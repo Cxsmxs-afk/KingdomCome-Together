@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - cursor/dialog-rain-tpose-8b43
+      - codex/join-save-retention
 
 jobs:
   build:
@@ -23,6 +23,12 @@ jobs:
       - name: Inno Setup 6
         run: choco install innosetup --no-progress -y
 
+      - name: Relay unit tests
+        run: dotnet test dotnet/KcdMp.Relay.Tests -c Release --logger "trx;LogFileName=relay.trx" --results-directory test-results
+
+      - name: Client unit tests
+        run: dotnet test dotnet/KcdMp.Client.Tests -c Release --logger "trx;LogFileName=client.trx" --results-directory test-results
+
       - name: Build installer, DLL, pak and programs
         shell: pwsh
         run: >
@@ -35,6 +41,24 @@ jobs:
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File tools\Package-DropIn.ps1
 
+      - name: Verify drop-in contents
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $PWD 'release/KingdomComeTogether-DropIn.zip'))
+          try {
+            $entries = @{}
+            foreach ($entry in $zip.Entries) { $entries[$entry.FullName.Replace('\', '/')] = $entry }
+            foreach ($path in @('INSTALL.txt', 'KingdomComeTogether/KCDMP_launcher.exe', 'Mods/kdcmp/Data/kdcmp.pak', 'KingdomComeTogether/install-verify.txt')) {
+              if (-not $entries.ContainsKey($path) -or $entries[$path].Length -eq 0) { throw "Missing or empty drop-in entry: $path" }
+            }
+            $reader = [System.IO.StreamReader]::new($entries['KingdomComeTogether/install-verify.txt'].Open())
+            try { if ($reader.ReadLine() -notmatch '^PASS(?:\s|$)') { throw 'Drop-in install verification is not PASS' } }
+            finally { $reader.Dispose() }
+            Write-Output 'Drop-in contents PASS: instructions, launcher, pak and install-verify'
+          }
+          finally { $zip.Dispose() }
+
       - uses: actions/upload-artifact@v4
         with:
           name: kingdom-come-together
@@ -44,6 +68,13 @@ jobs:
             release/KingdomComeTogether-DropIn.zip
             release/BUILD-*.log
             release/RELEASE-CANDIDATE-*.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          if-no-files-found: warn
+          path: test-results/*.trx
 
   sim:
     runs-on: ubuntu-latest
@@ -68,3 +99,5 @@ jobs:
             tools/sim/out/sim.json
             tools/sim/out/sim-load.json
             tools/sim/out/sim.md
+
+

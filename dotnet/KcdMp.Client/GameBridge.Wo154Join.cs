@@ -42,9 +42,11 @@ public partial class GameBridge
         Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: no sign of the load's {(stage == "accept" ? "start" : "end")} yet -- asking the game where it is; it is never given up while it is busy (mp_join_patient)");
         while (true)
         {
+            if (j.Abandoned.Task.IsCompleted || !ReferenceEquals(_jj, j)) return false;
             if (Done()) return true;
             if (j.LoadFailed!.Task.IsCompleted) return false;
             string w = await Wo154WhereNowAsync();
+            if (j.Abandoned.Task.IsCompleted || !ReferenceEquals(_jj, j)) return false;
             if (Done()) return true;
             double waited = (DateTime.UtcNow - t0).TotalSeconds;
             var v = watch.Feed(w, waited, loadAccepted: j.LoadStarted!.Task.IsCompleted);
@@ -115,9 +117,10 @@ public partial class GameBridge
     /// </summary>
     private bool Wo154RemovePlacedLater(JoinerJoin j, string path)
     {
+        if (j.PlacedVerified && !_retainedJoinWorlds.MayRemove(path, j)) return true;
         bool commanded = j.LoadCmdUtc != default;
         bool past = (j.GameplayStarted?.Task.IsCompleted ?? false) || (j.LoadFailed?.Task.IsCompleted ?? false);
-        if (!_w154JoinPatient || Wo154Rules.PlacedFileMayGo(commanded, past, false, "")) return false;
+        if ((!j.PlacedVerified && !_w154JoinPatient) || Wo154Rules.PlacedFileMayGo(commanded, past, false, "")) return false;
         Interlocked.Increment(ref _w154JoinDeferredRemovals);
         int pl = j.Playline; string name = j.Name; uint id = j.JoinId;
         Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: {SaveDisplay(path)} is kept until no load can be reading it");
@@ -130,7 +133,15 @@ public partial class GameBridge
                 string w = await Wo154WhereNowAsync();
                 if (Wo154Rules.PlacedFileMayGo(true, false, false, w))
                 {
-                    try { if (File.Exists(path)) File.Delete(path); } catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(path)}: {ex.Message}"); }
+                    bool gone = false;
+                    try
+                    {
+                        if (j.PlacedVerified) gone = _retainedJoinWorlds.TryDelete(path, j);
+                        else { File.Delete(path); gone = !File.Exists(path); }
+                    }
+                    catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(path)}: {ex.Message}"); }
+                    if (!gone) return;
+                    if (j.PlacedPath == path) j.PlacedPath = null;
                     var after = await _combat.SaveListAsync(1, pl, name);
                     Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: removed {SaveDisplay(path)} now that the game answers from {(w == "menu" ? "the main menu" : "a world")}; rescan listed={(after is null ? "?" : On(after.Listed))}");
                     return;
@@ -193,3 +204,4 @@ public partial class GameBridge
     private string Wo154JoinStatsText() => FormattableString.Invariant(
         $"join_patient={(_w154JoinPatient ? "on" : "off")} join_frozen={(_w154JoinFrozen ? "on" : "off")} frozen_seen={Interlocked.Read(ref _w154JoinFrozenSeen)} join_stopvideo={(_w154JoinStopVideo ? "on" : "off")} video_stops={Interlocked.Read(ref _w154JoinVideoStops)} join_waits={_w154JoinWaits} join_wait_aborts={_w154JoinWaitAborts} join_wait_worlds={_w154JoinWaitWorlds} placed_deferred={_w154JoinDeferredRemovals} join_panel={(_w154JoinPanel ? "on" : "off")} panel_pushes={_w154PanelPushes}");
 }
+

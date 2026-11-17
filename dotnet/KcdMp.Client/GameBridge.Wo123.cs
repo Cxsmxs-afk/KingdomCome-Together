@@ -217,7 +217,7 @@ public partial class GameBridge
                 return;
             case "join_cancel":     // mp_join_cancel, on either machine
                 if (_hostJoin is { } j3) { Console.WriteLine("MP-JOIN host: mp_join_cancel"); j3.Cancel("cancel"); }
-                else if (_joinRx is not null || _joinOutId != 0) _ = CancelOutgoingJoinAsync("mp_join_cancel");
+                else if (_joinRx is not null || _joinOutId != 0 || _jj is not null || _retainedJoinWorlds.Count > 0) _ = CancelOutgoingJoinAsync("mp_join_cancel");
                 else Console.WriteLine("MP-JOIN mp_join_cancel: no join in progress");
                 return;
             case "join_request":    // mp_join_request on the joiner
@@ -720,18 +720,28 @@ public partial class GameBridge
     private async Task CancelOutgoingJoinAsync(string why)
     {
         uint id = _joinRx?.JoinId ?? _joinOutId;
+        JoinerJoin[] released;
+        lock (_joinGate)
+        {
+            var active = _jj;
+            if (active is not null) { active.Phase = "cancelled"; active.Abandoned.TrySetResult(true); _jj = null; }
+            released = _retainedJoinWorlds.End(joined: false, cancelled: true);
+            _joinReceivedId = 0;
+            _autoRequests = 99;   // a player's cancel never restarts this join automatically
+        }
         _joinRx?.Abort();
         _joinRx = null;
         _joinOutId = 0;
         SetJoinUi("aborted", "Join cancelled.");
         try { await WriteJoinAsync(WorldReceiver.BuildAbort(Protocol.JoinTargetHost, id, Protocol.JoinAbortJoinerCancel)); } catch { }
+        await CleanupRetainedJoinWorldsAsync(released, "player-cancel");
         Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8} cancelled ({why}) -- staging deleted, the host resumes");
     }
 
     /// <summary>The next WO calls this once the joiner has spliced, loaded and is in the world.</summary>
-    private async Task SendJoinerReadyAsync(string why)
+    private async Task<bool> SendJoinerReadyAsync(string why)
     {
-        if (_joinReceivedId == 0) { Console.WriteLine($"MP-JOIN joiner: ready ({why}) but no world was received -- not sent"); return; }
+        if (_joinReceivedId == 0) { Console.WriteLine($"MP-JOIN joiner: ready ({why}) but no world was received -- not sent"); return false; }
         try
         {
             await WriteJoinAsync(WorldReceiver.BuildReady(_joinReceivedId, _joinReceivedSeq));
@@ -739,8 +749,9 @@ public partial class GameBridge
             _ = Wo210AfterSkipAsync("join");   // WO-210 A.4: the host's whole-body states afresh for this world
             SetJoinUi("ready", "In the world.");
             _joinReceivedId = 0;
+            return true;
         }
-        catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: ready not sent: {ex.Message}"); }
+        catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: ready not sent: {ex.Message}"); return false; }
     }
 
     private uint _joinReceivedId, _joinReceivedSeq;
@@ -881,3 +892,4 @@ public partial class GameBridge
         return sb.ToString();
     }
 }
+

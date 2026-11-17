@@ -27,10 +27,10 @@ namespace KcdMp.Client;
 ///     mpworld&lt;joinId&gt;.whs in that save's playline, read back, the engine's
 ///     cached save list is rescanned natively and the file must be listed ->
 ///     wh_sys_LoadGame from the menu;
-///   * right after "Gameplay started": the file is deleted and the list
-///     rescanned (Continue must never find it), then in order: the save lock
+///   * after "Gameplay started", keep the verified file through the save lock,
 ///     read back, the death guard, the Henry check (money + items against the
 ///     source), the teleport beside the host, and Ready (the host resumes).
+///     Only join=in or the player's cancel authorizes its removal.
 /// Every failure sends JoinAbort (the host resumes) and leaves the joiner
 /// where it can go on: at the menu before the load; after it, back in their
 /// own newest save (KCD2 1.5.5 has no safe exit to the main menu: console
@@ -75,6 +75,7 @@ public partial class GameBridge
         public uint WorldSavedSeq;
         public HenrySource? Source;
         public string? PlacedPath;
+        public bool PlacedVerified;
         public int Playline;
         public string Name = "";
         public byte[]? SplicedSha;
@@ -88,9 +89,11 @@ public partial class GameBridge
         public WhsSave.HenryParts? SplicedParts;
         public byte[]? OfferMd5;
         public TaskCompletionSource<bool>? LoadStarted, GameplayStarted, LoadFailed;
+        public readonly TaskCompletionSource<bool> Abandoned = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     private JoinerJoin? _jj;
+    private readonly JoinWorldFiles<JoinerJoin> _retainedJoinWorlds = new();
     private volatile bool _joinedWorld;            // this game's loaded world is the host's (after a join, until it leaves)
     private HenrySource? _joinedSource;            // the save to go back to when leaving
     private volatile bool _ownLoadExpected;        // our own "leave" load is running
@@ -499,7 +502,7 @@ public partial class GameBridge
     {
         if (!JoinerSharedEffective) return Task.CompletedTask;
         var j = new JoinerJoin { JoinId = joinId, Host = host, WorldSavedSeq = seq, InWorld = _where == GameWhere.World, OfferMd5 = _joinReceivedMd5 };
-        _jj = j;
+        lock (_joinGate) _jj = j;
         // Never awaited by the frame loop: observed, awaiting it held every relay
         // frame (the host's positions, its aborts) for the whole ~50 s load.
         _ = Task.Run(() => RunJoinerJoinAsync(j, stagedPath));
@@ -609,11 +612,25 @@ public partial class GameBridge
                 return;
             }
             Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} placed {SaveDisplay(final)} ({back.Length} B, read back: sha256 = the splice, verify ok)");
+            lock (_joinGate)
+            {
+                j.PlacedVerified = true;
+                _retainedJoinWorlds.Keep(final, j);
+                if (j.Abandoned.Task.IsCompleted) _retainedJoinWorlds.Cancel(j);
+            }
+            if (Wo206JoinGone(j, "after placing")) { await RemovePlacedWorldAsync(j, "abandoned-after-place"); return; }
             if (coopPl >= 0) Wo175JoinPlaced(j.JoinId, hostTag, final, j.SplicedSha);
-            var listed = await _combat.SaveListAsync(1, j.Playline, j.Name);
+            int listAttempt = 0;
+            var listed = await JoinSaveList.WaitAsync(async (op, ct) =>
+            {
+                var report = await _combat.SaveListAsync(op, j.Playline, j.Name, ct);
+                Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} list attempt={++listAttempt} op={op} file={SaveDisplay(final)} listed={(report is null ? "unreadable" : On(report.Listed))}; the verified world stays in place");
+                return report;
+            }, () => ReferenceEquals(_jj, j) && j.Phase == "preparing");
+            if (Wo206JoinGone(j, "after listing") || j.Phase != "preparing") return;
             if (listed is null || !listed.Listed)
             {
-                Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: the native rescan {(listed is null ? "did not answer (is the plugin running?)" : $"does not list it (playline{j.Playline} has {listed.Count})")} -- abort, fail closed");
+                Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: the native list did not discover the placed world after {listAttempt} attempts -- the host resumes, the verified file is retained");
                 await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "load-failed", "Your host's world could not be loaded.");
                 return;
             }
@@ -639,7 +656,7 @@ public partial class GameBridge
             }
             if (Wo206JoinGone(j, "before the load"))   // WO-206 B2: never load a join that was aborted while it was placed
             {
-                if (j.PlacedPath is string gone) { try { File.Delete(gone); } catch { } j.PlacedPath = null; }
+                await RemovePlacedWorldAsync(j, "abandoned-before-load");
                 return;
             }
             j.Phase = "loading";
@@ -656,17 +673,20 @@ public partial class GameBridge
             // until "Gameplay started" (observed: deleting it earlier failed the
             // load and the engine went back to the menu).
             // WO-154 4.2: past 20 s the game is asked where it is; never given up while it is busy (mp_join_patient)
-            if (await Task.WhenAny(j.LoadStarted.Task, Task.Delay(20000)) != j.LoadStarted.Task
+            if (await Task.WhenAny(j.LoadStarted.Task, j.Abandoned.Task, Task.Delay(20000)) != j.LoadStarted.Task
                 && !(_w154JoinPatient && await Wo154WaitLoadAsync(j, "accept")))
             {
+                if (Wo206JoinGone(j, "while accepting load")) return;
                 Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: the engine did not accept wh_sys_LoadGame {j.Playline} {j.Name} {(j.Frozen ? "(the game froze)" : _w154JoinPatient ? "(the game answers, not loading)" : "within 20 s")} -- abort");
                 if (j.Frozen) await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "load-frozen", Wo154Rules.FrozenLoadText);
                 else await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "load-failed", "Your host's world could not be loaded.");
                 return;
             }
-            var endT = await Task.WhenAny(j.GameplayStarted.Task, j.LoadFailed.Task, Task.Delay(_w154JoinPatient ? 90000 : 300000));
+            var endT = await Task.WhenAny(j.GameplayStarted.Task, j.LoadFailed.Task, j.Abandoned.Task, Task.Delay(_w154JoinPatient ? 90000 : 300000));
+            if (Wo206JoinGone(j, "while loading")) return;
             if (endT != j.GameplayStarted.Task && !(endT != j.LoadFailed.Task && _w154JoinPatient && await Wo154WaitLoadAsync(j, "gameplay")))
             {
+                if (Wo206JoinGone(j, "after load wait")) return;
                 Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: the load {(endT == j.LoadFailed.Task ? "FAILED (the engine went back to the menu)" : j.Frozen ? "FROZE (busy with no CPU: the game's own freeze at the loading screen)" : "never reached \"Gameplay started\" in 300 s")} -- abort");
                 if (j.Frozen) await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "load-frozen", Wo154Rules.FrozenLoadText);
                 else await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "load-failed", "Your host's world could not be loaded.");
@@ -674,12 +694,15 @@ public partial class GameBridge
             }
             Console.WriteLine(FormattableString.Invariant(
                 $"MP-JOIN joiner: join 0x{j.JoinId:x8} loaded: command -> accepted {(j.LoadStartUtc - j.LoadCmdUtc).TotalSeconds:F1} s, -> file read (LoadGame) {(j.LoadGameUtc == default ? double.NaN : (j.LoadGameUtc - j.LoadCmdUtc).TotalSeconds):F1} s, -> Gameplay started {(j.GameplayUtc - j.LoadCmdUtc).TotalSeconds:F1} s (received -> in world {(j.GameplayUtc - t0).TotalSeconds:F1} s)"));
-            j.Phase = "post-load";
-            _joinedSource = choice.Save;
-            SetJoinedWorld(true);   // the saves watch runs: a save that still lands here is a leak (QuickSave passes the lock)
+            lock (_joinGate)
+            {
+                if (!ReferenceEquals(_jj, j) || j.Abandoned.Task.IsCompleted || j.Phase != "loading") return;
+                j.Phase = "post-load";
+                _joinedSource = choice.Save;
+                SetJoinedWorld(true);   // the saves watch runs: a save that still lands here is a leak (QuickSave passes the lock)
+            }
 
-            // ---- right after Gameplay started: the file goes, Continue must not find it
-            await RemovePlacedWorldAsync(j, "after-load");
+            // GameplayStarted alone is not a completed join: keep the retry source through PostLoad and Ready.
             await PostLoadAsync(j);
         }
         catch (Exception ex)
@@ -702,8 +725,19 @@ public partial class GameBridge
     private async Task RemovePlacedWorldAsync(JoinerJoin j, string why)
     {
         if (j.PlacedPath is not string p) return;
+        if (j.PlacedVerified && !_retainedJoinWorlds.MayRemove(p, j))
+        {
+            Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} {why}: kept {SaveDisplay(p)} -- no join=in or player cancel yet");
+            return;
+        }
+        if (Wo154RemovePlacedLater(j, p)) return;
         bool gone = false;
-        try { if (File.Exists(p)) File.Delete(p); gone = !File.Exists(p); } catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(p)}: {ex.Message}"); }
+        try
+        {
+            if (j.PlacedVerified) gone = _retainedJoinWorlds.TryDelete(p, j);
+            else { File.Delete(p); gone = !File.Exists(p); }
+        }
+        catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(p)}: {ex.Message}"); }
         j.PlacedPath = gone ? null : p;
         var after = await _combat.SaveListAsync(1, j.Playline, j.Name);
         string expect = "?";
@@ -717,10 +751,18 @@ public partial class GameBridge
                           $"Continue would load playline{after?.ContinuePlayline}/{after?.ContinueName ?? "?"} (this player's newest own save in playline{j.Playline}: {expect}) -> {(contOk ? "OK" : "CHECK")}");
     }
 
+    private async Task CleanupRetainedJoinWorldsAsync(IEnumerable<JoinerJoin> worlds, string why)
+    {
+        foreach (var kept in worlds)
+            try { await RemovePlacedWorldAsync(kept, why); }
+            catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: retained world cleanup failed: {ex.Message}"); }
+    }
+
     // ---------------------------------------------------------------- Phase 4: in the world, before Ready
 
     private async Task PostLoadAsync(JoinerJoin j)
     {
+        if (Wo206JoinGone(j, "before post-load") || j.Phase != "post-load") return;
         // 0. WO-125: the world in memory is the file this join placed (the engine's own record of the last
         // load). The Henry check cannot tell two worlds apart when the Henry is the same (a "bring" restore
         // equals the player's own save's Henry), so it is asked here.
@@ -788,14 +830,28 @@ public partial class GameBridge
         else Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} step 4 beside the host: no fresh host position (ghost {j.Host}) -- the joiner keeps the spliced spot");
 
         // 5. Ready
+        if (Wo206JoinGone(j, "before Ready") || j.Phase != "post-load") return;
         uint readySeq = _joinReceivedSeq;
-        await SendJoinerReadyAsync("wo124");
+        if (!await SendJoinerReadyAsync("wo124"))
+        {
+            await LeaveAfterFailedJoinAsync(j, Protocol.JoinAbortIo, "ready-failed", "Your host could not confirm the join.");
+            return;
+        }
+        if (Wo206JoinGone(j, "after Ready") || j.Phase != "post-load") return;
         if (j.WorldTag is string wt0) Wo134AfterReady(wt0);   // WO-134: the joiner's chest ledger (restored with the Henry), then the host's
         if (j.WorldTag is string wt && j.SplicedParts is { } sp) Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, readySeq);   // WO-125: the join save's matched pair
-        j.Phase = "in";
-        SetJoinUi("in", "In your host's world.");
-        await ExecLuaAsync("if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"Co-op: you are in your host's world.\") end");
-        _jj = null;
+        JoinerJoin[] completed;
+        lock (_joinGate)
+        {
+            if (!ReferenceEquals(_jj, j) || j.Phase != "post-load") return;
+            j.Phase = "in";
+            SetJoinUi("in", "In your host's world.");
+            completed = _retainedJoinWorlds.End(joined: true, cancelled: false);
+            _jj = null;
+        }
+        await CleanupRetainedJoinWorldsAsync(completed, "join=in");
+        try { await ExecLuaAsync("if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"Co-op: you are in your host's world.\") end"); }
+        catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: joined notification failed: {ex.Message}"); }
         _ = Task.Delay(10000).ContinueWith(_ => { if (_joinUiState == "in") SetJoinUi("idle", ""); });
     }
 
@@ -932,24 +988,19 @@ public partial class GameBridge
     /// <summary>Before the load: abort to the host (it resumes), clean up, stay at the menu.</summary>
     private async Task AbortJoinerJoinAsync(JoinerJoin j, byte reason, string why, string message, bool sendAbort = true)
     {
+        if (!ReferenceEquals(_jj, j)) { await RemovePlacedWorldAsync(j, why); return; }
         if (sendAbort)
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason)); } catch { }
-        if (j.PlacedPath is string p)
+        await RemovePlacedWorldAsync(j, why);
+        lock (_joinGate)
         {
-            if (Wo154RemovePlacedLater(j, p)) j.PlacedPath = null;   // WO-154 4.2: a load may be reading it -- it goes later
-            else
-            {
-                try { File.Delete(p); } catch { }
-                j.PlacedPath = null;
-                var after = await _combat.SaveListAsync(1, j.Playline, j.Name);
-                Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: removed {SaveDisplay(p)}; rescan listed={(after is null ? "?" : On(after.Listed))}");
-            }
+            if (!ReferenceEquals(_jj, j)) return;
+            WorldReceiver.SweepStaging(WorldReceiver.DefaultStagingDir());
+            _joinReceivedId = 0;
+            _jj = null;
+            _autoNextUtc = DateTime.UtcNow.AddSeconds(30);
+            SetJoinUi(why == "no-own-save" ? "no-save" : "failed", message, why == "load-frozen" ? "frozen" : "");
         }
-        WorldReceiver.SweepStaging(WorldReceiver.DefaultStagingDir());
-        _joinReceivedId = 0;
-        if (ReferenceEquals(_jj, j)) _jj = null;
-        _autoNextUtc = DateTime.UtcNow.AddSeconds(30);
-        SetJoinUi(why == "no-own-save" ? "no-save" : "failed", message, why == "load-frozen" ? "frozen" : "");
         Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} ABORTED ({why}) -- JoinAbort {Protocol.JoinAbortName(reason)} {(sendAbort ? "sent (the host resumes)" : "not sent")}; {(j.InWorld && _joinedWorld ? "leaving the host's world" : "staying where it is")}");
         // WO-125: a failed in-world rejoin leaves the host's world (what the joiner did since the reload is not kept).
         if (j.InWorld && _joinedWorld) await LeaveSharedWorldAsync(why, message);
@@ -958,10 +1009,15 @@ public partial class GameBridge
     /// <summary>After the load: abort to the host, then leave its world (back to this player's own newest save).</summary>
     private async Task LeaveAfterFailedJoinAsync(JoinerJoin j, byte reason, string why, string message)
     {
+        if (!ReferenceEquals(_jj, j)) return;
         try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason)); } catch { }
         Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} ABORTED after the load ({why}) -- JoinAbort {Protocol.JoinAbortName(reason)} sent (the host resumes)");
-        _joinReceivedId = 0;
-        if (ReferenceEquals(_jj, j)) _jj = null;
+        lock (_joinGate)
+        {
+            if (!ReferenceEquals(_jj, j)) return;
+            _joinReceivedId = 0;
+            _jj = null;
+        }
         if (!_w207LinkRejoin) _autoRequests = 99;   // no automatic retry into the same failure (a join the link cut is not one: WO-207 C.4)
         await LeaveSharedWorldAsync(why, message);
     }
@@ -1058,7 +1114,7 @@ public partial class GameBridge
                     {
                         // WO-154 4.2 (live L7): still loading -- or frozen. The file stays until no load can read it (it was
                         // deleted here while the game was busy), and the world is left only once the game is in one.
-                        if (j.PlacedPath is string pp && Wo154RemovePlacedLater(j, pp)) j.PlacedPath = null;
+                        if (j.PlacedPath is string pp) Wo154RemovePlacedLater(j, pp);
                         var t0 = DateTime.UtcNow;
                         string w = "busy";
                         while ((DateTime.UtcNow - t0).TotalSeconds < Wo154Rules.JoinLoadWatch.MaxWaitS && !j.Frozen
@@ -1105,3 +1161,4 @@ public partial class GameBridge
         _ = Wo184AfterQuitAsync(_joinedTag, owedAtQuit);
     }
 }
+
