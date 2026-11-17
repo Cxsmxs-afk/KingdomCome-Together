@@ -241,6 +241,57 @@ public sealed class JoinWorldFilesTests : IDisposable
     }
 
     [Fact]
+    public void Late_placement_after_cancel_releases_only_its_owner_and_preserves_the_next_join()
+    {
+        var files = new JoinWorldFiles<object>();
+        var cancelledJoin = new object();
+        var nextJoin = new object();
+        // The player's cancel happened before the older pipeline finished placing its verified file.
+        Assert.Empty(files.End(joined: false, cancelled: true));
+        string nextPath = World("mpworld35905a71.whs");
+        files.Keep(nextPath, nextJoin);
+        string latePath = World();
+        files.Keep(latePath, cancelledJoin);
+
+        files.Cancel(cancelledJoin);
+
+        Assert.True(files.MayRemove(latePath, cancelledJoin));
+        Assert.True(files.Protects(latePath));
+        Assert.True(files.TryDelete(latePath, cancelledJoin));
+        Assert.False(File.Exists(latePath));
+        Assert.False(files.MayRemove(nextPath, nextJoin));
+        Assert.False(files.TryDelete(nextPath, nextJoin));
+        Assert.True(files.Protects(nextPath));
+        Assert.True(File.Exists(nextPath));
+    }
+
+    [Fact]
+    public void Stale_owner_cancel_cannot_release_a_renewed_lease_of_the_same_path()
+    {
+        var files = new JoinWorldFiles<object>();
+        var oldJoin = new object();
+        var newJoin = new object();
+        string path = World();
+        byte[] digest = SHA256.HashData(File.ReadAllBytes(path));
+        files.Keep(path, oldJoin);
+        files.Cancel(oldJoin);
+        Assert.True(files.MayRemove(path, oldJoin));
+        files.Keep(path, newJoin);
+
+        files.Cancel(oldJoin);
+
+        Assert.False(files.MayRemove(path, oldJoin));
+        Assert.False(files.MayRemove(path, newJoin));
+        Assert.False(files.TryDelete(path, oldJoin));
+        Assert.False(files.TryDelete(path, newJoin));
+        Assert.True(files.Protects(path));
+        Assert.Equal(digest, SHA256.HashData(File.ReadAllBytes(path)));
+        files.Cancel(newJoin);
+        Assert.True(files.TryDelete(path, newJoin));
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
     public void Failed_file_deletion_preserves_its_lease_and_sweep_protection()
     {
         var files = new JoinWorldFiles<object>();
