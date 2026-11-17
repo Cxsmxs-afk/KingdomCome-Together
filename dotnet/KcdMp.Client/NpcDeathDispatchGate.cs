@@ -19,7 +19,17 @@ public sealed class NpcDeathDispatchGate
             ticket = 0;
             if (!MayAnnounce(roleApplied, authority)) return false;
             if (alias is not null) _aliases[npc] = alias;
-            if (_sentOrPending.ContainsKey(npc) || (alias is not null && _sentOrPending.ContainsKey(alias))) return false;
+            bool named = _sentOrPending.TryGetValue(npc, out long namedTicket);
+            long aliasTicket = 0;
+            bool aliased = alias is not null && _sentOrPending.TryGetValue(alias, out aliasTicket);
+            if (named || aliased)
+            {
+                // Resolving a name/soul after either route won must close the other
+                // route too, including while that first dispatch is still pending.
+                if (!named) _sentOrPending[npc] = aliasTicket;
+                if (alias is not null && !aliased) _sentOrPending[alias] = namedTicket;
+                return false;
+            }
             ticket = ++_ticket;
             _sentOrPending[npc] = ticket;
             if (alias is not null) _sentOrPending[alias] = ticket;

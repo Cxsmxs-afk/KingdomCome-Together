@@ -1712,6 +1712,7 @@ public partial class GameBridge(ClientConfig config)
                     // WO-131 1b/1c: on a joiner, only a hit on the host's NPC where
                     // the host has it goes out, and never as a kill.
                     var (w131Send, w131Health, w131Fatal) = await Wo131GateOutboundAsync(soul, npcName, health, died, judge);
+                    if (hitLife != Interlocked.Read(ref _npcDeathLife) || !ReferenceEquals(stream, _resyncStream)) return;
                     if (!w131Send) { _stats.DmgOutDropped++; return; }
                     health = w131Health; died = w131Fatal;
                     if (!await SendNpcDamageAsync(stream, npcName, stamina, health, suppressHitReaction: true, fatal: died,

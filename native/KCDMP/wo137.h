@@ -156,6 +156,10 @@ bool punish_gate_armed();
 // Paket C/F3: only the State currently being set by a host mirror may pass a
 // time-library Execute gate; downstream local decisions remain gated.
 bool applying_state(const void* node);
+// Paket F3 hot-path predicate: inspect exact node/ancestor names directly,
+// without formatting a dotted path or keeping a cache of engine pointers.
+bool host_time_scope(const void* node);
+bool host_time_scope_ready();
 uint32_t punish_skipped();
 
 } // namespace kcdmp::wo137

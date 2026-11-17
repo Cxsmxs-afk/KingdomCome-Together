@@ -504,11 +504,10 @@ void hooked_out_trigger(void* port) {
     void* owner = port_owner(port);
     if (!owner) { g_origOut(port); return; }
     if (host_graph_only()) {
-        char path[480] = "", method[128] = "";
-        const bool library = wo137::path_of(owner, path, sizeof path) && host_time_path(path);
+        char method[128] = "";
         const bool function = classify_node(owner) == Kind::Function && wo137::function_method(owner, method, sizeof method) &&
                               method_kind(method) == Method::HostTime;
-        if (library || function) {
+        if (function || wo137::host_time_scope(owner)) {
             c_quiet.fetch_add(1, std::memory_order_relaxed);
             call_release(owner);
             return;
@@ -775,10 +774,13 @@ bool gate(void* node, void* /*ctx*/) {
     const uint32_t cid = gate_closure(t_closure, t_sceneCarry);   // WO-203 I.5: a scene's out-port carries the closure that started it
     const bool carried = t_closure == 0 && cid != 0;
     const Kind k = classify(vt);
+    Method m = Method::Other;
+    char mname[128] = "";
+    const bool methodRead = k == Kind::Function && wo137::function_method(node, mname, sizeof mname);
+    if (methodRead) m = method_kind(mname);
     if (host_graph_only()) {
-        char path[480] = "";
         ++t_inGate;
-        const bool timePath = !wo137::applying_state(node) && wo137::path_of(node, path, sizeof path) && host_time_path(path);
+        const bool timePath = !wo137::applying_state(node) && (m == Method::HostTime || wo137::host_time_scope(node));
         --t_inGate;
         if (timePath) {
             c_verdict[static_cast<int>(Verdict::HostWorld)].fetch_add(1, std::memory_order_relaxed);
@@ -798,11 +800,8 @@ bool gate(void* node, void* /*ctx*/) {
     c.storyBarks = (gb & 8) != 0;   // WO-201 B7
     const bool inClosure = in_replay_closure(cid);
     const bool mirror = t_mirrorTalker;
-    Method m = Method::Other;
-    char mname[128] = "";
     if (k == Kind::Function) {
-        if (!wo137::function_method(node, mname, sizeof mname)) return false;
-        m = method_kind(mname);
+        if (!methodRead) return false;
         if (m == Method::Other) return false;
         if (m == Method::PlayerHorse || (m == Method::KillSoul && t_horsePass)) {   // WO-221 D.1: explicit horse pass-through
             char pn[128] = "";
@@ -1061,7 +1060,9 @@ void describe_source(const void* node, const void* port, char* cls, size_t ncls,
     if (owner && !node) call_release(owner);
 }
 bool copy_neutral_always() { return g_role.load() == kRoleJoiner && g_joined.load() && (g_valueBits.load() & 1) != 0; }
-bool host_authority_ready() { return A.tap && A.gate && A.ports && g_triggerClasses == 3 && wo137::punish_gate_armed(); }
+bool host_authority_ready() {
+    return A.tap && A.gate && A.ports && g_triggerClasses == 3 && wo137::punish_gate_armed() && wo137::host_time_scope_ready();
+}
 bool host_graph_only() { return g_role.load() == kRoleJoiner && g_joined.load(); }
 void set_mirror_talker(bool on) { t_mirrorTalker = on; }
 

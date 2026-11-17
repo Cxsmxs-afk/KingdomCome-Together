@@ -39,6 +39,10 @@ int wo200_tests(int* passed) {
            host_time_path("SetIsNight") && !host_time_path("Barbora.time.ResetIsNight.Write") &&
            !host_time_path("Barbora.WhatTimeIsItLater") && !host_time_path(nullptr),
            "Paket F3: whole dotted node/ancestor components only, including unclassified module nodes");
+    WCHECK(host_time_name("SETISNIGHT") && host_time_name("WhatTimeIsIt") &&
+           !host_time_name("ResetIsNight") && !host_time_name("SetIsNightExtra") &&
+           !host_time_name("WhatTimeIsItLater") && !host_time_name(nullptr),
+           "Paket F3: the allocation-free ancestor walker uses exact node names, including case variants");
     WCHECK(decide(kRoleJoiner, Kind::WorldTrigger, Method::Other, Target::Unknown, false, false, false, false, on) == Verdict::HostWorld &&
            decide(kRoleHost, Kind::WorldTrigger, Method::Other, Target::Unknown, false, false, false, false, on) == Verdict::Run &&
            decide(kRoleJoiner, Kind::WorldTrigger, Method::Other, Target::Unknown, false, false, false, false, notJoined) == Verdict::Run,
@@ -175,7 +179,8 @@ int wo200_tests(int* passed) {
     // ---- Gate 1: the tap ----
     WCHECK(tap(kRoleJoiner, Kind::Clock, true, true, true, false, false) == Tap::QuietDrop, "I.4: the joiner's clock fire is dropped");
     WCHECK(tap(kRoleJoiner, Kind::Clock, false, true, true, false, false) == Tap::Pass, "not joined: the joiner's own world");
-    WCHECK(tap(kRoleJoiner, Kind::Clock, true, false, true, false, false) == Tap::Pass, "joiner_quiet_clocks off");
+    WCHECK(tap(kRoleJoiner, Kind::Clock, true, false, true, false, false) == Tap::QuietDrop,
+           "Paket C: the legacy quiet-clocks bit cannot reopen joined quest timers/watches");
     WCHECK(tap(kRoleHost, Kind::Clock, true, true, true, false, false) == Tap::Pass, "the host's clocks decide");
     WCHECK(tap(kRoleJoiner, Kind::Dialogue, true, true, true, false, false) == Tap::Capture, "I.1: a dialogue out-port is recorded");
     WCHECK(tap(kRoleJoiner, Kind::DialogueStarter, true, true, true, false, false) == Tap::Capture, "a forced dialogue's out-port too");

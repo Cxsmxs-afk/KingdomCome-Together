@@ -78,23 +78,28 @@ inline Method method_kind(const char* methodName) {
 // C_Node::GetName/GetParent produce a dotted path (wo137::path_of). Time
 // libraries are sometimes modules rather than reflection methods. Match whole
 // components, never e.g. ResetIsNight or WhatTimeIsItLater.
+inline bool host_time_name(const char* value, size_t n) {
+    if (!value) return false;
+    for (const char* name : {"SetIsNight", "WhatTimeIsIt"}) {
+        if (std::strlen(name) != n) continue;
+        size_t i = 0;
+        for (; i < n; ++i) {
+            char a = value[i], b = name[i];
+            if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+            if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+            if (a != b) break;
+        }
+        if (i == n) return true;
+    }
+    return false;
+}
+inline bool host_time_name(const char* name) { return name && host_time_name(name, std::strlen(name)); }
 inline bool host_time_path(const char* path) {
     if (!path) return false;
     for (const char* p = path; *p;) {
         const char* end = p;
         while (*end && *end != '.') ++end;
-        const size_t n = static_cast<size_t>(end - p);
-        for (const char* name : {"SetIsNight", "WhatTimeIsIt"}) {
-            if (std::strlen(name) != n) continue;
-            size_t i = 0;
-            for (; i < n; ++i) {
-                char a = p[i], b = name[i];
-                if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
-                if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
-                if (a != b) break;
-            }
-            if (i == n) return true;
-        }
+        if (host_time_name(p, static_cast<size_t>(end - p))) return true;
         p = *end ? end + 1 : end;
     }
     return false;
@@ -217,9 +222,8 @@ inline HorsePass horse_pass(uint8_t role, Kind k, Method m, bool inClosure, bool
 // ContinueLocal (WO-203 I.5): a scene handler a closure started pulses its out-ports (OnQueued, BeforePlay, AfterPlay, OnFinished) frames
 // later; the pulse re-enters that closure for the node gate only -- nothing is captured, nothing goes to the host, no State change is marked.
 enum class Tap : uint8_t { Pass = 0, QuietDrop, Capture, Continue, ContinueLocal };
-inline Tap tap(uint8_t role, Kind ownerKind, bool joined, bool quietClocks, bool capture, bool markedInClosure, bool inClosure) {
-    if (role == kRoleJoiner && joined && ownerKind == Kind::WorldTrigger) return Tap::QuietDrop;
-    if (role == kRoleJoiner && joined && quietClocks && ownerKind == Kind::Clock) return Tap::QuietDrop;
+inline Tap tap(uint8_t role, Kind ownerKind, bool joined, bool /*quietClocks*/, bool capture, bool markedInClosure, bool inClosure) {
+    if (role == kRoleJoiner && joined && (ownerKind == Kind::WorldTrigger || ownerKind == Kind::Clock)) return Tap::QuietDrop;
     // a conversation's node (a forced or fader dialogue is one too): the host marks its own talks as well (I.3's mirror rule)
     if ((ownerKind == Kind::Dialogue || ownerKind == Kind::DialogueStarter) && capture && !inClosure) return Tap::Capture;
     if (ownerKind == Kind::Waiter && markedInClosure && !inClosure) return Tap::Continue;

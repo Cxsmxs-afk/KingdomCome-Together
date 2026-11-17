@@ -71,6 +71,21 @@ public class NpcDeathDispatchTests
     }
 
     [Fact]
+    public async Task Late_soul_resolution_closes_guid_fallback_after_the_name_route_won()
+    {
+        var bridge = Bridge(true, true);
+        using var wire = new MemoryStream();
+        var soul = Guid.NewGuid();
+        // The observer's lookup had no GUID; it announced by name.
+        Assert.True(await bridge.SendNpcDamageAsync(wire, "npc", 0, 0, true, fatal: true));
+        // The DLL later resolves that same body, then a lookup fails again.
+        Assert.False(await bridge.SendNpcDamageAsync(wire, "npc", 0, 0, true, fatal: true, deathSoul: soul));
+        await bridge.SendLocalDeathAsync(wire, soul);
+        Assert.Equal(3 + 1 + 3 + Protocol.NpcDamageFixedTail, wire.Length);
+        Assert.Equal(Protocol.NpcDamageUp, wire.ToArray()[0]);
+    }
+
+    [Fact]
     public void Failed_dispatch_can_retry_and_old_world_failure_cannot_clear_new_claim()
     {
         var gate = new NpcDeathDispatchGate();

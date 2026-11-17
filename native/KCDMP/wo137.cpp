@@ -554,10 +554,10 @@ void* hooked_fn_invoke(void* self, void* ret, void* out) {
     // Keep those time decisions on the host as well; the empty variant is the
     // engine's existing no-invocation result used by the time-set gate below.
     if (wo200::host_graph_only()) {
-        const char* s = nullptr; char m[128] = "", path[kMaxPath + 64] = "";
+        const char* s = nullptr; char m[128] = "";
         const bool method = rd(self, kOffFnMethodName, &s) && s && copy_cstr(s, m, sizeof m) &&
                             wo200rules::method_kind(m) == wo200rules::Method::HostTime;
-        const bool library = node_path(self, path, sizeof path) && wo200rules::host_time_path(path);
+        const bool library = !method && host_time_scope(self);
         if ((method || library) && call_variant_ctor(ret)) {
             c_timeSkipped.fetch_add(1);
             return ret;
@@ -1125,6 +1125,26 @@ bool path_of(const void* node, char* out, size_t cap) {
     if (n + 1 > cap) { out[0] = 0; return false; }
     std::memcpy(out, c, n + 1);
     return true;
+}
+bool host_time_scope_ready() { return A.nodeName && A.nodeParent && A.release; }
+bool host_time_scope(const void* node) {
+    if (!node || !host_time_scope_ready()) return false;
+    const void* current = node;   // borrowed from the active engine call
+    void* held = nullptr;         // GetParent returns one owned reference
+    bool found = false;
+    for (int depth = 0; current && depth < 40; ++depth) {
+        const char* name = nullptr;
+        char copy[160];
+        if (!call_name(current, &name) || !name || !copy_cstr(name, copy, sizeof copy)) break;
+        if (wo200rules::host_time_name(copy)) { found = true; break; }
+        void* parent = nullptr;
+        if (!call_parent(current, &parent)) break;
+        call_release(held);
+        held = parent;
+        current = parent;
+    }
+    call_release(held);
+    return found;
 }
 Applied pulse_node(const char* path, const char* port, NodeAccept accept, void* ctx) { return pulse_node_impl(path, port, accept, ctx); }
 const char* applied_name(Applied a) { return applied_text(a); }
