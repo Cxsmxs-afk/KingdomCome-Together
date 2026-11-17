@@ -40,6 +40,14 @@ try {
         Copy-Item $manifest (Join-Path $dest "mod.manifest") -Force
         Copy-Item $pak (Join-Path $dest "Data\kdcmp.pak") -Force
     }
+    # The launcher locks Host and Join unless this file's first line says PASS.
+    # Setup writes it when it finishes; a drop-in never ran Setup, and an older
+    # folder may still hold FAIL or nothing. The zip has to bring PASS with it.
+    $verify = @"
+PASS  drop-in $version : these files are the verified build
+version $version
+"@
+    [System.IO.File]::WriteAllText((Join-Path $app "install-verify.txt"), $verify.Replace("`n", "`r`n"), [System.Text.UTF8Encoding]::new($false))
 
     $install = @"
 Kingdom Come: Together $version

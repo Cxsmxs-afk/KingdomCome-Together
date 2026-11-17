@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - cursor/session-hold-8b43
+      - cursor/dropin-verify-8b43
 
 jobs:
   build:

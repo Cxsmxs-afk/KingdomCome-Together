@@ -93,8 +93,31 @@ public class ModInstallTests
     [Fact]
     public void AFailedInstallVerdictIsNotComplete()
     {
-        using var f = new FakeSteam("verdict").WithModdingTools().WithInstall(verdictPass: false).WithModPlaced();
-        Assert.False(ModInstall.Check(f.AppDir, f.MtRoot, true).Ok);
+        using var f = new FakeSteam("verdict").WithGame().WithModdingTools().Linked().WithInstall(verdictPass: false).WithModPlaced();
+        var report = ModInstall.Check(f.AppDir, f.MtRoot, true);
+        Assert.False(report.Ok);
+        Assert.False(report.VerdictPass);
+        var detail = SetupChecklist.Evaluate(f.Snapshot(ownsMod: true), SetupActivity.Idle).Single(s => s.Id == StepId.Mod).Detail;
+        Assert.Contains(@"KingdomComeTogether\install-verify.txt", detail);
+        Assert.Contains("FAIL", detail);
+    }
+
+    [Fact]
+    public void AMissingVerdictNamesTheFileAndAPassLineUnlocks()
+    {
+        using var f = new FakeSteam("noverdict").WithGame().WithModdingTools().Linked().WithInstall().WithModPlaced();
+        File.Delete(Path.Combine(f.AppDir, ModInstall.VerdictName));
+        var missing = ModInstall.Check(f.AppDir, f.MtRoot, true);
+        Assert.False(missing.VerdictPass);
+        Assert.Equal("", missing.VerdictLine);
+        var detail = SetupChecklist.Evaluate(f.Snapshot(ownsMod: true), SetupActivity.Idle).Single(s => s.Id == StepId.Mod).Detail;
+        Assert.Contains(@"KingdomComeTogether\install-verify.txt is missing", detail);
+
+        File.WriteAllText(Path.Combine(f.AppDir, ModInstall.VerdictName), "PASS  drop-in 0.65.2 : these files are the verified build\r\n");
+        var ok = ModInstall.Check(f.AppDir, f.MtRoot, true);
+        Assert.True(ok.VerdictPass);
+        Assert.True(ok.Ok);
+        Assert.Equal(StepStatus.Done, SetupChecklist.Evaluate(f.Snapshot(ownsMod: true), SetupActivity.Idle).Single(s => s.Id == StepId.Mod).Status);
     }
 }
 

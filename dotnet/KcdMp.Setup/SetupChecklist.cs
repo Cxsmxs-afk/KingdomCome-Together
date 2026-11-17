@@ -228,8 +228,14 @@ public static class SetupChecklist
         if (m.DevelopmentBuild)
             return new(StepId.Mod, title, StepStatus.Done, "Development build: no install manifest beside the launcher, so nothing to check.");
         if (!m.VerdictPass)
+        {
+            const string file = @"KingdomComeTogether\install-verify.txt";
+            string why = string.IsNullOrWhiteSpace(m.VerdictLine)
+                ? $"{file} is missing."
+                : $"{file} starts with \"{m.VerdictLine.Trim()}\" instead of PASS.";
             return new(StepId.Mod, title, StepStatus.NeedsYou,
-                "The install is incomplete. Close the launcher and run Setup again; it repairs an install in this state.");
+                why + " Extract the drop-in zip again and choose overwrite, or run Setup from the same download. Host and Join stay locked until that file's first line says PASS.");
+        }
         if (m.ForeignFolder)
             return new(StepId.Mod, title, StepStatus.NeedsYou,
                 "A different mod named \"kdcmp\" is in the Modding Tools' Mods folder. Run Setup again and let it replace that folder.");
