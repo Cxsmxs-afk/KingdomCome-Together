@@ -162,11 +162,9 @@ public class ClientSession
     // a timeout, not only a clean disconnect (FIN) or an immediate reset
     // (RST) -- a client whose machine or network vanishes silently (cable
     // pulled, hard crash) leaves this read parked forever with neither. The
-    // real client sends a position heartbeat at least every 2 s even at a
-    // menu or a loading screen (GameBridge.cs's PositionHeartbeatInterval,
-    // which keeps running independent of the game's own Script.SetTimer
-    // chains) -- Tcp:IdleTimeoutMs (default 30 s, TcpSocketService) is 15x
-    // that margin before calling it dead.
+    // real client sends a ping every 2 s on its own loop, not behind the
+    // console (GameBridge.PingLoopAsync). A loading screen or a quest flood
+    // must not look like a dead client. Tcp:IdleTimeoutMs defaults to 90 s.
     private readonly TimeSpan _idleTimeout;
 
     public ClientSession(ILogger logger, TcpClient tcp, TcpBroadcastService broadcastService,

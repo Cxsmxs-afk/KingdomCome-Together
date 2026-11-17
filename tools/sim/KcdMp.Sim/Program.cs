@@ -55,7 +55,8 @@ public static class Program
         await File.WriteAllTextAsync(Path.Combine(outDir, "sim-load.json"), JsonSerializer.Serialize(load, opt));
         var queued = QueueLoad.RunAll();
         var feel = Feel.RunAll();
-        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load) + Report.Queue(queued) + Report.Feel(feel));
+        var life = SessionLife.RunAll();
+        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load) + Report.Queue(queued) + Report.Feel(feel) + Report.Life(life));
         int gated = results.Count(r => r.Gate);
         int failed = results.Count(r => r.Gate && !r.Pass);
         // Phase 3: a flooded console freezes the figure for seconds. The ring's
@@ -63,8 +64,9 @@ public static class Program
         bool ringFlat = queued.Where(r => r.Timeline == "ring").All(r => r.WireBytes < 800);
         bool consoleTrails = queued.Where(r => r.Timeline == "console").All(r => r.WireBytes > 2000);
         bool feelOk = feel.All(r => r.Pass);
-        Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. queue ringFlat={ringFlat} consoleTrails={consoleTrails} feel={feelOk}. {mdPath}");
-        return failed == 0 && ringFlat && consoleTrails && feelOk ? 0 : 1;
+        bool lifeOk = life.All(r => r.Pass);
+        Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. queue ringFlat={ringFlat} consoleTrails={consoleTrails} feel={feelOk} life={lifeOk}. {mdPath}");
+        return failed == 0 && ringFlat && consoleTrails && feelOk && lifeOk ? 0 : 1;
     }
 
     static async Task<RunResult> RunOne(int players, Profile profile, string label, string commit)
@@ -497,6 +499,21 @@ static class Report
         sb.AppendLine("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         foreach (var r in rows)
             sb.AppendLine($"| {r.Players} | {r.Profile} | {r.Mode} | {r.HeightP95Cm:0.0} | {r.HeightMaxCm:0.0} | {r.Sinks} | {r.BreaksPerMin:0.0} | {r.HitP95:0} | {r.DeathP95:0} | {r.Lost} | {r.DialogP95:0} | {r.DialogAsync} |");
+        return sb.ToString();
+    }
+
+    public static string Life(List<LifeRow> rows)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine();
+        sb.AppendLine("## Eigene Welt");
+        sb.AppendLine();
+        sb.AppendLine("`before`: 30 s ohne Paket ist tot, und jede Ladezeile wirft sofort in die eigene Welt. `after`: 90 s, eine Ladezeile hält 45 s, ein Relay-Neustart unter 60 s verbindet still nach. Resync ist -1, wenn die Session weg ist.");
+        sb.AppendLine();
+        sb.AppendLine("| Spieler | Fall | Stand | Eigene Welt | Resync ms | Abweichung m |");
+        sb.AppendLine("|---:|---|---|---:|---:|---:|");
+        foreach (var r in rows)
+            sb.AppendLine($"| {r.Players} | {r.Kind} | {r.Mode} | {r.OwnWorld} | {r.ResyncMs} | {r.DriftM:0.0} |");
         return sb.ToString();
     }
 }
