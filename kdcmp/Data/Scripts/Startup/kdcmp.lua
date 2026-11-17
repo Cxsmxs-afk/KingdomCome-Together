@@ -809,6 +809,7 @@ function KCD2MP_EmitTick()
     if (nowClock - (KCD2MP._perfAt or 0)) >= (KCD2MP._perfOn and 2 or 15) then
         KCD2MP._perfAt = nowClock
         KCD2MP_PerfFlush(false)
+        if KCD2MP_DesyncFlush then KCD2MP_DesyncFlush() end
     end
 
     local ok, err = pcall(KCD2MP_EmitState)
@@ -2251,6 +2252,40 @@ function KCD2MP_PerfFlush(force)
     KCD2MP._perf = { t0 = now }
 end
 
+-- One place a drifted world is visible in kcd.log. `detail` is logged at most
+-- once per 2 s per distinct text; the count still climbs. The 15 s summary
+-- is the line to grep after a session that "felt wrong".
+function KCD2MP_DesyncNote(kind, detail)
+    local d = KCD2MP._desync
+    if not d then d = { n = {}, t0 = os.clock() }; KCD2MP._desync = d end
+    d.n[kind] = (d.n[kind] or 0) + 1
+    if detail then
+        local key = kind .. "\0" .. detail
+        local now = os.clock()
+        d.told = d.told or {}
+        if not d.told[key] or (now - d.told[key]) >= 2.0 then
+            d.told[key] = now
+            mp_log(string.format("MP-DESYNC kind=%s %s n=%d", kind, detail, d.n[kind]))
+        end
+    end
+end
+
+function KCD2MP_DesyncFlush()
+    local d = KCD2MP._desync
+    if not d or not d.n then return end
+    local now = os.clock()
+    local win = now - (d.t0 or now)
+    local parts, any = {}, false
+    for k, v in pairs(d.n) do
+        if v > 0 then parts[#parts + 1] = k .. "=" .. tostring(v); any = true end
+    end
+    if any then
+        table.sort(parts)
+        mp_log(string.format("MP-DESYNC summary window_s=%.0f %s", win, table.concat(parts, " ")))
+    end
+    KCD2MP._desync = { n = {}, t0 = now, told = d.told }
+end
+
 function KCD2MP_SetPerf(arg)
     local s = tostring(arg or ""):lower()
     if s:find("now") then
@@ -2787,14 +2822,14 @@ function KCD2MP_NpcSmoothDelayS()
 end
 -- Ring depth: renderAt only ever looks DELAY back, and packets are ~emitMs
 -- apart, so three samples cover it with one to spare.
-TUNE.NPC_SMOOTH_RING = 3
+TUNE.NPC_SMOOTH_RING = 8   -- was 3. A burst of samples used to evict the one before the gap, so the partner interpolated inside the burst and then popped. Eight is about 0.8 s of a 10 Hz stream.
 -- Anim only: while the renderer holds at the newest sample because the next
 -- packet is merely LATE (jitter past DELAY), keep the last segment's speed
 -- for up to this long before reading the hold as "stopped". Position is not
 -- affected -- it holds regardless. Without this a 130 ms gap against a
 -- 120 ms delay would flick walk->idle->walk for one tick, which is exactly
 -- the churn Step 1 exists to remove.
-TUNE.NPC_SMOOTH_ANIM_GRACE_S = 0.06
+TUNE.NPC_SMOOTH_ANIM_GRACE_S = 0.20   -- was 0.06. A 60 ms grace turned a 150 ms delivery gap into walk-idle-walk. Position still holds; only the clip waits.
 -- WO-118 follow-up: a puppet KCDMP.dll writes gets its samples from the agent
 -- at most every 200 ms (GameBridge's NpcLuaCoalescer; flag and health changes
 -- at once) -- in practice 200-300 ms apart. Lua renders it only for the gait,
@@ -2918,8 +2953,16 @@ local function mp_npc_smooth_render(p, now)
         p.cz = a.z + (b.z - a.z) * t
         p.cr = lerpAngle(a.rot, b.rot, t)
         local sdx, sdy = b.x - a.x, b.y - a.y
-        spd = math.sqrt(sdx*sdx + sdy*sdy) / segDur
-        p.segSpd = spd
+        local step = math.sqrt(sdx*sdx + sdy*sdy)
+        local rawDur = b.at - a.at
+        -- Two samples a few milliseconds apart are a burst, not a gait. Dividing
+        -- a small step by the 50 ms floor read as a sprint and restarted the clip.
+        if rawDur < 0.04 and step < 0.35 then
+            spd = p.segSpd or 0
+        else
+            spd = step / segDur
+            p.segSpd = spd
+        end
     end
     return spd
 end
@@ -9893,7 +9936,18 @@ function KCD2MP_ApplyNpcState(name, x, y, z, rot, hp, flags, src, seq, senderMs)
         local s = KCD2MP.npcPacketStats
         if d == 0 then s.seqDup = (s.seqDup or 0) + 1; seqOk = false
         elseif d > 32768 then s.seqBehind = (s.seqBehind or 0) + 1; seqOk = false
-        elseif d > 1 and not p.nativeOwned then s.seqGaps = (s.seqGaps or 0) + (d - 1) end   -- a native puppet's are the agent's coalescing
+        elseif d > 1 and not p.nativeOwned then
+            s.seqGaps = (s.seqGaps or 0) + (d - 1)   -- a native puppet's are the agent's coalescing
+            -- A hole in the sequence is samples the partner never applied.
+            -- Remember it so a short silence does not hand the body back to
+            -- the local brain (that is the walk-off desync). A wide hole is logged.
+            p.gapAt = nowPkt
+            if d >= 4 then
+                KCD2MP_DesyncNote("npc-seq-gap", string.format("npc=%s missed=%d", name, d - 1))
+            else
+                KCD2MP_DesyncNote("npc-seq-gap")
+            end
+        end
     end
     if seq and seqOk then p.lastSeq = seq end
     local stampAt = mp_sender_stamp(src, tonumber(senderMs), nowPkt)
@@ -9996,6 +10050,36 @@ end
 -- never stored past the closure, so one reused table per call site is safe.
 SCRATCH.NPCPUPPETTICK_PPOS_SCRATCH = {}
 SCRATCH.NPCPUPPETTICK_AP_SCRATCH   = {}
+
+-- Once a second, if the body is more than 3 m from the pose we are rendering
+-- and the player is not standing on it, put it back. A local brain that
+-- wins for a moment is how the two worlds drift. Near the player we only
+-- log: snapping a body someone is fighting looks worse than the drift.
+function KCD2MP_PuppetDriftCorrect(name, p, e, now)
+    if not (p and e and p.cx) or p.dead or p.ko or p.carried or p.yielded then return end
+    if (now - (p.driftAt or 0)) < 1.0 then return end
+    p.driftAt = now
+    local ap = nil
+    pcall(function() ap = e:GetWorldPos(SCRATCH.NPCPUPPETTICK_AP_SCRATCH) end)
+    if not ap then return end
+    local dx, dy = ap.x - p.cx, ap.y - p.cy
+    local d2 = dx * dx + dy * dy
+    if d2 <= 9.0 then return end
+    local near = false
+    if player then
+        pcall(function()
+            local pp = player:GetWorldPos(SCRATCH.NPCPUPPETTICK_PPOS_SCRATCH)
+            if pp and (ap.x - pp.x) ^ 2 + (ap.y - pp.y) ^ 2 < 9.0 then near = true end
+        end)
+    end
+    KCD2MP_DesyncNote("puppet-drift", string.format("npc=%s dist_m=%.1f near=%s", name, math.sqrt(d2), near and "1" or "0"))
+    -- A native-owned body is the DLL's. Snapping it here fights that writer.
+    if near or p.nativeOwned then return end
+    pcall(function()
+        e:SetWorldPos({ x = p.cx, y = p.cy, z = p.cz or ap.z })
+        if p.cr then e:SetWorldAngles({ x = 0, y = 0, z = p.cr }) end
+    end)
+end
 -- True when this puppet should ask the engine whether it died. Near bodies,
 -- and any body the stream already calls dead or out, are asked every tick.
 function KCD2MP_PuppetLifeDue(p, now)
@@ -10199,6 +10283,11 @@ function KCD2MP_NpcPuppetTick(arg, gen)
                 KCD2MP_NpcReplicaDemote(name, "silence")   -- WO-104: the NPC returns before the puppet is dropped
                 KCD2MP_NpcNativeSync(name, p, nil, false, "silence")   -- WO-118
                 KCD2MP.npcPuppets[name] = nil
+                if p.lastPacketMoved then
+                    KCD2MP_DesyncNote("puppet-release", string.format("npc=%s quiet_s=%.1f", name, now - (p.lastPacketAt or now)))
+                else
+                    KCD2MP_DesyncNote("puppet-release")
+                end
                 mp_log("NPC-SYNC release " .. name .. " (stream silent)")
                 mp_auth_log(name, "release", p.owner == nil and "?" or p.owner, "silence", now - (p.ownerSince or now))   -- WO-102
                 mp_wo102_release(name, "silence")   -- WO-102 Phase 4; WO-108 s3.5: held for the dwell, resumed by mp_wo102_pending_tick
@@ -10208,6 +10297,7 @@ function KCD2MP_NpcPuppetTick(arg, gen)
 
             local e, isReplica = KCD2MP_NpcBody(name)
             if not e then return end
+            KCD2MP_PuppetDriftCorrect(name, p, e, now)   -- before this tick's own write, so a body the brain moved is visible
             if p.detach then KCD2MP_NpcDetachCheck(name, p, e) end   -- WO-118 Phase 3: MP-DETACH result line
             if p.detachPending then KCD2MP_NpcDetachRetry(name, p, e) end   -- skipped for a conversation: retried after it
             -- WO-104: life state (dead/KO/hp) is read from the WORLD NPC -- the
@@ -13491,6 +13581,7 @@ function KCD2MP_InterpTick(arg, gen)
                 istate.corrSnapsWin = (istate.corrSnapsWin or 0) + 1
                 KCD2MP.snapSession = (KCD2MP.snapSession or 0) + 1
                 mp_log(string.format("TELEPORT id=%s dist=%.1f", id, math.sqrt(distSq)))
+                KCD2MP_DesyncNote("ghost-snap", string.format("id=%s dist_m=%.1f", tostring(id), math.sqrt(distSq)))
                 if KCD2MP_QuestHazard then KCD2MP_QuestHazard("teleport-ghost", string.format("ghost %s snapped %.0fm", tostring(id), math.sqrt(distSq))) end
                 istate.cx = istate.tx
                 istate.cy = istate.ty
@@ -18739,11 +18830,16 @@ function KCD2MP_NpcSilenceRelease(name, p, now)
     local ns = KCD2MP.npcSilence
     if KCD2MP_W148Holds and KCD2MP_W148Holds(name) then return false end   -- WO-148: carried -- the stream waits on purpose
     local quiet = now - (p.lastPacketAt or 0)
+    -- After a sequence hole, wait 6 s before giving the body back. The 3 s
+    -- rule was releasing puppets during a lossy stretch; the local brain then
+    -- walked them somewhere the host's world does not have them.
+    local limit = (KCD2MP.npcSync and KCD2MP.npcSync.releaseS) or 3
+    if p.gapAt and (now - p.gapAt) < 8.0 and limit < 6.0 then limit = 6.0 end
     if KCD2MP.w147.npcCatchup and (now - ns.agentAt) < ns.ttlS then
         local m = ns.silent[name]
-        return (m ~= nil and m >= (p.lastPacketAt or 0)) or quiet > ns.fallbackS
+        return (m ~= nil and m >= (p.lastPacketAt or 0)) or quiet > math.max(ns.fallbackS or 0, limit)
     end
-    return quiet > KCD2MP.npcSync.releaseS
+    return quiet > limit
 end
 
 function KCD2MP_SetNpcCatchup(arg)

@@ -341,4 +341,65 @@ do
     noErrs("(j)")
 end
 
+-- (k) a burst a few centimetres long is not a new gait.
+do
+    local e = reset("npc_k", 0, 0, 0)
+    for i = 0, 10 do
+        NOW = i * 0.1
+        pkt("npc_k", V * NOW, 0, 0)
+        tick()
+    end
+    check("(k) a steady walk is tagged walk before the burst", KCD2MP.npcPuppets["npc_k"].animTag == "walk",
+        tostring(KCD2MP.npcPuppets["npc_k"].animTag))
+    local before = #e.anims
+    NOW = NOW + 0.02
+    pkt("npc_k", V * 1.0 + 0.05, 0, 0)
+    tick()
+    check("(k) a 5 cm sample 20 ms later does not change the walk clip",
+        KCD2MP.npcPuppets["npc_k"].animTag == "walk" and #e.anims == before,
+        tostring(KCD2MP.npcPuppets["npc_k"].animTag) .. " anims=" .. tostring(#e.anims - before))
+    noErrs("(k)")
+end
+
+-- (l) a sequence hole is logged and holds the puppet through a short silence.
+do
+    local e = reset("npc_g", 0, 0, 0)
+    NOW = 10
+    KCD2MP_ApplyNpcState("npc_g", 0, 0, 0, 0, 100, 0, 1, 1, nil)
+    NOW = 10.2
+    local nLog = #LOG
+    KCD2MP_ApplyNpcState("npc_g", 0.3, 0, 0, 0, 100, 0, 1, 6, nil)   -- missed 4
+    local saw = false
+    for i = nLog + 1, #LOG do if LOG[i]:find("MP-DESYNC kind=npc-seq-gap", 1, true) then saw = true end end
+    check("(l) a gap of 4 or more samples is logged as MP-DESYNC", saw)
+    local p = KCD2MP.npcPuppets["npc_g"]
+    check("(l) the gap is remembered on the puppet", p.gapAt == NOW)
+    KCD2MP.w147.npcCatchup = false
+    p.lastPacketAt = NOW - 4
+    check("(l) 4 s of silence after a gap does not release the puppet",
+        KCD2MP_NpcSilenceRelease("npc_g", p, NOW) == false)
+    p.gapAt = nil
+    check("(l) the same 4 s without a gap does release it",
+        KCD2MP_NpcSilenceRelease("npc_g", p, NOW) == true)
+    KCD2MP.w147.npcCatchup = true
+    noErrs("(l)")
+end
+
+-- (m) a body the local brain walked off is put back on the rendered pose.
+do
+    local e = reset("npc_d", 0, 0, 0)
+    NOW = 0
+    pkt("npc_d", 0, 0, 0)
+    tick()
+    e.px, e.py = 8, 0
+    NOW = 1.2
+    local nLog = #LOG
+    tick()
+    local saw = false
+    for i = nLog + 1, #LOG do if LOG[i]:find("MP-DESYNC kind=puppet-drift", 1, true) then saw = true end end
+    check("(m) a body 8 m off the rendered pose is logged", saw)
+    check("(m) and put back on the rendered pose", near(e.px, KCD2MP.npcPuppets["npc_d"].cx, 1e-4), fmt(e.px))
+    noErrs("(m)")
+end
+
 OUT = table.concat(RESULTS, "\n")

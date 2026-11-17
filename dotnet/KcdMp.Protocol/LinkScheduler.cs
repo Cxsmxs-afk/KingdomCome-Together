@@ -142,8 +142,11 @@ public sealed class LinkSchedOptions
     public bool LatestWins = true;
     /// <summary>C.2: state goes the path's unreliable way (set once the hello agreed and the path has one).</summary>
     public bool Unreliable;
-    /// <summary>C.3: a state older than this at send time is dropped and counted (0 = no limit).</summary>
-    public int AgeLimitMs = 500;
+    /// <summary>C.3: a state older than this at send time is dropped and counted (0 = no limit).
+    /// 2000, was 500. The slot already holds only the latest sample (latest-wins). Dropping it at 500 ms
+    /// during a hitch meant the partner got silence, released the puppet, and the local brain walked the NPC
+    /// off. A late latest sample is still the right place; the receiver's sender clock puts it on the timeline.</summary>
+    public int AgeLimitMs = 2000;
     /// <summary>C.2: an unchanged owner / pose / opponent state is stated again this often while state travels unreliably.</summary>
     public int RepeatMs = 1000;
     /// <summary>C.2: WO-143's extras (hands, gaits, looks, vitals, mounts) again this often -- each row is a native write on the joiner
