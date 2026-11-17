@@ -3514,6 +3514,12 @@ KCD2MP.npcDetach = true
 KCD2MP._npcDetachStats = { issued = 0, skipped = 0, changed = 0, unchanged = 0 }
 
 function KCD2MP_NpcDetach(name, p, why)
+    -- Paket C: without per-body suspension there is no pause anchor to undo.
+    -- Host activity/state replication owns the transition, including ladders.
+    if KCD2MP.hostAuthority and KCD2MP.hostAuthority.joiner then
+        if p then p.detachPending, p.detach = nil, nil end
+        return
+    end
     if not KCD2MP.npcDetach or not p then return end
     local e = nil
     pcall(function() e = System.GetEntityByName(name) end)
@@ -3575,6 +3581,10 @@ end
 -- cutscene is issued as soon as neither holds (checked twice a second, no
 -- log while it waits). why=retry-after-dialog|retry-after-cutscene.
 function KCD2MP_NpcDetachRetry(name, p, e)
+    if KCD2MP.hostAuthority and KCD2MP.hostAuthority.joiner then
+        p.detachPending, p.detach = nil, nil
+        return false
+    end
     local d = p.detachPending
     if not d or not KCD2MP.npcDetach then return false end
     local now = os.clock()
@@ -3702,7 +3712,17 @@ local function mp_npc_death_observe(name, dead, hp, src)
         end
         local remote = KCD2MP._npcDeathRemote[name]
         local announced = KCD2MP._npcDeathAnnounced[name]
-        if remote then
+        -- Paket F2: a copy reports what the host decided. Its local corpse state
+        -- is never a second source of FATAL, including during bootstrap before
+        -- a remote-death mark or the ordinary session tick has arrived.
+        local joinerCopy = (KCD2MP.hostAuthority and KCD2MP.hostAuthority.joiner)
+            or (KCD2MP.wo102 and KCD2MP.wo102.authorityHost and KCD2MP.w137
+                and KCD2MP.w137.joiner and KCD2MP.w137.active)
+        if joinerCopy then
+            mp_log(string.format("NPC-DEATH %s died here (by %s, hp=%s) -- host copy, not announced",
+                name, src, tostring(hp)))
+            if KCD2MP_W172CopyDied then pcall(KCD2MP_W172CopyDied, name, remote and remote.via or "copy-state") end
+        elseif remote then
             mp_log(string.format("NPC-DEATH %s died here (by %s, hp=%s) -- applied from a peer via %s, not announced",
                 name, src, tostring(hp), tostring(remote.via)))
             if KCD2MP_W172CopyDied then pcall(KCD2MP_W172CopyDied, name, remote.via) end   -- WO-172 C1: the host's death wins
@@ -35616,7 +35636,7 @@ do
     }
     W216.HELP = {
         route_replay = "A: (both) with mp_route on (it ships off), a copy makes its host NPC's own movement request (goal, speed class, exact end) once per change; the stream only corrects",
-        no_brains = "B: (joiner) no NPC here runs its own brain: every body suspended, one the host does not stream frozen and hidden",
+        no_brains = "B: (joiner) the native intellect entry gate stops scheduler and brain decisions; the host's graph alone decides",
         activity_line = "C: (both) one activity line from the host per NPC (activity, object, stance, posture, hands, looping, the route's class)",
         outfits = "D: (both) the host NPC's worn items on its copy, with the spawn and on a change",
         riders = "E: (both) a rider attached to its horse the engine's way; with mp_route on, the horse moved by its host's request",
@@ -35664,17 +35684,32 @@ do
     end
     System.AddCCommand("mp_w216_status", "KCD2MP_W216Status()", "WO-216: every WO-216 switch and the DLL's numbers")
 
-    -- ---- B (the joiner): no brain runs here. The DLL suspends every body it finds running (once a second, and a body this engine spawns
-    -- on its own at its spawn) and hides the ones the host does not stream. A copy the stream lets go is never resumed (the WO-102 lever's
-    -- release: mp_wo102_resume, the one place a copy got its own brain back in the host's shadow); every other resume here is a feature's
-    -- own (a guard's stop, a talk, the horse this player takes, an avatar's horse) and is told to the DLL as exempt while it runs.
+    -- Paket C replaces the copy suspend/resume cycle with the native intellect
+    -- entry gate. The role intent arrives before loading the host save; armed
+    -- is a separate proof from the native hook. A missing hook never falls back
+    -- to suspending an already-running scheduler. Dialogue/body requests keep
+    -- their direct engine path, but cannot exempt the copy's decision graph.
     --   WO216-NORESUME npc=<n> -- a released copy stays frozen       WO216-EXEMPT npc=<n> secs=<s> why=<w>
     W216.stats = W216.stats or { blocked = 0, exempt = 0 }
     W216.exemptAt = W216.exemptAt or {}
+    KCD2MP.hostAuthority = KCD2MP.hostAuthority or { joiner = false, armed = false, blocked = 0 }
+    function KCD2MP_HostAuthority(joiner, armed)
+        local a = KCD2MP.hostAuthority
+        joiner, armed = joiner == true, armed == true and joiner == true
+        if a.joiner ~= joiner or a.armed ~= armed then
+            mp_log(string.format("HOST-AUTHORITY joiner=%s decision_gate=%s -- %s", tostring(joiner),
+                armed and "armed" or "unavailable", joiner and (armed and "only the host graph decides" or "join refused until the native gate is ready")
+                    or "local world decisions restored"))
+        end
+        a.joiner, a.armed = joiner, armed
+        if not joiner then W216.exemptAt = {} end
+        return not joiner or armed
+    end
     function KCD2MP_W216JoinerBrainsOff()
         return KCD2MP_W216On("no_brains") and KCD2MP.w137 ~= nil and KCD2MP.w137.joiner == true and KCD2MP.w137.active == true
     end
     function KCD2MP_W216Exempt(name, secs, why)
+        if KCD2MP.hostAuthority.joiner then return false end   -- no talk/corpse/horse can wake a copy's graph
         name = tostring(name or "")
         if name == "" or string.find(name, "^kcd2mp") then return false end
         local now = os.clock()
@@ -35698,6 +35733,16 @@ do
             if verb and KCD2MP_W217RealName then
                 local real = KCD2MP_W217RealName(al)
                 if real then s = verb .. " " .. real .. (rest or ""); cmd = s end
+            end
+            local pauseVerb, copyName = string.match(s, "^%s*(wh_ai_%a+)%s+([^%s]+)")
+            if KCD2MP.hostAuthority.joiner and (pauseVerb == "wh_ai_PauseNPC" or pauseVerb == "wh_ai_ResumeNPC") then
+                local a = KCD2MP.hostAuthority
+                a.blocked = a.blocked + 1
+                if a.blocked <= 5 or a.blocked % 100 == 0 then
+                    mp_log(string.format("HOST-AUTHORITY ignored %s npc=%s decision_gate=%s [n=%d]",
+                        pauseVerb, copyName, a.armed and "armed" or "unavailable", a.blocked))
+                end
+                return nil
             end
             local name = string.match(s, "^%s*wh_ai_ResumeNPC%s+([%w_%-%.]+)")
             if name and not string.find(name, "^kcd2mp") and KCD2MP_W216JoinerBrainsOff() then

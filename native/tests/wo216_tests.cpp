@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 
 #include "wo216_rules.h"
 #include "wo215_rules.h"
@@ -110,6 +111,11 @@ int wo216_tests(int* passed) {
 
     // ---- B
     WCHECK(breach(0) && !breach(1) && !breach(2) && !breach(-1), "a running brain (state 0) is a breach; suspended or unknown are not");
+    WCHECK(decision_suppressed(2, true) && !decision_suppressed(1, true) && !decision_suppressed(0, true) &&
+           !decision_suppressed(2, false), "Paket C: only the joiner with the installed entry gate skips the decision batch");
+    WCHECK(!breach(0, true) && breach(0, false), "Paket C: a gated batch keeps node runtime untouched; state 0 alone is no executed decision");
+    for (uint8_t role : {uint8_t{2}, uint8_t{0}, uint8_t{1}, uint8_t{2}})
+        WCHECK(decision_suppressed(role, true) == (role == 2), "Paket C: cancel/own save/host/rejoin follows the current role");
     WCHECK(hide_unbound(false, false) && !hide_unbound(true, false) && !hide_unbound(false, true), "an unbound body is hidden; a copy or a figure is not");
     WCHECK(fighting_a_player(true, false) && fighting_a_player(false, true) && !fighting_a_player(false, false),
            "a fight with the local player or the other player's figure");

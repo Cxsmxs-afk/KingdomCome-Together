@@ -166,11 +166,15 @@ const ClassRow kClasses[] = {
     {"RPGModule.dll", ".?AVC_ClothingPresetOverride@rpgmodule@wh@@", Kind::BodyEffect},
     {"RPGModule.dll", ".?AVC_WeaponPresetOverride@rpgmodule@wh@@", Kind::BodyEffect},
     {"GUIModule.dll", ".?AVC_CutsceneHandler@guimodule@wh@@", Kind::SceneStarter},   // WO-203 I.5
+    {"RPGModule.dll", ".?AVC_AreaTrigger@rpgmodule@wh@@", Kind::WorldTrigger},
+    {"RPGModule.dll", ".?AVC_AreaTriggerAnonymous@rpgmodule@wh@@", Kind::WorldTrigger},
+    {"RPGModule.dll", ".?AVC_AreaLabelTrigger@rpgmodule@wh@@", Kind::WorldTrigger},
 };
 constexpr int kNClasses = static_cast<int>(sizeof kClasses / sizeof kClasses[0]);
 const void* g_vft[kNClasses]{};
 bool g_isEffect[kNClasses]{};
 int g_found = 0;
+int g_triggerClasses = 0;
 size_t g_offEffectActive = 0;   // C_Effect's own "is active" byte, read out of C_Effect::ExecuteNode (0 = not found)
 
 // WO-203 I.5: what a scene handler's Execute starts (WO-193's reads, as wo194 makes them; each object's class is checked by RTTI before
@@ -211,8 +215,9 @@ std::atomic<const void*> g_playerFull{nullptr};
 
 void recompute() {
     const bool role = g_role.load() != kRoleUnknown;
-    g_tapOn = A.tap && role && g_tapBits.load() != 0;
-    g_gateOn = A.gate && role && g_gateBits.load() != 0;
+    const bool receiveOnly = g_role.load() == kRoleJoiner && g_joined.load();
+    g_tapOn = A.tap && role && (g_tapBits.load() != 0 || receiveOnly);
+    g_gateOn = A.gate && role && (g_gateBits.load() != 0 || receiveOnly);
 }
 
 // --- thread marks ---------------------------------------------------------------
@@ -498,6 +503,17 @@ void hooked_out_trigger(void* port) {
     c_tapCalls.fetch_add(1, std::memory_order_relaxed);
     void* owner = port_owner(port);
     if (!owner) { g_origOut(port); return; }
+    if (host_graph_only()) {
+        char path[480] = "", method[128] = "";
+        const bool library = wo137::path_of(owner, path, sizeof path) && host_time_path(path);
+        const bool function = classify_node(owner) == Kind::Function && wo137::function_method(owner, method, sizeof method) &&
+                              method_kind(method) == Method::HostTime;
+        if (library || function) {
+            c_quiet.fetch_add(1, std::memory_order_relaxed);
+            call_release(owner);
+            return;
+        }
+    }
     const void* drop = g_researchDrop.load();
     if (drop && owner == drop && g_researchDrop.compare_exchange_strong(drop, nullptr)) {   // O4-narrow (research): one fire, any class
         c_researchDrops.fetch_add(1);
@@ -557,6 +573,7 @@ void hooked_out_trigger(void* port) {
     switch (act) {
         case Tap::QuietDrop: {
             c_quiet.fetch_add(1, std::memory_order_relaxed);
+            if (k == Kind::WorldTrigger) c_npcTrigQuiet.fetch_add(1, std::memory_order_relaxed);
             bool log = false;
             {
                 std::lock_guard<std::mutex> lk(g_markMx);
@@ -758,6 +775,16 @@ bool gate(void* node, void* /*ctx*/) {
     const uint32_t cid = gate_closure(t_closure, t_sceneCarry);   // WO-203 I.5: a scene's out-port carries the closure that started it
     const bool carried = t_closure == 0 && cid != 0;
     const Kind k = classify(vt);
+    if (host_graph_only()) {
+        char path[480] = "";
+        ++t_inGate;
+        const bool timePath = !wo137::applying_state(node) && wo137::path_of(node, path, sizeof path) && host_time_path(path);
+        --t_inGate;
+        if (timePath) {
+            c_verdict[static_cast<int>(Verdict::HostWorld)].fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
     if (cid) note_closure_class(node, vt, k, cid, carried);
     if (k == Kind::None) return false;
     c_gateClassified.fetch_add(1, std::memory_order_relaxed);
@@ -765,7 +792,7 @@ bool gate(void* node, void* /*ctx*/) {
     const uint8_t gb = g_gateBits.load();
     Cfg c;
     c.joined = g_joined.load();
-    c.puppets = (gb & 1) != 0;
+    c.puppets = (gb & 1) != 0 || (role == kRoleJoiner && c.joined);
     c.hostClosure = (gb & 2) != 0;
     c.route = (gb & 4) != 0;
     c.storyBarks = (gb & 8) != 0;   // WO-201 B7
@@ -777,8 +804,7 @@ bool gate(void* node, void* /*ctx*/) {
         if (!wo137::function_method(node, mname, sizeof mname)) return false;
         m = method_kind(mname);
         if (m == Method::Other) return false;
-        if (m == Method::PlayerHorse || m == Method::KillSoul) {   // WO-221 D.1: gated by the horse rule only
-            if (m == Method::KillSoul && !t_horsePass) return false;
+        if (m == Method::PlayerHorse || (m == Method::KillSoul && t_horsePass)) {   // WO-221 D.1: explicit horse pass-through
             char pn[128] = "";
             ++t_inGate;
             const bool pok = parent_name(node, pn, sizeof pn);
@@ -795,9 +821,11 @@ bool gate(void* node, void* /*ctx*/) {
                 --t_inGate;
                 if (horse_module_blocked(tp)) { hp = HorsePass::Replace; hostOwnBuy = true; c_horseOwnBuy.fetch_add(1, std::memory_order_relaxed); }
             }
-            if (hp == HorsePass::No) return false;
-            horse_pass_through(node, cid, hp, pok ? pn : "", role, hostOwnBuy);
-            return true;
+            if (hp != HorsePass::No) {
+                horse_pass_through(node, cid, hp, pok ? pn : "", role, hostOwnBuy);
+                return true;
+            }
+            if (m != Method::KillSoul || role != kRoleJoiner || !c.joined) return false;
         }
     }
     Target t = Target::Unknown;
@@ -833,7 +861,7 @@ bool gate(void* node, void* /*ctx*/) {
     }
     // (a scene handler's own state already says whether this Execute starts anything: a busy one ran above, an idle one starts a scene
     // whatever its effect byte says)
-    if (v != Verdict::Run && k != Kind::SceneStarter) {
+    if (v != Verdict::Run && v != Verdict::HostWorld && v != Verdict::PuppetRefused && k != Kind::SceneStarter) {
         const int row = class_row(vt);
         if (row >= 0 && g_isEffect[row] && g_offEffectActive) {
             uint8_t active = 0;
@@ -1033,6 +1061,8 @@ void describe_source(const void* node, const void* port, char* cls, size_t ncls,
     if (owner && !node) call_release(owner);
 }
 bool copy_neutral_always() { return g_role.load() == kRoleJoiner && g_joined.load() && (g_valueBits.load() & 1) != 0; }
+bool host_authority_ready() { return A.tap && A.gate && A.ports && g_triggerClasses == 3 && wo137::punish_gate_armed(); }
+bool host_graph_only() { return g_role.load() == kRoleJoiner && g_joined.load(); }
 void set_mirror_talker(bool on) { t_mirrorTalker = on; }
 
 void install() {
@@ -1069,7 +1099,11 @@ void install() {
     for (int i = 0; i < kNClasses; ++i) {
         HMODULE m = GetModuleHandleA(kClasses[i].module);
         g_vft[i] = m ? anchor::find_vftable(m, kClasses[i].rtti, 0) : nullptr;
-        if (g_vft[i]) { ++g_found; g_isEffect[i] = derives_from(g_vft[i], ".?AVC_Effect@conceptmodule@wh@@"); }
+        if (g_vft[i]) {
+            ++g_found;
+            if (kClasses[i].kind == Kind::WorldTrigger) ++g_triggerClasses;
+            g_isEffect[i] = derives_from(g_vft[i], ".?AVC_Effect@conceptmodule@wh@@");
+        }
         else logf("WO200-BUILD class %s (%s) not found -- that row of the gate stays off", kClasses[i].rtti, kClasses[i].module);
     }
     // WO-203 I.5: what a scene handler starts, by RTTI in GUIModule -- its configuration, and the two scene classes that are the player's
@@ -1182,13 +1216,14 @@ int status_text(char* out, int n) {
     return _snprintf_s(out, static_cast<size_t>(n), _TRUNCATE,
         "wo200 tap=%d gate=%d ports=%d classes=%d/%d role=%u joined=%d tapBits=%u gateBits=%u taps=%u captured=%u quiet=%u continued=%u "
         "scene_continues=%u gates=%u classified=%u reads=%u puppet=%u host_dialogue=%u host_view=%u talker_host=%u talker_joiner=%u joiner_story=%u "
-        "host_scene=%u replays=%u replay_refused=%u marks=%zu player=%d npc_triggers=%zu npc_trigger_quiet=%u npc_trigger_resolved=%u npc_trigger_missing=%u",
+        "host_scene=%u replays=%u replay_refused=%u marks=%zu player=%d npc_trigger_classes=%d/3 host_world=%u npc_triggers=%zu npc_trigger_quiet=%u npc_trigger_resolved=%u npc_trigger_missing=%u",
         A.tap, A.gate, A.ports, g_found, kNClasses, g_role.load(), g_joined.load(), g_tapBits.load(), g_gateBits.load(), c_tapCalls.load(),
         c_captured.load(), c_quiet.load(), c_continued.load(), c_sceneContinued.load(), c_gateCalls.load(), c_gateClassified.load(), c_targetReads.load(),
         c_verdict[static_cast<int>(Verdict::PuppetRefused)].load(), c_verdict[static_cast<int>(Verdict::HostDialogue)].load(),
         c_verdict[static_cast<int>(Verdict::HostView)].load(), c_verdict[static_cast<int>(Verdict::TalkerOnlyHost)].load(),
         c_verdict[static_cast<int>(Verdict::TalkerOnlyJoiner)].load(), c_verdict[static_cast<int>(Verdict::JoinerStoryBark)].load(),
         c_verdict[static_cast<int>(Verdict::HostScene)].load(), c_replays.load(), c_replayRefused.load(), g_marks.size(), g_playerFull.load() != nullptr,
+        g_triggerClasses, c_verdict[static_cast<int>(Verdict::HostWorld)].load(),
         g_npcTrig.size(), c_npcTrigQuiet.load(), c_npcTrigResolved.load(), c_npcTrigMissing.load());
 }
 
@@ -1206,6 +1241,7 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
         case kOpConfig: {
             if (len < 5 || cap < 5) return 1;
             const uint8_t prevRole = g_role.load();
+            const bool prevJoined = g_joined.load();
             if (body[0] != 255) g_role = body[0];
             if (body[1] != 255) g_joined = body[1] != 0;
             if (body[2] != 255) g_tapBits = body[2];
@@ -1222,9 +1258,13 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
                      g_tapBits.load(), g_gateBits.load(), g_logBits.load(), g_valueBits.load(), g_tapOn.load() ? "on" : "off", g_gateOn.load() ? "on" : "off",
                      copy_neutral_always() ? "on" : "off");
             }
-            if (prevRole != g_role.load()) {   // a new session: nothing of the last one's closures carries over
+            if (prevRole != g_role.load() || prevJoined != g_joined.load()) {   // a world/role transition: forget every old graph pointer
                 std::lock_guard<std::mutex> lk(g_markMx);
                 g_marks.clear(); g_quietLast.clear(); g_waiterDropOnce.clear(); g_sceneMeetSeen.clear();
+                AcquireSRWLockExclusive(&g_npcTrigLock);
+                g_npcTrig.clear();
+                ReleaseSRWLockExclusive(&g_npcTrigLock);
+                g_npcTrigAny = false;
             }
             out[0] = g_role.load(); out[1] = g_joined.load(); out[2] = g_tapBits.load(); out[3] = g_gateBits.load(); out[4] = g_logBits.load();
             *outLen = 5;

@@ -28,7 +28,7 @@
 
 NOW = 0                                  -- the fake wall clock, seconds
 os.clock = function() return NOW end
-LOG = {}; TIMERS = {}; ENTS = {}; ERRS = {}; TOASTS = {}
+LOG = {}; TIMERS = {}; ENTS = {}; ERRS = {}; TOASTS = {}; CMDS = {}
 
 local function mkstub()
     return setmetatable({}, { __index = function(_, k) return function(...) return nil end end })
@@ -38,6 +38,7 @@ System.LogAlways = function(s) LOG[#LOG + 1] = tostring(s) end
 System.GetCVarValue = function() return "0" end
 System.GetEntityByName = function(n) return ENTS[n] end
 System.GetEntitiesInSphere = function() return {} end
+System.ExecuteCommand = function(s) CMDS[#CMDS + 1] = tostring(s) end
 System.RemoveEntity = function(eid)
     for n, e in pairs(ENTS) do if e.id == eid then ENTS[n] = nil end end
 end
@@ -370,6 +371,67 @@ do
     KCD2MP.hitSensorOn = false
     KCD2MP.npcSyncRunning = false
     noErrs("(g)")
+end
+
+-- Paket C/F2: the new role intent exists before the host save is loaded.
+-- It blocks the old suspend/resume cycle even when native readiness failed,
+-- and a locally-dead copy cannot announce FATAL through the Lua observer.
+do
+    resetNpcSync()
+    local logMark, cmdMark = #LOG, #CMDS
+    check("(h) missing native hook refuses host authority readiness", KCD2MP_HostAuthority(true, false) == false)
+    System.ExecuteCommand("wh_ai_PauseNPC copy_before_load")
+    System.ExecuteCommand("wh_ai_ResumeNPC copy_before_load")
+    check("(h) no suspend/resume fallback before native readiness", #CMDS == cmdMark)
+    check("(h) readiness failure is explicit", countLog("decision_gate=unavailable", logMark) > 0)
+    check("(h) native readiness is recorded separately", KCD2MP_HostAuthority(true, true) == true and KCD2MP.hostAuthority.armed)
+    System.ExecuteCommand("wh_ai_PauseNPC copy")
+    System.ExecuteCommand("wh_ai_ResumeNPC copy")
+    check("(h) ready joiner also never suspends/resumes copies", #CMDS == cmdMark)
+    local detachCopy = mkEntity("copy_detach", 0, 0, 0); ENTS["copy_detach"] = detachCopy
+    local detachState = { detachPending = { since = NOW, checkedAt = -1e9, reason = "dialog" } }
+    KCD2MP_NpcDetach("copy_detach", detachState, "puppet-start")
+    check("(h) copy start cannot issue local Stance/Unstance reset", #CMDS == cmdMark and detachState.detachPending == nil)
+    detachState.detachPending = { since = NOW, checkedAt = -1e9, reason = "dialog" }
+    check("(h) pending detach retry is retired without a reset", KCD2MP_NpcDetachRetry("copy_detach", detachState, detachCopy) == false
+        and detachState.detachPending == nil and #CMDS == cmdMark)
+    check("(h) a dialogue/horse/corpse exemption cannot wake its graph", KCD2MP_W216Exempt("copy", 120, "talk") == false)
+    System.ExecuteCommand("sys_budget test")
+    check("(h) unrelated engine commands still run", #CMDS == cmdMark + 1 and CMDS[#CMDS] == "sys_budget test")
+
+    local e = mkEntity("copy_dead", 0, 0, 0); ENTS["copy_dead"] = e
+    KCD2MP_ApplyNpcState("copy_dead", 0, 0, 0, 0, 100, 0)
+    tick()
+    e.dead = true; e.hp = 0
+    tick(); tick()
+    check("(h) locally dead copy never emits npc_death/FATAL", countEvt("npc_death", "copy_dead", logMark) == 0)
+    check("(h) local copy death remains observable", countLog("host copy, not announced", logMark) == 1)
+    KCD2MP_NpcRemoteDeath("copy_dead", "host")
+    tick()
+    check("(h) host death arriving later still produces no echo", countEvt("npc_death", "copy_dead", logMark) == 0)
+    check("(h) host role reset succeeds", KCD2MP_HostAuthority(false, false) == true)
+    System.ExecuteCommand("wh_ai_PauseNPC host_body")
+    System.ExecuteCommand("wh_ai_ResumeNPC host_body")
+    check("(h) host/local-world engine control is restored", #CMDS == cmdMark + 3)
+    noErrs("(h)")
+end
+
+-- The ordinary joiner role protects the observer too if its role-intent Lua
+-- statement has not arrived yet. CLAIM compatibility remains in (a)-(g).
+do
+    resetNpcSync()
+    KCD2MP.wo102.authorityHost = true
+    KCD2MP.w137.joiner, KCD2MP.w137.active = true, true
+    local logMark = #LOG
+    local e = mkEntity("late_intent", 0, 0, 0); ENTS["late_intent"] = e
+    KCD2MP_ApplyNpcState("late_intent", 0, 0, 0, 0, 100, 0)
+    tick()
+    e.dead = true; e.hp = 0
+    tick()
+    check("(i) joiner session cannot announce before role intent", countEvt("npc_death", "late_intent", logMark) == 0)
+    KCD2MP.w137.joiner, KCD2MP.w137.active = false, false
+    KCD2MP.wo102.authorityHost = false
+    noErrs("(i)")
 end
 
 OUT = table.concat(RESULTS, "\n")

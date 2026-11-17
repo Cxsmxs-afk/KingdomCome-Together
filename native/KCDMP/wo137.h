@@ -153,6 +153,9 @@ constexpr uint8_t kFClosure = 128;
 // hold while it applies: wo200::set_mirror_talker).
 constexpr uint8_t kApplyMirrorTalker = 1;
 bool punish_gate_armed();
+// Paket C/F3: only the State currently being set by a host mirror may pass a
+// time-library Execute gate; downstream local decisions remain gated.
+bool applying_state(const void* node);
 uint32_t punish_skipped();
 
 } // namespace kcdmp::wo137

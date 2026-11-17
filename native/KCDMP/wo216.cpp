@@ -20,6 +20,9 @@
 #include "hits.h"
 #include "wo138.h"
 #include "wo217.h"
+#include "wo200.h"
+#include "inline_hook.h"
+#include "x64_len.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -64,7 +67,51 @@ double now_s() {
     return static_cast<double>(c.QuadPart) / static_cast<double>(f.QuadPart);
 }
 
-std::atomic<uint8_t> g_role{0};   // op 160's role byte: 0 none, 1 the host, 2 a joiner in the host's world (not during a load)
+std::atomic<uint8_t> g_role{0};   // op 160: 0 own world, 1 host, 2 host-world joiner (armed before load, retained through holds)
+std::atomic<bool> g_decisionGate{false};
+std::atomic<uint32_t> c_decisionBlocked{0};
+const char* g_decisionWhy = "not installed";
+char g_decisionReason[192]{};   // inline_hook may return a thread-local decoder diagnostic
+
+// Paket C: stop the decision batch BEFORE it visits a brain. Suspending individual
+// nodes after their scheduler began left suspended nodes in a live tree. The AI
+// module's movement/navigation update is deliberately left running for host orders.
+bool decision_gate(void*, void*) {
+    const bool blocked = decision_suppressed(g_role.load(std::memory_order_acquire), g_decisionGate.load());
+    if (blocked) c_decisionBlocked.fetch_add(1, std::memory_order_relaxed);
+    return blocked;
+}
+
+void install_decision_gate() {
+    HMODULE xg = GetModuleHandleA("XGenAIModule.dll");
+    int count = 0;
+    const uint8_t* fn = xg ? anchor::function_by_string(xg, "wh::xgenaimodule::C_NPCManager::UpdateIntellects", &count) : nullptr;
+    anchor::Range range{};
+    if (!fn || count != 1 || !anchor::function_range(xg, fn, &range) || range.begin != fn || range.size() < 32) {
+        g_decisionWhy = "UpdateIntellects has no unique profiler anchor and PE function entry";
+    } else {
+        // As with crash_capture's OS detour, derive only a relocation-free patch
+        // length from the anchored live entry. install_gate compares this snapshot
+        // again with other threads stopped; no RVA or guessed instruction length.
+        uint8_t live[32]{};
+        if (!fault::guarded_silent([&] { std::memcpy(live, fn, sizeof live); })) {
+            g_decisionWhy = "UpdateIntellects entry unreadable";
+        } else {
+            size_t len = 0;
+            for (size_t n = 14; n <= sizeof live && !len; ++n)
+                if (x64::check_patch(live, sizeof live, n).verdict == x64::Boundary::Ok) len = n;
+            if (!len) g_decisionWhy = "UpdateIntellects has no relocation-free 14-32 byte entry";
+            else if (inlinehook::install_gate(const_cast<uint8_t*>(fn), live, len, &decision_gate, &g_decisionWhy)) {
+                g_decisionGate.store(true, std::memory_order_release);
+                g_decisionWhy = "armed";
+            }
+        }
+    }
+    std::snprintf(g_decisionReason, sizeof g_decisionReason, "%s", g_decisionWhy ? g_decisionWhy : "unknown install failure");
+    g_decisionWhy = g_decisionReason;
+    logf("HOST-AUTHORITY decision_gate=%s (%s); UpdateIntellects blocked only for role 2; navigation remains live",
+         g_decisionGate.load() ? "armed" : "unavailable", g_decisionWhy);
+}
 void b_exempt(const char* name, bool on, double forS);
 int b_status(char* out, int n);
 
@@ -93,6 +140,7 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
         char t[1200];
         int n = b_status(t, sizeof t);
         if (n < 0) n = 0;
+        if (static_cast<size_t>(n) >= sizeof t) n = static_cast<int>(sizeof t) - 1;
         if (static_cast<size_t>(n) > cap) n = static_cast<int>(cap);
         std::memcpy(out, t, static_cast<size_t>(n));
         *outLen = static_cast<size_t>(n);
@@ -103,6 +151,8 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
         uint32_t bits = 0;
         std::memcpy(&bits, body + 1, 4);
         if (len == 6) {
+            if (body[5] > 2) return wo163::kRBadRequest;
+            if (body[5] == 2 && (!g_decisionGate.load() || !wo200::host_authority_ready())) return wo163::kRFailed;
             const uint8_t was = g_role.exchange(body[5]);
             if (was != body[5]) logf("WO216-CFG role %u -> %u (0 none, 1 the host, 2 a joiner in the host's world)", was, body[5]);
         }
@@ -130,17 +180,10 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
 }
 
 // ================================================================================================== B: no brain runs on the joiner
-// Every NPC body here is checked once a second (the census): one with a running brain is suspended at once -- the engine's own
-// wh_ai_PauseNPC (C_IntelligentObject::Suspend), through the console the way Lua's System.ExecuteCommand calls it -- and, unless the
-// host streams it (the writer binds it), hidden (CEntity::Hide, the call Lua's entity:Hide makes). A body the writer binds is shown again.
-// A body the engine spawns here on its own (an encounter, an animal, a caravan) is caught at its spawn (the entity system's SpawnEntity,
-// its interface slot wrapped) and hidden in the same frame, suspended as soon as it has a brain (WO216-LOCALSPAWN). The partner's figure
-// and the mod's own bodies (kcd2mp_*, kcdmp*) are never touched; a body the mod's own features run on purpose here (a guard's stop, a talk,
-// the horse this player rides) is exempt while Lua says so (op 165), and counted apart.
-// Neither engine call is wrapped by the fault guard: both may take an engine lock (a guarded fault inside one is a hang -- WO-215).
+// Paket C gates UpdateIntellects before its decision batch. The census now
+// controls visibility only: no per-body suspend/resume masks or polling pauses.
+// CEntity::Hide stays unguarded because it may take an engine lock (WO-215).
 struct Api {
-    void* conExec = nullptr;       // IConsole::ExecuteString's slot offset is resolved below; this is the slot's offset as a pointer-sized int
-    size_t conExecSlot = 0;
     size_t hideSlot = 0;           // CEntity::Hide(bool)
     bool armed = false;
     const char* why = "not resolved";
@@ -150,24 +193,6 @@ struct Api {
 void b_resolve() {
     if (g_b.resolved) return;
     g_b.resolved = true;
-    // the console's ExecuteString: CScriptBind_System::ExecuteCommand (CryScriptSystem, found by its own error text) calls
-    // mov rcx,[rdi+78h]; xor r9d,r9d; mov rdx,[rsp+48h]; xor r8d,r8d; mov rax,[rcx]; call [rax+<slot>]   (bSilent = 0, bDefer = 0)
-    HMODULE ss = GetModuleHandleA("CryScriptSystem.dll");
-    if (!ss) { g_b.why = "CryScriptSystem.dll not loaded"; return; }
-    int nf = 0;
-    const uint8_t* door = anchor::function_by_string(ss, "CScriptBind_System::ExecuteCommand", &nf);
-    if (!door || nf != 1) { g_b.why = "System.ExecuteCommand's binding not found as one function"; return; }
-    uint8_t code[0x100]{};
-    KCDMP_FAULT_READ(rsite, "wo216::b_resolve");
-    if (!fault::guarded(rsite, [&] { std::memcpy(code, door, sizeof code); })) { g_b.why = "the binding unreadable"; return; }
-    static const uint8_t pat[] = {0x45, 0x33, 0xC9, 0x48, 0x8B, 0x54, 0x24, 0x48, 0x45, 0x33, 0xC0, 0x48, 0x8B, 0x01, 0xFF, 0x90};
-    size_t at = 0;
-    for (size_t i = 0; i + sizeof pat + 4 <= sizeof code && !at; ++i) if (std::memcmp(code + i, pat, sizeof pat) == 0) at = i + sizeof pat;
-    if (!at) { g_b.why = "the binding's console call not found"; return; }
-    int32_t slot = 0;
-    std::memcpy(&slot, code + at, 4);
-    if (slot <= 0 || slot > 0x400 || (slot & 7)) { g_b.why = "the console call's slot is implausible"; return; }
-    g_b.conExecSlot = static_cast<size_t>(slot);
     // CEntity::Hide(bool) at slot 63: its own first act sets the entity's hidden bit (flags +8, bit 4):
     // mov ecx,[rsi+8]; mov r8d,r14d; shl r8d,4; mov eax,ecx; and eax,0FFFFFFEFh
     void* pe = engine::entity_by_id(0x7777);   // the local player's entity (any CEntity carries the vftable)
@@ -184,22 +209,10 @@ void b_resolve() {
     g_b.hideSlot = kHide;
     g_b.armed = true;
     g_b.why = "armed";
-    char a[96];
-    anchor::describe(door, a, sizeof a);
-    logf("WO216-BRAINS armed: the console's ExecuteString is its slot +0x%X (System.ExecuteCommand's own call, %s); CEntity::Hide is slot 63 "
-         "(its hidden bit checked)", slot, a);
+    logf("WO216-BRAINS visibility armed: CEntity::Hide is slot 63 (its hidden bit checked)");
 }
 
-// the engine's own calls, unguarded (see above); inputs: a console with its vftable checked, a live entity, our own text
-bool b_exec(const char* cmd) {
-    if (!g_b.armed) return false;
-    void* con = engine::console();
-    if (!con) return false;
-    void* vt = *reinterpret_cast<void**>(con);
-    auto fn = reinterpret_cast<void (*)(void*, const char*, bool, bool)>(reinterpret_cast<void**>(vt)[g_b.conExecSlot / 8]);
-    fn(con, cmd, false, false);
-    return true;
-}
+// The engine's own Hide, unguarded (see above), on a freshly resolved entity.
 bool b_hide(uint32_t eid, bool hide) {
     if (!g_b.armed) return false;
     void* e = engine::entity_by_id(eid);
@@ -228,14 +241,12 @@ struct BBody {
     bool fightPlayer = false;  // its opponent is a player this census: the hide sweep must leave it shown
     bool keptFight = false;    // already logged that this fight kept it on screen
     double visAt = -1e9;       // when hidden last flipped (a hide and a show inside 2 s is the flicker)
-    bool pausedByUs = false;
-    double pauseAt = -1e9;     // the last pause we asked for (a body that runs again within 5 s is asked again at most every 2 s)
     double spawnAt = -1;       // a local spawn: when it was seen (its brain may come a frame or two later)
     int kind = 0;
 };
 std::unordered_map<uint32_t, BBody> g_bodies;           // main thread
 std::unordered_map<std::string, double> g_exempt;       // name -> until (s)
-std::vector<uint32_t> g_pauseQ, g_hideQ, g_showQ;       // main thread: the actions, at most kPerFrame a frame
+std::vector<uint32_t> g_hideQ, g_showQ;       // main thread: the actions, at most kPerFrame a frame
 constexpr int kPerFrame = 24;
 std::mutex g_spawnMu;
 std::vector<uint32_t> g_spawned;                        // the spawn watch's new entities (any thread -> main)
@@ -289,7 +300,7 @@ void b_hook_spawn() {
     VirtualProtect(slot, sizeof(void*), old, &tmp);
     g_spawnWhy = "armed";
     logf("WO216-BRAINS the spawn watch is in: the entity system's SpawnEntity (+0x60) wrapped -- a body this engine spawns on its own is "
-         "hidden in the frame it appears and suspended once it has a brain");
+         "hidden in the frame it appears and decisions gated before the brain update");
 }
 
 // WO-217 B.4 (layer_watch): the entity system's EnableLayer (the function that logs its own "EnableLayer '%s', enable:%c, serialized:%c";
@@ -349,12 +360,6 @@ bool exempt(const std::string& name, double now) {
     return true;
 }
 
-void b_queue_pause(uint32_t eid, BBody& b, double now) {
-    if (now - b.pauseAt < 2.0) return;
-    b.pauseAt = now;
-    g_pauseQ.push_back(eid);
-}
-
 struct CensusCtx { double now; bool layerOn = false; uint32_t layerCaught = 0; std::string layerNames; uint32_t bodies = 0, running = 0, exemptRunning = 0, hidden = 0, bound = 0, nearRunning = 0, nearN = 0, deadRunning = 0; std::string names;
                    const std::unordered_set<uint32_t>* fresh = nullptr; uint32_t freshRunning = 0; std::string freshNames;   // WO-217 B.4
                    std::unordered_set<uint32_t> seen; bool havePlayer = false; float player[3]{}; };
@@ -384,7 +389,7 @@ bool census_visit(void* e, void* ctx) {
         }
     }
     if (nearMe) ++c->nearN;
-    if (wo216rules::breach(st)) {
+    if (wo216rules::breach(st, decision_suppressed(g_role.load(), g_decisionGate.load()))) {
         bool dead = false;
         void* soul = hits::soul_of_eid(eid);
         if (soul && rttr::soul_bool(soul, "IsDead", &dead) && dead) { ++c->deadRunning; return false; }   // a corpse: nothing to freeze
@@ -393,13 +398,11 @@ bool census_visit(void* e, void* ctx) {
             // WO-217 B.4: a body a layer switched on, its brain started inside the layer's watch -- caught at the activation, suspended
             ++c->layerCaught;
             if (c->layerNames.size() < 300) { if (!c->layerNames.empty()) c->layerNames += ","; c->layerNames += b.name; }
-            if (g_act) b_queue_pause(eid, b, c->now);
         } else {
             ++c->running;
             if (nearMe) ++c->nearRunning;
             if (c->names.size() < 600) { if (!c->names.empty()) c->names += ","; c->names += b.name + (bound ? "(bound)" : "(unbound)"); }
             if (c->fresh && c->fresh->count(eid)) { ++c->freshRunning; if (c->freshNames.size() < 300) { if (!c->freshNames.empty()) c->freshNames += ","; c->freshNames += b.name; } }
-            if (g_act) b_queue_pause(eid, b, c->now);
         }
     }
     const bool fight = fighting_player(eid);
@@ -486,10 +489,10 @@ void b_census(double now) {
     for (auto it = g_bodies.begin(); it != g_bodies.end();) { if (!c.seen.count(it->first)) it = g_bodies.erase(it); else ++it; }
     if (!g_swept) {
         g_swept = true;
-        c_bSweepPaused.store(static_cast<uint32_t>(g_pauseQ.size()));
+        c_bSweepPaused.store(0);
         c_bSweepHidden.store(static_cast<uint32_t>(g_hideQ.size()));
         logf("WO216-BRAINS the join's sweep: %u bodies with a brain here, %u running (%s), %u not streamed by the host (%s), %u bound, census %.1f ms",
-             c.bodies, c.running, g_act ? "suspended now" : "left running: no_brains off", static_cast<uint32_t>(g_hideQ.size()),
+             c.bodies, c.running, g_act ? "decision batch gated" : "left running: no_brains off", static_cast<uint32_t>(g_hideQ.size()),
              g_act ? "hidden" : "left shown", c.bound, ms);
         return;   // the contract's samples start after the sweep
     }
@@ -508,7 +511,7 @@ void b_census(double now) {
         if (g_cen.nonzero <= 200 || g_cen.nonzero % 50 == 0)
             logf("WO216-BRAINS sample=%u running=%u (not exempt; within 150 m %u of %u) exempt_running=%u bodies=%u hidden=%u bound=%u: %s -- %s [nonzero n=%u]",
                  g_cen.samples, c.running, c.nearRunning, c.nearN, c.exemptRunning, c.bodies, c.hidden, c.bound, c.names.c_str(),
-                 g_act ? "suspended again" : "left running (no_brains off: the twin)", g_cen.nonzero);
+                 g_act ? "decision gate unavailable" : "left running (no_brains off: the twin)", g_cen.nonzero);
     }
 }
 
@@ -540,10 +543,10 @@ void b_spawns(double now) {
         if (k <= 200 || k % 50 == 0)
             logf("WO216-LOCALSPAWN npc=%s kind=%s eid=0x%X: spawned by this engine on its own -- %s [n=%u]",
                  b.name.c_str(), kind == 0 ? "human" : kind == 1 ? "horse" : "animal", eid,
-                 !g_act ? "left as it is (no_brains off: the twin)" : bound ? "the host streams it (shown), suspended once it has a brain"
-                                                                    : "hidden this frame, suspended once it has a brain", k);
+                 !g_act ? "left as it is (no_brains off: the twin)" : bound ? "the host streams it (shown), decisions gated before the brain update"
+                                                                    : "hidden this frame, decisions gated before the brain update", k);
     }
-    // a local spawn's brain comes a frame or more after its entity: asked to pause each frame for up to 5 s until it has one
+    // A spawn may acquire its brain later. The entry gate covers it from its first update.
     for (auto& kv : g_bodies) {
         BBody& b = kv.second;
         if (b.spawnAt < 0) continue;
@@ -552,23 +555,12 @@ void b_spawns(double now) {
         if (!e) { b.spawnAt = -1; continue; }
         uint64_t w = 0; int st = -1, mask = -1;
         if (!actions::brain_state(e, &w, &st, &mask) || st < 0) continue;
-        if (g_act && st == 0 && !exempt(b.name, now)) b_queue_pause(kv.first, b, now);
         b.spawnAt = -1;
     }
 }
 
 void b_actions() {
     int budget = kPerFrame;
-    char cmd[96];
-    while (budget > 0 && !g_pauseQ.empty()) {
-        const uint32_t eid = g_pauseQ.back();
-        g_pauseQ.pop_back();
-        auto it = g_bodies.find(eid);
-        if (it == g_bodies.end() || !engine::entity_by_id(eid)) continue;
-        std::snprintf(cmd, sizeof cmd, "wh_ai_PauseNPC %s", it->second.name.c_str());
-        if (b_exec(cmd)) { it->second.pausedByUs = true; c_bPauses.fetch_add(1, std::memory_order_relaxed); }
-        --budget;
-    }
     while (budget > 0 && !g_hideQ.empty()) {
         const uint32_t eid = g_hideQ.back();
         g_hideQ.pop_back();
@@ -586,12 +578,18 @@ void b_actions() {
     }
 }
 
-// B going off (the switch, the session's end, a load): the bodies B hid are shown again (their pause stays: the bind-time rule's)
+// A world/role switch releases visibility; the decision gate reads role atomically.
 void b_stop(const char* why) {
     uint32_t shown = 0;
     for (auto& kv : g_bodies) if (kv.second.hidden) { if (b_hide(kv.first, false)) ++shown; kv.second.hidden = false; }
     g_bodies.clear();
-    g_pauseQ.clear(); g_hideQ.clear(); g_showQ.clear();
+    g_hideQ.clear(); g_showQ.clear();
+    g_exempt.clear();
+    { std::lock_guard<std::mutex> l(g_spawnMu); g_spawned.clear(); }
+    { std::lock_guard<std::mutex> l(g_layerMu); g_layersOn.clear(); }
+    g_layerBorn.clear();
+    g_layerBurstUntil = 0;
+    g_lastNames.clear();
     g_spawnWatch.store(false);
     g_layerWatch.store(false);
     g_swept = false;
@@ -614,7 +612,7 @@ void b_tick(double now) {
         b_resolve();
         if (!g_b.armed) {
             static bool s_told = false;
-            if (!s_told) { s_told = true; logf("WO216-BRAINS NOT armed: %s -- the bind-time suspend only (as 0.64.2)", g_b.why); }
+            if (!s_told) { s_told = true; logf("WO216-BRAINS visibility NOT armed: %s -- decision gate remains independent", g_b.why); }
             return;
         }
         g_active = true;
@@ -642,10 +640,11 @@ void b_exempt(const char* name, bool on, double forS) {
 
 int b_status(char* out, int n) {
     return std::snprintf(out, static_cast<size_t>(n),
-        "B no_brains=%s role=%u active=%d (%s; spawn watch %s) samples=%u nonzero=%u max_running=%u last_running=%u near_nonzero=%u max_near_running=%u "
+        "B decision_gate=%s story_gate=%s decision_blocked=%u decision_reason=%s no_brains=%s role=%u active=%d (%s; spawn watch %s) samples=%u nonzero=%u max_running=%u last_running=%u near_nonzero=%u max_near_running=%u "
         "last_near_running=%u last_near=%u last_dead_with_brain=%u last_exempt_running=%u bodies=%u list=%zu "
         "hidden=%u bound=%u census_ms=%.1f max_ms=%.1f sweep_paused=%u sweep_hidden=%u pauses=%u hides=%u shows=%u fight_kept=%u local_spawns=%u spawns_seen=%u "
         "breaches=%u exempt_running=%u exempt_names=%zu layer_watch=%s(%s) layers_on=%u layer_scans=%u layer_found=%u net_scans=%u net_found=%u last=%s",
+        g_decisionGate.load() ? "armed" : "unavailable", wo200::host_authority_ready() ? "armed" : "unavailable", c_decisionBlocked.load(), g_decisionWhy,
         on(kBitNoBrains) ? "on" : "off", g_role.load(), g_active ? 1 : 0, g_b.why, g_spawnWhy, g_cen.samples, g_cen.nonzero, g_cen.maxRunning,
         g_cen.lastRunning, g_cen.nearNonzero, g_cen.maxNearRunning, g_cen.lastNearRunning, g_cen.lastNear, g_cen.lastDead, g_cen.lastExemptRunning, g_cen.lastBodies, g_npcList.size(), g_cen.lastHidden, g_cen.lastBound, g_cen.lastCostMs, g_cen.maxCostMs,
         c_bSweepPaused.load(), c_bSweepHidden.load(), c_bPauses.load(), c_bHides.load(), c_bShows.load(), c_bFightKept.load(), c_bLocalSpawns.load(), c_bSpawnSeen.load(),
@@ -777,12 +776,13 @@ void tick_reg() {
 int status_reg(char* out, int n) { return status(out, n); }
 const bool kReg = wo203::reg_op(kOpConfig, &op) && wo203::reg_op(kOpStatus, &op) && wo203::reg_op(kOpBrains, &op) &&
                   wo203::reg_op(kOpExempt, &op) && wo203::reg_op(kOpOutfitRead, &op) && wo203::reg_op(kOpOutfitOf, &op) &&
-                  wo203::reg_tick("w216", &tick_reg) && wo203::reg_status("w216", &status_reg);
+                  wo203::reg_install("host_authority", &install_decision_gate) && wo203::reg_tick("w216", &tick_reg) && wo203::reg_status("w216", &status_reg);
 
 } // namespace
 
 bool on(uint32_t bit) { return (g_bits.load(std::memory_order_relaxed) & ~twin_off() & bit) != 0; }
 bool configured() { return g_configured.load(std::memory_order_relaxed); }
+bool decisions_blocked() { return decision_suppressed(g_role.load(std::memory_order_acquire), g_decisionGate.load()); }
 
 int status(char* out, int n) {
     if (!out || n <= 0) return 0;

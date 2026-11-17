@@ -66,6 +66,9 @@ void set_mirror_talker(bool on);
 // II.4 copy_neutral_always (config byte 6 bit 1, joiner in the host's world): a host copy's loaded state is kept equal to what it is
 // on every reconcile tick, and the planner is never asked to place it (wo141's reconcile).
 bool copy_neutral_always();
+// Paket C: class gates cover all world-area triggers, independently of loaded quest paths.
+bool host_authority_ready();
+bool host_graph_only();
 
 // WO-202 II.4: the node whose out-port pulse runs on this thread right now (its port), or nulls -- the source of a State change made
 // inside that pulse (a timer's OnFinished, a watch, a trigger, a conversation's consequence).

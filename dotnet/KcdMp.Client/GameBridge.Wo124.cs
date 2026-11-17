@@ -661,6 +661,11 @@ public partial class GameBridge
                 await RemovePlacedWorldAsync(j, "abandoned-before-load");
                 return;
             }
+            if (!await PrepareHostAuthorityAsync(j))
+            {
+                await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "authority-unavailable", "Your host's NPC and story authority could not be prepared. Update the mod on both PCs.");
+                return;
+            }
             if (!await PrepareHostCalendarAsync(j))
             {
                 await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "clock-unavailable", "Your host's world clock could not be prepared.");

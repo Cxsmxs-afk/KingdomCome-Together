@@ -23,6 +23,7 @@
 #include "port_gate.h"
 #include "respawn.h"
 #include "wo200.h"
+#include "wo200_rules.h"
 #include "wo209.h"
 #include "wo209_rules.h"
 
@@ -549,6 +550,19 @@ void log_time_skip(void* self, const char* method) {
 // port attribution was), so a quest time set an AI behaviour ran from a worker
 // would have passed the joiner's gate.
 void* hooked_fn_invoke(void* self, void* ret, void* out) {
+    // Paket F3: data-port reads can invoke a Function without C_Node::Execute.
+    // Keep those time decisions on the host as well; the empty variant is the
+    // engine's existing no-invocation result used by the time-set gate below.
+    if (wo200::host_graph_only()) {
+        const char* s = nullptr; char m[128] = "", path[kMaxPath + 64] = "";
+        const bool method = rd(self, kOffFnMethodName, &s) && s && copy_cstr(s, m, sizeof m) &&
+                            wo200rules::method_kind(m) == wo200rules::Method::HostTime;
+        const bool library = node_path(self, path, sizeof path) && wo200rules::host_time_path(path);
+        if ((method || library) && call_variant_ctor(ret)) {
+            c_timeSkipped.fetch_add(1);
+            return ret;
+        }
+    }
     if (g_timeGate.load(std::memory_order_relaxed)) {
         const char* s = nullptr; char m[128];
         if (rd(self, kOffFnMethodName, &s) && s && copy_cstr(s, m, sizeof m) && is_time_method(m) && call_variant_ctor(ret)) {
@@ -1475,6 +1489,7 @@ bool set_punish_gate(bool on) {
     return true;
 }
 bool punish_gate_armed() { return A.timeGate; }
+bool applying_state(const void* node) { return t_applyDepth > 0 && is_state(node); }
 uint32_t punish_skipped() { return c_punishSkipped.load(); }
 
 } // namespace kcdmp::wo137
