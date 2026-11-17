@@ -26,6 +26,8 @@ int status(char* out, int n);
 // WO-210 0.3: an owned copy's host NPC FullBody as the owner last applied it (the probe's "hf"); false when not owned or unknown
 bool host_fullbody(uint32_t eid, uint8_t* cls, uint32_t* frag);
 bool probe_owned(uint32_t eid);
+// An empty full body gets a FullBody action: the copy's neutral idle, else its guard or a locomotion pulse.
+bool repair_empty_body(uint32_t eid);
 // WO-221 C.1: the family of the host NPC's FullBody state as the owner last had it (wo208_rules.h Fam), 0xFF when the owner has no
 // word for this copy. Main thread.
 uint8_t host_family(uint32_t eid);

@@ -56,13 +56,17 @@ public partial class GameBridge
         if (frag.Length == 0) return;
         Interlocked.Increment(ref _w201RangedIn);
         string avatar = Wo141Rules.AvatarName(src);
-        bool bow = _w201FigureProp.TryGetValue(src, out var cls) && Wo201Models() is { } m && m.TryGetValue(cls.ToString("D"), out var v)
-                   && v.Model.Contains("bow", StringComparison.OrdinalIgnoreCase) && !v.Model.Contains("crossbow", StringComparison.OrdinalIgnoreCase);
+        string? model = null;
+        if (_w201FigureProp.TryGetValue(src, out var cls) && Wo201Models() is { } m && m.TryGetValue(cls.ToString("D"), out var v)) model = v.Model;
+        bool bow = Wo201Rules.IsBow(model);
+        string kind = model is null ? "unknown" : bow ? "bow" : "crossbow";
         string tags = Wo201Rules.RangedTags(phase, bow);
         int? id = null;
         try { id = await _combat.Wo143OneShotAsync(avatar, frag, tags, 0, 0); } catch { }
         if (id is >= 0) Interlocked.Increment(ref _w201RangedShown);
-        Console.WriteLine($"WO201-RANGED in from={src} {Wo201Rules.RangedPhaseName(phase)} -> {avatar} '{frag}' tags='{tags}' {(id is >= 0 ? $"request {id}" : "refused")}");
+        Console.WriteLine($"WO201-RANGED in from={src} {Wo201Rules.RangedPhaseName(phase)} weapon={kind} -> {avatar} '{frag}' tags='{tags}' {(id is >= 0 ? $"request {id}" : "refused")}");
+        if (phase == 3)
+            await _transport.ExecuteNowAsync($"if KCD2MP_W201Shot then KCD2MP_W201Shot(\"{src}\", \"{kind}\") end");
     }
 
     private string Wo201RangedStats() =>

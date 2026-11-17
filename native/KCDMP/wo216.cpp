@@ -227,6 +227,7 @@ struct BBody {
     bool hidden = false;       // hidden by B (shown again when bound, when it fights a player, or when B goes off)
     bool fightPlayer = false;  // its opponent is a player this census: the hide sweep must leave it shown
     bool keptFight = false;    // already logged that this fight kept it on screen
+    double visAt = -1e9;       // when hidden last flipped (a hide and a show inside 2 s is the flicker)
     bool pausedByUs = false;
     double pauseAt = -1e9;     // the last pause we asked for (a body that runs again within 5 s is asked again at most every 2 s)
     double spawnAt = -1;       // a local spawn: when it was seen (its brain may come a frame or two later)
@@ -404,15 +405,15 @@ bool census_visit(void* e, void* ctx) {
     const bool fight = fighting_player(eid);
     b.fightPlayer = fight;
     if (!fight) b.keptFight = false;
-    if (g_act && !ex && wo216rules::hide_unbound(bound, false, fight) && wo216rules::streamable_name(b.name.size()) && !b.hidden) {
-        b.hidden = true; g_hideQ.push_back(eid);
-    }
+    const bool wantHide = g_act && !ex && wo216rules::hide_unbound(bound, false, fight) && wo216rules::streamable_name(b.name.size());
+    const bool hidden = wo216rules::hide_holds(b.hidden, wantHide, b.visAt < 0 ? 1e9 : c->now - b.visAt);
+    if (hidden != b.hidden) { b.visAt = c->now; b.hidden = hidden; if (hidden) g_hideQ.push_back(eid); else g_showQ.push_back(eid); }
     if (g_act && fight && !bound && wo216rules::streamable_name(b.name.size()) && !b.hidden && !b.keptFight) {
         b.keptFight = true;
         c_bFightKept.fetch_add(1, std::memory_order_relaxed);
         logf("WO216-BRAINS npc=%s stays shown: in a fight with a player", b.name.c_str());
     }
-    if ((bound || fight) && b.hidden) { b.hidden = false; g_showQ.push_back(eid); }
+    if ((bound || fight) && b.hidden) { b.hidden = false; b.visAt = c->now; g_showQ.push_back(eid); }
     if (b.hidden) ++c->hidden;
     return false;
 }

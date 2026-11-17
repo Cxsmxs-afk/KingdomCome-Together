@@ -176,7 +176,8 @@ public partial class GameBridge
     {
         if (!config.WeatherSyncEnabled) return;
         Interlocked.Increment(ref _w166WeatherApplied);
-        await ExecLuaAsync(FormattableString.Invariant($"if KCD2MP_W166WeatherApply then KCD2MP_W166WeatherApply({rain:F2}, \"{profile ?? "-"}\") end"));
+        Console.WriteLine(FormattableString.Invariant($"WO166-WEATHER joiner rain={rain:F2} profile={profile ?? "-"} -- applied on this machine, not only the time-of-day blend"));
+        await _transport.ExecuteNowAsync(FormattableString.Invariant($"if KCD2MP_W166WeatherApply then KCD2MP_W166WeatherApply({rain:F2}, \"{profile ?? "-"}\") end"));
         if (profile is not null)
         {
             await Wo151OnHostWeatherAsync(profile);

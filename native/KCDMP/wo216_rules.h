@@ -199,5 +199,13 @@ inline bool hide_unbound(bool bound, bool figure, bool fightingPlayer = false) {
 // is longer can never be a copy -- it stays shown here (suspended, frozen), never hidden while the host shows its own
 constexpr size_t kStreamNameMax = 63;
 inline bool streamable_name(size_t nameLen) { return nameLen > 0 && nameLen <= kStreamNameMax; }
+// A hide and a show in the same second was the flicker (hides and shows in the thousands, empty bodies).
+// The last decision holds for this long before it may flip.
+constexpr double kHideHoldS = 2.0;
+inline bool hide_holds(bool hidden, bool wantHide, double sinceChangeS) {
+    if (wantHide == hidden) return hidden;
+    if (sinceChangeS >= 0.0 && sinceChangeS < kHideHoldS) return hidden;
+    return wantHide;
+}
 
 } // namespace kcdmp::wo216rules

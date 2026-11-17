@@ -190,10 +190,7 @@ void tpose_check(const Cand& c, BodyTrace& bt, double now) {
     const char* remedy = "none";
     if (now - bt.tposeRemedyAt >= 1.0) {
         bt.tposeRemedyAt = now;
-        bool combat = false;
-        motion::combat_mode_of(c.eid, &combat);
-        if (combat && motion::requeue_guard_idle(c.eid)) remedy = "guard-idle";
-        else if (motion::request_idle_pulse(c.eid)) remedy = "locomotion-pulse";
+        if (wo208::repair_empty_body(c.eid)) remedy = "full-body";
         if (std::strcmp(remedy, "none") != 0) c_tposeRemedied.fetch_add(1);
     }
     if (bt.tposeTold) return;
@@ -361,7 +358,15 @@ void tick() {
     if (now - s_lastGather >= 0.25) { s_lastGather = now; gather(s_cands, now); }
     const double period = mode == Mode::On ? kReadPeriodS : (mode == Mode::Auto ? kAutoReadPeriodS : kIdleWatchPeriodS);
     for (const Cand& c : s_cands) {
-        if (wo208::probe_owned(c.eid)) continue;   // WO-208 A.1: the probe's copy has one owner (its base rule is the owner's)
+        if (wo208::probe_owned(c.eid)) {
+            // The owner's copy was skipped, so an empty FullBody never reached WO204-TPOSE (the live close-up).
+            if (c.role == Role::Copy || c.role == Role::Figure) {
+                BodyTrace& ob = g_bodies[c.eid];
+                ob.role = c.role;
+                if (now - ob.readAt >= 0.25) { ob.readAt = now; trace_body(c, ob, now, Mode::Auto, false); tpose_check(c, ob, now); }
+            }
+            continue;
+        }
         if (mode == Mode::Auto && !c.fight) {
             BodyTrace& pb = g_bodies[c.eid];
             pb.role = c.role;

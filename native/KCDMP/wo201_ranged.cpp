@@ -113,6 +113,9 @@ uint8_t read_phase() {
     void* vp = nullptr;
     if (!rd(step, 0, &vp)) return 255;
     for (const auto& s : g_steps) if (s.vft && vp == static_cast<const void*>(s.vft)) return s.phase;
+    static uint32_t s_unknown = 0;
+    if (vp && s_unknown++ < 5)
+        logf("WO201-RANGED step class not in the bow/crossbow list (vt=%p) -- a bow step this build names differently [n=%u]", vp, s_unknown);
     return 0;   // a step this read does not name (start / done)
 }
 
