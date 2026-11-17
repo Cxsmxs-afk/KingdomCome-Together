@@ -75,9 +75,8 @@ public partial class GameBridge
     private void Wo210NoteOptions(byte src, int cid, int dec) => _w210Open = (src, cid, dec, Environment.TickCount64);
     private void Wo210NotePick(byte src, int cid, int dec) { _w210Open = null; _w210Pick = (src, cid, Environment.TickCount64); }
 
-    /// <summary>A line of the starter's talk: shown and voiced here in order; with mp_conv_pick_hold, a line that comes while a decision is
-    /// up waits up to 400 ms for its pick (the field's line came 70 ms before the pick), and every line within the pick's second waits for
-    /// the second to end -- nothing waits longer than 1.4 s.</summary>
+    /// <summary>A line of the starter's talk: shown and voiced here in order. A line that beats its pick (the field saw 70 ms) waits at most
+    /// 80 ms for that pick, then it is shown. It does not sit for a second, and it does not wait in the pose console.</summary>
     private async Task Wo210DeliverLineAsync(byte src, Wo204Rules.ConvLineMsg line)
     {
         long ageAtArrival = Wo213LineAge(line);   // WO-213 E.4: measured where it arrived -- the pick's hold below never counts against it
@@ -111,7 +110,7 @@ public partial class GameBridge
                 _w213PickAnswered = pk.At;
             }
             var (showMs, voice) = await Wo213LinePlanAsync(line, ageAtArrival, firstAfterPick);
-            await ExecLuaAsync(string.Create(CultureInfo.InvariantCulture,
+            await _transport.ExecuteNowAsync(string.Create(CultureInfo.InvariantCulture,
                 $"if KCD2MP_W204Line then KCD2MP_W204Line({src}, {line.Cid}, \"{EscapeLua(line.Name)}\", {(line.IsPlayer ? "true" : "false")}, \"{EscapeLua(line.StringName)}\", {showMs}, {(line.Earlier ? "true" : "false")}) end"));
             if (!line.Earlier && voice && W204("conv_voice")) _ = Wo204VoiceAsync(src, line);
         }

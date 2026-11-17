@@ -625,7 +625,8 @@ bool render(const Stream& s, double renderAt, double delay, float out[4], bool* 
     const float tf = static_cast<float>(t);
     out[0] = a->x + (b->x - a->x) * tf;
     out[1] = a->y + (b->y - a->y) * tf;
-    out[2] = a->z + (b->z - a->z) * tf;                                    // WO-110 R14: Z on the same segment
+    const float hx = b->x - a->x, hy = b->y - a->y;
+    out[2] = kcdmp::walkhold::segment_z(a->z, b->z, std::sqrt(hx * hx + hy * hy), tf);
     out[3] = lerp_angle(a->rot, b->rot, tf);
     if (segMps) {
         const float sx = b->x - a->x, sy = b->y - a->y;

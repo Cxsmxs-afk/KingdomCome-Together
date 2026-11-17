@@ -157,7 +157,7 @@ public class Wo210Tests
         Assert.Equal("v1|7|3|-1|42", Wo210Rules.HoverText(7, 3, 12, 42));
         Assert.False(Wo210Rules.TryParseHover("v2|7|3|2|41", out _, out _, out _, out _));
         Assert.False(Wo210Rules.TryParseHover("v1|7|3|9|41", out _, out _, out _, out _));
-        Assert.Equal(6_000, Wo210Rules.LineReleaseMs(5_000, 5_100));           // the pick's second
-        Assert.Equal(4_000 + Wo210Rules.LineHoldMaxMs, Wo210Rules.LineReleaseMs(5_000, 4_000));   // never more than the cap after the line
+        Assert.Equal(5_000, Wo210Rules.LineReleaseMs(5_000, 5_100));           // a pick already in does not hold the line
+        Assert.Equal(4_000 + Wo210Rules.LineHoldMaxMs, Wo210Rules.LineReleaseMs(5_000, 4_000));   // a line that beat its pick waits at most the cap
     }
 }

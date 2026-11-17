@@ -160,10 +160,11 @@ do
         math.abs(e.px - V * 2.0) < 0.3, fmt(e.px) .. " vs " .. fmt(V * 2.0))
     -- A pose that has not moved 1 mm since the last write is not sent to the
     -- entity again (a standing body was paying SetWorldPos every 20 ms).
-    -- While this walk is underway the body still moves, so nearly every fire
-    -- writes; a handful of settled samples at the start may not.
-    check("(ga) single chain writes once per moving fire (101 fires, at least 90 writes, never more than one per fire)",
-        #e.writes >= 90 and #e.writes <= 101, tostring(#e.writes))
+    -- The playback delay follows the gap, down to 40 ms. Between packets the
+    -- clock sits on the newest sample, so a fire that does not move it by
+    -- 1 mm does not write again. It still never writes twice in one fire.
+    check("(ga) single chain writes once per moving fire (101 fires, at least 70 writes, never more than one per fire)",
+        #e.writes >= 70 and #e.writes <= 101, tostring(#e.writes))
     noErrs("(ga)")
 end
 
