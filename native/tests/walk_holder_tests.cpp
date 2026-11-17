@@ -9,6 +9,7 @@
 using kcdmp::walkhold::consult_route;
 using kcdmp::walkhold::driver_class;
 using kcdmp::walkhold::extrapolate_pose;
+using kcdmp::walkhold::adaptive_delay_s;
 using kcdmp::walkhold::fixed_delay_s;
 using kcdmp::walkhold::fixed_timeline;
 using kcdmp::walkhold::snap_catchup;
@@ -38,6 +39,9 @@ int walk_holder_tests(int* passed) {
     WCHECK(fixed_delay_s(3.0) == 0.12, "a multi-second bind does not become the render delay");
     WCHECK(!snap_catchup(0.20, 0.12), "200 ms of age is still inside the fixed clock");
     WCHECK(snap_catchup(0.60, 0.12), "600 ms behind snaps to the newest sample");
+    WCHECK(adaptive_delay_s(0.12, 0.05) == 0.12, "a 50 ms gap keeps the 120 ms floor");
+    WCHECK(adaptive_delay_s(0.12, 0.16) == 0.16, "a wider gap raises the delay");
+    WCHECK(adaptive_delay_s(0.12, 0.50) == 0.20, "the delay stops at 200 ms");
     if (passed) *passed = g_pass;
     return g_fail;
 }

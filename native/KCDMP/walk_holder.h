@@ -42,6 +42,14 @@ inline double fixed_delay_s(double bindDelayS) {
     return kFixedDelayS;
 }
 
+/// Playback delay for a fixed timeline. The floor is the short bind. A wider
+/// gap raises it, and it never passes the 200 ms cap.
+inline double adaptive_delay_s(double bindDelayS, double gapS) {
+    double floor = fixed_delay_s(bindDelayS);
+    if (!(gapS > floor)) return floor;
+    return gapS < kFixedDelayCapS ? gapS : kFixedDelayCapS;
+}
+
 /// The newest sample is further behind the fixed clock than one catch-up.
 /// Show that sample now. Do not keep playing the backlog and do not extrapolate.
 inline bool snap_catchup(double newestAgeS, double delayS) {

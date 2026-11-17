@@ -36,12 +36,14 @@ public static class Continuous
         var budget = new double[players];
         var pending = new List<Due>[players];
         var bodies = new Dictionary<int, Body>[players];
+        var accepted = new Dictionary<int, long>[players];
         for (int i = 0; i < players; i++)
         {
             sched[i] = new LinkScheduler();
             queues[i] = new BatchQueue();
             pending[i] = new List<Due>();
             bodies[i] = new Dictionary<int, Body>();
+            accepted[i] = new Dictionary<int, long>();
         }
         var ages = new List<double>(steps / 8);
         int playerSnaps = 0, npcSnaps = 0, breaks = 0;
@@ -89,6 +91,13 @@ public static class Continuous
                 {
                     if (list[i].At > now) continue;
                     var s = list[i].Sample;
+                    if (timeline == "fixed" && accepted[p].TryGetValue(s.Id, out var prev)
+                        && s.Sent <= prev && prev - s.Sent < 30000)
+                    {
+                        list.RemoveAt(i);
+                        continue;
+                    }
+                    if (timeline == "fixed") accepted[p][s.Id] = s.Sent;
                     queues[p].Add(new BatchQueue.Entry
                     {
                         Lua = "KCD2MP_UpdateGhost(\"g\",1,0,0,0,false)",
@@ -171,10 +180,17 @@ public static class Continuous
         var newest = b.Samples[^1];
         if (timeline == "fixed")
         {
-            if (now - newest.sent > FixedDelayMs + SnapBehindMs) { rx = newest.x; ry = newest.y; }
+            long gap = b.LastSent == 0 ? FixedDelayMs : Math.Max(0, sent - b.LastSent);
+            double want = FixedDelayMs;
+            if (gap > want && gap < 1000) want = Math.Min(200, gap);
+            if (b.DelayMs <= 0) b.DelayMs = FixedDelayMs;
+            b.DelayMs = want > b.DelayMs ? Math.Min(want, b.DelayMs + 20) : Math.Max(want, b.DelayMs - 20);
+            b.LastSent = sent;
+            long delay = (long)b.DelayMs;
+            if (now - newest.sent > delay + SnapBehindMs) { rx = newest.x; ry = newest.y; }
             else
             {
-                long at = now - FixedDelayMs;
+                long at = now - delay;
                 var last = b.Samples[0];
                 var next = b.Samples[^1];
                 foreach (var s in b.Samples)
@@ -205,6 +221,21 @@ public static class Continuous
                 vy = (newest.y - a.y) / dt * extra;
             }
             rx = newest.x + vx; ry = newest.y + vy;
+        }
+        if (timeline == "fixed" && b.Have)
+        {
+            float dx0 = rx - b.X, dy0 = ry - b.Y;
+            float dist0 = MathF.Sqrt(dx0 * dx0 + dy0 * dy0);
+            long dt0 = Math.Max(16, now - b.LastNow);
+            float allow = (b.Pace + 2.5f) * (dt0 / 1000f);
+            if (dist0 > allow && dist0 < 5f)
+            {
+                float u = allow / dist0;
+                rx = b.X + dx0 * u;
+                ry = b.Y + dy0 * u;
+                b.Pace += 2.5f;
+            }
+            else b.Pace = dist0 / (dt0 / 1000f);
         }
         if (b.Have)
         {
@@ -281,8 +312,9 @@ public static class Continuous
     sealed class Body
     {
         public List<(long sent, float x, float y)> Samples { get; } = new();
-        public float X, Y, V;
-        public long LastNow;
+        public float X, Y, V, Pace;
+        public long LastNow, LastSent;
+        public double DelayMs;
         public bool Have, HaveV;
     }
 }

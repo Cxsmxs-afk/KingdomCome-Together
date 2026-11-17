@@ -1516,7 +1516,8 @@ void tick() {
         // sample. It is not extrapolated, and the delay does not grow.
         const bool fixedTl = kcdmp::walkhold::fixed_timeline(figure, oneHolder);
         if (fixedTl) {
-            renderDelay = kcdmp::walkhold::fixed_delay_s(p.delay);
+            const double gap = s.gapEma > 0.0 ? s.gapEma : 0.05;
+            renderDelay = kcdmp::walkhold::adaptive_delay_s(p.delay, gap);
             if (s.n > 0 && kcdmp::walkhold::snap_catchup(now - s.ring[s.n - 1].at, renderDelay))
                 renderDelay = now - s.ring[s.n - 1].at;
             g_playoutByEid[p.eid] = renderDelay;
