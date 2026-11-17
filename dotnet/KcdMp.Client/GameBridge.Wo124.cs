@@ -65,6 +65,7 @@ public partial class GameBridge
     {
         if (_joinedWorld == on) return;
         _joinedWorld = on;
+        if (!on) _ = ResetHostCalendarAsync("left-host-world");
         Wo122EnsureWatcher();
     }
 
@@ -281,7 +282,7 @@ public partial class GameBridge
             t.TrySetResult(true);
             return;
         }
-        if (_ownLoadExpected) return;
+        if (_ownLoadExpected) { _ = ResetHostCalendarAsync("own-load"); return; }
         if (_joinedWorld)
         {
             // A loading screen, a fast travel and a quest catch-up all print this line.
@@ -289,6 +290,7 @@ public partial class GameBridge
             // into a session. Hold. Only a save that is not the host's, still up
             // after the grace, ends the session -- and the line says why.
             bool own = SessionHold.LoadIsOwnSave(display, _joinedSource?.File);
+            if (own) _ = ResetHostCalendarAsync("different-save");   // grace preserves the session, never writes the host's clock into an own save
             _loadGraceUntilUtc = DateTime.UtcNow.AddMilliseconds(SessionHold.LoadGraceMs);
             _loadGraceOwn = own;
             Console.WriteLine(own
@@ -659,6 +661,12 @@ public partial class GameBridge
                 await RemovePlacedWorldAsync(j, "abandoned-before-load");
                 return;
             }
+            if (!await PrepareHostCalendarAsync(j))
+            {
+                await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "clock-unavailable", "Your host's world clock could not be prepared.");
+                return;
+            }
+            if (Wo206JoinGone(j, "after calendar prepare")) return;
             j.Phase = "loading";
             Wo137OnJoinLoading(j.JoinId);   // WO-137: host quest changes from before this world are in it already
             SetJoinUi("loading", "Loading your host's world...");
@@ -777,6 +785,12 @@ public partial class GameBridge
             return;
         }
         else Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} step 0 loaded file: {lastBase} (the engine's last load = the placed file)");
+
+        if (!await VerifyHostCalendarAsync(j))
+        {
+            await LeaveAfterFailedJoinAsync(j, Protocol.JoinAbortLoadFailed, "clock-unavailable", "Your host's world clock could not be verified.");
+            return;
+        }
 
         // 1. the save lock, read back
         await Wo122SetLockAsync(true, "join");
@@ -991,6 +1005,7 @@ public partial class GameBridge
         if (!ReferenceEquals(_jj, j)) { await RemovePlacedWorldAsync(j, why); return; }
         if (sendAbort)
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason)); } catch { }
+        await ResetHostCalendarAsync("join-abort");
         await RemovePlacedWorldAsync(j, why);
         lock (_joinGate)
         {
@@ -1011,6 +1026,7 @@ public partial class GameBridge
     {
         if (!ReferenceEquals(_jj, j)) return;
         try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason)); } catch { }
+        await ResetHostCalendarAsync("failed-post-load");
         Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} ABORTED after the load ({why}) -- JoinAbort {Protocol.JoinAbortName(reason)} sent (the host resumes)");
         lock (_joinGate)
         {
@@ -1030,6 +1046,7 @@ public partial class GameBridge
     private async Task LeaveSharedWorldAsync(string why, string message)
     {
         if (!_joinedWorld && _jj is null) return;
+        await ResetHostCalendarAsync("leave");
         _leaveInProgress = true;           // WO-125: no join is asked until this leave's own load is in
         _newWorldLeavePending = false;
         _leaveSinceUtc = DateTime.UtcNow;
@@ -1078,6 +1095,7 @@ public partial class GameBridge
             else if (_jj is { Phase: "preparing" } j) await AbortJoinerJoinAsync(j, 0, "host-left", "Your host left the game.", sendAbort: false);
             else if (_jj is { Phase: "loading" } jl)
             {
+                await ResetHostCalendarAsync("orphaned-host-left");
                 // Mid-load: the file goes now; the world that arrives is left at Gameplay started.
                 Console.WriteLine($"MP-JOIN joiner: the host left during the load of join 0x{jl.JoinId:x8}");
                 jl.Phase = "orphaned";
@@ -1105,6 +1123,7 @@ public partial class GameBridge
                 break;
             case "loading":
                 // The world arriving is no longer the host's: leave it once it is up.
+                await ResetHostCalendarAsync("orphaned-host-abort");
                 j.Phase = "orphaned";
                 _joinedSource ??= j.Source;
                 _ = Task.Run(async () =>

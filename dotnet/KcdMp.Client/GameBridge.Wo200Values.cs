@@ -13,15 +13,12 @@ namespace KcdMp.Client;
 //   II.2 rider_from_host: the host says per NPC "on <horse>" or "on foot" (extra kind 6); the joiner mounts and dismounts its copy on
 //        that word alone (WO-170's gates), never on geometry.
 //   II.4 copy_neutral_always: the DLL's config bit (wo141's reconcile asks no planner for copies).
-//   II.7 world_clock_from_host: the host's clock every 2 s (W164 kind 18); the joiner slews its own toward it through the clock's ratio
-//        (never a jump); large gaps stay with WO-140's pull and WO-133's forward convergence.
+//   II.7 world_clock_from_host: precise native calendar samples; the joiner's pre-update follower replaces ratio slews and poll pulls.
 public partial class GameBridge
 {
     private long _w200HitsNotApplied, _w200VitalsOut, _w200VitalsIn, _w200StaminaSet, _w200MountOut, _w200MountIn, _w200ClockOut, _w200ClockIn, _w200Slews;
     private readonly ConcurrentDictionary<string, (string Horse, float St, float Hp)> _w200HostVals = new(StringComparer.Ordinal);
     private double _w200Ratio = 15.0;       // the ratio this joiner last set (15 = the game's own)
-    private bool _w201CatchingUp;           // WO-201 B13: a lag over 30 game s is being caught up
-    private bool _w200Slewing;
     private long _w200ClockTick;
 
     /// <summary>The DLL's sixth config byte (Act II): 1 = copy_neutral_always.</summary>
@@ -107,50 +104,8 @@ public partial class GameBridge
     private async Task Wo200ClockTickAsync()
     {
         if (++_w200ClockTick % 2 != 0) return;
-        if (!W137Host || !W200("world_clock_from_host") || _lastPolledWorldTime is not uint t) return;
-        var peers = Wo134Peers();
-        if (peers.Count == 0) return;
-        // the host's clock now: its last reading moved on by the real seconds since (the game's own ratio)
-        double now = t + (DateTime.UtcNow - _lastPollUtc).TotalSeconds * WorldTimeRatio;
-        string text = string.Create(CultureInfo.InvariantCulture, $"{(uint)now} {(int)(WorldTimeRatio * 1000)}");
-        foreach (byte g in peers) await W164SendAsync(g, Protocol.W164Clock, text);
-        Interlocked.Increment(ref _w200ClockOut);
-    }
-
-    private async Task Wo200OnHostClockAsync(string text)
-    {
-        Interlocked.Increment(ref _w200ClockIn);
-        var f = text.Split(' ');
-        if (f.Length != 2 || !uint.TryParse(f[0], NumberStyles.None, CultureInfo.InvariantCulture, out uint host) ||
-            !int.TryParse(f[1], NumberStyles.None, CultureInfo.InvariantCulture, out int ratio1000) || ratio1000 < 1000 || ratio1000 > 100000) return;
-        if (!W200("world_clock_from_host") || !_joinedWorld || _isDamageAuthority) { await Wo200RatioAsync(15.0, "off"); return; }
-        // WO-209 D.1 (mp_clock_quiet_in_skip): the game's own time-lapse (a sleep, a wait) runs on its own ratio -- no write over it (the
-        // smoke's 9 h sleep: the reset 3 s in ran the joiner's sleep 56.5 s past the host's); the next correction after it writes afresh
-        bool skipping = _localSkipActive || _w140LocalSkipping;
-        // WO-210 H.5: the host's clock kept for the marks; a gap outside a skip told
-        if (_lastPolledWorldTime is uint mine0) Wo210OnHostClock(host, ratio1000 / 1000.0, mine0 + (DateTime.UtcNow - _lastPollUtc).TotalSeconds * _w200Ratio - host, skipping);
-        if (skipping && !Wo209Rules.RatioWriteAllowed(true, W209("clock_quiet_in_skip"))) { Wo209NoteSkipQuiet(); return; }
-        if (skipping || Wo136Holding || _lastPolledWorldTime is not uint mine) { if (_w200Slewing) await Wo200RatioAsync(15.0, "a skip or a load"); return; }
-        // WO-208 D.2 (mp_clock_stands_with_host): this clock stands with the host's (WO-144: the host is in a dialogue, ratio 0) -- no
-        // correction writes a running ratio over it (the baseline: the joiner's clock ran on through the host's talks, up to 917 game s
-        // ahead, then was pulled back in jumps)
-        if (!Wo208Rules.ClockSlewAllowed(_w144Following, W208("clock_stands_with_host"))) { Wo208NoteClockHeld(); return; }
-        double hostRatio = ratio1000 / 1000.0;
-        double myNow = mine + (DateTime.UtcNow - _lastPollUtc).TotalSeconds * _w200Ratio;
-        double err = myNow - host;   // game seconds this clock is ahead of the host's
-        double want = W201("clock_catchup") ? Wo201Rules.CatchUpRatio(hostRatio, err, ref _w201CatchingUp) : Wo200Rules.SlewRatio(hostRatio, err);   // WO-201 B13
-        await Wo200RatioAsync(want, FormattableString.Invariant($"{err:+0;-0} game s from the host's"));
-    }
-
-    private async Task Wo200RatioAsync(double ratio, string why)
-    {
-        if (Interlocked.Exchange(ref _w209RatioDirty, 0) == 1) _w200Ratio = double.NaN;   // WO-209 D.1: after a skip the game's ratio is its own
-        if (Math.Abs(ratio - _w200Ratio) < 0.05) return;
-        _w200Ratio = ratio;
-        _w200Slewing = Math.Abs(ratio - 15.0) >= 0.05;
-        Interlocked.Increment(ref _w200Slews);
-        Console.WriteLine(FormattableString.Invariant($"WO200-CLOCK joiner: this clock's ratio {ratio:F2} ({why}) -- a gentle correction, never a jump"));
-        try { await ExecLuaAsync(FormattableString.Invariant($"pcall(function() Calendar.SetWorldTimeRatio({ratio:F3}) end)")); } catch { }
+        if (!W137Host || Wo134Peers().Count == 0) return;   // shared-world calendar is mandatory; the old ratio-slew switch no longer owns it
+        await SendHostCalendarAsync();
     }
 
     // ---------------------------------------------------------------- II.6: the figure's clinch, ended

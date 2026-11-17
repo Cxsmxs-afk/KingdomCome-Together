@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 #include "anchors.h"
 #include "hook_prologues.h"
@@ -18,6 +19,8 @@
 #include "main_thread.h"
 #include "pe_exports.h"
 #include "wo140_rules.h"
+#include "calendar_follow_rules.h"
+#include "wo138.h"
 
 namespace kcdmp::wo140 {
 namespace {
@@ -64,6 +67,13 @@ std::atomic<uint64_t> g_approveUntil{0};
 wo140rules::Tracker g_track{};
 FrameFn g_frame = nullptr;
 std::atomic<uint32_t> c_held{0}, c_passed{0}, c_replayed{0}, c_edges{0}, c_started{0}, c_startRefused{0}, c_stopped{0}, c_pulled{0};
+
+// The connection close can come from the pipe thread. The lock covers state and
+// the short guarded memory write, so a reset returning means no old write remains in flight.
+std::mutex g_calendarMu;
+calendarfollow::Follower g_follow;
+bool g_followConnection = true;
+uint64_t g_calendarEpoch = 1; // protected by g_calendarMu, including close and request validation
 
 bool rd(const void* p, void* out, size_t n) {
     KCDMP_FAULT_READ(site, "wo140::rd");
@@ -218,9 +228,25 @@ int skip_state_now() {
 }
 
 void on_pipe_closed() {
+    { std::lock_guard<std::mutex> lk(g_calendarMu); ++g_calendarEpoch; g_follow = {}; g_followConnection = false; }
     g_on = false;
     g_approveUntil = 0;
     main_thread::post([] { g_held = {}; });
+}
+
+void calendar_pre_update() {
+    std::lock_guard<std::mutex> lk(g_calendarMu);
+    if (!g_follow.on || !g_setTime) return;
+    // Always ask GetGameIface again: a load can replace Calendar, or reuse it and reset its ms.
+    void* cal = calendar();
+    const bool first = !g_follow.verified || cal != g_follow.lastCalendar;
+    int64_t before = 0;
+    if (!calendarfollow::apply(g_follow, cal, GetTickCount64(), skip_state_now(),
+        [](void* c, int64_t* ms) { return rd(static_cast<uint8_t*>(c) + kOffCalMs, ms, 8); },
+        [](void* c, int64_t ms) { return write_ms(c, ms); }, &before)) return;
+    if (first)
+        logf("MP-CALENDAR pre_modules_update frame=%llu calendar=%p before_ms=%lld after_ms=%lld host_ratio=%.3f silent=1 world_timescale_changed=0",
+             static_cast<unsigned long long>(g_follow.frames), cal, static_cast<long long>(before), static_cast<long long>(g_follow.lastWritten), g_follow.ratio);
 }
 
 void tick() {
@@ -247,13 +273,23 @@ void tick() {
     }
 }
 
-uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
+uint64_t calendar_connection_epoch() {
+    std::lock_guard<std::mutex> lk(g_calendarMu);
+    return g_calendarEpoch;
+}
+
+uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen, uint64_t requestEpoch) {
     *outLen = 0;
     if (!len) return kRBadRequest;
     switch (body[0]) {
         case kOpConfig: {
             if (len != 2 || cap < 2) return kRBadRequest;
             const bool on = body[1] != 0;
+            {
+                std::lock_guard<std::mutex> lk(g_calendarMu);
+                if (requestEpoch != g_calendarEpoch) return kRFailed;
+                g_followConnection = true;
+            }
             void* inst = g_hook.load() ? instance() : nullptr;
             const bool armed = g_hook.load() && inst;
             if (on && !armed) { out[0] = 0; out[1] = 0xFF; *outLen = 2; return kRNotArmed; }
@@ -365,6 +401,43 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             if (!cal || !rd(static_cast<uint8_t*>(cal) + kOffCalMs, &cur, 8)) return kRFailed;
             const uint32_t s = static_cast<uint32_t>(cur / 1000);
             std::memcpy(out, &s, 4); *outLen = 4;
+            return kROk;
+        }
+        case kOpCalendarSnapshot: {
+            if (len != 1 || cap < 17) return kRBadRequest;
+            std::memset(out, 0, 17); *outLen = 17;
+            if (!g_setTime || skip_state_now() != 0) return kROk;
+            void* cal = calendar(); int64_t ms = 0;
+            if (!cal || !rd(static_cast<uint8_t*>(cal) + kOffCalMs, &ms, 8) || !calendarfollow::valid(ms, 15.0)) return kROk;
+            const uint16_t held = wo138::pause_sources();
+            const double ratio = wo138::join_held() || (held != 0xFFFF && held != 0) ? 0.0 : 15.0;
+            out[0] = 1; std::memcpy(out + 1, &ms, 8); std::memcpy(out + 9, &ratio, 8);
+            return kROk;
+        }
+        case kOpCalendarFollow: {
+            if (len != 18 || cap < 17) return kRBadRequest;
+            const uint8_t mode = body[1];
+            int64_t ms = 0; double ratio = 0;
+            std::memcpy(&ms, body + 2, 8); std::memcpy(&ratio, body + 10, 8);
+            if (mode > 3 || ((mode == 1 || mode == 2) && !calendarfollow::valid(ms, ratio))) return kRBadRequest;
+            std::memset(out, 0, 17); *outLen = 17;
+            std::lock_guard<std::mutex> lk(g_calendarMu);
+            if (requestEpoch != g_calendarEpoch) return kRFailed;
+            if (mode == 0) { g_follow = {}; out[0] = 1; return kROk; }
+            if (!g_followConnection || !g_setTime) return kROk;
+            if (mode == 2) {
+                g_follow = {}; g_follow.on = true; g_follow.ms = ms; g_follow.ratio = ratio; g_follow.at = GetTickCount64();
+                out[0] = 2; // Armed, deliberately not an old/menu Calendar readback.
+                logf("MP-CALENDAR prepared before load host_ms=%lld ratio=%.3f; awaiting pre_modules_update", static_cast<long long>(ms), ratio);
+                return kROk;
+            }
+            if (!g_follow.on) return kROk; // An update must never resurrect a reset follower.
+            if (mode == 1) { g_follow.ms = ms; g_follow.ratio = ratio; g_follow.at = GetTickCount64(); }
+            void* cal = calendar(); int64_t cur = 0;
+            const bool read = cal && rd(static_cast<uint8_t*>(cal) + kOffCalMs, &cur, 8);
+            const bool verified = read && calendarfollow::verify(g_follow, cal, cur, GetTickCount64(), skip_state_now());
+            out[0] = verified ? 1 : 2;
+            std::memcpy(out + 1, &g_follow.lastWritten, 8); std::memcpy(out + 9, &cur, 8);
             return kROk;
         }
         case kOpStatus: {

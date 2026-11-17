@@ -684,6 +684,7 @@ public partial class GameBridge
     /// </summary>
     private bool Wo140CheckClock(uint worldTime)
     {
+        if (HostCalendarOwned) return false;   // the native pre-update follower owns both forward and backward corrections
         if (!_joinedWorld || _isDamageAuthority || !_combatRoleApplied || _w140LocalSkipping || _localSkipActive || Wo136Holding) return false;
         if (DateTime.UtcNow < _w140PullQuietUntilUtc) return false;
         // a shared sleep: the host's own skip runs too, and its result is still to come (observed: the

@@ -509,6 +509,13 @@ public partial class GameBridge
             // WO-151 3.8: the world is truly held from here until the join ends (the mod's ratio 0 and NPC pauses
             // never stopped the engine: the DLL read world=running scale=1.000 through a 76 s "pause").
             await Wo151JoinHoldAsync(j, true);
+            // Reliable clock precedes the offer: the joiner arms its pre-update calendar before it issues any load.
+            if (!await SendHostCalendarAsync(j.Joiner, frozen: true, joinId: j.JoinId))
+            {
+                abortReason = Protocol.JoinAbortLoadFailed; resumeReason = "clock-unavailable";
+                Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: native calendar unreadable -- offer not sent");
+                return;
+            }
             string sha = Convert.ToHexString(sender.Offer.Sha256).ToLowerInvariant();
             Console.WriteLine(FormattableString.Invariant(
                 $"MP-JOIN host: join 0x{j.JoinId:x8} world={save.Display} bytes={bytes.Length} chunks={sender.ChunkCount} sha256={sha[..16]} worldsaved_seq={save.Seq} md5={v.Md5[..8].ToLowerInvariant()} verify=ok save_ms={(DateTime.UtcNow - t0).TotalMilliseconds:F0}"));
@@ -689,6 +696,10 @@ public partial class GameBridge
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Joiner, j.JoinId, abortReason)); } catch { }
         if (reason != "joiner-gone" && reason != "relay-lost")
             await TrySendStatusAsync(j, Protocol.JoinStateResumed, reason, (ushort)Math.Min(pausedS, ushort.MaxValue));
+        // A new time basis and running rate travel together; never extrapolate the held seconds at rate 15.
+        if (reason == "ready")
+            try { await SendHostCalendarAsync(j.Joiner); }
+            catch (Exception ex) { Console.WriteLine($"MP-CALENDAR resumed sample not sent: {ex.GetType().Name}"); }
         Console.WriteLine(FormattableString.Invariant(
             $"MP-JOIN host: resume join=0x{j.JoinId:x8} reason={reason} paused_s={pausedS:F1} phase_at_end={j.Phase}{(abortReason != 0 ? $" abort_sent={Protocol.JoinAbortName(abortReason)}" : "")}"));
         Wo202NoteEvent(FormattableString.Invariant($"the join's hold ended ({reason}, {pausedS:F0} s)"));

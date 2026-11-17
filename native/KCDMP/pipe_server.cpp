@@ -219,6 +219,7 @@ double w218_now_us() {
 struct PendingBatch {
     uint16_t id = 0;
     uint64_t gen = 0;
+    uint64_t calendarEpoch = 0;
     std::vector<uint8_t> raw;
     std::vector<wo218rules::Sub> subs;
     size_t next = 0;
@@ -295,7 +296,7 @@ void w218_note_single() {
 }
 
 // One generic request, here on the main thread: the reply frame's body into rb (the exact bytes the single path sends, seq 0).
-size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, size_t cap, bool* faulted) {
+size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, size_t cap, bool* faulted, uint64_t calendarEpoch) {
     *faulted = false;
     const uint8_t op = len ? body[0] : 0;
     if (cap < 4) return 0;
@@ -319,7 +320,7 @@ size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, 
             case kWo137: reason = kcdmp::wo137::handle(body, len, rb + 4, pcap < 1000 ? pcap : 1000, &n); break;
             case kWo138: reason = kcdmp::wo138::handle(body, len, rb + 4, pcap < 1000 ? pcap : 1000, &n); break;
             case kWo139: reason = kcdmp::wo139::handle(body, len, rb + 4, pcap < 300 ? pcap : 300, &n); break;
-            case kWo140: reason = kcdmp::wo140::handle(body, len, rb + 4, pcap < 340 ? pcap : 340, &n); break;
+            case kWo140: reason = kcdmp::wo140::handle(body, len, rb + 4, pcap < 340 ? pcap : 340, &n, calendarEpoch); break;
             case kWo141: reason = kcdmp::wo141::handle(body, len, rb + 4, pcap < 420 ? pcap : 420, &n); break;
             case kWo143: reason = kcdmp::wo143::handle(body, len, rb + 4, pcap < 420 ? pcap : 420, &n); break;
             case kWo147: reason = kcdmp::wo147::handle(body, len, rb + 4, pcap < 200 ? pcap : 200, &n); break;
@@ -359,7 +360,7 @@ void w218_drain() {
             const wo218rules::Sub& sub = b->subs[b->next];
             bool faulted = false;
             const double s0 = w218_now_us();
-            const size_t n = w218_run_sub(sub.type, b->raw.data() + sub.off, sub.len, rb, sizeof rb, &faulted);
+            const size_t n = w218_run_sub(sub.type, b->raw.data() + sub.off, sub.len, rb, sizeof rb, &faulted, b->calendarEpoch);
             w221_note_sub(sub.type, sub.len ? b->raw[sub.off] : 0, w218_now_us() - s0);   // WO-221 F.1
             b->reply.add(wo218rules::reply_type(sub.type), rb, n);
             ++b->next;
@@ -407,6 +408,7 @@ void w218_on_batch(HANDLE h, const BYTE* body, uint16_t len) {
         return;
     }
     b->gen = g_connGen.load();
+    b->calendarEpoch = kcdmp::wo140::calendar_connection_epoch();
     b->reply.begin(b->id, static_cast<uint8_t>(b->subs.size()));
     g_w218BatchesIn.fetch_add(1);
     {
@@ -1546,13 +1548,14 @@ void serve(HANDLE h) {
             }
             case kWo140: {
                 std::vector<uint8_t> copy(body, body + len);
+                const uint64_t calendarEpoch = kcdmp::wo140::calendar_connection_epoch();
                 struct R { uint8_t reason = kcdmp::wo140::kRFailed; uint8_t op = 0; uint8_t buf[340]{}; size_t n = 0; };
                 R r{};
                 bool faulted = false;
                 const bool ran = run_sync_bounded<R>(
-                    [copy](R& out) {
+                    [copy, calendarEpoch](R& out) {
                         out.op = copy.empty() ? 0 : copy[0];
-                        out.reason = kcdmp::wo140::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                        out.reason = kcdmp::wo140::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n, calendarEpoch);
                     }, "Wo140", r, &faulted);
                 if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo140::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
                 BYTE rb[4 + 340]{};

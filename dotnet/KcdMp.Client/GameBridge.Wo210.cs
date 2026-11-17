@@ -165,7 +165,8 @@ public partial class GameBridge
     private long _w210GapLines;
 
     /// <summary>This machine's world time now (the agent's last poll moved on by the game's own ratio); null before the first poll.</summary>
-    private double? Wo210MyWorldTime() => _lastPolledWorldTime is uint mine ? mine + (DateTime.UtcNow - _lastPollUtc).TotalSeconds * _w200Ratio : null;
+    private double? Wo210MyWorldTime() => _lastPolledWorldTime is uint mine && (DateTime.UtcNow - _lastPollUtc).TotalSeconds <= 10
+        ? mine + Math.Max(0, (DateTime.UtcNow - _lastPollUtc).TotalSeconds) * _w200Ratio : null;
 
     /// <summary>The host's world time now, from its last clock message (the joiner); null without one.</summary>
     private double? Wo210HostWorldTime() => _w210HostClock is { } h ? h.Host + (DateTime.UtcNow - h.At).TotalSeconds * h.Ratio : null;

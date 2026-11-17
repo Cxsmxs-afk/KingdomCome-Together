@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/join-save-retention
+      - codex/host-clock-bootstrap
 
 jobs:
   build:
