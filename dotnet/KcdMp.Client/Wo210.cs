@@ -24,7 +24,8 @@ public static class Wo210PipeBlock
     {
         var types = new HashSet<int>(); var ops = new HashSet<int>();
         if (string.IsNullOrWhiteSpace(spec)) return (types, ops);
-        foreach (var part in spec.Split([';', '|'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        // A collection expression here is ambiguous on the current SDK: Split(char[]?) and Split(string?).
+        foreach (var part in spec.Split(new[] { ';', '|' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             int eq = part.IndexOf('=');
             if (eq <= 0) continue;

@@ -15,6 +15,7 @@
                 <div class="modal-title">VERSION MISMATCH</div>
 
                 <p>@Message</p>
+                <p>Both players have to be on the same build of the mod. The releases page is where that build is published.</p>
 
                 <div class="modal-actions">
                     <button class="kcd-btn primary" @onclick="OpenReleases">VIEW RELEASES</button>
@@ -33,7 +34,7 @@
     // See Home.razor.cs's PollVersionMismatchAsync for how Message is built.
     [Parameter] public string Message { get; set; } = "";
 
-    private const string ReleasesUrl = "https://github.com/DeepFriedDepp/kcd2-multiplayer_Reworked/releases";
+    private const string ReleasesUrl = "https://github.com/DeepFriedDepp/KingdomCome-Together/releases";
 
     private void OpenReleases() => UrlLauncher.Open(ReleasesUrl);
 }

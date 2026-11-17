@@ -120,7 +120,13 @@ namespace KCDMP_launcher.Models
                 switch (cs.State)
                 {
                     case "connected": ConnLine = ""; ConnBad = false; break;
-                    case "failed": ConnLine = (cs.Message + " " + cs.Next).Trim(); ConnBad = true; break;
+                    case "failed":
+                        ConnLine = (cs.Message + " " + cs.Next).Trim();
+                        // A non-fatal failure is retried by the agent. Saying so
+                        // stops the line looking like the session is over.
+                        if (!cs.Fatal && ConnLine.Length > 0) ConnLine += " Trying again.";
+                        ConnBad = true;
+                        break;
                     default: ConnLine = cs.Message; ConnBad = false; break;
                 }
             }

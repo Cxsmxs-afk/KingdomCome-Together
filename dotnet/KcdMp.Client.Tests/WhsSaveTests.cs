@@ -413,7 +413,7 @@ public class WhsSaveTests
                 Put("Libs/Tables/rpg/perk.xml", $"<database><Perk Id=\"{Money}\" Name=\"notAnItem\" IsQuestItem=\"true\"/></database>");
             }
             var q = WhsSave.QuestClasses(pak);
-            Assert.Equal(["loveLetter"], q.Values);
+            Assert.Equal(new[] { "loveLetter" }, q.Values);
             Assert.True(q.ContainsKey(Letter));
         }
         finally { System.IO.File.Delete(pak); }

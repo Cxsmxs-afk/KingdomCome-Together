@@ -122,8 +122,13 @@ public class Wo129Tests
         var b = new AgentStatusBanner();
         b.Start(false, 0);
         b.Apply(new ConnectionStatusData { State = "failed", Message = "Your host's computer refused the connection.", Next = "Check the port." }, null, true, 1);
-        Assert.Equal("Your host's computer refused the connection. Check the port.", b.ConnLine);
+        Assert.Equal("Your host's computer refused the connection. Check the port. Trying again.", b.ConnLine);
         Assert.True(b.ConnBad);
+        var fatal = new AgentStatusBanner();
+        fatal.Start(false, 0);
+        fatal.Apply(new ConnectionStatusData { State = "failed", Fatal = true, Message = "Versions don't match.", Next = "Update both." }, null, true, 1);
+        Assert.Equal("Versions don't match. Update both.", fatal.ConnLine);
+        Assert.DoesNotContain("Trying again", fatal.ConnLine);
     }
 
     [Fact]

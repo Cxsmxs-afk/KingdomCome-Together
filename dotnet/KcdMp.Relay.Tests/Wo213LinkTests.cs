@@ -3,9 +3,12 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using KcdMp.Server.Features.ClientHandling;
 using KcdMp.Server.Features.Faults;
+using KcdMp.Server.Features.Tcp;
 
 namespace KcdMp.Relay.Tests;
 
@@ -389,6 +392,14 @@ public class Wo213SchedulerTests
     }
 
     [Fact]
+    public void Default_age_limit_keeps_the_latest_sample_for_two_seconds()
+    {
+        // A hitch longer than half a second used to throw away the only copy of
+        // an NPC's position. The receiver then treated the silence as "gone".
+        Assert.Equal(2000, new LinkSchedOptions().AgeLimitMs);
+    }
+
+    [Fact]
     public void Age_limit_drops_old_state_and_twin_sends_it_late()
     {
         var s = new LinkScheduler(new LinkSchedOptions { AgeLimitMs = 30 });
@@ -604,5 +615,18 @@ public class Wo213CompactTests
         var enc = new NpcCompact.Encoder();
         var f = Down("a", -5, 10, 10, 0, 50, 0, 1);
         Assert.Same(f, enc.Encode(f));
+    }
+
+    [Fact]
+    public void An_accepted_socket_gets_tcp_keepalive()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var client = new TcpClient();
+        client.Connect((IPEndPoint)listener.LocalEndpoint);
+        using var accepted = listener.AcceptTcpClient();
+        TcpKeepAlive.Arm(accepted.Client);
+        Assert.NotEqual(0, Convert.ToInt32(accepted.Client.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive)));
+        Assert.Equal(TcpKeepAlive.IdleSeconds, Convert.ToInt32(accepted.Client.GetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime)));
     }
 }
