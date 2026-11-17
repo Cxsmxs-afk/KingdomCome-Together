@@ -4,7 +4,20 @@
 
 The top goal of this fork is a smooth co-op for KCD2 that feels native, and playing together should be as fun as Elden Ring Seamless Co-op or similar. Every decision is measured against that; completely new approaches are allowed when they serve it.
 
-Dieselbe Regel steht in `AGENTS.md`. Sie ist der Maßstab für alles darunter. Eine Änderung, die die jetzige Maschine erhält, aber Henry, das Pferd oder die Leute im Dorf weiter ruckeln, zu spät oder auseinander zeigt, hat sie nicht erfüllt. Ein neuer Weg ist erlaubt, wenn er genau das leistet. Ein MMO mit eigener Welt, Accounts und persistenten Servern ist nicht das Ziel: Elden Ring Seamless Co-op und der Kampagnen-Koop von Cyberpunk (NightCoop) sind es. Zwei Leute spielen *diese* Geschichte in *einer* Welt, und es fühlt sich an wie das Einzelspieler-Spiel.
+Dieselbe Regel steht in `AGENTS.md`. Sie ist der Maßstab für alles darunter. Eine Änderung, die die jetzige Maschine erhält, aber Henry, das Pferd oder die Leute im Dorf weiter ruckeln, zu spät oder auseinander zeigt, hat sie nicht erfüllt. Ein neuer Weg ist erlaubt, wenn er genau das leistet. Ein MMO mit eigener Welt, Accounts und persistenten Servern ist nicht das Ziel: Elden Ring Seamless Co-op und der Kampagnen-Koop von Cyberpunk (NightCoop) sind es. Zwei Spieler spielen *diese* Geschichte in *einer* Welt, und es fühlt sich an wie das Einzelspieler-Spiel. Drei oder vier in derselben Welt müssen mitkönnen. Der Kern ist die Geschichte, die Leute, die offene Welt und die Spieler selbst. Ein Laden muss nicht pixelgleich sein.
+
+## Priorität
+
+Gemessen wird in dieser Reihenfolge. Was weiter oben steht, darf eine Fassung nicht verfehlen. Was weiter unten steht, wird so gut wie vernünftig machbar, und es hält keine Phase auf.
+
+1. **Die Spieler selbst.** Der andere Heinrich, zu Fuß und zu Pferd, ohne sichtbare Verzögerung.
+2. **Die NPCs.** Dieselben Leute, am selben Ort, in derselben Tätigkeit.
+3. **Die offene Welt.** Dieselbe Stelle, dieselbe Uhr, dieselben Wege. Die Leine bleibt, solange eine Maschine die Welt simuliert.
+4. **Die Geschichte und die Quests.** Dieselbe Stufe, zur selben Zeit. Eine Dialogwahl gilt, wenn mehr als die Hälfte der Anwesenden dafür ist.
+
+Truhen und Kräuter sind **pro Spieler**: jeder schaut in seine eigene. Das ist die Regel, kein ungelöstes Sync-Problem.
+
+**Zweitrangig:** Läden und Händler, und was ihnen gleicht (ein Bestand, der nicht jede Ware gleich annimmt). So gut wie vernünftig. Ein Händler, der eine Zwiebel nicht nimmt, ist kein Grund, die Fassung zurückzuhalten. Ein Absturz oder verlorenes Geld, das der Mod verursacht, bleibt ein Fehler.
 
 Dieses Dokument schlägt die Architektur vor. Es schreibt keinen Code um. Der laufende Test-Branch mit den Latenz-Pflastern bleibt ein eigener Pull Request und wird hier nicht vermischt.
 
@@ -225,13 +238,13 @@ Aufwand ist die Größe der Änderung, nicht eine Kalenderzeit. S = ein abgegren
 
 **Empfehlung: F, ausgeführt als B dann C dann D.** Nicht E. A nur noch als Pflaster, solange eine Phase nicht draußen ist.
 
-Warum diese Reihenfolge: das Gefühl entscheidet sich im Körper, und der Körper entscheidet sich auf dem Main-Thread. Das Netz ist schon schnell genug, wenn man ihm nicht eine Sekunde alte Lua-Schlange vorsetzt. Ein UDP-Umbau vor dem Ring würde die 9 s nur zuverlässiger ausliefern.
+Warum diese Reihenfolge: die Geschichte findet in den Körpern und in der offenen Welt statt. Zuerst muss der andere Spieler und der Dorfbewohner am richtigen Ort stehen, sonst ist eine gemeinsame Quest-Stufe nur eine Zeile im Log. Läden stehen nicht in dieser Reihenfolge. Das Netz ist schon schnell genug, wenn man ihm nicht eine Sekunde alte Lua-Schlange vorsetzt. Ein UDP-Umbau vor dem Ring würde die 9 s nur zuverlässiger ausliefern.
 
 ---
 
 ## 6. Phasen
 
-Jede Phase ist mit zwei Spielern auf den Modding Tools prüfbar und lässt das Spiel spielbar, auch wenn die nächste nie kommt. „Fertig“ heißt: der Zwei-Spieler-Check aus dem Abschnitt steht, und die Schicht, die ersetzt wurde, ist weg.
+Jede Phase bleibt spielbar, auch wenn die nächste nie kommt. Der Maßstab ist zuerst **zwei Spieler**: das ist der Fall, der sich am besten anfühlen muss, und der, an dem gemessen und zuerst getestet wird. Dieselbe Fassung muss mit **drei oder vier Spielern in derselben Welt** mitspielen, ohne ein zweites Spiel zu werden. „Fertig“ heißt: der Zwei-Spieler-Check steht, der gleiche Ablauf mit einem dritten und vierten Spieler in der Gruppe bricht ihn nicht, und die ersetzte Schicht ist weg. Die Modding Tools bleiben vorerst die Basis. Native Frame-Hooks dürfen bei einem Spiel-Patch brechen; sie werden danach nachgezogen, nicht vermieden.
 
 ### Phase 0 — dieser Text und die Regel
 
@@ -241,7 +254,7 @@ Dokument und `AGENTS.md`. Kein Verhalten. Zwei Spieler testen hier nichts.
 
 `body_drive` für jeden gehenden Menschen in der Nähe, der Writer nur noch für das, was der Request nicht kann (Sturz, Luft, der letzte halbe Meter). Die Geh-Schichten, die derselbe Körper noch schreibt, werden in derselben Phase gelöscht, nicht auf „aus“ gestellt.
 
-Check: nebeneinander durch ein Dorf. Die Füße des anderen Dorfbewohners stehen im Takt, kein Gleiten, kein Flackern zwischen zwei Punkten. Ein Stuhl-Gast, den die Engine festhält, bleibt sitzen und wird nicht im Sekundentakt umgesetzt.
+Check, zuerst zu zweit: nebeneinander durch ein Dorf. Die Füße des anderen Dorfbewohners stehen im Takt, kein Gleiten, kein Flackern zwischen zwei Punkten. Ein Stuhl-Gast, den die Engine festhält, bleibt sitzen und wird nicht im Sekundentakt umgesetzt. Danach derselbe Weg zu dritt und zu viert, eng beieinander: niemand bekommt eine zweite, abweichende Gangart, und die Leute in der Mitte der Gruppe bleiben die des Hosts.
 
 Aufwand M. Risiko mittel, weil die Engine den Körper weiter anfassen kann. Beweisbar nur im Spiel.
 
@@ -249,7 +262,7 @@ Aufwand M. Risiko mittel, weil die Engine den Körper weiter anfassen kann. Bewe
 
 Pose, Gangart und „er geht gerade“ tragen dieselbe Host-Zeit und werden um eine feste Spanne später gezeigt. Die Spanne ist ein gemessener RTT plus ein kleiner Puffer, gedeckelt, und sie schnappt herunter, wenn der Strom aufholt. Sie wächst nicht mit der Länge der Schlange.
 
-Check: der Partner sprintet, bleibt stehen, dreht sich. Die Figur bleibt im Takt und steht, wenn er steht, ohne eine Sekunde nachzuziehen. `mp_perf` zeigt die Verzögerung, und sie bleibt unter ein paar hundert Millisekunden, solange die Leitung normal ist.
+Check, zuerst zu zweit: der Partner sprintet, bleibt stehen, dreht sich. Die Figur bleibt im Takt und steht, wenn er steht, ohne eine Sekunde nachzuziehen. `mp_perf` zeigt die Verzögerung, und sie bleibt unter ein paar hundert Millisekunden, solange die Leitung normal ist. Zu dritt und zu viert gilt dasselbe für jede fremde Figur; die Leitung darf nicht deshalb ruckeln, dass zwei statt einer Figur gezeichnet werden.
 
 Aufwand M. Ein Teil (die Uhr, der Puffer) ist ohne Spiel an einem aufgezeichneten Strom testbar. Ob die Animation dazu passt, nicht.
 
@@ -265,29 +278,31 @@ Aufwand M, Grenze zu L, weil der Ring, der Agent und das Abschalten des alten Pf
 
 Die KI der Kopie ist aus, mit der Sperre, die das Spiel wirklich akzeptiert (nicht mit einer, die beim nächsten Dialog wieder aufwacht). Schaden, Tod und Aufwachen laufen auf dem Host und kommen als Ereignis. Ein Treffer auf der Kopie, den der Host nicht bestätigt hat, wird vom nächsten Snapshot überschrieben.
 
-Check: ein Bandit, beide schlagen. Er fällt bei beiden, zeitnah, und steht nicht wieder auf, weil die Kopie ihn lokal für lebendig hält. Ein Dorfbewohner läuft nicht davon, während zwei Sekunden keine Pakete kommen.
+Check, zuerst zu zweit: ein Bandit, beide schlagen. Er fällt bei beiden, zeitnah, und steht nicht wieder auf, weil die Kopie ihn lokal für lebendig hält. Ein Dorfbewohner läuft nicht davon, während zwei Sekunden keine Pakete kommen. Zu dritt und zu viert zählt jeder Treffer auf der Maschine des Hosts, nicht dreifach auf den Kopien.
 
 Aufwand L. Das größte Unbekannte. Mehrere Work-Orders haben die lokale KI schon „aus“ geglaubt.
 
-### Phase 5 — Quest und Inventar als Stufen, nicht als Skriptschwall
+### Phase 5 — die Geschichte als Stufen, nicht als Skriptschwall
 
-Eine Quest-Stufe, ein Inventar-Diff, eine Dialogwahl: zuverlässig, geordnet, idempotent. Der Joiner wendet die Stufe an. Er spielt nicht 80 Profil-Nachrichten nach, die er schon hat. Die Konsole bleibt für den Text, den nur Lua sagen kann, und ihre Schlange darf eine Stufe vorziehen, wenn sie vollläuft.
+Das ist Kern, kein Rest. Sie kommt nach dem Körper, weil eine Quest in der Welt stattfindet, die Phasen 1 bis 4 erst zeigen. Eine Quest-Stufe und eine Dialogwahl: zuverlässig, geordnet, idempotent. Der Joiner wendet die Stufe an. Er spielt nicht 80 Profil-Nachrichten nach, die er schon hat. Die Konsole bleibt für den Text, den nur Lua sagen kann, und ihre Schlange darf eine Stufe vorziehen, wenn sie vollläuft. Läden und Händler werden dabei nicht auf Gleichstand gebracht.
 
-Check: eine Quest einen Schritt weiter, eine Truhe, ein Gespräch mit Abstimmung. Beides bleibt synchron, auch wenn gleichzeitig gerannt wird. Ein Toast, der zwei Sekunden zu spät wäre, darf fehlen. Ein Tod oder ein Quest-Schritt nicht.
+Check, zuerst zu zweit, dann mit drei und vier in demselben Gespräch: eine Quest einen Schritt weiter, eine Dialogwahl per Mehrheit wie bei NightCoop (mehr als die Hälfte). Eine Truhe und ein Kraut bleiben **pro Spieler**: jeder hat seine eigene Beute, die Welt des Hosts leert sie nicht für die anderen. Ein Toast, der zwei Sekunden zu spät wäre, darf fehlen. Ein Tod oder ein Quest-Schritt nicht.
 
-Aufwand L. Inhaltlich viele Einzelfälle (Truhen sind heute absichtlich getrennt, Diebstahl-Markierung hat keinen Skript-Setter). Der Transport dafür ist Phase 3.
+Aufwand L. Diebstahl-Markierung hat keinen Skript-Setter. Der Transport dafür ist Phase 3. Truhen zusammenzulegen ist keine Phase: das bleibt so.
 
 ### Phase 6 — die Leitung, erst jetzt
 
 Pose unzuverlässig, neueste gewinnt, über den Steam-Socket, der schon da ist. Ereignisse auf einem zuverlässigen Kanal. TCP bleibt der Fallback für LAN ohne Steam, mit derselben Trennung. Der Relay leitet weiter, er simuliert nicht.
 
-Check: derselbe Lauf über Steam und über LAN. Ein verlorenes Pose-Paket macht einen kleinen Sprung, keinen Stillstand. Ein verlorenes Tod-Paket kommt nach.
+Check, zuerst zu zweit über Steam und über LAN. Ein verlorenes Pose-Paket macht einen kleinen Sprung, keinen Stillstand. Ein verlorenes Tod-Paket kommt nach. Mit drei und vier Teilnehmern bleibt die Pose unzuverlässig und neueste-gewinnt; die Ereignisse bleiben zuverlässig. Der Relay leitet an alle, er simuliert nicht.
 
 Aufwand M, nachdem Phase 3 die Nachricht überhaupt als Snapshot kennt.
 
 ### Was nicht in den Phasen steht
 
 Retail ohne Modding Tools. Das Audit schätzt den Port auf eine eigene, lange Strecke, und die Konsole existiert dort nicht. Phase 3 ist die Voraussetzung, nicht ein Abfallprodukt. Lippen, Stimme, Würgegriffe, weit auseinander spielen: eigene Lücken, keine Architekturfrage. Weit auseinander bleibt falsch, solange eine Maschine die Welt simuliert. Das ist dieselbe ehrliche Grenze wie die Leine heute.
+
+Läden und Händler sind keine eigene Phase. Sie bleiben so gut, wie der jetzige Stand sie schon trägt, und werden nur angefasst, wenn sie die Geschichte, einen NPC oder einen Spieler kaputtmachen. Truhen zusammenzulegen ist ebenfalls keine Phase: jeder Spieler hat seine eigene.
 
 ---
 
@@ -323,14 +338,17 @@ Ein laufender Branch flickt die ersten drei Punkte bereits, damit die aktuelle F
 
 ---
 
-## 9. Offene Fragen
+## 9. Entschieden
 
-1. Ist „fühlt sich an wie Seamless“ zuerst der andere Heinrich und die Leute im Dorf, oder zuerst Quest, Truhe und Gespräch? Die Phasen setzen den Körper vor die Quest. Wenn die Quest zuerst weh tut, kommt Phase 5 vor Phase 2, Phase 3 bleibt dazwischen.
-2. Bleibt es bei zwei Spielern? NightCoop geht bis acht, die Leine und eine simulierte Welt sprechen für zwei, höchstens eine kleine Gruppe in derselben Stelle.
-3. Darf die nächste Fassung weiter die Modding Tools verlangen? Phase 3 ist so gebaut, dass Retail später möglich wird. Sie verlangt die Tools noch zum Prüfen.
-4. Wie viel Bruch bei einem Spiel-Patch ist recht? Anker statt RVAs sind der jetzige Vertrag. Ein Ring auf einem Frame-Hook kann öfter brechen als eine Lua-Zeile.
-5. Truhen und Kräuter sind heute absichtlich getrennt. Sollen sie in Phase 5 in die Welt des Hosts, oder bleibt „jeder plündert seine“?
-6. Dialog: Mehrheitswahl wie NightCoop, oder weiter der, der das Gespräch führt? Heute ist es näher am zweiten, mit einer Stimme des Partners.
+Lasse, November 2026. Die Phasen oben folgen dem.
+
+1. **Gebaut wird zuerst, was man jede Sekunde sieht:** der andere Spieler, dann die NPCs, dann die offene Welt. Die Geschichte ist trotzdem Kern und steht in Phase 5, nicht auf einer Wunschliste. Truhen sind kein Sync-Ziel.
+2. **Zwei Spieler sind der Hauptfall** und müssen sich am besten anfühlen. Gemessen und zuerst getestet wird zu zweit. **Drei bis vier Spieler in derselben Welt müssen mitfunktionieren**; dafür ist ausgelegt, nicht für ein offenes MMO. Nicht für mehr als vier.
+3. **Die Modding Tools bleiben** die erforderliche Spiel-Fassung, bis ein späterer Schritt etwas anderes sagt.
+4. **Native Frame-Hooks sind erlaubt.** Bricht ein Spiel-Patch sie, werden sie nachgezogen.
+5. **Truhen und Kräuter bleiben pro Spieler.** Jeder schaut persönlich in seine eigene.
+6. **Dialog ist eine Mehrheitswahl** wie bei NightCoop: eine Wahl gilt, wenn mehr als die Hälfte der Anwesenden dafür ist.
+7. **Kern, in dieser Reihenfolge:** die Spieler, die NPCs, die offene Welt, die Geschichte und die Quests. **Zweitrangig:** Läden und Händler, nur so gut wie vernünftig machbar.
 
 ---
 

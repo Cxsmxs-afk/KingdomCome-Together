@@ -8,6 +8,8 @@ That is the bar for reviews, refactors and new work. A change that keeps the cur
 
 The same rule is the opening of `docs/ARCHITEKTUR-V2.md`, which is the architecture proposal for getting there. `docs/DESIGN-AUDIT.md` is the measured audit of the body path (who decides is sound; how a body is shown is not). Do not treat either document as a licence to rewrite the campaign into an MMO.
 
+Decided for this fork: two players are the primary case and must feel the best; design and keep working for a small group of three or four in the same world, and test the pair first. The core, in order, is the players themselves, the NPCs, the open world, and the story and quests. Build what you see every second first; the story is still core, not a leftover. Chests and herbs stay per player: each person looks into their own. Dialogue is a majority vote. Shops and traders are secondary and only need to be as good as is reasonable. The Modding Tools build stays required for now. Native frame hooks are allowed and get fixed after game patches.
+
 ## What this repository is
 
 Kingdom Come: Together is an unofficial co-op mod for Kingdom Come: Deliverance II. One player hosts their world; the other joins it. The game, CryEngine and the campaign content belong to Warhorse Studios and PLAION. This project's own code is GPL-3.0-only; see `LICENSE`, `NOTICE` and `AUTHORS`.
