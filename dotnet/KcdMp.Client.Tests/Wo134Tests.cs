@@ -208,7 +208,7 @@ public class Wo134Tests
     {
         var rows = Enumerable.Range(0, 1000).Select(i => E($"stash[Chest/{i}]", Dice, i + 1, 1000, 0)).ToList();
         var calls = Wo134Rules.ApplyCalls(rows, epoch: 1234);
-        var rowCounts = calls.Select(c => System.Text.RegularExpressions.Regex.Matches(c, "stash\\[Chest/").Count).ToArray();
+        var rowCounts = calls.Select(c => System.Text.RegularExpressions.Regex.Matches(c, @"stash\[Chest/").Count).ToArray();
         Assert.Equal(rows.Count, rowCounts.Sum());
         Assert.All(rowCounts, n => Assert.InRange(n, 1, 8));
         Assert.All(calls, c => Assert.EndsWith("},1234) end", c));

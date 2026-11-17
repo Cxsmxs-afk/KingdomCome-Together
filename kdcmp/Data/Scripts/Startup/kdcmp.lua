@@ -7245,6 +7245,7 @@ function KCD2MP_W136Hold(on, ttlS, why)
     local w = KCD2MP.w136
     local now = os.clock()
     if on then
+        if not w.hold and KCD2MP_W134LedgerReset then KCD2MP_W134LedgerReset("load") end
         local ttl = tonumber(ttlS) or 240
         if not w.hold then
             w.hold, w.holdSince, w.holdWhy = true, now, tostring(why or "?")
@@ -18356,6 +18357,11 @@ function W134.ledgerReset(why)
     w.ledger = { rows = {}, head = 1, tail = 0, scheduled = false, lastAt = -1e9,
                  applied = 0, expired = 0, skipped = 0, operations = 0, held = false, epoch = KCD2MP._w134LedgerEpoch, seen = {} }
 end
+function KCD2MP_W134LedgerReset(why) W134.ledgerReset(why) end
+function KCD2MP_W134LedgerLinkHold(on)
+    if not KCD2MP.w134.ledger then W134.ledgerReset("init") end
+    KCD2MP.w134.ledger.linkHeld = on == true
+end
 function KCD2MP_W134LedgerEpoch(tok)
     local w = KCD2MP.w134
     if not w.joiner or not w.shared then KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " not-ready"); return end
@@ -18404,7 +18410,7 @@ function KCD2MP_W134LedgerDrain()
     local q = w.ledger
     if not q or q.head > q.tail then return 0 end
     local start = os.clock()
-    if start - q.lastAt < 0.05 or q.held or not player then return 0 end
+    if start - q.lastAt < 0.05 or q.held or q.linkHeld or not player then return 0 end
     if not w.joiner or not w.shared then W134.ledgerReset("role"); return 0 end
     if KCD2MP_W136Held and KCD2MP_W136Held() then return 0 end
     if KCD2MP_Wo124WhereNow and KCD2MP_Wo124WhereNow() ~= "world" then return 0 end
@@ -18430,6 +18436,7 @@ function KCD2MP_W134LedgerDrain()
             else
                 if not r[9] then
                     r[9], r[10] = before, amount -- keep until a read confirms even a partially faulted edit
+                    w.chestSess[name] = nil -- invalidate BEFORE mutation, even when its readback must wait
                     if delta > 0 then pcall(function() e.inventory:CreateItem(cls, hp, amount) end)
                     else pcall(W134.deleteClass, e, cls, amount, hp, nil) end
                 end
@@ -18541,7 +18548,7 @@ function W134.startLoop()
     -- before it belongs to a world that is gone. Found live: a host reload beside a
     -- chest diffed the old snapshot against the reloaded chest and logged a take and
     -- a put nobody made.
-    W134.forgetWorld("loop-start")
+    if not (w.ledger and w.ledger.linkHeld) then W134.forgetWorld("loop-start") end
     KCD2MP.w134LoopRunning = true
     KCD2MP._w134LoopAliveAt = os.clock()
     Script.SetTimer(w.loopMs, W134.loop)
@@ -18556,7 +18563,7 @@ function KCD2MP_W134Tick(joiner, host, shared, peers)
     w.host = host == true
     w.shared = shared == true
     w.peers = tonumber(peers) or 0
-    if not w.joiner or not w.shared then W134.ledgerReset("role") end
+    if (not w.joiner or not w.shared) and not (w.ledger and w.ledger.linkHeld) then W134.ledgerReset("role") end
     w.aliveAt = os.clock()
     pcall(W134.installPickup)
     if w.shared and (w.joiner or w.host) then W134.startLoop() end

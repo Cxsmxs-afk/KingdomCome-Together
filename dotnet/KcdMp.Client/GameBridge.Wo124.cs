@@ -65,6 +65,7 @@ public partial class GameBridge
     {
         if (_joinedWorld == on) return;
         _joinedWorld = on;
+        if (!on) _ = Wo134InvalidateLedgerAsync("left-host-world");
         if (!on) _ = ResetHostCalendarAsync("left-host-world");
         Wo122EnsureWatcher();
     }
@@ -663,8 +664,8 @@ public partial class GameBridge
             }
             if (!await PrepareHostAuthorityAsync(j))
             {
-                string why = HostAuthorityFailure.IsReason(_hostAuthorityFailureReason) ? _hostAuthorityFailureReason : HostAuthorityFailure.NotConfirmed;
-                await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, why, HostAuthorityFailure.Message(why)!);
+                string authorityReason = HostAuthorityFailure.IsReason(_hostAuthorityFailureReason) ? _hostAuthorityFailureReason : HostAuthorityFailure.NotConfirmed;
+                await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, authorityReason, HostAuthorityFailure.Message(authorityReason)!);
                 return;
             }
             if (!await PrepareHostCalendarAsync(j))
