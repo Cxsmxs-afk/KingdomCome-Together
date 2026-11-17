@@ -12,6 +12,7 @@
 #include "engine.h"
 #include "fault_guard.h"
 #include "log.h"
+#include "motion.h"
 #include "npc_drive.h"
 #include "npc_scan.h"
 #include "respawn_actions.h"
@@ -209,6 +210,12 @@ bool b_hide(uint32_t eid, bool hide) {
     return true;
 }
 
+bool fighting_player(uint32_t eid) {
+    motion::NpcCombat c;
+    if (!motion::read_npc_combat(eid, &c)) return false;
+    return wo216rules::fighting_a_player(c.opponentIsPlayer != 0, c.opponentEid && motion::is_avatar_eid(c.opponentEid));
+}
+
 bool ours(const char* name) {
     if (!name || !*name || std::strncmp(name, "kcd2mp", 6) == 0 || std::strncmp(name, "kcdmp", 5) == 0) return true;
     // WO-217 0.1 (dialog_twins): the engine's dialogue twins are its conversation's actors -- never hidden, frozen or counted here
@@ -217,7 +224,9 @@ bool ours(const char* name) {
 
 struct BBody {
     std::string name;
-    bool hidden = false;       // hidden by B (shown again when bound or when B goes off)
+    bool hidden = false;       // hidden by B (shown again when bound, when it fights a player, or when B goes off)
+    bool fightPlayer = false;  // its opponent is a player this census: the hide sweep must leave it shown
+    bool keptFight = false;    // already logged that this fight kept it on screen
     bool pausedByUs = false;
     double pauseAt = -1e9;     // the last pause we asked for (a body that runs again within 5 s is asked again at most every 2 s)
     double spawnAt = -1;       // a local spawn: when it was seen (its brain may come a frame or two later)
@@ -241,7 +250,7 @@ struct Census { uint32_t samples = 0, nonzero = 0, maxRunning = 0, lastRunning =
                 uint32_t nearNonzero = 0, maxNearRunning = 0, lastNearRunning = 0, lastNear = 0, lastDead = 0;
                 double lastCostMs = 0, maxCostMs = 0; } g_cen;
 std::atomic<uint32_t> c_bPauses{0}, c_bHides{0}, c_bShows{0}, c_bLocalSpawns{0}, c_bBreaches{0}, c_bSweepPaused{0}, c_bSweepHidden{0},
-    c_bExemptRunning{0}, c_bSpawnSeen{0};
+    c_bExemptRunning{0}, c_bSpawnSeen{0}, c_bFightKept{0};
 std::string g_lastNames;                                // the newest non-zero sample's bodies (the briefing names them)
 
 void* spawn_detour(void* es, void* params, bool autoInit) {
@@ -392,8 +401,18 @@ bool census_visit(void* e, void* ctx) {
             if (g_act) b_queue_pause(eid, b, c->now);
         }
     }
-    if (g_act && !ex && wo216rules::hide_unbound(bound, false) && wo216rules::streamable_name(b.name.size()) && !b.hidden) { b.hidden = true; g_hideQ.push_back(eid); }
-    if (bound && b.hidden) { b.hidden = false; g_showQ.push_back(eid); }
+    const bool fight = fighting_player(eid);
+    b.fightPlayer = fight;
+    if (!fight) b.keptFight = false;
+    if (g_act && !ex && wo216rules::hide_unbound(bound, false, fight) && wo216rules::streamable_name(b.name.size()) && !b.hidden) {
+        b.hidden = true; g_hideQ.push_back(eid);
+    }
+    if (g_act && fight && !bound && wo216rules::streamable_name(b.name.size()) && !b.hidden && !b.keptFight) {
+        b.keptFight = true;
+        c_bFightKept.fetch_add(1, std::memory_order_relaxed);
+        logf("WO216-BRAINS npc=%s stays shown: in a fight with a player", b.name.c_str());
+    }
+    if ((bound || fight) && b.hidden) { b.hidden = false; g_showQ.push_back(eid); }
     if (b.hidden) ++c->hidden;
     return false;
 }
@@ -512,7 +531,11 @@ void b_spawns(double now) {
         if (std::find(g_npcList.begin(), g_npcList.end(), eid) == g_npcList.end()) g_npcList.push_back(eid);
         const uint32_t k = c_bLocalSpawns.fetch_add(1, std::memory_order_relaxed) + 1;
         const bool bound = npcdrive::is_bound_eid(eid);
-        if (g_act && !bound && wo216rules::streamable_name(b.name.size()) && !b.hidden) { b.hidden = true; b_hide(eid, true); c_bHides.fetch_add(1, std::memory_order_relaxed); }   // this frame
+        const bool fight = fighting_player(eid);
+        b.fightPlayer = fight;
+        if (g_act && wo216rules::hide_unbound(bound, false, fight) && wo216rules::streamable_name(b.name.size()) && !b.hidden) {
+            b.hidden = true; b_hide(eid, true); c_bHides.fetch_add(1, std::memory_order_relaxed);
+        }   // this frame
         if (k <= 200 || k % 50 == 0)
             logf("WO216-LOCALSPAWN npc=%s kind=%s eid=0x%X: spawned by this engine on its own -- %s [n=%u]",
                  b.name.c_str(), kind == 0 ? "human" : kind == 1 ? "horse" : "animal", eid,
@@ -549,6 +572,8 @@ void b_actions() {
         const uint32_t eid = g_hideQ.back();
         g_hideQ.pop_back();
         if (npcdrive::is_bound_eid(eid)) continue;
+        auto bit = g_bodies.find(eid);
+        if (bit != g_bodies.end() && bit->second.fightPlayer) continue;   // queued before the fight started
         if (b_hide(eid, true)) c_bHides.fetch_add(1, std::memory_order_relaxed);
         --budget;
     }
@@ -618,11 +643,11 @@ int b_status(char* out, int n) {
     return std::snprintf(out, static_cast<size_t>(n),
         "B no_brains=%s role=%u active=%d (%s; spawn watch %s) samples=%u nonzero=%u max_running=%u last_running=%u near_nonzero=%u max_near_running=%u "
         "last_near_running=%u last_near=%u last_dead_with_brain=%u last_exempt_running=%u bodies=%u list=%zu "
-        "hidden=%u bound=%u census_ms=%.1f max_ms=%.1f sweep_paused=%u sweep_hidden=%u pauses=%u hides=%u shows=%u local_spawns=%u spawns_seen=%u "
+        "hidden=%u bound=%u census_ms=%.1f max_ms=%.1f sweep_paused=%u sweep_hidden=%u pauses=%u hides=%u shows=%u fight_kept=%u local_spawns=%u spawns_seen=%u "
         "breaches=%u exempt_running=%u exempt_names=%zu layer_watch=%s(%s) layers_on=%u layer_scans=%u layer_found=%u net_scans=%u net_found=%u last=%s",
         on(kBitNoBrains) ? "on" : "off", g_role.load(), g_active ? 1 : 0, g_b.why, g_spawnWhy, g_cen.samples, g_cen.nonzero, g_cen.maxRunning,
         g_cen.lastRunning, g_cen.nearNonzero, g_cen.maxNearRunning, g_cen.lastNearRunning, g_cen.lastNear, g_cen.lastDead, g_cen.lastExemptRunning, g_cen.lastBodies, g_npcList.size(), g_cen.lastHidden, g_cen.lastBound, g_cen.lastCostMs, g_cen.maxCostMs,
-        c_bSweepPaused.load(), c_bSweepHidden.load(), c_bPauses.load(), c_bHides.load(), c_bShows.load(), c_bLocalSpawns.load(), c_bSpawnSeen.load(),
+        c_bSweepPaused.load(), c_bSweepHidden.load(), c_bPauses.load(), c_bHides.load(), c_bShows.load(), c_bFightKept.load(), c_bLocalSpawns.load(), c_bSpawnSeen.load(),
         c_bBreaches.load(), c_bExemptRunning.load(), g_exempt.size(), wo217::on(wo217rules::kBitLayerWatch) ? "on" : "off", g_layerWhy, c_layerOn.load(),
         c_layerScans.load(), c_layerFound.load(), c_netScans.load(), c_netFound.load(), g_lastNames.empty() ? "-" : g_lastNames.substr(0, 300).c_str());
 }

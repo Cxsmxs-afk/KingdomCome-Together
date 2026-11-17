@@ -700,7 +700,12 @@ void tick() {
     }
     if (g_s.armed) {
         const bool ok = fault::guarded(g_callSite, [] { tick_sampler(); });
-        if (!ok) { g_s.armed = false; logf("WO203B-CAMPOLL sampler FAULTED -- disarmed"); }
+        // One bad camera read used to disarm the sampler for the rest of the talk (live: head_sent stayed 0
+        // after wo203cam::read faulted). Skip the frame. The next one tries again.
+        if (!ok) {
+            static uint32_t told = 0;
+            if (told++ < 5) logf("WO203B-CAMPOLL sampler skipped a faulted frame -- still armed");
+        }
     }
 }
 

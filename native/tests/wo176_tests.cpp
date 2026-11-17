@@ -65,8 +65,8 @@ int wo176_tests(int* passed) {
     WCHECK(wo176rules::shield_wanted(false, 10.0, 12.0) && !wo176rules::shield_wanted(false, 10.0, 10.0 + wo176rules::kShieldOffS),
            "it stays for kShieldOffS after the last story actor was near, then goes");
     WCHECK(!wo176rules::shield_wanted(false, 0.0, 10.0), "never near -> never shielded");
-    WCHECK(wo176rules::kShieldContextCount == 2 && std::strcmp(wo176rules::kShieldContexts[0], "combat_invisible") == 0 &&
-           std::strcmp(wo176rules::kShieldContexts[1], "combat_alwaysWithdrawSkirmish") == 0, "the game's own contexts (Libs/Tables/ai/ScriptContext.xml)");
+    WCHECK(wo176rules::kShieldContextCount == 1 && std::strcmp(wo176rules::kShieldContexts[0], "combat_alwaysWithdrawSkirmish") == 0,
+           "the shield withdraws the figure; it does not set combat_invisible");
     // ---- A1: WO-173's real hit -- the arranged fight comes first, whatever the switches, and routes the blow nowhere
     {
         wo173rules::Pre p{};

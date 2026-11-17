@@ -37,8 +37,10 @@ inline constexpr int kMaxScan = 96;          // at most this many actors read pe
 inline constexpr double kAftermathS = 60.0;
 // While a story fight is within kScanRadiusM of a figure, the figure carries the game's own "not a combat target" and "always leave a
 // skirmish" contexts (only the counts this module wrote are cleared); off again once no story actor has been near it for kShieldOffS.
-inline constexpr const char* kShieldContexts[] = { "combat_invisible", "combat_alwaysWithdrawSkirmish" };
-inline constexpr int kShieldContextCount = 2;
+// combat_invisible hid the partner's figure for minutes in a live fight (WO176-SHIELD). The withdraw
+// context keeps the figure out of the story skirmish without taking it off the screen.
+inline constexpr const char* kShieldContexts[] = { "combat_alwaysWithdrawSkirmish" };
+inline constexpr int kShieldContextCount = 1;
 inline constexpr double kShieldOffS = 5.0;
 
 enum class Why : uint8_t { None = 0, Context = 1, Name = 2, Aftermath = 3 };

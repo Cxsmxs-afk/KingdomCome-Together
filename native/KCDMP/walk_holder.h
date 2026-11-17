@@ -57,22 +57,46 @@ inline double adaptive_delay_s(double /*bindDelayS*/, double gapS) {
     return want;
 }
 
-/// One shown step. Speed may rise by at most 2.5 m/s. A gap of 5 m or more
-/// is a teleport and is left alone.
+/// One shown step. The body may go up to 1.2 m/s faster than the pace it
+/// already shows, and never faster than a sprint. A hitch is charged as
+/// 50 ms, so one late frame cannot spend half a metre. Eight metres or more
+/// is a real relocation (a fast travel, a spawn) and is left alone.
+constexpr float kCatchMps = 1.2f;
+constexpr float kMaxShowMps = 6.5f;
+constexpr float kHitchDtS = 0.05f;
+constexpr float kPlaceM = 8.0f;
 inline void limit_step(float fromX, float fromY, float& x, float& y, float& pace, float dt) {
     if (!(dt > 0.f)) return;
-    if (dt < 0.016f) dt = 0.016f;
     const float dx = x - fromX, dy = y - fromY;
     const float dist = std::sqrt(dx * dx + dy * dy);
-    const float allow = (pace + 2.5f) * dt;
-    if (dist > allow && dist < 5.f) {
+    if (!(dist < kPlaceM)) return;
+    float stepDt = dt;
+    if (stepDt < 0.016f) stepDt = 0.016f;
+    if (stepDt > kHitchDtS) stepDt = kHitchDtS;
+    float cap = pace + kCatchMps;
+    if (cap > kMaxShowMps) cap = kMaxShowMps;
+    if (!(cap > kCatchMps)) cap = kCatchMps;
+    const float allow = cap * stepDt;
+    if (dist > allow) {
         const float u = allow / dist;
         x = fromX + dx * u;
         y = fromY + dy * u;
-        pace += 2.5f;
-    } else if (dist < 5.f) {
+        pace = cap;
+    } else {
         pace = dist / dt;
+        if (pace > kMaxShowMps) pace = kMaxShowMps;
     }
+}
+
+/// The gait follows the host, but a single late sample must not jump it
+/// (the live run: the partner's gait leapt to 5.6 m/s). At most 3 m/s of
+/// change per second. A reading over 9 m/s is a placement, not a pace.
+inline float smooth_gait(float prev, float want, float dt) {
+    if (!(want < 9.f) || !(dt > 0.f)) return prev;
+    const float step = 3.0f * dt;
+    if (want > prev + step) return prev + step;
+    if (want < prev - step) return prev - step;
+    return want;
 }
 
 /// Height along a segment. A step (at least 8 cm, and steeper than the
@@ -90,10 +114,14 @@ inline float segment_z(float az, float bz, float horiz, float t) {
     return az + dz * t;
 }
 
-/// The newest sample is further behind the fixed clock than one catch-up.
-/// Show that sample now. Do not keep playing the backlog and do not extrapolate.
+/// A sample this old is a load or a fast travel: show it. A late packet
+/// (the live run: 1.15 s, which used to jump the body onto the newest
+/// sample) keeps the clock. The step limit walks the gap off.
+constexpr double kPlaceAgeS = 4.0;
+inline bool place_now(double newestAgeS) { return newestAgeS > kPlaceAgeS; }
 inline bool snap_catchup(double newestAgeS, double delayS) {
-    return newestAgeS > delayS + kSnapBehindS;
+    (void)delayS;
+    return place_now(newestAgeS);
 }
 
 } // namespace kcdmp::walkhold

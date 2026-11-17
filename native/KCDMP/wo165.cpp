@@ -26,6 +26,7 @@
 #include "hits.h"
 #include "local_state.h"
 #include "log.h"
+#include "npc_drive.h"
 #include "rttr_abi.h"
 #include "wo173.h"
 
@@ -218,9 +219,10 @@ Result replay(const Request& rq) {
         void* aEnt = engine::entity_by_id(rq.attackerEid);
         const float d = (aEnt && engine::entity_world_pos(aEnt, ap)) ? std::sqrt((ap[0] - pos[0]) * (ap[0] - pos[0]) + (ap[1] - pos[1]) * (ap[1] - pos[1])) : -1.0f;
         const float limit = wo166::swing_reach_limit(rq.attackerEid);
-        if (d >= 0.0f && !wo178rules::in_reach(d, limit)) {
-            logf("WO178-REACH player blow=missed dist_m=%.2f reach_m=%.2f (the swing's contact distance + slack) attacker=0x%X -- out of reach on this screen: "
-                 "nothing applied, the host is told 'missed'", d, limit, rq.attackerEid);
+        const float age = static_cast<float>(npcdrive::pose_lag_s(rq.attackerEid));
+        if (d >= 0.0f && wo178rules::reach_miss(d, limit, age)) {
+            logf("WO178-REACH player blow=missed dist_m=%.2f reach_m=%.2f pose_age_s=%.2f (the swing's contact distance + slack) attacker=0x%X -- out of reach on this screen: "
+                 "nothing applied, the host is told 'missed'", d, limit, age, rq.attackerEid);
             res.reason = kOutOfReach; c_refused.fetch_add(1); return res;
         }
     }

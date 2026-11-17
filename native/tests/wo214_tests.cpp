@@ -62,6 +62,12 @@ int wo214_tests(int* passed) {
     WCHECK(stale_action(true, true, false, 5.0, 0.0, 0.0, true) == Stuck::No, "a posture (not a combat row) while its host NPC is not in a base: left");
     WCHECK(combat_fragment_name("CombatHitGen") && combat_fragment_name("CombatAttackGen") && !combat_fragment_name("ReadingBook") && !combat_fragment_name("Lying"),
            "a combat row is known by its fragment's name -- the owner's posture installs run through the combat manager too");
+    WCHECK(combat_pose_name("CombatAttackGen") && combat_pose_name("CombatBlock") && combat_pose_name("DrawWeapon") && combat_pose_name("Guard")
+           && !combat_pose_name("MotionIdle") && !combat_pose_name("IdleToMove"),
+           "a swing, a block, a draw and a guard are combat poses; a walk and an idle are not");
+    WCHECK(combat_pose_holds("CombatAttackGen", true, false) && combat_pose_holds("CombatBlock", false, true) && !combat_pose_holds("MotionIdle", true, true),
+           "an attack or a block stays when a walk arrives or the action queue is full; an idle does not");
+    WCHECK(!combat_pose_holds("CombatAttackGen", false, false), "a combat pose yields to something that is not a walk and not a full queue");
     WCHECK(stale_action(false, true, false, 249.0, 249.0, 1e9, true) == Stuck::No, "the twin (combat_end off): the field's 249 s behind the action stays");
     WCHECK(stoppable_class(true) && !stoppable_class(false),
            "only the combat manager's own action is stopped -- never the engine's walk transition (d3: 35 stops on one body, its movement system queued it again)");

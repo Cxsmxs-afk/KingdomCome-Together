@@ -13072,9 +13072,20 @@ function KCD2MP_GhostCombat(id, evt)
         KCD2MP.ghostWeaponDrawn[id] = wantDrawn or nil
         if ghost.entity.human then
             if wantDrawn then
-                -- Confirmed live (WO-16/17): draws the ghost's real equipped
-                -- weapon item, when the appearance layer has given it one.
-                pcall(function() ghost.entity.human:DrawWeapon() end)
+                -- An empty hand playing DrawWeapon is the live bug: the anim
+                -- runs, the weapon arrives on the hand line a moment later,
+                -- and WO214-HAND then holsters and draws again. Wait for that
+                -- class. A hand that already holds something draws now.
+                local empty = true
+                if KCD2MP.w136 and KCD2MP.w136.handClass then
+                    pcall(function() empty = KCD2MP.w136.handClass(ghost.entity, 0) == nil end)
+                end
+                local handsOn = KCD2MP_W214On and KCD2MP_W214On("figure_hands")
+                if KCD2MP_W214DrawWaits(handsOn, empty) then
+                    mp_log("CombatViz: ghost " .. id .. " draw waits for the weapon class")
+                else
+                    pcall(function() ghost.entity.human:DrawWeapon() end)
+                end
             else
                 pcall(function() ghost.entity.human:HolsterWeapon() end)
             end
@@ -35196,6 +35207,11 @@ do
         return true
     end
     System.AddCCommand("mp_w214_status", "KCD2MP_W214Status()", "WO-214: every WO-214 switch and the DLL's numbers")
+
+    -- An empty hand must not play the draw. The class arrives on the hand line and is equipped first.
+    function KCD2MP_W214DrawWaits(handsOn, handEmpty)
+        return handsOn and handEmpty and true or false
+    end
 
     -- ---- F (figure_hands, both roles): the partner's figure holds the weapon the partner holds ----
     -- The field: the joiner drew; the host's figure of him ran its draw ("CombatViz: ghost 1 drew weapon") and showed no weapon -- the
