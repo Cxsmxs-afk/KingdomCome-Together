@@ -88,11 +88,51 @@ public static class Wo134Rules
         public int R { get; set; }              // the container's restock period (days), 0 = never
     }
 
+    // A patch is identified by its item class and centimetre position, never the
+    // transient PickableArea entity name. Herb records remain local to a player;
+    // the host's chest delta protocol intentionally does not transmit them.
+    public sealed record HerbEntry(string Cls, float X, float Y, float Z, int N, long T)
+    {
+        public string Key => string.Create(CultureInfo.InvariantCulture, $"{Cls}/{X:F2}/{Y:F2}/{Z:F2}");
+    }
+    public static bool ValidHerb(HerbEntry e) => TryClass(e.Cls, out _) && float.IsFinite(e.X) && float.IsFinite(e.Y) && float.IsFinite(e.Z)
+        && Math.Abs(e.X) < 100000 && Math.Abs(e.Y) < 100000 && Math.Abs(e.Z) < 100000 && e.N > 0 && e.N <= 100000 && e.T >= 0;
+    public static HerbEntry? ParseHerbEvent(string text)
+    {
+        var f = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (f.Length != 6 || !TryCoord(f[1], out var x) || !TryCoord(f[2], out var y) || !TryCoord(f[3], out var z)
+            || !TryAmount(f[4], out var n) || !long.TryParse(f[5], NumberStyles.None, CultureInfo.InvariantCulture, out var t)) return null;
+        var e = new HerbEntry(f[0].ToLowerInvariant(), x, y, z, n, t);
+        return ValidHerb(e) ? e : null;
+    }
+    public static List<string> HerbCalls(IReadOnlyList<HerbEntry> rows, long epoch)
+    {
+        var calls = new List<string> { $"if KCD2MP_W134HerbsReset then KCD2MP_W134HerbsReset({epoch}) end" };
+        foreach (var batch in rows.Chunk(8))
+        {
+            var values = batch.Select(e => string.Create(CultureInfo.InvariantCulture,
+                $"{{\"{e.Cls}\",{F(e.X)},{F(e.Y)},{F(e.Z)},{e.N},{e.T}}}"));
+            calls.Add("if KCD2MP_W134HerbsRestore then KCD2MP_W134HerbsRestore({" + string.Join(',', values)
+                + "}," + epoch.ToString(CultureInfo.InvariantCulture) + ") end");
+        }
+        calls.Add($"if KCD2MP_W134HerbsReady then KCD2MP_W134HerbsReady({epoch}) end");
+        return calls;
+    }
+
     /// <summary>A chest ledger: what one player took out of (or put into) which container, in one world.</summary>
     public sealed class Ledger
     {
         public const int MaxEntries = 4000;
         public List<Entry> Entries { get; set; } = [];
+        public List<HerbEntry> Herbs { get; set; } = [];
+
+        public void AddHerb(HerbEntry e)
+        {
+            if (!ValidHerb(e)) return;
+            Herbs.RemoveAll(x => x.Key == e.Key);
+            Herbs.Add(e);
+            if (Herbs.Count > MaxEntries) Herbs.RemoveRange(0, Herbs.Count - MaxEntries);
+        }
 
         public void Add(Entry e)
         {
@@ -125,7 +165,9 @@ public static class Wo134Rules
             try
             {
                 var l = JsonSerializer.Deserialize<Ledger>(json) ?? new Ledger();
-                l.Entries.RemoveAll(e => !Valid(e));
+                l.Entries ??= []; l.Herbs ??= [];
+                l.Entries.RemoveAll(e => e is null || !Valid(e));
+                l.Herbs.RemoveAll(e => e is null || !ValidHerb(e));
                 return l;
             }
             catch (JsonException) { return new Ledger(); }
@@ -158,11 +200,11 @@ public static class Wo134Rules
     /// Each row keeps its own time and restock period: the mod leaves an expired
     /// one to the engine's restock.
     /// </summary>
-    public static List<Entry> JoinRows(Ledger host, Ledger joiner)
+    public static List<Entry> JoinRows(Ledger host, Ledger joiner, IReadOnlySet<string>? sharedQuestClasses = null)
     {
         var o = new List<Entry>();
-        foreach (var e in host.Entries) o.Add(new Entry { C = e.C, Cls = e.Cls, N = e.N, Hp = e.Hp, T = e.T, R = e.R });
-        foreach (var e in joiner.Entries) o.Add(new Entry { C = e.C, Cls = e.Cls, N = -e.N, Hp = e.Hp, T = e.T, R = e.R });
+        foreach (var e in host.Entries.Where(e => sharedQuestClasses?.Contains(e.Cls) != true)) o.Add(new Entry { C = e.C, Cls = e.Cls, N = e.N, Hp = e.Hp, T = e.T, R = e.R });
+        foreach (var e in joiner.Entries.Where(e => sharedQuestClasses?.Contains(e.Cls) != true)) o.Add(new Entry { C = e.C, Cls = e.Cls, N = -e.N, Hp = e.Hp, T = e.T, R = e.R });
         return o;
     }
 

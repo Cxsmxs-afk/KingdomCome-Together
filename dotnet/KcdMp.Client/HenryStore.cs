@@ -166,7 +166,7 @@ public sealed class HenryStore
     /// Then the world is pruned to the pairs of its newest <see cref="KeepPerWorld"/>
     /// host saves, at most <see cref="KeepPerHostSave"/> each, oldest first.
     /// </summary>
-    public Snapshot Store(string tag, WhsSave.HenryParts parts, string md5, string source, string detail)
+    public Snapshot Store(string tag, WhsSave.HenryParts parts, string md5, string source, string detail, string? lootLedgerJson = null)
     {
         CheckTag(tag);
         md5 = md5.ToLowerInvariant();
@@ -176,6 +176,7 @@ public sealed class HenryStore
         {
             var dir = WorldDir(tag);
             Directory.CreateDirectory(dir);
+            if (lootLedgerJson is not null) parts.PrivateLootLedgerJson = lootLedgerJson;
             var data = WhsSave.SerializeBlock(parts);
             var t = _now();
             string name;
@@ -223,16 +224,23 @@ public sealed class HenryStore
         lock (_gate)
         {
             var p = ChestLedgerPath(s);
+            // Validate before publishing; read back the exact sidecar paired to
+            // this Henry instead of relying on an eventual current-world file.
+            using var parsed = System.Text.Json.JsonDocument.Parse(json);
             File.WriteAllText(p + ".part", json);
             File.Move(p + ".part", p, overwrite: true);
+            if (File.ReadAllText(p) != json) throw new IOException("private loot ledger readback mismatch");
         }
     }
 
-    /// <summary>The ledger stored with this snapshot, or null (a snapshot from before WO-134: none).</summary>
+    /// <summary>The hash-protected embedded ledger, or the sidecar of a valid legacy v1 snapshot.</summary>
     public string? LoadChestLedger(Snapshot s)
     {
+        var parts = Load(s);
+        if (parts is null) return null; // a damaged/newer block must never borrow a sidecar
+        if (parts.PrivateLootLedgerJson is string json) return json;
         try { var p = ChestLedgerPath(s); return File.Exists(p) ? File.ReadAllText(p) : null; }
-        catch (IOException) { return null; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
     }
 
     private void Prune(string tag)

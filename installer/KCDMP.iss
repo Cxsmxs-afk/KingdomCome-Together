@@ -405,7 +405,7 @@ end;
 
   A foreign kdcmp still gets the full RemoveModFolder after the explicit ask:
   keeping half of somebody else's mod would be worse than replacing it. }
-procedure PruneDirTo(const Dir: String; const KeepFile, KeepFile2: String);
+procedure PruneDirTo(const Dir: String; const KeepFile, KeepFile2, KeepFile3: String);
 var
   FindRec: TFindRec;
   Full: String;
@@ -418,7 +418,8 @@ begin
       Full := Dir + '\' + FindRec.Name;
       if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
         DelTree(Full, True, True, True)
-      else if (CompareText(FindRec.Name, KeepFile) <> 0) and (CompareText(FindRec.Name, KeepFile2) <> 0) then
+      else if (CompareText(FindRec.Name, KeepFile) <> 0) and (CompareText(FindRec.Name, KeepFile2) <> 0) and
+              (CompareText(FindRec.Name, KeepFile3) <> 0) then
       begin
         { Clear read-only first, for the same reason [Files] carries
           overwritereadonly: a flagged file must not stop the install. }
@@ -449,12 +450,14 @@ begin
       begin
         if CompareText(FindRec.Name, 'Data') = 0 then
           { WO-148: kdcmp_keys.pak is ours too (built here from the game's own files); kept so a
-            failed rebuild after the copy leaves the previous keys working. }
-          PruneDirTo(Full, 'kdcmp.pak', 'kdcmp_keys.pak')
+            failed rebuild after the copy leaves the previous keys working. F4's local delta is
+            revalidated against its source assets by the launcher before the next game starts. }
+          PruneDirTo(Full, 'kdcmp.pak', 'kdcmp_keys.pak', 'kdcmp_facial_fallback.pak')
         else
           DelTree(Full, True, True, True);
       end
-      else if CompareText(FindRec.Name, 'mod.manifest') <> 0 then
+      else if (CompareText(FindRec.Name, 'mod.manifest') <> 0) and
+              (CompareText(FindRec.Name, 'kdcmp_facial_fallback.state.xml') <> 0) then
       begin
         ClearReadOnly(Full);
         DeleteFile(Full);

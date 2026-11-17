@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 namespace KcdMp.Client;
 
@@ -43,6 +44,8 @@ public static partial class WhsSave
         public string Build = "";
         public uint? Seed;
         public string Origin = OriginSave;
+        /// <summary>Private chest/herb ownership at this snapshot. Only stored in our block, never spliced into a game save.</summary>
+        public string? PrivateLootLedgerJson;
     }
 
     internal static Node RecordNode(byte[] rec) =>
@@ -73,25 +76,44 @@ public static partial class WhsSave
     // ------------------------------------------------------------------ the stored block
 
     private static readonly byte[] BlockMagic = "KCDMPHB1"u8.ToArray();
-    private const int BlockVersion = 1;
+    public const int MaxPrivateLootLedgerBytes = 4 * 1024 * 1024;
+    private static readonly UTF8Encoding BlockUtf8 = new(false, throwOnInvalidBytes: true);
+
+    private static byte[] PrivateLootLedgerBytes(string json)
+    {
+        try
+        {
+            int size = BlockUtf8.GetByteCount(json);
+            if (size == 0 || size > MaxPrivateLootLedgerBytes) throw new InvalidDataException("Henry block private loot ledger length out of range");
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) throw new InvalidDataException("Henry block private loot ledger is not an object");
+            return BlockUtf8.GetBytes(json);
+        }
+        catch (Exception ex) when (ex is JsonException or EncoderFallbackException)
+        {
+            throw new InvalidDataException("Henry block private loot ledger is not valid UTF-8 JSON", ex);
+        }
+    }
 
     /// <summary>
     /// <code>
-    ///   "KCDMPHB1" [u32 version=1] [str build] [u8 hasSeed][u32 seed] [str origin]
+    ///   "KCDMPHB1" [u32 version=1|2] [str build] [u8 hasSeed][u32 seed] [str origin]
     ///   [u32 len][player_henry record]
     ///   [u8 6] { [i32 len (-1 = the host's block stays)][payload] } x6
     ///   [u32 n] { [u16 len][0x05AD entry] } x n
+    ///   version 2 only: [u32 UTF-8 JSON length][private loot ledger]
     ///   [32-byte SHA-256 of everything before]
     /// </code>
     /// No save header, no world: nothing but Henry.
     /// </summary>
     public static byte[] SerializeBlock(HenryParts p)
     {
+        byte[]? loot = p.PrivateLootLedgerJson is string json ? PrivateLootLedgerBytes(json) : null;
         using var ms = new MemoryStream();
         using (var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
         {
             w.Write(BlockMagic);
-            w.Write(BlockVersion);
+            w.Write(loot is null ? 1 : 2);
             void Str(string s) { var b = Encoding.UTF8.GetBytes(s); w.Write((ushort)b.Length); w.Write(b); }
             Str(p.Build);
             w.Write((byte)(p.Seed is null ? 0 : 1));
@@ -107,6 +129,7 @@ public static partial class WhsSave
             }
             w.Write(p.KeyEntries.Count);
             foreach (var e in p.KeyEntries) { w.Write((ushort)e.Length); w.Write(e); }
+            if (loot is not null) { w.Write(loot.Length); w.Write(loot); }
         }
         var body = ms.ToArray();
         var o = new byte[body.Length + 32];
@@ -128,7 +151,7 @@ public static partial class WhsSave
         {
             r.ReadBytes(BlockMagic.Length);
             int ver = r.ReadInt32();
-            if (ver != BlockVersion) throw new InvalidDataException($"Henry block version {ver}");
+            if (ver is not (1 or 2)) throw new InvalidDataException($"Henry block version {ver}");
             string Str() => Encoding.UTF8.GetString(r.ReadBytes(r.ReadUInt16()));
             p.Build = Str();
             bool hasSeed = r.ReadByte() == 1;
@@ -151,6 +174,16 @@ public static partial class WhsSave
             int k = r.ReadInt32();
             if (k < 0 || k > 100000) throw new InvalidDataException("Henry block key count out of range");
             for (int i = 0; i < k; i++) p.KeyEntries.Add(r.ReadBytes(r.ReadUInt16()));
+            if (ver == 2)
+            {
+                int size = r.ReadInt32();
+                if (size < 1 || size > MaxPrivateLootLedgerBytes) throw new InvalidDataException("Henry block private loot ledger length out of range");
+                var loot = r.ReadBytes(size);
+                if (loot.Length != size) throw new InvalidDataException("Henry block private loot ledger truncated");
+                try { p.PrivateLootLedgerJson = BlockUtf8.GetString(loot); }
+                catch (DecoderFallbackException ex) { throw new InvalidDataException("Henry block private loot ledger is not valid UTF-8", ex); }
+                PrivateLootLedgerBytes(p.PrivateLootLedgerJson);
+            }
             if (r.BaseStream.Position != r.BaseStream.Length) throw new InvalidDataException("Henry block has trailing bytes");
         }
         catch (EndOfStreamException) { throw new InvalidDataException("Henry block truncated"); }

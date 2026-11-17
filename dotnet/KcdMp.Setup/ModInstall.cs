@@ -57,6 +57,8 @@ public static class ModInstall
     public const string StagedRel = @"mod\kdcmp";
     /// <summary>Built by the agent from the player's own game files (WO-148); ours, kept across a re-place.</summary>
     public const string KeysPak = @"Data\kdcmp_keys.pak";
+    /// <summary>Generated locally from this installation's validator evidence and source ADB; kept across a re-place.</summary>
+    public const string FacialPak = @"Data\kdcmp_facial_fallback.pak";
 
     public static string TargetDir(string moddingToolsRoot) => Path.Combine(moddingToolsRoot, "Mods", "kdcmp");
 
@@ -168,7 +170,7 @@ public static class ModInstall
                     return new PlaceResult(false, $"the installer's copy of {e.Rel} is {why}");
 
             Directory.CreateDirectory(Path.Combine(target, "Data"));
-            Prune(target, mods.Select(m => m.Rel).Append(KeysPak).ToList());
+            Prune(target, mods.Select(m => m.Rel).Append(KeysPak).Append(FacialPak).Append(FacialFallback.StateName).ToList());
 
             foreach (var e in mods)
             {

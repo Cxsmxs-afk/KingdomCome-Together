@@ -45,7 +45,7 @@ public partial class GameBridge
     private long _w134LedgerGeneration;
     private long _w134GameLedgerEpoch;
     private uint _w134GameLedgerWorld;
-    private sealed record LedgerWork(string Tag, uint World, long Generation, List<Wo134Rules.Entry> Rows)
+    private sealed record LedgerWork(string Tag, uint World, long Generation, List<Wo134Rules.Entry> Rows, List<Wo134Rules.HerbEntry> Herbs)
     {
         public List<string>? Calls;
         public int Next;
@@ -196,6 +196,9 @@ public partial class GameBridge
                     foreach (byte g in Wo134Peers())
                         _ = Wo134SendAsync(Protocol.LootHostUp, g, Protocol.LootHostItemGone, 0, string.Join(' ', f));
                 return;
+            case "w134_herb":
+                Wo134OnHerbEvent(arg ?? "");
+                return;
             // ---- both: chests
             case "w134_chest":     // <container> <cls> <n> <hp> <worldT> <restockDays>
                 Wo134OnChestEvent(arg ?? "");
@@ -232,10 +235,17 @@ public partial class GameBridge
                 _w134Worn[f[2]] = (now, worn);
             }
         }
+        var targets = peer == 0 ? Wo134Peers() : [peer];
+        if (items.Count > 0 && worn is null)
+        {
+            // Unknown REST equipment is never an empty outfit. Re-read the full
+            // native Worn set and refresh it on every affected copy; retries are paced by W216.
+            worn = await Wo216RefreshFullOutfitAsync(f[2], targets);
+            if (worn is not null) _w134Worn[f[2]] = (Environment.TickCount64, worn);
+        }
         var marked = Wo134Rules.MarkWorn(items, worn);
         string text = $"{f[2]} {f[3]} {f[4]} {f[5]} {f[6]} {Wo134Rules.FormatItems(marked)}";
         uint tok = uint.TryParse(f[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint t) ? t : 0;
-        var targets = peer == 0 ? Wo134Peers() : [peer];
         foreach (byte g in targets) await Wo134SendAsync(Protocol.LootHostUp, g, Protocol.LootHostBodyState, tok, text);
         if (f[5] == "1")
             Console.WriteLine($"MP-WO134 host: body {f[2]} ({f[3]}) -> {(peer == 0 ? $"every joiner ({targets.Count})" : $"ghost {peer}")}: parts={f[6]} worn_known={B(worn is not null)}");
@@ -339,6 +349,22 @@ public partial class GameBridge
             Wo134HostLedgerFor(tag).Add(e);
             _w134HostDirty = true;
             Console.WriteLine($"MP-WO134 chests: host {(e.N > 0 ? "took" : "put")} {Math.Abs(e.N)} x {e.Cls[..8]} {(e.N > 0 ? "from" : "into")} {e.C} (world {tag}; ledger {_w134HostLedger!.Entries.Count})");
+        }
+    }
+
+    private void Wo134OnHerbEvent(string arg)
+    {
+        var e = Wo134Rules.ParseHerbEvent(arg);
+        if (e is null) return;
+        lock (_w134Gate)
+        {
+            if (_jj is not null || _rewinding || _rejoinPending || _w134ApplyTag is not null || Wo136Holding) return;
+            if (_joinedWorld && _joinedTag is not null) _w134JoinerLedger.AddHerb(e);
+            else if (_hostWorldSeed is uint seed)
+            {
+                Wo134HostLedgerFor(WhsSave.SeedTag(seed)).AddHerb(e);
+                _w134HostDirty = true;
+            }
         }
     }
 
@@ -457,13 +483,19 @@ public partial class GameBridge
         }
     }
 
+    // Captured before Henry publication and embedded in the same hashed block.
+    private string Wo134SnapshotLedgerJson()
+    {
+        lock (_w134Gate) return _w134JoinerLedger.ToJson();
+    }
+
     /// <summary>WO-125: a snapshot was stored -- its chest ledger goes beside it.</summary>
     private void Wo134OnSnapshotStored(HenryStore.Snapshot snap)
     {
         try
         {
             string json;
-            lock (_w134Gate) json = _w134JoinerLedger.ToJson();
+            json = _henry.LoadChestLedger(snap) ?? Wo134SnapshotLedgerJson();
             _henry.StoreChestLedger(snap, json);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -501,21 +533,24 @@ public partial class GameBridge
         {
             if (_w134ApplyTag is not string t) return;
             hostIn = _w134RxLedger is not null;
-            bool late = (DateTime.UtcNow - _w134ApplySinceUtc).TotalSeconds > 15;
-            if (!hostIn && !late && !timeout) return;
+            // Never permanently apply only half the ownership equation. The
+            // host ledger is reliable and may be delayed by save/menu holds.
+            if (!hostIn) return;
             tag = t;
             world = _w206.World;
             generation = Interlocked.Read(ref _w134LedgerGeneration);
-            _w134ApplyTag = null;
             stamp = _w134RxStamp;
             // WO-206 E: a host ledger of a world the host has since left (it loaded after sending it) is not applied
-            if (hostIn && !Wo206Admit(Wo206Cat.Loot, stamp, $"the host's chest ledger ({_w134RxLedger!.Entries.Count} entries)")) { _w134RxLedger = null; hostIn = false; }
+            if (!Wo206Admit(Wo206Cat.Loot, stamp, $"the host's chest ledger ({_w134RxLedger!.Entries.Count} entries)")) { _w134RxLedger = null; return; }
+            _w134ApplyTag = null;
             hostLedger = _w134RxLedger ?? new Wo134Rules.Ledger();
             ownLedger = _w134JoinerLedger.Clone();
-            rows = Wo134Rules.JoinRows(hostLedger, ownLedger);
+            // Quest-item creation/removal belongs to the host graph (F6),
+            // never to a private chest correction which the engine refuses.
+            rows = Wo134Rules.JoinRows(hostLedger, ownLedger, _questClasses?.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase));
         }
         if (!hostIn) Console.WriteLine("MP-WO134 chests: the host's ledger did not arrive within 15 s -- only this joiner's own takes are applied");
-        var work = new LedgerWork(tag, world, generation, rows);
+        var work = new LedgerWork(tag, world, generation, rows, ownLedger.Herbs);
         lock (_w134Gate)
         {
             if (_w206.World != world || generation != Interlocked.Read(ref _w134LedgerGeneration)) return;
@@ -548,7 +583,9 @@ public partial class GameBridge
                     if (!Wo134LedgerCurrent(work)) return;
                     _w134GameLedgerWorld = work.World;
                     Interlocked.Exchange(ref _w134GameLedgerEpoch, epoch);
-                    work.Calls = Wo134Rules.ApplyCalls(work.Rows, epoch: epoch, serial: work.Generation);
+                    work.Calls = Wo134Rules.HerbCalls(work.Herbs, epoch);
+                    work.Calls.AddRange(Wo134Rules.ApplyCalls(work.Rows, epoch: epoch, serial: work.Generation));
+                    work.Calls.Add($"if KCD2MP_W134OwnershipReady then KCD2MP_W134OwnershipReady({epoch}) end");
                 }
             }
             while (work.Next < work.Calls.Count)
@@ -573,6 +610,8 @@ public partial class GameBridge
     private async Task Wo134InvalidateLedgerAsync(string why)
     {
         Wo134ResetLedgerGeneration();
+        Wo217LootLiveChanged(0);
+        try { await _transport.ExecuteNowAsync("if KCD2MP_W217LootReset then KCD2MP_W217LootReset() end"); } catch { }
         try { await _transport.ExecuteNowAsync("if KCD2MP_W134LedgerReset then KCD2MP_W134LedgerReset(\"load-or-leave\") end"); }
         catch (Exception ex) { Console.WriteLine($"MP-WO134 ledger reset ({why}): {ex.GetType().Name}"); }
     }

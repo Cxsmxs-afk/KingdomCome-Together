@@ -112,7 +112,7 @@ public static class WorkspaceSetupFlow
 /// The one elevated step: KcdMpSetup.exe link, started through UAC. The
 /// helper is a windowless (WinExe) build, so even elevated nothing appears
 /// but Windows' own prompt; it re-derives which files to link from the two
-/// install roots itself and touches nothing but those *.pak paths.
+/// install roots itself and touches only the expected game pak and facial-data paths.
 /// </summary>
 public static class ElevatedLinker
 {

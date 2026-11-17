@@ -849,13 +849,14 @@ public partial class GameBridge
         // 5. Ready
         if (Wo206JoinGone(j, "before Ready") || j.Phase != "post-load") return;
         uint readySeq = _joinReceivedSeq;
+        // Prepare ownership reception BEFORE Ready: the host may answer immediately.
+        if (j.WorldTag is string wt0) Wo134AfterReady(wt0);
         if (!await SendJoinerReadyAsync("wo124"))
         {
             await LeaveAfterFailedJoinAsync(j, Protocol.JoinAbortIo, "ready-failed", "Your host could not confirm the join.");
             return;
         }
         if (Wo206JoinGone(j, "after Ready") || j.Phase != "post-load") return;
-        if (j.WorldTag is string wt0) Wo134AfterReady(wt0);   // WO-134: the joiner's chest ledger (restored with the Henry), then the host's
         if (j.WorldTag is string wt && j.SplicedParts is { } sp) Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, readySeq);   // WO-125: the join save's matched pair
         JoinerJoin[] completed;
         lock (_joinGate)

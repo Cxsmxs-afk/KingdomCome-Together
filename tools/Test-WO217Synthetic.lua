@@ -167,7 +167,7 @@ local function world()
     w.pendingOpen = {}; w.sessions = {}; w.partial = {}; w.stash = {}; w.itemReq = {}; w.hostTaken = {}; w.hostVerify = {}
     w.bodySig = {}; w.chestSess = {}
     w.bodies, w.items, w.chests = true, true, true
-    W217.L.sess = {}; W217.L.hostLive = {}; W217.L.hostEsc = {}; W217.L.partial = {}; W217.L.fellBack = {}; W217.L.active = 0
+    W217.L.sess = {}; W217.L.hostLive = {}; W217.L.hostEsc = {}; W217.L.partial = {}; W217.L.fellBack = {}; W217.L.active = 0; W217.L.hostDone = {}; W217.L.restore = {}
     LOG = {}; TOASTS = {}; LOOTS = {}; TIMERS = {}
 end
 local function asJoiner()
@@ -285,6 +285,97 @@ LOG = {}
 KCD2MP_W217LootPoll()
 check("H7 the host's own take: request, grant, removed, applied (peer=host)", #ledger("applied") == 1 and table.concat(LOG, "\n"):find("peer=host", 1, true) ~= nil)
 check("H no Lua errors (host)", #ERRS == 0, ERRS[1])
+
+-- ================= Paket E: delayed lists, split stacks, replay and final ACK =================
+world(); asJoiner()
+local late = mkBody("late_body", 101, 100, 10)
+late.inventory:CreateItem(SWORD, 1, 1)
+BasicAIActions.OnLoot(late, player, 1)
+KCD2MP_W134BodyState("late_body", "open", 1, 1, 1, { { SWORD, 1, 1, false } })
+NOW = NOW + 4
+KCD2MP_W217LootPoll()
+for _, timer in ipairs(TIMERS) do if timer.ms == 3000 then timer.f() end end
+check("E1 a delayed live list never falls back to the unconfirmed legacy loot screen", #LOOTS == 0 and KCD2MP.w134.pendingOpen.late_body ~= nil)
+check("E1 the live poll retries the real host-open request", #events("w134_open") >= 2)
+KCD2MP_W217BodyList("late_body", 1, 1, 1, { { id = "late_h", cls = SWORD, amt = 1, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+local lateSword = moveTo(late.inventory, player.inventory, SWORD)
+LOG = {}
+KCD2MP_W217BodyList("late_body", 2, 1, 1, {}) -- arrives before the next periodic take poll
+local lateReq = events("w217_treq")[1]
+local lateTok = lateReq and lateReq:match("^(%S+)")
+check("E2 a new host list cannot erase an unpolled take", lateReq ~= nil and esc().inventory:HasItem(lateSword))
+KCD2MP_W217TakeResult(lateTok, "grant", "late_body", "wrong_item", "-", 0)
+check("E2 a mismatched host item cannot apply another pending token", not player.inventory:HasItem(lateSword))
+KCD2MP_W217TakeResult(lateTok, "grant", "late_body", "late_h", "-", 0)
+KCD2MP_W217TakeResult(lateTok, "grant", "late_body", "late_h", "-", 0)
+check("E2 duplicate grants transfer exactly one item and replay their ACK", count(player.inventory, SWORD) == 1 and #events("w217_tack") >= 2)
+KCD2MP_W217BodyList("late_body", 3, 1, 1, {}, lateTok)
+check("E2 only the final readback list retires the applied ACK retry", W217.L.sess.late_body.acks[lateTok] == nil and (events("w217_bapplied")[#events("w217_bapplied")] or "") == "late_body 3 ok")
+
+world(); asJoiner()
+local partial = mkBody("stack_body", 101, 100, 10)
+partial.inventory:CreateItem(APPLE, 1, 10)
+player.inventory:CreateItem(APPLE, 1, 5)
+BasicAIActions.OnLoot(partial, player, 1)
+KCD2MP_W217BodyList("stack_body", 1, 1, 1, { { id = "stack_h", cls = APPLE, amt = 10, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+ITEMS[partial.inventory.list[1]].amount = 7
+ITEMS[player.inventory.list[1]].amount = 8 -- ItemTransfer merged three into an existing personal stack
+LOG = {}
+KCD2MP_W217LootPoll()
+local partialReq = events("w217_treq")[1]
+local partialTok = partialReq and partialReq:match("^(%S+)")
+check("E3 merged/split stack changes generate a request for exactly the transferred amount", partialReq and partialReq:find(" stack_body stack_h " .. APPLE .. " 3", 1, true) ~= nil, partialReq)
+check("E3 the player's existing five apples stay available while three await the host", count(player.inventory, APPLE) == 5 and count(esc().inventory, APPLE) == 3)
+KCD2MP_W217TakeResult(partialTok, "grant", "stack_body", "stack_h", "-", 0)
+check("E3 the grant restores exactly eight apples, never the whole source stack", count(player.inventory, APPLE) == 8 and count(partial.inventory, APPLE) == 7)
+KCD2MP_W217BodyList("stack_body", 2, 1, 1, { { id = "rest_h", cls = APPLE, amt = 7, hp = 1, worn = 0, stolen = 0, owner = "-" } }, partialTok)
+check("E3 final corpse state acknowledges the authoritative seven-item remainder", count(partial.inventory, APPLE) == 7 and W217.L.sess.stack_body.acks[partialTok] == nil)
+
+world(); asHost(2)
+local authoritative = mkBody("host_stack", 101, 100, 10)
+authoritative.inventory:CreateItem(APPLE, 1, 10)
+local originalId = key(authoritative.inventory.list[1])
+KCD2MP_W217HostOpen(1, "host_stack")
+LOG = {}
+KCD2MP_W217HostTakeReq(1, "901", "host_stack", originalId, SWORD, 3)
+check("E4 a forged class cannot remove the host's item", count(authoritative.inventory, APPLE) == 10 and #ledger("grant") == 0)
+KCD2MP_W217HostTakeReq(1, "902", "host_stack", originalId, APPLE, 11)
+check("E4 an oversized amount cannot remove the host's item", count(authoritative.inventory, APPLE) == 10 and #ledger("grant") == 0)
+KCD2MP_W217HostTakeReq(1, "903", "host_stack", originalId, APPLE, 3)
+local firstGrant = events("w217_tres")[#events("w217_tres")]
+local movedCount = W217.L.stats.moves
+KCD2MP_W217HostTakeReq(1, "903", "host_stack", originalId, APPLE, 3)
+check("E4 a token retry replays its verdict without moving another item", count(authoritative.inventory, APPLE) == 7 and count(esc().inventory, APPLE) == 3 and W217.L.stats.moves == movedCount and events("w217_tres")[#events("w217_tres")] == firstGrant)
+KCD2MP_W217HostAck(1, "903", "applied", "wrong_body")
+check("E4 an ACK for another body cannot commit this transfer", count(esc().inventory, APPLE) == 3)
+LOG = {}
+KCD2MP_W217HostAck(1, "903", "applied", "host_stack")
+check("E4 host commit removes only the granted three and emits a final receipt list", count(authoritative.inventory, APPLE) == 7 and count(esc().inventory, APPLE) == 0 and (events("w217_blist")[#events("w217_blist")] or ""):match(" 903$") ~= nil)
+KCD2MP_W217HostAck(1, "903", "cancel", "host_stack")
+check("E4 a late cancel cannot undo an already applied grant", count(authoritative.inventory, APPLE) == 7)
+KCD2MP_W217HostAck(1, "904", "cancel", "host_stack")
+local remainId = key(authoritative.inventory.list[1])
+KCD2MP_W217HostTakeReq(1, "904", "host_stack", remainId, APPLE, 1)
+check("E4 a request arriving after its cancel cannot reserve loot", count(authoritative.inventory, APPLE) == 7)
+KCD2MP_W217LootReset()
+check("E5 a world reset discards pending scopes and replay tokens", next(W217.L.sess) == nil and next(W217.L.hostDone) == nil and L == nil)
+check("E no Lua errors", #ERRS == 0, ERRS[1])
+
+world(); asJoiner()
+local unreadable = mkBody("unreadable_body", 101, 100, 10)
+unreadable.inventory:CreateItem(SWORD, 1, 1)
+BasicAIActions.OnLoot(unreadable, player, 1)
+local getTable = unreadable.inventory.GetInventoryTable
+unreadable.inventory.GetInventoryTable = function() error("inventory temporarily unavailable") end
+KCD2MP_W217BodyList("unreadable_body", 1, 1, 1, {})
+unreadable.inventory.GetInventoryTable = getTable
+check("E6 unavailable inventory never becomes a confirmed empty corpse", count(unreadable.inventory, SWORD) == 1 and #LOOTS == 0 and (events("w217_bapplied")[1] or "") == "unreadable_body 1 failed")
+ERRS = {} -- the deliberate read fault above was caught and refused
+KCD2MP_W217BodyList("unreadable_body", 3, 1, 2, {})
+KCD2MP_W217BodyList("unreadable_body", 2, 2, 2, { { id = "stale", cls = APPLE, amt = 9, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("E6 an older part cannot replace a newer multipart revision", W217.L.partial.unreadable_body.rev == 3)
+KCD2MP_W217BodyList("unreadable_body", 3, 2, 2, { { id = "new", cls = SWORD, amt = 1, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("E6 only the complete newest revision is applied and opens loot", W217.L.sess.unreadable_body.rev == 3 and count(unreadable.inventory, APPLE) == 0 and #LOOTS == 1)
 
 -- ================= B3: a long name's alias =================
 world()

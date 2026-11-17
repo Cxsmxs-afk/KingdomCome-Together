@@ -231,7 +231,26 @@ do
     clearLog(); NOW = NOW + 61
     KCD2MP_W200QItemsTick(true)
     local full = evts("w200_qitems")[1] or ""
-    check("c: host: every 60 s all it holds (for a late joiner), never the zeros", full:find(G2 .. ":2", 1, true) ~= nil and full:find(G1, 1, true) == nil, full)
+    check("c: host: every 60 s full baseline includes hand-in zeros for a late joiner", full:find(G2 .. ":2", 1, true) ~= nil and full:find(G1 .. ":0", 1, true) ~= nil, full)
+
+    -- A new peer must receive zeros immediately too, before the 60-second periodic baseline.
+    clearLog(); NOW = NOW + 3
+    local reportedBefore = W200.q.stats.reported
+    KCD2MP_W200QItemsTick(true, true)
+    local fresh = table.concat(evts("w200_qitems"), " ")
+    check("c: new peer forced baseline contains picked-up and handed-in item counts", fresh:find(G2 .. ":2", 1, true) ~= nil and fresh:find(G1 .. ":0", 1, true) ~= nil)
+    check("c: report counter measures every class in a full baseline", W200.q.stats.reported - reportedBefore == 3)
+    -- An unreadable inventory row is unknown, never an invented hand-in/count zero.
+    local realCount = player.inventory.GetCountOfClass
+    player.inventory.GetCountOfClass = function(self, g) if g == G3 then return nil end return realCount(self, g) end
+    clearLog(); NOW = NOW + 3
+    KCD2MP_W200QItemsTick(true, true)
+    local unread = table.concat(evts("w200_qitems"), " ")
+    check("c: unreadable host count never travels as zero", unread:find(G3 .. ":0", 1, true) == nil and unread:find(G1 .. ":0", 1, true) ~= nil)
+    local differedBefore = W200.q.stats.differs
+    KCD2MP_W200QItemHost(G3, 1, 0)
+    check("c: unreadable joiner count is not a false mismatch", W200.q.stats.differs == differedBefore and logCount("WO200-QITEM unread class=" .. G3) == 1)
+    player.inventory.GetCountOfClass = realCount
 
     -- the joiner: primed first (his own quest items are not "changes" at the start); he compares, he never writes a quest item
     -- (the game allows a quest item only through its AddQuestItem effect -- the quest-state mirror carries it)

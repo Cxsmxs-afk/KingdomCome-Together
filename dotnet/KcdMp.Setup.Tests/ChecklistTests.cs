@@ -30,17 +30,21 @@ public class ModInstallTests
     }
 
     [Fact]
-    public void PlacingPrunesLooseSourcesButKeepsTheKeysPak()
+    public void PlacingPrunesLooseSourcesButKeepsLocallyGeneratedPaksAndFacialProvenance()
     {
         using var f = new FakeSteam("prune").WithModdingTools().WithInstall().WithModPlaced();
         var target = ModInstall.TargetDir(f.MtRoot);
         Directory.CreateDirectory(Path.Combine(target, "Data", "Libs", "Tables"));
         File.WriteAllText(Path.Combine(target, "Data", "Libs", "Tables", "loose.xml"), "breaks the game");
         File.WriteAllText(Path.Combine(target, "Data", "kdcmp_keys.pak"), "keys");
+        File.WriteAllText(Path.Combine(target, "Data", FacialFallback.PakName), "local facial delta");
+        File.WriteAllText(Path.Combine(target, FacialFallback.StateName), "local facial provenance");
         File.WriteAllText(Path.Combine(target, "Data", "kdcmp.pak"), "an older pak");
         Assert.True(ModInstall.Place(f.AppDir, f.MtRoot).Ok);
         Assert.False(Directory.Exists(Path.Combine(target, "Data", "Libs")));
         Assert.Equal("keys", File.ReadAllText(Path.Combine(target, "Data", "kdcmp_keys.pak")));
+        Assert.Equal("local facial delta", File.ReadAllText(Path.Combine(target, "Data", FacialFallback.PakName)));
+        Assert.Equal("local facial provenance", File.ReadAllText(Path.Combine(target, FacialFallback.StateName)));
         Assert.True(ModInstall.Check(f.AppDir, f.MtRoot, true).Ok);
     }
 

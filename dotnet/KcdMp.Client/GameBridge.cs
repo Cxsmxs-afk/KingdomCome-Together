@@ -6233,6 +6233,8 @@ public partial class GameBridge(ClientConfig config)
             case "w134_tres":
             case "w134_ires":
             case "w134_igone":
+            case "w134_ledger_row":
+            case "w134_herb":
             case "w134_chest":
             case "w134_applied":
                 Wo134OnEvent(name, arg);
@@ -7433,7 +7435,7 @@ public partial class GameBridge(ClientConfig config)
     public static bool IsMenuSafeLua(string lua) => MenuSafeLua.IsMatch(lua);
 
     private static readonly System.Text.RegularExpressions.Regex MenuSafeLua = new(
-        @"^(if )?KCD2MP_(Wo12[1-5]|Join|HostOnlyLock|HostAuthority|EmitEvent|SetHitSensor|WorldSavedIn|SaveRefused|SaveLeak|W154VoiceState|W207KeepAwake)|^if KCD2MP_Wo12[45]|^System\.LogAlways",
+        @"^(if )?KCD2MP_(Wo12[1-5]|Join|HostOnlyLock|HostAuthority|EmitEvent|SetHitSensor|WorldSavedIn|SaveRefused|SaveLeak|W154VoiceState|W207KeepAwake|W217LootReset)|^if KCD2MP_Wo12[45]|^System\.LogAlways",
         System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     // WO-110 R9: the client side of the framing-drop counters (the relay has

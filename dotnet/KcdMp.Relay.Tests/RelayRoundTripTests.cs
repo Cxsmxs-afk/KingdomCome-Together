@@ -991,6 +991,47 @@ public class RelayRoundTripTests : IClassFixture<RelayFixture>
     // ---- WO-137: shared quests 0x60..0x63 (join channel) --------------------
 
     [Fact]
+    public async Task Corpse_loot_request_verdict_commit_and_final_inventory_ack_cross_the_real_relay()
+    {
+        var (host, joiner) = await TwoPeersAsync();
+        await using var _host = host; await using var _joiner = joiner;
+        const string body = "bandit_corpse_1", item = "wuid_dead_17", cls = "4a6fa310-067a-404d-9813-bd1761d1c70d";
+        const uint token = 47001;
+        async Task<LootMsg> Ask(LootMsg message)
+        {
+            await joiner.SendRawAsync(message.BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost));
+            var received = await host.ReadUntilAsync(Protocol.LootAskDown, Wait);
+            Assert.Equal(joiner.Id, received[0]);
+            Assert.True(LootMsg.TryDecode(received.AsSpan(1 + Protocol.JoinHeaderLen), out var decoded));
+            return decoded;
+        }
+        async Task<LootMsg> Verdict(LootMsg message)
+        {
+            await host.SendRawAsync(message.BuildUp(Protocol.LootHostUp, joiner.Id));
+            var received = await joiner.ReadUntilAsync(Protocol.LootHostDown, Wait);
+            Assert.Equal(host.Id, received[0]);
+            Assert.True(LootMsg.TryDecode(received.AsSpan(1 + Protocol.JoinHeaderLen), out var decoded));
+            return decoded;
+        }
+        var request = new LootMsg(Protocol.LootAskTakeReq, token, $"{body} {item} {cls} 3");
+        Assert.Equal(request, await Ask(request));
+        var grant = new LootMsg(Protocol.LootHostTakeVerdict, token, $"grant {body} {item} - 0");
+        Assert.Equal(grant, await Verdict(grant));
+        var applied = new LootMsg(Protocol.LootAskTakeAck, token, $"{body} applied");
+        Assert.Equal(applied, await Ask(applied));
+        var final = new LootMsg(Protocol.LootHostBodyList, token, $"{body} 7 1 1 remaining_18:{cls}:7:1:0:0:-");
+        Assert.Equal(final, await Verdict(final)); // same token is the host's commit receipt
+        var readback = new LootMsg(Protocol.LootAskBodyApplied, 0, $"{body} 7 ok");
+        Assert.Equal(readback, await Ask(readback));
+        // The joiner cannot forge a grant or final state, and the host cannot
+        // route a self-request through the joiner-only authority lane.
+        await joiner.SendRawAsync(grant.BuildUp(Protocol.LootHostUp, host.Id));
+        await host.SendRawAsync(request.BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost));
+        Assert.True(await host.NoneOfAsync(Protocol.LootHostDown, Quiet));
+        Assert.True(await joiner.NoneOfAsync(Protocol.LootAskDown, Quiet));
+    }
+
+    [Fact]
     public async Task Quest_messages_cross_the_relay_host_to_joiner_and_joiner_to_host_only()
     {
         var (a, b) = await TwoPeersAsync();   // a = the host (damage authority), b = the joiner
