@@ -3,9 +3,12 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using KcdMp.Server.Features.ClientHandling;
 using KcdMp.Server.Features.Faults;
+using KcdMp.Server.Features.Tcp;
 
 namespace KcdMp.Relay.Tests;
 
@@ -389,6 +392,38 @@ public class Wo213SchedulerTests
     }
 
     [Fact]
+    public void Default_age_limit_drops_a_sample_older_than_half_a_second()
+    {
+        // 2000 ms kept delivering a sample that was already up to two seconds late.
+        // The slot is still latest-wins; a sample older than half a second is dropped
+        // instead of being played late. Puppet release is the receiver's silence window.
+        Assert.Equal(500, new LinkSchedOptions().AgeLimitMs);
+    }
+
+    [Fact]
+    public void A_multi_second_event_backlog_lets_the_newest_state_go_first()
+    {
+        var s = new LinkScheduler(new LinkSchedOptions { EventSnapMs = 40 });
+        s.Enqueue(Event(1));
+        s.Enqueue(Event(2));
+        Thread.Sleep(80);
+        s.Enqueue(NpcDown(0, "npc_a", 9));
+        Assert.True(s.TryTake(int.MaxValue, -1, out var frame, out bool isState));
+        Assert.True(isState);
+        Assert.Equal(9f, BitConverter.ToSingle(frame, 3 + 2 + 5));
+        Assert.True(s.StateJumped >= 1);
+        var rest = Drain(s);
+        Assert.Equal(2, rest.Count);
+        var held = new LinkScheduler(new LinkSchedOptions { EventSnapMs = 0 });
+        held.Enqueue(Event(1));
+        Thread.Sleep(80);
+        held.Enqueue(NpcDown(0, "npc_a", 9));
+        Assert.True(held.TryTake(int.MaxValue, -1, out var ev, out bool evState));
+        Assert.False(evState);
+        Assert.Equal(Protocol.StoryBeatDown, ev[0]);
+    }
+
+    [Fact]
     public void Age_limit_drops_old_state_and_twin_sends_it_late()
     {
         var s = new LinkScheduler(new LinkSchedOptions { AgeLimitMs = 30 });
@@ -604,5 +639,18 @@ public class Wo213CompactTests
         var enc = new NpcCompact.Encoder();
         var f = Down("a", -5, 10, 10, 0, 50, 0, 1);
         Assert.Same(f, enc.Encode(f));
+    }
+
+    [Fact]
+    public void An_accepted_socket_gets_tcp_keepalive()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var client = new TcpClient();
+        client.Connect((IPEndPoint)listener.LocalEndpoint);
+        using var accepted = listener.AcceptTcpClient();
+        TcpKeepAlive.Arm(accepted.Client);
+        Assert.NotEqual(0, Convert.ToInt32(accepted.Client.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive)));
+        Assert.Equal(TcpKeepAlive.IdleSeconds, Convert.ToInt32(accepted.Client.GetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime)));
     }
 }

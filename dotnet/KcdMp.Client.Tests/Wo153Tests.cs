@@ -99,7 +99,7 @@ public class Wo153Tests
     [Fact]
     public void Time_to_live_and_the_bound_are_enforced_and_counted()
     {
-        var q = new BatchQueue { LevelTtlMs = 15_000, EdgeTtlMs = 120_000, MaxEntries = 4 };
+        var q = new BatchQueue { LevelTtlMs = 15_000, EdgeTtlMs = 120_000, MaxEntries = 4, CatchUpLagMs = long.MaxValue };
         q.Add(E(Ghost("0", 1), at: 0)); q.Add(E(Toast("old"), at: 0));
         var b = q.TakeBatch(10_000, 16_000);                       // the state is 16 s old (gone), the edge lives 120 s
         Assert.Equal(new[] { Toast("old") }, b.Select(e => e.Lua));
@@ -114,6 +114,26 @@ public class Wo153Tests
         q.Add(E(Toast("f1"))); q.Add(E(Toast("f2"))); q.Add(E(Toast("f3"))); q.Add(E(Toast("f4"))); q.Add(E(Toast("f5")));
         Assert.Equal(2, q.Overflowed);
         Assert.Equal(new[] { Toast("f2"), Toast("f3"), Toast("f4"), Toast("f5") }, q.TakeBatch(10_000, 0).Select(e => e.Lua));
+    }
+
+    [Fact]
+    public void A_nine_second_backlog_applies_the_newest_state_and_sheds_stale_edges()
+    {
+        var q = new BatchQueue();
+        q.Add(E(Toast("old"), at: 0));
+        q.Add(E(Ghost("0", 1), at: 0));
+        for (int i = 0; i < 30; i++) q.Add(E(Toast("e" + i), at: 1000 + i));
+        q.Add(E(Ghost("0", 9), at: 9000));
+        q.Add(E(Toast("fresh"), at: 8000));
+        var b = q.TakeBatch(100_000, 9000).Select(e => e.Lua).ToList();
+        Assert.Equal(Ghost("0", 9), b[0]);
+        Assert.DoesNotContain(Ghost("0", 1), b);
+        Assert.DoesNotContain(Toast("old"), b);
+        Assert.Contains(Toast("fresh"), b);
+        Assert.True(q.EdgesShed >= 30);
+        Assert.True(q.Snapped >= 1);
+        Assert.True(q.LastLagMs >= 9000);
+        Assert.True(q.LagMs(9000) < 2000);
     }
 
     [Fact]

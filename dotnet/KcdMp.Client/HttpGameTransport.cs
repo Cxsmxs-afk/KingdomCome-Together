@@ -392,7 +392,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
                     while (!_held && !ct.IsCancellationRequested)
                     {
                         List<BatchQueue.Entry> batch;
-                        lock (_queueLock) batch = _queue.TakeBatch(MaxBatchChars, NowMs());
+                        batch = TakeForSend();
                         if (batch.Count == 0) break;
                         burst += batch.Count;
                         FlusherBatches++;
@@ -410,6 +410,32 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     /// <summary>WO-110: statements that could never fit one ExecuteString and were dropped (see LuaCommandBudget).</summary>
     public long OversizeDropped { get; private set; }
     private DateTime _lastOversizeLogUtc = DateTime.MinValue;
+    private long _latencyToldMs;
+
+    /// <summary>The next batch. When the console queue is already a second or more behind, that lag is logged (MP-DESYNC kind=latency).</summary>
+    private List<BatchQueue.Entry> TakeForSend()
+    {
+        List<BatchQueue.Entry> batch;
+        long lag, shed, snap;
+        lock (_queueLock)
+        {
+            long shed0 = _queue.EdgesShed, snap0 = _queue.Snapped;
+            batch = _queue.TakeBatch(MaxBatchChars, NowMs());
+            lag = _queue.LastLagMs;
+            shed = _queue.EdgesShed - shed0;
+            snap = _queue.Snapped - snap0;
+        }
+        if (lag >= 1000 && (shed > 0 || snap > 0))
+        {
+            long now = Environment.TickCount64;
+            if (now - _latencyToldMs >= 2000)
+            {
+                _latencyToldMs = now;
+                Console.WriteLine($"MP-DESYNC kind=latency delay_ms={lag} snapped_state={snap} shed_edges={shed}");
+            }
+        }
+        return batch;
+    }
 
     public async Task FlushAsync(CancellationToken ct = default)
     {
@@ -421,7 +447,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
             for (int i = 0; i < 8 && !_held; i++)
             {
                 List<BatchQueue.Entry> batch;
-                lock (_queueLock) batch = _queue.TakeBatch(MaxBatchChars, NowMs());
+                batch = TakeForSend();
                 if (batch.Count == 0) break;
                 if (!await SendEntriesAsync(batch, ct)) break;
             }
@@ -497,7 +523,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
                 try
                 {
                     List<BatchQueue.Entry> batch;
-                    lock (_queueLock) batch = _queue.TakeBatch(MaxBatchChars, NowMs());
+                    batch = TakeForSend();
                     bool answered;
                     if (batch.Count == 0)
                     {

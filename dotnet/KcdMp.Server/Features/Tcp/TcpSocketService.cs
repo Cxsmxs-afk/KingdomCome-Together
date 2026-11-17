@@ -68,6 +68,11 @@ public class TcpSocketService : BackgroundService
 				// WO-110 R6: no Nagle coalescing on 40-byte NPC frames; the
 				// agent sets the same on its side.
 				tcpListener.NoDelay = true;
+				// A NAT that stops forwarding a quiet socket otherwise sits until the 30 s
+				// application idle timeout. Probes start after 10 s of silence; a peer
+				// that still answers is left alone (this is not an application ping).
+				try { TcpKeepAlive.Arm(tcpListener.Client); }
+				catch (Exception ex) { _logger.Debug(ex, "TCP keepalive was not set on the accepted socket"); }
 				// WO-206 B: the test-only fault layer wraps the connection when (and
 				// only when) both halves of its switch were given; otherwise this is
 				// the same session on the same socket as ever.
@@ -120,5 +125,23 @@ public class TcpSocketService : BackgroundService
 			}
 		}
 		catch (OperationCanceledException) { }
+	}
+}
+
+/// <summary>
+/// TCP keepalive on an accepted relay socket. Probes begin after 10 s without
+/// traffic, then every 3 s, and the socket is declared dead after 3 missed
+/// replies. A peer that answers is not disconnected.
+/// </summary>
+public static class TcpKeepAlive
+{
+	public const int IdleSeconds = 10, IntervalSeconds = 3, RetryCount = 3;
+
+	public static void Arm(Socket socket)
+	{
+		socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+		socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, IdleSeconds);
+		socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, IntervalSeconds);
+		socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, RetryCount);
 	}
 }

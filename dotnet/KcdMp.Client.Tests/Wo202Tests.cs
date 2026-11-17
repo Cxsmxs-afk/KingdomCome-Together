@@ -104,6 +104,20 @@ public class Wo202Tests
     }
 
     [Fact]
+    public void A_multi_second_backlog_drops_a_stale_event_and_keeps_the_newest_state()
+    {
+        Assert.True(Wo202Rules.DropStaleEvent(Protocol.ActionDown, 9000, 9000));
+        Assert.True(Wo202Rules.DropStaleEvent(Protocol.StoryBeatDown, 9000, 2500));
+        Assert.False(Wo202Rules.DropStaleEvent(Protocol.Ghost, 9000, 9000));
+        Assert.False(Wo202Rules.DropStaleEvent(Protocol.NpcStateDown, 9000, 4000));
+        Assert.False(Wo202Rules.DropStaleEvent(Protocol.DeathDown, 9000, 9000));
+        Assert.False(Wo202Rules.DropStaleEvent(Protocol.SessionEventDown, 9000, 9000));
+        Assert.False(Wo202Rules.DropStaleEvent(Protocol.ItemClaimDown, 9000, 9000));
+        Assert.False(Wo202Rules.DropStaleEvent(Protocol.ActionDown, 9000, 500));
+        Assert.False(Wo202Rules.DropStaleEvent(Protocol.ActionDown, 400, 9000));
+    }
+
+    [Fact]
     public void Speech_TheEnginesOwnPathIsAVoicePath()
     {
         // the field's lines: no extension -- WO-201 took only ".ogg" and captured nothing on all four machines

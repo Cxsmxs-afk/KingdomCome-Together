@@ -309,8 +309,14 @@ function KCD2MP_ShowPing(ms, queueLagMs, inFront)
     if wc then wc.agentLag = tonumber(queueLagMs); wc.inFront = tonumber(inFront) end
     if KCD2MP_W157ConnSample then pcall(KCD2MP_W157ConnSample, ms) end   -- WO-157 3.2
     local off = KCD2MP.clockOffsetMs
+    local qlag = tonumber(queueLagMs)
+    if qlag and qlag >= 0 then KCD2MP._queueLagMs = qlag end
+    if qlag and qlag >= 1000 then
+        KCD2MP_DesyncNote("latency", string.format("delay_ms=%d", math.floor(qlag)))
+    end
     KCD2MP.pingText = string.format("Ping: %d ms", ms)
         .. (off and string.format("  clock %+.2f s", off / 1000) or "")
+        .. (qlag and qlag >= 1000 and string.format("  queue %d ms", math.floor(qlag)) or "")
 end
 
 -- WO-98 Phase 1: the agent's clock-offset estimate (relay clock minus this
@@ -550,6 +556,11 @@ end
 local SCRATCH = {}
 SCRATCH.EMITSTATE_POS_SCRATCH = {}
 SCRATCH.EMITSTATE_ANG_SCRATCH = {}
+SCRATCH.SETPOS = {}
+SCRATCH.SETANG = {}
+SCRATCH.HORSE_SETPOS = {}
+SCRATCH.HORSE_SETANG = {}
+SCRATCH.BADGE_POS = {}
 
 -- Builds and writes one state line. Returns false when the player is not in a
 -- state worth reporting (no world, mid-load).
@@ -799,6 +810,13 @@ function KCD2MP_EmitTick()
         end
     end
     KCD2MP._emitAliveAt = nowClock
+    -- Cost line. 15 s while quiet, 2 s with `mp_perf on`. Same log the
+    -- tickstat line already lives in, so a bug report carries it.
+    if (nowClock - (KCD2MP._perfAt or 0)) >= (KCD2MP._perfOn and 2 or 15) then
+        KCD2MP._perfAt = nowClock
+        KCD2MP_PerfFlush(false)
+        if KCD2MP_DesyncFlush then KCD2MP_DesyncFlush() end
+    end
 
     local ok, err = pcall(KCD2MP_EmitState)
     if not ok then
@@ -2196,6 +2214,212 @@ function KCD2MP_DebugHud(arg)
     return true
 end
 
+-- In-game cost line. Always one line per 15 s while the interp tick is
+-- actually rendering (same quiet cadence as tickstat); `mp_perf on` shortens
+-- that to 2 s. Counts are per second over the window so two sessions compare.
+-- The wire format is unchanged: this is local measurement only.
+function KCD2MP_PerfBump(key)
+    local p = KCD2MP._perf
+    if not p then p = { t0 = os.clock() }; KCD2MP._perf = p end
+    p[key] = (p[key] or 0) + 1
+end
+
+function KCD2MP_PerfNoteInterp(t0)
+    if not t0 then return end
+    local ms = (os.clock() - t0) * 1000
+    if ms < 0 then ms = 0 end
+    local p = KCD2MP._perf
+    if not p then p = { t0 = os.clock() }; KCD2MP._perf = p end
+    p.interpN = (p.interpN or 0) + 1
+    p.interpSum = (p.interpSum or 0) + ms
+    if ms > (p.interpMax or 0) then p.interpMax = ms end
+end
+
+function KCD2MP_PerfFlush(force)
+    local p = KCD2MP._perf
+    if not p then return end
+    local now = os.clock()
+    local win = now - (p.t0 or now)
+    if win < 0.5 and not force then return end
+    local n = p.interpN or 0
+    local function rate(v) return (v or 0) / math.max(win, 0.001) end
+    local lat = (KCD2MP.npcSilence and KCD2MP.npcSilence.lagMs) or 0
+    if (KCD2MP._queueLagMs or 0) > lat then lat = KCD2MP._queueLagMs end
+    if not force and n == 0 and (p.floorCasts or 0) == 0 and (p.npcSkip or 0) == 0
+       and (p.npcIdleSkip or 0) == 0 and (p.puppetLifeSkip or 0) == 0 and lat < 1000 then
+        p.t0 = now
+        return
+    end
+    System.LogAlways(string.format(
+        "[KCD2-MP] perf window_s=%.1f interp_avg_ms=%.2f interp_max_ms=%.2f interp_n=%d floor_cast_s=%.1f floor_reuse_s=%.1f pose_skip_s=%.1f horse_skip_s=%.1f npc_skip_s=%.1f npc_idle_skip_s=%.1f puppet_life_skip_s=%.1f ride_sphere_s=%.2f ride_skip_s=%.2f bone_read_s=%.1f bone_reuse_s=%.1f latency_ms=%.0f",
+        win,
+        n > 0 and (p.interpSum / n) or 0, p.interpMax or 0, n,
+        rate(p.floorCasts), rate(p.floorReuse), rate(p.poseSkip), rate(p.horseSkip),
+        rate(p.npcSkip), rate(p.npcIdleSkip), rate(p.puppetLifeSkip),
+        rate(p.rideSphere), rate(p.rideSkip), rate(p.boneRead), rate(p.boneReuse), lat))
+    KCD2MP._perf = { t0 = now }
+end
+
+-- One place a drifted world is visible in kcd.log. `detail` is logged at most
+-- once per 2 s per distinct text; the count still climbs. The 15 s summary
+-- is the line to grep after a session that "felt wrong".
+function KCD2MP_DesyncNote(kind, detail)
+    local d = KCD2MP._desync
+    if not d then d = { n = {}, t0 = os.clock() }; KCD2MP._desync = d end
+    d.n[kind] = (d.n[kind] or 0) + 1
+    if detail then
+        local key = kind .. "\0" .. detail
+        local now = os.clock()
+        d.told = d.told or {}
+        if not d.told[key] or (now - d.told[key]) >= 2.0 then
+            d.told[key] = now
+            mp_log(string.format("MP-DESYNC kind=%s %s n=%d", kind, detail, d.n[kind]))
+        end
+    end
+end
+
+function KCD2MP_DesyncFlush()
+    local d = KCD2MP._desync
+    if not d or not d.n then return end
+    local now = os.clock()
+    local win = now - (d.t0 or now)
+    local parts, any = {}, false
+    for k, v in pairs(d.n) do
+        if v > 0 then parts[#parts + 1] = k .. "=" .. tostring(v); any = true end
+    end
+    if any then
+        table.sort(parts)
+        mp_log(string.format("MP-DESYNC summary window_s=%.0f %s", win, table.concat(parts, " ")))
+    end
+    KCD2MP._desync = { n = {}, t0 = now, told = d.told }
+end
+
+function KCD2MP_SetPerf(arg)
+    local s = tostring(arg or ""):lower()
+    if s:find("now") then
+        KCD2MP_PerfFlush(true)
+        return true
+    elseif s:find("on") then
+        KCD2MP._perfOn = true
+    elseif s:find("off") then
+        KCD2MP._perfOn = false
+    else
+        mp_log("mp_perf: expected 'on', 'off' or 'now' (a line is written every 15 s either way)")
+        return false
+    end
+    mp_log("mp_perf " .. (KCD2MP._perfOn and "on -- a perf line every 2 s" or "off -- a perf line every 15 s"))
+    return true
+end
+
+-- True when the smoothed pose has moved far enough from the last SetWorldPos
+-- to be worth another one. A settled ghost used to call into the entity
+-- transform path every 20 ms for a fraction of a millimetre.
+function KCD2MP_PoseChanged(st, x, y, z, r)
+    local lx, ly, lz, lr = st.lastWroteX, st.lastWroteY, st.lastWroteZ, st.lastWroteR
+    if lx then
+        local dx, dy, dz = x - lx, y - ly, z - lz
+        local dr = r - (lr or r)
+        if dr > 3.14159 then dr = dr - 6.28318 elseif dr < -3.14159 then dr = dr + 6.28318 end
+        -- 1 mm / ~0.6 deg. The first sample inside the band is still written,
+        -- so a ghost that is coming to rest lands on the target; the ticks
+        -- after that, while it has not moved, do not touch the entity.
+        if dx * dx + dy * dy + dz * dz < 1e-6 and dr * dr < 1e-4 then
+            if st.poseHeld then
+                KCD2MP_PerfBump("poseSkip")
+                return false
+            end
+            st.poseHeld = true
+        else
+            st.poseHeld = nil
+        end
+    end
+    st.lastWroteX, st.lastWroteY, st.lastWroteZ, st.lastWroteR = x, y, z, r
+    return true
+end
+
+function KCD2MP_GhostLabelName(id)
+    local base = (KCD2MP.ghostNames and KCD2MP.ghostNames[id]) or ("Player" .. tostring(id))
+    local menu = KCD2MP.ghostInMenu[id] and true or false
+    local dead = KCD2MP.ghostDead[id] and true or false
+    local hs = KCD2MP.ghostHealth[id]
+    local hh = (hs and hs.h) or -2
+    local ss = (hs and hs.s) or -2
+    local cache = KCD2MP._labelNames
+    if not cache then cache = {}; KCD2MP._labelNames = cache end
+    local row = cache[id]
+    if row and row.base == base and row.menu == menu and row.dead == dead and row.h == hh and row.s == ss then
+        return row.name
+    end
+    local displayName = base
+    if menu then displayName = displayName .. " [in menu]" end
+    if dead then
+        displayName = displayName .. " [dead - reloading]"
+    elseif hh >= 0 then
+        displayName = string.format("%s  %d HP", displayName, math.floor(hh + 0.5))
+        if ss >= 0 then
+            displayName = string.format("%s / %d ST", displayName, math.floor(ss + 0.5))
+        end
+    end
+    cache[id] = { base = base, menu = menu, dead = dead, h = hh, s = ss, name = displayName }
+    return displayName
+end
+
+function KCD2MP_LabelCachePut(id, x, y, z, size, name, ent)
+    local lc = KCD2MP.labelCache[id]
+    if not lc then
+        lc = {}
+        KCD2MP.labelCache[id] = lc
+    end
+    lc.x, lc.y, lc.z, lc.size, lc.name, lc.ent = x, y, z, size, name, ent
+end
+
+-- Riding detection for the 100 ms check. IsMounted()==false means we are on
+-- foot: the old path still walked every entity in a 2.5 m sphere. IsMounted()
+-- ==true means we are on a horse and the name comes from W136 right after
+-- this returns. Only a build without IsMounted keeps the sphere scan.
+-- Sets KCD2MP._mountKnown to true/false/nil (nil = scan was used).
+function KCD2MP_SenseHorseNear()
+    KCD2MP._mountKnown = nil
+    local mounted = nil
+    pcall(function()
+        if player and player.human and player.human.IsMounted then
+            mounted = player.human:IsMounted() == true
+        end
+    end)
+    if mounted == false then
+        KCD2MP._mountKnown = false
+        KCD2MP_PerfBump("rideSkip")
+        return false, nil
+    end
+    if mounted == true then
+        KCD2MP._mountKnown = true
+        KCD2MP_PerfBump("rideSkip")
+        return true, nil
+    end
+    KCD2MP_PerfBump("rideSphere")
+    local riding, mountName = false, nil
+    pcall(function()
+        local pos = player:GetWorldPos()
+        if not pos then return end
+        local ents = System.GetEntitiesInSphere(pos, 2.5)
+        if not ents then return end
+        for _, e in ipairs(ents) do
+            local ec, en = "?", ""
+            pcall(function() ec = tostring(e.class or "?") end)
+            pcall(function() en = tostring(e:GetName() or "") end)
+            if ec == "Horse" and not en:find("kcd2mp_horse_") then
+                local horsePos = nil
+                pcall(function() horsePos = e:GetWorldPos() end)
+                if horsePos and (pos.z - horsePos.z) > 1.0 then
+                    riding = true
+                    if en ~= "" and string.find(en, "^[%w_]+$") then mountName = en end
+                end
+            end
+        end
+    end)
+    return riding, mountName
+end
+
 -- ===== Ghost NPC Spawn =====
 
 -- WO-17: mp_enable_aggro on|off. Opt-in, off by default, decided locally on
@@ -2606,14 +2830,14 @@ function KCD2MP_NpcSmoothDelayS()
 end
 -- Ring depth: renderAt only ever looks DELAY back, and packets are ~emitMs
 -- apart, so three samples cover it with one to spare.
-TUNE.NPC_SMOOTH_RING = 3
+TUNE.NPC_SMOOTH_RING = 8   -- was 3. A burst of samples used to evict the one before the gap, so the partner interpolated inside the burst and then popped. Eight is about 0.8 s of a 10 Hz stream.
 -- Anim only: while the renderer holds at the newest sample because the next
 -- packet is merely LATE (jitter past DELAY), keep the last segment's speed
 -- for up to this long before reading the hold as "stopped". Position is not
 -- affected -- it holds regardless. Without this a 130 ms gap against a
 -- 120 ms delay would flick walk->idle->walk for one tick, which is exactly
 -- the churn Step 1 exists to remove.
-TUNE.NPC_SMOOTH_ANIM_GRACE_S = 0.06
+TUNE.NPC_SMOOTH_ANIM_GRACE_S = 0.20   -- was 0.06. A 60 ms grace turned a 150 ms delivery gap into walk-idle-walk. Position still holds; only the clip waits.
 -- WO-118 follow-up: a puppet KCDMP.dll writes gets its samples from the agent
 -- at most every 200 ms (GameBridge's NpcLuaCoalescer; flag and health changes
 -- at once) -- in practice 200-300 ms apart. Lua renders it only for the gait,
@@ -2737,8 +2961,16 @@ local function mp_npc_smooth_render(p, now)
         p.cz = a.z + (b.z - a.z) * t
         p.cr = lerpAngle(a.rot, b.rot, t)
         local sdx, sdy = b.x - a.x, b.y - a.y
-        spd = math.sqrt(sdx*sdx + sdy*sdy) / segDur
-        p.segSpd = spd
+        local step = math.sqrt(sdx*sdx + sdy*sdy)
+        local rawDur = b.at - a.at
+        -- Two samples a few milliseconds apart are a burst, not a gait. Dividing
+        -- a small step by the 50 ms floor read as a sprint and restarted the clip.
+        if rawDur < 0.04 and step < 0.35 then
+            spd = p.segSpd or 0
+        else
+            spd = step / segDur
+            p.segSpd = spd
+        end
     end
     return spd
 end
@@ -8787,6 +9019,34 @@ end
 SCRATCH.NPCSYNCTICK_PPOS_SCRATCH = {}
 SCRATCH.NPCSYNCTICK_POS_SCRATCH  = {}
 SCRATCH.NPCSYNCTICK_ANG_SCRATCH  = {}
+-- True when this tracked NPC can skip the actor polls this tick. Culled
+-- bodies are far from every player; idle ones have not moved and were not
+-- drawn or engaged the last time we looked. Either way the 2 s heartbeat
+-- and the move epsilon still force a full read.
+function KCD2MP_NpcEmitSkip(t, p, ppos, now)
+    if not (t and p and p.x and t.vitalAt) then return false end
+    local hbDue = not t.lastSentAt or (now - t.lastSentAt) >= (KCD2MP.npcSync.heartbeatS or 2)
+    if hbDue then return false end
+    local age = now - t.vitalAt
+    if t.culled and KCD2MP.wo1025 and KCD2MP.wo1025.npcCull and age < 0.5 and ppos then
+        local dx, dy = p.x - ppos.x, p.y - ppos.y
+        local r = KCD2MP.wo1025.cullRadius or 80
+        if dx * dx + dy * dy > r * r then
+            KCD2MP_PerfBump("npcSkip")
+            return true
+        end
+    end
+    if age < 0.25 and not t.sentDrawn and not t.sentEngaged and t.lastX then
+        local eps = KCD2MP.npcSync.moveEps or 0.05
+        if math.abs(p.x - t.lastX) <= eps and math.abs(p.y - t.lastY) <= eps
+           and math.abs(p.z - (t.lastZ or p.z)) <= eps then
+            KCD2MP_PerfBump("npcIdleSkip")
+            return true
+        end
+    end
+    return false
+end
+
 function KCD2MP_NpcSyncTick()
     if not KCD2MP.npcSyncRunning then return end
     Script.SetTimer(KCD2MP.npcSync.emitMs, KCD2MP_NpcSyncTick)  -- reschedule FIRST
@@ -8894,7 +9154,10 @@ function KCD2MP_NpcSyncTick()
             local natFresh = nat and KCD2MP._nativeScan.at
                 and (os.clock() - KCD2MP._nativeScan.at) <= mp_native_scan_stale_after_s()
             if natFresh then
-                p = { x = nat.x, y = nat.y, z = nat.z }
+                -- Same scratch the Lua read below writes into. `p` is not
+                -- stored past this NPC, so the next NPC may reuse it.
+                p = SCRATCH.NPCSYNCTICK_POS_SCRATCH
+                p.x, p.y, p.z = nat.x, nat.y, nat.z
                 rot = nat.yaw
                 readNativeHits = readNativeHits + 1
             else
@@ -8903,6 +9166,12 @@ function KCD2MP_NpcSyncTick()
                 pcall(function() rot = e:GetWorldAngles(SCRATCH.NPCSYNCTICK_ANG_SCRATCH).z or 0 end)
                 readLuaHits = readLuaHits + 1
             end
+            -- A culled body, and a still one that is not in a fight, does not
+            -- need IsDead / IsWeaponDrawn at 10 Hz. The heartbeat and any
+            -- move still take the full read, so a death or a draw lands on
+            -- the next poll (0.5 s culled, 0.25 s idle) rather than never.
+            if KCD2MP_NpcEmitSkip(t, p, ppos, now) then return end
+            t.vitalAt = now
             local hp, dead, ko = -1, false, false
             if e.actor then
                 pcall(function() hp = e.actor:GetHealth() or -1 end)
@@ -9675,7 +9944,18 @@ function KCD2MP_ApplyNpcState(name, x, y, z, rot, hp, flags, src, seq, senderMs)
         local s = KCD2MP.npcPacketStats
         if d == 0 then s.seqDup = (s.seqDup or 0) + 1; seqOk = false
         elseif d > 32768 then s.seqBehind = (s.seqBehind or 0) + 1; seqOk = false
-        elseif d > 1 and not p.nativeOwned then s.seqGaps = (s.seqGaps or 0) + (d - 1) end   -- a native puppet's are the agent's coalescing
+        elseif d > 1 and not p.nativeOwned then
+            s.seqGaps = (s.seqGaps or 0) + (d - 1)   -- a native puppet's are the agent's coalescing
+            -- A hole in the sequence is samples the partner never applied.
+            -- Remember it so a short silence does not hand the body back to
+            -- the local brain (that is the walk-off desync). A wide hole is logged.
+            p.gapAt = nowPkt
+            if d >= 4 then
+                KCD2MP_DesyncNote("npc-seq-gap", string.format("npc=%s missed=%d", name, d - 1))
+            else
+                KCD2MP_DesyncNote("npc-seq-gap")
+            end
+        end
     end
     if seq and seqOk then p.lastSeq = seq end
     local stampAt = mp_sender_stamp(src, tonumber(senderMs), nowPkt)
@@ -9778,6 +10058,62 @@ end
 -- never stored past the closure, so one reused table per call site is safe.
 SCRATCH.NPCPUPPETTICK_PPOS_SCRATCH = {}
 SCRATCH.NPCPUPPETTICK_AP_SCRATCH   = {}
+
+-- Once a second, if the body is more than 3 m from the pose we are rendering
+-- and the player is not standing on it, put it back. A local brain that
+-- wins for a moment is how the two worlds drift. Near the player we only
+-- log: snapping a body someone is fighting looks worse than the drift.
+function KCD2MP_PuppetDriftCorrect(name, p, e, now)
+    if not (p and e and p.cx) or p.dead or p.ko or p.carried or p.yielded then return end
+    if (now - (p.driftAt or 0)) < 1.0 then return end
+    p.driftAt = now
+    local ap = nil
+    pcall(function() ap = e:GetWorldPos(SCRATCH.NPCPUPPETTICK_AP_SCRATCH) end)
+    if not ap then return end
+    local dx, dy = ap.x - p.cx, ap.y - p.cy
+    local d2 = dx * dx + dy * dy
+    if d2 <= 9.0 then return end
+    local near = false
+    if player then
+        pcall(function()
+            local pp = player:GetWorldPos(SCRATCH.NPCPUPPETTICK_PPOS_SCRATCH)
+            if pp and (ap.x - pp.x) ^ 2 + (ap.y - pp.y) ^ 2 < 9.0 then near = true end
+        end)
+    end
+    KCD2MP_DesyncNote("puppet-drift", string.format("npc=%s dist_m=%.1f near=%s", name, math.sqrt(d2), near and "1" or "0"))
+    -- A native-owned body is the DLL's. Snapping it here fights that writer.
+    if near or p.nativeOwned then return end
+    pcall(function()
+        e:SetWorldPos({ x = p.cx, y = p.cy, z = p.cz or ap.z })
+        if p.cr then e:SetWorldAngles({ x = 0, y = 0, z = p.cr }) end
+    end)
+end
+-- True when this puppet should ask the engine whether it died. Near bodies,
+-- and any body the stream already calls dead or out, are asked every tick.
+function KCD2MP_PuppetLifeDue(p, now)
+    if not p or p.dead or p.ko or not p.lifeAt or (now - p.lifeAt) >= 0.4 then return true end
+    -- One player-position read per puppet tick, shared by every puppet. The
+    -- facing check above keeps its own read; this one exists because that
+    -- local is not in scope here (it only runs on a non-authority).
+    local a = KCD2MP._perfAnchor
+    if not a then a = {}; KCD2MP._perfAnchor = a end
+    if a.at ~= now then
+        a.at = now
+        a.x, a.y = nil, nil
+        if player then
+            pcall(function()
+                local pos = player:GetWorldPos(SCRATCH.NPCPUPPETTICK_PPOS_SCRATCH)
+                if pos then a.x, a.y = pos.x, pos.y end
+            end)
+        end
+    end
+    if not (a.x and p.cx) then return true end
+    local dx, dy = p.cx - a.x, p.cy - a.y
+    if dx * dx + dy * dy <= 400 then return true end
+    KCD2MP_PerfBump("puppetLifeSkip")
+    return false
+end
+
 function KCD2MP_NpcPuppetTick(arg, gen)
     if KCD2MP_W221WheelsTick then pcall(KCD2MP_W221WheelsTick) end   -- WO-221 E.2: the carts' wheels (50 ms)
     -- WO-84: absorb the orphan of a generation that stopped ITSELF.
@@ -9854,16 +10190,20 @@ function KCD2MP_NpcPuppetTick(arg, gen)
     local ns = KCD2MP.npcSilence
     do
         local tnow = os.clock()
-        -- the render lag follows the agent's (fresh) word, at most 0.5 s per second, never past lagCapS
+        -- the render lag follows the agent's (fresh) word, never past lagCapS. It rises at once and snaps
+        -- back down when the agent is no longer seconds behind (a slow ease used to keep a 3 s delay after the queue had caught up).
         local tdt = ns.tickAt and math.max(0, math.min(tnow - ns.tickAt, 1.0)) or 0   -- never negative (a clock set back)
-        -- (behind at all: the agent's worst of its last second plus 0.25 s, so a sample's wait never shows as a
-        -- stop; up at once, down 0.5 s per second)
+        -- (behind at all: the agent's worst of its last second plus 0.25 s, so a sample's wait never shows as a stop)
         local want = 0
         if KCD2MP.w147.npcCatchup and (tnow - ns.agentAt) < ns.ttlS and (ns.lagMs or 0) >= 100 then
             want = math.min(ns.lagCapS, (ns.lagMs or 0) / 1000 + 0.25)
         end
         local cur = ns.lagSmooth or 0
-        if want > cur then cur = want else cur = math.max(want, cur - 0.5 * tdt) end
+        -- up at once. A healed backlog snaps: easing 0.5 s per second left a 3 s render delay
+        -- unwinding for several seconds after the queue had already caught up.
+        if want > cur then cur = want
+        elseif cur - want >= 0.5 then cur = want
+        else cur = math.max(want, cur - 0.5 * tdt) end
         ns.lagSmooth = cur
         if KCD2MP.w147.npcCatchup and ns.tickAt and tnow - ns.tickAt > ns.stallS then
             local gap = tnow - ns.tickAt
@@ -9955,6 +10295,11 @@ function KCD2MP_NpcPuppetTick(arg, gen)
                 KCD2MP_NpcReplicaDemote(name, "silence")   -- WO-104: the NPC returns before the puppet is dropped
                 KCD2MP_NpcNativeSync(name, p, nil, false, "silence")   -- WO-118
                 KCD2MP.npcPuppets[name] = nil
+                if p.lastPacketMoved then
+                    KCD2MP_DesyncNote("puppet-release", string.format("npc=%s quiet_s=%.1f", name, now - (p.lastPacketAt or now)))
+                else
+                    KCD2MP_DesyncNote("puppet-release")
+                end
                 mp_log("NPC-SYNC release " .. name .. " (stream silent)")
                 mp_auth_log(name, "release", p.owner == nil and "?" or p.owner, "silence", now - (p.ownerSince or now))   -- WO-102
                 mp_wo102_release(name, "silence")   -- WO-102 Phase 4; WO-108 s3.5: held for the dwell, resumed by mp_wo102_pending_tick
@@ -9964,6 +10309,7 @@ function KCD2MP_NpcPuppetTick(arg, gen)
 
             local e, isReplica = KCD2MP_NpcBody(name)
             if not e then return end
+            KCD2MP_PuppetDriftCorrect(name, p, e, now)   -- before this tick's own write, so a body the brain moved is visible
             if p.detach then KCD2MP_NpcDetachCheck(name, p, e) end   -- WO-118 Phase 3: MP-DETACH result line
             if p.detachPending then KCD2MP_NpcDetachRetry(name, p, e) end   -- skipped for a conversation: retried after it
             -- WO-104: life state (dead/KO/hp) is read from the WORLD NPC -- the
@@ -9986,9 +10332,19 @@ function KCD2MP_NpcPuppetTick(arg, gen)
             -- extends the same rule to unconsciousness on both sources: a
             -- knocked-out NPC kept walking under the stream (Section G).
             local locallyDead, locallyKo = false, false
-            if lifeE.actor then
-                pcall(function() locallyDead = lifeE.actor:IsDead() == true end)
-                pcall(function() locallyKo = lifeE.actor:IsUnconscious() == true end)
+            -- A puppet more than 20 m away, already read as alive, does not
+            -- need IsDead/IsUnconscious every 50 ms. The stream's own dead
+            -- bit (p.dead) is still honoured every tick; this only delays a
+            -- death that happened on THIS machine and nowhere near the player.
+            if KCD2MP_PuppetLifeDue(p, now) then
+                if lifeE.actor then
+                    pcall(function() locallyDead = lifeE.actor:IsDead() == true end)
+                    pcall(function() locallyKo = lifeE.actor:IsUnconscious() == true end)
+                end
+                p.lifeAt = now
+                p.lifeDead, p.lifeKo = locallyDead, locallyKo
+            else
+                locallyDead, locallyKo = p.lifeDead or false, p.lifeKo or false
             end
             -- WO-86: the third death reader. This is the one that covers the
             -- field report's killer: the NPC was a PUPPET on their machine
@@ -11811,12 +12167,51 @@ end
 -- drove InterpTick alone would leave a mounted ghost's horse standing still
 -- while the rider slid along on top of it.
 function KCD2MP_ApplyHorseTransforms()
+    local now = os.clock()
+    local sp, sa = SCRATCH.HORSE_SETPOS, SCRATCH.HORSE_SETANG
     for id, horseData in pairs(KCD2MP.horseGhosts) do
         if horseData.entity and horseData.renderX and not (horseData.native and horseData.native.bound) then   -- WO-154 5: the DLL writes it
-            pcall(function()
-                horseData.entity:SetWorldPos({x=horseData.renderX, y=horseData.renderY, z=horseData.renderZ})
-                horseData.entity:SetWorldAngles({x=0, y=0, z=horseData.renderR})
-            end)
+            -- The render target only moves on the 20 ms ghost tick. Chasing it
+            -- every frame turns that step into a short glide. Once the chase
+            -- has landed (within 1 mm), further identical writes are skipped:
+            -- each SetWorldPos still walks the entity transform path.
+            local tx, ty, tz = horseData.renderX, horseData.renderY, horseData.renderZ
+            local tr = horseData.renderR or 0
+            if not horseData.dispX then
+                horseData.dispX, horseData.dispY, horseData.dispZ, horseData.dispR = tx, ty, tz, tr
+            else
+                local dx, dy, dz = tx - horseData.dispX, ty - horseData.dispY, tz - horseData.dispZ
+                if dx * dx + dy * dy + dz * dz > 25 then
+                    horseData.dispX, horseData.dispY, horseData.dispZ, horseData.dispR = tx, ty, tz, tr
+                else
+                    local dt = now - (horseData.dispAt or now)
+                    if dt < 0 then dt = 0 elseif dt > 0.1 then dt = 0.1 end
+                    local k = 1 - (0.30 ^ math.max(dt / 0.020, 0.05))
+                    horseData.dispX = horseData.dispX + dx * k
+                    horseData.dispY = horseData.dispY + dy * k
+                    horseData.dispZ = horseData.dispZ + dz * k
+                    horseData.dispR = lerpAngle(horseData.dispR or tr, tr, k)
+                end
+            end
+            horseData.dispAt = now
+            local lx, ly, lz = horseData.wroteX, horseData.wroteY, horseData.wroteZ
+            local dr = (horseData.dispR or 0) - (horseData.wroteR or horseData.dispR or 0)
+            if dr > 3.14159 then dr = dr - 6.28318 elseif dr < -3.14159 then dr = dr + 6.28318 end
+            local mx, my, mz = horseData.dispX - (lx or horseData.dispX), horseData.dispY - (ly or horseData.dispY), horseData.dispZ - (lz or horseData.dispZ)
+            local settled = lx and mx * mx + my * my + mz * mz < 1e-6 and dr * dr < 1e-4
+            if settled and horseData.poseHeld then
+                KCD2MP_PerfBump("horseSkip")
+            else
+                horseData.poseHeld = settled and true or nil
+                pcall(function()
+                    sp.x, sp.y, sp.z = horseData.dispX, horseData.dispY, horseData.dispZ
+                    sa.x, sa.y, sa.z = 0, 0, horseData.dispR or 0
+                    horseData.entity:SetWorldPos(sp)
+                    horseData.entity:SetWorldAngles(sa)
+                end)
+                horseData.wroteX, horseData.wroteY, horseData.wroteZ, horseData.wroteR =
+                    horseData.dispX, horseData.dispY, horseData.dispZ, horseData.dispR
+            end
         end
     end
 end
@@ -12030,9 +12425,20 @@ function mp_ghost_is_corpse(id, ghost)
     local gh = KCD2MP.ghostHealth[id]
     if gh and gh.flags and (math.floor(gh.flags) % 2) == 1 then return true end
     if not (ghost and ghost.entity and ghost.entity.actor) then return false end
+    -- IsDead + IsUnconscious are engine calls. This runs on the 20 ms ghost
+    -- tick, and a live body stays live: re-ask at 10 Hz. The network death
+    -- flag and the unconscious bit above are still read every tick.
+    local st = ghost.istate
+    local nowC = os.clock()
+    if st and st.corpseAt and (nowC - st.corpseAt) < 0.1 then
+        return st.corpseCached and true or false
+    end
     local dead = false
     pcall(function() dead = ghost.entity.actor:IsDead() and true or false end)
-    if dead then return true end
+    if dead then
+        if st then st.corpseAt, st.corpseCached = nowC, true end
+        return true
+    end
     -- WO-38 Phase 6: an NPC knocked this ghost out in THIS world. KCD2's
     -- unconsciousness is a real state distinct from death (the original A1
     -- lesson), and an unconscious body must freeze for exactly the same
@@ -12041,6 +12447,7 @@ function mp_ghost_is_corpse(id, ghost)
     -- conscious, because wrongly freezing a live player is the worse error.
     local ko = false
     pcall(function() ko = ghost.entity.actor:IsUnconscious() and true or false end)
+    if st then st.corpseAt, st.corpseCached = nowC, ko and true or false end
     return ko
 end
 
@@ -12100,7 +12507,7 @@ function KCD2MP_W158Finite(v) return type(v) == "number" and v == v and v > -1e7
 function KCD2MP_W158BadgeAnchor(ent, fx, fy, fz)
     local w = KCD2MP.w158
     if ent then
-        local okp, ep = pcall(function() return ent:GetWorldPos() end)
+        local okp, ep = pcall(function() return ent:GetWorldPos(SCRATCH.BADGE_POS) end)
         if okp and type(ep) == "table" and KCD2MP_W158Finite(ep.x) and KCD2MP_W158Finite(ep.y) and KCD2MP_W158Finite(ep.z) then
             for _, bone in ipairs(w.badgeBones) do
                 local okb, bp = pcall(function() return ent:GetBonePos(bone) end)
@@ -12142,7 +12549,18 @@ function KCD2MP_LabelTick()
         if badges and lbl.size > 0 and not (w194hid and w194hid[id]) then
             pcall(function()
                 local lx, ly, lz, lvl = lbl.x, lbl.y, lbl.z, "stream"
-                if lbl.ent then lx, ly, lz, lvl = KCD2MP_W158BadgeAnchor(lbl.ent, lbl.x, lbl.y, lbl.z) end
+                -- The neck bone does not move enough in one frame to be worth
+                -- a GetBonePos on every one. 50 ms is about three frames at
+                -- 60 fps and the badge still sits on the body.
+                local nowL = os.clock()
+                if lbl.ent and lbl.badgeAt and (nowL - lbl.badgeAt) < 0.05 and lbl.blvl then
+                    lx, ly, lz, lvl = lbl.bx, lbl.by, lbl.bz, lbl.blvl
+                    KCD2MP_PerfBump("boneReuse")
+                elseif lbl.ent then
+                    lx, ly, lz, lvl = KCD2MP_W158BadgeAnchor(lbl.ent, lbl.x, lbl.y, lbl.z)
+                    lbl.badgeAt, lbl.bx, lbl.by, lbl.bz, lbl.blvl = nowL, lx, ly, lz, lvl
+                    KCD2MP_PerfBump("boneRead")
+                end
                 if lbl.ent then KCD2MP_W158BadgeNote(id, lvl) end
                 local nm = KCD2MP_W211BadgeName and KCD2MP_W211BadgeName(id, lbl.name) or lbl.name   -- WO-211 A.1.5: "(reconnecting)"
                 System.DrawLabel({x=lx, y=ly, z=lz}, lbl.size, nm, 1, 1, 0, 1)
@@ -12980,7 +13398,24 @@ end
 
 -- Floor detection: physics raycast hits real geometry (roads, rocks, bridges).
 -- Falls back to terrain elevation if raycast unavailable.
-local function getFloorZ(x, y, curZ)
+--
+-- The raycast is a main-thread physics query. The ghost tick calls it every
+-- 20 ms, and the horse path calls it again. A standing body, or one that has
+-- moved a few centimetres, is standing on the same floor it stood on 100 ms
+-- ago. `cache` is a caller-owned table; nil keeps the old always-cast path.
+local FLOOR_REUSE_S = 0.10
+local FLOOR_REUSE_XY2 = 0.35 * 0.35
+local function getFloorZ(x, y, curZ, cache)
+    if cache and cache.at then
+        local age = os.clock() - cache.at
+        if age >= 0 and age < FLOOR_REUSE_S and cache.curZ and math.abs(curZ - cache.curZ) < 0.8 then
+            local dx, dy = x - cache.x, y - cache.y
+            if dx * dx + dy * dy < FLOOR_REUSE_XY2 then
+                KCD2MP_PerfBump("floorReuse")
+                return cache.floorZ, cache.reliable
+            end
+        end
+    end
     local floorZ = nil
     local reliable = false
 
@@ -12989,12 +13424,10 @@ local function getFloorZ(x, y, curZ)
     -- This covers range [curZ+2 .. curZ-10] - hits bridges, stairs, terrain.
     -- Flags 15 = ent_terrain(1)|ent_static(2)|ent_rigid(4)|ent_sleeping_rigid(8)
     pcall(function()
-        local hits = Physics.RayWorldIntersection(
-            {x=x, y=y, z=curZ + 2.0},
-            {x=0,  y=0, z=-12},
-            15,
-            1
-        )
+        local o = SCRATCH.RAY_O
+        if not o then o = {}; SCRATCH.RAY_O = o; SCRATCH.RAY_D = { x = 0, y = 0, z = -12 } end
+        o.x, o.y, o.z = x, y, curZ + 2.0
+        local hits = Physics.RayWorldIntersection(o, SCRATCH.RAY_D, 15, 1)
         if hits and hits[1] then
             local h = hits[1]
 
@@ -13034,6 +13467,12 @@ local function getFloorZ(x, y, curZ)
         end)
     end
 
+    if cache then
+        cache.at = os.clock()
+        cache.x, cache.y, cache.curZ = x, y, curZ
+        cache.floorZ, cache.reliable = floorZ, reliable
+    end
+    KCD2MP_PerfBump("floorCasts")
     return floorZ, reliable
 end
 
@@ -13111,6 +13550,7 @@ function KCD2MP_InterpTick(arg, gen)
     local _playerPos = nil
     if player then pcall(function() _playerPos = player:GetWorldPos(SCRATCH.INTERPTICK_PLAYERPOS_SCRATCH) end) end
 
+    KCD2MP._perfT0 = os.clock()
     for id, ghost in pairs(KCD2MP.ghosts) do
         local _ok, _err = pcall(function()  -- catch any crash, keep tick alive
         local istate = ghost.istate
@@ -13153,6 +13593,7 @@ function KCD2MP_InterpTick(arg, gen)
                 istate.corrSnapsWin = (istate.corrSnapsWin or 0) + 1
                 KCD2MP.snapSession = (KCD2MP.snapSession or 0) + 1
                 mp_log(string.format("TELEPORT id=%s dist=%.1f", id, math.sqrt(distSq)))
+                KCD2MP_DesyncNote("ghost-snap", string.format("id=%s dist_m=%.1f", tostring(id), math.sqrt(distSq)))
                 if KCD2MP_QuestHazard then KCD2MP_QuestHazard("teleport-ghost", string.format("ghost %s snapped %.0fm", tostring(id), math.sqrt(distSq))) end
                 istate.cx = istate.tx
                 istate.cy = istate.ty
@@ -13274,8 +13715,12 @@ function KCD2MP_InterpTick(arg, gen)
             -- Snap-DOWN: hovering up to 2m (hover fix; >2m cap prevents snapping off bridges).
             -- Skip floor snap when riding: horse engine handles terrain, NPC follows horse.
             local sz = z
-            if not istate.isRiding then
-                local floorZ, reliable = getFloorZ(x, y, z)
+            -- The DLL writes a bound ghost, including its Z. The raycast
+            -- result would be thrown away, and it is the expensive call in
+            -- this tick. Lua still snaps when it is the one placing the body.
+            if not istate.isRiding and not istate.nativeOwned then
+                if not istate.floor then istate.floor = {} end
+                local floorZ, reliable = getFloorZ(x, y, z, istate.floor)
                 if floorZ then
                     local diff = sz - floorZ
                     if diff < -0.05 and diff > -10.0 then
@@ -13337,10 +13782,13 @@ function KCD2MP_InterpTick(arg, gen)
                 -- no position/angle writes; the one-shot owns the body
             elseif istate.nativeOwned then
                 -- WO-118 Phase 2b: KCDMP.dll writes this ghost every frame at its frame hook
-            elseif not istate.nativeMounted then
+            elseif not istate.nativeMounted and KCD2MP_PoseChanged(istate, x, y, sz, r) then
                 local _, err = pcall(function()
-                    ghost.entity:SetWorldPos({x=x, y=y, z=sz})
-                    ghost.entity:SetWorldAngles({x=0, y=0, z=r})
+                    local sp, sa = SCRATCH.SETPOS, SCRATCH.SETANG
+                    sp.x, sp.y, sp.z = x, y, sz
+                    sa.x, sa.y, sa.z = 0, 0, r
+                    ghost.entity:SetWorldPos(sp)
+                    ghost.entity:SetWorldAngles(sa)
                 end)
                 if err then
                     System.LogAlways("[KCD2-MP] InterpTick err '" .. id .. "': " .. tostring(err))
@@ -13424,12 +13872,18 @@ function KCD2MP_InterpTick(arg, gen)
                     -- a Z close to sz, putting the horse on top of the NPC ghost.
                     -- Fix: use sz-1.5 as default; only accept raycast if it finds ground
                     -- at least 0.5m below saddle (rules out horse/player body hits).
+                    local horseData = KCD2MP.horseGhosts[id]
                     local horseGroundZ = sz - 1.5
-                    local hFloorZ, _ = getFloorZ(x, y, sz)
+                    -- A natively written horse does not use this Z. The raycast
+                    -- was still fired every riding tick.
+                    local hFloorZ = nil
+                    if not (horseData and horseData.native and horseData.native.bound) then
+                        if not istate.horseFloor then istate.horseFloor = {} end
+                        hFloorZ = getFloorZ(x, y, sz, istate.horseFloor)
+                    end
                     if hFloorZ and (sz - hFloorZ) >= 0.5 then
                         horseGroundZ = hFloorZ
                     end
-                    local horseData = KCD2MP.horseGhosts[id]
                     if horseData and horseData.entity then
                         -- WO-78: `dt` is the ghost's real elapsed render time (above), not 0.020.
                         local vx = (x - (horseData.lastX or x)) / dt
@@ -13511,31 +13965,9 @@ function KCD2MP_InterpTick(arg, gen)
                 -- Update label cache for the render loop (runs at 8ms to avoid flicker).
                 -- When riding: sz = saddle height, head ~1.3m above saddle.
                 -- When on foot: sz = feet, head ~1.8m above feet.
-                local displayName = KCD2MP.ghostNames[id] or ("Player" .. tostring(id))
-                -- WO-13 Phase 2: a player in a menu is standing perfectly still
-                -- and not responding, which reads as broken. Say so instead.
-                -- No pose work needed -- KCD2MP_UpdateAnimation already settles
-                -- a stationary ghost into its idle animation on its own.
-                if KCD2MP.ghostInMenu[id] then
-                    displayName = displayName .. " [in menu]"
-                end
-                -- WO-28 Flow C, before health: a dead player's remaining
-                -- number is stale by definition, so saying "dead" and a health
-                -- figure at once would be two answers to one question.
-                if KCD2MP.ghostDead[id] then
-                    displayName = displayName .. " [dead - reloading]"
-                else
-                    -- WO-28 Flow A. This is the owner's own authoritative
-                    -- health, not this world's local copy of the ghost --
-                    -- see KCD2MP_SetGhostHealth.
-                    local hs = KCD2MP.ghostHealth[id]
-                    if hs and hs.h and hs.h >= 0 then
-                        displayName = string.format("%s  %d HP", displayName, math.floor(hs.h + 0.5))
-                        if hs.s and hs.s >= 0 then
-                            displayName = string.format("%s / %d ST", displayName, math.floor(hs.s + 0.5))
-                        end
-                    end
-                end
+                -- Rebuilt only when the name, menu flag, death flag or vitals
+                -- change. The old string.format ran every 20 ms per ghost.
+                local displayName = KCD2MP_GhostLabelName(id)
                 -- WO-28 Flow B: sample this ghost's LOCAL health for
                 -- NPC-inflicted damage. No-op unless this client holds
                 -- NPCÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢player damage authority.
@@ -13546,7 +13978,7 @@ function KCD2MP_InterpTick(arg, gen)
                 -- at a sitting / lying head height.
                 local w141st = KCD2MP.w141 and KCD2MP.w141.avatarStance and KCD2MP.w141.avatarStance[id]
                 if w141st and w141st ~= 0 and ghost.entity then
-                    local okp, bp = pcall(function() return ghost.entity:GetWorldPos() end)
+                    local okp, bp = pcall(function() return ghost.entity:GetWorldPos(SCRATCH.INTERPTICK_WP_SCRATCH) end)
                     if okp and bp then
                         x, y = bp.x, bp.y
                         labelZ = bp.z + ((w141st == 2 and 0.75) or (w141st == 3 and 1.35) or (w141st == 4 and 1.25) or 1.8)
@@ -13562,7 +13994,7 @@ function KCD2MP_InterpTick(arg, gen)
                         labelSize = math.max(0.3, math.min(2.0, 10.0 / math.max(dist, 1.0)))
                     end
                 end
-                KCD2MP.labelCache[id] = {x=x, y=y, z=labelZ, size=labelSize, name=displayName, ent=ghost.entity}   -- WO-158 S1: ent = the neck bone read
+                KCD2MP_LabelCachePut(id, x, y, labelZ, labelSize, displayName, ghost.entity)   -- WO-158 S1: ent = the neck bone read
             end
         end
         end)  -- end pcall for ghost update
@@ -13577,46 +14009,10 @@ function KCD2MP_InterpTick(arg, gen)
     if KCD2MP._ridingCheckTick >= 5 then
         KCD2MP._ridingCheckTick = 0
         if player then
-            local riding = false
-            local mountName = nil
-            -- Method 0: Find "Horse" class entity within 2.5m of player.
-            -- When riding, horse origin is ~1.5m below saddle (player pos).
-            -- Exclude our own ghost horses (kcd2mp_horse_*) to avoid false positives.
-            pcall(function()
-                local pos = player:GetWorldPos()
-                if pos then
-                    local ents = System.GetEntitiesInSphere(pos, 2.5)
-                    if ents then
-                        for _, e in ipairs(ents) do
-                            local ec = "?"
-                            local en = ""
-                            pcall(function() ec = tostring(e.class or "?") end)
-                            pcall(function() en = tostring(e:GetName() or "") end)
-                            if ec == "Horse" and not en:find("kcd2mp_horse_") then
-                                -- Require player to be >1.0m ABOVE horse pivot.
-                                -- Horse entity pivot is at ground level; when mounted,
-                                -- player Z = saddle height (~1.5m above ground).
-                                -- Filters false positives when merely standing next to horse.
-                                local horsePos = nil
-                                pcall(function() horsePos = e:GetWorldPos() end)
-                                if horsePos and (pos.z - horsePos.z) > 1.0 then
-                                    riding = true
-                                    -- WO-38 Phase 5: this IS the mounted horse.
-                                    -- Only a plain authored name travels -- it is
-                                    -- the cross-client key (same rule as NPC sync);
-                                    -- a generated per-save name stays local and the
-                                    -- receiver keeps its proxy fallback.
-                                    if en ~= "" and string.find(en, "^[%w_]+$") then
-                                        mountName = en
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end)
-            -- Method 1: KCD2 human:IsRiding() (returns nil in v1.5, kept as fallback)
-            if not riding then
+            local riding, mountName = KCD2MP_SenseHorseNear()
+            -- Method 1 and 2 only when IsMounted is missing on this build.
+            -- A definite answer already skipped the 2.5 m entity scan.
+            if KCD2MP._mountKnown == nil and not riding then
                 pcall(function()
                     if player.human then
                         local r = player.human:IsRiding()
@@ -13624,8 +14020,7 @@ function KCD2MP_InterpTick(arg, gen)
                     end
                 end)
             end
-            -- Method 2: CryEngine linked parent
-            if not riding then
+            if KCD2MP._mountKnown == nil and not riding then
                 pcall(function()
                     local p = player:GetLinkedParent()
                     if p then riding = true end
@@ -13662,7 +14057,7 @@ function KCD2MP_InterpTick(arg, gen)
             pcall(KCD2MP_W148Tick)        -- WO-148: this player's own carry (a body, a sack)
         end
     end
-
+    KCD2MP_PerfNoteInterp(KCD2MP._perfT0)
 end
 
 -- ===== Main Tick (500ms) - position reporting =====
@@ -18425,6 +18820,17 @@ function KCD2MP_NpcSilenceAgent(lagMs)
     local lag = tonumber(lagMs) or -1
     local on = lag >= 0
     if on then ns.agentAt = os.clock(); ns.lagMs = lag else ns.agentAt = -1e9 end
+    if on and lag >= 1000 then
+        KCD2MP._latencyMs = lag
+        if os.clock() - (ns.latToldAt or -1e9) >= 2 then
+            ns.latToldAt = os.clock()
+            KCD2MP_DesyncNote("latency", string.format("delay_ms=%d", math.floor(lag)))
+        else
+            KCD2MP_DesyncNote("latency")
+        end
+    elseif on then
+        KCD2MP._latencyMs = lag
+    end
     if on ~= ns.wordOn then
         ns.wordOn = on
         mp_log(string.format("NPC-SYNC agent silence word %s (lag %d ms) -- %s", on and "on" or "off", math.floor(math.max(lag, 0)),
@@ -18447,11 +18853,16 @@ function KCD2MP_NpcSilenceRelease(name, p, now)
     local ns = KCD2MP.npcSilence
     if KCD2MP_W148Holds and KCD2MP_W148Holds(name) then return false end   -- WO-148: carried -- the stream waits on purpose
     local quiet = now - (p.lastPacketAt or 0)
+    -- After a sequence hole, wait 6 s before giving the body back. The 3 s
+    -- rule was releasing puppets during a lossy stretch; the local brain then
+    -- walked them somewhere the host's world does not have them.
+    local limit = (KCD2MP.npcSync and KCD2MP.npcSync.releaseS) or 3
+    if p.gapAt and (now - p.gapAt) < 8.0 and limit < 6.0 then limit = 6.0 end
     if KCD2MP.w147.npcCatchup and (now - ns.agentAt) < ns.ttlS then
         local m = ns.silent[name]
-        return (m ~= nil and m >= (p.lastPacketAt or 0)) or quiet > ns.fallbackS
+        return (m ~= nil and m >= (p.lastPacketAt or 0)) or quiet > math.max(ns.fallbackS or 0, limit)
     end
-    return quiet > KCD2MP.npcSync.releaseS
+    return quiet > limit
 end
 
 function KCD2MP_SetNpcCatchup(arg)
@@ -29080,6 +29491,7 @@ local ok, err = pcall(function()
     System.AddCCommand("mp_enable_aggro",    'KCD2MP_EnableAggro(%line)', "WO-17: opt-in NPC aggro on ghosts, this client only: mp_enable_aggro on|off")
     System.AddCCommand("mp_respawn",         'KCD2MP_SetRespawn(%line)',  "WO-113: death without Game Over in a session: mp_respawn on|off (default on; off = vanilla death); bare = report")
     System.AddCCommand("mp_debug_hud",       'KCD2MP_DebugHud(%line)', "WO-50: toggle the CryEngine debug HUD (r_DisplayInfo), off by default in release: mp_debug_hud on|off")
+    System.AddCCommand("mp_perf",            'KCD2MP_SetPerf(%line)',  "Log tick cost (interp ms, floor raycasts/s, skipped NPC polls). on = every 2s, off = every 15s, now = one line")
 
     -- NPC sync (WO-32)
     System.AddCCommand("mp_npc_sync",    'KCD2MP_EnableNpcSync(%line)', "WO-32: stream nearby NPCs to peers (world authority only): mp_npc_sync on|off")

@@ -142,8 +142,18 @@ public sealed class LinkSchedOptions
     public bool LatestWins = true;
     /// <summary>C.2: state goes the path's unreliable way (set once the hello agreed and the path has one).</summary>
     public bool Unreliable;
-    /// <summary>C.3: a state older than this at send time is dropped and counted (0 = no limit).</summary>
+    /// <summary>C.3: a state older than this at send time is dropped and counted (0 = no limit).
+    /// 500 again. 2000 kept handing the partner a sample that was already up to two seconds late, and that
+    /// staleness stacked on whatever the receiver's own queue was holding. The slot is still latest-wins, so
+    /// the age is the newest sample's age. A hitch that produces no newer sample drops this one instead of
+    /// playing it late; the next sample after the hitch is fresh. Puppet release stays on the receiver's
+    /// silence window (several seconds), which one dropped sample does not trip.</summary>
     public int AgeLimitMs = 500;
+    /// <summary>
+    /// When the oldest unsent event is at least this old and a body's state is waiting, that state goes next
+    /// (0 = events always stay strictly first). A burst of events otherwise head-of-line blocks position.
+    /// </summary>
+    public int EventSnapMs = 1000;
     /// <summary>C.2: an unchanged owner / pose / opponent state is stated again this often while state travels unreliably.</summary>
     public int RepeatMs = 1000;
     /// <summary>C.2: WO-143's extras (hands, gaits, looks, vitals, mounts) again this often -- each row is a native write on the joiner
@@ -195,7 +205,7 @@ public sealed class LinkScheduler
     public Func<StatePiece, int?>? BandOf { get; set; }
 
     // counters (the MP-LINK lines)
-    public long EventsIn, StateIn, Coalesced, StaleDropped, Repeats, StateSent, EventsSent, FramesBuilt, PendingWaits, BudgetWaits;
+    public long EventsIn, StateIn, Coalesced, StaleDropped, Repeats, StateSent, EventsSent, FramesBuilt, PendingWaits, BudgetWaits, StateJumped;
     private readonly List<double> _stateAgeAtSendMs = new(512), _eventAgeAtSendMs = new(512);
 
     public LinkScheduler(LinkSchedOptions? options = null) => Options = options ?? new LinkSchedOptions();
@@ -245,7 +255,22 @@ public sealed class LinkScheduler
         frame = []; isState = false;
         lock (_lock)
         {
-            if (_events.Count > 0 && !eventsHeld)
+            bool eventFirst = _events.Count > 0 && !eventsHeld;
+            if (eventFirst && Options.EventSnapMs > 0)
+            {
+                long eventAgeMs = (long)((now - _events.Peek().Ts) / TicksPerMs);
+                if (eventAgeMs >= Options.EventSnapMs)
+                {
+                    foreach (var s in _slots.Values)
+                    {
+                        if (!s.Dirty) continue;
+                        eventFirst = false;
+                        StateJumped++;
+                        break;
+                    }
+                }
+            }
+            if (eventFirst)
             {
                 var e = _events.Dequeue();
                 _eventBytes -= e.F.Length;

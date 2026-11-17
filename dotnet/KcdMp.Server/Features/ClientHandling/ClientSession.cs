@@ -48,6 +48,10 @@ public class ClientSession
     private readonly Dictionary<string, byte[]> _pendingNpcPackets = new();   // WO-110 4.4: "<src>|<name>" -> newest packet, only under pressure
     private readonly SemaphoreSlim _writeSignal = new(0);
     private bool _writeQueueStopped;
+    // One timer for every header wait. A new CancellationTokenSource per packet
+    // was a steady allocation on the 30-50 Hz position stream.
+    private readonly CancellationTokenSource _idleRead = new();
+    private readonly byte[] _pingPayload = new byte[8];
     private int _queuedBytes;
     private long _npcCoalesced;
 
@@ -424,10 +428,10 @@ public class ClientSession
 
                 if (type == Protocol.Ping && payloadLen == 8)
                 {
-                    // Ping → echo back as Pong with same 8-byte timestamp
-                    var tsBytes = new byte[8];
-                    await ReadExactAsync(tsBytes);
-                    EnqueueRaw(BuildPacket(Protocol.Pong, tsBytes));
+                    // Ping → echo back as Pong with same 8-byte timestamp.
+                    // The buffer is reused; BuildPacket copies it before the next ping.
+                    await ReadExactAsync(_pingPayload);
+                    EnqueueRaw(BuildPacket(Protocol.Pong, _pingPayload));
                     continue;
                 }
 
@@ -1028,6 +1032,7 @@ public class ClientSession
         {
             StopWriteQueue();
             await writeTask;
+            _idleRead.Dispose();
             _conn.Dispose();
         }
     }
@@ -1745,18 +1750,20 @@ public class ClientSession
     /// </summary>
     private async Task ReadExactWithIdleTimeoutAsync(byte[] buffer)
     {
-        using var cts = new CancellationTokenSource(_idleTimeout);
+        if (!_idleRead.TryReset())
+            throw new IOException("the idle timer could not be armed again");
+        _idleRead.CancelAfter(_idleTimeout);
         try
         {
             int offset = 0;
             while (offset < buffer.Length)
             {
-                int n = await _stream.ReadAsync(buffer.AsMemory(offset), cts.Token);
+                int n = await _stream.ReadAsync(buffer.AsMemory(offset), _idleRead.Token);
                 if (n == 0) throw new EndOfStreamException();
                 offset += n;
             }
         }
-        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        catch (OperationCanceledException) when (_idleRead.IsCancellationRequested)
         {
             throw new IOException($"idle timeout ({_idleTimeout.TotalSeconds:F0}s) waiting for the next packet");
         }
