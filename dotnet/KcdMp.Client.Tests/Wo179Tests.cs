@@ -90,13 +90,45 @@ public class Wo179Tests
     }
 
     [Fact]
-    public void B_the_partners_black_is_bounded_three_seconds_and_one_second_past_the_report()
+    public async Task B_unknown_destination_starts_no_black_or_move()
     {
-        Assert.Equal(13_000, Wo179Rules.PartnerFadeDeadline(10_000, 0));          // no report: 3 s
-        Assert.Equal(11_600, Wo179Rules.PartnerFadeDeadline(10_000, 10_600));     // report at 0.6 s: 1 s past it
-        Assert.Equal(13_000, Wo179Rules.PartnerFadeDeadline(10_000, 12_500));     // report at 2.5 s: still 3 s in all
-        Assert.Equal(11_000, Wo179Rules.PartnerFadeDeadline(10_000, 9_000));      // a report kept from before the black
-        Assert.True(Wo179Rules.PartnerFadeMaxMs <= 3_000);
+        var calls = new List<string>();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Wo179Rules.DuringKnownMoveAsync(false,
+            () => { calls.Add("fade-out"); return Task.FromResult(true); },
+            () => { calls.Add("move"); return Task.FromResult(true); },
+            () => { calls.Add("fade-in"); return Task.CompletedTask; }));
+        Assert.Empty(calls);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task B_known_move_closes_its_fade_on_success_and_refusal(bool placed)
+    {
+        var calls = new List<string>();
+        bool result = await Wo179Rules.DuringKnownMoveAsync(true,
+            () => { calls.Add("fade-out"); return Task.FromResult(true); },
+            () => { calls.Add("move"); return Task.FromResult(placed); },
+            () => { calls.Add("fade-in"); return Task.CompletedTask; });
+        Assert.Equal(placed, result);
+        Assert.Equal(new[] { "fade-out", "move", "fade-in" }, calls);
+    }
+
+    [Fact]
+    public async Task B_known_move_closes_its_fade_when_world_changes_or_the_move_faults()
+    {
+        foreach (Exception failure in new Exception[] { new OperationCanceledException("world changed"), new IOException("pipe lost") })
+        {
+            int closed = 0;
+            await Assert.ThrowsAsync(failure.GetType(), () => Wo179Rules.DuringKnownMoveAsync<bool>(true,
+                () => Task.FromResult(true), () => Task.FromException<bool>(failure),
+                () => { closed++; return Task.CompletedTask; }));
+            Assert.Equal(1, closed);
+        }
+        int lifted = 0;
+        await Wo179Rules.DuringKnownMoveAsync(true, () => Task.FromResult(false), () => Task.FromResult(true),
+            () => { lifted++; return Task.CompletedTask; });
+        Assert.Equal(0, lifted);   // a refused fade never owns the screen
     }
 
     [Theory]

@@ -70,6 +70,7 @@ public partial class GameBridge
             }
         }
         Console.WriteLine($"WO192-CFG host_autosave={On(_w192Autosave)} every={Wo189Rules.Secs(Interlocked.Read(ref _w192AutosaveMs) / 60)} min of play wake_hold={On(_w192WakeHold)} station_release={On(_w192StationRelease)}");
+        if (!_w192WakeHold) Wo192ResetWake("wake hold disabled");
     }
 
     private void Wo192OnConnect() => _ = ExecLuaAsync("if KCD2MP_W192Cfg then KCD2MP_W192Cfg() end");
@@ -174,16 +175,31 @@ public partial class GameBridge
     private long _w192HoldSince;           // the hold's start (0 = none)
     private volatile bool _w192WakeHolding;
     private long _w192WakeHolds, _w192WakeBounds;
+    private readonly SemaphoreSlim _w192WakeGate = new(1, 1);
+    private long _w192WakeGeneration;
+    private uint _w192WakeLease;
+
+    private void Wo192ResetWake(string why)
+    {
+        Interlocked.Increment(ref _w192WakeGeneration);
+        uint lease = Volatile.Read(ref _w192WakeLease);
+        if (lease != 0) _ = Wo192ReleaseWakeAsync(why, lease);
+    }
 
     /// <summary>This game's own skip began (the DLL's edge): a new shared skip, the host has not woken in it yet.</summary>
-    private void Wo192OnSkipBegan() => Volatile.Write(ref _w192HostWokeMs, 0);
+    private void Wo192OnSkipBegan()
+    {
+        Wo192ResetWake("new shared skip");
+        Volatile.Write(ref _w192HostWokeMs, 0);
+    }
 
     /// <summary>The host's "woke" reached this joiner (Wo140OnCancelAsync): a held wake ends a moment later.</summary>
     private void Wo192OnHostWoke()
     {
         if (_isDamageAuthority) return;
         Volatile.Write(ref _w192HostWokeMs, Math.Max(Environment.TickCount64, 1));
-        if (_w192WakeHolding) _ = Task.Run(async () => { await Task.Delay((int)Wo192Rules.WakeSettleMs); await Wo192ReleaseWakeAsync("the host woke"); });
+        uint lease = Volatile.Read(ref _w192WakeLease);
+        if (_w192WakeHolding && lease != 0) _ = Task.Run(async () => { await Task.Delay((int)Wo192Rules.WakeSettleMs); await Wo192ReleaseWakeAsync("the host woke", lease); });
     }
 
     /// <summary>
@@ -193,31 +209,54 @@ public partial class GameBridge
     private async Task Wo192OnLocalWokeAsync(bool force = false)
     {
         if (_isDamageAuthority || (!W140SharedSkip && !force)) return;
-        long now = Environment.TickCount64;
-        if (Volatile.Read(ref _w192HostWokeMs) != 0) { Console.WriteLine("WO192-WAKE the host woke first -- no hold"); return; }
-        if (!_w192WakeHold) { Console.WriteLine("WO192-WAKE this player woke before the host -- not held (mp_wake_hold is off)"); return; }
-        var fr = await _combat.Wo163Async(Protocol.Wo179OpFade, [1, .. BitConverter.GetBytes(0.3f)]);
-        if (fr is not { Ok: true }) { Console.WriteLine("WO192-WAKE this player woke before the host -- the game's fader refused: not held"); return; }
-        Interlocked.Increment(ref _w192WakeHolds);
-        Volatile.Write(ref _w192HoldSince, now);
-        _w192WakeHolding = true;
-        Console.WriteLine($"WO192-WAKE this player woke before the host -- held behind the game's fader until the host's 'woke' (at most {Wo192Rules.WakeHoldMaxMs / 1000} s)");
-        _ = Task.Run(async () =>
+        long generation = Interlocked.Read(ref _w192WakeGeneration);
+        await _w192WakeGate.WaitAsync();
+        uint lease = OwnedFader.NextToken();
+        bool acquired = false, retained = false;
+        try
         {
-            await Task.Delay((int)Wo192Rules.WakeHoldMaxMs);
-            if (_w192WakeHolding && Volatile.Read(ref _w192HoldSince) == now) { Interlocked.Increment(ref _w192WakeBounds); await Wo192ReleaseWakeAsync("the 15 s bound"); }
-        });
+            if (generation != Interlocked.Read(ref _w192WakeGeneration) || _isDamageAuthority || _w192WakeHolding) return;
+            long now = Environment.TickCount64;
+            if (Volatile.Read(ref _w192HostWokeMs) != 0) { Console.WriteLine("WO192-WAKE the host woke first -- no hold"); return; }
+            if (!_w192WakeHold) { Console.WriteLine("WO192-WAKE this player woke before the host -- not held (mp_wake_hold is off)"); return; }
+            acquired = await OwnedFadeAsync(true, 0.3f, FaderOwner.Wake, lease);
+            if (!acquired) { Console.WriteLine("WO192-WAKE this player woke before the host -- the game's fader refused: not held"); return; }
+            if (generation != Interlocked.Read(ref _w192WakeGeneration) || _isDamageAuthority || Volatile.Read(ref _w192HostWokeMs) != 0 || !_w192WakeHold) return;
+            Interlocked.Increment(ref _w192WakeHolds);
+            Volatile.Write(ref _w192HoldSince, now);
+            Volatile.Write(ref _w192WakeLease, lease);
+            _w192WakeHolding = true;
+            retained = true;
+            Console.WriteLine($"WO192-WAKE this player woke before the host -- held behind the game's fader until the host's 'woke' (at most {Wo192Rules.WakeHoldMaxMs / 1000} s)");
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay((int)Wo192Rules.WakeHoldMaxMs);
+                if (_w192WakeHolding && Volatile.Read(ref _w192WakeLease) == lease) { Interlocked.Increment(ref _w192WakeBounds); await Wo192ReleaseWakeAsync("the 15 s bound", lease); }
+            });
+        }
+        finally
+        {
+            try { if (acquired && !retained) await OwnedFadeAsync(false, 0.1f, FaderOwner.Wake, lease); }
+            finally { _w192WakeGate.Release(); }
+        }
     }
 
-    private async Task Wo192ReleaseWakeAsync(string why)
+    private async Task Wo192ReleaseWakeAsync(string why, uint expectedLease = 0)
     {
-        if (!_w192WakeHolding) return;
-        _w192WakeHolding = false;
-        long held = Environment.TickCount64 - Volatile.Read(ref _w192HoldSince);
-        try { await _combat.Wo163Async(Protocol.Wo179OpFade, [0, .. BitConverter.GetBytes(0.5f)]); }
-        catch (Exception ex) when (ex is IOException or InvalidOperationException or OperationCanceledException or ObjectDisposedException) { }
-        Console.WriteLine($"WO192-WAKE released after {Wo189Rules.Secs(held)} s ({why})");
-        _ = ExecLuaAsync("if KCD2MP_ReportWorldTime then KCD2MP_ReportWorldTime() end");   // the pin: the clock meets the host's
+        await _w192WakeGate.WaitAsync();
+        try
+        {
+            uint lease = Volatile.Read(ref _w192WakeLease);
+            if (!_w192WakeHolding || lease == 0 || (expectedLease != 0 && expectedLease != lease)) return;
+            _w192WakeHolding = false;
+            Volatile.Write(ref _w192WakeLease, 0);
+            long held = Environment.TickCount64 - Volatile.Read(ref _w192HoldSince);
+            try { await OwnedFadeAsync(false, 0.5f, FaderOwner.Wake, lease); }
+            catch (Exception ex) when (ex is IOException or InvalidOperationException or OperationCanceledException or ObjectDisposedException) { }
+            Console.WriteLine($"WO192-WAKE released after {Wo189Rules.Secs(held)} s ({why})");
+            _ = ExecLuaAsync("if KCD2MP_ReportWorldTime then KCD2MP_ReportWorldTime() end");   // the pin: the clock meets the host's
+        }
+        finally { _w192WakeGate.Release(); }
     }
 
     // ================================================================ 4c: a station's save lock

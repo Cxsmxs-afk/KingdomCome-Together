@@ -316,6 +316,7 @@ namespace KCDMP_launcher.Pages
             // version poll's (which a closed launch panel cancels).
             agentPollCts?.Cancel();
             agentPollCts = new CancellationTokenSource();
+            authorityFailureModalShown = false;
             agentBanner.Start(server.SteamCode is not null, agentClock.Elapsed.TotalSeconds);
             SyncAgentBanner();
             _ = PollAgentStatusAsync(agentProcess, agentPollCts.Token);
@@ -330,6 +331,7 @@ namespace KCDMP_launcher.Pages
         private readonly Stopwatch agentClock = Stopwatch.StartNew();
         private CancellationTokenSource? agentPollCts;
         private bool agentPollErrorLogged;
+        private bool authorityFailureModalShown;
 
         private void SyncAgentBanner()
         {
@@ -357,13 +359,19 @@ namespace KCDMP_launcher.Pages
                         steamFallbackShown = true;
                         ShowMessage("STEAM CONNECTION FAILED", cs.Message, "", addressFallback: true);
                     }
-                    string? change = agentBanner.Apply(cs, js, alive, agentClock.Elapsed.TotalSeconds);
+                    string? change = agentBanner.Apply(cs, js, alive, agentClock.Elapsed.TotalSeconds, settings.Language);
                     if (change is not null)
                     {
                         Log.Information(change);
                         SyncAgentBanner();
                         await InvokeAsync(StateHasChanged);
                     }
+                    if (agentBanner.AuthorityUnavailable && !authorityFailureModalShown)
+                    {
+                        authorityFailureModalShown = true;
+                        ShowMessage(KcdMp.Wire.HostAuthorityFailure.Title(agentBanner.JoinReason, settings.Language), agentBanner.JoinMessage, "");
+                    }
+                    else if (!agentBanner.AuthorityUnavailable) authorityFailureModalShown = false;
                     // WO-140: a joiner connected from his own save -- a modal once, besides the in-game line
                     if (agentBanner.OwnWorld && !ownWorldModalShown)
                     {

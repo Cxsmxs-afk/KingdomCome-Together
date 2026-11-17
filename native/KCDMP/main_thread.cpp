@@ -8,6 +8,7 @@
 #include "iat_hook.h"
 #include "log.h"
 #include "wo140.h"
+#include "wo218_rules.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -49,7 +51,8 @@ struct Repeating {
 };
 
 std::mutex                              g_mutex;
-std::vector<std::function<void()>>      g_queue;
+struct Queued { std::function<bool()> eligible; std::function<void()> work; };
+std::deque<Queued>                      g_queue;
 std::vector<std::shared_ptr<Repeating>> g_repeating;
 std::condition_variable                 g_drained;
 std::atomic<unsigned long long>         g_frames{0};
@@ -172,14 +175,16 @@ void hooked_update(void* self, float dt) {
 
     // Swap under the lock and run outside it: queued work may post more work,
     // and holding the lock across a call into the game invites a deadlock.
-    std::vector<std::function<void()>> batch;
+    std::deque<Queued> batch;
     // Copy under the lock, run outside it. Running them while holding g_mutex
     // would block every post() for the duration of a call into the game, which
     // is exactly the deadlock the comment above warns about.
     std::vector<std::shared_ptr<Repeating>> repeating;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_queue.empty()) batch.swap(g_queue);
+        for (size_t n = 0; !g_queue.empty() && n < wo218rules::kRequestsPerFrame; ++n) {
+            batch.push_back(std::move(g_queue.front())); g_queue.pop_front();
+        }
         repeating = g_repeating;
     }
     const bool cost = g_costOn.load(std::memory_order_relaxed);
@@ -200,11 +205,18 @@ void hooked_update(void* self, float dt) {
     }
 
     double batchUs = 0;
-    const uint32_t items = static_cast<uint32_t>(batch.size());
+    uint32_t items = 0;
     if (!batch.empty()) {
         const double b0 = now_us();
-        for (auto& work : batch) {
-            run_guarded(g_queuedSite, &work);
+        while (!batch.empty()) {
+            if (!wo218rules::may_run(static_cast<int>(items), now_us() - b0) || (batch.front().eligible && !batch.front().eligible())) break;
+            run_guarded(g_queuedSite, &batch.front().work);
+            batch.pop_front(); ++items;
+        }
+        // Older carried work keeps its place before tasks posted during this frame.
+        if (!batch.empty()) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            while (!batch.empty()) { g_queue.push_front(std::move(batch.back())); batch.pop_back(); }
         }
         batchUs = now_us() - b0;
         g_drained.notify_all();
@@ -286,8 +298,12 @@ void post_repeating(const char* name, std::function<void()> work) {
 }
 
 void post(std::function<void()> work) {
+    post_when({}, std::move(work));
+}
+
+void post_when(std::function<bool()> eligible, std::function<void()> work) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_queue.push_back(std::move(work));
+    g_queue.push_back(Queued{std::move(eligible), std::move(work)});
 }
 
 bool run_sync(std::function<void()> work, unsigned timeout_ms) {

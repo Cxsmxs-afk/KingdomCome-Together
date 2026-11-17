@@ -16,7 +16,7 @@ namespace KcdMp.Client;
 //      (mp_sweep_fight_guard; the Lua gate is KCD2MP_W191Fighting, this side gates the DLL's neutralise).
 //   3  an attacker always has a body: the host pins an NPC or animal that targets a partner into the NPC stream at once; the joiner asks
 //      for one it has no body for; a blow from a bodiless attacker is counted as ghost damage (mp_attacker_bind; WO191-BIND, WO191-GHOST).
-//   4  on the joiner, a fader that belongs to no scene ends the game's own way after 3 s (mp_fader_bound; WO191-FADER).
+//   4  only a known waiting conversation is recovered. Unknown faders never trigger a global override (mp_fader_bound; WO191-FADER).
 // Log tags: WO191-ACTION, WO191-SWEEP, WO191-BIND, WO191-GHOST, WO191-FADER, WO191-CFG, WO191-STATS.
 public partial class GameBridge
 {
@@ -187,6 +187,12 @@ public partial class GameBridge
     private long _w191FadeSeq;
     private readonly Wo191Rules.PendingConversation _w191Conv = new();
 
+    private void Wo191ResetFader()
+    {
+        Interlocked.Increment(ref _w191FadeSeq);
+        _w191Conv.Clear();
+    }
+
     /// <summary>4: the engine lines (Wo144OnEngineLine): this player's conversation waiting for its NPC; the host's target lines (3b).</summary>
     private void Wo191OnEngineLineAll(string line)
     {
@@ -195,37 +201,38 @@ public partial class GameBridge
         Wo191OnEngineLine(line);
     }
 
-    /// <summary>4b: WO-179's fade watch (on / off); a fader that is still black and shows nothing at 3 s is ended the game's own way.</summary>
+    /// <summary>Only the same known conversation may be interrupted. An unknown fade has no recovery timer.</summary>
     private void Wo191OnFade(bool on, long whenMs)
     {
         long seq = Interlocked.Increment(ref _w191FadeSeq);
         if (!on || !W137Joiner || !_w191FaderBound) return;
+        string? content = _w192WakeHolding ? "the wake waiting for the host (WO-192)"
+            : Wo191Rules.FaderContent(Wo179SceneLabel(), Wo138PauseState(), _w167FtActive, W179NotInWorld, _sentDeathForThisLife);
+        var holder = _w191Conv.Capture(whenMs);
+        if (content is not null || holder is null)
+        {
+            Console.WriteLine($"WO191-FADER owner={content ?? "unknown"} -- left unchanged; no default black-screen timeout");
+            return;
+        }
         _ = Task.Run(async () =>
         {
             await Task.Delay((int)Wo191Rules.FaderBoundMs);
             if (Interlocked.Read(ref _w191FadeSeq) != seq || _w179FadeOnAt == 0 || !W137Joiner || !_w191FaderBound) return;   // ended, or another edge came
+            if (!_w191Conv.StillWaiting(holder.Value)) return;   // ran, ended, replaced, loaded or disconnected
             string label = _w179FadeScene != "-" ? _w179FadeScene : Wo179SceneLabel();   // a scene at the fade's start, or one since
-            string? content = _w192WakeHolding ? "the wake waiting for the host (WO-192)"
+            string? currentContent = _w192WakeHolding ? "the wake waiting for the host (WO-192)"
                              : Wo191Rules.FaderContent(label, Wo138PauseState(), _w167FtActive, W179NotInWorld, _sentDeathForThisLife);
             long held = Environment.TickCount64 - whenMs;
-            if (content is not null)
+            if (currentContent is not null)
             {
-                Console.WriteLine(FormattableString.Invariant($"WO191-FADER held {held / 1000.0:F1} s, left alone: it shows {content}"));
+                Console.WriteLine(FormattableString.Invariant($"WO191-FADER held {held / 1000.0:F1} s, left alone: it shows {currentContent}"));
                 return;
             }
-            int waiting = _w191Conv.Waiting;
+            int waiting = holder.Value.Id;
             Interlocked.Increment(ref _w191FaderReleases);
             Console.WriteLine(FormattableString.Invariant($"WO191-FADER released after {held / 1000.0:F1} s ({Wo191Rules.HolderText(waiting)})"));
-            if (waiting >= 0)
-            {
-                _w179TwinReleasedFor = W200("joiner_scoped_twins") ? Volatile.Read(ref _w200AttemptMs) : _w179DudeStartMs;   // WO-179 A3 would end the same conversation at 3.5 s (WO-200 I.6: its bound's start)
-                await ExecLuaAsync($"if KCD2MP_W179ReleaseDialog then KCD2MP_W179ReleaseDialog(\"wo191-fader-3s\", {(Wo201OwnTalk() ? 1 : 0)}) end");   // WO-201 B6
-            }
-            else
-            {
-                Volatile.Write(ref _w167FaderHeldMs, W167NowMs());
-                await ExecLuaAsync("if KCD2MP_W167SceneReleased then KCD2MP_W167SceneReleased(false, \"wo191-fader-3s\", 0) end");   // WO-201 B19: no scene of the partner's
-            }
+            _w179TwinReleasedFor = W200("joiner_scoped_twins") ? Volatile.Read(ref _w200AttemptMs) : _w179DudeStartMs;
+            await ExecLuaAsync($"if KCD2MP_W179ReleaseDialog then KCD2MP_W179ReleaseDialog(\"wo191-known-conversation-{waiting}\", {(Wo201OwnTalk() ? 1 : 0)}) end");
         });
     }
 }

@@ -663,7 +663,8 @@ public partial class GameBridge
             }
             if (!await PrepareHostAuthorityAsync(j))
             {
-                await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "authority-unavailable", "Your host's NPC and story authority could not be prepared. Update the mod on both PCs.");
+                string why = HostAuthorityFailure.IsReason(_hostAuthorityFailureReason) ? _hostAuthorityFailureReason : HostAuthorityFailure.NotConfirmed;
+                await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, why, HostAuthorityFailure.Message(why)!);
                 return;
             }
             if (!await PrepareHostCalendarAsync(j))
@@ -734,7 +735,7 @@ public partial class GameBridge
         return File.Exists(p) ? p : null;
     }
 
-    /// <summary>Delete the transient file, rescan, and report what Continue would load now.</summary>
+    /// <summary>Delete the transient file and report the engine cache without refreshing it during active play.</summary>
     private async Task RemovePlacedWorldAsync(JoinerJoin j, string why)
     {
         if (j.PlacedPath is not string p) return;
@@ -752,16 +753,9 @@ public partial class GameBridge
         }
         catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(p)}: {ex.Message}"); }
         j.PlacedPath = gone ? null : p;
-        var after = await _combat.SaveListAsync(1, j.Playline, j.Name);
-        string expect = "?";
-        if (ResolveSavesDirForJoin() is string saves)
-        {
-            var own = OwnSaves(saves, HostSeedForOwn(), l => Console.WriteLine(l), Wo157HostedSeed).FirstOrDefault(s => s.Save.Playline == j.Playline);   // WO-125: a host-seed copy is never "own"
-            expect = own?.Save.Base ?? "-";
-        }
-        bool contOk = after is not null && !after.Listed && after.ContinueName == expect;
-        Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} {why}: {SaveDisplay(p)} deleted={On(gone)}; rescan listed={(after is null ? "?" : On(after.Listed))}; " +
-                          $"Continue would load playline{after?.ContinuePlayline}/{after?.ContinueName ?? "?"} (this player's newest own save in playline{j.Playline}: {expect}) -> {(contOk ? "OK" : "CHECK")}");
+        var after = await _combat.SaveListAsync(3, j.Playline, j.Name);
+        Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} {why}: {SaveDisplay(p)} deleted={On(gone)}; cached listed={(after is null ? "?" : On(after.Listed))}; " +
+                          $"cached Continue entry=playline{after?.ContinuePlayline}/{after?.ContinueName ?? "?"} (not refreshed)");
     }
 
     private async Task CleanupRetainedJoinWorldsAsync(IEnumerable<JoinerJoin> worlds, string why)
@@ -793,7 +787,10 @@ public partial class GameBridge
 
         if (!await VerifyHostCalendarAsync(j))
         {
-            await LeaveAfterFailedJoinAsync(j, Protocol.JoinAbortLoadFailed, "clock-unavailable", "Your host's world clock could not be verified.");
+            string why = _hostAuthorityFailureReason;
+            if (HostAuthorityFailure.IsReason(why))
+                await LeaveAfterFailedJoinAsync(j, Protocol.JoinAbortLoadFailed, why, HostAuthorityFailure.Message(why)!);
+            else await LeaveAfterFailedJoinAsync(j, Protocol.JoinAbortLoadFailed, "clock-unavailable", "Your host's world clock could not be verified.");
             return;
         }
 
@@ -1019,7 +1016,7 @@ public partial class GameBridge
             _joinReceivedId = 0;
             _jj = null;
             _autoNextUtc = DateTime.UtcNow.AddSeconds(30);
-            SetJoinUi(why == "no-own-save" ? "no-save" : "failed", message, why == "load-frozen" ? "frozen" : "");
+            SetJoinUi(why == "no-own-save" ? "no-save" : "failed", message, HostAuthorityFailure.JoinReason(why));
         }
         Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} ABORTED ({why}) -- JoinAbort {Protocol.JoinAbortName(reason)} {(sendAbort ? "sent (the host resumes)" : "not sent")}; {(j.InWorld && _joinedWorld ? "leaving the host's world" : "staying where it is")}");
         // WO-125: a failed in-world rejoin leaves the host's world (what the joiner did since the reload is not kept).
@@ -1073,13 +1070,13 @@ public partial class GameBridge
         await Wo122SetLockAsync(false, "left-shared-world");
         Wo144ReleaseClock("left-shared-world");   // WO-144 3.3: a clock standing with the host's never stays standing
         string full = src is null ? message : $"{message} Going back to your own game.";
-        SetJoinUi("left", full);
+        SetJoinUi("left", full, HostAuthorityFailure.JoinReason(why));
         Console.WriteLine($"MP-JOIN joiner: leaving the host's world ({why}) -> {(src is null ? "no own save (" + ownWhy + "): back to the main menu" : "loading " + src.Display)}");
         await ExecLuaAsync($"if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"{EscapeLua(full)}\") end");
         if (src is null)
         {
             await Task.Delay(4000);
-            if (!await Wo125ExitToMenuAsync(why)) { _leaveInProgress = false; SetJoinUi("left", message + " Quit the game to get back to the main menu."); }
+            if (!await Wo125ExitToMenuAsync(why)) { _leaveInProgress = false; SetJoinUi("left", message + " Quit the game to get back to the main menu.", HostAuthorityFailure.JoinReason(why)); }
             return;
         }
         if (!await Wo177WaitQuietAsync("leave")) { _leaveInProgress = false; SetJoinUi("left", full + " " + Wo177Rules.GaveUpText); return; }   // WO-177 A5

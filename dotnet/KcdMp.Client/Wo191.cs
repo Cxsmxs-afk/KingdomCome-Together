@@ -14,7 +14,7 @@ namespace KcdMp.Client;
 ///   2  no sweep resets a copy that fights: engaged, in combat mode, targeted by or targeting a player, or within 10 s of any of those.
 ///   3  an NPC or animal that targets a player and has no copy there is bound at once (the host pins it into the NPC stream); a blow that
 ///      still comes from an attacker with no body is counted as ghost damage (WO191-GHOST).
-///   4  on the joiner, a fader that belongs to no scene is ended the game's own way after 3 s (WO191-FADER).
+///   4  a joiner's known waiting conversation may be ended; an unidentified fader is observed, never lifted globally.
 /// </summary>
 public static class Wo191Rules
 {
@@ -155,9 +155,9 @@ public static class Wo191Rules
     public static bool AskBind(bool haveBody, bool on, long lastAskMs, long nowMs) =>
         on && !haveBody && (lastAskMs == 0 || nowMs - lastAskMs >= BindAskGapMs);
 
-    // ================================================================ 4: a fader with no content
+    // ================================================================ 4: a fader with a known holder
 
-    /// <summary>4b: a joiner's fader that belongs to no scene is ended the game's own way after this long.</summary>
+    /// <summary>A known conversation's WAITING_FOR_TWINS grace. This never arms a timer for an unknown black screen.</summary>
     public const long FaderBoundMs = 3_000;
 
     /// <summary>The local pause reasons that are a fader's content (a menu, the inventory/trade screens, a running dialogue, a cutscene, a load, sleep/wait/travel).</summary>
@@ -165,7 +165,7 @@ public static class Wo191Rules
                                      | Wo138Codec.ReasonLoad | Wo138Codec.ReasonSkipTime;
 
     /// <summary>
-    /// 4b: what the black shows, or null when it shows nothing (then it is ended): a scene (WO-179's label), a pause reason, a fast travel,
+    /// What the black shows, or null when its owner is unknown: a scene (WO-179's label), a pause reason, a fast travel,
     /// no world (menu/loading), this player's death.
     /// </summary>
     public static string? FaderContent(string sceneLabel, byte pauseReasons, bool travelling, bool notInWorld, bool dead)
@@ -184,28 +184,43 @@ public static class Wo191Rules
     /// </summary>
     public sealed class PendingConversation
     {
+        private readonly object _sync = new();
+        private long _generation;
         public int Id { get; private set; } = -1;
         public long SinceMs { get; private set; }
         public bool Running { get; private set; }
 
+        public readonly record struct Stamp(int Id, long Generation);
+
+        // The holder must already be known at the fade's edge. A later dialogue
+        // cannot retroactively justify interrupting a black screen.
+        public Stamp? Capture(long fadeAtMs) { lock (_sync) return Waiting >= 0 && SinceMs <= fadeAtMs ? new(Id, _generation) : null; }
+        public bool StillWaiting(Stamp stamp) { lock (_sync) return Waiting == stamp.Id && _generation == stamp.Generation; }
+        public void Clear() { lock (_sync) { Id = -1; SinceMs = 0; Running = false; _generation++; } }
+
         public void OnLine(string line, long nowMs)
         {
+            lock (_sync) OnLineCore(line, nowMs);
+        }
+
+        private void OnLineCore(string line, long nowMs)
+        {
             int id = Wo179Rules.DudeDialogId(line);
-            if (id >= 0) { Id = id; SinceMs = Math.Max(nowMs, 1); Running = false; return; }
+            if (id >= 0) { Id = id; SinceMs = Math.Max(nowMs, 1); Running = false; _generation++; return; }
             if (Id < 0) return;
             if (line.StartsWith("[ID: " + Id.ToString(CultureInfo.InvariantCulture) + "] Dialog end", StringComparison.Ordinal)
                 || line.StartsWith("[ID: " + Id.ToString(CultureInfo.InvariantCulture) + "] Dialog interrupted", StringComparison.Ordinal))
-            { Id = -1; SinceMs = 0; Running = false; return; }
+            { Clear(); return; }
             if (!Running && Wo179Rules.ConversationRunning(line, Id)) Running = true;
         }
 
         /// <summary>The waiting conversation's id, or -1.</summary>
-        public int Waiting => Id >= 0 && !Running ? Id : -1;
+        public int Waiting { get { lock (_sync) return Id >= 0 && !Running ? Id : -1; } }
     }
 
     /// <summary>4b: the holder text of the WO191-FADER line.</summary>
     public static string HolderText(int waitingConversation) =>
         waitingConversation >= 0
             ? $"conversation id={waitingConversation.ToString(CultureInfo.InvariantCulture)} waiting for its NPC (WAITING_FOR_TWINS) -> ended the game's own way (InterruptDialogs)"
-            : "nothing known (no scene, no conversation, no pause reason) -> the black lifted (wh_ui_FaderSuspend)";
+            : "unknown owner -- observed only; no global fader override";
 }

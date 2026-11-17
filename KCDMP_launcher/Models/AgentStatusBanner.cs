@@ -1,6 +1,8 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+using KcdMp.Wire;
+
 namespace KCDMP_launcher.Models
 {
     // The two agent endpoints' payloads (moved here from AppModels.cs so the
@@ -61,6 +63,7 @@ namespace KCDMP_launcher.Models
         public bool ShowFresh => JoinState is "choose" or "choose-fresh";
         /// <summary>WO-140: a joiner connected from its own save (the agent's "own-world" state): the launcher shows a modal once.</summary>
         public bool OwnWorld => JoinState == "own-world";
+        public bool AuthorityUnavailable => HostAuthorityFailure.IsReason(JoinReason);
         /// <summary>WO-154: the joiner has no usable save and the agent can join with a new character (POST /join-choice?c=fresh).</summary>
         public bool ShowFreshJoin { get; private set; }
         /// <summary>WO-154: the agent's reason code for the plain message (empty: none given).</summary>
@@ -103,7 +106,7 @@ namespace KCDMP_launcher.Models
         /// the endpoint could not be read. Returns a line for the launcher log
         /// when anything visible changed, else null.
         /// </summary>
-        public string? Apply(ConnectionStatusData? cs, JoinStatusData? js, bool agentAlive, double nowS)
+        public string? Apply(ConnectionStatusData? cs, JoinStatusData? js, bool agentAlive, double nowS, string language = "en")
         {
             if (!agentAlive)
             {
@@ -141,7 +144,8 @@ namespace KCDMP_launcher.Models
                 JoinMessage = JoinState == "idle" ? "" : js.Message;
                 // WO-154: no usable save, a new character possible: the plain words for the reason, and the button.
                 JoinReason = js.Reason ?? "";
-                ShowFreshJoin = js.CanFresh && !ShowChoiceButtons;
+                if (HostAuthorityFailure.Message(JoinReason, language) is string authorityMessage) JoinMessage = authorityMessage;
+                ShowFreshJoin = js.CanFresh && !ShowChoiceButtons && !AuthorityUnavailable;
                 if (ShowFreshJoin)
                     JoinMessage = PlainReason(JoinReason) is string plain ? plain + " " + FreshJoinOffer
                                 : string.IsNullOrEmpty(JoinMessage) ? FreshJoinOffer : JoinMessage;

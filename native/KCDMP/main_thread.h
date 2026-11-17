@@ -26,6 +26,9 @@ void uninstall();
 
 // Queue work for the next frame. Thread-safe, returns immediately.
 void post(std::function<void()> work);
+// Eligibility is checked on the game thread. An ineligible head waits for the
+// next frame with the FIFO behind it; no later reliable command overtakes it.
+void post_when(std::function<bool()> eligible, std::function<void()> work);
 
 // Run work on every tick, for the lifetime of the process. Used by the
 // outbound sampler, which needs a per-frame heartbeat rather than a one-shot.

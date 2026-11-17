@@ -11,6 +11,7 @@
 // with the rest (a respawn without a fade is still a respawn).
 
 #include <cstdint>
+#include "fader_rules.h"
 
 namespace kcdmp::actions {
 
@@ -20,8 +21,10 @@ void resolve();
 
 // --- presentation -----------------------------------------------------------
 bool fade_available();
-bool fade_out(float seconds);
-bool fade_in(float seconds);
+bool fade_out(float seconds, fader::Owner owner = fader::Owner::Respawn, uint32_t token = 1);
+bool fade_in(float seconds, fader::Owner owner = fader::Owner::Respawn, uint32_t token = 1);
+// Main thread: release only a mod-owned external fade on load/disconnect.
+void reset_external_fade();
 // True once the screen is fully black (or when no fader is available, so the
 // executor never waits on a fade that cannot happen).
 bool fade_is_black();

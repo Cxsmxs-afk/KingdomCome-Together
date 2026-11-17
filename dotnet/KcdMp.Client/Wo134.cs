@@ -215,23 +215,25 @@ public static class Wo134Rules
     /// call runs past the console's limit (WO-110: ExecuteString truncates past
     /// ~2,100 encoded characters) -- container names reach 190+ characters.
     /// </summary>
-    public static List<string> ApplyCalls(IReadOnlyList<Entry> rows, int maxEncoded = 1800)
+    public static List<string> ApplyCalls(IReadOnlyList<Entry> rows, int maxEncoded = 1800, long? epoch = null, long? serial = null)
     {
-        const string pre = "if KCD2MP_W134ChestApply then KCD2MP_W134ChestApply({", post = "}) end";
+        const string pre = "if KCD2MP_W134ChestApply then KCD2MP_W134ChestApply({";
+        string Post(int part) => epoch is long stamp ? "}," + stamp.ToString(CultureInfo.InvariantCulture)
+            + (serial is long id ? "," + id.ToString(CultureInfo.InvariantCulture) + "," + part.ToString(CultureInfo.InvariantCulture) : "") + ") end" : "}) end";
         var o = new List<string>();
         var sb = new StringBuilder(pre);
         int n = 0;
         foreach (var e in rows)
         {
             string r = string.Create(CultureInfo.InvariantCulture, $"{{\"{e.C}\",\"{e.Cls}\",{e.N},{F(e.Hp)},{e.T},{e.R}}},");
-            if (n > 0 && Uri.EscapeDataString("#" + sb + r + post).Length > maxEncoded)
+            if (n > 0 && (n >= 8 || Uri.EscapeDataString("#" + sb + r + Post(o.Count + 1)).Length > maxEncoded))
             {
-                o.Add(sb.Append(post).ToString());
+                o.Add(sb.Append(Post(o.Count + 1)).ToString());
                 sb = new StringBuilder(pre); n = 0;
             }
             sb.Append(r); n++;
         }
-        if (n > 0 || o.Count == 0) o.Add(sb.Append(post).ToString());
+        if (n > 0 || o.Count == 0) o.Add(sb.Append(Post(o.Count + 1)).ToString());
         return o;
     }
 }

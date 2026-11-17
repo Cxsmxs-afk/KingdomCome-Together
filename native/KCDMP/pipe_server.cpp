@@ -24,6 +24,7 @@
 #include "npc_trace.h"
 #include "join_native.h"
 #include "savelist.h"
+#include "pipe_outbox.h"
 #include "leash.h"
 #include "wo131.h"
 #include "wo187.h"
@@ -74,8 +75,18 @@ const char* pipe_name() { return instance::pipe_name().c_str(); }
 
 std::atomic<bool>   g_running{false};
 std::atomic<bool>   g_connected{false};
-HANDLE              g_pipe = INVALID_HANDLE_VALUE;
+std::atomic<HANDLE> g_pipe{INVALID_HANDLE_VALUE};
 uint8_t             g_seq = 0;
+std::atomic<uint64_t> g_connGen{0};
+
+struct Tx {
+    std::mutex mutex;
+    std::condition_variable cv;
+    pipeout::Outbox queue;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    uint64_t generation = 0;
+    bool connected = false, writing = false, failed = false;
+} g_tx;
 
 // The pipe is duplex and both directions are in use at once: the serve loop
 // parks in a read while the game thread pushes hits out. On a *synchronous*
@@ -93,7 +104,7 @@ struct Op {
     Op& operator=(const Op&) = delete;
 };
 
-bool write_all(HANDLE h, const void* data, DWORD len) {
+bool write_physical(HANDLE h, const void* data, DWORD len) {
     const auto* p = static_cast<const BYTE*>(data);
     Op op;
     if (!op.ov.hEvent) return false;
@@ -103,12 +114,76 @@ bool write_all(HANDLE h, const void* data, DWORD len) {
         ResetEvent(op.ov.hEvent);
         if (!WriteFile(h, p + done, len - done, &n, &op.ov)) {
             if (GetLastError() != ERROR_IO_PENDING) return false;
-            if (!GetOverlappedResult(h, &op.ov, &n, TRUE)) return false;
+            // Only the writer thread waits. A dead/stalled agent cannot hold a game frame.
+            if (WaitForSingleObject(op.ov.hEvent, 2000) != WAIT_OBJECT_0) {
+                CancelIoEx(h, &op.ov);
+                GetOverlappedResult(h, &op.ov, &n, TRUE); // reclaim OVERLAPPED only after cancellation completes
+                SetLastError(ERROR_TIMEOUT);
+                return false;
+            }
+            if (!GetOverlappedResult(h, &op.ov, &n, FALSE)) return false;
         }
         if (n == 0) return false;
         done += n;
     }
     return true;
+}
+
+bool enqueue_raw(HANDLE h, const void* data, size_t len, uint64_t generation) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    std::lock_guard<std::mutex> lock(g_tx.mutex);
+    if (h != g_tx.handle || !pipeout::same_connection(generation, g_tx.generation, g_tx.connected) || g_tx.failed) {
+        SetLastError(ERROR_BROKEN_PIPE); return false;
+    }
+    const bool ok = g_tx.queue.push_wire(std::vector<uint8_t>(p, p + len));
+    if (!ok) { g_tx.failed = true; SetLastError(ERROR_NOT_ENOUGH_MEMORY); } // explicit failure, never a silently missing reliable event
+    g_tx.cv.notify_one();
+    return ok;
+}
+
+void tx_connected(HANDLE h) {
+    std::lock_guard<std::mutex> lock(g_tx.mutex);
+    g_tx.queue.clear();
+    g_tx.handle = h; g_tx.generation = g_connGen.load(); g_tx.connected = true; g_tx.failed = false;
+}
+void tx_disconnected(HANDLE h) {
+    std::unique_lock<std::mutex> lock(g_tx.mutex);
+    g_tx.connected = false;
+    CancelIoEx(h, nullptr);
+    g_tx.cv.notify_all();
+    // Pipe thread only: no CloseHandle while the writer owns an OVERLAPPED on it.
+    g_tx.cv.wait(lock, [] { return !g_tx.writing; });
+    g_tx.queue.clear(); g_tx.handle = INVALID_HANDLE_VALUE;
+}
+void write_loop() {
+    for (;;) {
+        std::vector<uint8_t> frame;
+        HANDLE h = INVALID_HANDLE_VALUE;
+        uint64_t generation = 0;
+        bool failed = false;
+        bool report = false;
+        {
+            std::unique_lock<std::mutex> lock(g_tx.mutex);
+            g_tx.cv.wait(lock, [] { return !g_running || (g_tx.connected && (g_tx.failed || !g_tx.queue.empty())); });
+            if (!g_running) break;
+            h = g_tx.handle; generation = g_tx.generation; failed = g_tx.failed;
+            if (!failed && !g_tx.queue.pop(&frame)) continue;
+            g_tx.writing = true;
+        }
+        const bool ok = !failed && write_physical(h, frame.data(), static_cast<DWORD>(frame.size()));
+        const DWORD error = ok ? 0 : (failed ? ERROR_NOT_ENOUGH_MEMORY : GetLastError());
+        {
+            std::lock_guard<std::mutex> lock(g_tx.mutex);
+            if (!ok && pipeout::same_connection(generation, g_tx.generation, g_tx.connected)) {
+                g_tx.connected = false; g_tx.failed = true;
+                CancelIoEx(h, nullptr); // wake serve() and let its normal disconnect path reconcile the session
+                report = true;
+            }
+            g_tx.writing = false;
+        }
+        g_tx.cv.notify_all();
+        if (report) logf("PIPE: outbound connection failed (%s, error=%lu); queued reliable data requires session recovery", failed ? "queue full" : "write", error);
+    }
 }
 
 bool read_all(HANDLE h, void* data, DWORD len) {
@@ -131,34 +206,36 @@ bool read_all(HANDLE h, void* data, DWORD len) {
 
 // Head and body go out as one write so a frame cannot be split across two I/O
 // operations. Byte-mode pipes do not require it, but it removes the question.
-bool send_frame(HANDLE h, uint8_t type, const void* payload, uint16_t len) {
+bool send_frame(HANDLE h, uint8_t type, const void* payload, uint16_t len, uint64_t generation = ~0ull) {
+    if (generation == ~0ull) generation = g_connGen.load();
     BYTE frame[3 + 1024];
     if (len > sizeof(frame) - 3) return false;
     frame[0] = type;
     frame[1] = static_cast<BYTE>(len & 0xFF);
     frame[2] = static_cast<BYTE>((len >> 8) & 0xFF);
     if (len) std::memcpy(frame + 3, payload, len);
-    return write_all(h, frame, 3u + len);
+    return enqueue_raw(h, frame, 3u + len, generation);
 }
 
 // WO-218 A.1: a frame over send_frame's 1 KB (the batch's reply), head and body in one write.
-bool send_big(HANDLE h, uint8_t type, const void* payload, size_t len) {
+bool send_big(HANDLE h, uint8_t type, const void* payload, size_t len, uint64_t generation = ~0ull) {
+    if (generation == ~0ull) generation = g_connGen.load();
     if (len > 0xFFFF) return false;
     std::vector<BYTE> frame(3 + len);
     frame[0] = type;
     frame[1] = static_cast<BYTE>(len & 0xFF);
     frame[2] = static_cast<BYTE>((len >> 8) & 0xFF);
     if (len) std::memcpy(frame.data() + 3, payload, len);
-    return write_all(h, frame.data(), static_cast<DWORD>(frame.size()));
+    return enqueue_raw(h, frame.data(), frame.size(), generation);
 }
 
-// Two threads write to this pipe -- the serve loop's replies and the game
-// thread's hits -- so the lock keeps their frames from interleaving. It does
-// nothing about read/write concurrency; see the note on Op above for that.
+// Producer ordering only: every protected send copies/appends to the outbox.
+// The sole writer thread performs I/O without this lock or the queue mutex.
 CRITICAL_SECTION g_write_lock;
 bool             g_write_lock_ready = false;
 
 void send_local_hit(const unsigned char guid[16], void* soul, float health_delta, float stamina_delta, bool died) {
+    const uint64_t generation = g_connGen.load();
     // WO-147: the sampler hands over the soul it measured (the old per-hit soul-list walk is gone), and a
     // stamina drop is kept only for the player's own blow (an NPC's swings and blocks cost it stamina too).
     const bool byPlayer = soul && hits::hit_by_player(soul, 1.5);
@@ -186,24 +263,25 @@ void send_local_hit(const unsigned char guid[16], void* soul, float health_delta
     body[24] = died ? 1 : 0;
     body[25] = byPlayer ? 1 : 0;
     EnterCriticalSection(&g_write_lock);
-    const bool sent = send_frame(g_pipe, kLocalHit, body, sizeof(body));
+    const bool sent = send_frame(g_pipe, kLocalHit, body, sizeof(body), generation);
     const DWORD err = sent ? 0 : GetLastError();
     LeaveCriticalSection(&g_write_lock);
     // A failed write used to be indistinguishable from a delivered one, which is
     // how a deadlocked send looked like a working one for so long.
-    if (!sent) logf("PIPE: LocalHit write failed: %lu", err);
+    if (!sent) logf("PIPE: LocalHit enqueue failed: %lu", err);
 }
 
 // WO-113: unsolicited respawn frames, written from the game thread under the
 // same write lock as LocalHit. A missing agent is logged by respawn.cpp's own
 // lines; here only a failed write is.
 void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what) {
+    const uint64_t generation = g_connGen.load();
     if (!g_connected || g_pipe == INVALID_HANDLE_VALUE) return;
     EnterCriticalSection(&g_write_lock);
-    const bool sent = send_frame(g_pipe, type, body, len);
+    const bool sent = send_frame(g_pipe, type, body, len, generation);
     const DWORD err = sent ? 0 : GetLastError();
     LeaveCriticalSection(&g_write_lock);
-    if (!sent) logf("PIPE: %s write failed: %lu", what, err);
+    if (!sent) logf("PIPE: %s enqueue failed: %lu", what, err);
 }
 
 // ---- WO-218 A.1: the pipe's batch (wo218_rules.h) -------------------------------------------------------------------------------
@@ -229,13 +307,12 @@ struct PendingBatch {
 std::mutex                                  g_bqMutex;
 std::deque<std::shared_ptr<PendingBatch>>   g_bq;
 std::atomic<bool>                           g_drainPosted{false};
-std::atomic<uint64_t>                       g_connGen{0};
 
 // main thread only: what one frame's pipe turn served, and the drain's own time
 struct W218Stats {
     wo218rules::FrameCount subs, singles;
-    unsigned long long frameSpent = ~0ull;
-    double spentUs = 0, drainUsSum = 0, drainUsMax = 0, winStartUs = 0;
+    wo218rules::FrameBudget budget;
+    double drainUsSum = 0, drainUsMax = 0, winStartUs = 0;
     unsigned drains = 0, carries = 0, batches = 0, faulted = 0, cut = 0, notBatchable = 0;
     size_t replyMax = 0;
 } g_w218;
@@ -290,8 +367,13 @@ void w218_maybe_log(double now) {
 }
 
 // a single request's task ran on the main thread (run_sync_bounded)
-void w218_note_single() {
+bool w218_single_ready() {
+    g_w218.budget.begin(main_thread::frame_count());
+    return g_w218.budget.may_run();
+}
+void w218_note_single(double usedUs) {
     g_w218.singles.add(main_thread::frame_count(), 1);
+    g_w218.budget.add(1, usedUs);
     w218_maybe_log(w218_now_us());
 }
 
@@ -343,7 +425,7 @@ void w218_drain() {
     W218Stats& s = g_w218;
     const unsigned long long frame = main_thread::frame_count();
     const double t0 = w218_now_us();
-    if (s.frameSpent != frame) { s.frameSpent = frame; s.spentUs = 0; }
+    s.budget.begin(frame);
     int ran = 0;
     bool carry = false;
     static uint8_t rb[4 + 1024];
@@ -355,8 +437,8 @@ void w218_drain() {
             b = g_bq.front();
         }
         while (b->next < b->subs.size()) {
-            const double spent = s.spentUs + (w218_now_us() - t0);
-            if (!wo218rules::may_run(ran, spent)) { carry = true; break; }
+            if (b->gen != g_connGen.load()) { b->next = b->subs.size(); break; }
+            if (!wo218rules::may_run(static_cast<int>(s.budget.ran) + ran, s.budget.spentUs + w218_now_us() - t0)) { carry = true; break; }
             const wo218rules::Sub& sub = b->subs[b->next];
             bool faulted = false;
             const double s0 = w218_now_us();
@@ -376,13 +458,13 @@ void w218_drain() {
         if (b->reply.b.size() > s.replyMax) s.replyMax = b->reply.b.size();
         if (b->gen == g_connGen.load() && g_connected && g_pipe != INVALID_HANDLE_VALUE) {
             EnterCriticalSection(&g_write_lock);
-            const bool sent = send_big(g_pipe, wo218rules::kBatchReply, b->reply.b.data(), b->reply.b.size());
+            const bool sent = send_big(g_pipe, wo218rules::kBatchReply, b->reply.b.data(), b->reply.b.size(), b->gen);
             LeaveCriticalSection(&g_write_lock);
-            if (!sent) logf("PIPE: BatchReply write failed: %lu", GetLastError());
+            if (!sent) logf("PIPE: BatchReply enqueue failed: %lu", GetLastError());
         }
     }
     const double used = w218_now_us() - t0;
-    s.spentUs += used;
+    s.budget.add(static_cast<unsigned>(ran), used);
     if (ran) {
         s.subs.add(frame, static_cast<unsigned>(ran));
         ++s.drains; s.drainUsSum += used; if (used > s.drainUsMax) s.drainUsMax = used;
@@ -691,7 +773,7 @@ void send_npc_scan_result(HANDLE h, bool ok, uint8_t seq, const kcdmp::npcscan::
     frame[1] = static_cast<BYTE>(payloadLen & 0xFF);
     frame[2] = static_cast<BYTE>((payloadLen >> 8) & 0xFF);
     EnterCriticalSection(&g_write_lock);
-    write_all(h, frame.data(), static_cast<DWORD>(frame.size()));
+    enqueue_raw(h, frame.data(), frame.size(), g_connGen.load());
     LeaveCriticalSection(&g_write_lock);
 }
 
@@ -720,7 +802,7 @@ void send_leash_page(HANDLE h, bool ok, uint8_t seq, const kcdmp::leash::Result&
     frame[1] = static_cast<BYTE>(payloadLen & 0xFF);
     frame[2] = static_cast<BYTE>((payloadLen >> 8) & 0xFF);
     EnterCriticalSection(&g_write_lock);
-    write_all(h, frame.data(), static_cast<DWORD>(frame.size()));
+    enqueue_raw(h, frame.data(), frame.size(), g_connGen.load());
     LeaveCriticalSection(&g_write_lock);
 }
 
@@ -772,6 +854,7 @@ struct PipeSyncState {
     bool done = false;
     bool ran = false;
     bool faulted = false;   // WO-110 R12: the task ran and faulted; `value` is default-constructed garbage
+    bool started = false, cancelled = false;
     T value{};
 };
 
@@ -797,13 +880,21 @@ constexpr uint8_t  kReasonUnknownCommand = 18;   // mirrors PipeReason.UnknownCo
 template <typename T>
 bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& outValue, bool* faultedOut = nullptr) {
     auto state = std::make_shared<PipeSyncState<T>>();
+    const uint64_t generation = g_connGen.load();
     // WO-210 H.3: the task is posted to the main thread directly; serve() waits on the shared state, bounded. It used to be a detached
     // helper thread per request (its run_sync waited for the frame) -- one OS thread created and torn down for every pipe request, ~50 a
     // second on a host alone, and the host alone climbed ~50-85 MB/s with it. The guarantee is the same: nothing here references the
     // caller's frame (work is copied, state is shared), so a wait given up on can never dangle, and a task the frame runs late still lands.
     std::function<void(T&)> task = work;
-    main_thread::post([state, task] {
-        w218_note_single();   // WO-218 A.0: what one frame's pipe turn served
+    main_thread::post_when(&w218_single_ready, [state, task, generation] {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->cancelled || generation != g_connGen.load()) {
+                state->done = true; state->cv.notify_all(); return;
+            }
+            state->started = true;
+        }
+        const double started = w218_now_us();
         bool faulted = false;
         try {
             faulted = !fault::guarded(g_sitePipeTask, [&] { task(state->value); });
@@ -811,6 +902,7 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
             logf("PIPE: a task raised a C++ exception on the main thread -- swallowed");
             faulted = true;
         }
+        w218_note_single(w218_now_us() - started);
         std::lock_guard<std::mutex> lock(state->mutex);
         state->ran = true;
         state->faulted = faulted;
@@ -821,8 +913,9 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
     std::unique_lock<std::mutex> lock(state->mutex);
     if (!state->cv.wait_for(lock, std::chrono::milliseconds(kPipeSyncTimeoutMs),
                              [&] { return state->done; })) {
+        if (!state->started) state->cancelled = true;
         logf("PIPE: %s is still waiting on the main thread past %ums -- the frame loop "
-             "may be hung. Replying failure now; the call will still land if a frame resumes.",
+             "may be hung. Replying failure now; a pending call is cancelled, an already running engine call finishes safely.",
              what, kPipeSyncTimeoutMs);
         return false;
     }
@@ -834,6 +927,7 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
 
 // One connected agent, until it disconnects.
 void serve(HANDLE h) {
+    tx_connected(h);
     g_connected = true;
     logf("PIPE: agent connected");
 
@@ -1736,6 +1830,7 @@ void serve(HANDLE h) {
 
     g_connected = false;
     w218_on_disconnect();   // WO-218 A.1: a waiting batch's reply never reaches the next connection
+    tx_disconnected(h);
     logf("PIPE: agent disconnected");
     // WO-118: no agent, no stream -- every native binding is dropped.
     npcdrive::on_pipe_closed();
@@ -1751,6 +1846,7 @@ void serve(HANDLE h) {
     kcdmp::wo140::on_pipe_closed();  // WO-140: no agent -- the sleep gate off  // WO-139: no agent -- the trespass detector off
     kcdmp::main_thread::post([] { kcdmp::wo141::on_pipe_closed(); });   // WO-141: no agent -- no capture, no apply, every hold released
     kcdmp::main_thread::post([] { kcdmp::wo143::on_pipe_closed(); });   // WO-143: no agent -- hands, gaits, one-shots and looks off, what this DLL set undone
+    kcdmp::main_thread::post([] { kcdmp::actions::reset_external_fade(); }); // only our external lease, on the engine thread
     // WO-113: no agent, no session -- the death guard stands down (vanilla).
     respawn::set_session(false, "pipe closed");
     // WO-114: no agent, no partner -- a death wakes by today's rule.
@@ -1848,6 +1944,7 @@ bool start() {
 
     // The injected plugin has process lifetime. Detaching keeps DLL teardown
     // free of a blocking join under the Windows loader lock.
+    std::thread(write_loop).detach();
     std::thread(listen_loop).detach();
     logf("PIPE: listening on %s", pipe_name());
     return true;
@@ -1855,6 +1952,9 @@ bool start() {
 
 void stop() {
     if (!g_running.exchange(false)) return;
+    g_tx.cv.notify_all();
+    const HANDLE current = g_pipe.load();
+    if (current != INVALID_HANDLE_VALUE) CancelIoEx(current, nullptr);
     // Unblock ConnectNamedPipe by connecting to it once.
     HANDLE poke = CreateFileA(pipe_name(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                               OPEN_EXISTING, 0, nullptr);
