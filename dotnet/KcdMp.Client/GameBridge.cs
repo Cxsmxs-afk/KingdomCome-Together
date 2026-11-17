@@ -4890,7 +4890,7 @@ public partial class GameBridge(ClientConfig config)
                         // WO-213 D.4: the DLL drives the figure from every sample (30-45 a second while it moves); the game's Lua update at the
                         // old pace -- one Lua call a sample crowded the joiner's console (a joined talk's join request waited 67 s)
                         if (!Wo147GhostSkip(ghostId, frame.Arrival, gs.State2 is not null) && Wo213GhostLuaDue(ghostId, isRiding, gs.State2 is not null))
-                            await UpdateGhostAsync(ghostId.ToString(), x, y, z, rotZ, isRiding, body);
+                            await UpdateGhostAsync(ghostId.ToString(), x, y, z, rotZ, isRiding, body, gs.SenderMs);
                     }
                     else if (type == Protocol.ActionDown)
                     {
@@ -5699,7 +5699,7 @@ public partial class GameBridge(ClientConfig config)
     // -------------------------------------------------------------------------
 
     private async Task UpdateGhostAsync(string ghostId, float x, float y, float z, float rotZ,
-                                        bool isRiding, BodyState? body = null)
+                                        bool isRiding, BodyState? body = null, uint senderMs = 0)
     {
         string gx   = x.ToString("F2",  CultureInfo.InvariantCulture);
         string gy   = y.ToString("F2",  CultureInfo.InvariantCulture);
@@ -5711,9 +5711,13 @@ public partial class GameBridge(ClientConfig config)
         // has a 6-parameter KCD2MP_UpdateGhost and ignores the extras, so a
         // mod/agent mismatch degrades to the old call rather than erroring --
         // the same additive discipline the wire uses.
+        // Sender clock last, after the body-state tail. An older pak ignores
+        // extra arguments. nil in the body slots keeps "no body state" meaning
+        // what it meant, so the sender time never lands in the pace argument.
+        string msArg = senderMs == 0 ? "nil" : senderMs.ToString(CultureInfo.InvariantCulture);
         string tail = body is BodyState b
-            ? $",{(byte)b.Pace},{(byte)b.Dir},{(byte)b.Stance},{b.AnimSpeedCenti}"
-            : string.Empty;
+            ? $",{(byte)b.Pace},{(byte)b.Dir},{(byte)b.Stance},{b.AnimSpeedCenti},{msArg}"
+            : $",nil,nil,nil,nil,{msArg}";
 
         try
         {

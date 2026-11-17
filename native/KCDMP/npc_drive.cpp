@@ -1503,13 +1503,26 @@ void tick() {
         g_playoutByEid[p.eid] = renderDelay;
         float pose[4];
         // Phase 1: a walking person has one holder (the driver). Do not extrapolate
-        // the place that request steers toward. A horse or a figure still may.
+        // the place that request steers toward. A horse or a fight still may.
+        // Phase 2 puts the other player on that same fixed clock.
         const bool fightNow = wo216::on(wo216rules::kBitRouteReplay)
                                   ? ((s.flags & (0x08 | 0x20)) != 0 || now < p.holdUntil || wo209::mirrored(p.eid))
                                   : ((s.flags & (0x04 | 0x08)) != 0 || now < p.holdUntil || wo209::mirrored(p.eid));
         const float vzNow = stream_vz(s);
         const bool oneHolder = kcdmp::walkhold::driver_class(figure, p.beast, parented, p.human, !p.noPhys, fightNow, vzNow);
-        bool ex = g_walkFromHost.load(std::memory_order_relaxed) && !p.beast && kcdmp::walkhold::extrapolate_pose(oneHolder);   // WO-201 B10: in = allowed, out = extrapolated
+        // Phase 2: a player and a walking person render on a fixed delay. The
+        // adaptive play-out and the lateness slew stay for horses and fights.
+        // A stream more than 0.40 s behind that clock is shown at its newest
+        // sample. It is not extrapolated, and the delay does not grow.
+        const bool fixedTl = kcdmp::walkhold::fixed_timeline(figure, oneHolder);
+        if (fixedTl) {
+            const double gap = s.gapEma > 0.0 ? s.gapEma : 0.05;
+            renderDelay = kcdmp::walkhold::adaptive_delay_s(p.delay, gap);
+            if (s.n > 0 && kcdmp::walkhold::snap_catchup(now - s.ring[s.n - 1].at, renderDelay))
+                renderDelay = now - s.ring[s.n - 1].at;
+            g_playoutByEid[p.eid] = renderDelay;
+        }
+        bool ex = g_walkFromHost.load(std::memory_order_relaxed) && !p.beast && !fixedTl && kcdmp::walkhold::extrapolate_pose(oneHolder);   // WO-201 B10: in = allowed, out = extrapolated
         float segMps = 0.0f;
         if (!render(s, now - renderDelay, renderDelay, pose, &ex, &segMps, e1)) { ++it; continue; }
         if (ex) c_extrapFrames.fetch_add(1, std::memory_order_relaxed);

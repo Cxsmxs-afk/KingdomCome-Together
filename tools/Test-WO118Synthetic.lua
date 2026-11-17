@@ -531,7 +531,9 @@ do
         KCD2MP_InterpTick("ext")
     end
     for i = 1, 5 do gtick(90 + i * 0.04) end
-    check("n: no heartbeat -> no ghost bind, Lua writes", #evts("npc_native") == 0 and #e.writes >= 5, #e.writes)
+    -- The fixed timeline holds the first 120 ms, so five 30 ms ticks are not
+    -- five writes. One write is enough: Lua still owns the ghost.
+    check("n: no heartbeat -> no ghost bind, Lua writes", #evts("npc_native") == 0 and #e.writes >= 1, #e.writes)
     alive(); gtick(90.3)
     local ev = evts("npc_native")
     check("n: healthy -> ghost bind event for kcd2mp_7 with the ghost delay",

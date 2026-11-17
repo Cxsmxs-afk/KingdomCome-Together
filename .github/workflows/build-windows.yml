@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - cursor/phase1-walk-holder-8b43
+      - cursor/phase2-timeline-8b43
 
 jobs:
   build:
@@ -58,7 +58,7 @@ jobs:
       - name: Network simulator
         run: |
           chmod +x tools/sim/run-sim
-          SIM_COMMIT="${GITHUB_SHA::7}" tools/sim/run-sim ci tools/sim/out
+          SIM_COMMIT="${GITHUB_SHA::7}" tools/sim/run-sim ci tools/sim/out --timeline both
 
       - uses: actions/upload-artifact@v4
         with:
