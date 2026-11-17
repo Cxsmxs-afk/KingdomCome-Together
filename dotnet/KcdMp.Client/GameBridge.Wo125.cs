@@ -824,7 +824,7 @@ public partial class GameBridge
             string dir = Path.Combine(saves, $"playline{pl}");
             if (!Directory.Exists(dir)) continue;
             foreach (var f in Directory.EnumerateFiles(dir))
-                if (TransientAny.IsMatch(Path.GetFileName(f)) && (_jj?.PlacedPath is not string keep || !string.Equals(keep, f, StringComparison.OrdinalIgnoreCase))
+                if (TransientAny.IsMatch(Path.GetFileName(f)) && !_retainedJoinWorlds.Protects(f) && (_jj?.PlacedPath is not string keep || !string.Equals(keep, f, StringComparison.OrdinalIgnoreCase))
                     && _henry.MoveOut(f, $"a transient file of the mod ({why})")) n++;
         }
         foreach (var e in _henry.Ledger().Where(x => x.State != "done"))
@@ -834,6 +834,7 @@ public partial class GameBridge
             if (e.File is string f && File.Exists(Path.Combine(dir, f)))
             {
                 string p = Path.Combine(dir, f);
+                if (_retainedJoinWorlds.Protects(p)) continue;
                 var v = WhsSave.VerifyFile(p);
                 if (e.Md5 is null || string.Equals(v.Md5, e.Md5, StringComparison.OrdinalIgnoreCase))
                 { if (_henry.MoveOut(p, $"a {e.Kind} save the mod made or saw while joined ({why})")) n++; else done = false; }
@@ -845,6 +846,7 @@ public partial class GameBridge
                 // the host's world (its seed) that landed in that playline within two minutes of the request.
                 foreach (var p in Directory.EnumerateFiles(dir, "*.whs"))
                 {
+                    if (_retainedJoinWorlds.Protects(p)) continue;
                     var t = File.GetLastWriteTimeUtc(p);
                     if (t < e.SinceUtc || t > e.SinceUtc.AddMinutes(2) || WorldSaved.ParsePath(p) is null) continue;
                     if (WhsSave.ReadSeedFromFile(p) is uint s && WhsSave.SeedTag(s) == _henry.BaseTagOf(e.WorldTag))
@@ -979,3 +981,4 @@ public partial class GameBridge
 
     private Task Wo125ToastAsync(string msg) => ExecLuaAsync($"if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"{EscapeLua(msg)}\") end");
 }
+

@@ -56,7 +56,8 @@ public static class Program
         var queued = QueueLoad.RunAll();
         var feel = Feel.RunAll();
         var life = SessionLife.RunAll();
-        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load) + Report.Queue(queued) + Report.Feel(feel) + Report.Life(life));
+        var join = await JoinDiscovery.RunAsync();
+        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load) + Report.Queue(queued) + Report.Feel(feel) + Report.Life(life) + join.Report);
         int gated = results.Count(r => r.Gate);
         int failed = results.Count(r => r.Gate && !r.Pass);
         // Phase 3: a flooded console freezes the figure for seconds. The ring's
@@ -66,7 +67,8 @@ public static class Program
         bool feelOk = feel.All(r => r.Pass);
         bool lifeOk = life.All(r => r.Pass);
         Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. queue ringFlat={ringFlat} consoleTrails={consoleTrails} feel={feelOk} life={lifeOk}. {mdPath}");
-        return failed == 0 && ringFlat && consoleTrails && feelOk && lifeOk ? 0 : 1;
+        Console.WriteLine($"join-save lifecycle: {(join.Pass ? "PASS" : "FAIL")}");
+        return failed == 0 && ringFlat && consoleTrails && feelOk && lifeOk && join.Pass ? 0 : 1;
     }
 
     static async Task<RunResult> RunOne(int players, Profile profile, string label, string commit)
@@ -432,14 +434,14 @@ static class Report
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"# Simulator {label}");
         sb.AppendLine();
-        sb.AppendLine($"Kurz: {ok} von {gated} gewerteten Läufen bestanden (gute und typische Leitung).");
+        sb.AppendLine($"Kurz: {ok} von {gated} gewerteten L�ufen bestanden (gute und typische Leitung).");
         if (worst != null)
-            sb.AppendLine($"Größte gewertete Latenz: {worst.Max:0} ms bei {worst.Players} Spielern, Profil {worst.Profile}. Eine 9000-ms-Spitze wäre hier sichtbar.");
-        sb.AppendLine("Der Konsolen-Rückstand ist die Wartezeit des neuesten Stands hinter alten Einmal-Befehlen, gerechnet mit 35 ms pro Befehl. Das ist das Modell der Spielkonsole, nicht eine Messung im Spiel.");
+            sb.AppendLine($"Gr��te gewertete Latenz: {worst.Max:0} ms bei {worst.Players} Spielern, Profil {worst.Profile}. Eine 9000-ms-Spitze w�re hier sichtbar.");
+        sb.AppendLine("Der Konsolen-R�ckstand ist die Wartezeit des neuesten Stands hinter alten Einmal-Befehlen, gerechnet mit 35 ms pro Befehl. Das ist das Modell der Spielkonsole, nicht eine Messung im Spiel.");
         sb.AppendLine();
         sb.AppendLine($"Commit `{commit}`.");
         sb.AppendLine();
-        sb.AppendLine("| Spieler | Profil | p50 | p95 | p99 | max | Queue | Stand hinter Einmal | verworfen | Snaps | Brüche | Byte/s | Wertung |");
+        sb.AppendLine("| Spieler | Profil | p50 | p95 | p99 | max | Queue | Stand hinter Einmal | verworfen | Snaps | Br�che | Byte/s | Wertung |");
         sb.AppendLine("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|");
         foreach (var r in rows)
         {
@@ -449,10 +451,10 @@ static class Report
         sb.AppendLine();
         sb.AppendLine("## Was die Simulation nicht zeigt");
         sb.AppendLine();
-        sb.AppendLine("- Wie eine Animation im Spiel aussieht, ob Füße rutschen, ob ein Pferd galoppiert.");
+        sb.AppendLine("- Wie eine Animation im Spiel aussieht, ob F��e rutschen, ob ein Pferd galoppiert.");
         sb.AppendLine("- Wie lange ExecuteString und die Lua-Konsole auf diesem PC wirklich brauchen. Die 35 ms sind der Wert aus den Feldsitzungen, fest eingesetzt.");
-        sb.AppendLine("- Die native DLL, `body_drive`, und ob die Engine einen Körper annimmt.");
-        sb.AppendLine("- Steam, NAT und eine echte Leitung. Die Verzögerung macht ein Proxy im selben Prozess.");
+        sb.AppendLine("- Die native DLL, `body_drive`, und ob die Engine einen K�rper annimmt.");
+        sb.AppendLine("- Steam, NAT und eine echte Leitung. Die Verz�gerung macht ein Proxy im selben Prozess.");
         sb.AppendLine("- Die CPU-Zahl ist der ganze Simulator inklusive Relay, nicht das Relay allein.");
         return sb.ToString();
     }
@@ -463,9 +465,9 @@ static class Report
         sb.AppendLine();
         sb.AppendLine("## Dauerlast, 10 Minuten, virtuelle Uhr");
         sb.AppendLine();
-        sb.AppendLine("40 NPCs und die Spieler, Profile typical/bad/awful, zehn Minuten auf einer virtuellen Uhr. Ein Konsolen-Aufruf kostet 35 ms und nimmt jeden Stand mit, der in 1900 Zeichen passt, wie der echte Flusher. Queue ist das Alter des ältesten wartenden Stands. Snaps sind Sprünge über 5 m. Brüche sind Geschwindigkeitssprünge der Spieler über 3 m/s.");
+        sb.AppendLine("40 NPCs und die Spieler, Profile typical/bad/awful, zehn Minuten auf einer virtuellen Uhr. Ein Konsolen-Aufruf kostet 35 ms und nimmt jeden Stand mit, der in 1900 Zeichen passt, wie der echte Flusher. Queue ist das Alter des �ltesten wartenden Stands. Snaps sind Spr�nge �ber 5 m. Br�che sind Geschwindigkeitsspr�nge der Spieler �ber 3 m/s.");
         sb.AppendLine();
-        sb.AppendLine("| Spieler | Profil | Zeitlinie | Queue p95 | Queue max | Snaps/min | davon Spieler | davon NPC | Brüche/min | Extrapoliert ms |");
+        sb.AppendLine("| Spieler | Profil | Zeitlinie | Queue p95 | Queue max | Snaps/min | davon Spieler | davon NPC | Br�che/min | Extrapoliert ms |");
         sb.AppendLine("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|");
         foreach (var r in rows)
             sb.AppendLine($"| {r.Players} | {r.Profile} | {r.Timeline} | {r.QueueP95:0} | {r.QueueMax:0} | {r.SnapsPerMin:0.0} | {r.PlayerSnapsPerMin:0.0} | {r.NpcSnapsPerMin:0.0} | {r.BreaksPerMin:0.0} | {r.ExtrapMs:0} |");
@@ -478,7 +480,7 @@ static class Report
         sb.AppendLine();
         sb.AppendLine("## Quest-Last, Pose");
         sb.AppendLine();
-        sb.AppendLine("Eine Minute lang füllt ein Quest-Nachzug die Konsole (eine Zeile pro Runde, schneller als sie abläuft). Nach 20 s steht das Spiel 3 s im Hintergrund und die Konsole tut nichts. `console` ist Phase 2: die Pose wartet in derselben Schlange. `ring` ist Phase 3: die Pose kommt aus dem DLL-Ring und läuft weiter. Queue ist das Alter der Quest-Zeile. Pose p95 bleibt flach; Pose max zeigt, ob die Figur in der Pause stehen bleibt.");
+        sb.AppendLine("Eine Minute lang f�llt ein Quest-Nachzug die Konsole (eine Zeile pro Runde, schneller als sie abl�uft). Nach 20 s steht das Spiel 3 s im Hintergrund und die Konsole tut nichts. `console` ist Phase 2: die Pose wartet in derselben Schlange. `ring` ist Phase 3: die Pose kommt aus dem DLL-Ring und l�uft weiter. Queue ist das Alter der Quest-Zeile. Pose p95 bleibt flach; Pose max zeigt, ob die Figur in der Pause stehen bleibt.");
         sb.AppendLine();
         sb.AppendLine("| Spieler | Profil | Pfad | Queue p95 | Queue max | Pose p95 | Pose max |");
         sb.AppendLine("|---:|---|---|---:|---:|---:|---:|");
@@ -491,11 +493,11 @@ static class Report
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine();
-        sb.AppendLine("## Höhe, Treffer, Dialog");
+        sb.AppendLine("## H�he, Treffer, Dialog");
         sb.AppendLine();
-        sb.AppendLine("`before` ist die letzte Runde: höhere Trittfläche, Pose-Puffer bei 200 ms gedeckelt. `after` fragt den Boden unter dem gezeigten Punkt und lässt den Puffer dem One-Way folgen (bis 800 ms), mit einem Schrittdeckel. Treffer und Dialog bleiben auf dem direkten Weg.");
+        sb.AppendLine("`before` ist die letzte Runde: h�here Trittfl�che, Pose-Puffer bei 200 ms gedeckelt. `after` fragt den Boden unter dem gezeigten Punkt und l�sst den Puffer dem One-Way folgen (bis 800 ms), mit einem Schrittdeckel. Treffer und Dialog bleiben auf dem direkten Weg.");
         sb.AppendLine();
-        sb.AppendLine("| Spieler | Profil | Stand | Höhe p95 cm | Höhe max | Durchsinken | Ruckler/min | Treffer p95 | Tod p95 | verloren | Dialog p95 | Dialog verloren |");
+        sb.AppendLine("| Spieler | Profil | Stand | H�he p95 cm | H�he max | Durchsinken | Ruckler/min | Treffer p95 | Tod p95 | verloren | Dialog p95 | Dialog verloren |");
         sb.AppendLine("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         foreach (var r in rows)
             sb.AppendLine($"| {r.Players} | {r.Profile} | {r.Mode} | {r.HeightP95Cm:0.0} | {r.HeightMaxCm:0.0} | {r.Sinks} | {r.BreaksPerMin:0.0} | {r.HitP95:0} | {r.DeathP95:0} | {r.Lost} | {r.DialogP95:0} | {r.DialogAsync} |");
@@ -508,7 +510,7 @@ static class Report
         sb.AppendLine();
         sb.AppendLine("## Eigene Welt");
         sb.AppendLine();
-        sb.AppendLine("`before`: 30 s ohne Paket ist tot, und jede Ladezeile wirft sofort in die eigene Welt. `after`: 90 s, eine Ladezeile hält 45 s, ein Relay-Neustart unter 60 s verbindet still nach. Resync ist -1, wenn die Session weg ist.");
+        sb.AppendLine("`before`: 30 s ohne Paket ist tot, und jede Ladezeile wirft sofort in die eigene Welt. `after`: 90 s, eine Ladezeile h�lt 45 s, ein Relay-Neustart unter 60 s verbindet still nach. Resync ist -1, wenn die Session weg ist.");
         sb.AppendLine();
         sb.AppendLine("| Spieler | Fall | Stand | Eigene Welt | Resync ms | Abweichung m |");
         sb.AppendLine("|---:|---|---|---:|---:|---:|");
@@ -517,3 +519,4 @@ static class Report
         return sb.ToString();
     }
 }
+
