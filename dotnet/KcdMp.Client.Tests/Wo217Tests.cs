@@ -145,5 +145,7 @@ public class Wo217Tests
         Assert.Equal("take-verdict", Protocol.LootHostName(Protocol.LootHostTakeVerdict));
         Assert.NotEqual(Protocol.LootAskTakeReq, Protocol.LootAskTakedown);
         Assert.NotEqual(Protocol.LootHostBodyList, Protocol.LootHostBuild);
+        Assert.Equal("body-applied", Protocol.LootAskName(Protocol.LootAskBodyApplied));
+        Assert.Equal(9, Protocol.LootAskBodyApplied);
     }
 }

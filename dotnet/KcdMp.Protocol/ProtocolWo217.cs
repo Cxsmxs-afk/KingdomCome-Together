@@ -20,6 +20,7 @@ public static partial class Protocol
     //   host (host -> joiner) 8 BodyList "<body> <rev> <part> <nparts> <items|->"  items = item:cls:amt:hp:worn:stolen:owner,...
     //                         9 TakeVerdict "<grant|refuse> <body> <item> <owner|-|gone|busy> <stolen>"
     public const byte LootAskTakeReq = 6, LootAskTakeAck = 7, LootAskLiveEnd = 8;
+    public const byte LootAskBodyApplied = 9; // "<body> <revision> <ok|failed>": actual game inventory readback
     public const byte LootHostBodyList = 8, LootHostTakeVerdict = 9;
     //                         10 Corpses "<name:x:y:z:yaw,...|->"   E.1: the dead bodies near the players (the host's census; latest wins)
     public const byte LootHostCorpses = 10;

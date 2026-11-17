@@ -62,7 +62,8 @@ public static partial class Protocol
     public static string LootAskName(byte k) => k switch
     {
         LootAskBodyOpen => "body-open", LootAskBodyTake => "body-take", LootAskBodyPut => "body-put", LootAskItemTake => "item-take",
-        LootAskTakedown => "takedown", LootAskTakeReq => "take-request", LootAskTakeAck => "take-ack", LootAskLiveEnd => "live-end", _ => $"unknown-{k}",
+        LootAskTakedown => "takedown", LootAskTakeReq => "take-request", LootAskTakeAck => "take-ack", LootAskLiveEnd => "live-end",
+        LootAskBodyApplied => "body-applied", _ => $"unknown-{k}",
     };
 
     public static string LootHostName(byte k) => k switch

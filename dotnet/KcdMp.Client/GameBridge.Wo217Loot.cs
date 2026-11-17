@@ -17,6 +17,22 @@ public partial class GameBridge
 {
     private long _w217LootPolls, _w217LootLists, _w217LootReqs, _w217LootVerdicts, _w217LootDropped;
     private volatile int _w217LootLive;
+    private long _w217LootAcksOut, _w217LootBodyApplied, _w217LootBodyFailed, _w217LootBodyAcksIn;
+
+    // Count the real relay write, including retries, rather than counting a Lua
+    // log line whose send can still be refused or fail. The host deduplicates tok.
+    private async Task Wo217SendLootAsync(byte type, byte peer, byte kind, uint tok, string text)
+    {
+        if (type == Protocol.LootAskUp && (!Wo134JoinerRole || Wo140HoldOutbound("corpse loot"))) return;
+        if (type == Protocol.LootHostUp && !Wo134HostRole) return;
+        try
+        {
+            await WriteJoinAsync(new LootMsg(kind, tok, text).BuildUp(type, peer));
+            if (kind == Protocol.LootAskTakeReq && type == Protocol.LootAskUp) Interlocked.Increment(ref _w217LootReqs);
+            if (kind == Protocol.LootAskTakeAck && type == Protocol.LootAskUp) Interlocked.Increment(ref _w217LootAcksOut);
+        }
+        catch (Exception ex) { Console.WriteLine($"MP-W217 loot send {kind}/{tok} failed: {ex.GetType().Name}; the same token is retried by the game"); }
+    }
 
     private void Wo217LootTick(long n)
     {
@@ -59,36 +75,44 @@ public partial class GameBridge
     /// <summary>The mod's WO-217 loot events (the router hands every w217_ event not WO-217's own switches here).</summary>
     private bool Wo217LootEvent(string name, string? arg)
     {
-        var f = (arg ?? "").Split(' ');
+        var f = (arg ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
         switch (name)
         {
             case "w217_lootlive":
                 if (int.TryParse(arg, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n)) Wo217LootLiveChanged(n);
                 return true;
             case "w217_blist":   // host: <peers> <body> <rev> <part> <nparts> <items|->
-                if (f.Length == 6 && Wo134Rules.BodyName.IsMatch(f[1]))
+                if (f.Length is 6 or 7 && Wo134HostRole && Wo134Rules.BodyName.IsMatch(f[1]) && Wo217LootRules.ParseItems(f[5]) is not null
+                    && (f.Length == 6 || uint.TryParse(f[6], out _)))
                 {
                     Interlocked.Increment(ref _w217LootLists);
                     if (f[3] == "1") Console.WriteLine($"WO218-LOOT host-list npc={f[1]} rev={f[2]} parts={f[4]} -- the host's body changed (E.4's first stamp)");
                     foreach (var ps in f[0].Split(',', StringSplitOptions.RemoveEmptyEntries))
                         if (byte.TryParse(ps, NumberStyles.Integer, CultureInfo.InvariantCulture, out byte peer))
-                            _ = Wo134SendAsync(Protocol.LootHostUp, peer, Protocol.LootHostBodyList, 0, $"{f[1]} {f[2]} {f[3]} {f[4]} {f[5]}");
+                            _ = Wo217SendLootAsync(Protocol.LootHostUp, peer, Protocol.LootHostBodyList, f.Length == 7 ? uint.Parse(f[6], CultureInfo.InvariantCulture) : 0, $"{f[1]} {f[2]} {f[3]} {f[4]} {f[5]}");
                 }
                 return true;
             case "w217_tres":    // host: <peer> <tok> <grant|refuse> <body> <item> <owner|why> <stolen>
-                if (f.Length == 7 && byte.TryParse(f[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out byte tp) && uint.TryParse(f[1], out uint ttok))
-                    _ = Wo134SendAsync(Protocol.LootHostUp, tp, Protocol.LootHostTakeVerdict, ttok, $"{f[2]} {f[3]} {f[4]} {f[5]} {f[6]}");
+                if (f.Length == 7 && Wo134HostRole && byte.TryParse(f[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out byte tp) && uint.TryParse(f[1], out uint ttok))
+                    _ = Wo217SendLootAsync(Protocol.LootHostUp, tp, Protocol.LootHostTakeVerdict, ttok, $"{f[2]} {f[3]} {f[4]} {f[5]} {f[6]}");
                 return true;
             case "w217_treq":    // joiner: <tok> <body> <item> <cls> <amt>
-                if (f.Length == 5 && uint.TryParse(f[0], out uint rtok))
+                if (f.Length == 5 && uint.TryParse(f[0], out uint rtok) && rtok != 0 && Wo134Rules.BodyName.IsMatch(f[1])
+                    && Wo217LootRules.ItemId.IsMatch(f[2]) && Wo134Rules.TryClass(f[3], out _) && Wo134Rules.TryAmount(f[4], out _))
                 {
-                    Interlocked.Increment(ref _w217LootReqs);
-                    _ = Wo134SendAsync(Protocol.LootAskUp, Protocol.JoinTargetHost, Protocol.LootAskTakeReq, rtok, $"{f[1]} {f[2]} {f[3]} {f[4]}");
+                    _ = Wo217SendLootAsync(Protocol.LootAskUp, Protocol.JoinTargetHost, Protocol.LootAskTakeReq, rtok, $"{f[1]} {f[2]} {f[3]} {f[4]}");
                 }
                 return true;
             case "w217_tack":    // joiner: <tok> <body> <applied|cancel>
-                if (f.Length == 3 && uint.TryParse(f[0], out uint atok))
-                    _ = Wo134SendAsync(Protocol.LootAskUp, Protocol.JoinTargetHost, Protocol.LootAskTakeAck, atok, $"{f[1]} {f[2]}");
+                if (f.Length == 3 && uint.TryParse(f[0], out uint atok) && atok != 0 && Wo134Rules.BodyName.IsMatch(f[1]) && f[2] is "applied" or "cancel")
+                    _ = Wo217SendLootAsync(Protocol.LootAskUp, Protocol.JoinTargetHost, Protocol.LootAskTakeAck, atok, $"{f[1]} {f[2]}");
+                return true;
+            case "w217_bapplied": // emitted only after the game's inventory readback
+                if (f.Length == 3 && Wo134JoinerRole && Wo134Rules.BodyName.IsMatch(f[0]) && int.TryParse(f[1], out int br) && br > 0 && f[2] is "ok" or "failed")
+                {
+                    if (f[2] == "ok") Interlocked.Increment(ref _w217LootBodyApplied); else Interlocked.Increment(ref _w217LootBodyFailed);
+                    _ = Wo217SendLootAsync(Protocol.LootAskUp, Protocol.JoinTargetHost, Protocol.LootAskBodyApplied, 0, string.Join(' ', f));
+                }
                 return true;
             case "w217_corpses": // host: <name:x:y:z:yaw,...|->  (E.1)
                 if (arg is { Length: > 0 } && arg.Length <= Protocol.LootTextMax)
@@ -141,13 +165,19 @@ public partial class GameBridge
                     return true;
                 case Protocol.LootAskTakeAck when f.Length == 2 && Wo134Rules.BodyName.IsMatch(f[0]) && f[1] is "applied" or "cancel":
                     if (!Wo134HostRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
-                    await ExecLuaAsync($"if KCD2MP_W217HostAck then KCD2MP_W217HostAck({src}, \"{m.Tok}\", \"{f[1]}\") end");
+                    await ExecLuaAsync($"if KCD2MP_W217HostAck then KCD2MP_W217HostAck({src}, \"{m.Tok}\", \"{f[1]}\", \"{f[0]}\") end");
+                    return true;
+                case Protocol.LootAskBodyApplied when f.Length == 3 && Wo134Rules.BodyName.IsMatch(f[0]) && int.TryParse(f[1], out int appliedRev)
+                        && appliedRev > 0 && f[2] is "ok" or "failed":
+                    if (!Wo134HostRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
+                    Interlocked.Increment(ref _w217LootBodyAcksIn);
+                    await ExecLuaAsync($"if KCD2MP_W217HostStateAck then KCD2MP_W217HostStateAck({src}, \"{f[0]}\", {appliedRev}, {(f[2] == "ok" ? "true" : "false")}) end");
                     return true;
                 case Protocol.LootAskLiveEnd when f.Length == 1 && Wo134Rules.BodyName.IsMatch(f[0]):
                     if (!Wo134HostRole) return true;
                     await ExecLuaAsync($"if KCD2MP_W217HostEnd then KCD2MP_W217HostEnd({src}, \"{f[0]}\") end");
                     return true;
-                case Protocol.LootAskTakeReq or Protocol.LootAskTakeAck or Protocol.LootAskLiveEnd:
+                case Protocol.LootAskTakeReq or Protocol.LootAskTakeAck or Protocol.LootAskLiveEnd or Protocol.LootAskBodyApplied:
                     Interlocked.Increment(ref _w217LootDropped);
                     Console.WriteLine($"MP-W217 loot: a malformed {Protocol.LootAskName(m.Kind)} from ghost {src} -- dropped");
                     return true;
@@ -162,7 +192,7 @@ public partial class GameBridge
                     && int.TryParse(f[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out int np) && part >= 1 && np >= 1 && part <= np && np <= 40
                     && Wo217LootRules.ParseItems(f[4]) is { } items:
                 if (!Wo134JoinerRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
-                await ExecLuaAsync($"if KCD2MP_W217BodyList then KCD2MP_W217BodyList(\"{f[0]}\", {rev}, {part}, {np}, {Wo217LootRules.LuaItems(items)}) end");
+                await ExecLuaAsync($"if KCD2MP_W217BodyList then KCD2MP_W217BodyList(\"{f[0]}\", {rev}, {part}, {np}, {Wo217LootRules.LuaItems(items)}, \"{m.Tok}\") end");
                 return true;
             case Protocol.LootHostTakeVerdict when f.Length == 5 && f[0] is "grant" or "refuse" && Wo134Rules.BodyName.IsMatch(f[1])
                     && Wo217LootRules.ItemId.IsMatch(f[2]) && Wo217LootRules.Owner.IsMatch(f[3]) && f[4] is "0" or "1":
@@ -279,6 +309,7 @@ public partial class GameBridge
     private string Wo217LootStats() =>
         $" loot_polls={Interlocked.Read(ref _w217LootPolls)} loot_lists_out={Interlocked.Read(ref _w217LootLists)} loot_reqs_out={Interlocked.Read(ref _w217LootReqs)}"
         + $" loot_verdicts_in={Interlocked.Read(ref _w217LootVerdicts)} loot_dropped={Interlocked.Read(ref _w217LootDropped)} loot_live_now={_w217LootLive}"
+        + $" loot_acks_out={Interlocked.Read(ref _w217LootAcksOut)} loot_body_applied={Interlocked.Read(ref _w217LootBodyApplied)} loot_body_failed={Interlocked.Read(ref _w217LootBodyFailed)} loot_body_acks_in={Interlocked.Read(ref _w217LootBodyAcksIn)}"
         + $" corpse_lists_in={Interlocked.Read(ref _w217CorpsesIn)} corpse_deaths_applied={Interlocked.Read(ref _w217CorpseApplied)}"
         + $" corpses_made={Interlocked.Read(ref _w217CorpseMade)} corpses_shown={Interlocked.Read(ref _w217CorpseShown)}"
         + $" corpses_not_shown={_w217CorpseState.Count(kv => kv.Value.State != "shown")}"

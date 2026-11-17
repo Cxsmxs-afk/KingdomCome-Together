@@ -469,7 +469,11 @@ NOW = NOW + 0.05; drain()
 check("C6 A is full again for the joiner (the host's take put back)", ca.inventory:GetCountOfClass(DICE) == 1)
 check("C6 B stays empty for him (his own take)", cb.inventory:GetCountOfClass(DICE) == 0)
 check("C6 an entry past its restock is left to the engine", cc.inventory:GetCountOfClass(APPLE) == 0)
-check("C6 the apply line counts applied / expired / skipped", events("w134_applied")[1] == "2 1 1", events("w134_applied")[1])
+check("E unloaded chest ownership is retained", #events("w134_applied") == 0 and KCD2MP.w134.ledger.head <= KCD2MP.w134.ledger.tail)
+local lateChest = mkChest("stash[Chest/nowhere]", "Stash", 400, 400, 10, 0)
+NOW = NOW + 0.051; drain()
+check("E streamed chest receives its retained row", lateChest.inventory:GetCountOfClass(APPLE) == 1)
+check("C6 the apply line counts applied / expired / skipped", events("w134_applied")[1] == "3 1 0", events("w134_applied")[1])
 player.GetWorldPos = function() return { x = 300, y = 300, z = 10 } end
 KCD2MP_W134ChestApply({ { "stash[Chest/a]", DICE, 1, 1, WORLD_T, 7 } })
 LOG = {}; loop(); loop()
@@ -621,6 +625,64 @@ KCD2MP.w134LoopRunning = false                                     -- the load k
 KCD2MP.w134.startLoop(); TIMERS = {}
 LOG = {}; loop()
 check("X3 a chest that changed across a load is not recorded as a take or a put", #events("w134_chest") == 0, events("w134_chest")[1])
+
+world(); asHost(0)
+local readChest=mkChest("stash[Chest/readfail]","Stash",101,100,10,0)
+readChest.inventory:CreateItem(DICE,1,2); loop()
+local tableRead=readChest.inventory.GetInventoryTable
+readChest.inventory.GetInventoryTable=function() error("intentional unavailable chest read") end
+LOG={}; loop()
+check("E unreadable chest is not recorded as emptied", #events("w134_chest")==0)
+readChest.inventory.GetInventoryTable=tableRead
+readChest.inventory:DeleteItem(readChest.inventory.list[1],1); loop()
+check("E chest read recovery compares the retained baseline", #events("w134_chest")==1)
+for i=#ERRS,1,-1 do if tostring(ERRS[i]):find("intentional unavailable chest read",1,true) then table.remove(ERRS,i) end end
+
+-- E: establish the baseline at the real use edge, before the first click;
+-- retain the final transfer when movement closes the screen before the timer.
+world(); asHost(0)
+Stash = { OnUsed = function(self) self.inventory:DeleteItem(self.inventory.list[1],1); return true end }
+KCD2MP_W134Tick(false,true,true,0); TIMERS={}
+local edgeChest=mkChest("stash[Chest/edge]","Stash",101,100,10,0)
+edgeChest.inventory:CreateItem(DICE,1,2)
+LOG={}; Stash.OnUsed(edgeChest,player)
+player.GetWorldPos=function() return {x=200,y=200,z=10} end
+loop()
+check("E first and last chest click is recorded across reach exit", #events("w134_chest")==1 and events("w134_chest")[1]:find(DICE.." 1 ",1,true)~=nil)
+Stash=nil; player.GetWorldPos=function() return {x=100,y=100,z=10} end
+
+-- E: actual Gather wrapper -> confirmed inventory delta -> durable event;
+-- restore only this player's patch records, including stale epoch rejection.
+world(); asJoiner(); WORLD_T=1000
+PickableArea = { Gather = function(self)
+    if self.cancel or self.gathered then return false end
+    self.gathered=true; player.inventory:CreateItem(self.GuidItemPicked, 1, self.Amount)
+    return true
+end }
+KCD2MP_W134Tick(true, false, true, 1); TIMERS = {}
+local herbEpoch = KCD2MP.w134.ledger.epoch
+KCD2MP_W134HerbsReset(herbEpoch); KCD2MP_W134HerbsReady(herbEpoch)
+local herb = { GuidItemPicked = APPLE, Amount = 3, GetWorldPos = function() return { x=103,y=100,z=10 } end }
+LOG = {}; herb.Gather = PickableArea.Gather; herb:Gather()
+check("E successful herb gathering emits actual amount", #events("w134_herb") == 1 and events("w134_herb")[1]:find("3 1000",1,true) ~= nil)
+herb:Gather()
+check("E same private patch cannot be gathered twice", player.inventory:GetCountOfClass(APPLE) == 3 and #events("w134_herb") == 1)
+local cancelled = { GuidItemPicked=APPLE,Amount=3,cancel=true,GetWorldPos=function() return {x=104,y=100,z=10} end }
+cancelled.Gather = PickableArea.Gather; LOG={}; cancelled:Gather()
+NOW=NOW+31; loop(); KCD2MP_W131Tick(true,true); KCD2MP_W134Tick(true,false,true,1); TIMERS={}
+check("E cancelled gathering is not written", #events("w134_herb") == 0)
+KCD2MP_W134HerbsReset(herbEpoch)
+check("E restore hold prevents collecting before private ledger arrives", herb:Gather() == false)
+KCD2MP_W134HerbsRestore({{APPLE,103,100,10,3,1000}},herbEpoch)
+KCD2MP_W134HerbsReady(herbEpoch)
+check("E restored own herb record is read", KCD2MP.w134.herbs.rows[APPLE.."/103.00/100.00/10.00"][5]==3)
+herb.gathered=false; LOG={}; herb:Gather()
+check("E engine regrowth is not blocked by an old ledger row", #events("w134_herb")==1)
+local other = {GuidItemPicked=APPLE,Amount=2,GetWorldPos=function() return {x=105,y=100,z=10} end,Gather=PickableArea.Gather}
+LOG={}; other:Gather()
+check("E an unpicked private patch stays gatherable", #events("w134_herb") == 1)
+check("E stale herb restore cannot cross a world", KCD2MP_W134HerbsRestore({{APPLE,105,100,10,2,1000}},herbEpoch-1)==false)
+PickableArea = nil
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0

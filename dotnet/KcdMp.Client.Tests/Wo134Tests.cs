@@ -267,4 +267,35 @@ public class Wo134Tests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+    [Fact]
+    public void Private_herb_records_roundtrip_with_the_selected_snapshot_and_never_ride_the_host_chest_wire()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "wo134herbs-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var hs = new HenryStore(root);
+            var snap = new HenryStore.Snapshot("0123456789", "snap-test.hblk", new string('a', 32), DateTime.UtcNow, "snapshot", 1);
+            Directory.CreateDirectory(hs.WorldDir(snap.Tag));
+            var own = new Wo134Rules.Ledger(); own.Add(E("B", Dice, 1));
+            own.AddHerb(new(Dice, 1.25f, 2, 3, 4, 1000));
+            hs.StoreChestLedger(snap, own.ToJson());
+            var restored = Wo134Rules.Ledger.FromJson(hs.LoadChestLedger(snap));
+            Assert.Single(restored.Herbs); Assert.Equal(4, restored.Herbs[0].N);
+            Assert.DoesNotContain("1.25", string.Join(' ', Wo134Rules.LedgerParts(own)));
+            var calls = Wo134Rules.HerbCalls(restored.Herbs, 42);
+            Assert.Contains("HerbsReset(42)", calls[0]);
+            Assert.Contains("HerbsRestore", calls[1]); Assert.Contains("HerbsReady(42)", calls[^1]);
+            Assert.Null(Wo134Rules.ParseHerbEvent($"{Dice} NaN 2 3 4 1000"));
+            Assert.NotNull(Wo134Rules.ParseHerbEvent($"{Dice} 1.25 2 3 4 1000"));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public void A_world_reset_may_cancel_old_loot_at_the_menu()
+    {
+        Assert.True(GameBridge.IsMenuSafeLua("if KCD2MP_W217LootReset then KCD2MP_W217LootReset() end"));
+        Assert.False(GameBridge.IsMenuSafeLua("if KCD2MP_W217LootPoll then KCD2MP_W217LootPoll() end"));
+    }
+
 }

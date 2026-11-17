@@ -223,8 +223,12 @@ public sealed class HenryStore
         lock (_gate)
         {
             var p = ChestLedgerPath(s);
+            // Validate before publishing; read back the exact sidecar paired to
+            // this Henry instead of relying on an eventual current-world file.
+            using var parsed = System.Text.Json.JsonDocument.Parse(json);
             File.WriteAllText(p + ".part", json);
             File.Move(p + ".part", p, overwrite: true);
+            if (File.ReadAllText(p) != json) throw new IOException("private loot ledger readback mismatch");
         }
     }
 
