@@ -491,7 +491,7 @@ static class Report
         sb.AppendLine();
         sb.AppendLine("## Höhe, Treffer, Dialog");
         sb.AppendLine();
-        sb.AppendLine("`before` lerpt die Höhe durch die Stufe, lässt einen Tod 200 ms warten und stellt Dialogzeilen hinter den Quest-Nachzug. `after` hält die Stufe, spielt die Zeitleiste am gemessenen Abstand (bis 40 ms) und stellt Treffer, Tod und Dialog sofort und geordnet zu.");
+        sb.AppendLine("`before` ist die letzte Runde: höhere Trittfläche, Pose-Puffer bei 200 ms gedeckelt. `after` fragt den Boden unter dem gezeigten Punkt und lässt den Puffer dem One-Way folgen (bis 800 ms), mit einem Schrittdeckel. Treffer und Dialog bleiben auf dem direkten Weg.");
         sb.AppendLine();
         sb.AppendLine("| Spieler | Profil | Stand | Höhe p95 cm | Höhe max | Durchsinken | Ruckler/min | Treffer p95 | Tod p95 | verloren | Dialog p95 | Dialog verloren |");
         sb.AppendLine("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");

@@ -2829,7 +2829,7 @@ TUNE.NPC_SMOOTH_DELAY_FACTOR = 1.2
 -- Phase 2: the other player's body is shown this far behind the samples that
 -- have already reached this machine. It does not grow when the console queue does.
 TUNE.GHOST_TIMELINE_DELAY_S = 0.04
-TUNE.GHOST_TIMELINE_CAP_S = 0.20
+TUNE.GHOST_TIMELINE_CAP_S = 0.80
 TUNE.GHOST_TIMELINE_SNAP_S = 0.40
 TUNE.GHOST_TIMELINE_RING = 16
 function KCD2MP_NpcSmoothDelayS()

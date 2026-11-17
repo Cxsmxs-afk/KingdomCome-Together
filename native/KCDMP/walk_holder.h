@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #pragma once
+#include <cmath>
 // One holder for a walking person (phase 1). The engine's per-frame movement
 // request (body_drive) is that holder. The route (WO-215) and pose extrapolation
 // were a second guess of the same body: with the route on, the joiner crashed,
@@ -33,6 +34,7 @@ inline bool fixed_timeline(bool figure, bool isDriverClass) { return figure || i
 
 constexpr double kFixedDelayS = 0.12;
 constexpr double kFixedDelayCapS = 0.20;
+constexpr double kPoseDelayCapS = 0.80;
 constexpr double kDelayFloorS = 0.040;
 constexpr double kDelayMarginS = 0.020;
 constexpr double kSnapBehindS = 0.40;
@@ -46,12 +48,31 @@ inline double fixed_delay_s(double bindDelayS) {
 }
 
 /// Playback delay follows the measured gap. A tight link plays under 120 ms.
-/// Floor 40 ms, 20 ms of margin, cap 200 ms. The bind is not a floor.
+/// Floor 40 ms, 20 ms of margin. A bad link may use up to 800 ms so a late
+/// sample is interpolated instead of held and then jumped. The bind is not a floor.
 inline double adaptive_delay_s(double /*bindDelayS*/, double gapS) {
     double want = gapS + kDelayMarginS;
     if (!(want > kDelayFloorS)) want = kDelayFloorS;
-    if (want > kFixedDelayCapS) want = kFixedDelayCapS;
+    if (want > kPoseDelayCapS) want = kPoseDelayCapS;
     return want;
+}
+
+/// One shown step. Speed may rise by at most 2.5 m/s. A gap of 5 m or more
+/// is a teleport and is left alone.
+inline void limit_step(float fromX, float fromY, float& x, float& y, float& pace, float dt) {
+    if (!(dt > 0.f)) return;
+    if (dt < 0.016f) dt = 0.016f;
+    const float dx = x - fromX, dy = y - fromY;
+    const float dist = std::sqrt(dx * dx + dy * dy);
+    const float allow = (pace + 2.5f) * dt;
+    if (dist > allow && dist < 5.f) {
+        const float u = allow / dist;
+        x = fromX + dx * u;
+        y = fromY + dy * u;
+        pace += 2.5f;
+    } else if (dist < 5.f) {
+        pace = dist / dt;
+    }
 }
 
 /// Height along a segment. A step (at least 8 cm, and steeper than the
