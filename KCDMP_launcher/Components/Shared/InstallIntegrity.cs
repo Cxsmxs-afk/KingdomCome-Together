@@ -79,7 +79,7 @@ namespace KCDMP_launcher.Components.Shared
                    string.Join(", ", wrong) + ". " +
                    "That usually means an installer ran while the launcher, agent, relay or game was still open, " +
                    "and the files in use silently kept their old version. " +
-                   "Close everything and re-run the installer, then check install-verify.txt says PASS.";
+                   "Close the game and the launcher, then extract the new zip over the Modding Tools folder (overwrite) or re-run Setup. install-verify.txt should say PASS.";
         }
     }
 }
