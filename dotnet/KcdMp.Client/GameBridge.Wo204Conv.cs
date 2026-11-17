@@ -197,7 +197,7 @@ public partial class GameBridge
         _ = Task.Run(async () =>
         {
             await W3cNativeAsync(92, Wo207Rules.ConvArgs(92, [(byte)(index < 0 ? 255 : index), 0], W207("conv_op_frame")));
-            await ExecLuaAsync($"if KCD2MP_W204VoteIcon then KCD2MP_W204VoteIcon(\"{EscapeLua(rows)}\", {index}, {cur}, {(right ? "true" : "false")}) end");
+            await _transport.ExecuteNowAsync($"if KCD2MP_W204VoteIcon then KCD2MP_W204VoteIcon(\"{EscapeLua(rows)}\", {index}, {cur}, {(right ? "true" : "false")}) end");
             Interlocked.Increment(ref _w204VoteIcons);
         });
     }
@@ -219,7 +219,7 @@ public partial class GameBridge
         _ = Task.Run(async () =>
         {
             await W3cNativeAsync(92, Wo207Rules.ConvArgs(92, [255, 0], W207("conv_op_frame")));
-            await ExecLuaAsync($"if KCD2MP_W204VoteIcon then KCD2MP_W204VoteIcon(\"{EscapeLua(rows)}\", -1, {cur}, {(right ? "true" : "false")}) end");
+            await _transport.ExecuteNowAsync($"if KCD2MP_W204VoteIcon then KCD2MP_W204VoteIcon(\"{EscapeLua(rows)}\", -1, {cur}, {(right ? "true" : "false")}) end");
         });
     }
 
@@ -245,7 +245,7 @@ public partial class GameBridge
                 if (!mine || l!.Cid != ocid) return;
                 _w204ListenDec = (src, ocid, dec);
                 Wo210NoteOptions(src, ocid, dec);   // WO-210 F.2b: a decision is up -- a line before its pick waits for it
-                _ = ExecLuaAsync($"if KCD2MP_W204Options then KCD2MP_W204Options({src}, {ocid}, {dec}, \"{EscapeLua(Wo204Rules.RowsForLua(rows))}\") end");
+                _ = _transport.ExecuteNowAsync($"if KCD2MP_W204Options then KCD2MP_W204Options({src}, {ocid}, {dec}, \"{EscapeLua(Wo204Rules.RowsForLua(rows))}\") end");
                 return;
             case Protocol.ConvChosen when Wo203CamRules.TryParseCid(m.Text, out int ccid, out string rest):
             {
@@ -253,7 +253,7 @@ public partial class GameBridge
                 var f = rest.Split('|');
                 if (!mine || l!.Cid != ccid || f.Length != 2 || !int.TryParse(f[0], out int cdec) || !int.TryParse(f[1], out int cidx)) return;
                 Wo210NotePick(src, ccid, cdec);   // WO-210 F.2b: the lines after it wait for the pick's second
-                _ = ExecLuaAsync($"if KCD2MP_W204Chosen then KCD2MP_W204Chosen({src}, {ccid}, {cdec}, {cidx}) end");
+                _ = _transport.ExecuteNowAsync($"if KCD2MP_W204Chosen then KCD2MP_W204Chosen({src}, {ccid}, {cdec}, {cidx}) end");
                 return;
             }
             case Protocol.ConvVote when Wo204Rules.TryParseVote(m.Text, out int vcid, out int vdec, out int vidx):

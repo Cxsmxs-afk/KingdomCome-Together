@@ -77,7 +77,7 @@ public static class Wo210Rules
     /// <summary>F.2a: at most 10 hover messages a second per talk (the newest row wins a coalesced send).</summary>
     public const long HoverMinGapMs = 100;
     /// <summary>F.2b: a line that comes while a decision is up waits this long for its pick; the pick shows this long before the next line.</summary>
-    public const long PickWaitMs = 400, PickShowMs = 1000, LineHoldMaxMs = 1400;
+    public const long PickWaitMs = 80, PickShowMs = 0, LineHoldMaxMs = 80;
 
     /// <summary>"Topic index 'N' activated." (the starter's cursor moved; the log tail keeps a trailing character) -> N (0..7), else -1. The
     /// haggle's negative indices are refused.</summary>
@@ -107,8 +107,8 @@ public static class Wo210Rules
         return row is >= -1 and < 8;
     }
 
-    /// <summary>F.2b: when a line that arrived at <paramref name="arrivedMs"/> may play, its pick having come at <paramref name="pickMs"/>:
-    /// the pick's second first, never more than <see cref="LineHoldMaxMs"/> after the line arrived.</summary>
+    /// <summary>When a line that arrived at <paramref name="arrivedMs"/> may play, its pick having come at <paramref name="pickMs"/>.
+    /// A line is not held for a second after the pick. One that beat the pick waits at most <see cref="LineHoldMaxMs"/>.</summary>
     public static long LineReleaseMs(long pickMs, long arrivedMs) => Math.Min(pickMs + PickShowMs, arrivedMs + LineHoldMaxMs);
 
     /// <summary>The switches that start off; the bench's KCDMP_TEST_W210_ON names one on.</summary>

@@ -33,7 +33,10 @@ inline bool fixed_timeline(bool figure, bool isDriverClass) { return figure || i
 
 constexpr double kFixedDelayS = 0.12;
 constexpr double kFixedDelayCapS = 0.20;
+constexpr double kDelayFloorS = 0.040;
+constexpr double kDelayMarginS = 0.020;
 constexpr double kSnapBehindS = 0.40;
+constexpr float kStepZ = 0.08f;
 
 /// The render delay for a fixed timeline. The bind's delay when it is already
 /// a short fixed span, otherwise 120 ms. It does not take the queue age.
@@ -42,12 +45,28 @@ inline double fixed_delay_s(double bindDelayS) {
     return kFixedDelayS;
 }
 
-/// Playback delay for a fixed timeline. The floor is the short bind. A wider
-/// gap raises it, and it never passes the 200 ms cap.
-inline double adaptive_delay_s(double bindDelayS, double gapS) {
-    double floor = fixed_delay_s(bindDelayS);
-    if (!(gapS > floor)) return floor;
-    return gapS < kFixedDelayCapS ? gapS : kFixedDelayCapS;
+/// Playback delay follows the measured gap. A tight link plays under 120 ms.
+/// Floor 40 ms, 20 ms of margin, cap 200 ms. The bind is not a floor.
+inline double adaptive_delay_s(double /*bindDelayS*/, double gapS) {
+    double want = gapS + kDelayMarginS;
+    if (!(want > kDelayFloorS)) want = kDelayFloorS;
+    if (want > kFixedDelayCapS) want = kFixedDelayCapS;
+    return want;
+}
+
+/// Height along a segment. A step (at least 8 cm, and steeper than the
+/// horizontal move) takes the higher tread: going up, the new height as soon
+/// as the segment starts, so the body does not walk into the stair; going
+/// down, the old height until the segment ends. A slope lerps.
+inline float segment_z(float az, float bz, float horiz, float t) {
+    float dz = bz - az;
+    float adz = dz < 0.f ? -dz : dz;
+    if (adz >= kStepZ && adz > horiz) {
+        if (bz >= az) return t > 0.f ? bz : az;
+        return t >= 1.f ? bz : az;
+    }
+    if (t < 0.f) t = 0.f; else if (t > 1.f) t = 1.f;
+    return az + dz * t;
 }
 
 /// The newest sample is further behind the fixed clock than one catch-up.

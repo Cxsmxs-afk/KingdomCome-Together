@@ -2828,7 +2828,7 @@ KCD2MP.npcSmooth = true
 TUNE.NPC_SMOOTH_DELAY_FACTOR = 1.2
 -- Phase 2: the other player's body is shown this far behind the samples that
 -- have already reached this machine. It does not grow when the console queue does.
-TUNE.GHOST_TIMELINE_DELAY_S = 0.12
+TUNE.GHOST_TIMELINE_DELAY_S = 0.04
 TUNE.GHOST_TIMELINE_CAP_S = 0.20
 TUNE.GHOST_TIMELINE_SNAP_S = 0.40
 TUNE.GHOST_TIMELINE_RING = 16
@@ -12014,8 +12014,8 @@ function KCD2MP_TimelinePush(istate, x, y, z, rot, at)
 end
 
 -- True when this sample is newer than the last one accepted on the sender's
--- clock. An older one is dropped. The playback delay slews between 120 and
--- 200 ms with the gap, and never past that cap.
+-- clock. An older one is dropped. The playback delay follows the gap: 40 ms
+-- on a tight link, 20 ms of margin, never past 200 ms.
 function KCD2MP_TimelineNote(istate, senderMs)
     if not senderMs or senderMs == 0 then return true end
     local prev = istate.lastSenderMs
@@ -12023,9 +12023,11 @@ function KCD2MP_TimelineNote(istate, senderMs)
         local d = senderMs - prev
         if d <= 0 and d > -30000 then return false end
         if d > 0 and d < 1000 then
-            local want = TUNE.GHOST_TIMELINE_DELAY_S or 0.12
+            local floor = TUNE.GHOST_TIMELINE_DELAY_S or 0.04
             local cap = TUNE.GHOST_TIMELINE_CAP_S or 0.20
-            if d / 1000 > want then want = math.min(cap, d / 1000) end
+            local want = d / 1000 + 0.02
+            if want < floor then want = floor end
+            if want > cap then want = cap end
             local cur = istate.tlDelay or want
             if want > cur then cur = math.min(want, cur + 0.02) else cur = math.max(want, cur - 0.02) end
             istate.tlDelay = cur
@@ -12094,7 +12096,15 @@ function KCD2MP_TimelineApply(istate, now)
     if t < 0 then t = 0 elseif t > 1 then t = 1 end
     istate.rx = a.x + (b.x - a.x) * t
     istate.ry = a.y + (b.y - a.y) * t
-    istate.rz = a.z + (b.z - a.z) * t
+    local dz = b.z - a.z
+    local horiz = math.sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y))
+    local adz = dz < 0 and -dz or dz
+    if adz >= 0.08 and adz > horiz then
+        if dz > 0 then istate.rz = t > 0 and b.z or a.z
+        else istate.rz = t >= 1 and b.z or a.z end
+    else
+        istate.rz = a.z + dz * t
+    end
     istate.rr = lerpAngle(a.r, b.r, t)
     KCD2MP_TimelinePace(istate, now)
 end

@@ -54,15 +54,17 @@ public static class Program
         else load.AddRange(Continuous.RunAll(timeline));
         await File.WriteAllTextAsync(Path.Combine(outDir, "sim-load.json"), JsonSerializer.Serialize(load, opt));
         var queued = QueueLoad.RunAll();
-        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load) + Report.Queue(queued));
+        var feel = Feel.RunAll();
+        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load) + Report.Queue(queued) + Report.Feel(feel));
         int gated = results.Count(r => r.Gate);
         int failed = results.Count(r => r.Gate && !r.Pass);
         // Phase 3: a flooded console freezes the figure for seconds. The ring's
         // pose age stays the link plus the fixed delay, under a second.
         bool ringFlat = queued.Where(r => r.Timeline == "ring").All(r => r.WireBytes < 800);
         bool consoleTrails = queued.Where(r => r.Timeline == "console").All(r => r.WireBytes > 2000);
-        Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. queue ringFlat={ringFlat} consoleTrails={consoleTrails}. {mdPath}");
-        return failed == 0 && ringFlat && consoleTrails ? 0 : 1;
+        bool feelOk = feel.All(r => r.Pass);
+        Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. queue ringFlat={ringFlat} consoleTrails={consoleTrails} feel={feelOk}. {mdPath}");
+        return failed == 0 && ringFlat && consoleTrails && feelOk ? 0 : 1;
     }
 
     static async Task<RunResult> RunOne(int players, Profile profile, string label, string commit)
@@ -480,6 +482,21 @@ static class Report
         sb.AppendLine("|---:|---|---|---:|---:|---:|---:|");
         foreach (var r in rows)
             sb.AppendLine($"| {r.Players} | {r.Profile} | {r.Timeline} | {r.QueueP95:0} | {r.QueueMax:0} | {r.ExtrapMs:0} | {r.WireBytes} |");
+        return sb.ToString();
+    }
+
+    public static string Feel(List<FeelRow> rows)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine();
+        sb.AppendLine("## Höhe, Treffer, Dialog");
+        sb.AppendLine();
+        sb.AppendLine("`before` lerpt die Höhe durch die Stufe, lässt einen Tod 200 ms warten und stellt Dialogzeilen hinter den Quest-Nachzug. `after` hält die Stufe, spielt die Zeitleiste am gemessenen Abstand (bis 40 ms) und stellt Treffer, Tod und Dialog sofort und geordnet zu.");
+        sb.AppendLine();
+        sb.AppendLine("| Spieler | Profil | Stand | Höhe p95 cm | Höhe max | Durchsinken | Ruckler/min | Treffer p95 | Tod p95 | verloren | Dialog p95 | Dialog verloren |");
+        sb.AppendLine("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+        foreach (var r in rows)
+            sb.AppendLine($"| {r.Players} | {r.Profile} | {r.Mode} | {r.HeightP95Cm:0.0} | {r.HeightMaxCm:0.0} | {r.Sinks} | {r.BreaksPerMin:0.0} | {r.HitP95:0} | {r.DeathP95:0} | {r.Lost} | {r.DialogP95:0} | {r.DialogAsync} |");
         return sb.ToString();
     }
 }
