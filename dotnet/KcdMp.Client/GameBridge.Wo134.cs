@@ -235,10 +235,17 @@ public partial class GameBridge
                 _w134Worn[f[2]] = (now, worn);
             }
         }
+        var targets = peer == 0 ? Wo134Peers() : [peer];
+        if (items.Count > 0 && worn is null)
+        {
+            // Unknown REST equipment is never an empty outfit. Re-read the full
+            // native Worn set and refresh it on every affected copy; retries are paced by W216.
+            worn = await Wo216RefreshFullOutfitAsync(f[2], targets);
+            if (worn is not null) _w134Worn[f[2]] = (Environment.TickCount64, worn);
+        }
         var marked = Wo134Rules.MarkWorn(items, worn);
         string text = $"{f[2]} {f[3]} {f[4]} {f[5]} {f[6]} {Wo134Rules.FormatItems(marked)}";
         uint tok = uint.TryParse(f[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint t) ? t : 0;
-        var targets = peer == 0 ? Wo134Peers() : [peer];
         foreach (byte g in targets) await Wo134SendAsync(Protocol.LootHostUp, g, Protocol.LootHostBodyState, tok, text);
         if (f[5] == "1")
             Console.WriteLine($"MP-WO134 host: body {f[2]} ({f[3]}) -> {(peer == 0 ? $"every joiner ({targets.Count})" : $"ghost {peer}")}: parts={f[6]} worn_known={B(worn is not null)}");

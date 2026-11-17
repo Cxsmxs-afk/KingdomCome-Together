@@ -35973,6 +35973,13 @@ do
         if not (e and e.inventory and e.actor) then return false end
         local D = W216.dress
         D.calls = D.calls + 1
+        local off, askedOff = 0, 0
+        for cls in string.gmatch(tostring(remList or ""), "[^,]+") do
+            askedOff = askedOff + 1
+            local it = nil
+            pcall(function() it = e.inventory:FindItem(cls) end)
+            if it and pcall(function() e.actor:UnequipInventoryItem(it) end) then off = off + 1 end
+        end
         local on, asked, made = 0, 0, 0
         for cls in string.gmatch(tostring(addList or ""), "[^,]+") do
             asked = asked + 1
@@ -35984,13 +35991,6 @@ do
                 if it then made = made + 1 end
             end
             if it and pcall(function() e.actor:EquipInventoryItem(it) end) then on = on + 1 end
-        end
-        local off, askedOff = 0, 0
-        for cls in string.gmatch(tostring(remList or ""), "[^,]+") do
-            askedOff = askedOff + 1
-            local it = nil
-            pcall(function() it = e.inventory:FindItem(cls) end)
-            if it and pcall(function() e.actor:UnequipInventoryItem(it) end) then off = off + 1 end
         end
         D.on = D.on + on; D.off = D.off + off; D.made = D.made + made
         if on < asked or off < askedOff then D.fail = D.fail + 1 end

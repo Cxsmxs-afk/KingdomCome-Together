@@ -64,6 +64,7 @@ public partial class GameBridge
     private void Wo216Tick(long n)
     {
         if (n % 8 == 5 || Wo216Role() != _w216RolePushed) _ = Wo216PushNativeAsync();   // a load or the join's end goes at once
+        if (n % 4 == 3) Wo216AuditOneOutfit();
         if (n % 20 == 3 && W137Joiner && W216On("no_brains")) _ = ExecLuaAsync("if KCD2MP_W216Tick then KCD2MP_W216Tick() end");
         if (n % 120 == 47 && (W137Host || W137Joiner)) { _ = Wo216NativeStatusAsync(); Console.WriteLine(Wo216StatsLine()); }
         if (n % 240 == 53) _ = Wo216TellModAsync();
@@ -78,6 +79,17 @@ public partial class GameBridge
     }
 
     // ---------------------------------------------------------------- D: outfits
+    private sealed record OutfitTarget(List<byte[]> Worn, uint World, long Life)
+    {
+        public long NextAuditMs;
+    }
+    private sealed record HostOutfitRefresh(IReadOnlyList<byte> Peers, uint World, long Life)
+    {
+        public long NextTryMs;
+    }
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, HostOutfitRefresh> _w216HostRefresh = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, OutfitTarget> _w216OutfitWanted = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _w216OutfitGates = new(StringComparer.Ordinal);
     private long _w216OutfitsOut, _w216OutfitsIn, _w216Dressed, _w216DressChecked, _w216DressMatched, _w216DressMissing, _w216DressExtra, _w216DressRetries;
 
     /// <summary>The host, once a second: the bodies whose worn set changed (or new to the stream), one body a frame to every joiner.</summary>
@@ -109,43 +121,103 @@ public partial class GameBridge
     }
 
     /// <summary>The joiner: the host NPC's worn set -- the copy takes what it lacks and takes off what the host's does not wear.</summary>
-    private async Task Wo216OnOutfitAsync(ExtraRow r)
+    private Task Wo216OnOutfitAsync(ExtraRow r)
     {
         Interlocked.Increment(ref _w216OutfitsIn);
-        if (!W137Joiner || !W216On("outfits")) return;
-        var mine = await Wo216OutfitOfAsync(r.Name);
-        if (mine is null) return;   // no such copy here
-        var (add, rem) = Wo216Rules.OutfitDiff(r.Worn, mine);
-        if (add.Count == 0 && rem.Count == 0) { Interlocked.Increment(ref _w216DressMatched); Interlocked.Increment(ref _w216DressChecked); return; }
-        Interlocked.Increment(ref _w216Dressed);
-        string a = string.Join(',', add.Select(ExtraRow.ClassText)), d = string.Join(',', rem.Select(ExtraRow.ClassText));
-        await ExecLuaAsync($"if KCD2MP_W216Dress then KCD2MP_W216Dress(\"{EscapeLua(r.Name)}\", \"{a}\", \"{d}\") end");
-        // the check: what the copy wears 2 s later against the host's set. A dress that had to make its items first wore none of them 2 s
-        // later (b8: made and equipped in one call, the item does not take); the items exist then -- dressed again with what is still off,
-        // at most twice, and checked again
-        _ = Task.Run(async () =>
+        if (!W137Joiner || !W216On("outfits")) return Task.CompletedTask;
+        _w216OutfitWanted[r.Name] = new(r.Worn.Select(b => b.ToArray()).ToList(), _w206.World, Interlocked.Read(ref _npcDeathLife));
+        _ = Task.Run(() => Wo216RepairOutfitAsync(r.Name));
+        return Task.CompletedTask;
+    }
+
+    private void Wo216AuditOneOutfit()
+    {
+        long now = Environment.TickCount64;
+        var pending = _w216OutfitWanted.Where(p => p.Value.NextAuditMs <= now).OrderBy(p => p.Value.NextAuditMs).FirstOrDefault();
+        if (pending.Key is not null)
         {
-            List<byte[]> a2 = add, r2 = rem;
-            int again = 0;
-            for (int attempt = 0; ; attempt++)
+            pending.Value.NextAuditMs = now + 5000;
+            _ = Task.Run(() => Wo216RepairOutfitAsync(pending.Key));
+        }
+        var host = _w216HostRefresh.Where(p => p.Value.NextTryMs <= now).OrderBy(p => p.Value.NextTryMs).FirstOrDefault();
+        if (host.Key is not null)
+        {
+            host.Value.NextTryMs = now + 5000;
+            _ = Task.Run(() => Wo216TryHostRefreshAsync(host.Key, host.Value));
+        }
+    }
+
+    private async Task Wo216RepairOutfitAsync(string name)
+    {
+        var gate = _w216OutfitGates.GetOrAdd(name, _ => new SemaphoreSlim(1, 1));
+        if (!await gate.WaitAsync(0)) return;
+        try
+        {
+            while (_w216OutfitWanted.TryGetValue(name, out var target))
             {
-                await Task.Delay(2000);
-                var after = await Wo216OutfitOfAsync(r.Name);
-                if (after is null) return;
-                (a2, r2) = Wo216Rules.OutfitDiff(r.Worn, after);
-                if ((a2.Count == 0 && r2.Count == 0) || attempt >= Wo216Rules.DressRetries) break;
-                Interlocked.Increment(ref _w216DressRetries);
-                again++;
-                await ExecLuaAsync($"if KCD2MP_W216Dress then KCD2MP_W216Dress(\"{EscapeLua(r.Name)}\", \"{string.Join(',', a2.Select(ExtraRow.ClassText))}\", \"{string.Join(',', r2.Select(ExtraRow.ClassText))}\") end");
+                bool Current() => W137Joiner && W216On("outfits") && _w206.World == target.World
+                    && Interlocked.Read(ref _npcDeathLife) == target.Life
+                    && _w216OutfitWanted.TryGetValue(name, out var wanted) && ReferenceEquals(wanted, target);
+                if (!Current())
+                {
+                    ((ICollection<KeyValuePair<string, OutfitTarget>>)_w216OutfitWanted).Remove(new(name, target));
+                    continue;
+                }
+                var ordered = (await Wo144InLayerOrderAsync(target.Worn.Select(b => new Guid(b)))).Select(g => g.ToByteArray()).ToList();
+                var result = await OutfitRepair.ConvergeAsync(ordered, () => Wo216OutfitOfAsync(name), async plan =>
+                {
+                    if (!Current()) return;
+                    Interlocked.Increment(ref _w216Dressed);
+                    await ExecLuaAsync($"if KCD2MP_W216Dress then KCD2MP_W216Dress(\"{EscapeLua(name)}\", \"{string.Join(',', plan.FullWorn.Select(ExtraRow.ClassText))}\", \"{string.Join(',', plan.Remove.Select(ExtraRow.ClassText))}\") end");
+                }, Current);
+                Interlocked.Increment(ref _w216DressChecked);
+                if (result.Converged) Interlocked.Increment(ref _w216DressMatched);
+                Interlocked.Add(ref _w216DressRetries, Math.Max(0, result.Applies - 1));
+                Interlocked.Add(ref _w216DressMissing, result.Missing);
+                Interlocked.Add(ref _w216DressExtra, result.Extra);
+                Console.WriteLine($"MP-W216 outfit npc={name} full_set={ordered.Count} worn_known={B(result.Known)} classes_match={B(result.Converged)} missing={result.Missing} extra={result.Extra} applies={result.Applies}");
+                if (!Current())
+                {
+                    ((ICollection<KeyValuePair<string, OutfitTarget>>)_w216OutfitWanted).Remove(new(name, target));
+                    continue;
+                }
+                target.NextAuditMs = Environment.TickCount64 + (result.Converged ? 30000 : 5000);
+                return; // keep even matched targets: class equality cannot prove that the equipment slots stayed correct
             }
-            Interlocked.Increment(ref _w216DressChecked);
-            if (a2.Count == 0 && r2.Count == 0) Interlocked.Increment(ref _w216DressMatched);
-            Interlocked.Add(ref _w216DressMissing, a2.Count);
-            Interlocked.Add(ref _w216DressExtra, r2.Count);
-            long k = Interlocked.Read(ref _w216Dressed);
-            if (k <= 60 || k % 50 == 0)
-                Console.WriteLine($"MP-W216 outfit npc={r.Name} host={r.Worn.Count} copy_before={mine.Count} put_on={add.Count} took_off={rem.Count} after: missing={a2.Count} extra={r2.Count} dressed_again={again} [n={k}]");
-        });
+        }
+        catch (Exception ex) { Console.WriteLine($"MP-W216 outfit repair paused npc={name}: {ex.GetType().Name}: {ex.Message}"); }
+        finally { gate.Release(); }
+    }
+
+    private async Task<Guid[]?> Wo216RefreshFullOutfitAsync(string name, IReadOnlyList<byte>? targets = null)
+    {
+        if (!W137Host) return null;
+        var request = new HostOutfitRefresh((targets ?? Wo134Peers()).ToArray(), _w206.World, Interlocked.Read(ref _npcDeathLife));
+        _w216HostRefresh[name] = request;
+        return await Wo216TryHostRefreshAsync(name, request);
+    }
+
+    private async Task<Guid[]?> Wo216TryHostRefreshAsync(string name, HostOutfitRefresh request)
+    {
+        bool Current() => W137Host && request.World == _w206.World && request.Life == Interlocked.Read(ref _npcDeathLife)
+            && _w216HostRefresh.TryGetValue(name, out var latest) && ReferenceEquals(request, latest);
+        if (!Current())
+        {
+            ((ICollection<KeyValuePair<string, HostOutfitRefresh>>)_w216HostRefresh).Remove(new(name, request));
+            return null;
+        }
+        request.NextTryMs = Environment.TickCount64 + 5000;
+        var worn = await Wo216OutfitOfAsync(name);
+        if (!Current() || worn is null) return null;
+        var row = new ExtraRow { Name = name, Worn = worn };
+        foreach (byte peer in request.Peers)
+        {
+            if (!Current()) return null;
+            await Wo143SendAsync(peer, Protocol.ExtraKindOutfit, [row]);
+        }
+        Interlocked.Increment(ref _w216OutfitsOut);
+        ((ICollection<KeyValuePair<string, HostOutfitRefresh>>)_w216HostRefresh).Remove(new(name, request));
+        return worn.Select(b => new Guid(b)).ToArray();
     }
 
     private async Task<List<byte[]>?> Wo216OutfitOfAsync(string name)
@@ -155,11 +227,7 @@ public partial class GameBridge
         body[0] = (byte)nb.Length;
         nb.CopyTo(body, 1);
         var r = await _combat.Wo163Async(Protocol.Wo216OpOutfitOf, body);
-        if (r is not { Ok: true } rr || rr.Payload.Length < 2 || rr.Payload[0] != 1) return null;
-        int n = rr.Payload[1];
-        var list = new List<byte[]>(n);
-        for (int i = 0; i < n && 2 + (i + 1) * 16 <= rr.Payload.Length; i++) list.Add(rr.Payload.AsSpan(2 + i * 16, 16).ToArray());
-        return list;
+        return r is { Ok: true } rr ? OutfitRepair.ReadCopy(rr.Payload) : null;
     }
 
     private void Wo216OnEvent(string name, string? arg)
