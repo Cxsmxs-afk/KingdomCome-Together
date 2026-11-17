@@ -19,7 +19,9 @@ inline constexpr uint32_t kMagic = 0x33524E50u; // 'PNR3'
 inline constexpr uint32_t kVersion = 1;
 inline constexpr uint32_t kCapacity = 64;
 inline constexpr uint32_t kNameLen = 24;
-inline constexpr char kBuildStamp[] = "KCDMP-BUILD:0.65.2";
+// The bytes "KCDMP-BUILD:0.65.2" live in pose_ring.cpp (kcdmp_build_stamp).
+// An unused header string is stripped from the DLL, and the launcher then
+// reports a missing stamp.
 
 enum Kind : uint8_t { kPlayer = 1, kHorse = 2, kNpc = 3 };
 

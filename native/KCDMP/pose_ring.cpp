@@ -9,16 +9,22 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+// Exported and stored so the linker keeps the bytes. The launcher scans the
+// DLL for this exact prefix and compares it with the pak and its own version.
+extern "C" __declspec(dllexport) const char kcdmp_build_stamp[] = "KCDMP-BUILD:0.65.2";
+
 namespace kcdmp::posering {
 
 namespace {
 HANDLE g_map = nullptr;
+volatile const char* g_stamp = kcdmp_build_stamp;
 void* g_bytes = nullptr;
 View g_view{};
 uint32_t g_lastHostMs = 0;
 }
 
 void start() {
+    if (g_stamp[0] == '\0') return;
     if (g_bytes) return;
     g_map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, bytes_needed(), "Local\\KCD2MP.PoseRing.1");
     if (!g_map) return;
