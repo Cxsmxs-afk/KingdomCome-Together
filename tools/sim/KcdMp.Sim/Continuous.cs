@@ -319,6 +319,113 @@ public static class Continuous
     }
 }
 
+/// <summary>
+/// A minute of quest lines filling the console while poses keep arriving.
+/// "console" is phase 2: the pose waits in that queue. "ring" is phase 3:
+/// the pose is applied from the DLL ring and the queue only holds the quest lines.
+/// </summary>
+public static class QueueLoad
+{
+    const int Seconds = 60;
+    const int StepMs = 5;
+    const int ApplyMs = 35;
+
+    public static List<LoadResult> RunAll()
+    {
+        var rows = new List<LoadResult>();
+        foreach (var path in new[] { "console", "ring" })
+            foreach (var players in new[] { 2, 3, 4 })
+                foreach (var name in new[] { "typical", "bad", "awful" })
+                    rows.Add(Run(players, Profile.All.First(p => p.Name == name), path));
+        return rows;
+    }
+
+    public static LoadResult Run(int players, Profile profile, string path)
+    {
+        var rng = new Random(77 + players * 3 + profile.Name.GetHashCode(StringComparison.Ordinal));
+        int steps = Seconds * 1000 / StepMs;
+        var queues = new BatchQueue[players];
+        var budget = new double[players];
+        var shownSent = new long[players];
+        var haveShown = new bool[players];
+        var poseWait = new List<double>();
+        var poseDelay = new List<double>();
+        var edgeAge = new List<double>();
+        for (int i = 0; i < players; i++) queues[i] = new BatchQueue();
+        for (int step = 0; step < steps; step++)
+        {
+            long now = (long)step * StepMs;
+            int net = Math.Max(0, profile.DelayMs + (int)((rng.NextDouble() * 2 - 1) * profile.JitterMs));
+            if (now % 50 == 0)
+            {
+                for (int p = 0; p < players; p++)
+                {
+                    long sent = now - net;
+                    if (path == "ring")
+                    {
+                        // The DLL ring does not wait on the console, including while it is paused.
+                        poseWait.Add(0);
+                        poseDelay.Add(net + 120);
+                    }
+                    else
+                    {
+                        queues[p].Add(new BatchQueue.Entry
+                        {
+                            Lua = "KCD2MP_UpdateGhost(\"g\",1,0,0,0,false)",
+                            Text = sent.ToString(),
+                            Kind = BatchKind.Level, Key = "pose|" + p, Encoded = 48, EnqueuedMs = now,
+                        });
+                    }
+                    // One quest line fills a console round trip, and they arrive faster
+                    // than the console can run them, so the queue grows into seconds.
+                    for (int e = 0; e < 2; e++)
+                        queues[p].Add(new BatchQueue.Entry
+                        {
+                            Lua = "quest()", Text = "e", Kind = BatchKind.Edge, Encoded = 1800, EnqueuedMs = now,
+                        });
+                }
+            }
+            for (int p = 0; p < players; p++)
+            {
+                if (now % 50 == 0)
+                {
+                    edgeAge.Add(queues[p].LagMs(now));
+                    if (path != "ring" && haveShown[p]) poseDelay.Add(Math.Max(0, now - shownSent[p]));
+                }
+                // Twenty seconds in, the game is in the background for three seconds:
+                // the console runs nothing. The ring still applies the pose.
+                if (now >= 20000 && now < 23000) continue;
+                budget[p] += StepMs;
+                if (budget[p] < ApplyMs || queues[p].Count == 0) continue;
+                budget[p] -= ApplyMs;
+                foreach (var e in queues[p].TakeBatch(1900, now))
+                {
+                    if (e.Kind != BatchKind.Level || e.Text is null) continue;
+                    shownSent[p] = long.Parse(e.Text);
+                    haveShown[p] = true;
+                    poseWait.Add(Math.Max(0, now - e.EnqueuedMs));
+                }
+            }
+        }
+        poseDelay.Sort();
+        edgeAge.Sort();
+        return new LoadResult
+        {
+            Players = players, Profile = profile.Name, Timeline = path,
+            QueueP95 = Pct(edgeAge, 0.95), QueueMax = edgeAge.Count == 0 ? 0 : edgeAge[^1],
+            ExtrapMs = Pct(poseDelay, 0.95), WireBytes = poseDelay.Count == 0 ? 0 : (long)poseDelay[^1],
+        };
+    }
+
+    static double Pct(List<double> s, double q)
+    {
+        if (s.Count == 0) return 0;
+        double i = (s.Count - 1) * q;
+        int lo = (int)i, hi = Math.Min(s.Count - 1, lo + 1);
+        return s[lo] + (s[hi] - s[lo]) * (i - lo);
+    }
+}
+
 public sealed class LoadResult
 {
     public int Players { get; set; }

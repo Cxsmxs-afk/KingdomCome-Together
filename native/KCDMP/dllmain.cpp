@@ -6,6 +6,7 @@
 // Loaded by KCDMP_LauncherInjector.exe via CreateRemoteThread(LoadLibraryA),
 // which is what KCDMP_launcher's LaunchGame already expects.
 
+#include "pose_ring.h"
 #include "wo211.h"
 #include "motion.h"
 #include "hits.h"
@@ -299,6 +300,7 @@ DWORD WINAPI plugin_main(LPVOID) {
     kcdmp::main_thread::post_repeating("wo141::tick", &kcdmp::wo141::tick);   // WO-141: activities
     kcdmp::main_thread::post_repeating("wo143::tick", &kcdmp::wo143::tick);   // WO-143: hands, gaits, one-shots, looks
 
+    kcdmp::main_thread::post_repeating("posering::tick", &kcdmp::posering::tick);
     kcdmp::pipe::start();
     return 0;
 }

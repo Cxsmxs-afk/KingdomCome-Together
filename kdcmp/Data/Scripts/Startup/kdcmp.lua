@@ -3,6 +3,7 @@
 -- content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 -- Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
 -- Kingdom Come: Together (the mod: kcdmp / kdcmp.pak; internal names keep KCD2MP_) - Mod Init Script
+-- KCDMP-BUILD:0.65.2
 System.LogAlways("[KCD2-MP] === MOD INIT ===")
 
 KCD2MP = {}

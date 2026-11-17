@@ -73,6 +73,20 @@ namespace KCDMP_launcher.Components.Shared
                     wrong.Add($"{name} is {version}");
             }
 
+            string dllPath = Path.Combine(baseDir, "KCDMP.dll");
+            string? pakPath = PakPath(baseDir);
+            if (File.Exists(dllPath) || pakPath is not null)
+            {
+                string? dllStamp = StampOf(dllPath);
+                string? pakStamp = StampOf(pakPath);
+                if (File.Exists(dllPath) && dllStamp is null) wrong.Add("KCDMP.dll has no build stamp");
+                else if (dllStamp is not null && dllStamp != Globals.Version) wrong.Add($"KCDMP.dll is {dllStamp}");
+                if (pakPath is not null && pakStamp is null) wrong.Add("kdcmp.pak has no build stamp");
+                else if (pakStamp is not null && pakStamp != Globals.Version) wrong.Add($"kdcmp.pak is {pakStamp}");
+                if (dllStamp is not null && pakStamp is not null && dllStamp != pakStamp)
+                    wrong.Add($"KCDMP.dll ({dllStamp}) and kdcmp.pak ({pakStamp}) are not the same build");
+            }
+
             if (wrong.Count == 0) return null;
 
             return $"This install is a mix of two builds -- the launcher is {Globals.Version} but " +
@@ -80,6 +94,41 @@ namespace KCDMP_launcher.Components.Shared
                    "That usually means an installer ran while the launcher, agent, relay or game was still open, " +
                    "and the files in use silently kept their old version. " +
                    "Close the game and the launcher, then extract the new zip over the Modding Tools folder (overwrite) or re-run Setup. install-verify.txt should say PASS.";
+        }
+
+        /// <summary>The ASCII stamp <c>KCDMP-BUILD:version</c> inside a DLL or a pak, or null.</summary>
+        public static string? StampOf(string? path)
+        {
+            if (path is null || !File.Exists(path)) return null;
+            try
+            {
+                var bytes = File.ReadAllBytes(path);
+                var needle = System.Text.Encoding.ASCII.GetBytes("KCDMP-BUILD:");
+                for (int i = 0; i + needle.Length + 1 < bytes.Length; i++)
+                {
+                    bool hit = true;
+                    for (int j = 0; j < needle.Length; j++) if (bytes[i + j] != needle[j]) { hit = false; break; }
+                    if (!hit) continue;
+                    int s = i + needle.Length;
+                    int e = s;
+                    while (e < bytes.Length && e - s < 32 && IsStampChar(bytes[e])) e++;
+                    if (e > s) return System.Text.Encoding.ASCII.GetString(bytes, s, e - s);
+                }
+            }
+            catch { return null; }
+            return null;
+        }
+
+        static bool IsStampChar(byte b) => b == (byte)'.' || (b >= (byte)'0' && b <= (byte)'9');
+
+        static string? PakPath(string baseDir)
+        {
+            foreach (var rel in new[] { Path.Combine("mod", "kdcmp", "Data", "kdcmp.pak"), Path.Combine("..", "Mods", "kdcmp", "Data", "kdcmp.pak") })
+            {
+                string p = Path.GetFullPath(Path.Combine(baseDir, rel));
+                if (File.Exists(p)) return p;
+            }
+            return null;
         }
     }
 }

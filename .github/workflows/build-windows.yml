@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - cursor/phase2-timeline-8b43
+      - cursor/phase3-pose-ring-8b43
 
 jobs:
   build:
