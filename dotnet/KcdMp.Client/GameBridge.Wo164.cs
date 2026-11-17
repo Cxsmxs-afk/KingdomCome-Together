@@ -401,9 +401,9 @@ public partial class GameBridge
             case Protocol.W164RangedStep:   // WO-201 B11: the partner's crossbow / bow step, on his figure here
                 await Wo201OnRangedStepAsync(src, m.Text);
                 return;
-            case Protocol.W164Clock:   // WO-200 II.7: the host's clock (the joiner slews to it)
+            case Protocol.W164Clock:   // native calendar samples, also cached before the join's load
                 if (W137Host) { Interlocked.Increment(ref _w164Malformed); return; }
-                await Wo200OnHostClockAsync(m.Text);
+                await ReceiveHostCalendarAsync(src, m.Text);
                 return;
             case Protocol.W164Weather when W164Text.TryParseWeather(m.Text, out float wrain, out string? wprof):   // WO-166 W1
                 if (W137Host) { Interlocked.Increment(ref _w164Malformed); return; }   // only the host's weather is the session's

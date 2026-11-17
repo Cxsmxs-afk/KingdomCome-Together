@@ -138,7 +138,7 @@ public partial class GameBridge
     {
         _w200Connected = false;
         _w200QPushed = false;   // I.3: the classes again at the next connection (a new game's script)
-        if (_w200Slewing) { _w200Ratio = 15.0; _w200Slewing = false; _ = ExecLuaAsync("pcall(function() Calendar.SetWorldTimeRatio(15.0) end)"); }   // II.7: the game's own pace back
+        _ = ResetHostCalendarAsync("disconnect");
         _w200Talks.Clear();
         _w200Caps.Clear();
         lock (_w200DlgLock) { _w200DudeConv.Clear(); _w200DudeMono.Clear(); _w200DlgSent = (-1, -1); }

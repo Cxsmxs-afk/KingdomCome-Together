@@ -70,6 +70,10 @@ constexpr uint8_t kOpStart   = 5;
 constexpr uint8_t kOpStop    = 6;
 constexpr uint8_t kOpPull    = 7;
 constexpr uint8_t kOpClock   = 8;
+constexpr uint8_t kOpCalendarSnapshot = 9; // [] -> [result:1][ms:i64][ratio:f64]; result 1 read
+constexpr uint8_t kOpCalendarFollow = 10;  // [mode:1][ms:i64][ratio:f64] -> [result:1][before:i64][after:i64]
+// mode 0 reset, 1 update existing follower, 2 prepare before load, 3 verify pre-update readback.
+// result 1 verified/reset, 2 prepared but no current pre-update readback, 0 refused.
 
 constexpr uint8_t kROk         = 0;
 constexpr uint8_t kRBadRequest = 1;
@@ -85,7 +89,13 @@ void install();
 // Main thread, every frame: the state edges, the kept frames.
 void tick();
 
-uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen);
+// Before C_ModulesManager::Update; writes only the anchored Calendar millisecond field.
+// No SetWorldTime/change handlers and no world simulation timescale change.
+void calendar_pre_update();
+
+// Capture at pipe enqueue; a request from a closed connection cannot re-arm/reset a newer follower.
+uint64_t calendar_connection_epoch();
+uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen, uint64_t requestEpoch);
 
 using FrameFn = void (*)(const uint8_t* body, uint16_t len);
 void set_frame_callback(FrameFn fn);   // 0xA5 goes out through it

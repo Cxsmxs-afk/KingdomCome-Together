@@ -7,6 +7,7 @@
 #include "frame_meter.h"
 #include "iat_hook.h"
 #include "log.h"
+#include "wo140.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -154,9 +155,11 @@ bool run_guarded(fault::Site& site, std::function<void()>* work) {
 }
 
 void hooked_update(void* self, float dt) {
-    // Original first: queued work should observe the state the frame produced,
-    // and if our work throws the game has still updated.
+    // The follower's calendar must be in place at module-update entry. Other
+    // queued work still observes the frame the engine produced.
     const double t0 = now_us();
+    wo140::calendar_pre_update();
+    const double tEngine = now_us();
     if (g_original) g_original(self, dt);
     const double t1 = now_us();
 
@@ -208,9 +211,10 @@ void hooked_update(void* self, float dt) {
     }
     const double t2 = now_us();
     fault::tick(t2 / 1e6);                 // WO-151: the 60 s FAULT-SUM line
-    note_frame_rate(t1, t2 - t1);          // WO-151: the 60 s FRAME line
+    const double calendarUs = tEngine - t0;
+    note_frame_rate(t1, t2 - t1 + calendarUs); // WO-151: include the pre-update work too
     if (cost && t2 - t1 >= kSlowOursUs) { if (batchUs > topUs) note_slow("queued-work", batchUs); else note_slow(topName, topUs); }   // WO-221 F.1
-    if (cost) note_cost(t1 - t0, t2 - t1, batchUs, items, t2);
+    if (cost) note_cost(t1 - tEngine, t2 - t1 + calendarUs, batchUs, items, t2);
 }
 
 } // namespace

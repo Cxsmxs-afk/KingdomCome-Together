@@ -157,6 +157,7 @@ public partial class GameBridge
         if (!_w211Holding) return;
         if (Wo211Rules.ResumeInPlace(_w211HoldEpoch, world))
         {
+            _hostCalendarResumeEpoch = world;   // only this confirmed same world can re-arm without another load
             Interlocked.Increment(ref _w211ResumedInPlace);
             _ = Task.Run(async () =>
             {
@@ -375,3 +376,4 @@ public partial class GameBridge
         if (W211("joint_crime_told")) _ = ExecLuaAsync($"KCD2MP_ShowNativeToast(\"{EscapeLua(text)}\")");
     }
 }
+

@@ -4,8 +4,11 @@
 // WO-210: engine-free checks of wo210_rules.h. Linked into KCDMP_NativeTests; wo210_tests() returns the number of failures.
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <initializer_list>
 
 #include "wo210_rules.h"
+#include "calendar_follow_rules.h"
 
 using namespace kcdmp::wo210rules;
 namespace w8 = kcdmp::wo208rules;
@@ -211,6 +214,56 @@ int wo210_tests(int* passed) {
         WCHECK(!ai_claims_attack(false, true, true) && !ai_claims_attack(false, false, true), "not wanted: never claimed");
         WCHECK(twin_off_bits("ai_in_fight") == kFixAiInFight && (kFixAiInFight & (kBitsDefault | kFixFightHeal | kFixHitFx)) == 0,
                "the fallback's twin, a bit of its own");
+    }
+
+    // Paket B: the same injected memory path that calendar_pre_update uses.
+    {
+        namespace cf = kcdmp::calendarfollow;
+        int64_t cal = 0, replacement = 0, before = -1;
+        int writes = 0;
+        auto read = [](void* p, int64_t* v) { *v = *static_cast<int64_t*>(p); return true; };
+        auto write = [&](void* p, int64_t v) { ++writes; *static_cast<int64_t*>(p) = v; return true; };
+        cf::Follower f;
+        f.on = true; f.ms = 572161000; f.ratio = 0; f.at = 100;
+        WCHECK(!cf::verify(f, &cal, cal, 100, 0), "prepare alone is not a pre-update readback");
+        WCHECK(cf::apply(f, &cal, 100, 0, read, write, &before) && before == 0 && cal == 572161000,
+               "first pre-module frame replaces start=0 with host calendar");
+        WCHECK(cf::verify(f, &cal, cal, 100, 0), "the applied pre-module calendar verifies");
+        cal += 122000;
+        WCHECK(!cf::verify(f, &cal, cal, 100, 0) && cf::apply(f, &cal, 100, 0, read, write, &before) && cal == 572161000,
+               "+122 seconds corrected silently in one pre-update, no slew");
+        WCHECK(cf::apply(f, &cal, 208100, 0, read, write, &before) && cal == 572161000,
+               "208-second host hold never advances its frozen calendar sample");
+        WCHECK(!cf::apply(f, nullptr, 208100, 0, read, write, &before) && !f.verified,
+               "no Calendar before load: wait, never report verified");
+        WCHECK(cf::apply(f, &replacement, 208100, 0, read, write, &before) && replacement == 572161000 && f.lastCalendar == &replacement,
+               "a new Calendar receives host time before its module update");
+        replacement = 0;
+        WCHECK(!cf::verify(f, &replacement, replacement, 208100, 0) &&
+               cf::apply(f, &replacement, 208100, 0, read, write, &before) && replacement == 572161000,
+               "a reused Calendar internally reset to zero is corrected again");
+        WCHECK(cf::apply(f, &replacement, 208100, 0, read, write, &before) && cf::verify(f, &replacement, replacement, 208100, 0),
+               "same Calendar pointer without reset is a legitimate loaded world");
+        for (int skip : {1, 2, 3, -1}) {
+            const int n = writes;
+            WCHECK(!cf::apply(f, &replacement, 208100, skip, read, write, &before) && writes == n && !f.verified,
+                   "picker, active skip and untrusted skip state never write Calendar (%d)", skip);
+        }
+        f.ratio = 15; f.at = 300000;
+        WCHECK(cf::apply(f, &replacement, 300100, 0, read, write, &before) && replacement == 572162500,
+               "running Calendar projects at normal ratio15 without changing world simulation rate");
+        const int n = writes;
+        WCHECK(!cf::apply(f, &replacement, 310001, 0, read, write, &before) && writes == n,
+               "stale running host sample stops writes after ten seconds");
+        f = {};
+        WCHECK(!cf::apply(f, &replacement, 300100, 0, read, write, &before) && writes == n,
+               "reset follower cannot write or verify");
+        WCHECK(!cf::valid(-1, 15) && !cf::valid(cf::kMaxWorldMs + 1, 15) && !cf::valid(0, 15.01) &&
+               !cf::valid(0, std::numeric_limits<double>::quiet_NaN()) && !cf::valid(0, std::numeric_limits<double>::infinity()),
+               "invalid time, oversized ratio, NaN and infinity refused");
+        int64_t target = 0;
+        WCHECK(!cf::target(cf::kMaxWorldMs, 15, 0, 1, &target) && !cf::target(1000, 15, 2, 1, &target),
+               "projection overflow and a reversed monotonic clock refused");
     }
 
     *passed = g_pass;

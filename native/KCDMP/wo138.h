@@ -120,6 +120,8 @@ void on_pipe_closed();   // any thread: sender off, gate off, hold off
 // when the agent goes away. Main thread. True = the engine call ran.
 bool join_hold(bool on, double maxS);
 bool join_held();
+// PauseGame counters, 0xFFFF if the instance/counters are unavailable. Main thread.
+uint16_t pause_sources();
 
 // WO-141: every tracked name with a live entity (main thread).
 void for_each_tracked(void (*fn)(const char* name, uint32_t eid, void* ctx), void* ctx);

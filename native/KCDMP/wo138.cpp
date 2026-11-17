@@ -712,6 +712,7 @@ bool join_hold(bool on, double maxS) {
 }
 
 bool join_held() { return g_joinHeld.load(); }
+uint16_t pause_sources() { return held_mask(); }
 
 void tick() {
     const double now = now_s();

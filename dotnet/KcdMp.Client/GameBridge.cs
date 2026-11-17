@@ -3179,6 +3179,15 @@ public partial class GameBridge(ClientConfig config)
     private void OnWorldTimeReading(uint worldTime)
     {
         var now = DateTime.UtcNow;
+        if (HostCalendarOwned && !_awaitSkipDoneTime && !_localSkipActive && !_w140LocalSkipping)
+        {
+            // Native corrections can go backwards without loading a save. The old forward-convergence watcher must not undo them.
+            _reloadConvergeTarget = null;
+            _fastAdvanceActive = false;
+            _lastPolledWorldTime = worldTime;
+            _lastPollUtc = now;
+            return;
+        }
         Wo140CheckClock(worldTime);   // WO-140: a joiner's clock ahead of the host's is pulled back at once
 
         if (_awaitSkipDoneTime)
@@ -3192,7 +3201,7 @@ public partial class GameBridge(ClientConfig config)
             // now that our skip is over. Forward-only, so a stale one is a no-op.
             ApplyPendingTimeSkipIfAny();
             // The jump watcher must not re-report the advance the skip caused.
-            _lastPolledWorldTime = Math.Max(worldTime, _lastPolledWorldTime ?? 0);
+            _lastPolledWorldTime = HostCalendarOwned ? worldTime : Math.Max(worldTime, _lastPolledWorldTime ?? 0);
             _lastPollUtc = now;
             _fastAdvanceActive = false;
             return;
@@ -3399,6 +3408,7 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private async Task SendReloadConvergenceAsync(uint target)
     {
+        if (HostCalendarOwned) return;
         try
         {
             await ExecLuaAsync(string.Format(CultureInfo.InvariantCulture,
@@ -4178,6 +4188,12 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private async Task ApplyTimeSkipAsync(byte sourceId, byte kind, uint worldTime, bool quiet, CancellationToken ct, DateTime? receivedUtc = null)
     {
+        if (HostCalendarOwned && !_localSkipActive && !_awaitSkipDoneTime && !_w140LocalSkipping)
+        {
+            // Quiet peer announcements never overrule the host's native calendar. Genuine shared skip ends use the same follower.
+            if (!quiet) await ApplyHostCalendarSkipEndAsync(sourceId, worldTime, receivedUtc ?? DateTime.UtcNow, ct);
+            return;
+        }
         // WO-140: this game's own C_SkipTime runs (the DLL's edges -- the log's AfterSkipTime marker only
         // comes at the end): a clock write now reaches the skip's target and ends it (observed: the host's
         // result written 1 s into the joiner's shared sleep ended it, with almost no rest). Held for the end.
@@ -4632,6 +4648,7 @@ public partial class GameBridge(ClientConfig config)
         _combatRoleApplied = true;
         if (!first && _isDamageAuthority == isAuthority) return;
         _isDamageAuthority = isAuthority;
+        await ResetHostCalendarAsync("role-change");
         Console.WriteLine(isAuthority
             ? "[role] this client now holds NPC->player damage authority"
             : "[role] this client no longer holds NPC->player damage authority");
