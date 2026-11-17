@@ -116,6 +116,8 @@ int wo216_tests(int* passed) {
     WCHECK(!hide_unbound(false, false, true) && !hide_unbound(false, true, true) && !hide_unbound(true, false, true),
            "an NPC fighting a player is never hidden, bound or not");
     WCHECK(hide_unbound(false, false, false), "an unbound bystander is still hidden");
+    WCHECK(hide_holds(false, true, 0.4) == false && hide_holds(true, false, 0.4) == true, "a hide and a show inside 2 s do not flip");
+    WCHECK(hide_holds(false, true, 2.5) == true && hide_holds(true, false, 3.0) == false, "after the hold, the sweep may hide or show");
     WCHECK(streamable_name(63) && !streamable_name(65) && !streamable_name(0),
            "a name the stream cannot carry (the animal care's horses, 65) is never hidden: it can never be a copy");
 

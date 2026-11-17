@@ -618,7 +618,8 @@ void tick_sampler() {
         // outside of collision": the starter's view stays in his head the whole talk) sent nothing, and the listener's view ended for
         // silence (d29's pair drops, both roles). Once a running talk has sampled no dialogue shot for kHeadLiftMs, the starter's own
         // rendered view goes out like a shot; a dialogue shot after it is a cut, as before.
-        if (!wo208rules::head_lift(wo208::on(wo208rules::kBitPlayerView), nowMs, g_s.lastShotMs, g_s.armedMs)) {
+        const bool lift = wo208rules::head_lift(wo208::on(wo208rules::kBitPlayerView), nowMs, g_s.lastShotMs, g_s.armedMs);
+        if (!wo208rules::head_send(wo208::on(wo208rules::kBitPlayerView), lift, g_s.headSent)) {
             g_s.cutPending = true;
             g_s.havePrev = false;
             return;
@@ -938,14 +939,9 @@ bool op_view_off_main(uint8_t op, const uint8_t* body, size_t len, uint8_t* out,
     return true;
 }
 
-// WO-207 A.1: op 95 cmd 2 (the starter's poll) on the pipe's reader thread -- it only reads this file's own ring (g_sLock), no engine
-// call. At 27-45 fps the pipe's one request a frame left the camera samples 0.2-2.5 s late and the listener's view ended for silence.
-bool op_poll_off_main(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen, uint8_t* reason) {
-    if (len < 2 || body[1] != 2) return false;
-    c_pollsOffMain.fetch_add(1, std::memory_order_relaxed);
-    *reason = op_poll(op, body, len, out, cap, outLen);
-    return true;
-}
+// The camera poll used to run on the pipe thread. The live talk faulted wo203cam::read in the same second as
+// those off-main polls (0xC0000005 on both machines). The poll now waits for the main thread, with the read.
+bool op_poll_off_main(uint8_t, const uint8_t*, size_t, uint8_t*, size_t, size_t*, uint8_t*) { return false; }
 
 } // namespace
 

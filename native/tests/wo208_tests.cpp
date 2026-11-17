@@ -30,6 +30,15 @@ int wo208_tests(int* passed) {
     WCHECK(!head_lift(true, 999999, 0, 0), "a sampler that never armed sends nothing");
     // twin: the old rule (the switch off) never sends the head view -- d29's talks with every dialogue camera invalid sent nothing at all
     WCHECK(!head_lift(false, 1000 + 60000, 0, 1000), "twin: off, the head view is never sent");
+    WCHECK(head_send(true, false, 0) && !head_send(true, false, 1) && head_send(true, true, 4) && !head_send(false, true, 0),
+           "the first head of a talk is sent (in_head reaches head_sent); a later one waits for the lift; off sends nothing");
+    {
+        const int one[] = {12};
+        const int many[] = {8, 5, 20};
+        WCHECK(pick_hud_slot(one, 1, 3) == 12, "one slot that references the name is the build's, even far from the research");
+        WCHECK(pick_hud_slot(many, 3, 6) == 5, "several hits: the one nearest the research slot");
+        WCHECK(pick_hud_slot(nullptr, 0, 6) < 0, "no hit: the call is not mirrored");
+    }
     WCHECK(kHeadLiftMs < 3000, "under the listener's 3 s silence rule");
 
     // ---- F.1: the local player as a copy's opponent only inside his fight

@@ -26,6 +26,7 @@
 //      get-or-create the engine's dialogue and barks call, C_Actor +0x210 on the build the research read); bit 1 -- eid 0 is the
 //      entity named <name> here (the host listening: its own NPC, no copy id).
 #include "wo203.h"
+#include "wo208_rules.h"
 #include "wo201.h"
 #include "motion.h"
 #include "npc_drive.h"
@@ -393,11 +394,14 @@ void install_timer(HMODULE gm, void* const* vt) {
     for (const T& t : ts) {
         const char* name = anchor::find_cstring(gm, t.name);
         if (!name) { logf("WO207-TIMER the name %s not found -- that call is not mirrored", t.name); continue; }
-        for (int s = g_setSlot + 1; s < g_setSlot + 24 && *t.slot < 0; ++s) {
+        int hits[8]; int nh = 0;
+        const int research = t.name[0] == 'S' ? 5 : t.name[0] == 'U' ? 6 : 7;   // the build the research read: +0x28 / +0x30 / +0x38
+        for (int s = 0; s < 64 && nh < 8; ++s) {
             void* f = nullptr;
             if (!rd(vt, s * 8, &f) || !f) break;
-            if (s != g_activeSlot && anchor::function_refs(gm, f, name)) *t.slot = s;
+            if (s != g_activeSlot && anchor::function_refs(gm, f, name)) hits[nh++] = s;
         }
+        *t.slot = wo208rules::pick_hud_slot(hits, nh, research);
         if (*t.slot < 0) { logf("WO207-TIMER %s's slot not found -- that call is not mirrored", t.name); continue; }
         void** at = const_cast<void**>(vt) + *t.slot;
         void* cur = nullptr;
@@ -432,10 +436,14 @@ void install() {
         }
     }
     if (!vt) { g_why = "the HUD interface's vtable not found"; logf("WO203-CONV not armed: %s", g_why); return; }
-    for (int s = g_setSlot + 1; s < g_setSlot + 24; ++s) {
-        void* f = nullptr;
-        if (!rd(vt, s * 8, &f) || !f) break;
-        if (anchor::function_refs(gm, f, name)) { g_activeSlot = s; break; }
+    {
+        int hits[8]; int nh = 0;
+        for (int s = 0; s < 64 && nh < 8; ++s) {
+            void* f = nullptr;
+            if (!rd(vt, s * 8, &f) || !f) break;
+            if (anchor::function_refs(gm, f, name)) hits[nh++] = s;
+        }
+        g_activeSlot = wo208rules::pick_hud_slot(hits, nh, 3);   // the research read SetActiveSequenceChanged at +0x18
     }
     if (g_activeSlot < 0) { g_why = "the highlight slot not found"; logf("WO203-CONV not armed: %s", g_why); return; }
     void** at = const_cast<void**>(vt) + g_activeSlot;

@@ -1012,7 +1012,8 @@ void own_apply(uint32_t eid, OwnCopy& oc, int cm, const HostScope hsc[2], const 
     if (!empty) oc.fullEmptySince = -1;
     else {
         if (oc.fullEmptySince < 0) oc.fullEmptySince = now;
-        if (now - oc.fullEmptySince > 0.3 && now - oc.lastPulse > 1.0 && !oc.baseAct && !queueFull) {
+        // A full action queue used to skip this, so a speaker's FullBody stayed empty (the live close-up, tens of seconds).
+        if (now - oc.fullEmptySince > 0.3 && now - oc.lastPulse > 1.0 && !oc.baseAct) {
             oc.lastPulse = now;
             const HostScope* hb = have[0] && is_base(fam_of(eid, hsc[0].cls, hsc[0].frag)) && hsc[0].cls != kClsNone ? &hsc[0] : nullptr;
             const char* how = "no host base to give it";
@@ -1691,6 +1692,18 @@ bool probe_only(uint32_t eid) {
 double owner_shift_s(uint32_t eid) {
     if (!eid || !on(kBitOwner) || !g_ownerOnly.empty() || g_owned.count(eid) == 0) return 0.0;
     return g_ownerDelayS + kStreamEveryS / 2;   // the state arrives within one stream period of the row, then waits the stream delay
+}
+
+bool repair_empty_body(uint32_t eid) {
+    if (!eid) return false;
+    HostScope nb{};
+    void* act = nullptr;
+    if (neutral_idle(eid, &nb) && rttr::install_fragment(eid, nb.frag, nb.tags, wo208rules::kBasePriority, nb.flags, &act) == rttr::SwingResult::Ok && act)
+        return true;
+    bool combat = false;
+    motion::combat_mode_of(eid, &combat);
+    if (combat && motion::requeue_guard_idle(eid)) return true;
+    return motion::request_idle_pulse(eid);
 }
 
 bool probe_owned_name(const char* name) {

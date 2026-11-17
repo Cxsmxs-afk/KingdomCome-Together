@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - cursor/combat-reach-shield-8b43
+      - cursor/dialog-rain-tpose-8b43
 
 jobs:
   build:

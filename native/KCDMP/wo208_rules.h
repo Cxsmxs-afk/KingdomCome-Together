@@ -92,6 +92,27 @@ inline bool head_lift(bool on, int64_t nowMs, int64_t lastShotMs, int64_t armedM
     const int64_t from = lastShotMs > armedMs ? lastShotMs : armedMs;
     return from > 0 && nowMs - from >= kHeadLiftMs;
 }
+// The first in-head frame of a talk is sent. Waiting out the lift left head_sent at 0 while in_head
+// had already counted (the live close-up). Later in-head frames between shots still wait for the lift.
+inline bool head_send(bool on, bool lift, uint32_t headSent) {
+    if (!on) return false;
+    return lift || headSent == 0;
+}
+
+// The HUD slot whose function references the Flash name. One hit is that slot (the build's), even when it is not
+// the offset the research read. Several hits: the one nearest the research slot, so a neighbour that also mentions
+// the name does not win.
+inline int pick_hud_slot(const int* hits, int n, int research) {
+    if (!hits || n <= 0) return -1;
+    int best = hits[0];
+    if (research < 0) return best;
+    int bestD = hits[0] > research ? hits[0] - research : research - hits[0];
+    for (int i = 1; i < n; ++i) {
+        int d = hits[i] > research ? hits[i] - research : research - hits[i];
+        if (d < bestD) { bestD = d; best = hits[i]; }
+    }
+    return best;
+}
 
 // ---- A: the copy animation owner's rules ----
 // The action family of one scope's installed action: the standing idle, locomotion, combat footwork, a posture, an idle variation, and

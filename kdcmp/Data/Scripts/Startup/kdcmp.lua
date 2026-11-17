@@ -24769,6 +24769,26 @@ function KCD2MP_W166SetTalkResumeFirst(arg)
     return true
 end
 
+-- A shot on the partner's figure. The class is the game's if it has one; a miss only logs.
+function KCD2MP_W201Shot(id, kind)
+    kind = tostring(kind or "unknown")
+    mp_log(string.format("WO201-RANGED shot weapon=%s figure=%s", kind, tostring(id)))
+    local g = KCD2MP.ghosts and KCD2MP.ghosts[tostring(id)]
+    local e = g and g.entity
+    if not (e and e.GetPos) then return false end
+    local pos
+    pcall(function() pos = e:GetPos() end)
+    if not pos then return false end
+    local class = kind == "bow" and "Arrow" or "Bolt"
+    local spawned = false
+    pcall(function()
+        local ent = System.SpawnEntity({ Name = "kcdmp_shot_" .. tostring(id), Class = class, Pos = pos })
+        spawned = ent ~= nil
+    end)
+    if spawned then mp_log(string.format("WO201-RANGED shot spawned class=%s figure=%s", class, tostring(id))) end
+    return true
+end
+
 -- ---- W1: the host's live weather ----------------------------------------------------------------------------------
 -- The game's rain is computed per machine from the local cloud density (EnvironmentModule); its weather layer profiles follow it.
 -- The host reads its own rain (EnvironmentModule.GetRainIntensity) and the agent sends it on a change and every 60 s; a joiner holds
@@ -24813,7 +24833,7 @@ function KCD2MP_W166WeatherApply(rain, profile)
     local ok = pcall(function() System.SetCVar("wh_env_RainIntensityOverride", rain) end)
     X.applied, X.appliedRain = ok, rain
     X.stats.applies = X.stats.applies + 1
-    if was == nil or math.abs(rain - was) >= 0.05 then
+    if was == nil or math.abs(rain - was) >= 0.05 or not ok then
         local back = nil
         if type(EnvironmentModule) == "table" and type(EnvironmentModule.GetRainIntensity) == "function" then
             pcall(function() back = tonumber(EnvironmentModule.GetRainIntensity()) end)

@@ -50,6 +50,35 @@ public static class Wo201Rules
     /// <summary>The fragment tags: the weapon's (a crossbow's reload with the goat's foot).</summary>
     public static string RangedTags(byte p, bool bow) => bow ? "l_bow" : p == 4 ? "l_crossbow+medium+goatsfoot" : "l_crossbow";
 
+    /// <summary>A missile weapon's model. A crossbow's model also contains "bow", so that word is checked first.</summary>
+    public static bool IsBow(string? model) =>
+        model is not null && model.Contains("bow", StringComparison.OrdinalIgnoreCase)
+        && !model.Contains("crossbow", StringComparison.OrdinalIgnoreCase);
+
+    public const float ArrowSpeed = 55f;
+    public const float BoltSpeed = 70f;
+
+    /// <summary>Where the shot is after <paramref name="t"/> seconds. The direction need not be a unit vector.</summary>
+    public static (float X, float Y, float Z) Flight(float ox, float oy, float oz, float dx, float dy, float dz, float speed, float t)
+    {
+        float len = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 1e-4f || t <= 0) return (ox, oy, oz);
+        float s = speed * t / len;
+        return (ox + dx * s, oy + dy * s, oz + dz * s);
+    }
+
+    /// <summary>The shot's segment from the origin to <paramref name="at"/> passes within <paramref name="radius"/> of the target.</summary>
+    public static bool ShotHits(float ox, float oy, float oz, float ax, float ay, float az, float tx, float ty, float tz, float radius)
+    {
+        float vx = ax - ox, vy = ay - oy, vz = az - oz;
+        float wx = tx - ox, wy = ty - oy, wz = tz - oz;
+        float vv = vx * vx + vy * vy + vz * vz;
+        float u = vv > 1e-6f ? (wx * vx + wy * vy + wz * vz) / vv : 0f;
+        if (u < 0f) u = 0f; else if (u > 1f) u = 1f;
+        float dx = ox + vx * u - tx, dy = oy + vy * u - ty, dz = oz + vz * u - tz;
+        return dx * dx + dy * dy + dz * dz <= radius * radius;
+    }
+
     // ---- V.1 joiner_receive_only ----
     /// <summary>Is a joiner's own root step his to ask for? Only what his own conversation decided, or his own interaction (the
     /// coal-sack search: an interactiontrigger_* of this player); anything else his game's quest logic decided by itself (a distance,

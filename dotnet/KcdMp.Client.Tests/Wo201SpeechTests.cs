@@ -38,6 +38,13 @@ public class Wo201SpeechTests
         Assert.Equal("", Wo201Rules.RangedFragment(2));   // the aim hold needs the shooting's own tags: not shown
         Assert.Equal("l_crossbow+medium+goatsfoot", Wo201Rules.RangedTags(4, false));
         Assert.Equal("l_bow", Wo201Rules.RangedTags(3, true));
+        Assert.True(Wo201Rules.IsBow("weapons/bow_yew.cgf"));
+        Assert.False(Wo201Rules.IsBow("weapons/crossbow_light.cgf"));
+        Assert.False(Wo201Rules.IsBow(null));
+        var at = Wo201Rules.Flight(0, 0, 1.6f, 1, 0, 0, Wo201Rules.ArrowSpeed, 0.1f);
+        Assert.InRange(at.X, 5.4f, 5.6f);
+        Assert.True(Wo201Rules.ShotHits(0, 0, 1.6f, 10, 0, 1.6f, 8, 0.2f, 1.6f, 0.5f));
+        Assert.False(Wo201Rules.ShotHits(0, 0, 1.6f, 10, 0, 1.6f, 8, 4, 1.6f, 0.5f));
         Assert.Equal("ranged-step", Protocol.W164KindName(Protocol.W164RangedStep));
     }
 }
