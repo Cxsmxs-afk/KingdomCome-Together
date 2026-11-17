@@ -58,7 +58,8 @@ public sealed class Win32LinkPrimitives : ILinkPrimitives
 /// Each link is made under a temporary name and moved over the target in
 /// one step, so a pak the game needs is never missing, not even for a moment,
 /// and an interrupted run leaves the old file rather than nothing. Only the
-/// expected *.pak paths are ever touched; nothing else in the Modding Tools.
+/// expected game pak paths and the installed game's Data\Facials files are
+/// touched; unrelated files in the Modding Tools are left alone.
 /// </summary>
 public static class WorkspaceLinker
 {

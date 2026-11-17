@@ -47,17 +47,20 @@ public sealed record WorkspaceReport(string GameRoot, string ModdingToolsRoot, I
 }
 
 /// <summary>
-/// What Warhorse's WorkspaceSetup.exe produces, and checking it is there.
+/// What Warhorse's WorkspaceSetup.exe produces, plus the retail facial data,
+/// and checking those files are there.
 ///
 /// Read from the tool itself (docs/WO-150-findings.md): it mirrors every
 /// *.pak in the game's Data and Localization folders, and in each
 /// Data\Levels\&lt;level&gt; folder, to the same relative path in the Modding
 /// Tools -- nothing else, no other folder. On the maintainer's machine that
-/// is 42 + 21 + 28 = 91 files (docs/WO-150A-workspace-map.md).
+/// is 42 + 21 + 28 = 91 files (docs/WO-150A-workspace-map.md). Paket F4 also
+/// includes actual files below Data\Facials, which that tool omits. Their names
+/// and formats come from the installed game; no facial assets are redistributed.
 /// </summary>
 public static class Workspace
 {
-    /// <summary>Relative paths (to the game root, identical under the Modding Tools root) in the tool's own order.</summary>
+    /// <summary>Relative game paths, identical under the Modding Tools root; facial files are sorted recursively.</summary>
     public static List<string> ExpectedFiles(string gameRoot)
     {
         var rels = new List<string>();
@@ -70,6 +73,21 @@ public static class Workspace
                 rels.Add(Path.Combine(relDir, f.Name));
         }
         Mirror("Data");
+        var facials = Path.Combine(gameRoot, "Data", "Facials");
+        if (Directory.Exists(facials))
+        {
+            // The retail folder can contain loose facial data as well as packs.
+            // Follow only real entries within this tree, never nested link loops.
+            var options = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = false,
+                AttributesToSkip = FileAttributes.ReparsePoint,
+            };
+            foreach (var file in Directory.EnumerateFiles(facials, "*", options)
+                         .OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
+                rels.Add(Path.GetRelativePath(gameRoot, file));
+        }
         Mirror("Localization");
         var levels = Path.Combine(gameRoot, "Data", "Levels");
         if (Directory.Exists(levels))

@@ -151,7 +151,10 @@ foreach ($f in Get-ChildItem $appFull -Recurse -File) {
 $modFull = (Get-Item $ModDir).FullName
 foreach ($stray in Get-ChildItem $modFull -Recurse -File -ErrorAction SilentlyContinue) {
     $rel = $stray.FullName.Substring($modFull.Length + 1)
-    if ($rel -ne 'mod.manifest' -and $rel -ne 'Data\kdcmp.pak') {
+    # Locally generated deltas and their source/run proof survive an update. The launcher
+    # revalidates the facial delta before the next start, removing it after asset changes.
+    if ($rel -notin @('mod.manifest', 'Data\kdcmp.pak', 'Data\kdcmp_keys.pak',
+                     'Data\kdcmp_facial_fallback.pak', 'kdcmp_facial_fallback.state.xml')) {
         $stray.IsReadOnly = $false
         Remove-Item $stray.FullName -Force
         $removed += "mod: $rel"

@@ -507,6 +507,12 @@ namespace KCDMP_launcher.Pages
                     WorkingDirectory = GameRootOf(settings.GamePath)
                 };
 
+                // F4: inspect this installation's previous run before history or the game replaces its log.
+                if (!await PrepareFacialFallbackAsync(GameRootOf(settings.GamePath)))
+                {
+                    UiService.ShowError("Der vorhandene Facial-Patch konnte nicht sicher geprüft oder entfernt werden. Schließe das Spiel und prüfe die Schreibrechte im Mod-Ordner vor dem nächsten Start.");
+                    return;
+                }
                 // WO-144: the previous launch's logs are kept before the game starts over them
                 LogBundle.KeepHistory(GameRootOf(settings.GamePath), Path.GetDirectoryName(agentPath) ?? "");
                 // WO-154: the agent's first start of a launch (the keys pak). Windows refusing it stops
