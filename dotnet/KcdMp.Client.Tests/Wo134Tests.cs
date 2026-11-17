@@ -257,7 +257,9 @@ public class Wo134Tests
         try
         {
             var hs = new HenryStore(root);
-            var snap = new HenryStore.Snapshot("0123456789", "snap-20260927080000000-" + new string('a', 32) + "-snapshot.hblk", new string('a', 32), DateTime.UtcNow, "snapshot", 1);
+            var (_, spec) = WhsSaveTests.Pair();
+            var parts = WhsSave.PartsFromFile(WhsSaveTests.File(spec), WhsSave.HenryParts.OriginSnapshot);
+            var snap = hs.Store("0123456789", parts, new string('a', 32), HenryStore.SourceSnapshot, "legacy sidecar");
             Directory.CreateDirectory(hs.WorldDir(snap.Tag));
             Assert.Null(hs.LoadChestLedger(snap));   // a snapshot from before WO-134
             var l = new Wo134Rules.Ledger(); l.Add(E("B", Dice, 1));
@@ -274,7 +276,9 @@ public class Wo134Tests
         try
         {
             var hs = new HenryStore(root);
-            var snap = new HenryStore.Snapshot("0123456789", "snap-test.hblk", new string('a', 32), DateTime.UtcNow, "snapshot", 1);
+            var (_, spec) = WhsSaveTests.Pair();
+            var parts = WhsSave.PartsFromFile(WhsSaveTests.File(spec), WhsSave.HenryParts.OriginSnapshot);
+            var snap = hs.Store("0123456789", parts, new string('a', 32), HenryStore.SourceSnapshot, "legacy sidecar");
             Directory.CreateDirectory(hs.WorldDir(snap.Tag));
             var own = new Wo134Rules.Ledger(); own.Add(E("B", Dice, 1));
             own.AddHerb(new(Dice, 1.25f, 2, 3, 4, 1000));
@@ -296,6 +300,15 @@ public class Wo134Tests
     {
         Assert.True(GameBridge.IsMenuSafeLua("if KCD2MP_W217LootReset then KCD2MP_W217LootReset() end"));
         Assert.False(GameBridge.IsMenuSafeLua("if KCD2MP_W217LootPoll then KCD2MP_W217LootPoll() end"));
+    }
+
+    [Fact]
+    public void Quest_items_follow_the_host_graph_instead_of_private_chest_creation()
+    {
+        var host = new Wo134Rules.Ledger(); host.Add(E(Chest, Coat, 1)); host.Add(E(Chest, Dice, 1));
+        var own = new Wo134Rules.Ledger(); own.Add(E(Chest, Coat, 1));
+        var rows = Wo134Rules.JoinRows(host, own, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Coat });
+        Assert.Equal(Dice, Assert.Single(rows).Cls);
     }
 
 }

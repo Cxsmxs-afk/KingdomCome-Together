@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Text;
 using KcdMp.Wire;
 using Spec = KcdMp.Client.Tests.WhsSaveTests.Spec;
@@ -79,6 +80,63 @@ public class Wo125Tests : IDisposable
         magic[0] = (byte)'X';
         Assert.Throws<InvalidDataException>(() => WhsSave.ParseBlock(magic));
         Assert.Throws<InvalidDataException>(() => WhsSave.ParseBlock(new byte[10]));
+    }
+
+    [Fact]
+    public void Legacy_v1_blocks_remain_byte_identical_without_an_embedded_ledger()
+    {
+        var block = WhsSave.SerializeBlock(Parts());
+        Assert.Equal(1, BinaryPrimitives.ReadInt32LittleEndian(block.AsSpan(8)));
+        var back = WhsSave.ParseBlock(block);
+        Assert.Null(back.PrivateLootLedgerJson);
+        Assert.Equal(block, WhsSave.SerializeBlock(back));
+    }
+
+    [Fact]
+    public void A_v2_block_keeps_private_loot_with_henry_but_never_splices_it_into_the_game_save()
+    {
+        var (hs, js) = WhsSaveTests.Pair();
+        var host = F(hs);
+        var parts = WhsSave.PartsFromFile(F(js), WhsSave.HenryParts.OriginSnapshot);
+        var expectedSave = WhsSave.SpliceParts(host, parts, Q, WhsSave.QuestItemMode.Strip).File;
+        const string ledger = "{\"Entries\":[],\"Herbs\":[],\"note\":\"eigener Besitz: Kräuter\"}";
+        parts.PrivateLootLedgerJson = ledger;
+        var block = WhsSave.SerializeBlock(parts);
+        Assert.Equal(2, BinaryPrimitives.ReadInt32LittleEndian(block.AsSpan(8)));
+        var back = WhsSave.ParseBlock(block);
+        Assert.Equal(ledger, back.PrivateLootLedgerJson);
+        Assert.Equal(block, WhsSave.SerializeBlock(back));
+        Assert.Equal(expectedSave, WhsSave.SpliceParts(host, back, Q, WhsSave.QuestItemMode.Strip).File);
+    }
+
+    private static void RehashBlock(byte[] block) => SHA256.HashData(block.AsSpan(0, block.Length - 32)).CopyTo(block, block.Length - 32);
+
+    [Fact]
+    public void Embedded_loot_is_hash_protected_bounded_and_strict_utf8_json()
+    {
+        var parts = Parts();
+        parts.PrivateLootLedgerJson = "{\"Entries\":[],\"Herbs\":[]}";
+        var good = WhsSave.SerializeBlock(parts);
+        int jsonAt = good.Length - 32 - Encoding.UTF8.GetByteCount(parts.PrivateLootLedgerJson);
+        var corrupt = (byte[])good.Clone(); corrupt[jsonAt + 2] ^= 1;
+        Assert.Throws<InvalidDataException>(() => WhsSave.ParseBlock(corrupt));
+        var invalidJson = (byte[])good.Clone(); invalidJson[jsonAt] = (byte)'['; RehashBlock(invalidJson);
+        Assert.Throws<InvalidDataException>(() => WhsSave.ParseBlock(invalidJson));
+        var invalidUtf8 = (byte[])good.Clone(); invalidUtf8[jsonAt] = 0xff; RehashBlock(invalidUtf8);
+        Assert.Throws<InvalidDataException>(() => WhsSave.ParseBlock(invalidUtf8));
+        var excessive = (byte[])good.Clone();
+        BinaryPrimitives.WriteInt32LittleEndian(excessive.AsSpan(jsonAt - 4), WhsSave.MaxPrivateLootLedgerBytes + 1); RehashBlock(excessive);
+        Assert.Throws<InvalidDataException>(() => WhsSave.ParseBlock(excessive));
+        var truncated = (byte[])good.Clone();
+        BinaryPrimitives.WriteInt32LittleEndian(truncated.AsSpan(jsonAt - 4), good.Length - jsonAt); RehashBlock(truncated);
+        Assert.Throws<InvalidDataException>(() => WhsSave.ParseBlock(truncated));
+
+        parts.PrivateLootLedgerJson = "[]";
+        Assert.Throws<InvalidDataException>(() => WhsSave.SerializeBlock(parts));
+        parts.PrivateLootLedgerJson = "{\"bad\":\"\ud800\"}";
+        Assert.Throws<InvalidDataException>(() => WhsSave.SerializeBlock(parts));
+        parts.PrivateLootLedgerJson = "{\"padding\":\"" + new string('é', WhsSave.MaxPrivateLootLedgerBytes / 2) + "\"}";
+        Assert.Throws<InvalidDataException>(() => WhsSave.SerializeBlock(parts));
     }
 
     [Fact]
@@ -219,6 +277,77 @@ public class Wo125Tests : IDisposable
         Assert.Contains(_log, l => l.Contains("read back: hash + parse ok"));
         Assert.Single(st.Worlds());
         Assert.Equal("bring", st.Worlds()[0].FirstSource);
+    }
+
+    [Fact]
+    public void A_real_snapshot_restores_its_private_chest_and_herb_ledger_without_a_sidecar()
+    {
+        var st = Store();
+        string tag = WhsSave.SeedTag(77);
+        var own = new Wo134Rules.Ledger();
+        own.Add(new() { C = "stash[Chest/own]", Cls = "b8df2253-e5c8-4e6c-9303-b4bc84192e67", N = 1, T = 1000 });
+        own.AddHerb(new("2264f217-590e-4c0f-a4c6-f50c6532b9f6", 1.25f, 2, 3, 4, 1000));
+        string json = own.ToJson();
+        var snap = st.Store(tag, Parts(), M(1), HenryStore.SourceSnapshot, "", lootLedgerJson: json);
+        Assert.False(File.Exists(st.ChestLedgerPath(snap)));
+        var picked = st.PickFor(tag, [M(1)])!;
+        Assert.Equal(json, picked.Parts.PrivateLootLedgerJson);
+        Assert.Equal(json, st.LoadChestLedger(picked.Snapshot));
+        var restored = Wo134Rules.Ledger.FromJson(st.LoadChestLedger(picked.Snapshot));
+        Assert.Equal(1, Assert.Single(restored.Entries).N);
+        Assert.Equal(4, Assert.Single(restored.Herbs).N);
+
+    }
+
+    [Fact]
+    public void A_failed_or_corrupt_compatibility_sidecar_cannot_lose_the_embedded_ledger()
+    {
+        var st = Store();
+        string tag = WhsSave.SeedTag(77), json = "{\"Entries\":[],\"Herbs\":[],\"own\":true}";
+        var snap = st.Store(tag, Parts(), M(1), HenryStore.SourceSnapshot, "", lootLedgerJson: json);
+        string path = st.ChestLedgerPath(snap);
+        Directory.CreateDirectory(path); // deterministic IO failure even when tests run as an administrator
+        var failure = Record.Exception(() => st.StoreChestLedger(snap, json));
+        Assert.True(failure is IOException or UnauthorizedAccessException, failure?.ToString());
+        Assert.Equal(json, st.LoadChestLedger(snap));
+        Assert.Equal(json, st.PickFor(tag, [M(1)])!.Parts.PrivateLootLedgerJson);
+        Directory.Delete(path);
+        File.WriteAllText(path, "{corrupt");
+        Assert.Equal(json, st.LoadChestLedger(snap));
+        File.WriteAllText(path, "{\"Entries\":[],\"wrongMoment\":true}");
+        Assert.Equal(json, st.LoadChestLedger(snap));
+    }
+
+    [Fact]
+    public void Only_valid_legacy_v1_snapshots_may_read_their_old_sidecars()
+    {
+        var st = Store();
+        string tag = WhsSave.SeedTag(77), json = "{\"Entries\":[],\"Herbs\":[]}";
+        var legacy = st.Store(tag, Parts(), M(1), HenryStore.SourceSnapshot, "");
+        Assert.Null(st.Load(legacy)!.PrivateLootLedgerJson);
+        st.StoreChestLedger(legacy, json);
+        Assert.Equal(json, st.LoadChestLedger(legacy));
+        _now = _now.AddMinutes(5);
+        var newer = st.Store(tag, Parts(), M(2), HenryStore.SourceSnapshot, "", lootLedgerJson: json);
+        st.StoreChestLedger(newer, json);
+        string path = Path.Combine(st.WorldDir(tag), newer.File);
+        var bytes = File.ReadAllBytes(path);
+        int jsonAt = bytes.Length - 32 - Encoding.UTF8.GetByteCount(json);
+        bytes[jsonAt] = (byte)'['; RehashBlock(bytes); File.WriteAllBytes(path, bytes);
+        Assert.Null(st.LoadChestLedger(newer));
+        Assert.Equal(legacy.File, st.PickFor(tag, [M(2), M(1)])!.Snapshot.File);
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(8), 3); RehashBlock(bytes); File.WriteAllBytes(path, bytes);
+        Assert.Null(st.LoadChestLedger(newer));
+    }
+
+    [Fact]
+    public void Invalid_embedded_json_never_publishes_a_henry_snapshot()
+    {
+        var st = Store();
+        string tag = WhsSave.SeedTag(77);
+        Assert.Throws<InvalidDataException>(() => st.Store(tag, Parts(), M(1), HenryStore.SourceSnapshot, "", lootLedgerJson: "{broken"));
+        Assert.Empty(st.Snapshots(tag));
+        Assert.Empty(Directory.GetFiles(st.WorldDir(tag), "*.part"));
     }
 
     [Fact]

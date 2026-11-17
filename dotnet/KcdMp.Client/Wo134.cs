@@ -200,11 +200,11 @@ public static class Wo134Rules
     /// Each row keeps its own time and restock period: the mod leaves an expired
     /// one to the engine's restock.
     /// </summary>
-    public static List<Entry> JoinRows(Ledger host, Ledger joiner)
+    public static List<Entry> JoinRows(Ledger host, Ledger joiner, IReadOnlySet<string>? sharedQuestClasses = null)
     {
         var o = new List<Entry>();
-        foreach (var e in host.Entries) o.Add(new Entry { C = e.C, Cls = e.Cls, N = e.N, Hp = e.Hp, T = e.T, R = e.R });
-        foreach (var e in joiner.Entries) o.Add(new Entry { C = e.C, Cls = e.Cls, N = -e.N, Hp = e.Hp, T = e.T, R = e.R });
+        foreach (var e in host.Entries.Where(e => sharedQuestClasses?.Contains(e.Cls) != true)) o.Add(new Entry { C = e.C, Cls = e.Cls, N = e.N, Hp = e.Hp, T = e.T, R = e.R });
+        foreach (var e in joiner.Entries.Where(e => sharedQuestClasses?.Contains(e.Cls) != true)) o.Add(new Entry { C = e.C, Cls = e.Cls, N = -e.N, Hp = e.Hp, T = e.T, R = e.R });
         return o;
     }
 

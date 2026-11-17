@@ -1,4 +1,10 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Reflection;
+using KcdMp.Wire;
+
 namespace KcdMp.Client.Tests;
 
 public class OutfitRepairTests
@@ -71,6 +77,53 @@ public class OutfitRepairTests
         }, () => current, () => { current = false; return Task.CompletedTask; });
         Assert.False(result.Converged);
         Assert.Equal(1, applies);
+    }
+
+    [Fact]
+    public async Task Actual_worker_keeps_a_silent_target_without_native_work_then_retires_it_when_host_death_arrives()
+    {
+        var bridge = Joiner();
+        const string name = "outfit_test_npc";
+        const BindingFlags fields = BindingFlags.NonPublic | BindingFlags.Instance;
+        var wanted = (IDictionary)typeof(GameBridge).GetField("_w216OutfitWanted", fields)!.GetValue(bridge)!;
+        var targetType = typeof(GameBridge).GetNestedType("OutfitTarget", BindingFlags.NonPublic)!;
+        var target = Activator.CreateInstance(targetType, new object[] { new List<byte[]> { Under }, 0u, 0L })!;
+        wanted.Add(name, target);
+        var newest = (ConcurrentDictionary<string, (ushort, byte, long)>)typeof(GameBridge).GetField("_w147NpcNewest", fields)!.GetValue(bridge)!;
+        long now = Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency;
+        newest[name] = (1, 0, now - 60_000);
+        var worker = typeof(GameBridge).GetMethod("Wo216RepairOutfitAsync", fields)!;
+        await (Task)worker.Invoke(bridge, [name])!;
+        Assert.Same(target, wanted[name]); // no engine request: this bridge has no connected game
+        newest[name] = (2, Protocol.NpcStateFlagDead, now);
+        await (Task)worker.Invoke(bridge, [name])!;
+        Assert.False(wanted.Contains(name)); // the retained living outfit can no longer rebuild corpse loot
+    }
+
+    [Fact]
+    public async Task Actual_outfit_receiver_refuses_a_predeath_set_after_an_authoritative_death()
+    {
+        var bridge = Joiner();
+        const string name = "outfit_test_npc";
+        const BindingFlags fields = BindingFlags.NonPublic | BindingFlags.Instance;
+        var dead = (ConcurrentDictionary<string, bool>)typeof(GameBridge).GetField("_npcLastDead", fields)!.GetValue(bridge)!;
+        dead[name] = true;
+        var receive = typeof(GameBridge).GetMethod("Wo216OnOutfitAsync", fields)!;
+        await (Task)receive.Invoke(bridge, [new ExtraRow { Name = name, Worn = [Under] }])!;
+        var wanted = (IDictionary)typeof(GameBridge).GetField("_w216OutfitWanted", fields)!.GetValue(bridge)!;
+        Assert.Empty(wanted);
+    }
+
+    private static GameBridge Joiner()
+    {
+        var bridge = new GameBridge(new ClientConfig());
+        const BindingFlags fields = BindingFlags.NonPublic | BindingFlags.Instance;
+        void Set(string field, object value) => typeof(GameBridge).GetField(field, fields)!.SetValue(bridge, value);
+        Set("_combatRoleApplied", true); Set("_isDamageAuthority", false); Set("_sharedWorld", true);
+        Set("_hostAuthority", true); Set("_joinedWorld", true);
+        var where = typeof(GameBridge).GetField("_where", fields)!;
+        where.SetValue(bridge, Enum.Parse(where.FieldType, "World"));
+        return bridge;
     }
 
     [Fact]

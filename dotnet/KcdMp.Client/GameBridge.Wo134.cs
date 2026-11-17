@@ -483,13 +483,19 @@ public partial class GameBridge
         }
     }
 
+    // Captured before Henry publication and embedded in the same hashed block.
+    private string Wo134SnapshotLedgerJson()
+    {
+        lock (_w134Gate) return _w134JoinerLedger.ToJson();
+    }
+
     /// <summary>WO-125: a snapshot was stored -- its chest ledger goes beside it.</summary>
     private void Wo134OnSnapshotStored(HenryStore.Snapshot snap)
     {
         try
         {
             string json;
-            lock (_w134Gate) json = _w134JoinerLedger.ToJson();
+            json = _henry.LoadChestLedger(snap) ?? Wo134SnapshotLedgerJson();
             _henry.StoreChestLedger(snap, json);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -533,13 +539,15 @@ public partial class GameBridge
             tag = t;
             world = _w206.World;
             generation = Interlocked.Read(ref _w134LedgerGeneration);
-            _w134ApplyTag = null;
             stamp = _w134RxStamp;
             // WO-206 E: a host ledger of a world the host has since left (it loaded after sending it) is not applied
-            if (hostIn && !Wo206Admit(Wo206Cat.Loot, stamp, $"the host's chest ledger ({_w134RxLedger!.Entries.Count} entries)")) { _w134RxLedger = null; hostIn = false; }
+            if (!Wo206Admit(Wo206Cat.Loot, stamp, $"the host's chest ledger ({_w134RxLedger!.Entries.Count} entries)")) { _w134RxLedger = null; return; }
+            _w134ApplyTag = null;
             hostLedger = _w134RxLedger ?? new Wo134Rules.Ledger();
             ownLedger = _w134JoinerLedger.Clone();
-            rows = Wo134Rules.JoinRows(hostLedger, ownLedger);
+            // Quest-item creation/removal belongs to the host graph (F6),
+            // never to a private chest correction which the engine refuses.
+            rows = Wo134Rules.JoinRows(hostLedger, ownLedger, _questClasses?.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase));
         }
         if (!hostIn) Console.WriteLine("MP-WO134 chests: the host's ledger did not arrive within 15 s -- only this joiner's own takes are applied");
         var work = new LedgerWork(tag, world, generation, rows, ownLedger.Herbs);
@@ -577,6 +585,7 @@ public partial class GameBridge
                     Interlocked.Exchange(ref _w134GameLedgerEpoch, epoch);
                     work.Calls = Wo134Rules.HerbCalls(work.Herbs, epoch);
                     work.Calls.AddRange(Wo134Rules.ApplyCalls(work.Rows, epoch: epoch, serial: work.Generation));
+                    work.Calls.Add($"if KCD2MP_W134OwnershipReady then KCD2MP_W134OwnershipReady({epoch}) end");
                 }
             }
             while (work.Next < work.Calls.Count)

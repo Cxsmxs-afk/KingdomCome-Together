@@ -18311,7 +18311,18 @@ function W134.installChests()
                 if type(ct[method]) == "function" and ct[method] ~= w.chestWraps[key] then
                     local original = ct[method]
                     local wrapper = function(self, ...)
-                        if W134.chestsRecording() then W134.chestBaseline(self) end
+                        if W134.chestsRecording() then
+                            local isChest, name = W134.isChest(self)
+                            local q = w.ledger
+                            if isChest and w.joiner and (not q or not q.received or q.order[name]) then
+                                if os.clock() - (w.chestWaitToastAt or -1e9) > 5 then
+                                    w.chestWaitToastAt = os.clock()
+                                    KCD2MP_ShowNativeToast("Die Truhe wird vorbereitet. / Preparing your chest.")
+                                end
+                                return false -- never expose a chest before its personal correction
+                            end
+                            W134.chestBaseline(self)
+                        end
                         return original(self, ...)
                     end
                     w.chestWraps[key], ct[method] = wrapper, wrapper
@@ -18330,7 +18341,7 @@ function W134.chestPass()
     if not pp then return end
     local ents = {}
     pcall(function() ents = System.GetEntitiesInSphere(pp, w.chestRadiusM) or {} end)
-    local inReach, seen = {}, {}
+    local inReach, seen, sampled = {}, {}, {}
     for _, e in ipairs(ents) do local name = W134.name(e); if name then inReach[name], seen[name] = true, true end end
     -- Take one final snapshot at screen close / leaving reach. The last click
     -- must not vanish just because movement preceded the next 250-ms pass.
@@ -18345,6 +18356,7 @@ function W134.chestPass()
         if ok then
             local list, known = W134.items(e)
             if known then
+            sampled[name] = true
             local now = W134.counts(list)
             local s = w.chestSess[name]
             if not s then
@@ -18374,7 +18386,7 @@ function W134.chestPass()
             end -- unknown inventory reads keep the previous baseline
         end
     end
-    for name in pairs(w.chestSess) do if not inReach[name] then w.chestSess[name] = nil end end
+    for name in pairs(w.chestSess) do if not inReach[name] and sampled[name] then w.chestSess[name] = nil end end
 end
 
 -- Herbs have a local ledger as well. Record a successful engine gathering,
@@ -18456,7 +18468,7 @@ function W134.ledgerReset(why)
     local w = KCD2MP.w134
     KCD2MP._w134LedgerEpoch = (KCD2MP._w134LedgerEpoch or 0) + 1
     w.ledger = { rows = {}, head = 1, tail = 0, scheduled = false, lastAt = -1e9,
-                 applied = 0, expired = 0, skipped = 0, operations = 0, held = false, epoch = KCD2MP._w134LedgerEpoch, seen = {} }
+                 applied = 0, expired = 0, skipped = 0, operations = 0, held = false, epoch = KCD2MP._w134LedgerEpoch, seen = {}, order = {}, nextId = 0 }
 end
 function KCD2MP_W134LedgerReset(why) W134.ledgerReset(why) end
 function KCD2MP_W134LedgerLinkHold(on)
@@ -18495,11 +18507,22 @@ function KCD2MP_W134ChestApply(rows, epoch, serial, part)
     if key and q.seen[key] then return true end
     for _, r in ipairs(rows or {}) do
         q.tail = q.tail + 1
-        q.rows[q.tail] = { tostring(r[1]), tostring(r[2]), tonumber(r[3]) or 0,
+        q.nextId = q.nextId + 1
+        local name = tostring(r[1])
+        local order = q.order[name] or { head = 1, tail = 0 }
+        q.order[name] = order; order.tail = order.tail + 1; order[order.tail] = q.nextId
+        q.rows[q.tail] = { name, tostring(r[2]), tonumber(r[3]) or 0,
                          tonumber(r[4]) or 1, tonumber(r[5]) or 0, tonumber(r[6]) or 0, 0 }
+        q.rows[q.tail][12] = q.nextId
     end
     if key then q.seen[key] = true end
     W134.ledgerSchedule(q)
+    return true
+end
+function KCD2MP_W134OwnershipReady(epoch)
+    local q = KCD2MP.w134.ledger
+    if not q or tonumber(epoch) ~= q.epoch then return false end
+    q.received = true
     return true
 end
 function W134.ledgerCount(e, cls)
@@ -18525,12 +18548,15 @@ function KCD2MP_W134LedgerDrain()
         local now = W134.worldTime()
         local e = nil
         pcall(function() e = System.GetEntityByName(name) end)
-        local done = true
-        if rd > 0 and now - t > rd * 86400 then q.expired = q.expired + 1
+        local done, deferred = true, false
+        local order = q.order[name]
+        if order and order[order.head] ~= r[12] then
+            q.tail = q.tail + 1; q.rows[q.tail] = r; deferred = true
+        elseif rd > 0 and now - t > rd * 86400 then q.expired = q.expired + 1
         elseif not e then
             -- Containers outside streaming range are still owned. Retain their
             -- ordered rows until the player reaches them instead of dropping them.
-            q.tail = q.tail + 1; q.rows[q.tail] = r
+            q.tail = q.tail + 1; q.rows[q.tail] = r; deferred = true
         elseif not W134.isChest(e) or delta == 0 then q.skipped = q.skipped + 1
         elseif KCD2MP_W201InvBusy and KCD2MP_W201InvBusy(name) then break -- retry FIFO after this screen closes
         else
@@ -18565,7 +18591,13 @@ function KCD2MP_W134LedgerDrain()
             w.chestSess[name] = nil -- a ledger edit is not a player's take
         end
         operations = operations + 1
-        if done then q.rows[q.head] = nil; q.head = q.head + 1 end
+        if done then
+            if not deferred and order then
+                order[order.head] = nil; order.head = order.head + 1
+                if order.head > order.tail then q.order[name] = nil end
+            end
+            q.rows[q.head] = nil; q.head = q.head + 1
+        end
     end
     q.operations = q.operations + operations
     if q.head > q.tail then
@@ -35981,6 +36013,19 @@ do
         if not KCD2MP_W216On("outfits") then return false end
         local e = System.GetEntityByName(tostring(name))
         if not (e and e.inventory and e.actor) then return false end
+        -- The outfit audit may have been queued before death, stream release or
+        -- a loot list. Those inventories have their own writer; never recreate
+        -- a garment that was just taken from a corpse or under an open screen.
+        local p = KCD2MP.npcPuppets and KCD2MP.npcPuppets[name]
+        if not p or p.dead or p.deadHint then return false end
+        if KCD2MP_NpcSilenceRelease and KCD2MP_NpcSilenceRelease(name, p, os.clock()) then return false end
+        local known, dead = pcall(function() return e.actor:IsDead() end)
+        if not known or (dead ~= false and dead ~= 0) then return false end
+        if KCD2MP_W201InvBusy and KCD2MP_W201InvBusy(name) then return false end
+        local loot = W217 and W217.L
+        local body = KCD2MP.w134
+        if (loot and ((loot.sess or {})[name] or (loot.partial or {})[name]))
+            or (body and ((body.pendingOpen or {})[name] or (body.stash or {})[name] or (body.sessions or {})[name])) then return false end
         local D = W216.dress
         D.calls = D.calls + 1
         local off, askedOff = 0, 0

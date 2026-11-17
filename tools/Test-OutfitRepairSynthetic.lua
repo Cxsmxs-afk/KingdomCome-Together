@@ -125,7 +125,8 @@ function BasicAIActions:OnPickpocketing(user, slot) LOOTS[#LOOTS + 1] = "pp:" ..
 local RESULTS = {}
 local function check(name, ok) RESULTS[#RESULTS + 1] = (ok and "PASS  " or "FAIL  ") .. name end
 local equipped, owned, calls = {}, {}, {}
-local entity = { inventory = {}, actor = {} }
+local entity = { inventory = {}, actor = {}, dead = false }
+function entity.actor:IsDead() return entity.dead end
 function entity.inventory:FindItem(cls) return owned[cls] and cls or nil end
 function entity.inventory:CreateItem(cls) owned[cls] = true end
 function entity.actor:UnequipInventoryItem(cls) calls[#calls + 1] = 'off:' .. cls; equipped[cls] = nil end
@@ -135,6 +136,7 @@ function entity.actor:EquipInventoryItem(cls)
     equipped[cls] = true
 end
 ENTS.outfit_test_npc = entity
+KCD2MP.npcPuppets.outfit_test_npc = { lastPacketAt = NOW, dead = false }
 owned = { under = true, outer = true, extra = true }; equipped = { outer = true, extra = true }; calls = {}
 KCD2MP_W216Dress('outfit_test_npc', 'under,outer', 'extra')
 check('F5 removes the wrong slot occupant before equipping the entire layered host set', calls[1] == 'off:extra' and calls[2] == 'on:under' and calls[3] == 'on:outer')
@@ -146,4 +148,22 @@ owned = {}; equipped = {}; calls = {}
 KCD2MP_W216Dress('outfit_test_npc', 'under,outer', '')
 check('F5 created pieces participate in the same complete layered pass', owned.under and owned.outer and equipped.under and equipped.outer)
 check('F5 unavailable copy does not masquerade as a successful repair', KCD2MP_W216Dress('absent_outfit_npc', 'under,outer', '') == false)
+-- The queued audit must not become a second inventory writer after a death
+-- or while the live-loot transaction owns this body.
+owned = {}; equipped = {}; calls = {}; entity.dead = true
+check('F5 queued old outfit never recreates looted corpse pieces', KCD2MP_W216Dress('outfit_test_npc', 'under,outer', '') == false and next(owned) == nil and #calls == 0)
+entity.dead = false; KCD2MP.npcPuppets.outfit_test_npc.dead = true
+check('F5 authoritative dead stream vetoes a copy still reading alive locally', KCD2MP_W216Dress('outfit_test_npc', 'under,outer', '') == false and next(owned) == nil)
+KCD2MP.npcPuppets.outfit_test_npc.dead = false; entity.dead = nil
+check('F5 unreadable death state never blindly creates items', KCD2MP_W216Dress('outfit_test_npc', 'under,outer', '') == false and next(owned) == nil)
+entity.dead = false; KCD2MP.npcPuppets.outfit_test_npc = nil
+check('F5 inactive unstreamed body is not dressed from an old target', KCD2MP_W216Dress('outfit_test_npc', 'under,outer', '') == false and next(owned) == nil)
+KCD2MP.npcPuppets.outfit_test_npc = { lastPacketAt = NOW - 60, dead = false }
+check('F5 released silent stream does not recreate the old target', KCD2MP_W216Dress('outfit_test_npc', 'under,outer', '') == false and next(owned) == nil)
+KCD2MP.npcPuppets.outfit_test_npc.lastPacketAt = NOW
+W217.L.sess.outfit_test_npc = { rev = 4 }
+check('F5 full live-loot inventory stays the sole writer even when the copy is alive', KCD2MP_W216Dress('outfit_test_npc', 'under,outer', '') == false and next(owned) == nil and #calls == 0)
+W217.L.sess.outfit_test_npc = nil
+KCD2MP_W216Dress('outfit_test_npc', 'under,outer', '')
+check('F5 active known-alive copy resumes full repair after inventory ownership ends', owned.under and owned.outer and equipped.under and equipped.outer)
 OUT = table.concat(RESULTS, "\n")

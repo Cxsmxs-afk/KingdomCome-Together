@@ -116,6 +116,35 @@ public class FacialFallbackTests
     }
 
     [Fact]
+    public void Runtime_localization_run_changes_do_not_invalidate_source_evidence()
+    {
+        using var f = new Installation(); string loc = Path.Combine(f.Mod, "Localization"); Directory.CreateDirectory(loc);
+        string oldName = Path.Combine(loc, "kct_n_20261117-115900_r0.xml"); File.WriteAllText(oldName, "old player");
+        string conversation = Path.Combine(loc, "kct_conv.xml"); File.WriteAllText(conversation, "old prompt");
+        f.Prepare();
+        File.Delete(oldName); File.WriteAllText(Path.Combine(loc, "kct_n_20261117-120010_p3.xml"), "new player");
+        File.WriteAllText(conversation, "new prompt");
+        f.Log(f.Now.AddSeconds(10), Warning());
+        var r = f.Prepare(20); Assert.True(r.Ok); Assert.Equal("generated", r.Action); Assert.Equal(2, r.References);
+        File.WriteAllText(Path.Combine(loc, "kct_n_unknown_b1.xml"), "next player");
+        File.WriteAllText(conversation, "next prompt");
+        f.Log(f.Now.AddSeconds(30), "clean patched run"); Assert.Equal("unchanged", f.Prepare(40).Action);
+    }
+
+    [Theory]
+    [InlineData("kdcmp", "Localization", "other.xml")]
+    [InlineData("kdcmp", "Localization", "kct_n_not-a-generated-name.xml")]
+    [InlineData("kdcmp", "Data", "kct_conv.xml")]
+    [InlineData("other", "Localization", "kct_conv.xml")]
+    public void Runtime_localization_exception_does_not_exclude_other_xml_or_other_paths(string mod, string folder, string file)
+    {
+        using var f = new Installation(); f.Generate();
+        string path = Path.Combine(f.Root, "Mods", mod, folder, file); Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, "possible asset change");
+        Assert.Equal("removed", f.Prepare(30).Action); Assert.False(File.Exists(f.Pak));
+    }
+
+    [Fact]
     public void Unknown_current_schema_disables_override_and_preserves_original_archive()
     {
         using var f = new Installation(); f.SourceAdb(Adb.Replace("<FragmentList>", "<Unexpected/><FragmentList>"));
@@ -160,6 +189,20 @@ public class FacialFallbackTests
         using var f = new Installation(); f.Generate(); f.SourceAdb(Adb.Replace("sleep+male", "updated-tag"));
         using var locked = new FileStream(f.Pak, FileMode.Open, FileAccess.Read, FileShare.Read);
         var r = f.Prepare(30); Assert.False(r.Ok); Assert.True(r.BlocksLaunch); Assert.Equal("blocked", r.Action);
+    }
+
+    [Fact]
+    public void Windows_exclusively_locked_stale_override_blocks_without_mutating_output_or_provenance()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var f = new Installation(); f.Generate(); f.SourceAdb(Adb.Replace("sleep+male", "updated-tag"));
+        byte[] pak = File.ReadAllBytes(f.Pak), state = File.ReadAllBytes(f.State);
+        using (var locked = new FileStream(f.Pak, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            var r = f.Prepare(30); Assert.False(r.Ok); Assert.True(r.BlocksLaunch); Assert.Equal("blocked", r.Action);
+            Assert.Equal(state, File.ReadAllBytes(f.State));
+        }
+        Assert.Equal(pak, File.ReadAllBytes(f.Pak)); Assert.Equal(state, File.ReadAllBytes(f.State));
     }
 
     [Fact]

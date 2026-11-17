@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
 using KcdMp.Wire;
 
@@ -124,7 +125,7 @@ public partial class GameBridge
     private Task Wo216OnOutfitAsync(ExtraRow r)
     {
         Interlocked.Increment(ref _w216OutfitsIn);
-        if (!W137Joiner || !W216On("outfits")) return Task.CompletedTask;
+        if (!W137Joiner || !W216On("outfits") || Wo216OutfitDead(r.Name)) return Task.CompletedTask;
         _w216OutfitWanted[r.Name] = new(r.Worn.Select(b => b.ToArray()).ToList(), _w206.World, Interlocked.Read(ref _npcDeathLife));
         _ = Task.Run(() => Wo216RepairOutfitAsync(r.Name));
         return Task.CompletedTask;
@@ -147,6 +148,18 @@ public partial class GameBridge
         }
     }
 
+    // Outfit records are changes, not leases. Keep a quiet target for the next
+    // active stream, but never dress a corpse from a record received before loot.
+    private bool Wo216OutfitDead(string name) =>
+        (_npcLastDead.TryGetValue(name, out bool dead) && dead)
+        || _npcDeathAppliedUtc.ContainsKey(name) || _w195Dead.ContainsKey(name) || _w217CorpseWant.ContainsKey(name)
+        || (_w147NpcNewest.TryGetValue(name, out var newest) && (newest.Flags & Protocol.NpcStateFlagDead) != 0);
+
+    private bool Wo216OutfitActive(string name) => _where == GameWhere.World && !Wo136Holding
+        && _w147NpcNewest.TryGetValue(name, out var newest)
+        && W147StampMs(Stopwatch.GetTimestamp()) - newest.AtMs <= Wo214SilenceReleaseMs(name)
+        && !_w147SilentSent.ContainsKey(name);
+
     private async Task Wo216RepairOutfitAsync(string name)
     {
         var gate = _w216OutfitGates.GetOrAdd(name, _ => new SemaphoreSlim(1, 1));
@@ -155,14 +168,16 @@ public partial class GameBridge
         {
             while (_w216OutfitWanted.TryGetValue(name, out var target))
             {
-                bool Current() => W137Joiner && W216On("outfits") && _w206.World == target.World
+                bool Valid() => W137Joiner && W216On("outfits") && _w206.World == target.World
                     && Interlocked.Read(ref _npcDeathLife) == target.Life
                     && _w216OutfitWanted.TryGetValue(name, out var wanted) && ReferenceEquals(wanted, target);
-                if (!Current())
+                bool Current() => Valid() && !Wo216OutfitDead(name) && Wo216OutfitActive(name);
+                if (!Valid() || Wo216OutfitDead(name))
                 {
                     ((ICollection<KeyValuePair<string, OutfitTarget>>)_w216OutfitWanted).Remove(new(name, target));
                     continue;
                 }
+                if (!Wo216OutfitActive(name)) { target.NextAuditMs = Environment.TickCount64 + 5000; return; }
                 var ordered = (await Wo144InLayerOrderAsync(target.Worn.Select(b => new Guid(b)))).Select(g => g.ToByteArray()).ToList();
                 var result = await OutfitRepair.ConvergeAsync(ordered, () => Wo216OutfitOfAsync(name), async plan =>
                 {
@@ -176,11 +191,12 @@ public partial class GameBridge
                 Interlocked.Add(ref _w216DressMissing, result.Missing);
                 Interlocked.Add(ref _w216DressExtra, result.Extra);
                 Console.WriteLine($"MP-W216 outfit npc={name} full_set={ordered.Count} worn_known={B(result.Known)} classes_match={B(result.Converged)} missing={result.Missing} extra={result.Extra} applies={result.Applies}");
-                if (!Current())
+                if (!Valid() || Wo216OutfitDead(name))
                 {
                     ((ICollection<KeyValuePair<string, OutfitTarget>>)_w216OutfitWanted).Remove(new(name, target));
                     continue;
                 }
+                if (!Wo216OutfitActive(name)) { target.NextAuditMs = Environment.TickCount64 + 5000; return; }
                 target.NextAuditMs = Environment.TickCount64 + (result.Converged ? 30000 : 5000);
                 return; // keep even matched targets: class equality cannot prove that the equipment slots stayed correct
             }

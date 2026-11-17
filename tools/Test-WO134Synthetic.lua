@@ -651,6 +651,48 @@ loop()
 check("E first and last chest click is recorded across reach exit", #events("w134_chest")==1 and events("w134_chest")[1]:find(DICE.." 1 ",1,true)~=nil)
 Stash=nil; player.GetWorldPos=function() return {x=100,y=100,z=10} end
 
+-- Review E: more than one frame of missing rows may not invert + / - for
+-- one container when it streams between slices.
+world(); asJoiner()
+local orderedRows={{"stash[Chest/ordered]",DICE,1,1,WORLD_T,0}}
+for i=1,7 do orderedRows[#orderedRows+1]={"stash[Chest/missing"..i.."]",APPLE,1,1,WORLD_T,0} end
+orderedRows[#orderedRows+1]={"stash[Chest/ordered]",DICE,-1,1,WORLD_T,0}
+KCD2MP_W134ChestApply(orderedRows); NOW=NOW+0.051; drain()
+local ordered=mkChest("stash[Chest/ordered]","Stash",101,100,10,0)
+for i=1,5 do NOW=NOW+0.051; drain() end
+check("E deferred rows preserve container order across frame budgets", ordered.inventory:GetCountOfClass(DICE)==0 and KCD2MP.w134.ledger.order["stash[Chest/ordered]"]==nil)
+
+world(); asHost(0)
+local lastReadChest=mkChest("stash[Chest/lastread]","Stash",101,100,10,0)
+lastReadChest.inventory:CreateItem(DICE,1,2); loop()
+lastReadChest.inventory:DeleteItem(lastReadChest.inventory.list[1],1)
+local lastRead=lastReadChest.inventory.GetInventoryTable
+lastReadChest.inventory.GetInventoryTable=function() error("intentional final chest read") end
+player.GetWorldPos=function() return {x=200,y=200,z=10} end
+LOG={};loop()
+check("E unknown final read retains chest baseline", KCD2MP.w134.chestSess["stash[Chest/lastread]"]~=nil and #events("w134_chest")==0)
+lastReadChest.inventory.GetInventoryTable=lastRead;loop()
+check("E final chest read recovery records the actual take", #events("w134_chest")==1)
+player.GetWorldPos=function() return {x=100,y=100,z=10} end
+for i=#ERRS,1,-1 do if tostring(ERRS[i]):find("intentional final chest read",1,true) then table.remove(ERRS,i) end end
+
+-- A player must never get an uncorrected chest while the paired ownership
+-- data is still in transit or the row for this chest still waits in the budget.
+world(); asJoiner()
+local opens=0
+Stash={OnUsed=function() opens=opens+1;return true end}
+KCD2MP_W134Tick(true,false,true,1);TIMERS={}
+local readyChest=mkChest("stash[Chest/ready]","Stash",101,100,10,0)
+check("E chest waits for the complete ownership input", Stash.OnUsed(readyChest,player)==false and opens==0)
+local ownershipEpoch=KCD2MP.w134.ledger.epoch
+KCD2MP_W134ChestApply({{"stash[Chest/ready]",DICE,1,1,WORLD_T,0}})
+KCD2MP_W134OwnershipReady(ownershipEpoch)
+check("E chest still waits for its own deferred correction", Stash.OnUsed(readyChest,player)==false and opens==0)
+NOW=NOW+0.051;drain()
+check("E corrected private chest opens normally", Stash.OnUsed(readyChest,player)==true and opens==1 and readyChest.inventory:GetCountOfClass(DICE)==1)
+check("E stale ownership completion cannot release a new world", KCD2MP_W134OwnershipReady(ownershipEpoch-1)==false)
+Stash=nil
+
 -- E: actual Gather wrapper -> confirmed inventory delta -> durable event;
 -- restore only this player's patch records, including stale epoch rejection.
 world(); asJoiner(); WORLD_T=1000

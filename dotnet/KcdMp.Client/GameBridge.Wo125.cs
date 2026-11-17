@@ -750,7 +750,7 @@ public partial class GameBridge
         try
         {
             parts.Origin = WhsSave.HenryParts.OriginSnapshot;
-            var joinSnap = _henry.Store(tag, parts, Convert.ToHexString(offerMd5), mode == "restore" ? HenryStore.SourceJoin : mode, $"the join save (seq {seq})");
+            var joinSnap = _henry.Store(tag, parts, Convert.ToHexString(offerMd5), mode == "restore" ? HenryStore.SourceJoin : mode, $"the join save (seq {seq})", lootLedgerJson: Wo134SnapshotLedgerJson());
             Wo134OnSnapshotStored(joinSnap);   // WO-134: the chest ledger pairs with it
             _henry.MarkJoined(tag);
             Wo157ClaimJoinedWorld(tag);   // WO-157: this folder is this host's world from now on

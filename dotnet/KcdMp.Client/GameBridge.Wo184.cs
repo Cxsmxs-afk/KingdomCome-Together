@@ -462,7 +462,7 @@ public partial class GameBridge
         {
             // WO-184: a snapshot taken later than the host's save pairs with it all the same (the late rule: "a late snapshot pairs with the
             // newest host save it follows", accepted by the maintainer) -- WO-125's 3 s rejection is gone: it lost a pair for a slow request
-            var snap = _henry.Store(_joinedTag!, parts!, md5, HenryStore.SourceSnapshot, $"host {Protocol.SaveKindName(w.Kind)} playline{w.Playline}/{w.FileName} seq={w.Seq} ({purpose})");
+            var snap = _henry.Store(_joinedTag!, parts!, md5, HenryStore.SourceSnapshot, $"host {Protocol.SaveKindName(w.Kind)} playline{w.Playline}/{w.FileName} seq={w.Seq} ({purpose})", lootLedgerJson: Wo134SnapshotLedgerJson());
             Wo134OnSnapshotStored(snap);   // WO-134: the chest ledger pairs with it
             Interlocked.Increment(ref _w184Paired);
             _w184Health.Paired(w.Seq);

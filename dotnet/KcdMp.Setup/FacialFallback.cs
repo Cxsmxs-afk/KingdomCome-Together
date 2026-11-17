@@ -33,6 +33,8 @@ public static class FacialFallback
         RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
     private static readonly Regex RunStart = new(@"^Log Started at (?<time>\d{4}-\d{2}-\d{2}  \d{2}:\d{2}:\d{2})\s*$",
         RegexOptions.Multiline | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+    private static readonly Regex RuntimeNames = new(@"^kct_n_(?:[0-9]{8}-[0-9]{6}|unknown)_[rpbg][0-3]\.xml$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
     public sealed record Outcome(bool Ok, string Action, int Databases, int References, string Detail, bool BlocksLaunch = false);
     private sealed record State(string Installation, string Fingerprint, DateTime PreparedUtc, string LogHash,
@@ -49,7 +51,10 @@ public static class FacialFallback
         {
             if (!Directory.Exists(modDir)) return new(false, "skipped", 0, 0, "mod folder is absent");
             // A name alone does not authorize overwriting another mod's file.
-            bool foreignPak = File.Exists(pak) && !OwnedPak(pak);
+            var pakKind = InspectPak(pak);
+            if (pakKind == PakKind.Unreadable)
+                return new(false, "blocked", 0, 0, "existing override cannot be inspected; close the game and check file access", true);
+            bool foreignPak = pakKind == PakKind.Foreign;
             if (foreignPak || (File.Exists(statePath) && !OwnedXml(statePath)))
             {
                 if (!foreignPak) DeleteOwnedPak(pak); // a foreign state cannot certify our old override
@@ -107,8 +112,8 @@ public static class FacialFallback
         {
             // A stale delta must not outlive the source/schema proof. Only our marked files may be removed.
             try { DeleteOwnedPak(pak); if (OwnedXml(statePath)) File.Delete(statePath); } catch { }
-            if (File.Exists(pak) && OwnedPak(pak))
-                return new(false, "blocked", 0, 0, "unverified owned override could not be removed; close the game and check file access", true);
+            if (InspectPak(pak) is PakKind.Owned or PakKind.Unreadable)
+                return new(false, "blocked", 0, 0, "unverified override could not be inspected or removed; close the game and check file access", true);
             return new(false, "disabled", 0, 0, $"validation failed ({ex.GetType().Name}); no facial fallback certified");
         }
     }
@@ -195,7 +200,8 @@ public static class FacialFallback
             foreach (string path in Directory.EnumerateFiles(facials, "*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint })
                          .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)) Stamp(path);
         // Another mod may repair an animation alias without changing a base archive. Discard the old
-        // evidence then too. Exclude only our output/provenance and the proven config-only keys pak.
+        // evidence then too. Exclude only our output/provenance, config-only keys pak and the two
+        // known runtime localization producers (WO171 hover names and WO203 conversation prompt).
         string mods = Path.Combine(root, "Mods");
         var generated = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -204,10 +210,15 @@ public static class FacialFallback
         };
         if (Directory.Exists(mods))
             foreach (string path in Directory.EnumerateFiles(mods, "*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint })
-                         .Where(p => !generated.Contains(Path.GetFullPath(p))).OrderBy(p => p, StringComparer.OrdinalIgnoreCase)) Stamp(path);
+                         .Where(p => !generated.Contains(Path.GetFullPath(p)) && !RuntimeLocalization(modDir, p))
+                         .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)) Stamp(path);
         return Hash(Encoding.UTF8.GetBytes(b.ToString()));
         void Stamp(string path) { var f = new FileInfo(path); b.Append(Path.GetRelativePath(root, path)).Append('|').Append(f.Length).Append('|').Append(f.LastWriteTimeUtc.Ticks).Append('\n'); }
     }
+
+    private static bool RuntimeLocalization(string modDir, string path) =>
+        string.Equals(Path.GetDirectoryName(Path.GetFullPath(path)), Path.GetFullPath(Path.Combine(modDir, "Localization")), StringComparison.OrdinalIgnoreCase) &&
+        (string.Equals(Path.GetFileName(path), "kct_conv.xml", StringComparison.OrdinalIgnoreCase) || RuntimeNames.IsMatch(Path.GetFileName(path)));
 
     private static (string? Text, string Hash, DateTime WrittenUtc) ReadLog(string root)
     {
@@ -253,12 +264,32 @@ public static class FacialFallback
     private static string Hash(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes));
     private static bool IsOwned(XDocument doc) => doc.Root?.Name == "FacialFallback" && (string?)doc.Root.Attribute("Owner") == Owner && (string?)doc.Root.Attribute("Version") == "1";
     private static bool OwnedXml(string path) { try { return new FileInfo(path).Length < MaxXml && IsOwned(ReadXml(File.ReadAllBytes(path))); } catch { return false; } }
-    private static bool OwnedPak(string path)
+    private enum PakKind { Missing, Owned, Foreign, Unreadable }
+    private static PakKind InspectPak(string path)
     {
-        try { using var zip = ZipFile.OpenRead(path); var e = zip.GetEntry(Marker); if (e is null || e.Length > MaxXml) return false;
-            using var s = e.Open(); using var m = new MemoryStream(); s.CopyTo(m); return IsOwned(ReadXml(m.ToArray())); } catch { return false; }
+        FileStream file;
+        try { file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read); }
+        catch (FileNotFoundException) { return PakKind.Missing; }
+        catch (DirectoryNotFoundException) { return PakKind.Missing; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return PakKind.Unreadable; }
+        using (file)
+        try
+        {
+            using var zip = new ZipArchive(file, ZipArchiveMode.Read);
+            var e = zip.GetEntry(Marker); if (e is null || e.Length > MaxXml) return PakKind.Foreign;
+            using var s = e.Open(); using var m = new MemoryStream(); s.CopyTo(m);
+            return IsOwned(ReadXml(m.ToArray())) ? PakKind.Owned : PakKind.Foreign;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or XmlException or ArgumentException) { return PakKind.Foreign; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return PakKind.Unreadable; }
     }
-    private static bool DeleteOwnedPak(string path) { if (!File.Exists(path) || !OwnedPak(path)) return false; File.Delete(path); return true; }
+    private static bool DeleteOwnedPak(string path)
+    {
+        var kind = InspectPak(path);
+        if (kind == PakKind.Unreadable) throw new IOException("existing override cannot be inspected");
+        if (kind != PakKind.Owned) return false;
+        File.Delete(path); return true;
+    }
 
     private static State ReadState(string path)
     {

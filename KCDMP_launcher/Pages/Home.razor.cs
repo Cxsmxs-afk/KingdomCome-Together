@@ -510,7 +510,7 @@ namespace KCDMP_launcher.Pages
                 // F4: inspect this installation's previous run before history or the game replaces its log.
                 if (!await PrepareFacialFallbackAsync(GameRootOf(settings.GamePath)))
                 {
-                    UiService.ShowError("Der vorhandene Facial-Patch konnte nicht sicher geprüft oder entfernt werden. Schließe das Spiel und prüfe die Schreibrechte im Mod-Ordner vor dem nächsten Start.");
+                    UiService.ShowError("Der vorhandene Facial-Patch konnte nicht sicher geprüft oder entfernt werden. Schließe das Spiel und prüfe die Schreibrechte im Mod-Ordner vor dem nächsten Start.\n\nThe existing facial patch could not be verified or removed. Close the game and check write access to the mod folder before launching again.");
                     return;
                 }
                 // WO-144: the previous launch's logs are kept before the game starts over them
