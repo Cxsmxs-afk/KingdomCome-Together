@@ -24862,7 +24862,10 @@ do
     --   WO200-QITEM differs class=<guid> host=<n> here=<m> | pending class=<guid> ... | agreed again class=<guid>
     W200.q = W200.q or { set = {}, n = 0, last = {}, localAt = {}, fullAt = -1000, primed = false, differs = {},
                          stats = { reported = 0, agreed = 0, differs = 0, pending = 0 } }
-    function KCD2MP_W200QClassReset() W200.q.set, W200.q.n, W200.q.last, W200.q.primed = {}, 0, {}, false end
+    function KCD2MP_W200QClassReset()
+        local q = W200.q
+        q.set, q.n, q.last, q.primed, q.localAt, q.differs, q.unread, q.fullAt = {}, 0, {}, false, {}, {}, {}, -1000
+    end
     function KCD2MP_W200QClassAdd(list)
         local q = W200.q
         for g in string.gmatch(tostring(list or ""), "[%x%-]+") do
@@ -24870,26 +24873,26 @@ do
         end
     end
     local function w200QCount(g)
-        local c = 0
-        pcall(function() c = tonumber(player.inventory:GetCountOfClass(g)) or 0 end)
+        local ok, c = pcall(function() return tonumber(player.inventory:GetCountOfClass(g)) end)
+        if not ok or c == nil or c < 0 then return nil end
         return c
     end
     -- every 3 s (the agent's loop): the host reports the classes whose count changed (and all it holds every 60 s, for a late joiner);
     -- the joiner notes when his own count changed (a change his own conversation made is "pending" while its replay may be confirmed)
-    function KCD2MP_W200QItemsTick(isHost)
+    function KCD2MP_W200QItemsTick(isHost, forceFull)
         local q = W200.q
         if q.n == 0 or not KCD2MP_W200On("qitem_mirror") or not (player and player.inventory) then return end
         local now = os.clock()
-        local full = isHost and (now - q.fullAt) >= 60
+        local full = isHost and (forceFull == true or (now - q.fullAt) >= 60)
         if full then q.fullAt = now end
         local out = {}
         for g in pairs(q.set) do
             local c = w200QCount(g)
             local was = q.last[g] or 0
-            if c ~= was then
+            if c ~= nil and c ~= was then
                 q.last[g] = c
                 if isHost then out[#out + 1] = g .. ":" .. c elseif q.primed then q.localAt[g] = now end
-            elseif full and c > 0 then
+            elseif full and c ~= nil then
                 out[#out + 1] = g .. ":" .. c
             end
         end
@@ -24906,6 +24909,13 @@ do
         if not KCD2MP_W200On("qitem_mirror") or not (player and player.inventory) then return end
         count = tonumber(count) or 0
         local have = w200QCount(g)
+        if have == nil then
+            q.unread = q.unread or {}
+            if not q.unread[g] then mp_log(string.format("WO200-QITEM unread class=%s -- inventory count unavailable, never treated as zero", g)) end
+            q.unread[g] = true
+            return
+        end
+        if q.unread then q.unread[g] = nil end
         q.last[g] = have
         if have == count then
             q.stats.agreed = q.stats.agreed + 1
