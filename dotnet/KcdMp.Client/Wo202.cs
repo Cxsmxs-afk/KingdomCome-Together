@@ -271,6 +271,34 @@ public static class Wo202Rules
         return null;
     }
 
+    /// <summary>
+    /// A queue this far behind is no longer "a little late": events older than this are dropped so the newest
+    /// state is applied now. Deaths, session and inventory one-shots are kept (they are not a position stream).
+    /// </summary>
+    public const int LatencySnapMs = 2000;
+
+    /// <summary>True when this frame should be skipped because the processor is already seconds behind and the frame itself is that old.</summary>
+    public static bool DropStaleEvent(int type, long queueLagMs, long frameAgeMs) =>
+        queueLagMs >= LatencySnapMs && frameAgeMs >= LatencySnapMs && !KeepWhenBehind(type);
+
+    /// <summary>One-shots that still have to land even when the queue is catching up. Position streams are kept because they are already the newest sample.</summary>
+    public static bool KeepWhenBehind(int type) => type is
+        KcdMp.Wire.Protocol.Ghost or KcdMp.Wire.Protocol.NpcStateDown or KcdMp.Wire.Protocol.NpcStateUp or KcdMp.Wire.Protocol.Position
+        or KcdMp.Wire.Protocol.DeathDown or KcdMp.Wire.Protocol.DeathUp
+        or KcdMp.Wire.Protocol.PlayerDeathDown or KcdMp.Wire.Protocol.PlayerDeathUp
+        or KcdMp.Wire.Protocol.PlayerRespawnedDown or KcdMp.Wire.Protocol.PlayerRespawnedUp
+        or KcdMp.Wire.Protocol.GraveAddDown or KcdMp.Wire.Protocol.GraveAddUp
+        or KcdMp.Wire.Protocol.GraveRemoveDown or KcdMp.Wire.Protocol.GraveRemoveUp
+        or KcdMp.Wire.Protocol.SessionStart or KcdMp.Wire.Protocol.SessionEnd or KcdMp.Wire.Protocol.SessionLeave
+        or KcdMp.Wire.Protocol.SessionEventDown or KcdMp.Wire.Protocol.SessionEventUp
+        or KcdMp.Wire.Protocol.ItemDropDown or KcdMp.Wire.Protocol.ItemDropUp
+        or KcdMp.Wire.Protocol.ItemClaimDown or KcdMp.Wire.Protocol.ItemClaimUp
+        or KcdMp.Wire.Protocol.TimeSkipDown or KcdMp.Wire.Protocol.TimeSkipUp
+        or KcdMp.Wire.Protocol.PauseDown or KcdMp.Wire.Protocol.PauseUp
+        or KcdMp.Wire.Protocol.Disconnect or KcdMp.Wire.Protocol.Handshake
+        or KcdMp.Wire.Protocol.DamageDown or KcdMp.Wire.Protocol.DamageUp
+        or KcdMp.Wire.Protocol.NpcDamageDown or KcdMp.Wire.Protocol.NpcDamageUp;
+
     // ---- III.3 rejoin_recover (joiner) ----
     public const int RejoinTries = 3;
     public const uint RejoinPromptId = 9202;   // the F11/F12 prompt's id (WO-140's prompt, its answer routed here)

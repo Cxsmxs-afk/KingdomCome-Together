@@ -56,6 +56,30 @@ public partial class GameBridge
         return false;
     }
 
+    private long _latDropN, _latToldMs;
+
+    /// <summary>
+    /// The processor is seconds behind the reader. Say so (MP-DESYNC kind=latency), and skip an event that is
+    /// itself that old. State, deaths and the other one-shots in <see cref="Wo202Rules.KeepWhenBehind"/> stay.
+    /// </summary>
+    private bool WoLatencyDrop(in InFrame frame)
+    {
+        if (frame.Arrival <= 0) return false;
+        long now = W147StampMs(Stopwatch.GetTimestamp());
+        long age = Math.Max(0, now - W147StampMs(frame.Arrival));
+        long lag = Wo202QueueLagMs();
+        if (lag < Wo202Rules.LatencySnapMs) return false;
+        long told = Environment.TickCount64;
+        if (told - _latToldMs >= 2000)
+        {
+            _latToldMs = told;
+            Console.WriteLine($"MP-DESYNC kind=latency delay_ms={lag} frame_age_ms={age} dropped_events={Interlocked.Read(ref _latDropN)}");
+        }
+        if (!Wo202Rules.DropStaleEvent(frame.Type, lag, age)) return false;
+        Interlocked.Increment(ref _latDropN);
+        return true;
+    }
+
     /// <summary>How far behind the reader the frame processor is right now (ms; 0 when it keeps up).</summary>
     private long Wo202QueueLagMs()
     {

@@ -4788,6 +4788,7 @@ public partial class GameBridge(ClientConfig config)
                     if (Wo140DropSeparate(frame.Type)) continue;   // WO-140: nothing of the host's world reaches a joiner in its own
                     if (Wo206DropStale(frame)) continue;   // WO-206 E: a world write from an older world epoch (a load since it was sent)
                     if (Wo207DropStale(frame)) continue;   // WO-207 B.2: a combat moment already older than its use, dropped before any handler
+                    if (WoLatencyDrop(frame)) continue;    // a multi-second backlog: this event is already too old to apply in order
                     int type       = frame.Type;
                     var payload    = frame.Payload;
                     int payloadLen = payload.Length;

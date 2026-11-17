@@ -95,6 +95,10 @@ public sealed class BatchQueue
     public int MaxEntries { get; init; } = 256;
     public long LevelTtlMs { get; init; } = 15_000;
     public long EdgeTtlMs { get; init; } = 120_000;
+    /// <summary>When the oldest waiting statement is at least this old, the newest state jumps the queue and ancient one-shots are shed.</summary>
+    public long CatchUpLagMs { get; init; } = 1000;
+    /// <summary>An edge or a stale relay older than this is dropped once the queue is already in catch-up (it would only run seconds late).</summary>
+    public long EdgeSnapMs { get; init; } = 2000;
 
     private readonly LinkedList<Entry> _q = new();
     private readonly Dictionary<string, LinkedListNode<Entry>> _byKey = new(StringComparer.Ordinal);
@@ -124,6 +128,15 @@ public sealed class BatchQueue
     public long StaleDropped { get; private set; }
     /// <summary>Statements that went back in front of the queue after a batch got no answer.</summary>
     public long Requeued { get; private set; }
+    /// <summary>Level statements pulled to the front because the queue was already a second or more behind.</summary>
+    public long Snapped { get; private set; }
+    /// <summary>Edges and stale relays dropped because they were already seconds old when the queue caught up.</summary>
+    public long EdgesShed { get; private set; }
+    /// <summary>Age of the oldest statement at the last <see cref="TakeBatch"/> (0 when the queue was empty).</summary>
+    public long LastLagMs { get; private set; }
+
+    /// <summary>How old the oldest waiting statement is (0 when nothing waits).</summary>
+    public long LagMs(long nowMs) => _q.First is { } n ? Math.Max(0, nowMs - n.Value.EnqueuedMs) : 0;
 
     public void Add(Entry e)
     {
@@ -142,6 +155,7 @@ public sealed class BatchQueue
     public List<Entry> TakeBatch(int budgetEncoded, long nowMs)
     {
         Purge(nowMs);
+        CatchUp(nowMs);
         var batch = new List<Entry>();
         int used = 0;
         while (_q.First is { } n)
@@ -194,6 +208,47 @@ public sealed class BatchQueue
             if (nowMs - n.Value.EnqueuedMs > ttl) { Remove(n); Expired++; }
             n = next;
         }
+    }
+
+    /// <summary>
+    /// A queue whose oldest statement is already <see cref="CatchUpLagMs"/> behind does not keep playing that past.
+    /// One-shots older than <see cref="EdgeSnapMs"/> are dropped. Every current Level (the newest ghost or NPC sample)
+    /// is moved to the front, so the next batch applies it before the one-shots that remain.
+    /// </summary>
+    private void CatchUp(long nowMs)
+    {
+        long lag = LagMs(nowMs);
+        LastLagMs = lag;
+        if (lag < CatchUpLagMs) return;
+        for (var n = _q.First; n is not null;)
+        {
+            var next = n.Next;
+            if (n.Value.Kind != BatchKind.Level && nowMs - n.Value.EnqueuedMs > EdgeSnapMs)
+            {
+                Remove(n);
+                EdgesShed++;
+            }
+            n = next;
+        }
+        var levels = new List<Entry>();
+        for (var n = _q.First; n is not null;)
+        {
+            var next = n.Next;
+            if (n.Value.Kind == BatchKind.Level)
+            {
+                levels.Add(n.Value);
+                Remove(n);
+            }
+            n = next;
+        }
+        for (int i = levels.Count - 1; i >= 0; i--)
+        {
+            var e = levels[i];
+            var node = _q.AddFirst(e);
+            _queuedEncoded += e.Encoded;
+            if (e.Key is { } k) _byKey[k] = node;
+        }
+        Snapped += levels.Count;
     }
 
     /// <summary>Over the bound: the oldest Level statement goes (the mod's loop sends it again); only without one, the oldest Edge.</summary>

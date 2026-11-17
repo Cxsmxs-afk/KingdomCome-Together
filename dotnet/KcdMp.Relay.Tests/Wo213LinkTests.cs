@@ -392,11 +392,35 @@ public class Wo213SchedulerTests
     }
 
     [Fact]
-    public void Default_age_limit_keeps_the_latest_sample_for_two_seconds()
+    public void Default_age_limit_drops_a_sample_older_than_half_a_second()
     {
-        // A hitch longer than half a second used to throw away the only copy of
-        // an NPC's position. The receiver then treated the silence as "gone".
-        Assert.Equal(2000, new LinkSchedOptions().AgeLimitMs);
+        // 2000 ms kept delivering a sample that was already up to two seconds late.
+        // The slot is still latest-wins; a sample older than half a second is dropped
+        // instead of being played late. Puppet release is the receiver's silence window.
+        Assert.Equal(500, new LinkSchedOptions().AgeLimitMs);
+    }
+
+    [Fact]
+    public void A_multi_second_event_backlog_lets_the_newest_state_go_first()
+    {
+        var s = new LinkScheduler(new LinkSchedOptions { EventSnapMs = 40 });
+        s.Enqueue(Event(1));
+        s.Enqueue(Event(2));
+        Thread.Sleep(80);
+        s.Enqueue(NpcDown(0, "npc_a", 9));
+        Assert.True(s.TryTake(int.MaxValue, -1, out var frame, out bool isState));
+        Assert.True(isState);
+        Assert.Equal(9f, BitConverter.ToSingle(frame, 3 + 2 + 5));
+        Assert.True(s.StateJumped >= 1);
+        var rest = Drain(s);
+        Assert.Equal(2, rest.Count);
+        var held = new LinkScheduler(new LinkSchedOptions { EventSnapMs = 0 });
+        held.Enqueue(Event(1));
+        Thread.Sleep(80);
+        held.Enqueue(NpcDown(0, "npc_a", 9));
+        Assert.True(held.TryTake(int.MaxValue, -1, out var ev, out bool evState));
+        Assert.False(evState);
+        Assert.Equal(Protocol.StoryBeatDown, ev[0]);
     }
 
     [Fact]

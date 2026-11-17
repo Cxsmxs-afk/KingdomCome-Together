@@ -394,6 +394,10 @@ do -- (f) the render lag: behind, the renderer stays behind by the agent's own l
 
     KCD2MP_NpcSilenceAgent(10000); run(10.0, function() KCD2MP_NpcSilenceAgent(10000) end)
     check("f: the render lag is capped at 3 s", math.abs(KCD2MP.npcSilence.lagSmooth - 3.0) < 0.05, KCD2MP.npcSilence.lagSmooth)
+    check("f: a 9 s queue is logged as latency", logCount("MP-DESYNC kind=latency") >= 1 and logCount("delay_ms=") >= 1)
+    KCD2MP_NpcSilenceAgent(40)
+    run(0.3, function() KCD2MP_NpcSilenceAgent(40) end)
+    check("f: a healed multi-second backlog snaps the render lag", KCD2MP.npcSilence.lagSmooth < 0.05, KCD2MP.npcSilence.lagSmooth)
     run(17.0)   -- no word any more
     check("f: no word: the render lag decays to 0", KCD2MP.npcSilence.lagSmooth == 0, KCD2MP.npcSilence.lagSmooth)
     reset(); clearLog(); freshSilence(); NOW = 2300

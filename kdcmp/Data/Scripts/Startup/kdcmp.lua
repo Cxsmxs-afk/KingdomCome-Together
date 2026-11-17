@@ -309,8 +309,14 @@ function KCD2MP_ShowPing(ms, queueLagMs, inFront)
     if wc then wc.agentLag = tonumber(queueLagMs); wc.inFront = tonumber(inFront) end
     if KCD2MP_W157ConnSample then pcall(KCD2MP_W157ConnSample, ms) end   -- WO-157 3.2
     local off = KCD2MP.clockOffsetMs
+    local qlag = tonumber(queueLagMs)
+    if qlag and qlag >= 0 then KCD2MP._queueLagMs = qlag end
+    if qlag and qlag >= 1000 then
+        KCD2MP_DesyncNote("latency", string.format("delay_ms=%d", math.floor(qlag)))
+    end
     KCD2MP.pingText = string.format("Ping: %d ms", ms)
         .. (off and string.format("  clock %+.2f s", off / 1000) or "")
+        .. (qlag and qlag >= 1000 and string.format("  queue %d ms", math.floor(qlag)) or "")
 end
 
 -- WO-98 Phase 1: the agent's clock-offset estimate (relay clock minus this
@@ -2236,19 +2242,21 @@ function KCD2MP_PerfFlush(force)
     local win = now - (p.t0 or now)
     if win < 0.5 and not force then return end
     local n = p.interpN or 0
+    local function rate(v) return (v or 0) / math.max(win, 0.001) end
+    local lat = (KCD2MP.npcSilence and KCD2MP.npcSilence.lagMs) or 0
+    if (KCD2MP._queueLagMs or 0) > lat then lat = KCD2MP._queueLagMs end
     if not force and n == 0 and (p.floorCasts or 0) == 0 and (p.npcSkip or 0) == 0
-       and (p.npcIdleSkip or 0) == 0 and (p.puppetLifeSkip or 0) == 0 then
+       and (p.npcIdleSkip or 0) == 0 and (p.puppetLifeSkip or 0) == 0 and lat < 1000 then
         p.t0 = now
         return
     end
-    local function rate(v) return (v or 0) / math.max(win, 0.001) end
     System.LogAlways(string.format(
-        "[KCD2-MP] perf window_s=%.1f interp_avg_ms=%.2f interp_max_ms=%.2f interp_n=%d floor_cast_s=%.1f floor_reuse_s=%.1f pose_skip_s=%.1f horse_skip_s=%.1f npc_skip_s=%.1f npc_idle_skip_s=%.1f puppet_life_skip_s=%.1f ride_sphere_s=%.2f ride_skip_s=%.2f bone_read_s=%.1f bone_reuse_s=%.1f",
+        "[KCD2-MP] perf window_s=%.1f interp_avg_ms=%.2f interp_max_ms=%.2f interp_n=%d floor_cast_s=%.1f floor_reuse_s=%.1f pose_skip_s=%.1f horse_skip_s=%.1f npc_skip_s=%.1f npc_idle_skip_s=%.1f puppet_life_skip_s=%.1f ride_sphere_s=%.2f ride_skip_s=%.2f bone_read_s=%.1f bone_reuse_s=%.1f latency_ms=%.0f",
         win,
         n > 0 and (p.interpSum / n) or 0, p.interpMax or 0, n,
         rate(p.floorCasts), rate(p.floorReuse), rate(p.poseSkip), rate(p.horseSkip),
         rate(p.npcSkip), rate(p.npcIdleSkip), rate(p.puppetLifeSkip),
-        rate(p.rideSphere), rate(p.rideSkip), rate(p.boneRead), rate(p.boneReuse)))
+        rate(p.rideSphere), rate(p.rideSkip), rate(p.boneRead), rate(p.boneReuse), lat))
     KCD2MP._perf = { t0 = now }
 end
 
@@ -10182,16 +10190,20 @@ function KCD2MP_NpcPuppetTick(arg, gen)
     local ns = KCD2MP.npcSilence
     do
         local tnow = os.clock()
-        -- the render lag follows the agent's (fresh) word, at most 0.5 s per second, never past lagCapS
+        -- the render lag follows the agent's (fresh) word, never past lagCapS. It rises at once and snaps
+        -- back down when the agent is no longer seconds behind (a slow ease used to keep a 3 s delay after the queue had caught up).
         local tdt = ns.tickAt and math.max(0, math.min(tnow - ns.tickAt, 1.0)) or 0   -- never negative (a clock set back)
-        -- (behind at all: the agent's worst of its last second plus 0.25 s, so a sample's wait never shows as a
-        -- stop; up at once, down 0.5 s per second)
+        -- (behind at all: the agent's worst of its last second plus 0.25 s, so a sample's wait never shows as a stop)
         local want = 0
         if KCD2MP.w147.npcCatchup and (tnow - ns.agentAt) < ns.ttlS and (ns.lagMs or 0) >= 100 then
             want = math.min(ns.lagCapS, (ns.lagMs or 0) / 1000 + 0.25)
         end
         local cur = ns.lagSmooth or 0
-        if want > cur then cur = want else cur = math.max(want, cur - 0.5 * tdt) end
+        -- up at once. A healed backlog snaps: easing 0.5 s per second left a 3 s render delay
+        -- unwinding for several seconds after the queue had already caught up.
+        if want > cur then cur = want
+        elseif cur - want >= 0.5 then cur = want
+        else cur = math.max(want, cur - 0.5 * tdt) end
         ns.lagSmooth = cur
         if KCD2MP.w147.npcCatchup and ns.tickAt and tnow - ns.tickAt > ns.stallS then
             local gap = tnow - ns.tickAt
@@ -18808,6 +18820,17 @@ function KCD2MP_NpcSilenceAgent(lagMs)
     local lag = tonumber(lagMs) or -1
     local on = lag >= 0
     if on then ns.agentAt = os.clock(); ns.lagMs = lag else ns.agentAt = -1e9 end
+    if on and lag >= 1000 then
+        KCD2MP._latencyMs = lag
+        if os.clock() - (ns.latToldAt or -1e9) >= 2 then
+            ns.latToldAt = os.clock()
+            KCD2MP_DesyncNote("latency", string.format("delay_ms=%d", math.floor(lag)))
+        else
+            KCD2MP_DesyncNote("latency")
+        end
+    elseif on then
+        KCD2MP._latencyMs = lag
+    end
     if on ~= ns.wordOn then
         ns.wordOn = on
         mp_log(string.format("NPC-SYNC agent silence word %s (lag %d ms) -- %s", on and "on" or "off", math.floor(math.max(lag, 0)),
