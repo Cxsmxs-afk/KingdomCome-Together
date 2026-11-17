@@ -111,6 +111,11 @@ int wo216_tests(int* passed) {
     // ---- B
     WCHECK(breach(0) && !breach(1) && !breach(2) && !breach(-1), "a running brain (state 0) is a breach; suspended or unknown are not");
     WCHECK(hide_unbound(false, false) && !hide_unbound(true, false) && !hide_unbound(false, true), "an unbound body is hidden; a copy or a figure is not");
+    WCHECK(fighting_a_player(true, false) && fighting_a_player(false, true) && !fighting_a_player(false, false),
+           "a fight with the local player or the other player's figure");
+    WCHECK(!hide_unbound(false, false, true) && !hide_unbound(false, true, true) && !hide_unbound(true, false, true),
+           "an NPC fighting a player is never hidden, bound or not");
+    WCHECK(hide_unbound(false, false, false), "an unbound bystander is still hidden");
     WCHECK(streamable_name(63) && !streamable_name(65) && !streamable_name(0),
            "a name the stream cannot carry (the animal care's horses, 65) is never hidden: it can never be a copy");
 

@@ -137,6 +137,20 @@ public class Wo153Tests
     }
 
     [Fact]
+    public void A_load_burst_of_young_edges_keeps_only_the_newest()
+    {
+        var q = new BatchQueue();
+        q.Add(E(Ghost("0", 1), at: 0));
+        for (int i = 0; i < 80; i++) q.Add(E(Toast("e" + i), at: 400 + i * 10));
+        var b = q.TakeBatch(100_000, 1300).Select(e => e.Lua).ToList();
+        Assert.Equal(Ghost("0", 1), b[0]);
+        Assert.Contains(Toast("e79"), b);
+        Assert.DoesNotContain(Toast("e0"), b);
+        Assert.True(b.Count <= 33);
+        Assert.True(q.EdgesShed >= 48);
+    }
+
+    [Fact]
     public void WO153_only_a_copy_in_a_fight_holds_the_no_own_hit_reaction_contexts()
     {
         var guarded = new Dictionary<string, uint> { ["ttkc_man_1"] = 0x10, ["tbuk_man_1"] = 0x11, ["karavany_horse_1"] = 0x12, ["no_body_yet"] = 0 };

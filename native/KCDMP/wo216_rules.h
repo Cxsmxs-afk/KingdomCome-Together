@@ -186,8 +186,15 @@ inline int parity_bin(float meanM) { int b = static_cast<int>(meanM * 10.0f); re
 constexpr double kBrainCensusS = 1.0;
 enum class Body : uint8_t { Figure = 0, Bound = 1, Unbound = 2, Dead = 3 };
 inline bool breach(int brainState) { return brainState == 0; }
-// what to do with a body found running: suspend it always; hide it unless the host streams it
-inline bool hide_unbound(bool bound, bool figure) { return !bound && !figure; }
+// The local player, or the other player's figure. An NPC in that fight stays on screen.
+inline bool fighting_a_player(bool opponentIsLocalPlayer, bool opponentIsPeer) {
+    return opponentIsLocalPlayer || opponentIsPeer;
+}
+// Suspend a running brain always. Hide an unbound bystander. Never hide a figure, a streamed copy,
+// or an NPC that is fighting a player (the live run hid fighters: sweep_hidden and hides in the thousands).
+inline bool hide_unbound(bool bound, bool figure, bool fightingPlayer = false) {
+    return !bound && !figure && !fighting_a_player(fightingPlayer, false);
+}
 // The stream carries names of at most 63 characters (the animal care's horses are "horse[animalcare/<name>_<guid>]", 65): a body whose name
 // is longer can never be a copy -- it stays shown here (suspended, frozen), never hidden while the host shows its own
 constexpr size_t kStreamNameMax = 63;

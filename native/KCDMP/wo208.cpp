@@ -718,7 +718,11 @@ bool own_handover(uint32_t eid, OwnCopy& oc, double now, uint8_t path) {
     if (wo211::on(wo211rules::kBitHandoverQueueCap) && wo209rules::owner_queue_full(wo187::queue_info(eid).n)) {
         for (auto& sc : oc.own) {
             uint32_t st = 0;
-            if (sc.act && rd(sc.act, 0x28, &st) && st < 2) own_retire(oc, sc, now, "a long queue: one pending action of ours at a time");
+            if (sc.act && rd(sc.act, 0x28, &st) && st < 2) {
+                // a pending swing, block or draw stays. The queue sheds a pending walk or idle instead.
+                if (wo214rules::combat_pose_holds(frag_name_of(eid, sc.frag).c_str(), false, true)) continue;
+                own_retire(oc, sc, now, "a long queue: one pending action of ours at a time");
+            }
         }
         if (wo209rules::owner_queue_full(wo187::queue_info(eid).n)) {
             wo211::note_handover_queue_full();
@@ -897,6 +901,9 @@ void own_apply(uint32_t eid, OwnCopy& oc, int cm, const HostScope hsc[2], const 
         switch (decide(fam, hs ? hs->act : 0, hs ? hs->prio : 0, copyRuns, view)) {
             case Do::Nothing: break;
             case Do::Withdraw:
+                // A swing, a block, a draw or a guard stays. An idle, a walk, or a full queue does not take the body
+                // (the live run: those updates cut the combat pose).
+                if (k == 0 && o.act && wo214rules::combat_pose_holds(frag_name_of(eid, o.frag).c_str(), is_base(fam), queueFull)) break;
                 // WO-210 A (path 15): the host's scope is back at its base -- the host's base is installed in the same frame, under the
                 // copy's own base (session E: a withdrawn posture kept looping on a paused copy whose own base never came back)
                 if (k == 0 && !copyRuns && wo210::on(wo210rules::kBitStateAlways)) own_handover(eid, oc, now, wo210rules::kPathBase);

@@ -241,7 +241,7 @@ public partial class GameBridge(ClientConfig config)
                 }
                 Console.WriteLine($"[combatviz] native swing for ghost {o.Entry.GhostId} did not apply " +
                                   $"(reason={new PipeResult(false, o.Reason).ReasonTag}) -- falling back to the Lua cue");
-                _ = ExecLuaAsync($"if KCD2MP_GhostCombat then KCD2MP_GhostCombat(\"{o.Entry.GhostId}\",{Protocol.CombatEventSwing}) end");
+                _ = _transport.ExecuteNowAsync($"if KCD2MP_GhostCombat then KCD2MP_GhostCombat(\"{o.Entry.GhostId}\",{Protocol.CombatEventSwing}) end");
             };
             inbox.Start();
             _swingInbox = inbox;
@@ -5690,7 +5690,7 @@ public partial class GameBridge(ClientConfig config)
                             EnsureSwingInbox(ct).TryEnqueue(new SwingInbox.Entry(
                                 ceSource.ToString(), ceSid, rsid,
                                 GhostGeneration(ceSource.ToString()), fragSpec, DateTime.UtcNow));
-                            await ExecLuaAsync($"if KCD2MP_GhostNativeSwingHold then KCD2MP_GhostNativeSwingHold(\"{ceSource}\") end");
+                            await _transport.ExecuteNowAsync($"if KCD2MP_GhostNativeSwingHold then KCD2MP_GhostNativeSwingHold(\"{ceSource}\") end", ct);
                         }
                         else if (ceEvent == Protocol.CombatEventWeaponDrawn
                                  && OversizedItemFor(ceSource) is Guid oversized)
@@ -5700,11 +5700,11 @@ public partial class GameBridge(ClientConfig config)
                             // attached by DrawWeapon() -- route the draw through
                             // DrawFromInventory instead (live-verified; see
                             // KCD2MP_GhostDrawItem for the ordering trap).
-                            await ExecLuaAsync($"if KCD2MP_GhostDrawItem then KCD2MP_GhostDrawItem(\"{ceSource}\",\"{oversized}\") end");
+                            await _transport.ExecuteNowAsync($"if KCD2MP_GhostDrawItem then KCD2MP_GhostDrawItem(\"{ceSource}\",\"{oversized}\") end", ct);
                         }
                         else
                         {
-                            await ExecLuaAsync($"if KCD2MP_GhostCombat then KCD2MP_GhostCombat(\"{ceSource}\",{ceEvent}) end");
+                            await _transport.ExecuteNowAsync($"if KCD2MP_GhostCombat then KCD2MP_GhostCombat(\"{ceSource}\",{ceEvent}) end", ct);
                         }
                     }
                     else if (type == Protocol.AppearanceDown && payloadLen >= 2)

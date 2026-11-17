@@ -47,7 +47,7 @@ public partial class GameBridge
         bool oversized = false;
         if (drawn && cls is Guid gc && _swingCatalog.IsCompletedSuccessfully && _swingCatalog.Result is { } cat) oversized = cat.OversizedItemOf([gc]) is not null;
         Console.WriteLine($"WO214-HAND figure kcd2mp_{src} told drawn={(drawn ? 1 : 0)} cls={c}{(oversized ? " (oversized)" : "")}");
-        _ = ExecLuaAsync($"if KCD2MP_W214FigureHand then KCD2MP_W214FigureHand(\"{src}\", {(drawn ? "true" : "false")}, \"{c}\", {(oversized ? "true" : "false")}) end");
+        _ = _transport.ExecuteNowAsync($"if KCD2MP_W214FigureHand then KCD2MP_W214FigureHand(\"{src}\", {(drawn ? "true" : "false")}, \"{c}\", {(oversized ? "true" : "false")}) end");
     }
 
     /// <summary>The mod's verdict on one figure ("w214_figure_hand": "&lt;id&gt; &lt;ok|fixed|failed&gt; &lt;how&gt;").</summary>

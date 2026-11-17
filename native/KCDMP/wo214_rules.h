@@ -114,6 +114,17 @@ inline Stuck stale_action(bool on, bool candidate, bool combatRow, double heldS,
     return Stuck::No;
 }
 inline bool combat_fragment_name(const char* n) { return n && std::strncmp(n, "Combat", 6) == 0; }
+// A swing, a block, a draw, a sheath or a guard. A movement or idle update, and a full action queue,
+// must not replace it (the live run: draws, stances, attacks and blocks broke off into the wrong pose).
+inline bool combat_pose_name(const char* n) {
+    if (!n || !*n) return false;
+    return std::strstr(n, "Attack") || std::strstr(n, "Block") || std::strstr(n, "Draw") || std::strstr(n, "Holster")
+        || std::strstr(n, "Sheath") || std::strstr(n, "Guard") || std::strstr(n, "Clinch") || std::strstr(n, "Hit");
+}
+inline bool combat_pose_holds(const char* playing, bool incomingIsMoveOrIdle, bool queueFull) {
+    if (!combat_pose_name(playing)) return false;
+    return incomingIsMoveOrIdle || queueFull;
+}
 // Only the combat manager's own action (C_CombatAnimAction) is ever stopped here: the owner's posture installs and the combat rows run
 // through it -- the field's stuck actions were all of it. The engine's own movement (the walk's start and stop, CAnimActionMovementTransition),
 // its idle state and its variations never are (d3's village: stopping a walk transition of a copy whose host NPC stood made the copy's own

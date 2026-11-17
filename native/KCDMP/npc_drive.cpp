@@ -1538,13 +1538,15 @@ void tick() {
         const bool oneHolder = kcdmp::walkhold::driver_class(figure, p.beast, parented, p.human, !p.noPhys, fightNow, vzNow);
         // Phase 2: a player and a walking person render on a fixed delay. The
         // adaptive play-out and the lateness slew stay for horses and fights.
-        // A stream more than 0.40 s behind that clock is shown at its newest
-        // sample. It is not extrapolated, and the delay does not grow.
+        // A late stream keeps this clock. Jumping the body onto the newest
+        // sample was the half-metre teleport (the live run: 23 jumps over
+        // 50 cm, pose age p99 1.15 s). Only a sample many seconds old — a
+        // load, a fast travel — is shown at once.
         const bool fixedTl = kcdmp::walkhold::fixed_timeline(figure, oneHolder);
         if (fixedTl) {
             const double gap = s.gapEma > 0.0 ? s.gapEma : 0.05;
             renderDelay = kcdmp::walkhold::adaptive_delay_s(p.delay, gap);
-            if (s.n > 0 && kcdmp::walkhold::snap_catchup(now - s.ring[s.n - 1].at, renderDelay))
+            if (s.n > 0 && kcdmp::walkhold::place_now(now - s.ring[s.n - 1].at))
                 renderDelay = now - s.ring[s.n - 1].at;
             g_playoutByEid[p.eid] = renderDelay;
         }
@@ -1651,10 +1653,12 @@ void tick() {
             p.blendWhy = "bind";
         }
         if (p.blending) blend_apply(p, pose, dt);
-        // A late sample on a bad link used to move the whole gap in one frame.
-        // The step is limited, then the tread under that point replaces a chord
-        // through the stair. Hits and dialogue do not use this clock.
-        if (fixedTl && p.haveLast) {
+        // A late sample used to move the whole gap in one frame, in a fight
+        // as well as on the walk. The step is limited (a real relocation of
+        // 8 m or more is still placed), then the tread under that point
+        // replaces a chord through the stair. Hits and dialogue do not use
+        // this clock.
+        if (p.haveLast) {
             float pace = p.speedMps;
             kcdmp::walkhold::limit_step(p.last[0], p.last[1], pose[0], pose[1], pace, static_cast<float>(dt));
             p.speedMps = pace;
@@ -1673,9 +1677,9 @@ void tick() {
         } else if (!p.haveLast) { p.speedMps = 0; p.velX = p.velY = 0; }
         // WO-201 B10: the walk is a value -- the gait follows the host's own speed on the segment, not a catch-up's
         if (g_walkFromHost.load(std::memory_order_relaxed) && !p.beast && std::isfinite(segMps) && segMps < 20.0f) {
-            const float sp = p.speedMps;
-            if (sp > 0.001f && segMps > 0.001f) { p.velX *= segMps / sp; p.velY *= segMps / sp; }
-            p.speedMps = segMps;
+            const float shown = kcdmp::walkhold::smooth_gait(p.speedMps, segMps, static_cast<float>(dt));
+            if (p.speedMps > 0.001f && shown > 0.001f) { p.velX *= shown / p.speedMps; p.velY *= shown / p.speedMps; }
+            p.speedMps = shown;
         }
         if (!write_one(p, e, pose, &wrote)) {
             if (!g_announcedFault) { g_announcedFault = true; logf("MP-NPCWRITE npc=%s engine call FAULTED", p.name.c_str()); }

@@ -99,6 +99,13 @@ public sealed class BatchQueue
     public long CatchUpLagMs { get; init; } = 1000;
     /// <summary>An edge or a stale relay older than this is dropped once the queue is already in catch-up (it would only run seconds late).</summary>
     public long EdgeSnapMs { get; init; } = 2000;
+    /// <summary>
+    /// Once the queue is in catch-up, at most this many one-shots stay. The rest of a load burst (the live run: 12–15 s,
+    /// then a 6.5 s peak) is the console playing every young edge at 35 ms each. The newest ones stay. A one-shot younger
+    /// than <see cref="EdgeKeepYoungMs"/> is never shed by this cap.
+    /// </summary>
+    public int EdgeKeep { get; init; } = 32;
+    public long EdgeKeepYoungMs { get; init; } = 250;
 
     private readonly LinkedList<Entry> _q = new();
     private readonly Dictionary<string, LinkedListNode<Entry>> _byKey = new(StringComparer.Ordinal);
@@ -227,6 +234,21 @@ public sealed class BatchQueue
             {
                 Remove(n);
                 EdgesShed++;
+            }
+            n = next;
+        }
+        // A burst of young one-shots is still seconds of console. Keep the newest EdgeKeep; drop older ones past the young window.
+        int edges = 0;
+        for (var n = _q.First; n is not null; n = n.Next)
+            if (n.Value.Kind != BatchKind.Level) edges++;
+        for (var n = _q.First; n is not null && edges > EdgeKeep;)
+        {
+            var next = n.Next;
+            if (n.Value.Kind != BatchKind.Level && nowMs - n.Value.EnqueuedMs > EdgeKeepYoungMs)
+            {
+                Remove(n);
+                EdgesShed++;
+                edges--;
             }
             n = next;
         }
