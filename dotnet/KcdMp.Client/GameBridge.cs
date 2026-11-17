@@ -99,6 +99,10 @@ public partial class GameBridge(ClientConfig config)
     private static readonly TimeSpan NativeLuaFlushTick = TimeSpan.FromMilliseconds(50);
     private const int FlushTickType = -1;   // an InFrame that is not a relay frame: flush due Lua pushes
     private bool NpcNativeBound(string npc) => _nativeWriteOn && _nativeBound.ContainsKey(npc);
+
+    /// <summary>Phase 3: a bound body whose DLL ring matches this build is not also a console pose.</summary>
+    private bool PoseGoesNative(string body) =>
+        PoseRing.VersionMatches && _combat.IsConnected && NpcNativeBound(body);
     private volatile bool _nativeSenderClock = true;  // mirror of mp_npc_senderclock (native side)
     private int _nativeHeartbeatBusy;
     private long _nativeHeartbeats;
@@ -333,6 +337,10 @@ public partial class GameBridge(ClientConfig config)
     private int _oracleBadRun;
     private long _oracleN; private double _oracleSum, _oracleMax;
     private const int    PosNativeGiveUpAfter = 20;
+    private long _poseRingProbeAt;
+    private bool _poseRingTold;
+    private uint _poseRingHost;
+    private long _poseRingMovedAt;
     private const double OracleMaxM = 3.0;         // log sample may lag the frame by ~60 ms+; a horse covers ~0.7 m in that
     private const int    OracleBadRunToRefuse = 20;
     private static readonly TimeSpan CadenceReportInterval = TimeSpan.FromSeconds(30);
@@ -1994,6 +2002,31 @@ public partial class GameBridge(ClientConfig config)
                 totalReadMs += sw.ElapsedMilliseconds;
                 tickCount++;
                 nowTimestamp = Stopwatch.GetTimestamp();
+                // The ring is the position source when the DLL build matches.
+                // hostMs is a frame counter: while it advances, the game thread
+                // is running and a missing log line does not stop the pose.
+                // A frozen counter is a pause, and the stale heartbeat below
+                // still runs. A missing or different ring leaves the log path.
+                bool ringLive = false;
+                bool poseFromLog = state.HasValue;
+                float ringX = 0, ringY = 0, ringZ = 0, ringRot = 0;
+                byte ringFlags = 0;
+                if (PoseRing.TryPlayer(out ringX, out ringY, out ringZ, out ringRot, out ringFlags, out uint ringHost))
+                {
+                    if (ringHost != _poseRingHost)
+                    {
+                        _poseRingHost = ringHost;
+                        _poseRingMovedAt = nowTimestamp;
+                        ringLive = true;
+                    }
+                    else
+                    {
+                        double ageMs = (nowTimestamp - _poseRingMovedAt) * 1000.0 / Stopwatch.Frequency;
+                        ringLive = ageMs < 400;
+                    }
+                    if (!state.HasValue && ringLive)
+                        state = new PlayerState(ringX, ringY, ringZ, ringRot, (ringFlags & 1) != 0);
+                }
 
                 // Re-arm the mod's own timer loops periodically (WO-13).
                 // Loading a save destroys every pending Script.SetTimer in the
@@ -2166,6 +2199,18 @@ public partial class GameBridge(ClientConfig config)
                     Console.WriteLine($"[pos] mod emitter resumed after {_staleRun} stale heartbeat(s)");
                     _staleRun = 0;
                 }
+                if (IntervalElapsed(ref _poseRingProbeAt, TimeSpan.FromSeconds(2), nowTimestamp))
+                {
+                    bool was = PoseRing.VersionMatches;
+                    PoseRing.Probe();
+                    if (!_poseRingTold || PoseRing.VersionMatches != was)
+                    {
+                        _poseRingTold = true;
+                        Console.WriteLine(PoseRing.VersionMatches
+                            ? "MP-POSE-RING path=ring version=1"
+                            : $"MP-POSE-RING path=log reason={PoseRing.Reason}");
+                    }
+                }
                 if (!state.HasValue && _hasPushed
                     && IntervalElapsed(ref lastPositionHeartbeat, PositionHeartbeatInterval, nowTimestamp))
                 {
@@ -2226,6 +2271,7 @@ public partial class GameBridge(ClientConfig config)
                     // yaw, riding and body state all from the native sample when
                     // there is one; the log line otherwise (0.23.2 behaviour).
                     float x, y, z, rotZ; bool riding; LocalBodyState? local = null;
+                    string posePath = nat is null ? "log" : "native";
                     if (nat is LocalState ns)
                     {
                         x = ns.X; y = ns.Y; z = ns.Z; rotZ = ns.RotZ; riding = Wo172Riding(ns.IsRiding); local = ns.Body;   // WO-172 R1
@@ -2234,14 +2280,23 @@ public partial class GameBridge(ClientConfig config)
                     {
                         x = st.X; y = st.Y; z = st.Z; rotZ = st.RotZ; riding = Wo172Riding(st.IsRiding);   // WO-172 R1
                     }
+                    if (ringLive)
+                    {
+                        x = ringX; y = ringY; z = ringZ; rotZ = ringRot; riding = Wo172Riding((ringFlags & 1) != 0);
+                        posePath = "ring";
+                    }
                     Wo127NoteLocal(x, y, z, riding);   // WO-127: the leash recorder's host/joiner anchor
 
                     // WO-28 Flows A and C ride the same sample the position
                     // push already reads, so neither adds a read of its own.
                     // Both are no-ops on a v1 emit line, where Health/IsDead
                     // are null -- "unknown, leave it alone".
-                    await SendPlayerStateIfChangedAsync(stream, st, cts.Token);
-                    await SendDeathIfNewAsync(stream, st, cts.Token);
+                    // A ring-only sample has no health or death. Those stay on the log.
+                    if (poseFromLog)
+                    {
+                        await SendPlayerStateIfChangedAsync(stream, st, cts.Token);
+                        await SendDeathIfNewAsync(stream, st, cts.Token);
+                    }
 
                     // Update voice local position and recalculate all player volumes.
                     // WO-154: one read -- the mod menu can close it from another thread.
@@ -2303,7 +2358,7 @@ public partial class GameBridge(ClientConfig config)
                         if (local is LocalBodyState lb)
                             await SendAttackEdgeAsync(stream, lb, cts.Token);
                         if (moved)
-                            Console.WriteLine($"[pos] {x:F1} {y:F1} {z:F1}  rot={rotZ:F2}  riding={riding}  read={sw.ElapsedMilliseconds}ms path={(nat is null ? "log" : "native")}");
+                            Console.WriteLine($"[pos] {x:F1} {y:F1} {z:F1}  rot={rotZ:F2}  riding={riding}  read={sw.ElapsedMilliseconds}ms path={posePath}");
                     }
                 }
 
@@ -4889,7 +4944,8 @@ public partial class GameBridge(ClientConfig config)
                         // The backlog fix: behind, a sample a newer one supersedes (no state block of its own) is not pushed.
                         // WO-213 D.4: the DLL drives the figure from every sample (30-45 a second while it moves); the game's Lua update at the
                         // old pace -- one Lua call a sample crowded the joiner's console (a joined talk's join request waited 67 s)
-                        if (!Wo147GhostSkip(ghostId, frame.Arrival, gs.State2 is not null) && Wo213GhostLuaDue(ghostId, isRiding, gs.State2 is not null))
+                        if (!Wo147GhostSkip(ghostId, frame.Arrival, gs.State2 is not null) && Wo213GhostLuaDue(ghostId, isRiding, gs.State2 is not null)
+                            && !PoseGoesNative("kcd2mp_" + ghostId))
                             await UpdateGhostAsync(ghostId.ToString(), x, y, z, rotZ, isRiding, body, gs.SenderMs);
                     }
                     else if (type == Protocol.ActionDown)
@@ -5404,7 +5460,7 @@ public partial class GameBridge(ClientConfig config)
                                 string npcLua = string.Format(CultureInfo.InvariantCulture,
                                     "if KCD2MP_ApplyNpcState then KCD2MP_ApplyNpcState(\"{0}\",{1:F3},{2:F3},{3:F3},{4:F4},{5:F1},{6},{7},{8},{9}) end",
                                     npcName, nx, ny, nz, nrot, nhp, nflags, nsrc, nseq, nSenderMs);   // WO-102 Phase 2: source id = the stream's owner (MP-AUTHORITY); WO-110 R6: seq + sender ms
-                                if (_npcLua.Offer(npcName, NpcNativeBound(npcName), nflags, nhp, frame.Arrival, npcLua))   // WO-118 follow-up
+                                if (!PoseGoesNative(npcName) && _npcLua.Offer(npcName, NpcNativeBound(npcName), nflags, nhp, frame.Arrival, npcLua))   // WO-118 follow-up
                                     await ExecLuaAsync(npcLua);
                                 }
 

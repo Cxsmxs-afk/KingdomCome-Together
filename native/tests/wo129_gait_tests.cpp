@@ -54,6 +54,7 @@ int wo211_tests(int* passed);              // wo211_tests.cpp (WO-211: the UI-di
 int wo214_tests(int* passed);              // wo214_tests.cpp (WO-214: one bind, the owner's base, combat end)
 int wo215_tests(int* passed);              // wo215_tests.cpp (WO-215: the route, the gait, the ladder, dormant, the ghost fight)
 int walk_holder_tests(int* passed);        // walk_holder_tests.cpp (phase 1: one holder for a walking person)
+int pose_ring_tests(int* passed);          // pose_ring_tests.cpp (phase 3: the pose ring)
 int wo216_tests(int* passed);
 int wo218_tests(int* passed);              // wo218_tests.cpp (WO-218: the pipe's batch)
 int wo217_tests(int* passed);              // wo217_tests.cpp (WO-217: the world around the bodies)              // wo216_tests.cpp (WO-216: the host's request replayed, no brains on the joiner)
@@ -418,6 +419,12 @@ int main() {
     {
         int fp = 0;
         const int ff = walk_holder_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+    {
+        int fp = 0;
+        const int ff = pose_ring_tests(&fp);
         g_pass += fp;
         g_fail += ff;
     }

@@ -16,6 +16,7 @@ add_library(KCDMP SHARED
     mannequin_read.cpp
     combat_write.cpp
     local_state.cpp
+    pose_ring.cpp
     npc_scan.cpp
     anchors.cpp
     engine.cpp

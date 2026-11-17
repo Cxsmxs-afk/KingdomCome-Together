@@ -53,11 +53,16 @@ public static class Program
         }
         else load.AddRange(Continuous.RunAll(timeline));
         await File.WriteAllTextAsync(Path.Combine(outDir, "sim-load.json"), JsonSerializer.Serialize(load, opt));
-        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load));
+        var queued = QueueLoad.RunAll();
+        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load) + Report.Queue(queued));
         int gated = results.Count(r => r.Gate);
         int failed = results.Count(r => r.Gate && !r.Pass);
-        Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. {mdPath}");
-        return failed == 0 ? 0 : 1;
+        // Phase 3: a flooded console freezes the figure for seconds. The ring's
+        // pose age stays the link plus the fixed delay, under a second.
+        bool ringFlat = queued.Where(r => r.Timeline == "ring").All(r => r.WireBytes < 800);
+        bool consoleTrails = queued.Where(r => r.Timeline == "console").All(r => r.WireBytes > 2000);
+        Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. queue ringFlat={ringFlat} consoleTrails={consoleTrails}. {mdPath}");
+        return failed == 0 && ringFlat && consoleTrails ? 0 : 1;
     }
 
     static async Task<RunResult> RunOne(int players, Profile profile, string label, string commit)
@@ -460,6 +465,21 @@ static class Report
         sb.AppendLine("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|");
         foreach (var r in rows)
             sb.AppendLine($"| {r.Players} | {r.Profile} | {r.Timeline} | {r.QueueP95:0} | {r.QueueMax:0} | {r.SnapsPerMin:0.0} | {r.PlayerSnapsPerMin:0.0} | {r.NpcSnapsPerMin:0.0} | {r.BreaksPerMin:0.0} | {r.ExtrapMs:0} |");
+        return sb.ToString();
+    }
+
+    public static string Queue(List<LoadResult> rows)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine();
+        sb.AppendLine("## Quest-Last, Pose");
+        sb.AppendLine();
+        sb.AppendLine("Eine Minute lang füllt ein Quest-Nachzug die Konsole (eine Zeile pro Runde, schneller als sie abläuft). Nach 20 s steht das Spiel 3 s im Hintergrund und die Konsole tut nichts. `console` ist Phase 2: die Pose wartet in derselben Schlange. `ring` ist Phase 3: die Pose kommt aus dem DLL-Ring und läuft weiter. Queue ist das Alter der Quest-Zeile. Pose p95 bleibt flach; Pose max zeigt, ob die Figur in der Pause stehen bleibt.");
+        sb.AppendLine();
+        sb.AppendLine("| Spieler | Profil | Pfad | Queue p95 | Queue max | Pose p95 | Pose max |");
+        sb.AppendLine("|---:|---|---|---:|---:|---:|---:|");
+        foreach (var r in rows)
+            sb.AppendLine($"| {r.Players} | {r.Profile} | {r.Timeline} | {r.QueueP95:0} | {r.QueueMax:0} | {r.ExtrapMs:0} | {r.WireBytes} |");
         return sb.ToString();
     }
 }
