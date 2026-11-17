@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/host-clock-bootstrap
+      - codex/host-story-authority
 
 jobs:
   build:

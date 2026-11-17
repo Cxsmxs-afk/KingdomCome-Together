@@ -31,6 +31,28 @@ int wo200_tests(int* passed) {
     WCHECK(method_kind("CreateItems") == Method::Items && method_kind("MoveItems") == Method::Items, "inventories");
     WCHECK(method_kind("math::boolean::Or") == Method::Other && method_kind("GetState") == Method::Other, "pure logic and reads run");
     WCHECK(method_kind(nullptr) == Method::Other && method_kind("") == Method::Other, "no name: other");
+    WCHECK(method_kind("wh::rpgmodule::SetIsNight") == Method::HostTime && method_kind("WhatTimeIsIt") == Method::HostTime,
+           "Paket F3: both time decisions belong to the host");
+    WCHECK(method_kind("GetWhatTimeIsIt") == Method::Other && method_kind("SetIsNightExtra") == Method::Other,
+           "Paket F3: method names match exactly");
+    WCHECK(host_time_path("Barbora.time.SetIsNight.Write") && host_time_path("Barbora.time.whattimeisit.Hour") &&
+           host_time_path("SetIsNight") && !host_time_path("Barbora.time.ResetIsNight.Write") &&
+           !host_time_path("Barbora.WhatTimeIsItLater") && !host_time_path(nullptr),
+           "Paket F3: whole dotted node/ancestor components only, including unclassified module nodes");
+    WCHECK(host_time_name("SETISNIGHT") && host_time_name("WhatTimeIsIt") &&
+           !host_time_name("ResetIsNight") && !host_time_name("SetIsNightExtra") &&
+           !host_time_name("WhatTimeIsItLater") && !host_time_name(nullptr),
+           "Paket F3: the allocation-free ancestor walker uses exact node names, including case variants");
+    WCHECK(decide(kRoleJoiner, Kind::WorldTrigger, Method::Other, Target::Unknown, false, false, false, false, on) == Verdict::HostWorld &&
+           decide(kRoleHost, Kind::WorldTrigger, Method::Other, Target::Unknown, false, false, false, false, on) == Verdict::Run &&
+           decide(kRoleJoiner, Kind::WorldTrigger, Method::Other, Target::Unknown, false, false, false, false, notJoined) == Verdict::Run,
+           "Paket C: the host's area graph alone decides; own saves and the host stay live");
+    WCHECK(decide(kRoleJoiner, Kind::Function, Method::HostTime, Target::Unknown, false, false, false, false, on) == Verdict::HostWorld &&
+           decide(kRoleHost, Kind::Function, Method::HostTime, Target::Unknown, false, false, false, false, on) == Verdict::Run,
+           "Paket F3: time decision functions never execute on the joined copy");
+    WCHECK(tap(kRoleJoiner, Kind::WorldTrigger, true, false, false, false, false) == Tap::QuietDrop &&
+           tap(kRoleHost, Kind::WorldTrigger, true, false, false, false, false) == Tap::Pass,
+           "Paket C: already active area triggers stay quiet even without the legacy clock feature bit");
 
     // ---- WO-221 D.1: the one "player's horse" is set only for the player whose conversation it is ----
     WCHECK(method_kind("ReplacePlayerHorse") == Method::PlayerHorse && method_kind("wh::rpgmodule::Kill") == Method::KillSoul, "the horse methods");
@@ -72,6 +94,9 @@ int wo200_tests(int* passed) {
            "KillNpc's TakeDamage on a copy: refused on the joiner (the host's world kills)");
     WCHECK(decide(kRoleJoiner, Kind::Function, Method::SetState, Target::Other, false, false, false, false, on) == Verdict::PuppetRefused,
            "a copy's health written by the joiner's graph: refused (II.1: values come from the host)");
+    WCHECK(decide(kRoleJoiner, Kind::Function, Method::KillSoul, Target::Other, false, false, false, false, on) == Verdict::PuppetRefused &&
+           needs_target(kRoleJoiner, Kind::Function, Method::KillSoul, false, false, on),
+           "Paket F2: a mirrored quest cannot invoke a second local Kill on the copy's soul");
     WCHECK(decide(kRoleJoiner, Kind::Function, Method::SetState, Target::Player, false, false, false, false, on) == Verdict::Run,
            "the joiner's own Henry's SetState: runs");
     WCHECK(decide(kRoleJoiner, Kind::Function, Method::AddBuff, Target::Other, false, false, false, false, on) == Verdict::Run,
@@ -79,8 +104,13 @@ int wo200_tests(int* passed) {
     WCHECK(decide(kRoleJoiner, Kind::BodyEffect, Method::Other, Target::Other, false, false, false, false, on) == Verdict::Run,
            "a clothing / weapon preset on a copy: runs (a listed gap: no host value replaces it)");
     Cfg noPuppets = on; noPuppets.puppets = false;
-    WCHECK(decide(kRoleJoiner, Kind::Behaviour, Method::Other, Target::Other, false, false, false, false, noPuppets) == Verdict::Run,
-           "joiner_no_puppet_quests off: today's behaviour");
+    for (Kind k : {Kind::Behaviour, Kind::EntityContext, Kind::SchedulerLink, Kind::Interrupt}) {
+        WCHECK(decide(kRoleJoiner, k, Method::Other, Target::Other, false, false, false, false, noPuppets) == Verdict::PuppetRefused &&
+               needs_target(kRoleJoiner, k, Method::Other, false, false, noPuppets),
+               "Paket C: the legacy feature bit cannot reopen %s on a copy", kind_name(k));
+        WCHECK(decide(kRoleJoiner, k, Method::Other, Target::Player, false, false, false, false, noPuppets) == Verdict::Run,
+               "Paket C: %s on the local player stays live with the legacy bit off", kind_name(k));
+    }
     WCHECK(decide(kRoleJoiner, Kind::Clock, Method::Other, Target::Unknown, false, false, false, false, on) == Verdict::Run,
            "a clock node executing (Start/Stop) is not the gate's: the tap keeps its fire quiet");
     WCHECK(decide(kRoleJoiner, Kind::Dialogue, Method::Other, Target::Unknown, false, false, false, false, on) == Verdict::Run,
@@ -149,7 +179,8 @@ int wo200_tests(int* passed) {
     // ---- Gate 1: the tap ----
     WCHECK(tap(kRoleJoiner, Kind::Clock, true, true, true, false, false) == Tap::QuietDrop, "I.4: the joiner's clock fire is dropped");
     WCHECK(tap(kRoleJoiner, Kind::Clock, false, true, true, false, false) == Tap::Pass, "not joined: the joiner's own world");
-    WCHECK(tap(kRoleJoiner, Kind::Clock, true, false, true, false, false) == Tap::Pass, "joiner_quiet_clocks off");
+    WCHECK(tap(kRoleJoiner, Kind::Clock, true, false, true, false, false) == Tap::QuietDrop,
+           "Paket C: the legacy quiet-clocks bit cannot reopen joined quest timers/watches");
     WCHECK(tap(kRoleHost, Kind::Clock, true, true, true, false, false) == Tap::Pass, "the host's clocks decide");
     WCHECK(tap(kRoleJoiner, Kind::Dialogue, true, true, true, false, false) == Tap::Capture, "I.1: a dialogue out-port is recorded");
     WCHECK(tap(kRoleJoiner, Kind::DialogueStarter, true, true, true, false, false) == Tap::Capture, "a forced dialogue's out-port too");

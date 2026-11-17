@@ -540,6 +540,7 @@ public partial class GameBridge
         // The souls read from the copies' bodies go too: a load reuses entity ids (the live run's stand-ins came
         // back with their old ids), so a cached (id, soul) pair named the dead old soul.
         _copySoulGuid.Clear();
+        ResetNpcDeathDispatch();
         int n = _w131Guarded.Count;
         if (n == 0) return;
         _w131Guarded.Clear();

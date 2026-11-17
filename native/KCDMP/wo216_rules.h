@@ -6,7 +6,7 @@
 // native/tests/wo216_tests.cpp checks them).
 //   A  route_replay: the host reads each streamed NPC's movement task (its request: goal, speed class, exact end) on the AI update's
 //      thread; a copy makes that request once per change; the position stream only corrects.
-//   B  no_brains: no NPC on the joiner runs its own brain -- every body suspended; one the host does not stream is frozen and hidden.
+//   B  no_brains: Paket C gates the decision batch at entry; the census hides unstreamed bodies.
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -15,7 +15,7 @@ namespace kcdmp::wo216rules {
 
 // ---- the agent's switch word (op 160): every bit on until the agent says otherwise; the bench's twin: KCDMP_TEST_W216_OFF=<names|all>
 constexpr uint32_t kBitRouteReplay = 0x001;   // A the host's own request replayed on its copy (off: WO-215's walk-to-sample)
-constexpr uint32_t kBitNoBrains = 0x002;      // B no brain runs on the joiner (off: the bind-time suspend only)
+constexpr uint32_t kBitNoBrains = 0x002;      // B visibility census; Paket C decision authority is mandatory for role 2
 constexpr uint32_t kBitActivityLine = 0x004;  // C one activity line from the host (off: the two descriptions, as 0.64.2)
 constexpr uint32_t kBitOutfits = 0x008;       // D the host NPC's worn items on its copy
 constexpr uint32_t kBitRiders = 0x010;        // E riders attached the engine's way, horses on the route
@@ -181,11 +181,14 @@ constexpr int kParityBins = 31;
 inline int parity_bin(float meanM) { int b = static_cast<int>(meanM * 10.0f); return b < 0 ? 0 : (b >= kParityBins ? kParityBins - 1 : b); }
 
 // ---- B no brain runs on the joiner -----------------------------------------------------------------------------------------------------
-// The census once a second: every NPC body here with a running brain (state 0) is a breach -- named, suspended at once. A body the
-// host does not stream (unbound) is frozen and hidden; a bound copy is moved by A and the owner.
+// The census once a second: state 0 is only a decision breach if the batch entry
+// is not gated. An unbound body is hidden; a bound copy is moved by host requests.
 constexpr double kBrainCensusS = 1.0;
 enum class Body : uint8_t { Figure = 0, Bound = 1, Unbound = 2, Dead = 3 };
-inline bool breach(int brainState) { return brainState == 0; }
+// A running-state byte is not an executed decision: Paket C gates the batch at
+// entry and leaves node state untouched. The host and own saves always run.
+inline bool decision_suppressed(uint8_t role, bool armed) { return role == 2 && armed; }
+inline bool breach(int brainState, bool decisionGated = false) { return brainState == 0 && !decisionGated; }
 // The local player, or the other player's figure. An NPC in that fight stays on screen.
 inline bool fighting_a_player(bool opponentIsLocalPlayer, bool opponentIsPeer) {
     return opponentIsLocalPlayer || opponentIsPeer;

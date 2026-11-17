@@ -36,6 +36,8 @@ public partial class GameBridge
     /// soul's own IsDead) -- never on a reading the engine does not share. No answer from the DLL (an older one): the observer's word.</summary>
     private async Task Wo202AnnounceDeathAsync(string npc, string hp, string src, Func<string, Task> send)
     {
+        if (!NpcDeathDispatchGate.MayAnnounce(_combatRoleApplied, _isDamageAuthority)) return;
+        long life = Interlocked.Read(ref _npcDeathLife);
         byte? dead = null;
         try
         {
@@ -56,6 +58,7 @@ public partial class GameBridge
             }
         }
         catch (Exception) { }
+        if (life != Interlocked.Read(ref _npcDeathLife)) return;
         if (!Wo202Rules.AnnounceDeath(dead))
         {
             long n = Interlocked.Increment(ref _w202DeathRefused);
@@ -63,7 +66,7 @@ public partial class GameBridge
             return;
         }
         Interlocked.Increment(ref _w202DeathAnnounced);
-        Console.WriteLine($"[npcdeath] out: mod observed '{npc}' die locally (hp={hp}, seen by {src}; the engine's soul {(dead == 1 ? "reads dead" : "unread: an older DLL")}) -- sending FATAL{CatchupTag()}");
+        Console.WriteLine($"[npcdeath] out: mod observed '{npc}' die locally (hp={hp}, seen by {src}; the engine's soul {(dead == 1 ? "reads dead" : "unread: an older DLL")}) -- host dispatch{CatchupTag()}");
         try { await send(npc); }
         catch (Exception ex) { Console.WriteLine($"[npcdeath] FATAL for '{npc}' not sent: {ex.GetBaseException().Message}"); }
     }

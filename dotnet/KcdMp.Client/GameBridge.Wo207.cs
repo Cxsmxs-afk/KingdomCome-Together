@@ -235,12 +235,7 @@ public partial class GameBridge
     }
 }
 
-// WO-207 D.2: the joiner's NPC triggers (mp_joiner_npc_triggers, on). WO-206 C1 named two States the joiner's own logic set
-// (trosecko.kovar.KovarJeVKovarne at each change, zaby.henik_hlida_majku.state27): each is written by an AreaTrigger watching a named
-// NPC (the blacksmith in his smithy, Henik at the maypole). On the joiner that NPC is a copy moving on the host's stream, so the trigger
-// fired at its own moments -- receive-only kept the change from being asked of the host, but it still landed here. The game's own quest
-// files name every such trigger (QuestValueIndex.NpcTriggerPaths: 185 in the 1.5.5 files); the joiner's DLL drops their out-port fires
-// like its quiet clocks, and the host's value arrives as a mirror. Sent after every load and every 5 minutes (a module woken since).
+// Paket C: trigger suppression is native and class-based. Unloaded quest paths need no registration.
 public partial class GameBridge
 {
     private volatile bool _w207NpcTrigDue = true;
@@ -251,7 +246,7 @@ public partial class GameBridge
 
     private void Wo207NpcTrigTick()
     {
-        if (!W137Joiner || _where != GameWhere.World) return;
+        if (!HostAuthorityOwned || _where != GameWhere.World) return;
         if (!_w207NpcTrigDue && Environment.TickCount64 - Interlocked.Read(ref _w207NpcTrigAtMs) < 300_000) return;
         if (Interlocked.CompareExchange(ref _w207NpcTrigBusy, 1, 0) != 0) return;
         _ = Task.Run(async () => { try { await Wo207SendNpcTriggersAsync(); } finally { Interlocked.Exchange(ref _w207NpcTrigBusy, 0); } });
@@ -261,35 +256,9 @@ public partial class GameBridge
     {
         _w207NpcTrigDue = false;
         Interlocked.Exchange(ref _w207NpcTrigAtMs, Environment.TickCount64);
-        var clear = await _combat.Wo163Async(Protocol.Wo200OpQuietNodes, [0]);
-        if (clear is not { Ok: true }) { Console.WriteLine("WO207-QUIET the DLL did not take the NPC triggers (an older DLL?) -- the joiner's own triggers still write its States"); return; }
-        if (!W207("joiner_npc_triggers")) return;
-        var idx = await Wo147QuestIndexAsync();
-        if (idx is null) { Console.WriteLine("WO207-QUIET Scripts.pak not read -- the joiner's NPC triggers are not quiet"); return; }
-        // WO-208 D.2 (mp_joiner_player_triggers): the joiner's own player-watching AreaTriggers go quiet too -- the host's value is mirrored
-        var all = idx.NpcTriggerPaths().ToList();
-        int playerN = 0;
-        if (W208("joiner_player_triggers")) { var pl = idx.PlayerTriggerPaths(); playerN = pl.Count; all.AddRange(pl); }
-        var paths = all.Distinct(StringComparer.Ordinal).Where(p => Encoding.ASCII.GetByteCount(p) <= 400).ToList();
-        int resolved = 0, missing = 0, i = 0;
-        while (i < paths.Count)
-        {
-            var batch = new List<byte[]>();
-            int size = 2;
-            while (i < paths.Count && batch.Count < 255)
-            {
-                var pb = Encoding.ASCII.GetBytes(paths[i]);
-                if (size + 2 + pb.Length > 900) break;
-                batch.Add(pb); size += 2 + pb.Length; i++;
-            }
-            var a = new byte[size];
-            a[0] = 1; a[1] = (byte)batch.Count;
-            int o = 2;
-            foreach (var pb in batch) { BinaryPrimitives.WriteUInt16LittleEndian(a.AsSpan(o), (ushort)pb.Length); pb.CopyTo(a, o + 2); o += 2 + pb.Length; }
-            var r = await _combat.Wo163Async(Protocol.Wo200OpQuietNodes, a);
-            if (r is not { Ok: true } x || x.Payload.Length < 2) { Console.WriteLine($"WO207-QUIET the DLL refused NPC triggers at {i}/{paths.Count}"); return; }
-            resolved += x.Payload[0]; missing += x.Payload[1];
-        }
-        Console.WriteLine($"WO207-QUIET joiner: {resolved} NPC trigger(s) of the game's quest files are quiet here ({missing} of {paths.Count} not loaded now; {playerN} of them watch the player, WO-208 D.2) -- the host's world decides their States");
+        var r = await _combat.Wo163Async(Protocol.Wo216OpBrains, []);
+        if (r is { Ok: true } x)
+            Console.WriteLine($"MP-AUTHORITY triggers: {Encoding.ASCII.GetString(x.Payload)} -- class gate; no unloaded-path registration");
+        else Console.WriteLine("MP-AUTHORITY native trigger status unavailable");
     }
 }

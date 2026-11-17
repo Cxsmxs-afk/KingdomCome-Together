@@ -22,6 +22,7 @@
 #include "respawn_actions.h"
 #include "script_context.h"
 #include "wo138.h"
+#include "wo216.h"
 #include "wo187.h"
 
 #include <windows.h>
@@ -705,6 +706,7 @@ int request_on(uint32_t eid, bool action, const char* fragment, const char* tags
 }
 
 bool body_paused(uint32_t eid) {
+    if (wo216::decisions_blocked() && npcdrive::is_bound_eid(eid)) return true;
     void* e = engine::entity_by_id(eid);
     uint64_t w = 0; int st = -1, mk = -1;
     return e && actions::brain_state(e, &w, &st, &mk) && st > 0;

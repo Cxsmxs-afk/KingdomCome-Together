@@ -22,22 +22,19 @@ public partial class GameBridge
     private long _w216RoutePolls, _w216RouteBodiesOut, _w216RouteFramesIn, _w216RouteBodiesIn, _w216RouteUnknown, _w216RouteBad, _w216RouteSkipped;
 
     /// <summary>B: 0 none, 1 the host, 2 a joiner in the host's world and not in a load (the DLL's census runs only then).</summary>
-    private byte Wo216Role() => W137Host ? (byte)1 : (W137Joiner && !Wo136Holding ? (byte)2 : (byte)0);
+    private byte Wo216Role() => W137Host ? (byte)1 : HostAuthorityOwned ? (byte)2 : (byte)0;
     private byte _w216RolePushed = 0xFF;
 
     private async Task Wo216PushNativeAsync()
     {
+        await _hostAuthorityGate.WaitAsync();
         try
         {
             byte role = Wo216Role();
-            _w216RolePushed = role;
-            var body = new byte[5];
-            BitConverter.GetBytes(W216Switch.NativeBits(W216On)).CopyTo(body, 0);
-            body[4] = role;
-            var r = await _combat.Wo163Async(Protocol.Wo216OpConfig, body);
-            if (r is not { Ok: true } && !_w216NativeToldOld) { _w216NativeToldOld = true; Console.WriteLine("MP-W216 the DLL did not take op 160 (an older KCDMP.dll?)"); }
+            if (!await PushHostAuthorityRoleAsync(role) && !_w216NativeToldOld) { _w216NativeToldOld = true; Console.WriteLine("MP-W216 native authority configuration refused -- join requires the current armed DLL"); }
         }
         catch (Exception ex) { Console.WriteLine($"MP-W216 the native word was not sent: {ex.Message}"); }
+        finally { _hostAuthorityGate.Release(); }
     }
 
     private async Task Wo216NativeStatusAsync()

@@ -88,7 +88,10 @@ public partial class GameBridge
             if (r is { Result: 0 } && generation == Interlocked.Read(ref _hostCalendarGeneration) &&
                 _hostCalendarResumeEpoch != 0 && _hostCalendarResumeEpoch == _w206.World && _joinedWorld &&
                 _jj is null && !_w211Holding && !_ownLoadExpected && !_loadGraceOwn)
+            {
+                if (!await ResumeHostAuthorityAsync(generation)) return;
                 r = await _combat.CalendarFollowAsync(2, sample.TargetMs(Environment.TickCount64), sample.Ratio);
+            }
             for (int i = 0; r is { Result: 2 } && i < 3 && !_localSkipActive && !_w140LocalSkipping; i++)
             {
                 if (generation != Interlocked.Read(ref _hostCalendarGeneration)) return;
@@ -144,6 +147,7 @@ public partial class GameBridge
     /// <summary>Read the new load's latch before Ready; the menu's old calendar is not sufficient.</summary>
     private async Task<bool> VerifyHostCalendarAsync(JoinerJoin join)
     {
+        if (!await PrepareHostAuthorityAsync(join)) return false;
         long generation = Interlocked.Read(ref _hostCalendarGeneration);
         await _hostCalendarGate.WaitAsync();
         try
@@ -171,6 +175,7 @@ public partial class GameBridge
     {
         Interlocked.Increment(ref _hostCalendarGeneration);   // in-flight old samples cannot re-arm after this reset
         _hostCalendarArmed = false;
+        await ResetHostAuthorityAsync(why);
         if (why != "role-change") _hostCalendarResumeEpoch = 0;
         lock (_hostCalendarLock) { _hostCalendar = null; _hostCalendarBootstrap = null; }
         _w210HostClock = null;
@@ -191,6 +196,7 @@ public partial class GameBridge
         {
             if (generation != Interlocked.Read(ref _hostCalendarGeneration) || _hostCalendarResumeEpoch != _w206.World ||
                 !_joinedWorld || _isDamageAuthority || _ownLoadExpected || _loadGraceOwn || _jj is not null || !sample.Fresh(Environment.TickCount64)) return;
+            if (!await ResumeHostAuthorityAsync(generation)) return;
             var r = await _combat.CalendarFollowAsync(2, sample.TargetMs(Environment.TickCount64), sample.Ratio);
             if (r is { Result: 1 or 2 } && generation == Interlocked.Read(ref _hostCalendarGeneration))
             {

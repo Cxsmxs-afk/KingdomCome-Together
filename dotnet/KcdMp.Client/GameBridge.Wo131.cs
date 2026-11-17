@@ -158,7 +158,7 @@ public partial class GameBridge
     /// <summary>1c: the mod's own death observer on a joiner -- the host decides deaths, so nothing goes out.</summary>
     private bool Wo131BlockLocalDeath(string npcName)
     {
-        if (!Wo131JoinerActive) return false;
+        if (NpcDeathDispatchGate.MayAnnounce(_combatRoleApplied, _isDamageAuthority)) return false;
         Interlocked.Increment(ref _w131DeathsBlocked);
         Console.WriteLine($"[npcdeath] out: '{npcName}' died locally on the joiner -- NOT sent (WO-131: only the host's world decides a death)");
         return true;

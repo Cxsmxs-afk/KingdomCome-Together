@@ -9,8 +9,7 @@ using KcdMp.Wire;
 namespace KcdMp.Client;
 
 // WO-195: three field fixes from a 0.60.5 joiner's evening (Wo195Rules has the rules; docs/WO-195-findings.md the evidence).
-//   1  mp_dead_release (joiner): at every death apply of a copy ([npcdeath]: owner-death, 0x31 FATAL, 0x27 transition / resync, this
-//      player's own fatal blow) every fight hold goes at once -- WO-132's engagement (logged now: 0.60.5 removed it quietly), WO-147's
+//   1  mp_dead_release (joiner): at every death apply of a copy ([npcdeath]: owner-death, 0x31 FATAL, 0x27 transition / resync) every fight hold goes at once -- WO-132's engagement (logged now: 0.60.5 removed it quietly), WO-147's
 //      own engagement, WO-187's guard hold and opponent wish (and its pin), the DLL's combat mode on the body (op 56). A copy marked dead
 //      is never engaged, held or wished again. One second later the body is checked (WO195-FALL: combat mode off, physics a ragdoll),
 //      two seconds later this player's own combat state (WO195-PLAYER, the mod's Lua).
@@ -119,7 +118,7 @@ public partial class GameBridge
     }
 
     /// <summary>
-    /// Every death apply of a copy (ApplyRemoteNpcDeathAsync, before the apply itself; this player's own fatal blow): every fight hold goes now.
+    /// Every death apply of a copy (ApplyRemoteNpcDeathAsync, before the apply itself): every fight hold goes now.
     ///   WO195-RELEASE npc=&lt;n&gt; path=&lt;owner-death|0x31-fatal|0x27-transition|0x27-resync|local-fatal&gt; engaged=yes|no local=yes|no wish=yes|no
     ///                 guard=yes|no native_held=&lt;engage+guard+wish+pin+combat|none&gt; combat_mode=on|off|? living=yes|no|?
     /// </summary>
@@ -267,14 +266,6 @@ public partial class GameBridge
         Console.WriteLine(r is { Ok: true, Payload.Length: >= 4 } x
             ? $"WO195-CHECK npc={npc} eid=0x{eid:X} dead={(x.Payload[0] == 1 ? "yes" : "no")} combat_mode={Wo195Rules.Tri(x.Payload[1], "on", "off")} living={Wo195Rules.Tri(x.Payload[2], "yes", "no(ragdoll)")} fight_held={(x.Payload[3] == 1 ? "YES" : "no")} marked_dead={(_w195Dead.ContainsKey(npc) ? "yes" : "no")} engaged={(_w132Engaged.ContainsKey(npc) ? "YES" : "no")}"
             : $"WO195-CHECK npc={npc} eid=0x{eid:X} no answer");
-    }
-
-    /// <summary>This player's own fatal blow on a copy (the DLL's LocalHit, died): its name by its soul, then the same release.</summary>
-    private void Wo195OnLocalFatal(Guid soul)
-    {
-        if (!_w195DeadRelease) return;
-        foreach (var (name, v) in _copySoulGuid)
-            if (v.Guid == soul) { _ = Wo195OnCopyDeathAsync(name, "local-fatal"); return; }
     }
 
     // ---------------------------------------------------------------- 2: stealth

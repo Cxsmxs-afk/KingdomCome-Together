@@ -563,4 +563,30 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
         // one byte more is refused before it is sent
         Assert.Throws<ArgumentOutOfRangeException>(() => new LootMsg(kind, 9, text + "x").BuildUp(up, joiner.Id));
     }
+
+    [Fact]
+    public async Task Copy_deaths_are_not_relayed_but_the_joiners_blow_still_reaches_the_host()
+    {
+        var (host, joiner) = await HostAndJoinerAsync();
+        await using var _h = host; await using var _j = joiner;
+        long stripped = Drops("0x30:fatal-not-host"), refused = Drops("0x14:not-host");
+        var body = new byte[2 + Protocol.NpcDamageFixedTail];
+        body[0] = 1; body[1] = (byte)'n';
+        BinaryPrimitives.WriteSingleLittleEndian(body.AsSpan(2 + 4), 12f);
+        body[^1] = Protocol.NpcDamageFlagFatal | Protocol.NpcDamageFlagAttributed;
+        await joiner.SendRawAsync(Frame(Protocol.NpcDamageUp, body));
+        var delivered = await ArrivesAsync(host, Protocol.NpcDamageDown, 1 + body.Length, joiner.Id);
+        Assert.Equal(0, delivered[^1] & Protocol.NpcDamageFlagFatal);
+        Assert.NotEqual(0, delivered[^1] & Protocol.NpcDamageFlagAttributed);
+        Assert.Equal(12f, BitConverter.ToSingle(delivered, 1 + 2 + 4));
+        await joiner.SendRawAsync(Frame(Protocol.DeathUp, new byte[Protocol.DeathUpPayloadLen]));
+        await joiner.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await joiner.ReadUntilAsync(Protocol.Pong, Wait);
+        Assert.Equal(stripped + 1, Drops("0x30:fatal-not-host"));
+        Assert.Equal(refused + 1, Drops("0x14:not-host"));
+        // The host's identical death remains authoritative.
+        await host.SendRawAsync(Frame(Protocol.NpcDamageUp, body));
+        var fatal = await ArrivesAsync(joiner, Protocol.NpcDamageDown, 1 + body.Length, host.Id);
+        Assert.NotEqual(0, fatal[^1] & Protocol.NpcDamageFlagFatal);
+    }
 }

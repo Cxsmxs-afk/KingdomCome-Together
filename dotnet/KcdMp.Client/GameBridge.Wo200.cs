@@ -94,9 +94,17 @@ public partial class GameBridge
         }
     }
 
-    private byte Wo200Role() => W137Host ? Wo200Rules.RoleHost : W137JoinerSession ? Wo200Rules.RoleJoiner : Wo200Rules.RoleNone;
+    private byte Wo200Role() => W137Host ? Wo200Rules.RoleHost : HostAuthorityOwned || W137JoinerSession ? Wo200Rules.RoleJoiner : Wo200Rules.RoleNone;
 
-    private async Task Wo200PushConfigAsync()
+    private async Task<bool> Wo200PushConfigAsync()
+    {
+        await _hostAuthorityGate.WaitAsync();
+        try { return await Wo200PushConfigCoreAsync(); }
+        finally { _hostAuthorityGate.Release(); }
+    }
+
+    // The authority lifecycle already owns _hostAuthorityGate when calling this.
+    private async Task<bool> Wo200PushConfigCoreAsync()
     {
         try
         {
@@ -104,9 +112,11 @@ public partial class GameBridge
             byte role = Wo200Role();
             byte tap = Wo200Rules.TapBits(s1, W200("joiner_quiet_clocks"));
             byte gate = (byte)(Wo200Rules.GateBits(W200("joiner_no_puppet_quests"), s1, W200("s1_route")) | (W201("joiner_no_story_barks") ? 8 : 0));   // WO-201 B7: bit 8
-            await _combat.Wo163Async(Protocol.Wo200OpConfig, [role, (byte)(W137Joiner ? 1 : 0), tap, gate, 1, Wo200ValueBits()]);
+            byte joined = (byte)(HostAuthorityOwned ? 1 : 0);
+            var r = await _combat.Wo163Async(Protocol.Wo200OpConfig, [role, joined, tap, gate, 1, Wo200ValueBits()]);
+            return r is { Ok: true } x && x.Payload.Length >= 2 && x.Payload[0] == role && x.Payload[1] == joined;
         }
-        catch (Exception ex) { Console.WriteLine($"MP-W200 config not pushed ({ex.GetType().Name})"); }
+        catch (Exception ex) { Console.WriteLine($"MP-W200 config not pushed ({ex.GetType().Name})"); return false; }
     }
 
     private void Wo200OnConnect(CancellationToken ct)

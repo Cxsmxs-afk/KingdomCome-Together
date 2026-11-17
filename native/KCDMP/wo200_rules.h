@@ -9,6 +9,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 
 namespace kcdmp::wo200rules {
 
@@ -31,6 +32,7 @@ enum class Kind : uint8_t {
     BodyEffect,       // C_BuffEffect, C_ClothingPresetOverride, C_WeaponPresetOverride: whose body is the soul input's
     SceneStarter,     // WO-203 I.5: C_CutsceneHandler -- a scene (a fader, an in-game cutscene) a consequence starts; its AfterPlay starts the
                       // next conversation frames later, outside the pulse that queued it (the closure is carried there: Tap::ContinueLocal)
+    WorldTrigger,     // Paket C: area's own condition; only the host graph evaluates proximity
     Count
 };
 
@@ -46,7 +48,8 @@ enum class Method : uint8_t {
     Damage,        // TakeDamage (KillNpc), Revive: a soul's life
     Items,         // CreateItems, MoveItems (inventories: money when the library around it is a money one)
     PlayerHorse,   // WO-221 D.1: ReplacePlayerHorse -- the one "player's horse" of this game set (a purchase, a gift)
-    KillSoul,      // WO-221 D.1: Kill -- gated only as the disposal of the old horse that follows a ReplacePlayerHorse
+    KillSoul,      // Kill -- host-only for NPC copies; WO-221's own horse disposal has its explicit pass-through
+    HostTime,      // Paket F3: SetIsNight / WhatTimeIsIt drive story time decisions on the host only
 };
 
 inline const char* last_segment(const char* name) {
@@ -68,7 +71,38 @@ inline Method method_kind(const char* methodName) {
     if (!std::strcmp(s, "CreateItems") || !std::strcmp(s, "MoveItems")) return Method::Items;
     if (!std::strcmp(s, "ReplacePlayerHorse")) return Method::PlayerHorse;
     if (!std::strcmp(s, "Kill")) return Method::KillSoul;
+    if (!std::strcmp(s, "SetIsNight") || !std::strcmp(s, "WhatTimeIsIt")) return Method::HostTime;
     return Method::Other;
+}
+
+// C_Node::GetName/GetParent produce a dotted path (wo137::path_of). Time
+// libraries are sometimes modules rather than reflection methods. Match whole
+// components, never e.g. ResetIsNight or WhatTimeIsItLater.
+inline bool host_time_name(const char* value, size_t n) {
+    if (!value) return false;
+    for (const char* name : {"SetIsNight", "WhatTimeIsIt"}) {
+        if (std::strlen(name) != n) continue;
+        size_t i = 0;
+        for (; i < n; ++i) {
+            char a = value[i], b = name[i];
+            if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+            if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+            if (a != b) break;
+        }
+        if (i == n) return true;
+    }
+    return false;
+}
+inline bool host_time_name(const char* name) { return name && host_time_name(name, std::strlen(name)); }
+inline bool host_time_path(const char* path) {
+    if (!path) return false;
+    for (const char* p = path; *p;) {
+        const char* end = p;
+        while (*end && *end != '.') ++end;
+        if (host_time_name(p, static_cast<size_t>(end - p))) return true;
+        p = *end ? end + 1 : end;
+    }
+    return false;
 }
 
 // Who a node's soul inputs name: the local player, someone else (a copy, the partner's figure, an NPC), or nothing readable.
@@ -84,6 +118,7 @@ enum class Verdict : uint8_t {
     JoinerStoryBark,      // WO-201 B7: the joiner's own quest logic starts no player monologue, dialogue, urged dialogue or focus camera
     HostScene,            // WO-203 I.5: in a replay's closure the host starts no fader or in-game scene (session C: its AfterPlay started the
                           // forced trialog for the host's Henry)
+    HostWorld,            // Paket C/F3: receive-only story decisions (areas and clock functions)
     Count
 };
 
@@ -103,7 +138,7 @@ inline bool handler_may_start(int state) { return state <= 0 || state > kHandler
 
 struct Cfg {
     bool joined = false;       // the joiner is in the host's world (role joiner only)
-    bool puppets = true;       // joiner_no_puppet_quests
+    bool puppets = true;       // legacy wire bit; Paket C makes copy decision authority mandatory while joined
     bool hostClosure = true;   // s1_replay (the host's I.2 rules inside a replay's closure)
     bool route = true;         // s1_route (talker-only, both machines)
     bool storyBarks = true;    // WO-201 B7 joiner_no_story_barks (gate bit 8)
@@ -114,9 +149,9 @@ inline bool needs_target(uint8_t role, Kind k, Method m, bool inClosure, bool mi
     const bool soulKind = k == Kind::BodyEffect || k == Kind::Interrupt ||
                           (k == Kind::Function && (m == Method::AddBuff || m == Method::SetState || m == Method::Damage));
     // I.5's puppet kinds (the WO's list) plus a copy's health written by the joiner's graph (II.1: the host's value only)
-    if (role == kRoleJoiner && c.joined && c.puppets &&
+    if (role == kRoleJoiner && c.joined &&
         (k == Kind::Behaviour || k == Kind::EntityContext || k == Kind::SchedulerLink || k == Kind::Interrupt ||
-         (k == Kind::Function && (m == Method::SetState || m == Method::Damage))))
+         (k == Kind::Function && (m == Method::SetState || m == Method::Damage || m == Method::KillSoul))))
         return true;
     if (role == kRoleJoiner && c.joined && c.route && mirrorTalker && soulKind) return true;
     if (role == kRoleHost && inClosure && c.route && soulKind) return true;
@@ -133,13 +168,14 @@ inline Verdict decide(uint8_t role, Kind k, Method m, Target t, bool inClosure, 
     const bool alwaysPlayer = k == Kind::RewardPlayer || (k == Kind::Function && m == Method::PlayerReward) ||
                               (k == Kind::Function && m == Method::Items && moneyParent);
     if (role == kRoleJoiner && c.joined) {
+        if (k == Kind::WorldTrigger || (k == Kind::Function && m == Method::HostTime)) return Verdict::HostWorld;
         // I.5 first: a quest behaviour on a puppet never runs here, whatever started it (the WO's list: behaviours -- duels, tours,
         // skirmishes --, entity contexts, scheduler links, the teleport interrupts, KillNpc's damage), nor a health written into a copy
         // (II.1: the host's value). The joiner's own Henry is not a puppet. A copy's looks (clothing / weapon presets, buffs) are not
         // refused: no host value replaces them yet (a listed gap) and the mirrored quest state gives them as the host's world does.
-        if (c.puppets) {
+        {
             const bool puppetKind = k == Kind::Behaviour || k == Kind::EntityContext || k == Kind::SchedulerLink || k == Kind::Interrupt ||
-                                    (k == Kind::Function && (m == Method::SetState || m == Method::Damage));
+                                    (k == Kind::Function && (m == Method::SetState || m == Method::Damage || m == Method::KillSoul));
             if (puppetKind && t != Target::Player) return Verdict::PuppetRefused;
         }
         // I.3 on the joiner: the host's own conversation's consequences, mirrored here, reach the host's Henry only.
@@ -186,8 +222,8 @@ inline HorsePass horse_pass(uint8_t role, Kind k, Method m, bool inClosure, bool
 // ContinueLocal (WO-203 I.5): a scene handler a closure started pulses its out-ports (OnQueued, BeforePlay, AfterPlay, OnFinished) frames
 // later; the pulse re-enters that closure for the node gate only -- nothing is captured, nothing goes to the host, no State change is marked.
 enum class Tap : uint8_t { Pass = 0, QuietDrop, Capture, Continue, ContinueLocal };
-inline Tap tap(uint8_t role, Kind ownerKind, bool joined, bool quietClocks, bool capture, bool markedInClosure, bool inClosure) {
-    if (role == kRoleJoiner && joined && quietClocks && ownerKind == Kind::Clock) return Tap::QuietDrop;
+inline Tap tap(uint8_t role, Kind ownerKind, bool joined, bool /*quietClocks*/, bool capture, bool markedInClosure, bool inClosure) {
+    if (role == kRoleJoiner && joined && (ownerKind == Kind::WorldTrigger || ownerKind == Kind::Clock)) return Tap::QuietDrop;
     // a conversation's node (a forced or fader dialogue is one too): the host marks its own talks as well (I.3's mirror rule)
     if ((ownerKind == Kind::Dialogue || ownerKind == Kind::DialogueStarter) && capture && !inClosure) return Tap::Capture;
     if (ownerKind == Kind::Waiter && markedInClosure && !inClosure) return Tap::Continue;
@@ -289,6 +325,7 @@ inline const char* kind_name(Kind k) {
         case Kind::RewardPlayer: return "RewardPlayer";
         case Kind::BodyEffect: return "BodyEffect";
         case Kind::SceneStarter: return "SceneStarter";
+        case Kind::WorldTrigger: return "WorldTrigger";
         default: return "None";
     }
 }
@@ -305,6 +342,7 @@ inline const char* scene_name(Scene s) {
 inline const char* verdict_name(Verdict v) {
     switch (v) {
         case Verdict::PuppetRefused: return "puppet";
+        case Verdict::HostWorld: return "host-world";
         case Verdict::HostDialogue: return "host-dialogue";
         case Verdict::HostView: return "host-view";
         case Verdict::TalkerOnlyHost: return "talker-only-host";

@@ -2163,7 +2163,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                     bool  died    = body.Length >= 25 && body[24] != 0;
                     bool  byPlayer = body.Length >= 26 && body[25] != 0;   // WO-121
                     bool  judge   = body.Length >= 27 && body[26] != 0;   // WO-210 E.2
-                    if (died) Console.WriteLine($"[npcdeath] DLL reports a FATAL local hit on {soul} (hp -{health:F1})");
+                    if (died) Console.WriteLine($"[npcdeath] DLL observed a lethal local reading on {soul}; authority dispatch pending (hp -{health:F1})");
                     if (OnLocalHit is { } handler)
                     {
                         try { await handler(soul, stamina, health, died, byPlayer, judge); }

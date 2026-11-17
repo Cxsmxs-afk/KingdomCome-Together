@@ -497,6 +497,11 @@ public class ClientSession
                 {
                     var body = new byte[Protocol.DeathUpPayloadLen];
                     await ReadExactAsync(body);
+                    if (!_clientHandler.IsDamageAuthority(this))
+                    {
+                        _clientHandler.CountDrop(Protocol.DeathUp, "not-host");
+                        continue;
+                    }
                     _broadcastService.BroadcastDeath(this, body);
                     continue;
                 }
@@ -806,8 +811,14 @@ public class ClientSession
                         // load-bearing -- it is the one event that makes two
                         // worlds agree a body is dead -- so it gets a line
                         // (WO-81 idiom: name the silent decision). Ordinary
-                        // hits stay quiet; the body is forwarded verbatim
-                        // either way, no relay-side state or gate.
+                        // hits stay quiet. Only the host may send the death bit;
+                        // a joiner's numeric blow still goes to the host.
+                        if ((body[payloadLen - 1] & Protocol.NpcDamageFlagFatal) != 0 && !_clientHandler.IsDamageAuthority(this))
+                        {
+                            // An older joiner can request a blow, but its copy cannot decide a death.
+                            body[payloadLen - 1] &= unchecked((byte)~Protocol.NpcDamageFlagFatal);
+                            _clientHandler.CountDrop(Protocol.NpcDamageUp, "fatal-not-host");
+                        }
                         if ((body[payloadLen - 1] & Protocol.NpcDamageFlagFatal) != 0)
                         {
                             string fatalNpc = System.Text.Encoding.UTF8.GetString(body, 1, body[0]);
