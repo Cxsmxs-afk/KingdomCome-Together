@@ -23,6 +23,12 @@ jobs:
       - name: Inno Setup 6
         run: choco install innosetup --no-progress -y
 
+      - name: Relay unit tests
+        run: dotnet test dotnet/KcdMp.Relay.Tests -c Release --logger "trx;LogFileName=relay.trx" --results-directory test-results
+
+      - name: Client unit tests
+        run: dotnet test dotnet/KcdMp.Client.Tests -c Release --logger "trx;LogFileName=client.trx" --results-directory test-results
+
       - name: Build installer, DLL, pak and programs
         shell: pwsh
         run: >
@@ -63,6 +69,13 @@ jobs:
             release/BUILD-*.log
             release/RELEASE-CANDIDATE-*.txt
 
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          if-no-files-found: warn
+          path: test-results/*.trx
+
   sim:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -78,11 +91,6 @@ jobs:
           chmod +x tools/sim/run-sim
           SIM_COMMIT="${GITHUB_SHA::7}" tools/sim/run-sim ci tools/sim/out --timeline both
 
-      - name: Relay and client unit tests
-        run: |
-          dotnet test dotnet/KcdMp.Relay.Tests -c Release --logger "trx;LogFileName=relay.trx" --results-directory test-results
-          dotnet test dotnet/KcdMp.Client.Tests -c Release --logger "trx;LogFileName=client.trx" --results-directory test-results
-
       - uses: actions/upload-artifact@v4
         with:
           name: network-sim
@@ -92,10 +100,4 @@ jobs:
             tools/sim/out/sim-load.json
             tools/sim/out/sim.md
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: unit-test-results
-          if-no-files-found: warn
-          path: test-results/*.trx
 
