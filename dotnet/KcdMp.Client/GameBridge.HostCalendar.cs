@@ -9,6 +9,7 @@ namespace KcdMp.Client;
 public partial class GameBridge
 {
     private readonly SemaphoreSlim _hostCalendarGate = new(1, 1);
+    private readonly SemaphoreSlim _hostCalendarSendGate = new(1, 1);
     private readonly object _hostCalendarLock = new();
     private HostCalendarSample? _hostCalendar;
     private HostCalendarSample? _hostCalendarBootstrap;
@@ -21,15 +22,22 @@ public partial class GameBridge
     /// <summary>A real native reading, including a standing clock. No extrapolation from an old Lua poll while the host holds.</summary>
     private async Task<bool> SendHostCalendarAsync(byte? target = null, bool frozen = false, uint joinId = 0)
     {
-        if (!W137Host || _localSkipActive || _w140LocalSkipping) return false;
-        var read = await _combat.CalendarSnapshotAsync();
-        if (read is not { } clock) return false;
-        int rate = frozen || _w144ClockPaused ? 0 : (int)Math.Round(clock.Ratio * 1000);
-        string text = HostCalendar.Format(clock.WorldMs, rate, CalendarRelayNowMs, _clockOffsetMs.HasValue, joinId != 0 ? joinId : _hostJoin?.JoinId ?? 0);
-        if (target is byte one) await W164SendAsync(one, Protocol.W164Clock, text);
-        else foreach (byte peer in Wo134Peers()) await W164SendAsync(peer, Protocol.W164Clock, text);
-        Interlocked.Increment(ref _w200ClockOut);
-        return true;
+        // Serialize the complete read/send operation: an older periodic read must reach
+        // the reliable channel before a later frozen snapshot, not after it.
+        await _hostCalendarSendGate.WaitAsync();
+        try
+        {
+            if (!W137Host || _localSkipActive || _w140LocalSkipping) return false;
+            var read = await _combat.CalendarSnapshotAsync();
+            if (read is not { } clock) return false;
+            int rate = frozen || _w144ClockPaused ? 0 : (int)Math.Round(clock.Ratio * 1000);
+            string text = HostCalendar.Format(clock.WorldMs, rate, CalendarRelayNowMs, _clockOffsetMs.HasValue, joinId != 0 ? joinId : _hostJoin?.JoinId ?? 0);
+            if (target is byte one) await W164SendAsync(one, Protocol.W164Clock, text);
+            else foreach (byte peer in Wo134Peers()) await W164SendAsync(peer, Protocol.W164Clock, text);
+            Interlocked.Increment(ref _w200ClockOut);
+            return true;
+        }
+        finally { _hostCalendarSendGate.Release(); }
     }
 
     private async Task ReceiveHostCalendarAsync(byte source, string text)
@@ -43,7 +51,9 @@ public partial class GameBridge
         {
             if (generation != Interlocked.Read(ref _hostCalendarGeneration)) return;
             _hostCalendar = sample;   // kept at the menu, before the first host-world frame
-            if (sample.JoinId != 0) _hostCalendarBootstrap = sample;
+            // A pre-hold periodic read can finish sending after the frozen offer sample.
+            // Only the frozen snapshot may own this attempt's bootstrap, even when that older read carries its JoinId.
+            if (sample.IsJoinSnapshot) _hostCalendarBootstrap = sample;
         }
         Interlocked.Increment(ref _w200ClockIn);
         if (!HostCalendarOwned && _hostCalendarResumeEpoch != 0 && _hostCalendarResumeEpoch == _w206.World && _joinedWorld &&

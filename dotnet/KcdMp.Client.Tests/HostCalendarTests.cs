@@ -75,4 +75,16 @@ public class HostCalendarTests
         Assert.True(sample.ReadyForJoin(208100, 123));
         Assert.True(sample.Fresh(208100));   // once armed, the same held load can take its time
     }
+
+    [Fact]
+    public void DelayedPreHoldRunningSampleCannotReplaceFrozenJoinSnapshot()
+    {
+        var frozen = new HostCalendarSample(572161000, 0, 100, 0, 123);
+        var delayed = new HostCalendarSample(572160000, 15000, 200, 0, 123);
+        Assert.True(frozen.IsJoinSnapshot);
+        Assert.True(frozen.ReadyForJoin(208100, 123));
+        Assert.False(delayed.IsJoinSnapshot);   // the receive cache only accepts IsJoinSnapshot
+        Assert.False(delayed.ReadyForJoin(200, 123));
+        Assert.False(new HostCalendarSample(572161000, 0, 100, 0).IsJoinSnapshot);
+    }
 }

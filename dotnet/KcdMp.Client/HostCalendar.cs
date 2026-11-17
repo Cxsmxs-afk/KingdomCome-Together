@@ -10,8 +10,9 @@ public readonly record struct HostCalendarSample(long WorldMs, int Ratio1000, lo
 {
     public const long RunningFreshMs = 10000;
     public double Ratio => Ratio1000 / 1000.0;
+    public bool IsJoinSnapshot => JoinId != 0 && Ratio1000 == 0;
     public bool Fresh(long nowMs) => Ratio1000 == 0 || (nowMs >= ArrivedMs && nowMs - ArrivedMs + TransitMs <= RunningFreshMs);
-    public bool ReadyForJoin(long nowMs, uint joinId) => JoinId == joinId && Fresh(nowMs);
+    public bool ReadyForJoin(long nowMs, uint joinId) => IsJoinSnapshot && JoinId == joinId && Fresh(nowMs);
     public long TargetMs(long nowMs) => Math.Min(HostCalendar.MaxWorldMs, WorldMs + (long)(Math.Max(0, nowMs - ArrivedMs + TransitMs) * Ratio));
 }
 
