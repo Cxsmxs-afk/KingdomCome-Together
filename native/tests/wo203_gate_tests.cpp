@@ -24,10 +24,12 @@ int wo203_gate_tests(int* passed) {
     const uint32_t replay = 0x01000001;            // the host's replay closure of it (peer 1, closure 1)
 
     // ---- the class table grows at its end only (op 74 reports the kind's number; the stats line reads the verdicts by index) ----
-    WCHECK(static_cast<int>(Kind::BodyEffect) == 12 && static_cast<int>(Kind::SceneStarter) == 13 && static_cast<int>(Kind::Count) == 14,
-           "Kind::SceneStarter appended before Count");
-    WCHECK(static_cast<int>(Verdict::JoinerStoryBark) == 6 && static_cast<int>(Verdict::HostScene) == 7 && static_cast<int>(Verdict::Count) == 8,
-           "Verdict::HostScene appended before Count");
+    WCHECK(static_cast<int>(Kind::BodyEffect) == 12 && static_cast<int>(Kind::SceneStarter) == 13 &&
+           static_cast<int>(Kind::WorldTrigger) == 14 && static_cast<int>(Kind::Count) == 15,
+           "WorldTrigger appended; existing kind numbers stay stable");
+    WCHECK(static_cast<int>(Verdict::JoinerStoryBark) == 6 && static_cast<int>(Verdict::HostScene) == 7 &&
+           static_cast<int>(Verdict::HostWorld) == 8 && static_cast<int>(Verdict::Count) == 9,
+           "HostWorld appended; existing verdict numbers stay stable");
     WCHECK(std::strcmp(kind_name(Kind::SceneStarter), "SceneStarter") == 0, "its kind word");
     WCHECK(std::strcmp(verdict_name(Verdict::HostScene), "host-scene") == 0, "its verdict word");
     WCHECK(std::strcmp(scene_name(Scene::Player), "fader-or-ingame") == 0 && std::strcmp(scene_name(Scene::Other), "other") == 0 &&
