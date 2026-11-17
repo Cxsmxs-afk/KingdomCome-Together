@@ -374,6 +374,7 @@ public sealed class LinkWriter
     private readonly ILinkPath _path;
     private readonly SemaphoreSlim _signal = new(0);
     private double _tokens;
+    private bool _bucketSeeded;
     private long _lastRefill = Stopwatch.GetTimestamp();
     public Exception? Failed { get; private set; }
     public long Written, WrittenBytes;
@@ -421,7 +422,11 @@ public sealed class LinkWriter
                 LastRate = st.RateBytesPerS;
                 double rate = st.RateBytesPerS * (1.0 - _sched.Options.Headroom);
                 long now = Stopwatch.GetTimestamp();
-                _tokens = Math.Min(Math.Max(4096, rate * 0.05), _tokens + rate * Stopwatch.GetElapsedTime(_lastRefill, now).TotalSeconds);
+                double cap = Math.Max(4096, rate * 0.05);
+                // A full first burst. An empty bucket made the first pump send nothing whenever the
+                // clock had not moved since the writer was built, so a fast runner dropped the state frame.
+                if (!_bucketSeeded) { _tokens = cap; _bucketSeeded = true; }
+                _tokens = Math.Min(cap, _tokens + rate * Stopwatch.GetElapsedTime(_lastRefill, now).TotalSeconds);
                 _lastRefill = now;
                 budget = (int)Math.Max(0, _tokens);
             }
