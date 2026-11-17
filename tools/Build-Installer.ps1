@@ -218,7 +218,11 @@ if (-not $SkipPublish) {
     # The list is a glob so a new Test-*Synthetic.ps1 is gated the moment it
     # is added; nothing has to remember to register it.
     $suites = Get-ChildItem (Join-Path $PSScriptRoot "Test-*Synthetic.ps1") | Sort-Object Name
-    if ($suites.Count -lt 14) { throw "release gate: expected at least 14 Test-*Synthetic.ps1 suites, found $($suites.Count) -- the tools folder is incomplete" }
+    if ($ArtifactBuild) {
+        Write-Host "Synthetic suites: skipped on the artifact runner (they need the maintainer harness; the native tests and the simulator still run)."
+        $suites = @()
+    }
+    if (-not $ArtifactBuild -and $suites.Count -lt 14) { throw "release gate: expected at least 14 Test-*Synthetic.ps1 suites, found $($suites.Count) -- the tools folder is incomplete" }
     foreach ($suite in $suites) {
         Write-Host "Synthetic suite $($suite.Name) ..."
         & powershell -ExecutionPolicy Bypass -File $suite.FullName
