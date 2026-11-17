@@ -150,11 +150,16 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
             return wo163::kROk;
         }
         case kOpFade: {
-            if (len != 6 || cap < 1) return wo163::kRBadRequest;
+            // A bare blackout has no provenance. Only a supported owner with a
+            // nonzero lease may create/release its own fade.
+            if (len != 11 || cap < 1 || body[1] > 1) return wo163::kRBadRequest;
+            const auto owner = static_cast<fader::Owner>(body[6]);
+            uint32_t token = 0; std::memcpy(&token, body + 7, 4);
+            if (!fader::external(owner) || token == 0) return wo163::kRBadRequest;
             float secs = 0.5f; std::memcpy(&secs, body + 2, 4);
             if (!std::isfinite(secs) || secs < 0.05f || secs > 5.0f) secs = 0.5f;
-            const bool ok = body[1] ? actions::fade_out(secs) : actions::fade_in(secs);
-            logf("WO179-FADE-OWN %s %.2f s %s", body[1] ? "out" : "in", secs, ok ? "ok" : "REFUSED (no fader / not ours)");
+            const bool ok = body[1] ? actions::fade_out(secs, owner, token) : actions::fade_in(secs, owner, token);
+            logf("WO179-FADE-OWN %s owner=%u lease=%u %.2f s %s", body[1] ? "out" : "in", body[6], token, secs, ok ? "ok" : "REFUSED (no fader / not ours)");
             out[0] = ok ? 1 : 0;
             *outLen = 1;
             return wo163::kROk;

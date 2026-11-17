@@ -36,7 +36,7 @@ namespace KcdMp.Client;
 ///   * every host world save while joined -> a QuickSave of this game's copy
 ///     (the one save type that passes the joiner's lock, WO-124 s9.1) -> the
 ///     Henry block is stored, paired with the host save's md5 -> the QuickSave
-///     is moved out of the playline at once and the list rescanned;
+///     is moved out of the playline at once; the engine cache is refreshed only for a load;
 ///   * a host reload takes the joiner along (an in-world rejoin); a save with
 ///     the host world's seed is never "own" (Henry source, leave route,
 ///     Continue check); with no own save to go back to, a listed file with no
@@ -557,23 +557,25 @@ public partial class GameBridge
     }
 
     /// <summary>
-    /// The leave route's target: the newest own save the ENGINE can load -- rescanned and found in its
-    /// cached list (a save that appeared after the game started is not in it, and wh_sys_LoadGame then
+    /// The leave route's target: the newest own save in the engine cache; one refresh at most
+    /// per leave attempt (a save that appeared after the game started is not in it, and wh_sys_LoadGame then
     /// silently loads nothing, WO-112 s3.5). No plugin answer: the newest own save, unchecked (logged).
     /// </summary>
     private async Task<(HenrySource? Save, string Why)> Wo125NewestOwnLoadableAsync()
     {
         if (TestNoOwnSave || ResolveSavesDirForJoin() is not string saves)
             return (Wo125NewestOwn(out string w0), w0);
-        foreach (var s in OwnSaves(saves, HostSeedForOwn(), l => Console.WriteLine(l), Wo157HostedSeed))
-        {
-            var v = WhsSave.VerifyFile(s.Save.FullPath);
-            if (!v.Ok) { Console.WriteLine($"MP-HENRY skipping {s.Save.Display}: {v.Reason}"); continue; }
-            var r = await _combat.SaveListAsync(1, s.Save.Playline, s.Save.Base);
-            if (r is null) { Console.WriteLine($"MP-HENRY leave target {s.Save.Display}: the plugin did not answer the rescan -- used unchecked"); return (s.Save, ""); }
-            if (r.Listed) return (s.Save, "");
-            Console.WriteLine($"MP-HENRY skipping {s.Save.Display} as the leave target: not in the engine's save list even after a rescan");
-        }
+        var selected = await SaveListMaintenance.FindOwnAsync(
+            OwnSaves(saves, HostSeedForOwn(), l => Console.WriteLine(l), Wo157HostedSeed),
+            s =>
+            {
+                var v = WhsSave.VerifyFile(s.Save.FullPath);
+                if (!v.Ok) Console.WriteLine($"MP-HENRY skipping {s.Save.Display}: {v.Reason}");
+                return v.Ok;
+            },
+            (s, op) => _combat.SaveListAsync(op, s.Save.Playline, s.Save.Base),
+            (s, why) => Console.WriteLine($"MP-HENRY leave target {s.Save.Display}: {why}"));
+        if (selected is not null) return (selected.Save, "");
         return (null, "no loadable save of this player's own (with a different playthrough than the host's)");
     }
 
@@ -796,10 +798,11 @@ public partial class GameBridge
             Playline = id?.Playline ?? -1, SinceUtc = DateTime.UtcNow, File = Path.GetFileName(path), Md5 = md5, WorldTag = _joinedTag ?? "", Kind = "leak", State = "written",
         });
         Console.WriteLine($"MP-SAVELOCK LEAK a save of the host's world was written on this joiner: {SaveDisplay(path)} -- moving it out of the playline");
-        _ = Task.Run(async () =>
+        _ = Task.Run(() =>
         {
-            if (_henry.MoveOut(path, "written while in the host's world (a leak)")) _henry.LedgerSet(led.Id, e => e.State = "done");
-            if (id is { } ii) await _combat.SaveListAsync(1, ii.Playline, "-");
+            bool gone = _henry.MoveOut(path, "written while in the host's world (a leak)");
+            if (gone) _henry.LedgerSet(led.Id, e => e.State = "done");
+            Console.WriteLine($"MP-HENRY leak cleanup: moved out={On(gone)}; engine cache refresh deferred until a load");
         });
         return true;
     }
@@ -912,7 +915,7 @@ public partial class GameBridge
             if (!await Wo177WaitQuietAsync("exit-to-menu"))   // WO-177 A5: never a load while a fight is running
             {
                 _henry.MoveOut(path, "a fight is still on: nothing was loaded");
-                await _combat.SaveListAsync(1, pl, name);
+                Console.WriteLine("MP-HENRY exit cancelled: file moved out; cached list not refreshed");
                 return false;
             }
             _ownLoadExpected = true;
@@ -922,7 +925,6 @@ public partial class GameBridge
                 for (int i = 0; i < 120 && _where != GameWhere.Menu; i++) await Task.Delay(1000);
                 await Task.Delay(1500);
                 _henry.MoveOut(path, "the exit file (its load failed as meant)");
-                await _combat.SaveListAsync(1, pl, name);
                 _ownLoadExpected = false;
                 Console.WriteLine($"MP-HENRY back at the main menu after the exit file: {(_where == GameWhere.Menu ? "yes" : "NOT SEEN")}; exit file moved out");
             });

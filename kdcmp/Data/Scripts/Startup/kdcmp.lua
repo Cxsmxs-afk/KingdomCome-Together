@@ -7245,6 +7245,7 @@ function KCD2MP_W136Hold(on, ttlS, why)
     local w = KCD2MP.w136
     local now = os.clock()
     if on then
+        if not w.hold and KCD2MP_W134LedgerReset then KCD2MP_W134LedgerReset("load") end
         local ttl = tonumber(ttlS) or 240
         if not w.hold then
             w.hold, w.holdSince, w.holdWhy = true, now, tostring(why or "?")
@@ -18348,35 +18349,127 @@ end
 -- delta > 0: put pieces back (the host took them); delta < 0: take them out (the
 -- joiner took them). A row older than its container's restock period is left to the
 -- engine (it restocks on its own); restock 0 never expires.
-function KCD2MP_W134ChestApply(rows)
+-- Paket D: receiving a ledger never edits an inventory. One timer owns a small
+-- FIFO slice; every row and large item amount yields, including across pipe bursts.
+function W134.ledgerReset(why)
     local w = KCD2MP.w134
-    local now = W134.worldTime()
-    local applied, expired, skipped = 0, 0, 0
+    KCD2MP._w134LedgerEpoch = (KCD2MP._w134LedgerEpoch or 0) + 1
+    w.ledger = { rows = {}, head = 1, tail = 0, scheduled = false, lastAt = -1e9,
+                 applied = 0, expired = 0, skipped = 0, operations = 0, held = false, epoch = KCD2MP._w134LedgerEpoch, seen = {} }
+end
+function KCD2MP_W134LedgerReset(why) W134.ledgerReset(why) end
+function KCD2MP_W134LedgerLinkHold(on)
+    if not KCD2MP.w134.ledger then W134.ledgerReset("init") end
+    KCD2MP.w134.ledger.linkHeld = on == true
+end
+function KCD2MP_W134LedgerEpoch(tok)
+    local w = KCD2MP.w134
+    if not w.joiner or not w.shared then KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " not-ready"); return end
+    W134.startLoop() -- any initial load reset happens before its epoch is returned
+    if not KCD2MP.w134LoopRunning then KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " not-ready"); return end
+    if not KCD2MP.w134.ledger then W134.ledgerReset("init") end
+    KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " " .. tostring(KCD2MP.w134.ledger.epoch))
+end
+function KCD2MP_W134LedgerHold(on)
+    local w = KCD2MP.w134
+    if not w.ledger then W134.ledgerReset("init") end
+    w.ledger.held = on == true
+end
+function W134.ledgerSchedule(q)
+    if q.scheduled or q.head > q.tail then return end
+    q.scheduled = true
+    Script.SetTimer(50, function()
+        if KCD2MP.w134.ledger ~= q then return end -- the callback belongs to an old world
+        q.scheduled = false
+        KCD2MP_W134LedgerDrain()
+        W134.ledgerSchedule(q)
+    end)
+end
+function KCD2MP_W134ChestApply(rows, epoch, serial, part)
+    local w = KCD2MP.w134
+    if not w.ledger then W134.ledgerReset("init") end
+    local q = w.ledger
+    if epoch ~= nil and tonumber(epoch) ~= q.epoch then return false end
+    local key = serial and part and (tostring(serial) .. ":" .. tostring(part)) or nil
+    if key and q.seen[key] then return true end
     for _, r in ipairs(rows or {}) do
-        local name, cls, delta, hp, t, rd = tostring(r[1]), tostring(r[2]), tonumber(r[3]) or 0, tonumber(r[4]) or 1, tonumber(r[5]) or 0, tonumber(r[6]) or 0
+        q.tail = q.tail + 1
+        q.rows[q.tail] = { tostring(r[1]), tostring(r[2]), tonumber(r[3]) or 0,
+                         tonumber(r[4]) or 1, tonumber(r[5]) or 0, tonumber(r[6]) or 0, 0 }
+    end
+    if key then q.seen[key] = true end
+    W134.ledgerSchedule(q)
+    return true
+end
+function W134.ledgerCount(e, cls)
+    local ok, n = pcall(function() return tonumber(e.inventory:GetCountOfClass(cls)) end)
+    return ok and n and n >= 0 and n or nil
+end
+function KCD2MP_W134LedgerDrain()
+    local w = KCD2MP.w134
+    local q = w.ledger
+    if not q or q.head > q.tail then return 0 end
+    local start = os.clock()
+    if start - q.lastAt < 0.05 or q.held or q.linkHeld or not player then return 0 end
+    if not w.joiner or not w.shared then W134.ledgerReset("role"); return 0 end
+    if KCD2MP_W136Held and KCD2MP_W136Held() then return 0 end
+    if KCD2MP_Wo124WhereNow and KCD2MP_Wo124WhereNow() ~= "world" then return 0 end
+    q.lastAt = start
+    local operations = 0
+    while q.head <= q.tail and operations < 8 do
+        if operations > 0 and os.clock() - start >= 0.002 then break end
+        local r = q.rows[q.head]
+        local name, cls, delta, hp, t, rd = r[1], r[2], r[3], r[4], r[5], r[6]
+        local now = W134.worldTime()
         local e = nil
         pcall(function() e = System.GetEntityByName(name) end)
-        if rd > 0 and (now - t) > rd * 86400 then
-            expired = expired + 1
-        elseif not (e and W134.isChest(e)) or delta == 0 then
-            skipped = skipped + 1
-        elseif KCD2MP_W201InvBusy and KCD2MP_W201InvBusy(name) then   -- WO-201 B5: this chest's screen is open
-            local row = r
-            KCD2MP_W201InvDefer("w134-chest", name .. ":" .. cls, "a chest row from the host's ledger", function() KCD2MP_W134ChestApply({ row }) end)
+        local done = true
+        if rd > 0 and now - t > rd * 86400 then q.expired = q.expired + 1
+        elseif not (e and W134.isChest(e)) or delta == 0 then q.skipped = q.skipped + 1
+        elseif KCD2MP_W201InvBusy and KCD2MP_W201InvBusy(name) then break -- retry FIFO after this screen closes
         else
-            if delta > 0 then
-                pcall(function() e.inventory:CreateItem(cls, hp, delta) end)
+            local before = r[9] or W134.ledgerCount(e, cls)
+            if before == nil then break end -- no blind edit when its readback is unavailable
+            local amount = r[10] or math.min(8, math.abs(delta))
+            if delta < 0 and before == 0 and not r[9] then
+                r[3] = 0 -- nothing remains in this container to remove
             else
-                W134.deleteClass(e, cls, -delta, hp, nil)
+                if not r[9] then
+                    r[9], r[10] = before, amount -- keep until a read confirms even a partially faulted edit
+                    w.chestSess[name] = nil -- invalidate BEFORE mutation, even when its readback must wait
+                    if delta > 0 then pcall(function() e.inventory:CreateItem(cls, hp, amount) end)
+                    else pcall(W134.deleteClass, e, cls, amount, hp, nil) end
+                end
+                local after = W134.ledgerCount(e, cls)
+                if after == nil then break end -- reconcile this edit on the next slice; never repeat it blindly
+                local moved = math.min(amount, math.max(0, delta > 0 and after - before or before - after))
+                r[9], r[10] = nil, nil
+                if moved == 0 then break end -- refused/failed: no successful-row event; retry later
+                r[3] = delta > 0 and delta - moved or delta + moved
+                r[7] = r[7] + (delta > 0 and moved or -moved)
+                if delta < 0 and after == 0 then r[3] = 0 end
             end
-            applied = applied + 1
-            w.chestSess[name] = nil   -- re-snapshot: this is not the player's doing
+            done = r[3] == 0
+            if done then
+                if r[7] ~= 0 then
+                    q.applied = q.applied + 1
+                    KCD2MP_EmitEvent("w134_ledger_row", string.format("%d %s %s %d", q.epoch, name, cls, r[7]))
+                else q.skipped = q.skipped + 1 end
+            end
+            w.chestSess[name] = nil -- a ledger edit is not a player's take
         end
+        operations = operations + 1
+        if done then q.rows[q.head] = nil; q.head = q.head + 1 end
     end
-    local s = w.stats
-    s.applied, s.expired, s.skipped = s.applied + applied, s.expired + expired, s.skipped + skipped
-    W134.log(string.format("WO134-CHEST apply rows=%d applied=%d expired=%d skipped=%d world_t=%d", #(rows or {}), applied, expired, skipped, math.floor(now)))
-    KCD2MP_EmitEvent("w134_applied", string.format("%d %d %d", applied, expired, skipped))
+    q.operations = q.operations + operations
+    if q.head > q.tail then
+        local s = w.stats
+        s.applied, s.expired, s.skipped = s.applied + q.applied, s.expired + q.expired, s.skipped + q.skipped
+        W134.log(string.format("WO134-CHEST apply rows=%d applied=%d expired=%d skipped=%d operations=%d -- bounded ledger complete", q.tail, q.applied, q.expired, q.skipped, q.operations))
+        KCD2MP_EmitEvent("w134_applied", string.format("%d %d %d", q.applied, q.expired, q.skipped))
+        q.rows = {}; q.head = 1; q.tail = 0; q.applied = 0; q.expired = 0; q.skipped = 0; q.operations = 0
+    end
+    return operations
 end
 
 -- ---- the loop -------------------------------------------------------------------------
@@ -18439,6 +18532,7 @@ function W134.loop()
 end
 
 function W134.forgetWorld(why)
+    W134.ledgerReset(why)
     local w = KCD2MP.w134
     local n = 0
     for _ in pairs(w.chestSess) do n = n + 1 end
@@ -18454,7 +18548,7 @@ function W134.startLoop()
     -- before it belongs to a world that is gone. Found live: a host reload beside a
     -- chest diffed the old snapshot against the reloaded chest and logged a take and
     -- a put nobody made.
-    W134.forgetWorld("loop-start")
+    if not (w.ledger and w.ledger.linkHeld) then W134.forgetWorld("loop-start") end
     KCD2MP.w134LoopRunning = true
     KCD2MP._w134LoopAliveAt = os.clock()
     Script.SetTimer(w.loopMs, W134.loop)
@@ -18469,6 +18563,7 @@ function KCD2MP_W134Tick(joiner, host, shared, peers)
     w.host = host == true
     w.shared = shared == true
     w.peers = tonumber(peers) or 0
+    if (not w.joiner or not w.shared) and not (w.ledger and w.ledger.linkHeld) then W134.ledgerReset("role") end
     w.aliveAt = os.clock()
     pcall(W134.installPickup)
     if w.shared and (w.joiner or w.host) then W134.startLoop() end
@@ -30943,7 +31038,7 @@ System.AddCCommand("mp_scene_ingame_skip_both", 'KCD2MP_W194SetSkip(%line)', "WO
 --   mp_action_forget on|off      (both) the receiver forgets a partner at every disconnect, re-naming and join (their actions start fresh)
 --   mp_sweep_fight_guard on|off  (joiner) no sweep resets a copy that fights or fought in the last 10 s, whatever the trigger
 --   mp_attacker_bind on|off      (both) an NPC or animal that turns on a partner is streamed at once (the host); a missing one is asked for
---   mp_fader_bound on|off        (joiner) a black screen that belongs to no scene ends the game's own way after 3 s
+--   mp_fader_bound on|off        (joiner) recover an identified waiting conversation; an unknown fader has no default timeout
 KCD2MP.w191 = KCD2MP.w191 or { forget = true, fightGuard = true, attackerBind = true, faderBound = true,
     fightAt = {}, fightWhy = {}, fightStart = {}, toldFor = {}, pins = {},
     stats = { skips = 0, marks = 0, pins = 0, pinRefused = 0 } }
@@ -30966,7 +31061,7 @@ end
 function KCD2MP_W191SetForget(arg) return KCD2MP_W191Switch("action_forget", "forget", arg, "a partner's actions start a fresh order at every (re)connect") end
 function KCD2MP_W191SetFightGuard(arg) return KCD2MP_W191Switch("sweep_fight_guard", "fightGuard", arg, "a copy that fights is never reset by a sweep") end
 function KCD2MP_W191SetAttackerBind(arg) return KCD2MP_W191Switch("attacker_bind", "attackerBind", arg, "an NPC or animal attacking a partner always has a body there") end
-function KCD2MP_W191SetFaderBound(arg) return KCD2MP_W191Switch("fader_bound", "faderBound", arg, "a black screen with no scene ends after 3 s") end
+function KCD2MP_W191SetFaderBound(arg) return KCD2MP_W191Switch("fader_bound", "faderBound", arg, "only an identified waiting conversation is recovered; unknown faders are left unchanged") end
 
 -- 2: the agent's sign that a copy fights (engaged, the host's NPC in combat or targeting a player, a blow, a swing at it).
 function KCD2MP_W191FightMark(name, why)
@@ -31072,7 +31167,7 @@ end
 System.AddCCommand("mp_action_forget", 'KCD2MP_W191SetForget(%line)', "WO-191: (both) your partner's actions start a fresh order whenever they (re)connect, so none is refused as stale after a restart (default on): mp_action_forget on|off")
 System.AddCCommand("mp_sweep_fight_guard", 'KCD2MP_W191SetFightGuard(%line)', "WO-191: (joiner) a copy that is fighting, or fought in the last 10 s, is never reset (default on): mp_sweep_fight_guard on|off")
 System.AddCCommand("mp_attacker_bind", 'KCD2MP_W191SetAttackerBind(%line)', "WO-191: (both) an NPC or animal attacking a partner is always shown on their screen (default on): mp_attacker_bind on|off")
-System.AddCCommand("mp_fader_bound", 'KCD2MP_W191SetFaderBound(%line)', "WO-191: (joiner) a black screen that belongs to no scene ends after 3 s (default on): mp_fader_bound on|off")
+System.AddCCommand("mp_fader_bound", 'KCD2MP_W191SetFaderBound(%line)', "WO-191: (joiner) recover only an identified waiting conversation; no default timeout or global override for unknown black screens (default on): mp_fader_bound on|off")
 
 -- ===== WO-195: dead copies fall and end the fight, stealth for the joiner, a body's key ==========================================
 -- The agent's part is GameBridge.Wo195.cs, the DLL's wo195.cpp (docs/WO-195-findings.md). The switches (all default ON):

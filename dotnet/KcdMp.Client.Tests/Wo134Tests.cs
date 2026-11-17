@@ -204,6 +204,21 @@ public class Wo134Tests
     }
 
     [Fact]
+    public void A_large_ledger_is_sent_in_small_epoch_scoped_pieces_without_losing_rows()
+    {
+        var rows = Enumerable.Range(0, 1000).Select(i => E($"stash[Chest/{i}]", Dice, i + 1, 1000, 0)).ToList();
+        var calls = Wo134Rules.ApplyCalls(rows, epoch: 1234);
+        var rowCounts = calls.Select(c => System.Text.RegularExpressions.Regex.Matches(c, @"stash\[Chest/").Count).ToArray();
+        Assert.Equal(rows.Count, rowCounts.Sum());
+        Assert.All(rowCounts, n => Assert.InRange(n, 1, 8));
+        Assert.All(calls, c => Assert.EndsWith("},1234) end", c));
+        Assert.All(calls, c => Assert.True(Uri.EscapeDataString("#" + c).Length < 2100));
+        var retryCalls = Wo134Rules.ApplyCalls(rows, epoch: 1234, serial: 99);
+        Assert.Equal(retryCalls, Wo134Rules.ApplyCalls(rows, epoch: 1234, serial: 99));
+        for (int i = 0; i < retryCalls.Count; i++) Assert.EndsWith($"}},1234,99,{i + 1}) end", retryCalls[i]);
+    }
+
+    [Fact]
     public void A_broken_ledger_file_is_an_empty_ledger_and_bad_rows_are_dropped()
     {
         Assert.Empty(Wo134Rules.Ledger.FromJson("{not json").Entries);

@@ -16,8 +16,9 @@
 //   31 Config [on:1] -> [on:1]   (255 = unchanged; on = mp_scene_guard's eyes and the bus's source)
 //   32 Poll [sinceSeq:4] -> [lastSeq:4][faded:1][havePos:1][x:4][y:4][z:4][n:1] then n x
 //        [seq:4][kind:1][ageMs:4][fx:4][fy:4][fz:4][tx:4][ty:4][tz:4]   (kind 1 fade on, 2 fade off, 3 jump, 4 own jump)
-//   33 Fade [out:1][seconds:4 float] -> [ok:1]   the partner's own fade around a bring-along (the WO-113 fader: C_BasicFader
-//        'KCDMP_respawn' on the RTTI-checked controller); out=0 fades back in (only after this DLL's own fade-out)
+//   33 Fade [out:1][seconds:4 float][owner:1][lease:4] -> [ok:1]; known owner only
+//        (2 video landing, 3 wake, 4 harness), lease nonzero. Out=0 releases only
+//        that exact owner/lease. An anonymous request or another owner's release is refused.
 #pragma once
 #include <cstddef>
 #include <cstdint>

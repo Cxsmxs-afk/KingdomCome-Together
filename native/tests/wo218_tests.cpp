@@ -4,11 +4,17 @@
 // WO-218: engine-free checks of wo218_rules.h (the pipe's batch). Linked into KCDMP_NativeTests; wo218_tests() returns the failures.
 #include <cstdio>
 #include "wo218_rules.h"
+#include "pipe_outbox.h"
+#include <future>
+#include <mutex>
+#include <thread>
+#include <chrono>
 
 namespace {
 int g_fail = 0, g_pass = 0;
 #define CHECK(c) do { if (c) ++g_pass; else { std::printf("FAIL  %s:%d  %s\n", __FILE__, __LINE__, #c); ++g_fail; } } while (0)
 using namespace kcdmp::wo218rules;
+namespace pipeout = kcdmp::pipeout;
 }
 
 int wo218_tests(int* passed) {
@@ -48,6 +54,68 @@ int wo218_tests(int* passed) {
     CHECK(c.b.size() <= kReplyCap && c.cut > 0 && c.subs == 70);
     // the frame's budget: one always runs, then while under 2 ms
     CHECK(may_run(0, 9999.0) && may_run(3, 1999.0) && !may_run(1, 2000.0));
+    CHECK(!may_run(8, 0));
+    FrameBudget budget;
+    budget.begin(1); budget.add(1, 20); // one single request
+    for (int i = 0; i < 7; ++i) { CHECK(budget.may_run()); budget.add(1, 20); }
+    CHECK(!budget.may_run());
+    budget.begin(1); CHECK(!budget.may_run()); // another drain in the same frame has no fresh allowance
+    budget.begin(2); CHECK(budget.may_run());
+    budget.add(1, 2500000); CHECK(!budget.may_run()); // a nonpreemptible engine call does not admit a second call
+    budget.begin(3); CHECK(budget.may_run());
+    std::vector<int> applied;
+    for (int frame = 4, next = 0; next < 255; ++frame) {
+        budget.begin(frame);
+        while (next < 255 && budget.may_run()) { applied.push_back(next++); budget.add(1, 1); }
+        CHECK(budget.ran <= 8);
+    }
+    CHECK(applied.size() == 255);
+    for (int i = 0; i < 255; ++i) CHECK(applied[i] == i); // carries preserve reliable order
+    using pipeout::Outbox;
+    auto row = [](uint8_t flags, uint8_t hp, uint8_t x) {
+        std::vector<uint8_t> r(27, 0); // one row, name 'n'
+        r[0] = 0xA0; r[1] = 24; r[3] = 1; r[4] = flags; r[5] = x; r[21] = hp; r[25] = 1; r[26] = 'n';
+        return r;
+    };
+    Outbox tx;
+    CHECK(tx.push_wire(row(0, 100, 1))); // initial life state is reliable
+    CHECK(tx.push_wire(row(0, 100, 2)) && tx.push_wire(row(0, 100, 3)) && tx.sample_count() == 1);
+    std::vector<uint8_t> frame;
+    CHECK(tx.pop(&frame) && frame[5] == 1);
+    CHECK(tx.pop(&frame) && frame[5] == 3 && tx.empty()); // replace movement, no backlog
+    CHECK(tx.push_wire(row(0, 100, 4)));
+    CHECK(tx.push_wire(row(1, 0, 5)) && tx.sample_count() == 0); // death erases an older alive position
+    CHECK(tx.push_reliable({0x9E, 1}) && tx.push_reliable({0x90, 2}));
+    CHECK(tx.pop(&frame) && frame[4] == 1 && frame[5] == 5);
+    CHECK(tx.pop(&frame) && frame[0] == 0x9E);
+    CHECK(tx.pop(&frame) && frame[0] == 0x90 && tx.empty()); // quest/hit order survives samples
+    for (uint8_t flags : {uint8_t{2}, uint8_t{4}, uint8_t{32}, uint8_t{8}}) {
+        CHECK(tx.push_wire(row(flags, 50, 6)) && tx.sample_count() == 0);
+        CHECK(tx.pop(&frame) && frame[4] == flags); // KO/draw/engage/swing stay reliable
+    }
+    CHECK(tx.push_wire(row(0, 49, 7)) && tx.sample_count() == 0 && tx.pop(&frame)); // HP change too
+    CHECK(!pipeout::same_connection(1, 2, true) && !pipeout::same_connection(2, 2, false) && pipeout::same_connection(2, 2, true));
+    tx.push_sample("old", {1}); tx.clear(); CHECK(tx.empty()); // reconnect cannot reuse old handle's queued records
+    CHECK(tx.push_reliable(std::vector<uint8_t>(Outbox::kReliableBytes, 1)));
+    CHECK(!tx.push_reliable({2}) && tx.reliable_bytes() == Outbox::kReliableBytes); // caller must fail connection, no silent drop
+    tx.clear();
+    // A writer owns the popped buffer while its I/O is blocked. Producers can
+    // still queue a reliable death; no queue lock crosses the simulated write.
+    std::mutex mx;
+    std::promise<void> blocked, release;
+    auto released = release.get_future().share();
+    auto blockedFuture = blocked.get_future();
+    tx.push_reliable({10});
+    std::thread writer([&] {
+        std::vector<uint8_t> owned;
+        { std::lock_guard<std::mutex> l(mx); tx.pop(&owned); }
+        blocked.set_value(); released.wait();
+    });
+    CHECK(blockedFuture.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    auto producer = std::async(std::launch::async, [&] { std::lock_guard<std::mutex> l(mx); return tx.push_reliable({11}); });
+    CHECK(producer.wait_for(std::chrono::milliseconds(250)) == std::future_status::ready);
+    release.set_value(); writer.join(); CHECK(producer.get());
+    CHECK(tx.pop(&frame) && frame[0] == 11);
     // what one frame served
     FrameCount f;
     f.add(10, 1); f.add(10, 2); f.add(11, 1); f.add(13, 5);

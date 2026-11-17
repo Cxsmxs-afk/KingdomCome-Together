@@ -142,8 +142,8 @@ public partial class GameBridge
                     catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(path)}: {ex.Message}"); }
                     if (!gone) return;
                     if (j.PlacedPath == path) j.PlacedPath = null;
-                    var after = await _combat.SaveListAsync(1, pl, name);
-                    Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: removed {SaveDisplay(path)} now that the game answers from {(w == "menu" ? "the main menu" : "a world")}; rescan listed={(after is null ? "?" : On(after.Listed))}");
+                    var after = await _combat.SaveListAsync(3, pl, name);
+                    Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: removed {SaveDisplay(path)} now that the game answers from {(w == "menu" ? "the main menu" : "a world")}; cached listed={(after is null ? "?" : On(after.Listed))} (not refreshed)");
                     return;
                 }
                 if (w != told) { told = w; Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: {SaveDisplay(path)} still kept -- the game is {w}"); }

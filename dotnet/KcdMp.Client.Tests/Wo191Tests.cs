@@ -270,6 +270,28 @@ public class Wo191Tests
     }
 
     [Fact]
+    public void Fader_recovery_requires_the_same_known_waiting_holder_throughout_its_lifecycle()
+    {
+        var c = new Wo191Rules.PendingConversation();
+        Assert.Null(c.Capture(1_000));   // unknown black: no timer or global FaderSuspend recovery
+        const string start = "New dialogue 'test (normal - Id: 175) (Actor::RequestDialog)' is starting. Params: souls = 'Ex: Dude; Ex: npc' forced = false";
+        c.OnLine(start, 2_000);
+        Assert.Null(c.Capture(1_000));   // a later dialogue cannot own an earlier fade
+        var holder = c.Capture(2_000)!.Value;
+        Assert.True(c.StillWaiting(holder));
+        c.OnLine("[ID: 175] DialogCommand-Anim: dialogId=175, who=X, anim=Y", 2_001);
+        Assert.False(c.StillWaiting(holder));   // running, never interrupted
+        c.OnLine(start, 3_000);
+        Assert.False(c.StillWaiting(holder));   // same id, a new attempt
+        holder = c.Capture(3_000)!.Value;
+        c.Clear();                              // load/disconnect
+        Assert.False(c.StillWaiting(holder));
+        Assert.Null(c.Capture(4_000));
+        Assert.Contains("unknown owner", Wo191Rules.HolderText(-1));
+        Assert.DoesNotContain("black lifted", Wo191Rules.HolderText(-1));
+    }
+
+    [Fact]
     public void The_switches_ship_on()
     {
         Assert.True(Wo191Rules.DefaultActionForget && Wo191Rules.DefaultFightGuard && Wo191Rules.DefaultAttackerBind && Wo191Rules.DefaultFaderBound);

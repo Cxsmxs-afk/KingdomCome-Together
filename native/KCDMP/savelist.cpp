@@ -253,11 +253,19 @@ Report query(bool rescan, int playline, const char* name) {
     if (!resolve()) return r;
     void* mgr = manager();
     if (!mgr) { logf("MP-SAVELIST query: no manager (GetGameIface()->+0x%zX null)", g_mgrOff); return r; }
-    if (rescan && !seh_update(mgr)) { logf("MP-SAVELIST UpdateSaveGameDescriptions FAULTED"); return r; }
+    if (rescan) {
+        // This export is monolithic and engine-affine. Only an explicit load
+        // transition may ask for it; production polling/cleanup uses rescan=false.
+        const ULONGLONG started = GetTickCount64();
+        const bool updated = seh_update(mgr);
+        logf("MP-SAVELIST explicit_refresh_ms=%llu nonpreemptible=1 ok=%d", GetTickCount64() - started, updated ? 1 : 0);
+        if (!updated) return r;
+    }
     if (!seh_current(mgr, &r.current)) return r;
     if (playline >= 0) {
         if (!seh_count(mgr, playline, &r.count) || r.count < 0 || r.count > 4096) return r;
-        for (int i = 0; i < r.count && name && name[0]; ++i) {
+        const bool findName = name && name[0] && std::strcmp(name, "-") != 0;
+        for (int i = 0; i < r.count && findName; ++i) {
             const void* d = nullptr; char nm[64];
             if (!seh_desc(mgr, playline, i, &d) || !d) continue;
             if (seh_name(d, nm, sizeof(nm)) && _stricmp(nm, name) == 0) { r.listed = true; r.idx = i; break; }

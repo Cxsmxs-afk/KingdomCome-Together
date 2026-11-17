@@ -72,7 +72,10 @@ local function mkInventory()
         self.list[#self.list + 1] = w
     end
     inv.DeleteItem = function(self, w, n)
-        for i, x in ipairs(self.list) do if x == w then table.remove(self.list, i); ITEMS[w] = nil; return true end end
+        for i, x in ipairs(self.list) do if x == w then
+            if n and n > 0 and ITEMS[w].amount > n then ITEMS[w].amount = ITEMS[w].amount - n
+            else table.remove(self.list, i); ITEMS[w] = nil end
+            return true end end
         return false
     end
     inv.RemoveItem = function(self, w) for i, x in ipairs(self.list) do if x == w then table.remove(self.list, i); return w end end end
@@ -223,6 +226,7 @@ local EGG = "7ae2e77b-bdae-46cb-b6ac-f532cf225748"
 local SWORD = "b0fc8e19-af72-4771-9517-caec4f568920"
 
 local function world()
+    KCD2MP_W134Tick(false, false, false, 0) -- a real role/world reset invalidates pending ledger callbacks
     for n in pairs(ENTS) do ENTS[n] = nil end
     ENTS["Dude"] = player
     player.inventory = mkInventory()
@@ -250,6 +254,7 @@ local function asHost(peers)
     KCD2MP_W134Tick(false, true, true, peers or 1)
     TIMERS = {}
 end
+local function drain() KCD2MP.w134.ledger.scheduled = false; return KCD2MP_W134LedgerDrain() end
 local function loop() NOW = NOW + 0.25; KCD2MP.w134.loopOnce(); TIMERS = {} end
 local function firstTok(kind) local e = events(kind)[1]; return e and string.match(e, "^(%S+)") end
 
@@ -445,6 +450,7 @@ LOG = {}; loop(); grave.inventory.list = {}; loop()
 check("C4 a grave is never a chest", #events("w134_chest") == 0)
 KCD2MP_W134Tick(false, true, false, 0); TIMERS = {}
 ch.inventory:CreateItem(DICE, 1, 1)
+NOW = NOW + 0.05; drain()
 LOG = {}; loop(); loop()
 check("C5 not a shared world: nothing recorded", #events("w134_chest") == 0)
 world(); asJoiner()
@@ -458,6 +464,8 @@ KCD2MP_W134ChestApply({ { "stash[Chest/a]", DICE, 1, 1, 1000 + 9 * 86400, 7 },
                         { "stash[Chest/b]", DICE, -1, 1, 1000, 0 },
                         { "stash[Chest/c]", APPLE, 2, 1, 1000, 7 },
                         { "stash[Chest/nowhere]", APPLE, 1, 1, 1000, 0 } })
+check("D ledger receive performs no inventory work", ca.inventory:GetCountOfClass(DICE) == 0 and cb.inventory:GetCountOfClass(DICE) == 1)
+NOW = NOW + 0.05; drain()
 check("C6 A is full again for the joiner (the host's take put back)", ca.inventory:GetCountOfClass(DICE) == 1)
 check("C6 B stays empty for him (his own take)", cb.inventory:GetCountOfClass(DICE) == 0)
 check("C6 an entry past its restock is left to the engine", cc.inventory:GetCountOfClass(APPLE) == 0)
@@ -467,6 +475,119 @@ KCD2MP_W134ChestApply({ { "stash[Chest/a]", DICE, 1, 1, WORLD_T, 7 } })
 LOG = {}; loop(); loop()
 check("C7 an apply beside a chest is never recorded as the joiner's take or put", #events("w134_chest") == 0)
 player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
+
+-- Paket D: many commands share one game-side budget; partial stacks, holds,
+-- old timers and old HTTP commands cannot make a new world's inventory burst.
+world(); asJoiner()
+local budgetChest = mkChest("stash[Chest/budget]", "Stash", 300, 300, 10, 0)
+for i = 1, 80 do KCD2MP_W134ChestApply({ { "stash[Chest/budget]", DICE, 1, 1, WORLD_T, 0 } }) end
+check("D80 commands only queue", budgetChest.inventory:GetCountOfClass(DICE) == 0)
+NOW = NOW + 0.05
+check("D80 first slice takes at most eight operations", drain() == 8 and budgetChest.inventory:GetCountOfClass(DICE) == 8)
+check("D80 another drain in same window cannot bypass budget", drain() == 0)
+KCD2MP_W134LedgerHold(true); NOW = NOW + 1
+check("D snapshot holds queued inventory work", drain() == 0 and budgetChest.inventory:GetCountOfClass(DICE) == 8)
+KCD2MP_W134LedgerHold(false)
+while KCD2MP.w134.ledger.head <= KCD2MP.w134.ledger.tail do NOW = NOW + 0.051; drain() end
+check("D bounded slices preserve every row", budgetChest.inventory:GetCountOfClass(DICE) == 80)
+KCD2MP_W134ChestApply({ { "stash[Chest/budget]", APPLE, 65, 1, WORLD_T, 0 } })
+NOW = NOW + 0.051; drain()
+check("D large amounts yield in eight-piece chunks", budgetChest.inventory:GetCountOfClass(APPLE) == 64)
+NOW = NOW + 0.051; drain()
+check("D large amount completes exactly", budgetChest.inventory:GetCountOfClass(APPLE) == 65)
+KCD2MP_W134ChestApply({ { "stash[Chest/budget]", APPLE, -65, 1, WORLD_T, 0 } })
+NOW = NOW + 0.051; drain(); NOW = NOW + 0.051; drain()
+check("D removals preserve exact partial-stack counts", budgetChest.inventory:GetCountOfClass(APPLE) == 0)
+local wasBusy = KCD2MP_W201InvBusy
+KCD2MP_W201InvBusy = function() return true end
+KCD2MP_W134ChestApply({ { "stash[Chest/budget]", APPLE, 1, 1, WORLD_T, 0 } }); NOW = NOW + 0.051
+check("D an open inventory waits without flushing a ledger burst", drain() == 0 and budgetChest.inventory:GetCountOfClass(APPLE) == 0)
+KCD2MP_W201InvBusy = wasBusy
+local wasWhere = KCD2MP_Wo124WhereNow
+KCD2MP_Wo124WhereNow = function() return "menu" end; NOW = NOW + 0.051
+check("D menu work stays queued", drain() == 0)
+KCD2MP_Wo124WhereNow = wasWhere; NOW = NOW + 0.051; drain()
+check("D work resumes after screen and menu close", budgetChest.inventory:GetCountOfClass(APPLE) == 1)
+-- Transport retries use stable (epoch, serial, part), not a second delta apply.
+local retryEpoch = KCD2MP.w134.ledger.epoch
+local retryRows = { { "stash[Chest/budget]", ONION, 1, 1, WORLD_T, 0 } }
+KCD2MP_W134ChestApply(retryRows, retryEpoch, 123, 1); KCD2MP_W134ChestApply(retryRows, retryEpoch, 123, 1)
+NOW = NOW + 0.051; drain()
+KCD2MP_W134ChestApply(retryRows, retryEpoch, 123, 1); NOW = NOW + 0.051; drain()
+check("D retry after a lost HTTP reply does not duplicate completed work", budgetChest.inventory:GetCountOfClass(ONION) == 1)
+check("D no incidental errors before injected engine faults", #ERRS == 0)
+local createOk = budgetChest.inventory.CreateItem
+budgetChest.inventory.CreateItem = function() return false end
+LOG = {}; KCD2MP_W134ChestApply({ { "stash[Chest/budget]", EGG, 1, 1, WORLD_T, 0 } }); NOW = NOW + 0.051; drain()
+check("D refused create keeps row pending and reports no completion", budgetChest.inventory:GetCountOfClass(EGG) == 0 and #events("w134_ledger_row") == 0)
+budgetChest.inventory.CreateItem = function() error("engine busy") end; NOW = NOW + 0.051; drain()
+check("D throwing create also keeps row pending", budgetChest.inventory:GetCountOfClass(EGG) == 0 and #events("w134_ledger_row") == 0)
+budgetChest.inventory.CreateItem = createOk; NOW = NOW + 0.051; drain()
+check("D failed create retries once and confirms its actual delta", budgetChest.inventory:GetCountOfClass(EGG) == 1 and #events("w134_ledger_row") == 1)
+local deleteOk = budgetChest.inventory.DeleteItem
+budgetChest.inventory.DeleteItem = function() error("engine busy") end
+LOG = {}; KCD2MP_W134ChestApply({ { "stash[Chest/budget]", EGG, -1, 1, WORLD_T, 0 } }); NOW = NOW + 0.051; drain()
+check("D failed delete is not marked applied", budgetChest.inventory:GetCountOfClass(EGG) == 1 and #events("w134_ledger_row") == 0)
+budgetChest.inventory.DeleteItem = deleteOk; NOW = NOW + 0.051; drain()
+check("D failed delete resumes without losing remainder", budgetChest.inventory:GetCountOfClass(EGG) == 0 and #events("w134_ledger_row") == 1)
+player.GetWorldPos = function() return { x = 300, y = 300, z = 10 } end
+asJoiner(); loop() -- prime the near-chest snapshot before an edit whose readback fails
+local countOk = budgetChest.inventory.GetCountOfClass
+local failRead = false
+budgetChest.inventory.GetCountOfClass = function(self, cls) if failRead then error("read busy") end return countOk(self, cls) end
+budgetChest.inventory.CreateItem = function(self, ...) local x = createOk(self, ...); failRead = true; return x end
+LOG = {}; KCD2MP_W134ChestApply({ { "stash[Chest/budget]", EGG, 1, 1, WORLD_T, 0 } }); NOW = NOW + 0.051; drain()
+check("D an unconfirmed edit waits for readback", countOk(budgetChest.inventory, EGG) == 1 and #events("w134_ledger_row") == 0)
+loop()
+check("D unconfirmed ledger edit is never recorded as the player looting a nearby chest", #events("w134_chest") == 0)
+failRead = false; budgetChest.inventory.CreateItem = createOk; NOW = NOW + 0.051; drain()
+check("D readback retry never repeats an already executed edit", budgetChest.inventory:GetCountOfClass(EGG) == 1 and #events("w134_ledger_row") == 1)
+budgetChest.inventory.GetCountOfClass = countOk
+local unexpected = 0; for _, err in ipairs(ERRS) do if not string.find(tostring(err), "engine busy", 1, true) and not string.find(tostring(err), "read busy", 1, true) then unexpected = unexpected + 1 end end
+check("D only the deliberately injected engine faults were caught", unexpected == 0)
+ERRS = {}
+local oldEpoch = KCD2MP.w134.ledger.epoch
+KCD2MP_W134ChestApply({ { "stash[Chest/budget]", APPLE, 1, 1, WORLD_T, 0 } }, oldEpoch)
+local oldCallback = TIMERS[#TIMERS].f
+world(); asJoiner()
+local newChest = mkChest("stash[Chest/budget]", "Stash", 300, 300, 10, 0)
+check("D an old HTTP command is rejected after world reset", KCD2MP_W134ChestApply({ { "stash[Chest/budget]", APPLE, 1, 1, WORLD_T, 0 } }, oldEpoch) == false)
+oldCallback(); NOW = NOW + 1; drain()
+check("D old timer cannot edit a same-named chest in a new world", newChest.inventory:GetCountOfClass(APPLE) == 0)
+local slowCreate = newChest.inventory.CreateItem
+newChest.inventory.CreateItem = function(self, ...) NOW = NOW + 0.003; return slowCreate(self, ...) end
+local slowRows = {}; for i = 1, 8 do slowRows[i] = { "stash[Chest/budget]", DICE, 1, 1, WORLD_T, 0 } end
+KCD2MP_W134ChestApply(slowRows); NOW = NOW + 0.051
+check("D elapsed budget yields after one slow engine call", drain() == 1 and newChest.inventory:GetCountOfClass(DICE) == 1)
+newChest.inventory.CreateItem = slowCreate
+while KCD2MP.w134.ledger.head <= KCD2MP.w134.ledger.tail do NOW = NOW + 0.051; drain() end
+
+world()
+LOG = {}; KCD2MP_W134LedgerEpoch("pre-role")
+check("D epoch query waits for a role instead of assigning an obsolete generation", events("wo124_reply")[1] == "pre-role not-ready")
+asJoiner(); KCD2MP.w134LoopRunning = false; KCD2MP._w134LoopAliveAt = nil
+local beforeStart = KCD2MP.w134.ledger.epoch
+NOW = NOW + 3; LOG = {}; KCD2MP_W134LedgerEpoch("after-role")
+check("D initial loop reset finishes before epoch reply", KCD2MP.w134LoopRunning and KCD2MP.w134.ledger.epoch > beforeStart and events("wo124_reply")[1] == "after-role " .. tostring(KCD2MP.w134.ledger.epoch))
+
+world(); asJoiner()
+local linkChest = mkChest("stash[Chest/link]", "Stash", 300, 300, 10, 0)
+KCD2MP_W134ChestApply({ { "stash[Chest/link]", APPLE, 100, 1, WORLD_T, 0 } }); NOW = NOW + 0.051; drain()
+KCD2MP_W134LedgerLinkHold(true); KCD2MP_W134Tick(false, false, false, 0); NOW = NOW + 1
+check("D link loss pauses rather than discards partial corrections", drain() == 0 and linkChest.inventory:GetCountOfClass(APPLE) == 64)
+check("D link hold retains its pending rows", KCD2MP.w134.ledger.head <= KCD2MP.w134.ledger.tail)
+KCD2MP.w134LoopRunning = false; KCD2MP._w134LoopAliveAt = nil
+asJoiner(); KCD2MP_W134LedgerLinkHold(false)
+while KCD2MP.w134.ledger.head <= KCD2MP.w134.ledger.tail do NOW = NOW + 0.051; drain() end
+check("D confirmed same-world resume completes without duplication", linkChest.inventory:GetCountOfClass(APPLE) == 100)
+KCD2MP_W134ChestApply({ { "stash[Chest/link]", APPLE, 1, 1, WORLD_T, 0 } })
+local loadTimer = TIMERS[#TIMERS].f
+local loadEpoch = KCD2MP.w134.ledger.epoch
+KCD2MP.w136.hold = false; KCD2MP_W136Hold(true, 240, "agent-own-load")
+local ownChest = mkChest("stash[Chest/link]", "Stash", 300, 300, 10, 0)
+KCD2MP_W136Hold(false, 0, "own-save-ready"); loadTimer(); NOW = NOW + 1; drain()
+check("D retained timers cannot edit an own save after load hold ends", ownChest.inventory:GetCountOfClass(APPLE) == 0 and KCD2MP.w134.ledger.epoch ~= loadEpoch)
+check("D commands from before load acceptance remain stale", KCD2MP_W134ChestApply({ { "stash[Chest/link]", APPLE, 1, 1, WORLD_T, 0 } }, loadEpoch) == false)
 
 -- ================= extra: order and the engine's take =================
 world(); asJoiner()

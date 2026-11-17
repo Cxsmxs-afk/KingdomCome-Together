@@ -262,7 +262,7 @@ public class Wo191ReplayTests
     // ================================================================ 4
 
     [Fact]
-    public void Item4_the_black_after_the_shop_talk_ends_within_3_s()
+    public void Item4_the_shop_talk_black_needs_a_known_holder_before_recovery()
     {
         string? agent = Log("joiner", "agent.log");
         if (agent is null) { _out.WriteLine("SKIPPED: logs/w191/joiner is not unpacked here"); return; }
@@ -270,13 +270,16 @@ public class Wo191ReplayTests
         byte pause = 0;
         double fadeOn = -1; string scene = "-";
         var verdicts = new List<string>();
-        bool fieldReleased = false;
+        bool fieldAudited = false;
+        Wo191Rules.PendingConversation.Stamp? fadeHolder = null;
         string? due = null; double dueAt = -1;
         void Due(double now)
         {
             if (fadeOn < 0 || dueAt < 0 || now < dueAt) return;
             string? content = Wo191Rules.FaderContent(scene, pause, false, false, false);
-            due = content is null ? "released after 3.0 s (no content: no scene, no pause reason; the holder from kcd.log below)" : $"left alone: {content}";
+            due = content is not null ? $"left alone: {content}"
+                : fadeHolder is { } holder && conv.StillWaiting(holder) ? $"released known waiting conversation id={holder.Id}"
+                : "unknown owner: left unchanged (no global fader override)";
             dueAt = -1;
         }
         foreach (string l in File.ReadLines(agent))
@@ -292,7 +295,7 @@ public class Wo191ReplayTests
                              | (l.Contains("inventory") ? Wo138Codec.ReasonInventory : 0) | (l.Contains("menu") ? Wo138Codec.ReasonMenu : 0)
                              | (l.Contains("cutscene") ? Wo138Codec.ReasonCutscene : 0) | (l.Contains("skip") ? Wo138Codec.ReasonSkipTime : 0));
             var on = Regex.Match(l, @"WO179-FADE on scene=(\S+)");
-            if (on.Success) { fadeOn = t; scene = on.Groups[1].Value; dueAt = t + Wo191Rules.FaderBoundMs / 1000.0; due = null; continue; }
+            if (on.Success) { fadeOn = t; scene = on.Groups[1].Value; fadeHolder = conv.Capture((long)(t * 1000)); dueAt = t + Wo191Rules.FaderBoundMs / 1000.0; due = null; continue; }
             var off = Regex.Match(l, @"WO179-FADE off scene=\S+ held_ms=(\d+)");
             if (off.Success && fadeOn >= 0)
             {
@@ -300,7 +303,7 @@ public class Wo191ReplayTests
                 if (held > Wo191Rules.FaderBoundMs)
                 {
                     verdicts.Add($"{Hms(fadeOn)} held {held / 1000.0:F1} s -> {due ?? "?"}");
-                    if (held > 20_000 && due is not null && due.StartsWith("released", StringComparison.Ordinal)) fieldReleased = true;   // its holder: below
+                    if (held > 20_000 && due is not null) fieldAudited = true;   // the separate kcd.log may name what the agent did not know
                 }
                 fadeOn = -1; dueAt = -1;
             }
@@ -330,7 +333,7 @@ public class Wo191ReplayTests
                 }
             }
         }
-        Assert.True(fieldReleased);
+        Assert.True(fieldAudited);
         if (kcd is not null) Assert.Equal(175, holder);
     }
 }

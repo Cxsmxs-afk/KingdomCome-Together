@@ -23,6 +23,7 @@ constexpr size_t  kMaxBatchLen = 4096;                         // the pipe's rea
 constexpr size_t  kMaxSubs = 255;
 constexpr size_t  kReplyCap = 60000;                           // under a frame's 16-bit length
 constexpr double  kBudgetUs = 2000.0;                          // the main thread's share a frame (the WO: 2 ms)
+constexpr unsigned kRequestsPerFrame = 8;
 constexpr uint8_t kReasonTaskFaulted = 17, kReasonNotBatchable = 19;
 
 inline bool batchable(uint8_t type) { return type >= kFirstGeneric && type <= kLastGeneric; }
@@ -76,7 +77,17 @@ inline uint8_t reply_type(uint8_t type) {
 }
 
 /// A frame's budget: another request runs while none ran yet this frame, or while the frame's spent time is under the budget.
-inline bool may_run(int ranThisFrame, double spentUs, double budgetUs = kBudgetUs) { return ranThisFrame == 0 || spentUs < budgetUs; }
+inline bool may_run(int ranThisFrame, double spentUs, double budgetUs = kBudgetUs) {
+    return ranThisFrame < static_cast<int>(kRequestsPerFrame) && (ranThisFrame == 0 || spentUs < budgetUs);
+}
+struct FrameBudget {
+    unsigned long long frame = ~0ull;
+    unsigned ran = 0;
+    double spentUs = 0;
+    void begin(unsigned long long f) { if (f != frame) { frame = f; ran = 0; spentUs = 0; } }
+    bool may_run(double inFlightUs = 0) const { return wo218rules::may_run(static_cast<int>(ran), spentUs + inFlightUs); }
+    void add(unsigned count, double us) { ran += count; spentUs += us; }
+};
 
 /// The failure reply of a sub that never ran its handler: [0][0][op][reason].
 inline size_t failure(uint8_t* rb, uint8_t op, uint8_t reason) { rb[0] = 0; rb[1] = 0; rb[2] = op; rb[3] = reason; return 4; }

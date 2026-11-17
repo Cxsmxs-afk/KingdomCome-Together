@@ -128,6 +128,7 @@ void* const*  g_vftBasicFader = nullptr;
 BasicFader    g_fader{};
 CryStr        g_faderName{};
 bool          g_fadeActive = false;
+fader::Lease  g_fadeLease{};
 
 void* fader_ctrl() {
     void* gi = engine::game_iface();
@@ -1061,8 +1062,10 @@ void resolve() {
 
 bool fade_available() { return g_fadeArmed; }
 
-bool fade_out(float seconds) {
+bool fade_out(float seconds, fader::Owner owner, uint32_t token) {
     if (!g_fadeArmed) return false;
+    if (!g_fadeLease.may_acquire(owner, token)) return false;
+    if (g_fadeActive && g_fadeLease.matches(owner, token)) return true;   // reliable retry of the same owner
     void* ctrl = fader_ctrl();
     if (!ctrl) return false;
     g_fader = BasicFader{ const_cast<void*>(static_cast<const void*>(g_vftBasicFader)), ctrl, g_faderName.ptr(), nullptr };
@@ -1073,6 +1076,7 @@ bool fade_out(float seconds) {
         return false;
     }
     g_fadeActive = true;
+    g_fadeLease.acquired(owner, token);
     return true;
 }
 
@@ -1094,12 +1098,17 @@ bool screen_faded_out(bool* out) {
     return true;
 }
 
-bool fade_in(float seconds) {
-    if (!g_fadeArmed || !g_fadeActive) return false;
-    g_fadeActive = false;
+bool fade_in(float seconds, fader::Owner owner, uint32_t token) {
+    if (!g_fadeArmed || !g_fadeActive || !g_fadeLease.matches(owner, token)) return false;
     void* ctrl = fader_ctrl();
     if (!ctrl) return false;
-    return vcall_void(ctrl, kFadeIn, static_cast<void*>(&g_fader), float_bits(seconds));
+    const bool ok = vcall_void(ctrl, kFadeIn, static_cast<void*>(&g_fader), float_bits(seconds));
+    if (ok) { g_fadeActive = false; g_fadeLease.clear(); }
+    return ok;
+}
+
+void reset_external_fade() {
+    if (g_fadeActive && fader::external(g_fadeLease.owner)) fade_in(0.1f, g_fadeLease.owner, g_fadeLease.token);
 }
 
 bool player_position(float out[3]) {

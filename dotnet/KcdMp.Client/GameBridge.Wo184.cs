@@ -57,14 +57,18 @@ public partial class GameBridge
     // screen faded by the game's own fader (the DLL's op 33, the one the bring-along uses). "fade on|off". And B3's recovery on a save
     // that is really pending: "cancel" starts a QuickSave and at once asks the engine's own cancel (what a stuck snapshot gets after 60 s).
     private static readonly bool W184Test = Environment.GetEnvironmentVariable("KCDMP_TEST_W184") == "1";
+    private uint _w184FadeLease;
 
     private async Task Wo184TestAsync(string? arg)
     {
         var f = (arg ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (f.Length >= 2 && f[0] == "fade")
         {
-            var r = await _combat.Wo163Async(Protocol.Wo179OpFade, [(byte)(f[1] == "on" ? 1 : 0), .. BitConverter.GetBytes(0.5f)]);
-            Console.WriteLine($"WO184-TEST fade {f[1]}: {(r is { Ok: true } ? "the game's own fader asked" : "REFUSED")}");
+            bool on = f[1] == "on";
+            if (on) _w184FadeLease = OwnedFader.NextToken();
+            bool ok = _w184FadeLease != 0 && await OwnedFadeAsync(on, 0.5f, FaderOwner.Harness, _w184FadeLease);
+            if (!on || !ok) _w184FadeLease = 0;
+            Console.WriteLine($"WO184-TEST fade {f[1]}: {(ok ? "the game's own fader asked" : "REFUSED")}");
         }
         else if (f.Length >= 1 && f[0] == "cancel")
         {
@@ -295,6 +299,7 @@ public partial class GameBridge
         HenryStore.LedgerEntry? led = null;
         try
         {
+            await Wo134LedgerHoldAsync(true);
             string? saves = ResolveSavesDirForJoin();
             int pl = _lastWorldPlayline;
             if (saves is null || pl < 0)
@@ -305,9 +310,11 @@ public partial class GameBridge
             }
             string dir = Path.Combine(saves, $"playline{pl}");
             int qs = Directory.Exists(dir) ? Directory.EnumerateFiles(dir, "quicksave*.whs").Count() : 0;
-            if (qs >= SnapshotQuicksaveGuard)
+            var cached = await _combat.SaveListAsync(3, pl, "-"); // count only, no directory rescan
+            string rotationBlock = SaveListMaintenance.SnapshotBlock(qs, cached?.Count);
+            if (rotationBlock.Length != 0)
             {
-                string why = $"playline{pl} holds {qs} quicksaves (the engine rotates at 100; a snapshot could push out the player's oldest)";
+                string why = $"playline{pl}: {rotationBlock}";
                 Console.WriteLine($"WO184-SNAP host save seq={w.Seq} md5={md5[..8]}: no snapshot -- {why}");
                 _w184Health.Reason(w.Seq, why);
                 return W184Take.Failed;
@@ -319,8 +326,8 @@ public partial class GameBridge
             // WO-192: no mod gate beyond the two hard blocks and the engine's own "not now". A scene positioning the host's copies, or the readiness
             // service's "not ready", is a log line only (a request now may cancel the copies' fast-forward: accepted, WO-189 C releases a stuck start)
             await Wo192SceneNoteAsync(purpose, w.Seq);
-            // keep the engine's cached list in step with the disk: a new quicksave is named max(SaveId in the list)+1 (observed)
-            await _combat.SaveListAsync(1, pl, "-");
+            // The engine allocates the next QuickSave ID from its cache. Keep that cache:
+            // moved-out snapshots still count conservatively toward the rotation guard above.
             led = _henry.LedgerAdd(new HenryStore.LedgerEntry { Playline = pl, SinceUtc = DateTime.UtcNow.AddSeconds(-1), WorldTag = _joinedTag!, Kind = "snapshot" });
             var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             var since = DateTime.UtcNow.AddSeconds(-1);
@@ -379,6 +386,8 @@ public partial class GameBridge
         }
         finally
         {
+            try { await Wo134LedgerHoldAsync(false); }
+            catch (Exception ex) { Console.WriteLine($"WO184-SNAP ledger hold release failed: {ex.GetType().Name}"); }
             lock (_snapGate) _snapWait = null;
             Volatile.Write(ref _w184ReqAtMs, 0);
             Volatile.Write(ref _snapBusy, 0);
@@ -480,9 +489,8 @@ public partial class GameBridge
         bool gone = _henry.MoveOut(path, "a snapshot's QuickSave (the host's world)");
         _ = Task.Run(async () =>
         {
-            var after = await _combat.SaveListAsync(1, pl, Path.GetFileNameWithoutExtension(path));
-            string expect = OwnSaves(saves, HostSeedForOwn(), null, Wo157HostedSeed).FirstOrDefault(s => s.Save.Playline == pl)?.Save.Base ?? "-";
-            Console.WriteLine($"MP-HENRY joiner: snapshot file {SaveDisplay(path)} moved out={On(gone)}; rescan listed={(after is null ? "?" : On(after.Listed))}; Continue would load playline{after?.ContinuePlayline}/{after?.ContinueName ?? "?"} (own newest there: {expect})");
+            var after = await _combat.SaveListAsync(3, pl, Path.GetFileNameWithoutExtension(path));
+            Console.WriteLine($"MP-HENRY joiner: snapshot file {SaveDisplay(path)} moved out={On(gone)}; cached listed={(after is null ? "?" : On(after.Listed))}; cached Continue entry=playline{after?.ContinuePlayline}/{after?.ContinueName ?? "?"} (not refreshed)");
         });
         if (gone) _henry.LedgerSet(led.Id, e => e.State = "done");
         return res;

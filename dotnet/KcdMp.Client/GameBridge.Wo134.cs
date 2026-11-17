@@ -42,6 +42,30 @@ public partial class GameBridge
     private Wo134Rules.Ledger? _w134RxLedger;
     private readonly ConcurrentDictionary<string, (long AtMs, Guid[]? Worn)> _w134Worn = new(StringComparer.OrdinalIgnoreCase);
     private long _w134AsksIn, _w134AsksOut, _w134HostOut, _w134HostIn, _w134Dropped;
+    private long _w134LedgerGeneration;
+    private long _w134GameLedgerEpoch;
+    private uint _w134GameLedgerWorld;
+    private sealed record LedgerWork(string Tag, uint World, long Generation, List<Wo134Rules.Entry> Rows)
+    {
+        public List<string>? Calls;
+        public int Next;
+    }
+    private LedgerWork? _w134LedgerPending;
+    private int _w134LedgerApplyBusy;
+    private volatile bool _w134LedgerLinkHeld;
+    private uint _w134LedgerLinkWorld;
+
+    private void Wo134ResetLedgerGeneration()
+    {
+        lock (_w134Gate)
+        {
+            Interlocked.Increment(ref _w134LedgerGeneration);
+            Interlocked.Exchange(ref _w134GameLedgerEpoch, 0);
+            _w134GameLedgerWorld = 0;
+            _w134LedgerPending = null;
+            _w134LedgerLinkHeld = false;
+        }
+    }
 
     private bool Wo134JoinerRole => _combatRoleApplied && !_isDamageAuthority && _hostAuthority;
     private bool Wo134HostRole => _combatRoleApplied && _isDamageAuthority;
@@ -49,6 +73,7 @@ public partial class GameBridge
     private void Wo134OnConnect(CancellationToken ct)
     {
         _w134Connected = true;
+        if (!_w134LedgerLinkHeld || !_w211Holding || _w206.World != _w134LedgerLinkWorld) Wo134ResetLedgerGeneration();
         _w134Worn.Clear();
         _ = Wo134LoopAsync(ct);
     }
@@ -56,6 +81,13 @@ public partial class GameBridge
     private async Task Wo134OnDisconnectAsync()
     {
         _w134Connected = false;
+        if (_w211Holding)
+        {
+            _w134LedgerLinkWorld = _w206.World;
+            _w134LedgerLinkHeld = true;
+            try { await _transport.ExecuteNowAsync("if KCD2MP_W134LedgerLinkHold then KCD2MP_W134LedgerLinkHold(true) end"); } catch { }
+        }
+        else Wo134ResetLedgerGeneration();
         Wo134FlushHost();
         try { await _transport.ExecuteNowAsync("if KCD2MP_W134Tick then KCD2MP_W134Tick(false, false, false, 0) end"); } catch { }
     }
@@ -73,7 +105,12 @@ public partial class GameBridge
                 bool host = Wo134HostRole;
                 bool shared = joiner ? JoinerSharedEffective : _sharedWorld;
                 int peers = LivePartners().Count;   // WO-144
-                _ = ExecLuaAsync($"if KCD2MP_W134Tick then KCD2MP_W134Tick({B(joiner)}, {B(host)}, {B(shared)}, {peers}) end");
+                await _transport.ExecuteNowAsync($"if KCD2MP_W134Tick then KCD2MP_W134Tick({B(joiner)}, {B(host)}, {B(shared)}, {peers}) end");
+                if (_w134LedgerLinkHeld && !_w211Holding && HostAuthorityOwned && _w206.World == _w134LedgerLinkWorld)
+                {
+                    await _transport.ExecuteNowAsync("if KCD2MP_W134LedgerLinkHold then KCD2MP_W134LedgerLinkHold(false) end");
+                    _w134LedgerLinkHeld = false;
+                }
                 Wo134FlushHost();
                 Wo135HostTick();   // WO-135: the host world's build to every joiner
                 await Wo134ApplyIfReadyAsync(timeout: false);
@@ -111,6 +148,11 @@ public partial class GameBridge
         uint U(string s) => uint.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out uint v) ? v : 0;
         switch (name)
         {
+            case "w134_ledger_row":
+                if (f.Length == 4 && W137Joiner && _w206.World == _w134GameLedgerWorld && long.TryParse(f[0], out long epoch) && epoch == Interlocked.Read(ref _w134GameLedgerEpoch)
+                    && Wo134Rules.ContainerName.IsMatch(f[1]) && Guid.TryParse(f[2], out _) && int.TryParse(f[3], out int delta))
+                    Wo206NoteApplied("loot", $"{f[1]}/{f[2]}", "ledger", null, delta > 0 ? "put" : "took");
+                return;
             // ---- joiner -> host
             case "w134_open":      // <body>
                 if (f.Length == 1 && Wo134Rules.BodyName.IsMatch(f[0]) && Wo134JoinerRole)
@@ -401,6 +443,7 @@ public partial class GameBridge
     /// <summary>After the join's Ready: the joiner's ledger is the restored one; wait for the host's, then apply both.</summary>
     private void Wo134AfterReady(string tag)
     {
+        Wo134ResetLedgerGeneration();
         lock (_w134Gate)
         {
             string? json = _w134RestoreSnap is { } s && s.Tag == tag ? _henry.LoadChestLedger(s) : null;
@@ -429,13 +472,31 @@ public partial class GameBridge
         }
     }
 
-    private async Task Wo134ApplyIfReadyAsync(bool timeout)
+    private Task Wo134ApplyIfReadyAsync(bool timeout)
     {
+        // A paced ledger must not hold the relay receive loop while it sends.
+        if (Interlocked.CompareExchange(ref _w134LedgerApplyBusy, 1, 0) == 0)
+            _ = Task.Run(async () =>
+            {
+                try { await Wo134ApplyLedgerCoreAsync(timeout); }
+                catch (Exception ex) { Console.WriteLine($"MP-WO134 ledger worker: {ex.GetType().Name}: {ex.Message}"); }
+                finally { Interlocked.Exchange(ref _w134LedgerApplyBusy, 0); }
+            });
+        return Task.CompletedTask;
+    }
+
+    private async Task Wo134ApplyLedgerCoreAsync(bool timeout)
+    {
+        LedgerWork? pending;
+        lock (_w134Gate) pending = _w134LedgerPending;
+        if (pending is not null) { await Wo134SendLedgerWorkAsync(pending); return; }
         List<Wo134Rules.Entry> rows;
         string tag;
         bool hostIn;
         Wo134Rules.Ledger hostLedger, ownLedger;
         uint stamp;
+        uint world;
+        long generation;
         lock (_w134Gate)
         {
             if (_w134ApplyTag is not string t) return;
@@ -443,6 +504,8 @@ public partial class GameBridge
             bool late = (DateTime.UtcNow - _w134ApplySinceUtc).TotalSeconds > 15;
             if (!hostIn && !late && !timeout) return;
             tag = t;
+            world = _w206.World;
+            generation = Interlocked.Read(ref _w134LedgerGeneration);
             _w134ApplyTag = null;
             stamp = _w134RxStamp;
             // WO-206 E: a host ledger of a world the host has since left (it loaded after sending it) is not applied
@@ -452,11 +515,65 @@ public partial class GameBridge
             rows = Wo134Rules.JoinRows(hostLedger, ownLedger);
         }
         if (!hostIn) Console.WriteLine("MP-WO134 chests: the host's ledger did not arrive within 15 s -- only this joiner's own takes are applied");
-        var calls = Wo134Rules.ApplyCalls(rows);
-        foreach (var c in calls) await ExecLuaAsync(c);
-        // WO-206 Part C: one APPLIED record per ledger entry (key = container/class, the ledger's own word for what was done)
-        foreach (var e in hostLedger.Entries) Wo206NoteApplied("loot", $"{e.C}/{e.Cls}", "host-ledger", null, e.N > 0 ? "took" : "put", stamp);
-        foreach (var e in ownLedger.Entries) Wo206NoteApplied("loot", $"{e.C}/{e.Cls}", "own-ledger", null, e.N > 0 ? "took" : "put", stamp);
-        Console.WriteLine($"MP-WO134 chests: world {tag}: {rows.Count} ledger row(s) sent to the mod in {calls.Count} call(s) (host's takes put back, this joiner's own taken out)");
+        var work = new LedgerWork(tag, world, generation, rows);
+        lock (_w134Gate)
+        {
+            if (_w206.World != world || generation != Interlocked.Read(ref _w134LedgerGeneration)) return;
+            _w134LedgerPending = work;
+        }
+        await Wo134SendLedgerWorkAsync(work);
+    }
+
+    private bool Wo134LedgerCurrent(LedgerWork work) => _w134Connected && W137Joiner && HostAuthorityOwned && !_ownLoadExpected && !_loadGraceOwn && _w206.World == work.World
+        && _joinedTag == work.Tag && work.Generation == Interlocked.Read(ref _w134LedgerGeneration);
+
+    private async Task Wo134SendLedgerWorkAsync(LedgerWork work)
+    {
+        try
+        {
+            if (_where != GameWhere.World || Wo136Holding || _w211Holding || _w134LedgerLinkHeld) return;
+            if (!Wo134LedgerCurrent(work))
+            {
+                lock (_w134Gate) if (ReferenceEquals(_w134LedgerPending, work)) _w134LedgerPending = null;
+                return;
+            }
+            if (work.Calls is null)
+            {
+                // The game's query starts its role's loop before returning an
+                // epoch, or replies not-ready until the initial role tick arrives.
+                string epochText = await AskModAsync("KCD2MP_W134LedgerEpoch", 3000);
+                if (!long.TryParse(epochText, NumberStyles.None, CultureInfo.InvariantCulture, out long epoch)) return; // retry this same work
+                lock (_w134Gate)
+                {
+                    if (!Wo134LedgerCurrent(work)) return;
+                    _w134GameLedgerWorld = work.World;
+                    Interlocked.Exchange(ref _w134GameLedgerEpoch, epoch);
+                    work.Calls = Wo134Rules.ApplyCalls(work.Rows, epoch: epoch, serial: work.Generation);
+                }
+            }
+            while (work.Next < work.Calls.Count)
+            {
+                if (_where != GameWhere.World || Wo136Holding || _w211Holding || _w134LedgerLinkHeld) return;
+                if (!Wo134LedgerCurrent(work)) return;
+                // Stable epoch/serial/part makes a transport retry idempotent even
+                // when the game accepted the previous HTTP request before its reply was lost.
+                await _transport.ExecuteNowAsync(work.Calls[work.Next]);
+                work.Next++;
+                await Task.Delay(50);
+            }
+            lock (_w134Gate) if (ReferenceEquals(_w134LedgerPending, work)) _w134LedgerPending = null;
+            Console.WriteLine($"MP-WO134 chests: world {work.Tag}: {work.Rows.Count} ledger row(s) queued in {work.Calls.Count} bounded call(s); completion is reported by the game");
+        }
+        catch (Exception ex) { Console.WriteLine($"MP-WO134 ledger send paused at part {work.Next + 1}; retrying the same work: {ex.GetType().Name}"); }
+    }
+
+    private Task Wo134LedgerHoldAsync(bool on) => _transport.ExecuteNowAsync(
+        $"if KCD2MP_W134LedgerHold then KCD2MP_W134LedgerHold({B(on)}) end");
+
+    private async Task Wo134InvalidateLedgerAsync(string why)
+    {
+        Wo134ResetLedgerGeneration();
+        try { await _transport.ExecuteNowAsync("if KCD2MP_W134LedgerReset then KCD2MP_W134LedgerReset(\"load-or-leave\") end"); }
+        catch (Exception ex) { Console.WriteLine($"MP-WO134 ledger reset ({why}): {ex.GetType().Name}"); }
     }
 }

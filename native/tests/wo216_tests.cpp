@@ -9,6 +9,7 @@
 
 #include "wo216_rules.h"
 #include "wo215_rules.h"
+#include "fader_rules.h"
 
 using namespace kcdmp::wo216rules;
 
@@ -127,6 +128,29 @@ int wo216_tests(int* passed) {
     WCHECK(streamable_name(63) && !streamable_name(65) && !streamable_name(0),
            "a name the stream cannot carry (the animal care's horses, 65) is never hidden: it can never be a copy");
 
+    // Paket F1: no anonymous black, no other owner's release, no stale lease
+    // after a load/disconnect and a new hold. Respawn remains source compatible.
+    {
+        using kcdmp::fader::Owner;
+        kcdmp::fader::Lease lease;
+        WCHECK(!lease.may_acquire(Owner::None, 1) && !lease.may_acquire(Owner::Wake, 0) &&
+            !lease.may_acquire(static_cast<Owner>(99), 1), "F1: unknown reason and zero lease create no fade");
+        WCHECK(lease.may_acquire(Owner::Wake, 10), "F1: a known wake owns its hold");
+        lease.acquired(Owner::Wake, 10);
+        WCHECK(lease.may_acquire(Owner::Wake, 10), "F1: retry of the same lease is idempotent");
+        WCHECK(!lease.may_acquire(Owner::VideoLanding, 11) && !lease.may_acquire(Owner::Respawn, 1),
+            "F1: concurrent owners cannot overwrite a hold");
+        WCHECK(!lease.matches(Owner::VideoLanding, 10) && !lease.matches(Owner::Wake, 9) && !lease.matches(Owner::Respawn, 1),
+            "F1: wrong owner, stale timer and respawn cannot lift the wake's fade");
+        WCHECK(kcdmp::fader::external(lease.owner), "F1: lifecycle reset can identify an external hold");
+        lease.clear();
+        lease.acquired(Owner::Wake, 12);
+        WCHECK(!lease.matches(Owner::Wake, 10) && lease.matches(Owner::Wake, 12), "F1: an old release cannot lift a new hold");
+        lease.clear();
+        WCHECK(lease.may_acquire(Owner::Respawn, 1), "F1: existing respawn calls keep their known owner");
+        lease.acquired(Owner::Respawn, 1);
+        WCHECK(!kcdmp::fader::external(lease.owner), "F1: external lifecycle cleanup never releases native respawn");
+    }
     if (passed) *passed = g_pass;
     return g_fail;
 }

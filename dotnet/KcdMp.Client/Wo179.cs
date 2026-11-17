@@ -16,7 +16,7 @@ namespace KcdMp.Client;
 ///   Part B  the scene bus (W164 kind 15): which shared scene runs, who triggered it, where Henry ends up, how it ended.
 ///   Part C  videos both watch (C1), relocations bring the partner along (C2), the quiet exit ladder (C3), the landing and the ignore window (C4).
 ///   WO-179B one skip ends the video for both (mp_scene_skip_both), the partner is safe while he watches (mp_scene_watch_safe), and he is moved
-///           after the video, to where the triggerer settles (the settle report), behind a fade bounded at 3 s.
+///           after the video, only when the triggerer's settled destination is known, behind a short fade for the actual move.
 /// </summary>
 public static class Wo179Rules
 {
@@ -95,10 +95,6 @@ public static class Wo179Rules
     public const float OwnFadeS = 0.5f;
 
     // ---- WO-179B ----
-    /// <summary>The partner's black after the video: never longer than this in total.</summary>
-    public const long PartnerFadeMaxMs = 3_000;
-    /// <summary>The partner's black after the video: at most this long past the triggerer's settle report (its own post-video fade + 1 s).</summary>
-    public const long PartnerFadePastSettleMs = 1_000;
     /// <summary>The partner's fade to black at a video's end: as short as the fader takes (a flash of at most a frame or two).</summary>
     public const float VideoEndFadeS = 0.05f;
     /// <summary>The fade back in after the landing.</summary>
@@ -109,9 +105,19 @@ public static class Wo179Rules
     public const long GroundReadGapMs = 150;
     public const float GroundSteadyM = 0.2f;
 
-    /// <summary>When the partner's black must lift: 3 s after it began, or 1 s past the settle report if that came first (0 = not yet).</summary>
-    public static long PartnerFadeDeadline(long fadeStartMs, long settleArrivedMs) =>
-        settleArrivedMs > 0 ? Math.Min(fadeStartMs + PartnerFadeMaxMs, Math.Max(settleArrivedMs, fadeStartMs) + PartnerFadePastSettleMs) : fadeStartMs + PartnerFadeMaxMs;
+    /// <summary>A fade needs an identified move. Its own handle closes on success, refusal, cancellation and faults.</summary>
+    public static async Task<T> DuringKnownMoveAsync<T>(bool destinationKnown, Func<Task<bool>> begin,
+        Func<Task<T>> move, Func<Task> end)
+    {
+        if (!destinationKnown) throw new InvalidOperationException("No known landing destination: no fade or move");
+        bool opened = false;
+        try
+        {
+            opened = await begin();
+            return await move();
+        }
+        finally { if (opened) await end(); }
+    }
 
     /// <summary>Item 1: the game's own skip key arms on the first press and skips on a second press within this long (WHGame's cutscene
     /// interaction, a fixed 4.0 s; read statically, not live-proven) -- a first press alone is no skip.</summary>
