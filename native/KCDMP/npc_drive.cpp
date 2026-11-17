@@ -28,6 +28,7 @@
 #include "respawn_actions.h"
 #include "combat_actions.h"
 #include "body_drive.h"
+#include "walk_holder.h"
 #include "holders.h"
 #include "wo221.h"
 
@@ -1501,7 +1502,14 @@ void tick() {
         } else p.playout = -1;
         g_playoutByEid[p.eid] = renderDelay;
         float pose[4];
-        bool ex = g_walkFromHost.load(std::memory_order_relaxed) && !p.beast;   // WO-201 B10: in = allowed, out = extrapolated
+        // Phase 1: a walking person has one holder (the driver). Do not extrapolate
+        // the place that request steers toward. A horse or a figure still may.
+        const bool fightNow = wo216::on(wo216rules::kBitRouteReplay)
+                                  ? ((s.flags & (0x08 | 0x20)) != 0 || now < p.holdUntil || wo209::mirrored(p.eid))
+                                  : ((s.flags & (0x04 | 0x08)) != 0 || now < p.holdUntil || wo209::mirrored(p.eid));
+        const float vzNow = stream_vz(s);
+        const bool oneHolder = kcdmp::walkhold::driver_class(figure, p.beast, parented, p.human, !p.noPhys, fightNow, vzNow);
+        bool ex = g_walkFromHost.load(std::memory_order_relaxed) && !p.beast && kcdmp::walkhold::extrapolate_pose(oneHolder);   // WO-201 B10: in = allowed, out = extrapolated
         float segMps = 0.0f;
         if (!render(s, now - renderDelay, renderDelay, pose, &ex, &segMps, e1)) { ++it; continue; }
         if (ex) c_extrapFrames.fetch_add(1, std::memory_order_relaxed);
@@ -1522,7 +1530,7 @@ void tick() {
             const double stopAfter215 = wo215rules::stop_after(s.gapEma);
             ri.streamMps = silent215 < stopAfter215 ? stream_speed(s) : 0.0f;
             if (ri.streamMps < 0.0f) ri.streamMps = 0.0f;
-            ri.streamVz = stream_vz(s);
+            ri.streamVz = vzNow;
             if (ri.streamMps > 0.0f) stream_vel(s, &ri.streamVx, &ri.streamVy);
             ri.figure = figure; ri.beast = p.beast; ri.parented = parented;
             ri.horse = p.beast && npcscan::body_kind(e) == 1;   // WO-216 E
@@ -1533,9 +1541,7 @@ void tick() {
             ri.newestAgeS = static_cast<float>((std::min)(1.0, (std::max)(0.0, now - nsm.at)));
             // WO-216 A: a fight is a swing, the emitter's own engagement, a hold or a mirrored opponent -- the drawn bit alone is no fight (a
             // villager's tool reads as a weapon in hand: WO-214 E; b1's walkers carrying one stayed on the writer and slid). The twin: as 0.64.2.
-            ri.fight = wo216::on(wo216rules::kBitRouteReplay)
-                           ? ((s.flags & (0x08 | 0x20)) != 0 || now < p.holdUntil || wo209::mirrored(p.eid))
-                           : ((s.flags & (0x04 | 0x08)) != 0 || now < p.holdUntil || wo209::mirrored(p.eid));
+            ri.fight = fightNow;
             ri.now = now;
             // WO-221 C (mp_drive): a copy that walks is driven -- the engine's own per-frame movement request moves it and nothing writes
             // it. The driver's snap (a body left behind) is one plain write of this frame's pose, no blend; its arrival hands the body to
@@ -1570,7 +1576,11 @@ void tick() {
                 if (dv == bodydrive::Out::Arrive) { p.blendPending = true; p.blendWhy = "arrive"; }
                 if (tableOn) holders::set(p.eid, p.name.c_str(), holders::Holder::Writer, now);
             }
-            const wo215::RouteOut ro = wo215::route_frame(ri);
+            // The route is the old second holder. A person the driver class owns never
+            // consults it, including when the driver hands the body to the writer.
+            wo215::RouteOut ro;
+            ro.v = wo215::Verdict::Writer;
+            if (kcdmp::walkhold::consult_route(oneHolder)) ro = wo215::route_frame(ri);
             if (ro.v == wo215::Verdict::Routed) {
                 p.haveLast = false;
                 p.havePrev = false;

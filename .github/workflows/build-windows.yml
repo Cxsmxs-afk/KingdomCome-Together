@@ -1,0 +1,70 @@
+# One Windows build of this branch: native DLL, launcher, agent, relay,
+# master, kdcmp.pak, the Inno Setup installer, and the drop-in zip.
+# Players download the artifacts. They do not build.
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cursor/phase1-walk-holder-8b43
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Inno Setup 6
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer, DLL, pak and programs
+        shell: pwsh
+        run: >
+          powershell -ExecutionPolicy Bypass -File tools\Build-Installer.ps1
+          -ReleaseCandidate
+          -ArtifactBuild
+          -SaveRoundTripWaiver "CI: no Modding Tools game on the runner"
+
+      - name: Drop-in zip
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File tools\Package-DropIn.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kingdom-come-together
+          if-no-files-found: error
+          path: |
+            release/KingdomComeTogether-Setup-*.exe
+            release/KingdomComeTogether-DropIn.zip
+            release/BUILD-*.log
+            release/RELEASE-CANDIDATE-*.txt
+
+  sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Network simulator
+        run: |
+          chmod +x tools/sim/run-sim
+          SIM_COMMIT="${GITHUB_SHA::7}" tools/sim/run-sim ci tools/sim/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: network-sim
+          if-no-files-found: error
+          path: |
+            tools/sim/out/sim.json
+            tools/sim/out/sim-load.json
+            tools/sim/out/sim.md
