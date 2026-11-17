@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>KcdMp.Sim</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\dotnet\KcdMp.Client\KcdMp.Client.csproj" />
+    <ProjectReference Include="..\..\..\dotnet\KcdMp.Server\KcdMp.Server.csproj" />
+  </ItemGroup>
+</Project>
