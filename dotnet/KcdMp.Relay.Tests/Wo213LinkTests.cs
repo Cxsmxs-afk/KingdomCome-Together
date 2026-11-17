@@ -566,7 +566,9 @@ public class Wo213SchedulerTests
     {
         // Steam's two lanes: the events' lane holds a world transfer's worth -- the events wait here, the state goes now (never dropped)
         var lane = new LanePath(ownLane: true) { EventPending = 200 * 1024 };
-        var w = new LinkWriter(new LinkScheduler(new LinkSchedOptions { Unreliable = true }), lane);
+        // Budget off: this test is the lane order. A live token bucket starts empty, so a fast
+        // clock gives the first pump a budget of zero and the state frame never leaves.
+        var w = new LinkWriter(new LinkScheduler(new LinkSchedOptions { Unreliable = true, Budget = false }), lane);
         for (int i = 0; i < 5; i++) w.Enqueue(Event(i));
         w.Enqueue(NpcDown(0, "a", 1));
         await w.PumpOnceAsync(CancellationToken.None);
@@ -577,7 +579,7 @@ public class Wo213SchedulerTests
         Assert.All(lane.Sent.Skip(1), x => Assert.Equal(Protocol.StoryBeatDown, x.Type));
         // the twin (Steam's defaults: one lane) -- the events first, the state behind the burst
         var one = new LanePath(ownLane: false) { EventPending = 200 * 1024 };
-        var w1 = new LinkWriter(new LinkScheduler(), one);
+        var w1 = new LinkWriter(new LinkScheduler(new LinkSchedOptions { Budget = false }), one);
         for (int i = 0; i < 5; i++) w1.Enqueue(Event(i));
         w1.Enqueue(NpcDown(0, "a", 1));
         await w1.PumpOnceAsync(CancellationToken.None);
