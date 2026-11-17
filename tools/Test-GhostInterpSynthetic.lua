@@ -158,8 +158,12 @@ do
     check("(ga) single chain: no single 20 ms step exceeds one packet gap + DR lookahead", okBound, bad)
     check("(ga) single chain: rendered x within 0.3 m of the true position at t=2.0 (lerp lag only)",
         math.abs(e.px - V * 2.0) < 0.3, fmt(e.px) .. " vs " .. fmt(V * 2.0))
-    check("(ga) single chain writes once per fire (101 fires, 100 writes: the first fire is the dt seed)",
-        #e.writes >= 99 and #e.writes <= 101, tostring(#e.writes))
+    -- A pose that has not moved 1 mm since the last write is not sent to the
+    -- entity again (a standing body was paying SetWorldPos every 20 ms).
+    -- While this walk is underway the body still moves, so nearly every fire
+    -- writes; a handful of settled samples at the start may not.
+    check("(ga) single chain writes once per moving fire (101 fires, at least 90 writes, never more than one per fire)",
+        #e.writes >= 90 and #e.writes <= 101, tostring(#e.writes))
     noErrs("(ga)")
 end
 
@@ -331,6 +335,65 @@ do
     for k = 1, 8 do NOW = 10.10 + k * 0.0125; pumpTick() end
     check("(gg) 80 Hz pumping does not overshoot the DR target", e.px <= ceiling, fmt(e.px) .. " <= " .. fmt(ceiling))
     noErrs("(gg)")
+end
+
+-- (pf) a standing ghost must not raycast the floor every 20 ms tick.
+do
+    local e = resetGhost("1", 10, 0, 0)
+    local gen = KCD2MP.interpGen
+    local casts = 0
+    Physics.RayWorldIntersection = function() casts = casts + 1; return nil end
+    local t0 = NOW
+    for i = 0, 49 do
+        NOW = t0 + i * 0.02
+        pkt("1", 10, 0, 0)
+        chainTick(gen)
+    end
+    check("(pf) a standing ghost reuses the floor raycast (under 15 casts in 1.0 s, not 50)",
+        casts >= 1 and casts < 15, tostring(casts))
+    check("(pf) the body was still placed", #e.writes >= 1, tostring(#e.writes))
+    noErrs("(pf)")
+end
+
+-- (ps) the NPC poll skips. Pure predicates; no entity is touched.
+do
+    KCD2MP.npcSync.heartbeatS = 2
+    KCD2MP.npcSync.moveEps = 0.05
+    KCD2MP.wo1025.npcCull = true
+    KCD2MP.wo1025.cullRadius = 80
+    local t = { culled = true, vitalAt = NOW, lastSentAt = NOW, lastX = 0, lastY = 0, lastZ = 0 }
+    local p = { x = 0, y = 0, z = 0 }
+    local ppos = { x = 0, y = 200, z = 0 }
+    check("(ps) a culled NPC far from the player skips the actor polls",
+        KCD2MP_NpcEmitSkip(t, p, ppos, NOW) == true)
+    ppos.y = 10
+    p.x = 1   -- it has also moved, so the idle skip does not hide it
+    check("(ps) a culled NPC that has come close and moved is read in full",
+        KCD2MP_NpcEmitSkip(t, p, ppos, NOW) == false)
+    p.x = 0
+    t.culled = false
+    check("(ps) a still, sheathed NPC skips for a quarter second",
+        KCD2MP_NpcEmitSkip(t, p, ppos, NOW) == true)
+    t.sentDrawn = true
+    check("(ps) a drawn NPC is not idle-skipped",
+        KCD2MP_NpcEmitSkip(t, p, ppos, NOW) == false)
+    t.sentDrawn = false
+    t.lastSentAt = NOW - 3
+    check("(ps) a due heartbeat forces a full read",
+        KCD2MP_NpcEmitSkip(t, p, ppos, NOW) == false)
+
+    player = { GetWorldPos = function() return { x = 0, y = 0, z = 0 } end }
+    KCD2MP._perfAnchor = nil
+    local far = { cx = 100, cy = 0, lifeAt = NOW }
+    check("(ps) a living puppet more than 20 m away skips IsDead this tick",
+        KCD2MP_PuppetLifeDue(far, NOW) == false)
+    local nearP = { cx = 5, cy = 0, lifeAt = NOW }
+    check("(ps) a puppet within 20 m is asked every tick",
+        KCD2MP_PuppetLifeDue(nearP, NOW) == true)
+    far.dead = true
+    check("(ps) a puppet the stream calls dead is always asked",
+        KCD2MP_PuppetLifeDue(far, NOW) == true)
+    player = nil
 end
 
 OUT = table.concat(RESULTS, "\n")
