@@ -73,7 +73,9 @@ public class Wo195Tests
         int rel = gb.IndexOf("await Wo195OnCopyDeathAsync(npcName, via);", StringComparison.Ordinal);
         int apply = gb.IndexOf("applied = await _combat.ApplyDeathAsync(lg, ct);", StringComparison.Ordinal);
         Assert.True(rel > 0 && apply > rel, "the release runs before the apply (the copy is marked dead before the engine kills it)");
-        Assert.Contains("Wo195OnLocalFatal(soul);", gb);
+        // F2: a local copy's health reading cannot release/kill it on a
+        // second path. Only the host's death enters the release above.
+        Assert.DoesNotContain("Wo195OnLocalFatal(", gb);
         Assert.Contains("Wo195NoteAlive(npcName);", gb);
         string w132 = Src("GameBridge.Wo132.cs");
         Assert.Contains("bool w195Dead = Wo195IsDead(ev.Name);", w132);
