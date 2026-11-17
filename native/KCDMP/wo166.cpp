@@ -767,7 +767,9 @@ void tick() {
                 (oppMe ? c_engineOppPlayer : c_engineOppOther).fetch_add(1);
                 s.countdown = write_countdown(model, static_cast<float>((std::max)(0.0, s.hitAt - now)));   // before the state: the window reads it
                 const float dist = planar_to_player(s.eid);
-                const bool reach = wo178rules::target_reachable(dist, s.hitDist, s.alignMax);
+                const float age = static_cast<float>(npcdrive::pose_lag_s(s.eid));
+                const float judged = wo178rules::rewind_distance(dist, age);
+                const bool reach = wo178rules::stale_trusts_host(age) || wo178rules::target_reachable(judged, s.hitDist, s.alignMax);
                 const bool reachSet = set_reachable(model, reach);
                 (reach ? c_reachYes : c_reachNo).fetch_add(1);
                 if (!motion::write_attack_fields(model, s.fields) || !set_state_engine(model, kStateWindup)) {
@@ -780,7 +782,7 @@ void tick() {
                     s.windupAt = now;
                     c_engineWindup.fetch_add(1);
                     s.engineReach = engine_reach(ca, model);   // in State 4 now: the reach's guard step stays out
-                    s.canHit = wo178rules::in_reach(dist, wo178rules::copy_reach_limit(s.engineReach, s.hitDist));
+                    s.canHit = !wo178rules::reach_miss(dist, wo178rules::copy_reach_limit(s.engineReach, s.hitDist), age);
                     bool hadTarget = false;
                     s.targetSet = oppMe && wo208::target_player_ok(s.eid, "strike") && ensure_target_player(ca, model, &hadTarget);   // WO-208 F.1
                     (s.targetSet ? (hadTarget ? c_targetHad : c_targetSet) : c_targetFailed).fetch_add(1);
@@ -826,7 +828,8 @@ void tick() {
                     }
                     const float r = engine_reach(ca2, model2);
                     if (wo178rules::engine_reach_ok(r)) s.engineReach = r;
-                    s.canHit = wo178rules::in_reach(planar_to_player(s.eid), wo178rules::copy_reach_limit(s.engineReach, s.hitDist));
+                    s.canHit = !wo178rules::reach_miss(planar_to_player(s.eid), wo178rules::copy_reach_limit(s.engineReach, s.hitDist),
+                                                     static_cast<float>(npcdrive::pose_lag_s(s.eid)));
                     set_can_hit(model2, s.canHit);
                 }
             }

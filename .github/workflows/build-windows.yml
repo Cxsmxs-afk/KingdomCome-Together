@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - cursor/dropin-verify-8b43
+      - cursor/combat-reach-shield-8b43
 
 jobs:
   build:

@@ -146,6 +146,12 @@ int wo178_tests(int* passed) {
     WCHECK(near_eq(contact_limit(2.7f, 1.6f), 2.0f), "a blow lands at the swing's contact distance (2.0 m for the stab), not the 2.7 m wind-up reach");
     WCHECK(near_eq(contact_limit(1.2f, 1.6f), 1.4f) && near_eq(contact_limit(-1.0f, 1.6f), 2.0f), "a shorter engine reach caps it; unread = the row's");
     WCHECK(in_reach(1.6f, copy_reach_limit(1.5f, 0.0f)) && !in_reach(1.8f, copy_reach_limit(1.5f, 0.0f)), "a 1.5 m reach lands at 1.6 m, misses at 1.8 m");
+    WCHECK(near_eq(rewind_distance(2.34f, 1.15f), 0.04f), "1.15 s of pose lag closes 2.3 m of a 2.34 m reading");
+    WCHECK(rewind_distance(3.26f, 1.15f) < 1.0f, "the live 3.26 m reading at the same age is still contact");
+    WCHECK(rewind_distance(6.0f, 1.0f) > 2.5f, "a real miss six metres away stays a miss");
+    WCHECK(stale_trusts_host(1.15f) && !stale_trusts_host(0.1f), "a pose older than 0.4 s is the host's blow, not a local miss");
+    WCHECK(!reach_miss(2.34f, 2.0f, 1.15f) && !reach_miss(3.26f, 2.0f, 1.15f), "the live misses are not misses");
+    WCHECK(reach_miss(3.0f, 2.0f, 0.05f) && !reach_miss(1.5f, 2.0f, 0.05f), "a fresh pose still misses past reach");
     // ---- the player's recoil: a kept reaction has its own word in the WO173-HIT / status lines
     WCHECK(std::strcmp(wo173rules::react_name(wo173rules::React::PlayerKept), "player-only-hit-reactions") == 0, "the kept reaction's word");
     WCHECK(static_cast<int>(wo173rules::React::PlayerKept) == 10, "appended after Off (9)");

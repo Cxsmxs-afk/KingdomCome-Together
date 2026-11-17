@@ -1781,6 +1781,19 @@ bool is_bound_eid(uint32_t eid) {
     return false;
 }
 
+double pose_lag_s(uint32_t eid) {
+    if (!eid) return -1.0;
+    const double now = now_s();
+    for (const auto& [key, p] : g_bound) {
+        if (p.eid != eid) continue;
+        auto st = g_streams.find(key);
+        if (st == g_streams.end() || st->second.n <= 0) return -1.0;
+        const double at = st->second.ring[st->second.n - 1].at;
+        return now >= at ? now - at : 0.0;
+    }
+    return -1.0;
+}
+
 int bound_bodies(BoundBody* out, int max) {
     // WO-190 0.1 (main thread): the bodies this writer drives -- the trace's copies and figures
     int n = 0;

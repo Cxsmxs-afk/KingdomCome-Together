@@ -180,5 +180,8 @@ bool hit_check(const char* name, HitCheck* out);
 // WO-213 E.1: the play-out delay this copy's position is rendered at now (s), or -1 when it is not written by this writer -- the owner
 // (wo208.cpp) applies the host's animation states the same delay after they arrive, so the actions start where the position is.
 double playout_delay_s(uint32_t eid);
+// How far behind the hit the rendered pose is: now minus the newest sample's host time, or -1.
+// A blow must not be called a miss off a pose that is a second late.
+double pose_lag_s(uint32_t eid);
 
 } // namespace kcdmp::npcdrive

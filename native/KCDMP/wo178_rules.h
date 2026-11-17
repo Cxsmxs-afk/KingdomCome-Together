@@ -151,6 +151,27 @@ inline float contact_limit(float engineReach, float hitDistance) {
     return engine_reach_ok(engineReach) && engineReach + kEngineReachSlackM < row ? engineReach + kEngineReachSlackM : row;
 }
 
+// A fighting copy's pose can be a second behind the blow (the live run: p99 1.15 s, so a hit at 2 m
+// read as 2.3–3.3 m and was told to the host as a miss). Credit closing speed for that age, and once
+// the pose is older than kStaleTrustS trust the host: the blow already landed there.
+constexpr float kCloseMps = 2.0f;
+constexpr float kRewindCapM = 3.0f;
+constexpr float kStaleTrustS = 0.40f;
+inline float rewind_distance(float measured, float ageS) {
+    if (!std::isfinite(measured) || measured < 0.f) return measured;
+    if (!std::isfinite(ageS) || ageS <= 0.05f) return measured;
+    float credit = kCloseMps * ageS;
+    if (credit > kRewindCapM) credit = kRewindCapM;
+    const float d = measured - credit;
+    return d < 0.f ? 0.f : d;
+}
+inline bool stale_trusts_host(float ageS) { return std::isfinite(ageS) && ageS > kStaleTrustS; }
+/// False when this screen must not turn the blow into a miss.
+inline bool reach_miss(float measured, float limit, float ageS) {
+    if (stale_trusts_host(ageS)) return false;
+    return !in_reach(rewind_distance(measured, ageS), limit);
+}
+
 // ------------------------------------------------------------------------------------------------------------ the player's own block
 // A copy's swing is an animation on the joiner, not an engine attack: his held block never reaches the engine's "block in place" nor turns
 // to the swing (live: State 0x80, block zone 1 vs the swing's zone 5 -> zone mismatch -> a full hit while he held block). So his own
