@@ -27,4 +27,25 @@ inline bool consult_route(bool isDriverClass) { return !isDriverClass; }
 /// Extrapolation is the writer's catch-up. The driver leads by its own short age.
 inline bool extrapolate_pose(bool isDriverClass) { return !isDriverClass; }
 
+/// Phase 2. A player (a figure) and a walking person share one fixed timeline.
+/// Horses, fights and falls keep the adaptive delay.
+inline bool fixed_timeline(bool figure, bool isDriverClass) { return figure || isDriverClass; }
+
+constexpr double kFixedDelayS = 0.12;
+constexpr double kFixedDelayCapS = 0.20;
+constexpr double kSnapBehindS = 0.40;
+
+/// The render delay for a fixed timeline. The bind's delay when it is already
+/// a short fixed span, otherwise 120 ms. It does not take the queue age.
+inline double fixed_delay_s(double bindDelayS) {
+    if (bindDelayS >= 0.05 && bindDelayS <= kFixedDelayCapS) return bindDelayS;
+    return kFixedDelayS;
+}
+
+/// The newest sample is further behind the fixed clock than one catch-up.
+/// Show that sample now. Do not keep playing the backlog and do not extrapolate.
+inline bool snap_catchup(double newestAgeS, double delayS) {
+    return newestAgeS > delayS + kSnapBehindS;
+}
+
 } // namespace kcdmp::walkhold

@@ -9,6 +9,9 @@
 using kcdmp::walkhold::consult_route;
 using kcdmp::walkhold::driver_class;
 using kcdmp::walkhold::extrapolate_pose;
+using kcdmp::walkhold::fixed_delay_s;
+using kcdmp::walkhold::fixed_timeline;
+using kcdmp::walkhold::snap_catchup;
 
 namespace {
 int g_fail = 0, g_pass = 0;
@@ -28,6 +31,13 @@ int walk_holder_tests(int* passed) {
     WCHECK(!driver_class(false, false, false, true, true, false, 1.6f), "a fall (vz 1.6) is the writer's");
     WCHECK(!driver_class(false, false, false, true, true, false, -1.6f), "a fall the other way is the writer's");
     WCHECK(driver_class(false, false, false, true, true, false, 1.5f), "vz at the air limit is still the driver's");
+    WCHECK(fixed_timeline(true, false), "the other player is on the fixed timeline");
+    WCHECK(fixed_timeline(false, true), "a walking person is on the fixed timeline");
+    WCHECK(!fixed_timeline(false, false), "a horse or a fight keeps the adaptive delay");
+    WCHECK(fixed_delay_s(0.12) == 0.12, "a 120 ms bind stays 120 ms");
+    WCHECK(fixed_delay_s(3.0) == 0.12, "a multi-second bind does not become the render delay");
+    WCHECK(!snap_catchup(0.20, 0.12), "200 ms of age is still inside the fixed clock");
+    WCHECK(snap_catchup(0.60, 0.12), "600 ms behind snaps to the newest sample");
     if (passed) *passed = g_pass;
     return g_fail;
 }

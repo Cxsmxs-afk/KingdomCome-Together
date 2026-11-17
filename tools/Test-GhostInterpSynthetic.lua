@@ -230,15 +230,14 @@ do
     end
     check("(gc2) two phase-offset chains stay within 5 cm of the single-chain trajectory while moving", okClose, bad)
     check("(gc2) two phase-offset chains never move the ghost backwards", okMono)
-    -- stream stops at x = V*2.0; both keep firing for 1 s. The WO-38 DR
-    -- HOLDS at the 60 ms projection (it never reverts to the bare packet), so
-    -- the rest point is packet + v * 0.060 -- same as a single chain.
-    local target = V * 2.0 + (KCD2MP.ghosts["1"].istate.vx or 0) * 0.060
+    -- stream stops at x = V*2.0; both keep firing for 1 s. Phase 2 holds at
+    -- the last sample. It does not run on by the old 60 ms lookahead.
+    local target = V * 2.0
     for i = 101, 150 do
         NOW = i * 0.02; chainTick(gen)
         NOW = i * 0.02 + 0.01; chainTick(gen)
     end
-    check("(gc2) after the stream stops both chains converge on the held DR point (1 mm)", near(e.px, target, 1e-3),
+    check("(gc2) after the stream stops both chains hold on the last sample (1 mm)", near(e.px, target, 1e-3),
         fmt(e.px) .. " vs " .. fmt(target))
     noErrs("(gc2)")
 end
@@ -320,20 +319,20 @@ do
     NOW = 10.05; pkt("1", 0.5, 0, 0)
     local nT = #TIMERS
     local stamp = KCD2MP._interpAliveAt
-    -- the render target is the packet plus the WO-38 DR lookahead (<= 60 ms
-    -- of the estimated velocity); a fire may approach it, never pass it.
-    local ceiling = 0.5 + (KCD2MP.ghosts["1"].istate.vx or 0) * 0.060 + 1e-9
+    -- Phase 2: the render target is on the fixed timeline, never past the
+    -- newest sample and never a 60 ms lookahead past it.
+    local ceiling = 0.5 + 1e-9
     NOW = 10.07; pumpTick()
-    check("(gg) a pumped fire renders (moved toward the packet, not past the DR target)", e.px > 0 and e.px <= ceiling,
+    check("(gg) a pumped fire renders (on the timeline, not past the newest sample)", e.px >= 0 and e.px <= ceiling,
         fmt(e.px) .. " <= " .. fmt(ceiling))
     check("(gg) a pumped fire never reschedules", #TIMERS == nT)
     check("(gg) a pumped fire never stamps the chain alive", KCD2MP._interpAliveAt == stamp)
     -- pumped fires at 80 Hz do not run away: 8 pumps over 100 ms still end
-    -- inside the DR target (each fire is time-scaled, not "one tick")
+    -- on the newest sample (each fire is the timeline, not "one tick")
     NOW = 10.10; pkt("1", 0.5, 0, 0)
-    ceiling = 0.5 + (KCD2MP.ghosts["1"].istate.vx or 0) * 0.060 + 1e-9
+    ceiling = 0.5 + 1e-9
     for k = 1, 8 do NOW = 10.10 + k * 0.0125; pumpTick() end
-    check("(gg) 80 Hz pumping does not overshoot the DR target", e.px <= ceiling, fmt(e.px) .. " <= " .. fmt(ceiling))
+    check("(gg) 80 Hz pumping does not run past the newest sample", e.px <= ceiling, fmt(e.px) .. " <= " .. fmt(ceiling))
     noErrs("(gg)")
 end
 

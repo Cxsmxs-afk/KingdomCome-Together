@@ -45,7 +45,13 @@ public static class Program
         string jsonPath = Path.Combine(outDir, "sim.json");
         await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(results, opt));
         string mdPath = Path.Combine(outDir, "sim.md");
-        var load = Continuous.RunAll(timeline);
+        var load = new List<LoadResult>();
+        if (timeline == "both")
+        {
+            load.AddRange(Continuous.RunAll("legacy"));
+            load.AddRange(Continuous.RunAll("fixed"));
+        }
+        else load.AddRange(Continuous.RunAll(timeline));
         await File.WriteAllTextAsync(Path.Combine(outDir, "sim-load.json"), JsonSerializer.Serialize(load, opt));
         await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load));
         int gated = results.Count(r => r.Gate);

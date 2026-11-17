@@ -2251,12 +2251,12 @@ function KCD2MP_PerfFlush(force)
         return
     end
     System.LogAlways(string.format(
-        "[KCD2-MP] perf window_s=%.1f interp_avg_ms=%.2f interp_max_ms=%.2f interp_n=%d floor_cast_s=%.1f floor_reuse_s=%.1f pose_skip_s=%.1f horse_skip_s=%.1f npc_skip_s=%.1f npc_idle_skip_s=%.1f puppet_life_skip_s=%.1f ride_sphere_s=%.2f ride_skip_s=%.2f bone_read_s=%.1f bone_reuse_s=%.1f latency_ms=%.0f",
+        "[KCD2-MP] perf window_s=%.1f interp_avg_ms=%.2f interp_max_ms=%.2f interp_n=%d floor_cast_s=%.1f floor_reuse_s=%.1f pose_skip_s=%.1f horse_skip_s=%.1f npc_skip_s=%.1f npc_idle_skip_s=%.1f puppet_life_skip_s=%.1f ride_sphere_s=%.2f ride_skip_s=%.2f bone_read_s=%.1f bone_reuse_s=%.1f latency_ms=%.0f timeline_ms=%.0f",
         win,
         n > 0 and (p.interpSum / n) or 0, p.interpMax or 0, n,
         rate(p.floorCasts), rate(p.floorReuse), rate(p.poseSkip), rate(p.horseSkip),
         rate(p.npcSkip), rate(p.npcIdleSkip), rate(p.puppetLifeSkip),
-        rate(p.rideSphere), rate(p.rideSkip), rate(p.boneRead), rate(p.boneReuse), lat))
+        rate(p.rideSphere), rate(p.rideSkip), rate(p.boneRead), rate(p.boneReuse), lat, (TUNE.GHOST_TIMELINE_DELAY_S or 0.12) * 1000))
     KCD2MP._perf = { t0 = now }
 end
 
@@ -2825,6 +2825,11 @@ KCD2MP.npcSmooth = true
 -- silence renders as a DELAY-long move at the NPC's implied speed, not as a
 -- slow slide across the whole silent gap.
 TUNE.NPC_SMOOTH_DELAY_FACTOR = 1.2
+-- Phase 2: the other player's body is shown this far behind the samples that
+-- have already reached this machine. It does not grow when the console queue does.
+TUNE.GHOST_TIMELINE_DELAY_S = 0.12
+TUNE.GHOST_TIMELINE_SNAP_S = 0.40
+TUNE.GHOST_TIMELINE_RING = 16
 function KCD2MP_NpcSmoothDelayS()
     return ((KCD2MP.npcSync and KCD2MP.npcSync.emitMs) or 250) / 1000 * TUNE.NPC_SMOOTH_DELAY_FACTOR
 end
@@ -2910,14 +2915,16 @@ local function mp_npc_smooth_render(p, now)
     local n = ring and #ring or 0
     if n == 0 then return nil end
     local delay = p.nativeOwned and TUNE.NPC_NATIVE_LUA_DELAY_S or KCD2MP_NpcSmoothDelayS()
-    -- The backlog fix (mp_npc_catchup): the agent's samples come as late as its queue runs behind (and,
-    -- behind, only the newest of each NPC): render that much further back, or every gap between them read
-    -- as a stop and then a dash (the live A/B: walkers flickering idle/sprint). 0 when nothing lags.
-    local ns = KCD2MP.npcSilence
-    local lagS = (ns and ns.lagSmooth and ns.lagSmooth > 0) and ns.lagSmooth or 0
-    delay = delay + lagS
-    -- ...and a sample that late is not yet a stop either (the live A/B: walkers dropping to idle between samples)
-    local grace = (p.nativeOwned and TUNE.NPC_NATIVE_ANIM_GRACE_S or TUNE.NPC_SMOOTH_ANIM_GRACE_S) + lagS
+    -- Phase 2: the delay is fixed. lagSmooth still records how far the console
+    -- queue is behind, and mp_perf prints that as latency_ms. It is not added
+    -- here. A stream more than 0.40 s behind the fixed clock is shown at its
+    -- newest sample instead of playing the backlog out.
+    local grace = p.nativeOwned and TUNE.NPC_NATIVE_ANIM_GRACE_S or TUNE.NPC_SMOOTH_ANIM_GRACE_S
+    local newest = ring[n]
+    if now - newest.at > delay + 0.40 then
+        p.cx, p.cy, p.cz, p.cr = newest.x, newest.y, newest.z, newest.rot
+        return p.segSpd or 0
+    end
     local renderAt = now - delay
     local a, b
     if renderAt >= ring[n].at then
@@ -11966,6 +11973,65 @@ end
 -- which is exactly "this peer sent no body state" -- the legacy inference then
 -- runs for that sample. No version negotiation, no probe: absence is the
 -- signal.
+-- One timeline for the other player. Samples are the packets this machine has
+-- already applied. The body is drawn GHOST_TIMELINE_DELAY_S behind the newest
+-- of those, between two real samples. It does not run on past the newest one.
+-- A sample more than SNAP behind that clock is shown at once.
+function KCD2MP_TimelinePush(istate, x, y, z, rot, at)
+    local ring = istate.tl
+    if not ring then ring = {}; istate.tl = ring end
+    local last = ring[#ring]
+    if last then
+        local dx, dy = x - last.x, y - last.y
+        if dx * dx + dy * dy > 25 then
+            ring = {}
+            istate.tl = ring
+            istate.cx, istate.cy, istate.cz, istate.cr = x, y, z, rot
+        end
+    end
+    ring[#ring + 1] = { x = x, y = y, z = z, r = rot, at = at }
+    local cap = TUNE.GHOST_TIMELINE_RING or 16
+    while #ring > cap do table.remove(ring, 1) end
+end
+
+function KCD2MP_TimelineApply(istate, now)
+    local ring = istate.tl
+    local n = ring and #ring or 0
+    if n == 0 then istate.rx = nil; istate.ry = nil; return end
+    local delay = TUNE.GHOST_TIMELINE_DELAY_S or 0.12
+    local newest = ring[n]
+    if now - newest.at > delay + (TUNE.GHOST_TIMELINE_SNAP_S or 0.40) then
+        istate.rx, istate.ry, istate.rz, istate.rr = newest.x, newest.y, newest.z, newest.r
+        istate.cx, istate.cy, istate.cz, istate.cr = newest.x, newest.y, newest.z, newest.r
+        if not istate.tlHeld then
+            istate.corrSnaps = (istate.corrSnaps or 0) + 1
+            istate.tlHeld = true
+        end
+        return
+    end
+    istate.tlHeld = false
+    local at = now - delay
+    local a, b
+    if at >= newest.at then a, b = newest, newest
+    elseif at <= ring[1].at then a, b = ring[1], ring[1]
+    else
+        a, b = ring[1], newest
+        for i = n, 2, -1 do
+            if ring[i - 1].at <= at then a, b = ring[i - 1], ring[i]; break end
+        end
+    end
+    if a == b or b.at == a.at then
+        istate.rx, istate.ry, istate.rz, istate.rr = a.x, a.y, a.z, a.r
+        return
+    end
+    local t = (at - a.at) / (b.at - a.at)
+    if t < 0 then t = 0 elseif t > 1 then t = 1 end
+    istate.rx = a.x + (b.x - a.x) * t
+    istate.ry = a.y + (b.y - a.y) * t
+    istate.rz = a.z + (b.z - a.z) * t
+    istate.rr = lerpAngle(a.r, b.r, t)
+end
+
 function KCD2MP_UpdateGhost(id, x, y, z, rotZ, isRiding, bPace, bDir, bStance, bSpeedCenti)
     -- WO-136 Phase 1: no avatar is spawned or moved while a world loads (the
     -- field: a spawn in that window came up with no model); the next sample
@@ -12032,6 +12098,7 @@ function KCD2MP_UpdateGhost(id, x, y, z, rotZ, isRiding, bPace, bDir, bStance, b
     istate.ty = y
     istate.tz = z
     istate.tr = r
+    KCD2MP_TimelinePush(istate, x, y, z, r, now)
     istate.ticksSincePacket = 0
     istate.packetCount = istate.packetCount + 1
 
@@ -13617,13 +13684,14 @@ function KCD2MP_InterpTick(arg, gen)
             -- visible step back. The projection now HOLDS at the DR_MAX
             -- point instead of reverting; the next real packet simply
             -- overwrites it.
-            local renderX = istate.tx or istate.cx
-            local renderY = istate.ty or istate.cy
-            -- WO-78: projection by real time since the last packet (was
-            -- ticksSincePacket x 20 ms, which N chains advanced N times).
+            KCD2MP_TimelineApply(istate, nowClock)
+            local renderX = istate.rx or istate.tx or istate.cx
+            local renderY = istate.ry or istate.ty or istate.cy
+            -- Phase 2: a timeline sample is the render target. The 60 ms
+            -- lookahead remains only for a ghost that has no samples yet.
             local DR_MAX_S = 0.060  -- 60 ms lookahead (covers a 50 ms packet gap)
             local sincePkt = nowClock - (istate.lastPacketTime or nowClock)
-            if sincePkt > 0 then
+            if not istate.rx and sincePkt > 0 then
                 local vx = istate.vx or 0
                 local vy = istate.vy or 0
                 if math.sqrt(vx*vx + vy*vy) > 0.5 then
@@ -13649,6 +13717,7 @@ function KCD2MP_InterpTick(arg, gen)
             if (vxS*vxS + vyS*vyS) > 0.25 and (dxT*vxS + dyT*vyS) < 0 then
                 factor = 0.15
             end
+            if istate.rx then factor = 1 end
             -- WO-78: the per-tick factor scaled to the real elapsed time.
             -- steps == 1 gives exactly the old 0.5 / 0.15; two fires 10 ms
             -- apart compose to the same result as one 20 ms fire.

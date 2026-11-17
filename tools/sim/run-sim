@@ -9,5 +9,7 @@ label="${1:-this-tree}"
 out="${2:-$root/tools/sim/out}"
 cd "$root"
 export SIM_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-dotnet run --project tools/sim/KcdMp.Sim/KcdMp.Sim.csproj -c Release -- --label "$label" --out "$out"
+extra=()
+if [ "$#" -ge 3 ]; then extra=("${@:3}"); fi
+dotnet run --project tools/sim/KcdMp.Sim/KcdMp.Sim.csproj -c Release -- --label "$label" --out "$out" "${extra[@]}"
 echo "report: $out/sim.md"
