@@ -47,6 +47,11 @@
     publishing gate (tools\Check-Publishing.ps1: every added line, file name and commit message against the
     denylist outside the repository; it fails closed). The gate also runs before the build, push or not.
 
+.PARAMETER ArtifactBuild
+    A GitHub Actions build that uploads the installer and the drop-in zip. It does not push, and it skips
+    only the publishing gate: that gate needs a denylist that lives outside the repository and is not on
+    the runner. Every other gate still runs.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File tools\Build-Installer.ps1
 #>
@@ -56,7 +61,8 @@ param(
     [string]$SoakWaiver,
     [switch]$ReleaseCandidate,
     [string]$SaveRoundTripWaiver,
-    [switch]$Push
+    [switch]$Push,
+    [switch]$ArtifactBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,11 +118,17 @@ if ($signing) {
     Write-Host "Code signing: OFF -- no signing settings found (docs\CODE-SIGNING.md). This build is UNSIGNED." -ForegroundColor Yellow
 }
 
+if ($Push -and $ArtifactBuild) { throw "-ArtifactBuild does not push. The publishing gate is what a push to main goes through." }
 # WO-179 0.1: the publishing gate -- nothing private in what a push of this code would publish (every added line,
 # file name and commit message of the pending commits against the denylist outside the repository; fails closed).
-Write-Host "Publishing gate (tools\Check-Publishing.ps1) ..."
-& powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Check-Publishing.ps1") -RepoDir $root
-if ($LASTEXITCODE -ne 0) { throw "the publishing gate FAILED. Not shipping." }
+# An artifact build has no denylist on the runner and does not push, so it skips this one gate only.
+if (-not $ArtifactBuild) {
+    Write-Host "Publishing gate (tools\Check-Publishing.ps1) ..."
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Check-Publishing.ps1") -RepoDir $root
+    if ($LASTEXITCODE -ne 0) { throw "the publishing gate FAILED. Not shipping." }
+} else {
+    Write-Host "Publishing gate: skipped (artifact build, no push, no denylist on the runner)."
+}
 
 # WO-151 Phase 0.3: no installer before the frame-rate soak has passed for exactly this
 # code (tools/perf/README.md). 0.42.7 was built with a frame-rate collapse listed as a

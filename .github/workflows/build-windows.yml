@@ -28,6 +28,7 @@ jobs:
         run: >
           powershell -ExecutionPolicy Bypass -File tools\Build-Installer.ps1
           -ReleaseCandidate
+          -ArtifactBuild
           -SaveRoundTripWaiver "CI: no Modding Tools game on the runner"
 
       - name: Drop-in zip
