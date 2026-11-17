@@ -337,7 +337,7 @@ int walk() {
 
 } // namespace
 
-bool snap_to_ground(const float in[3], float out[3]) {
+bool snap_to_ground(const float in[3], float out[3], bool logMiss) {
     if (!g_resolved) return false;
     void* gi = nullptr; void* X = nullptr; void* A = nullptr;
     if (!call_gi(g_getGameIface, &gi) || !gi || !rd(gi, kGiXGen, &X) || !X || !v0(X, kXWorld, &A) || !A) return false;
@@ -349,8 +349,9 @@ bool snap_to_ground(const float in[3], float out[3]) {
     // found nothing within the world config's own ranges. One wider search;
     // the 3 m acceptance rule still holds.
     const bool wide = nav_project(q, a * 4.0f, b * 4.0f, in, out);
-    logf("HANGOVER: ground snap at (%.1f, %.1f, %.1f): nothing within ranges %.2f/%.2f; 4x ranges %s",
-         in[0], in[1], in[2], a, b, wide ? "found the ground" : "found nothing either");
+    if (logMiss)
+        logf("HANGOVER: ground snap at (%.1f, %.1f, %.1f): nothing within ranges %.2f/%.2f; 4x ranges %s",
+             in[0], in[1], in[2], a, b, wide ? "found the ground" : "found nothing either");
     return wide;
 }
 

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - cursor/feel-stairs-combat-dialog-8b43
+      - cursor/floor-snap-pace-8b43
 
 jobs:
   build:

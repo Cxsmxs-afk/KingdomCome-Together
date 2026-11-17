@@ -29,6 +29,7 @@
 #include "combat_actions.h"
 #include "body_drive.h"
 #include "walk_holder.h"
+#include "hangover.h"
 #include "holders.h"
 #include "wo221.h"
 
@@ -339,6 +340,7 @@ float stream_vz(const Stream& s) {
     }
     return 0.0f;
 }
+
 std::atomic<uint32_t> c_chaseFollow{0}, c_chaseEnded{0};
 std::atomic<uint32_t> c_engineHolds{0};   // WO-221 C: bodies left where the engine holds them (the insisting engine)
 std::atomic<uint32_t> c_activityDrift{0};   // WO-209: activity holds ended because the host's NPC walked away from the body
@@ -367,6 +369,9 @@ struct Puppet {
     float    blendMps = 0;          // this blend's catch-up cap: kBlendMaxMps, or faster for a large offset
     bool     haveLast = false;
     float    last[3]{};
+    bool     haveFloor = false;
+    double   floorAt = -1e9;
+    float    floorX = 0, floorY = 0, floorZ = 0;
     bool     havePrev = false;      // the write before `last`
     float    prev[3]{};
     float    lastRot = 0;
@@ -400,6 +405,26 @@ struct Puppet {
     bool     seatPrevHave = false;
     const char* seatPrevWriter = "-";
 };
+
+// The tread under the shown point. The sample's own Z is the tread at the
+// sample; between two samples the riser is only known here. The navmesh is
+// the ground a player walks. A miss stays on the interpolated height. Quiet:
+// a body off the mesh must not log every frame.
+void snap_pose_floor(Puppet& p, float pose[4], float vz, double now) {
+    const float dx = pose[0] - p.floorX, dy = pose[1] - p.floorY;
+    const bool reuse = p.haveFloor && (now - p.floorAt) < 0.05 && dx * dx + dy * dy < 0.08f * 0.08f;
+    float gz = p.floorZ;
+    if (!reuse) {
+        const float in[3] = { pose[0], pose[1], pose[2] };
+        float out[3]{};
+        if (!hangover::snap_to_ground(in, out, false)) return;
+        gz = out[2];
+        p.floorX = pose[0]; p.floorY = pose[1]; p.floorZ = gz; p.floorAt = now; p.haveFloor = true;
+    }
+    const float diff = pose[2] - gz;
+    if (diff < -0.05f && diff > -10.f) pose[2] = gz;
+    else if (diff > 0.05f && diff < 2.f && vz < 1.2f) pose[2] = gz;
+}
 
 std::unordered_map<std::string, Stream> g_streams;
 std::unordered_map<std::string, Puppet> g_bound;
@@ -1626,6 +1651,16 @@ void tick() {
             p.blendWhy = "bind";
         }
         if (p.blending) blend_apply(p, pose, dt);
+        // A late sample on a bad link used to move the whole gap in one frame.
+        // The step is limited, then the tread under that point replaces a chord
+        // through the stair. Hits and dialogue do not use this clock.
+        if (fixedTl && p.haveLast) {
+            float pace = p.speedMps;
+            kcdmp::walkhold::limit_step(p.last[0], p.last[1], pose[0], pose[1], pace, static_cast<float>(dt));
+            p.speedMps = pace;
+        }
+        if (fixedTl && !p.beast && std::fabs(vzNow) <= kcdmp::walkhold::kAirVzMps)
+            snap_pose_floor(p, pose, vzNow, now);
         bool wrote = false;
         // WO-121: the rendered planar speed (this pose against the last one written).
         if (p.haveLast && dt > 0.0005) {
