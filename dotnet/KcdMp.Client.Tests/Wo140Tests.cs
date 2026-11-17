@@ -198,6 +198,22 @@ public class Wo140Tests
         => Assert.Equal(want, Wo140Rules.Separate(role, host, modeKnown, hostShared, inWorld, joined, busy));
 
     [Fact]
+    public void A_load_line_and_a_short_outage_do_not_end_the_session()
+    {
+        Assert.False(SessionHold.LoadIsOwnSave("Loading saved game 'playline2/host.whs'", "mine.whs"));
+        Assert.True(SessionHold.LoadIsOwnSave("Loading saved game 'playline1/mine.whs'", "mine.whs"));
+        Assert.False(SessionHold.LeaveAfterLoad(graceOver: false, inWorld: true, ownSave: true));
+        Assert.True(SessionHold.LeaveAfterLoad(graceOver: true, inWorld: true, ownSave: true));
+        Assert.False(SessionHold.ShowOwnWorld(separate: true, linkHolding: true, loadGrace: false, reconnecting: false));
+        Assert.False(SessionHold.ShowOwnWorld(separate: true, linkHolding: false, loadGrace: true, reconnecting: false));
+        Assert.True(SessionHold.ShowOwnWorld(separate: true, linkHolding: false, loadGrace: false, reconnecting: false));
+        Assert.False(SessionHold.LinkDead(10_000, 30_000));
+        Assert.True(SessionHold.LinkDead(30_000, 30_000));
+        Assert.False(SessionHold.LinkDead(30_000, SessionHold.IdleTimeoutMs));
+        Assert.Contains("different save", SessionHold.FailText("a different save finished loading"));
+    }
+
+    [Fact]
     public void A_separate_joiner_drops_the_hosts_world_but_keeps_the_players()
     {
         foreach (int t in new[] { Protocol.NpcStateDown, Protocol.NpcDamageDown, Protocol.DamageDown, Protocol.DeathDown, Protocol.ActionDown,

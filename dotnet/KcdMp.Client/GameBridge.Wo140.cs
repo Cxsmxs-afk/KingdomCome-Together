@@ -81,7 +81,7 @@ public partial class GameBridge
     private bool W140VoteRequired => Wo140Rules.VoteRequired(_w140On, _combatRoleApplied, _isDamageAuthority, _sharedWorld,
                                                              JoinerSharedEffective, _joinedWorld, Wo134Peers().Count);
     private bool W140JoinBusy => _jj is not null || _joinRx is not null || _joinOutId != 0 || _leaveInProgress || _rejoinPending
-                                 || _joinFromWorldOnce || _ownLoadExpected || _rewinding;
+                                 || _joinFromWorldOnce || _ownLoadExpected || _rewinding || LoadGraceActive || _w211Holding;
     private bool Wo140SeparateNow => Wo140Rules.Separate(_combatRoleApplied, _isDamageAuthority, _hostModeKnown, _hostSharedWorld,
                                                          _where == GameWhere.World, _joinedWorld, W140JoinBusy);
     /// <summary>A shared sleep is under way on this machine (the vote's skip): toasts quiet, the host's report says sleep.</summary>
@@ -716,6 +716,7 @@ public partial class GameBridge
     private async Task Wo140SeparateTickAsync()
     {
         W160NoteJoinActivity();   // WO-160 2: a join's activity keeps the verdict quiet for 60 s after it ends
+        LoadGraceTick();
         // WO-160 2: the verdict needs the mod's own, recent "world" answer and no join activity -- a stale "World" kept from a
         // game that crashed, a game at its main menu, a join's load: silent.
         bool sep = Wo140SeparateNow && await W160SeparateAllowedAsync();
@@ -727,7 +728,7 @@ public partial class GameBridge
             {
                 Console.WriteLine(Wo140Rules.SeparateLogLine + " -- nothing of the host's world is applied here (no NPC stream, puppets, copy guard, stand-ins, leash, loot, quests or crime); the ghosts still show each other");
                 _w140SeparateLogMs = now;
-                SetJoinUi("own-world", Wo140Rules.SeparateText);
+                SetJoinUi("own-world", SessionHold.FailText("this game is in a world that is not your host's, and reconnecting did not put it back"));
                 await Wo140SendLeashStateSoonAsync();
             }
             else

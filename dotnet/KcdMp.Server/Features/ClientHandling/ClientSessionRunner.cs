@@ -41,7 +41,10 @@ public sealed class ClientSessionRunner
 		_clientHandler = clientHandler;
 		_broadcastService = broadcastService;
 		_sessions = sessions;
-		IdleTimeout = TimeSpan.FromMilliseconds(int.Parse(configuration.GetSection("Tcp")["IdleTimeoutMs"] ?? "30000"));
+		// 90 s: a load or a stall of half a minute is not a dead client. The ping
+		// loop is separate from the console, so this only fires when nothing
+		// at all arrives. SessionHold.IdleTimeoutMs is the same number.
+		IdleTimeout = TimeSpan.FromMilliseconds(int.Parse(configuration.GetSection("Tcp")["IdleTimeoutMs"] ?? "90000"));
 	}
 
 	public ClientSession Create(RelayConnection conn)

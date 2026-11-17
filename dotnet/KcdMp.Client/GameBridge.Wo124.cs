@@ -281,13 +281,42 @@ public partial class GameBridge
         if (_ownLoadExpected) return;
         if (_joinedWorld)
         {
-            // The joiner loaded a save of its own from the pause menu: it has left the host's world.
-            Console.WriteLine("MP-JOIN joiner: a load started that the join did not ask for -- this game is leaving the host's world (its progress there is kept up to the host's last save, WO-125)");
-            _rewinding = false; _rejoinPending = false;
-            SetJoinedWorld(false);
-            _ = Wo122SetLockAsync(false, "left-shared-world");
-            SetJoinUi("idle", "");
+            // A loading screen, a fast travel and a quest catch-up all print this line.
+            // Leaving at once was the "you are in your own world" toast a few seconds
+            // into a session. Hold. Only a save that is not the host's, still up
+            // after the grace, ends the session -- and the line says why.
+            bool own = SessionHold.LoadIsOwnSave(display, _joinedSource?.File);
+            _loadGraceUntilUtc = DateTime.UtcNow.AddMilliseconds(SessionHold.LoadGraceMs);
+            _loadGraceOwn = own;
+            Console.WriteLine(own
+                ? $"MP-JOIN joiner: a different save started ({display}) -- holding the host's world for {SessionHold.LoadGraceMs / 1000} s before calling it your own"
+                : $"MP-JOIN joiner: a load started ({display}) -- staying in the host's world (a loading screen is not your own save)");
         }
+    }
+
+    private DateTime _loadGraceUntilUtc;
+    private bool _loadGraceOwn;
+    private bool LoadGraceActive => _loadGraceUntilUtc != default && DateTime.UtcNow < _loadGraceUntilUtc;
+
+    /// <summary>The load grace ended. A different save that is actually up leaves, and says so. Anything else stays.</summary>
+    private void LoadGraceTick()
+    {
+        if (_loadGraceUntilUtc == default || DateTime.UtcNow < _loadGraceUntilUtc) return;
+        if (_loadGraceOwn && _where == GameWhere.Loading)
+        {
+            _loadGraceUntilUtc = DateTime.UtcNow.AddMilliseconds(SessionHold.LoadGraceMs);
+            return;
+        }
+        bool own = _loadGraceOwn && _where == GameWhere.World && _joinedWorld;
+        _loadGraceUntilUtc = default;
+        _loadGraceOwn = false;
+        if (!own)
+        {
+            Console.WriteLine("MP-JOIN joiner: load grace ended -- still in the host's world");
+            return;
+        }
+        Console.WriteLine("MP-JOIN joiner: the other save is up and the grace ended -- leaving the host's world");
+        _ = LeaveSharedWorldAsync("own-save", SessionHold.FailText("a different save finished loading"));
     }
 
     /// <summary>"Exiting to main menu because save game loading failed." -- the engine went back to the menu.</summary>
