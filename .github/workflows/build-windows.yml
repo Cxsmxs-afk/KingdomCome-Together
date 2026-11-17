@@ -66,4 +66,5 @@ jobs:
           if-no-files-found: error
           path: |
             tools/sim/out/sim.json
+            tools/sim/out/sim-load.json
             tools/sim/out/sim.md

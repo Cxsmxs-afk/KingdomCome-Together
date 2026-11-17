@@ -24,26 +24,33 @@ public static class Program
     {
         string outDir = "tools/sim/out";
         string label = "this-tree";
+        string timeline = "legacy";
+        bool loadOnly = false;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--out" && i + 1 < args.Length) outDir = args[++i];
             else if (args[i] == "--label" && i + 1 < args.Length) label = args[++i];
+            else if (args[i] == "--timeline" && i + 1 < args.Length) timeline = args[++i];
+            else if (args[i] == "--load-only") loadOnly = true;
         }
         Directory.CreateDirectory(outDir);
         var commit = (Environment.GetEnvironmentVariable("SIM_COMMIT") ?? "unknown").Trim();
         var results = new List<RunResult>();
-        foreach (var players in new[] { 2, 3, 4 })
-            foreach (var profile in Profile.All)
-                results.Add(await RunOne(players, profile, label, commit));
+        if (!loadOnly)
+            foreach (var players in new[] { 2, 3, 4 })
+                foreach (var profile in Profile.All)
+                    results.Add(await RunOne(players, profile, label, commit));
 
         var opt = new JsonSerializerOptions { WriteIndented = true };
         string jsonPath = Path.Combine(outDir, "sim.json");
         await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(results, opt));
         string mdPath = Path.Combine(outDir, "sim.md");
-        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results));
+        var load = Continuous.RunAll(timeline);
+        await File.WriteAllTextAsync(Path.Combine(outDir, "sim-load.json"), JsonSerializer.Serialize(load, opt));
+        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load));
         int gated = results.Count(r => r.Gate);
         int failed = results.Count(r => r.Gate && !r.Pass);
-        Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. {mdPath}");
+        Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. {mdPath}");
         return failed == 0 ? 0 : 1;
     }
 
@@ -432,6 +439,21 @@ static class Report
         sb.AppendLine("- Die native DLL, `body_drive`, und ob die Engine einen Körper annimmt.");
         sb.AppendLine("- Steam, NAT und eine echte Leitung. Die Verzögerung macht ein Proxy im selben Prozess.");
         sb.AppendLine("- Die CPU-Zahl ist der ganze Simulator inklusive Relay, nicht das Relay allein.");
+        return sb.ToString();
+    }
+
+    public static string Load(List<LoadResult> rows)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine();
+        sb.AppendLine("## Dauerlast, 10 Minuten, virtuelle Uhr");
+        sb.AppendLine();
+        sb.AppendLine("40 NPCs und die Spieler, Profile typical/bad/awful, zehn Minuten auf einer virtuellen Uhr. Ein Konsolen-Aufruf kostet 35 ms und nimmt jeden Stand mit, der in 1900 Zeichen passt, wie der echte Flusher. Queue ist das Alter des ältesten wartenden Stands. Snaps sind Sprünge über 5 m. Brüche sind Geschwindigkeitssprünge der Spieler über 3 m/s.");
+        sb.AppendLine();
+        sb.AppendLine("| Spieler | Profil | Zeitlinie | Queue p95 | Queue max | Snaps/min | davon Spieler | davon NPC | Brüche/min | Extrapoliert ms |");
+        sb.AppendLine("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|");
+        foreach (var r in rows)
+            sb.AppendLine($"| {r.Players} | {r.Profile} | {r.Timeline} | {r.QueueP95:0} | {r.QueueMax:0} | {r.SnapsPerMin:0.0} | {r.PlayerSnapsPerMin:0.0} | {r.NpcSnapsPerMin:0.0} | {r.BreaksPerMin:0.0} | {r.ExtrapMs:0} |");
         return sb.ToString();
     }
 }
