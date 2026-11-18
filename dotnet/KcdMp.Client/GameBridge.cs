@@ -6189,7 +6189,7 @@ public partial class GameBridge(ClientConfig config)
             return;
         }
 
-        if (name is "edge_mode" or "edge_probe" or "edge_lanes")
+        if (name == "edge_mode" || name == "edge_probe" || name == "edge_lanes")
         {
             EdgeOnGameEvent(name, arg);
             return;
