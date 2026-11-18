@@ -55,6 +55,7 @@ int for_each_entity(bool (*visit)(void* e, void* ctx), void* ctx);
 
 // Console: set an int CVar, reporting the previous value. False when the CVar
 // does not exist or is not an int.
+bool cvar_get_int(const char* name, int* out);
 bool cvar_set_int(const char* name, int value, int* previous);
 
 } // namespace kcdmp::engine

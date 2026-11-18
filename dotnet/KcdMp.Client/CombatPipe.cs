@@ -804,33 +804,33 @@ public sealed partial class CombatPipe : IAsyncDisposable
     public sealed record JoinPlaceReport(bool Ok, bool Snapped, bool FallHeld, float[] Target, float[] Before, float[] After, float Residual);
 
     /// <summary>Put the player <paramref name="dist"/> m beside (x,y,z), on the ground, with the fall damage held (main thread, WO-113's teleport).</summary>
-    public async Task<JoinPlaceReport?> JoinPlaceAsync(float x, float y, float z, float dist, CancellationToken ct = default)
+    public async Task<JoinPlaceReport?> JoinPlaceAsync(float x, float y, float z, float dist, TeleportProof proof, CancellationToken ct = default)
     {
-        var payload = new byte[16];
+        if (!proof.Valid) return null;
+        var payload = new byte[33];
         BinaryPrimitives.WriteSingleLittleEndian(payload, x);
         BinaryPrimitives.WriteSingleLittleEndian(payload.AsSpan(4), y);
         BinaryPrimitives.WriteSingleLittleEndian(payload.AsSpan(8), z);
         BinaryPrimitives.WriteSingleLittleEndian(payload.AsSpan(12), dist);
-        var (body, _) = await SendAndAwaitAsync(JoinPlace, payload, JoinPlaceReply, ct);
+        WriteTeleportProof(payload.AsSpan(16), proof);
+        var (body, _) = await SendAndAwaitAsync(JoinPlace, payload, JoinPlaceReply, ct, () => proof.Valid);
         if (body is null || body.Length < 44) return null;
         float[] V(int o) => [BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(o)), BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(o + 4)), BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(o + 8))];
         return new JoinPlaceReport(body[0] == 1, body[2] == 1, body[3] == 1, V(4), V(16), V(28), BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(40)));
     }
 
-    /// <summary>
-    /// WO-114 Phase 2: where the other player is and the leash's warning
-    /// distance; a death then wakes within it (native wake_pick.h). valid=false
-    /// = no partner (today's rule). The DLL forgets it after 10 s without one.
-    /// </summary>
-    public Task<PipeResult> SetPartnerAsync(bool valid, float x, float y, float z, float radius, CancellationToken ct = default)
+    /// <summary>The peer's proven snapshot for native wake selection. Its fixed local deadline and generation survive every queue.
+    /// valid=false clears the cache even when no snapshot can be proved.</summary>
+    public Task<PipeResult> SetPartnerAsync(bool valid, float x, float y, float z, float radius, TeleportProof proof, CancellationToken ct = default)
     {
-        var payload = new byte[17];
+        var payload = new byte[34];
         payload[0] = B(valid);
         BinaryPrimitives.WriteSingleLittleEndian(payload.AsSpan(1), x);
         BinaryPrimitives.WriteSingleLittleEndian(payload.AsSpan(5), y);
         BinaryPrimitives.WriteSingleLittleEndian(payload.AsSpan(9), z);
         BinaryPrimitives.WriteSingleLittleEndian(payload.AsSpan(13), radius);
-        return SendForResultAsync(SetPartner, payload, ct);
+        WriteTeleportProof(payload.AsSpan(17), proof);
+        return SendPartnerProofAsync(payload, proof, valid, ct);
     }
 
     /// <summary>(session, enabled, applied) of the WO-113 death guard, or null.</summary>
@@ -2621,7 +2621,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// S3.1's fix, which this generalises rather than duplicates).
     /// </summary>
     private async Task<(byte[]? Body, PipeReason Fail)> SendAndAwaitAsync(
-        byte type, byte[] payload, byte wantType, CancellationToken ct)
+        byte type, byte[] payload, byte wantType, CancellationToken ct, Func<bool>? beforeWrite = null)
     {
         using var scope = ProcessorFrameScope.Link(ct);
         ct = scope.Token;
@@ -2629,7 +2629,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         ct.ThrowIfCancellationRequested();
         if (Wo210PipeBlock.Blocks(type, type == Wo163 && payload.Length > 0 ? payload[0] : -1)) return (null, PipeReason.NotConnected);   // WO-210 H.3's bisect only
         if (!await EnsureConnectedAsync(ct)) return (null, PipeReason.NotConnected);
-        if (UseBatch(type)) return await BatchSendAsync(type, payload, wantType, ct);   // WO-218 A.1: one round trip for every waiting request
+        if (beforeWrite is null && UseBatch(type)) return await BatchSendAsync(type, payload, wantType, ct);   // WO-218 A.1: one round trip for every waiting request
         if (CaptureSource() is not { } source) return (null, PipeReason.NotConnected);
 
         long gateAt = Environment.TickCount64;
@@ -2649,7 +2649,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                                   $"before sending 0x{type:X2} (total {StaleRepliesDropped})");
             }
 
-            await WriteFrameAsync(type, payload, ct, source.Pipe);
+            await WriteFrameAsync(type, payload, ct, source.Pipe, beforeWrite);
             sent = true;
 
             // Bounded wait with an explicit give-up, and the waited time is
@@ -2759,7 +2759,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     private static readonly TimeSpan ReplyDeadline = TimeSpan.FromSeconds(5);
 
-    private async Task WriteFrameAsync(byte type, byte[] payload, CancellationToken ct, NamedPipeClientStream expectedPipe)
+    private async Task WriteFrameAsync(byte type, byte[] payload, CancellationToken ct, NamedPipeClientStream expectedPipe, Func<bool>? beforeWrite = null)
     {
         using var scope = ProcessorFrameScope.Link(ct);
         ct = scope.Token;
@@ -2768,7 +2768,11 @@ public sealed partial class CombatPipe : IAsyncDisposable
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(ReplyDeadline); // background calls also cannot own the writer indefinitely
         await _writeLock.WaitAsync(deadline.Token);
-        try { await WriteFrameLockedAsync(type, payload, deadline.Token, expectedPipe); }
+        try
+        {
+            if (beforeWrite is not null && !beforeWrite()) throw new OperationCanceledException("teleport proof superseded", ct);
+            await WriteFrameLockedAsync(type, payload, deadline.Token, expectedPipe);
+        }
         finally { _writeLock.Release(); }
     }
 

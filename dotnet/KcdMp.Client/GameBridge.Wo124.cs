@@ -844,14 +844,9 @@ public partial class GameBridge
         }
 
         // 4. beside the host, on the ground
-        if (_ghostLastPos.TryGetValue(j.Host, out var hp) && (DateTime.UtcNow - hp.AtUtc).TotalSeconds < 10)
-        {
-            var pr = await _combat.JoinPlaceAsync(hp.X, hp.Y, hp.Z, 3.0f);
-            Console.WriteLine(pr is null
-                ? $"MP-JOIN joiner: join 0x{j.JoinId:x8} step 4 beside the host: no answer from the plugin (the joiner keeps the spliced spot)"
-                : FormattableString.Invariant($"MP-JOIN joiner: join 0x{j.JoinId:x8} step 4 beside the host ({hp.X:F1}, {hp.Y:F1}, {hp.Z:F1}): {(pr.Ok ? "placed" : "NOT placed")} at ({pr.After[0]:F1}, {pr.After[1]:F1}, {pr.After[2]:F1}) snapped={On(pr.Snapped)} residual_m={pr.Residual:F2} moved_m={Dist(pr.Before, pr.After):F1}"));
-        }
-        else Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} step 4 beside the host: no fresh host position (ghost {j.Host}) -- the joiner keeps the spliced spot");
+        var hostTarget = await T3TpPeerAsync(j.Host, TeleportSource.Join, j.HostWorldEpoch);
+        var placed = hostTarget is null ? null : await T3TpPlaceAsync(hostTarget, 3.0f, TeleportSource.Join);
+        Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} step 4 beside host: {(placed is { Ok: true } ? "placed" : "refused or no fresh safe snapshot; keeps spliced spot")}");
 
         // 5. Ready
         if (Wo206JoinGone(j, "before Ready") || j.Phase != "post-load") return;

@@ -260,9 +260,9 @@ constexpr uint8_t kWo121Status        = 0x1B;   // -> 0x8A [ok][seq][text]
 constexpr uint8_t kWo121StatusReply   = 0x8A;
 constexpr uint8_t kAttributedReply    = 0x8B;   // [ok][seq][steps][attackerWuid:8][victimWuid:8]
 // WO-124: put the joiner beside the host, on the ground (join_native.h).
-constexpr uint8_t kJoinPlace          = 0x1C;   // [hostX:4f][hostY:4f][hostZ:4f][dist:4f] -> 0x8C
+constexpr uint8_t kJoinPlace          = 0x1C;   // [hostXYZ:12][dist:f][source:1][deadline:u64][generation:u64] -> 0x8C
 constexpr uint8_t kJoinPlaceReply     = 0x8C;   // [ok][seq][snapped][fallHeld][target:12][before:12][after:12][residual:4f]
-constexpr int     kJoinPlaceLen       = 16;
+constexpr int     kJoinPlaceLen       = 33;
 // WO-124: the engine's cached save list (savelist.h): [op][playline][nameLen][name]
 //   op 1 = rescan + find, 2 = rescan + Continue's pick only, 3 = find without a rescan
 constexpr uint8_t kSaveList           = 0x1D;   // -> 0x8D
@@ -280,7 +280,7 @@ constexpr size_t  kLeashPageBudget    = 7000;
 // (respawn::set_partner; wake_pick.h). [valid:1][x:4f][y:4f][z:4f][radius:4f] -> 0x81.
 // Atomic setter (locked), no main-thread hop; the pipe closing clears it.
 constexpr uint8_t kSetPartner         = 0x20;
-constexpr int     kSetPartnerLen      = 17;
+constexpr int     kSetPartnerLen      = 34;
 // WO-131: combat and bodies (wo131.h): [op][...] -> 0x98 [ok][seq][op][reason][payload]
 constexpr uint8_t kWo131              = 0x21;
 constexpr uint8_t kWo131Reply         = 0x98;

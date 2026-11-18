@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/t3-p3-pickup-freeze
+      - codex/t3-p4-respawn-wake
 
 jobs:
   build:

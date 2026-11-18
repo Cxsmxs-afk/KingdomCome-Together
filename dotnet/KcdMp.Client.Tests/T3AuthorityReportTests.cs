@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.IO.Pipes;
 using System.Reflection;
 using System.Text;
+using System.Buffers.Binary;
 using KcdMp.Wire;
 
 namespace KcdMp.Client.Tests;
@@ -18,9 +19,15 @@ public class T3AuthorityReportTests
         Assert.Equal(0x2B, header[0]);
         var body = new byte[header[1] | header[2] << 8]; await stream.ReadExactlyAsync(body, ct); return body;
     }
-    private static async Task Reply(Stream stream, byte seq, byte op, CancellationToken ct, bool truncated = false)
+    private static async Task Reply(Stream stream, byte seq, byte op, CancellationToken ct, bool truncated = false, bool worldStats = false)
     {
         byte[] payload = op == Protocol.Wo216OpBrains ? Encoding.ASCII.GetBytes(truncated ? "B decision_blocked=999 npc_hidden=999" : Snapshot) : [];
+        if (worldStats)
+        {
+            int count = truncated ? 18 : 19;
+            payload = new byte[2 + count * 9]; payload[0] = 1; payload[1] = (byte)count;
+            for (int i = 0; i < count; i++) { payload[2 + i * 9] = (byte)i; BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(3 + i * 9), (ulong)(10 + i)); }
+        }
         byte[] body = [1, seq, op, 0, .. payload];
         byte[] frame = [0xAC, (byte)body.Length, (byte)(body.Length >> 8), .. body];
         await stream.WriteAsync(frame, ct);
@@ -46,9 +53,12 @@ public class T3AuthorityReportTests
         var counters = (ConcurrentDictionary<string, long>)typeof(GameBridge).GetField("_t3Counters", Private)!.GetValue(b)!;
         counters["postload_timeouts"] = 3;
         counters["decision_blocked"] = 9; counters["npc_hidden"] = 8;
+        counters["tp_total"] = 7;
         Task report = (Task)typeof(GameBridge).GetMethod("T3PublishStatsAsync", Private)!.Invoke(b, [stop.Token])!;
         Assert.Equal(new byte[] { Protocol.Wo216OpBrains }, await Read(server, stop.Token));
         await Reply(server, 1, Protocol.Wo216OpBrains, stop.Token, truncated);
+        Assert.Equal(new byte[] { Protocol.T3OpStats }, await Read(server, stop.Token));
+        await Reply(server, 2, Protocol.T3OpStats, stop.Token, truncated, worldStats: true);
         var mirror = await Read(server, stop.Token);
         Assert.Equal(Protocol.T3OpStats, mirror[0]); Assert.Equal(role, mirror[1]);
         string fields = Encoding.ASCII.GetString(mirror, 2, mirror.Length - 2);
@@ -59,7 +69,10 @@ public class T3AuthorityReportTests
         foreach (string key in new[] { "pickup_asks", "pickup_optimistic", "pickup_rollbacks", "pickup_unknown_kept", "ask_timeouts", "ask_latency_ms_p95", "take_busy_refusals", "input_held_max_s", "input_releases", "auto_rejoins_in_world" })
             Assert.Contains(key + "=0", fields);
         Assert.Equal(truncated ? 1 : 0, counters["authority_stats_unreadable"]);
-        await Reply(server, 2, Protocol.T3OpStats, stop.Token);
+        Assert.Equal(truncated ? 1 : 0, counters["world_stats_unreadable"]);
+        Assert.Contains("tp_total=" + (truncated ? 7 : 10), fields);
+        Assert.Contains("falldeath_after_tp=" + (truncated ? 0 : 24), fields);
+        await Reply(server, 3, Protocol.T3OpStats, stop.Token);
         await report.WaitAsync(stop.Token);
         var gate = (SemaphoreSlim)typeof(CombatPipe).GetField("_gate", Private)!.GetValue(pipe)!;
         await gate.WaitAsync(stop.Token); gate.Release(); // the fire-and-forget mirror has consumed its ACK

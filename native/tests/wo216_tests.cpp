@@ -188,6 +188,24 @@ int wo216_tests(int* passed) {
     }
     {
         using namespace kcdmp::wo216authority;
+        State off;
+        WCHECK(off.apply({Phase::Disabled, 10, 1}, 100), "P4: host/off Load confirms a disabled generation");
+        WCHECK(off.apply({Phase::Gameplay, 10, 2}, 200) && off.phase == Phase::Gameplay && off.loadAccepted && !off.enabled(), "P4: genuine Gameplay proves readiness even with optional authority disabled");
+        WCHECK(!off.legacy(2) && !off.active(2, true, 5200) && off.active_from() == 0, "P4: disabled Gameplay never activates the decision gate or silently arms legacy");
+        uint8_t ack[kAckBytes]{}; off.ack(ack, 2, true, 5200, 8);
+        WCHECK(ack[0] == uint8_t(Phase::Gameplay) && ack[1] == 0 && ack[2] == 0 && read_u64(ack+3) == 10 && read_u32(ack+11) == 5000, "P4: disabled Gameplay ACK reports ready phase without enabled/active authority");
+        WCHECK(off.apply({Phase::Gameplay, 10, 3}, 6200) && off.gameplayAtMs == 200, "P4: disabled Gameplay heartbeat does not renew source age or settle");
+        off.role_changed(0, 2, true);
+        WCHECK(off.legacy(2) && !off.enabled() && off.phase == Phase::Gameplay && off.loadAccepted, "P4: explicit generation-tagged legacy transition remains available after readiness proof");
+        off.role_changed(2, 2, true);
+        WCHECK(off.legacy(2) && !off.active(2, true, 99999), "P4: off role heartbeat preserves legacy without enabling intellect gate");
+        WCHECK(off.apply({Phase::Disabled, 11, 4}, 6300) && !off.legacy(2) && !off.loadAccepted && off.phase == Phase::Disabled, "P4: next off Load immediately invalidates old Gameplay and legacy");
+        WCHECK(!off.apply({Phase::Gameplay, 10, 5}, 6400) && off.generation == 11 && !off.loadAccepted, "P4: old Gameplay cannot establish readiness in newer disabled generation");
+        off.role_changed(0, 2, false);
+        WCHECK(!off.legacy(2), "P4: untagged role format still cannot activate disabled legacy");
+    }
+    {
+        using namespace kcdmp::wo216authority;
         WCHECK(!coverage(10, 0) && !coverage(0, 0) && !coverage(10, 2) && coverage(10, 3) && coverage(10, 4) && !coverage(10, 3, false), "P1: nearby bound0/under30percent/unknown player never authorize hiding");
         WCHECK(hide_eligible(true, true, false, true, false, false, true), "P1: initialized known living nearby bystander can qualify");
         WCHECK(!hide_eligible(false, true, false, true, false, false, true) && !hide_eligible(true, false, false, true, false, false, true) && !hide_eligible(true, true, true, true, false, false, true), "P1: unready, unknown life and dead body never hidden");

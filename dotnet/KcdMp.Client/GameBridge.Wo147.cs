@@ -32,7 +32,6 @@ public partial class GameBridge
 {
     // ---- partners' positions, as read (reader thread writes, leash loop reads) ----
     private readonly ConcurrentDictionary<byte, Wo147Rules.PeerPositions> _w147PeerPos = new();
-    private readonly ConcurrentDictionary<byte, List<(float X, float Y, float Z, long AtMs)>> _w147Trail = new();
     private readonly ConcurrentDictionary<byte, (bool Stale, long SinceMs)> _w147StaleNoted = new();
     private readonly ConcurrentDictionary<byte, bool> _w147PeerFlyingNoted = new();
 
@@ -48,7 +47,6 @@ public partial class GameBridge
     {
         foreach (var p in _w147PeerPos.Values) lock (p) p.Reset();
         _w147PeerPos.Clear();
-        _w147Trail.Clear();
         _w147StaleNoted.Clear();
         _w147PeerFlyingNoted.Clear();
         _w147Own.Reset();
@@ -67,12 +65,7 @@ public partial class GameBridge
         long at = W147StampMs(arrival);
         var pos = _w147PeerPos.GetOrAdd(gs.GhostId, _ => new Wo147Rules.PeerPositions());
         lock (pos) pos.Feed(gs.X, gs.Y, gs.SenderMs, at);
-        var trail = _w147Trail.GetOrAdd(gs.GhostId, _ => new List<(float, float, float, long)>());
-        lock (trail)
-        {
-            if (trail.Count == 0 || at - trail[^1].AtMs >= 250) trail.Add((gs.X, gs.Y, gs.Z, at));
-            if (trail.Count > 160) trail.RemoveRange(0, trail.Count - 160);   // ~40 s at 4 Hz
-        }
+
     }
 
     /// <summary>The leash's own lane: its frames are handled the moment they are read.</summary>
@@ -82,9 +75,12 @@ public partial class GameBridge
         {
             await foreach (var f in lane.ReadAllAsync(ct))
             {
-                if (Wo140DropSeparate(f.Type)) continue;   // WO-140: a joiner in its own world
+                if (Wo140DropSeparate(f.Type)) continue;
+                if (f.Type == Protocol.LeashDown && f.Payload.Length > 1 + Protocol.JoinHeaderLen && f.Payload[1 + Protocol.JoinHeaderLen] == Protocol.LeashKindPull &&
+                    (f.Stamp == 0 || f.Stamp != _w206.World || f.TeleportGeneration != P1Lifecycle.Current.Generation ||
+                    f.TeleportLifeRevision != Interlocked.Read(ref _t3InputLifeRevision))) continue;   // WO-140: a joiner in its own world
                 Interlocked.Increment(ref _w147LeashLaneFrames);
-                try { await Wo123OnFrameAsync(f.Type, f.Payload, ct); }
+                try { await Wo123OnFrameAsync(f.Type, f.Payload, ct, f.Stamp); }
                 catch (Exception ex) { Console.WriteLine($"MP-LEASH lane: a frame failed: {ex.GetType().Name}: {ex.Message}"); }
             }
         }
@@ -172,33 +168,6 @@ public partial class GameBridge
     }
 
     // ---------------------------------------------------------------- joiner: the pull's target
-
-    /// <summary>
-    /// Where the host is, for a pull: the command's own position, or the host's avatar's newest sample when
-    /// that is newer (a command that waited in a backlog carries an old position).
-    /// </summary>
-    private (float X, float Y, float Z) Wo147PullTargetHost(LeashCommand c)
-    {
-        byte hid = _leashHostId != 0xFF ? _leashHostId : _hostModeFrom;
-        if (hid != 0xFF && _w147Trail.TryGetValue(hid, out var trail))
-        {
-            lock (trail)
-            {
-                if (trail.Count > 0 && W147StampMs(Stopwatch.GetTimestamp()) - trail[^1].AtMs < 2000
-                    && LeashLogic.Dist2D(trail[^1].X, trail[^1].Y, c.HostX, c.HostY) < 200)
-                    return (trail[^1].X, trail[^1].Y, trail[^1].Z);
-            }
-        }
-        return (c.HostX, c.HostY, c.HostZ);
-    }
-
-    private (float X, float Y, float Z) Wo147PullFallbackSpot(float hx, float hy, float hz)
-    {
-        byte hid = _leashHostId != 0xFF ? _leashHostId : _hostModeFrom;
-        List<(float X, float Y, float Z, long AtMs)> copy = new();
-        if (hid != 0xFF && _w147Trail.TryGetValue(hid, out var trail)) lock (trail) copy.AddRange(trail);
-        return Wo147Rules.PullFallbackSpot(hx, hy, hz, _lastX, _lastY, copy, W147StampMs(Stopwatch.GetTimestamp()));
-    }
 
     // ================================================================ the frame backlog (mp_npc_catchup)
     //
@@ -724,18 +693,4 @@ public partial class GameBridge
     private string Wo147QuestStatsText() => FormattableString.Invariant(
         $"quest_safety={(_w147QuestSafety ? "on" : "off")} destructive_in={_w147DestructiveIn} already={_w147DestructiveAlready} conversation={_w147DestructiveConv} refused={_w147DestructiveRefused} corrections_skipped={_w147CorrectionsSkipped} not_own_blow={_w147NotOwnBlow} fight_watches={_w147FightWatches} guards_forgotten={_w147GuardsForgotten}");
 
-    /// <summary>After a fallback placement: the ground beside the host, once this area has loaded (two tries).</summary>
-    private async Task Wo147SettleBesideHostAsync(byte seq)
-    {
-        foreach (int waitMs in new[] { 1500, 3000, 4000, 6000, 10000 })
-        {
-            await Task.Delay(waitMs);
-            byte hid = _leashHostId != 0xFF ? _leashHostId : _hostModeFrom;
-            if (hid == 0xFF || !_ghostLastPos.TryGetValue(hid, out var hp)) return;
-            var pr = await _combat.JoinPlaceAsync(hp.X, hp.Y, hp.Z, LeashPlaceDistM);
-            Console.WriteLine(FormattableString.Invariant(
-                $"MP-LEASH joiner: pull #{seq}: the ground beside the host {(pr is { Ok: true } ? "has loaded -- placed there" : "is not loaded yet")} ({(pr is null ? "no answer" : $"residual {pr.Residual:F2} m")})"));
-            if (pr is { Ok: true }) return;
-        }
-    }
 }

@@ -35625,23 +35625,15 @@ do
     end
     System.AddCCommand("mp_leave", "KCD2MP_W211Leave(%line)", "WO-211 A.1: while the connection to your host is lost, leave the host's world now (your progress is saved first)")
 
-    -- A.2.3 (the joiner, his own world after a leave from a dropped link): he is put where he stood at the drop. A long move lands before
-    -- the ground's physics is there, so he is held 1.5 m over the ground (or the drop's own height, the higher) for 3 s, then let go.
+    -- P4: an old agent may deliver this after the own save loaded. Reject it:
+    -- that save owns the player's safe position, with no delayed transform loop.
     function KCD2MP_W211PlaceAt(x, y, z, rot)
-        x, y, z = tonumber(x), tonumber(y), tonumber(z)
-        if not (x and y and z and player) then return false end
-        local n = 0
-        local function hold()
-            n = n + 1
-            local g = nil
-            pcall(function() g = System.GetTerrainElevation({ x = x, y = y, z = z }) end)
-            local tz = math.max(z, (tonumber(g) or z) + (n < 30 and 1.5 or 0.2))
-            pcall(function() player:SetWorldPos({ x = x, y = y, z = tz }) end)
-            if n == 1 and rot then pcall(function() player:SetWorldAngles({ x = 0, y = 0, z = tonumber(rot) or 0 }) end) end
-            if n < 31 then Script.SetTimer(100, hold) else mp_log(string.format("WO211-HOME placed at (%.1f, %.1f, %.1f)", x, y, tz)) end
+        local w = KCD2MP.w211
+        w.homePlaceRefused = (w.homePlaceRefused or 0) + 1
+        if w.homePlaceRefused <= 3 or w.homePlaceRefused % 100 == 0 then
+            mp_log("T3-TP-REFUSED source=home why=removed-legacy-placement -- the loaded own save keeps its position [n=" .. w.homePlaceRefused .. "]")
         end
-        hold()
-        return true
+        return false
     end
 
     -- A.1.5 (the host): the partner's figure while its link is down -- its badge says so.

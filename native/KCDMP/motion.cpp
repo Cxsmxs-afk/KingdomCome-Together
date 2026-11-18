@@ -39,6 +39,7 @@
 #include "inline_hook.h"
 #include "log.h"
 #include "hits.h"
+#include "p4.h"
 #include "pe_exports.h"
 #include "script_context.h"
 #include "wo195.h"
@@ -1763,6 +1764,7 @@ void note_local_downed(State2* out) {
             if (s_since < 0) s_since = now;
             if (now - s_since >= (raw ? 0.15 : 0.30)) {
                 s_down = raw; s_since = -1;
+                p4::note_life_edge(raw ? "physics-down" : "physics-up");
                 if (raw) s_lastDownEdge = now;
                 logf("WO154-DOWN the local player is %s (physics %s)", raw ? "DOWN" : "up again", ps.living ? "living" : "not a living entity");
             }

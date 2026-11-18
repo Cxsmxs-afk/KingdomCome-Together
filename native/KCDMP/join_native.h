@@ -2,18 +2,15 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #pragma once
-// WO-124: the joiner's placement beside the host (docs/WO-124-findings.md).
-//
-// place(): put the player `dist` metres beside the host, on the ground. Eight
-// directions around the host are tried in turn (east first, then round) until
-// the navmesh snap WO-113 uses for its wake spots finds ground there within
-// 3 m of the host's height; then WO-113's player teleport (XGenAI teleport
-// with a physics reset, the `goto` shape as fallback) with the fall damage
-// held for the landing and given back 3 s later. No ground anywhere: no
-// teleport at all (fail closed -- the joiner keeps the host Henry's spot).
-// Main thread only; the pipe marshals it (0x1C -> 0x8C).
+// P4: all join/leash/unstuck/video/scene placements go through p4::place.
+// Fresh source/deadline/generation are mandatory; unknown legacy calls refuse.
+// Ground probing never skips exact targets. Original source and placement drops
+// are bounded separately. The shared fall lease waits for 1s known grounded proxy,
+// at most20s. Target hostility beyond the peer snapshot is not a verified API.
+// Main thread only (pipe0x1C ->0x8C).
 
 #include <cstdint>
+#include "p4.h"
 
 namespace kcdmp::joinnative {
 
@@ -28,14 +25,14 @@ struct PlaceReport {
     float residual = -1.f;     // |after - target| in the horizontal plane
 };
 
-PlaceReport place(float hostX, float hostY, float hostZ, float dist);
+PlaceReport place(float hostX, float hostY, float hostZ, float dist, p4::Context context = {});
 
 // WO-114: the ground search place() uses, alone -- eight directions around
-// (hx,hy), `dist` metres out, navmesh-snapped within 3 m of hz. False when no
+// (hx,hy), `dist` metres out, navmesh-snapped within 2 m of hz. False when no
 // direction has ground. Main thread only.
 bool find_beside(float hx, float hy, float hz, float dist, float out[3], int* tried);
 
-// Per-frame: gives the fall damage back 3 s after a place().
+// Per-frame: shared landing/protection/provenance monitor.
 void tick();
 
 } // namespace kcdmp::joinnative

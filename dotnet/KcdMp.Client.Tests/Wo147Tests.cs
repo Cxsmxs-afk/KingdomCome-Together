@@ -55,7 +55,6 @@ public class Wo147Tests
     [Theory]
     [InlineData(Hold.JoinerDialogue)]
     [InlineData(Hold.JoinerCutscene)]
-    [InlineData(Hold.JoinerDowned)]
     [InlineData(Hold.HostTravelling)]
     public void A_hold_ends_after_a_minute_then_the_countdown_runs_and_the_pull_is_forced(Hold h)
     {
@@ -197,7 +196,7 @@ public class Wo147Tests
         Assert.Equal(Hold.None, Wo147Rules.JoinerRefusesPull(Hold.JoinerMenu, false));
         Assert.Equal(Hold.JoinerDialogue, Wo147Rules.JoinerRefusesPull(Hold.JoinerDialogue | Hold.JoinerMenu, false));
         Assert.Equal(Hold.JoinerCutscene | Hold.JoinerDowned, Wo147Rules.JoinerRefusesPull(Hold.JoinerCutscene | Hold.JoinerDowned, false));
-        Assert.Equal(Hold.None, Wo147Rules.JoinerRefusesPull(Hold.JoinerDialogue | Hold.JoinerCutscene | Hold.JoinerDowned | Hold.JoinerMenu, true));
+        Assert.Equal(Hold.JoinerDowned, Wo147Rules.JoinerRefusesPull(Hold.JoinerDialogue | Hold.JoinerCutscene | Hold.JoinerDowned | Hold.JoinerMenu, true));
         Assert.Equal(Hold.JoinerLoading, Wo147Rules.JoinerRefusesPull(Hold.JoinerLoading | Hold.JoinerDialogue, true));
         Assert.Equal(Hold.JoinerLoading, Wo147Rules.JoinerRefusesPull(LeashLogic.JoinerHold(0), true));   // not in the host's world
     }
@@ -284,38 +283,17 @@ public class Wo147Tests
         Assert.False(m.Flying);
     }
 
-    // ================================================================ the pull's fallback spot
-
-    [Fact]
-    public void The_fallback_spot_is_where_the_host_just_stood()
+    [Theory]
+    [InlineData(Hold.JoinerDowned)]
+    [InlineData(Hold.JoinerCombat)]
+    public void P4_KO_and_combat_never_expire_into_a_forced_pull(Hold hold)
     {
-        var trail = new List<(float X, float Y, float Z, long AtMs)>
-        {
-            (90, 100, 50, 1_000), (97, 100, 50, 20_000), (98.5f, 100, 50.2f, 21_000), (100, 100, 50.5f, 22_000),
-        };
-        var s = Wo147Rules.PullFallbackSpot(100, 100, 50.5f, 800, 800, trail, 22_000);
-        Assert.Equal(98.5f, s.X);          // 1.5 m away, the newest such point
-        Assert.Equal(50.5f, s.Z, 3);       // + 0.3 m
-    }
-
-    [Fact]
-    public void With_no_trail_the_fallback_is_a_metre_toward_the_joiner()
-    {
-        var s = Wo147Rules.PullFallbackSpot(100, 100, 50, 100, 700, new List<(float, float, float, long)>(), 0);
-        Assert.Equal(100f, s.X, 3);
-        Assert.Equal(101f, s.Y, 3);
-        Assert.Equal(50.5f, s.Z, 3);
-        var old = new List<(float, float, float, long)> { (97, 100, 50, 0) };   // older than 30 s: not used
-        var s2 = Wo147Rules.PullFallbackSpot(100, 100, 50, 100, 100, old, 40_000);
-        Assert.Equal(101f, s2.X, 3);       // the joiner on the host's spot: +X
-    }
-
-    [Fact]
-    public void A_trail_point_on_another_level_is_not_used()
-    {
-        var trail = new List<(float X, float Y, float Z, long AtMs)> { (97, 100, 40, 1000) };   // 10 m below (a stair, a cellar)
-        var s = Wo147Rules.PullFallbackSpot(100, 100, 50, 100, 90, trail, 2000);
-        Assert.Equal(99f, s.Y, 3);
+        var logic = New(); long time = 0;
+        Run(logic, ref time, 250, 700);
+        var actions = Run(logic, ref time, 180000, 700, hold);
+        Assert.DoesNotContain(actions, a => a.Kind is Act.Pull or Act.HoldCapped);
+        Assert.Equal(hold, Wo147Rules.JoinerRefusesPull(hold, true));
+        Assert.Contains(Run(logic, ref time, 11000, 700), a => a.Kind == Act.Pull);
     }
 
     // ================================================================ the host's stuck "paused" (the field's 45 minutes)

@@ -98,7 +98,7 @@ public static partial class Protocol
         W203DefenceSwing => "defence-swing", W203DefenceOutcome => "defence-outcome", W203GuardState => "guard-state",
         W203EngageEarly => "engage-early", W203NpcWorn => "npc-worn", W203NpcPose => "npc-pose", W203JoinProgress => "join-progress",
         W203FocusEdge => "focus-edge", W203TravelRoute => "travel-route", W203DigestCheckpoint => "digest-checkpoint", W203Epoch => "epoch",
-        W203FigureHand => "figure-hand",
+        W203FigureHand => "figure-hand", W203TpSnapshotRequest => "tp-snapshot-request", W203TpSnapshotResponse => "tp-snapshot-response",
         _ => $"unknown-{k}",
     };
 

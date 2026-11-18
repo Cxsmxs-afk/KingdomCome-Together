@@ -742,11 +742,15 @@ public partial class GameBridge
     /// state of each ring spot, KCD2MP_W183AreasAt), never while this player is under arrest, in a crime stop or a punishment. Not public
     /// anywhere = not moved (the refusal text says why). The DLL's navmesh snap places him (within 3 m height of the spot).
     /// </summary>
-    private async Task<(CombatPipe.JoinPlaceReport? Report, float Ring, string Refusal)> Wo179PlaceAsync(float x, float y, float z,
+    private async Task<(CombatPipe.JoinPlaceReport? Report, float Ring, string Refusal)> Wo179PlaceAsync(byte peer,
         Func<Task<bool>>? beginFade = null, Func<Task>? endFade = null, Func<bool>? current = null)
     {
         string crime = W183CrimeProcess();
         if (crime != "") return (null, 0, $"crime: {crime} -- a player in an arrest is never moved");
+        var target = await T3TpPeerAsync(peer, TeleportSource.VideoLanding, _w206.World);
+        if (target is null) return (null, 0, "no fresh safe triggerer snapshot");
+        target = target with { CurrentOperation = current };
+        float x = target.X, y = target.Y, z = target.Z;
         var areas = new List<IReadOnlyList<string>>();
         for (int ri = 0; ri < Wo183Rules.LandingRingsM.Length; ri++)
         {
@@ -761,9 +765,11 @@ public partial class GameBridge
                 _w179OwnMoveMs = Environment.TickCount64;
                 // Public-area lookups and the exit ladder finish while visible.
                 // Black covers only a known placement, and closes even on faults.
-                var pr = beginFade is null ? await _combat.JoinPlaceAsync(pts[k].X, pts[k].Y, z, 0.6f)
+                var spot = target with { X = pts[k].X, Y = pts[k].Y };
+                long beforeRead = Environment.TickCount64;
+                var pr = beginFade is null ? await T3TpPlaceAsync(spot, 0.6f, TeleportSource.VideoLanding)
                     : await Wo179Rules.DuringKnownMoveAsync(true, beginFade,
-                        () => _combat.JoinPlaceAsync(pts[k].X, pts[k].Y, z, 0.6f), endFade!);
+                        () => T3TpPlaceAsync(spot, 0.6f, TeleportSource.VideoLanding), endFade!);
                 if (pr is not { Ok: true }) continue;
                 // the snap may have moved him a little: the spot he stands on is checked too; a non-public one puts him back where he was
                 var after = await Wo183AreasAtAsync([(pr.After[0], pr.After[1], pr.After[2])]);
@@ -771,9 +777,10 @@ public partial class GameBridge
                 if (after.Count == 1 && Wo183Rules.IsPublicSpot(after[0])) return (pr, rm, "placed");
                 Console.WriteLine($"WO179-LAND the snapped spot is {(after.Count == 1 ? after[0] : "unknown")}, not public -- he is put back where he was");
                 _w179OwnMoveMs = Environment.TickCount64;
-                if (beginFade is null) await _combat.JoinPlaceAsync(pr.Before[0], pr.Before[1], pr.Before[2], 0f);
+                var rollback = target with { X = pr.Before[0], Y = pr.Before[1], Z = pr.Before[2], SourceAt = beforeRead };
+                if (beginFade is null) await T3TpPlaceAsync(rollback, 0f, TeleportSource.VideoRollback);
                 else await Wo179Rules.DuringKnownMoveAsync(true, beginFade,
-                    () => _combat.JoinPlaceAsync(pr.Before[0], pr.Before[1], pr.Before[2], 0f), endFade!);
+                    () => T3TpPlaceAsync(rollback, 0f, TeleportSource.VideoRollback), endFade!);
             }
         }
         string seen = string.Join("/", areas.SelectMany(a => a).GroupBy(a => a).Select(g => $"{g.Key}x{g.Count()}"));
@@ -825,8 +832,10 @@ public partial class GameBridge
 
     private async Task Wo179BringAlongAsync(W179Remote r, string why)
     {
+        var origin = T3TpOperationGuard();
         long generation = Interlocked.Read(ref _w179LandingGeneration);
-        if (!r.HaveDest || r.Brought || !Wo179LandingCurrent(r, generation)) return;
+        bool Current() => origin() && Wo179LandingCurrent(r, generation);
+        if (!r.HaveDest || r.Brought || !Current()) return;
         if (!_w179Bring) { Console.WriteLine($"WO179-BRING seq={r.Seq} not done: mp_scene_bring_along off"); return; }
         if (W179NotInWorld || Wo136Holding || _jj is not null)
         {
@@ -855,8 +864,8 @@ public partial class GameBridge
             Console.WriteLine(FormattableString.Invariant($"WO179-BRING seq={r.Seq} ({why}) from player {r.Src}'s video '{r.Name}' -- {d0:F0} m away"));
             // dead, downed or respawning: wait until on his feet (the scene does not wait)
             long waitUntil = Environment.TickCount64 + Wo179Rules.DownWaitMaxMs;
-            while (_localDowned && Environment.TickCount64 < waitUntil && Wo179LandingCurrent(r, generation)) await Task.Delay(1000);
-            if (!Wo179LandingCurrent(r, generation)) return;
+            while (_localDowned && Environment.TickCount64 < waitUntil && Current()) await Task.Delay(1000);
+            if (!Current()) return;
             if (_localDowned) { Console.WriteLine($"WO179-BRING seq={r.Seq} not moved: still down after 180 s"); return; }
             if (d0 < 8f) { r.Brought = true; Console.WriteLine($"WO179-BRING seq={r.Seq} already beside ({d0:F1} m): nothing to do"); return; }
             // C3: the quiet exit ladder
@@ -871,15 +880,15 @@ public partial class GameBridge
                     if (dm.Contains("mounted=no", StringComparison.Ordinal)) break;
                 }
             }
-            if (!Wo179LandingCurrent(r, generation)) return;
+            if (!Current()) return;
             uint fadeLease = OwnedFader.NextToken();
             async Task<bool> BeginKnownFade()
             {
-                if (!Wo179LandingCurrent(r, generation) || _w192WakeHolding) throw new OperationCanceledException("the landing's world or owner changed");
+                if (!Current() || _w192WakeHolding) throw new OperationCanceledException("the landing's world or owner changed");
                 bool opened = await OwnedFadeAsync(true, Wo179Rules.VideoEndFadeS, FaderOwner.VideoLanding, fadeLease);
                 if (opened) Volatile.Write(ref _w179VideoFadeLease, fadeLease);
                 if (opened) await Task.Delay((int)(Wo179Rules.VideoEndFadeS * 1000) + 10);
-                if (!Wo179LandingCurrent(r, generation) || _localDowned)
+                if (!Current() || _localDowned)
                 {
                     if (opened) await OwnedFadeAsync(false, 0.1f, FaderOwner.VideoLanding, fadeLease);
                     Interlocked.CompareExchange(ref _w179VideoFadeLease, 0, fadeLease);
@@ -889,13 +898,13 @@ public partial class GameBridge
                 return opened;
             }
             // C4: the landing -- a free ground spot 3, 6 or 10 m from the relocated Henry, on his floor (the DLL's navmesh snap within 3 m height)
-            var (pr, ring, refusal) = await Wo179PlaceAsync(r.X, r.Y, r.Z, BeginKnownFade,
+            var (pr, ring, refusal) = await Wo179PlaceAsync(r.Src, BeginKnownFade,
                 async () => {
                     try { await OwnedFadeAsync(false, Wo179Rules.VideoLandFadeInS, FaderOwner.VideoLanding, fadeLease); }
                     finally { Interlocked.CompareExchange(ref _w179VideoFadeLease, 0, fadeLease); }
                 },
-                () => Wo179LandingCurrent(r, generation));
-            if (!Wo179LandingCurrent(r, generation)) return;
+                () => Current());
+            if (!Current()) return;
             if (pr is not { Ok: true })
             {
                 Interlocked.Increment(ref _w179LandRefused);

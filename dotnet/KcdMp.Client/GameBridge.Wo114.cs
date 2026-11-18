@@ -47,7 +47,6 @@ public partial class GameBridge
     private volatile bool _leashHostTravelling;                      // "FastTravel: started..." seen, "ended" not yet
     private DateTime _leashFtArrivedUtc = DateTime.MinValue;         // "FastTravel: ended...": the joiners come along 1.5 s later
     private (float X, float Y)? _leashJumpStartPos;                  // where the host was when its clock started jumping
-    private (bool Valid, float X, float Y, float R, DateTime AtUtc) _leashPartnerSent;
 
     // ---- both: the mod's answer to KCD2MP_Wo114Busy (dialogue, mounted) ----
     private (bool Dialogue, bool Mounted, DateTime AtUtc) _leashLuaBusy;
@@ -94,8 +93,7 @@ public partial class GameBridge
     {
         _leashByJoiner.Clear();
         _leashJoinerState.Clear();
-        _leashPartnerSent = default;
-        try { await _combat.SetPartnerAsync(false, 0, 0, 0, 0); } catch { }
+        try { await _combat.SetPartnerAsync(false, 0, 0, 0, 0, new(TeleportSource.Respawn, Environment.TickCount64 + 2000, P1Lifecycle.Current.Generation, () => true)); } catch { }
         if (_leashFtBlocked) await Wo114SetFastTravelBlockAsync(false, "disconnect");
         _ = ExecLuaAsync("if KCD2MP_Wo114Countdown then KCD2MP_Wo114Countdown(0) end");
     }
@@ -120,7 +118,7 @@ public partial class GameBridge
                 if (host && _sharedWorld) await Wo114HostTickAsync(now, second);
                 else if (joiner) await Wo114JoinerTickAsync(second);
 
-                if (second) await Wo114PartnerTickAsync(host, joiner);
+                if (second) _ = Wo114PartnerTickAsync(host, joiner);
             }
             catch (Exception ex) { Console.WriteLine($"MP-LEASH tick failed: {ex.GetType().Name}: {ex.Message}"); }
         }
@@ -438,7 +436,8 @@ public partial class GameBridge
         ushort f = 0;
         if (_joinedWorld) f |= Protocol.LeashFlagInWorld;
         if (_w140Separate) f |= Protocol.LeashFlagSeparate;   // WO-140: in its own world -- the host does not leash it
-        if (_localDowned) f |= Protocol.LeashFlagDowned;
+        if (_localDowned || T3TpOwnKo) f |= Protocol.LeashFlagDowned;
+        if (T3TpOwnCombat) f |= Protocol.LeashFlagCombat;
         if (_jj is not null || _rewinding || _where is GameWhere.Loading or GameWhere.Menu) f |= Protocol.LeashFlagLoading;
         if (_localCutsceneActive || W183CrimeProcess() != "") f |= Protocol.LeashFlagCutscene;   // WO-183 3d: an arrest / crime stop / punishment holds the pull like a scene
         LuaBusyFresh(out bool dialogue, out bool mounted);
@@ -486,7 +485,7 @@ public partial class GameBridge
     }
 
     /// <summary>The host's Leash message.</summary>
-    private void Wo114OnLeashIn(byte src, byte[] body)
+    private void Wo114OnLeashIn(byte src, byte[] body, CancellationToken ct, uint world)
     {
         if (_combatRoleApplied && _isDamageAuthority) return;   // the host never obeys a leash
         if (!LeashCommand.TryDecode(body, out var c)) return;
@@ -520,28 +519,22 @@ public partial class GameBridge
                 _ = ExecLuaAsync("if KCD2MP_Wo114Countdown then KCD2MP_Wo114Countdown(0) end");
                 return;
             case Protocol.LeashKindPull:
-                _ = Wo114PullAsync(c);
+                _ = Wo114PullAsync(c, ct, world);
                 return;
         }
     }
 
-    /// <summary>
-    /// Bring this player beside the host: dismount first; read the position back.
-    /// WO-147: refused only while a pull is unsafe for this player (a load, a dialogue, a cutscene, a down);
-    /// a menu is no reason (the world runs behind it since WO-138: the player is simply there when it
-    /// closes). A FORCED pull (the host's hold cap ran out) is refused only by a load: a dialogue is ended
-    /// first. Where the game has no ground beside the host (the area is not loaded here yet: the field's
-    /// "no ground in 8 directions", 1.2 and 1.9 km out) the player goes to a spot the host just stood on,
-    /// and to the ground beside the host once the area has loaded.
-    /// </summary>
-    private async Task Wo114PullAsync(LeashCommand c)
+    /// <summary>Dismount first, then challenge the host for a fresh native snapshot. P4 removes old trail/exact-spot
+    /// fallbacks. Neither a forced pull nor a delayed continuation may cross combat, KO, life or world boundaries.</summary>
+    private async Task Wo114PullAsync(LeashCommand c, CancellationToken ct, uint world)
     {
         if (Interlocked.Exchange(ref _leashPulling, 1) == 1) { Console.WriteLine($"MP-LEASH joiner: pull #{c.Seq} ignored -- a pull is already running"); return; }
+        var origin = T3TpOperationGuard();
         string reason = Protocol.LeashReasonName(c.Arg);
         bool forced = (c.Arg & Protocol.LeashReasonForced) != 0;
         byte result = Protocol.LeashResultNone;
         // WO-147: the newest host position this machine has (the command's may have waited in a backlog).
-        var (hx, hy, hz) = Wo147PullTargetHost(c);
+        float hx = c.HostX, hy = c.HostY, hz = c.HostZ;
         double from = _hasPushed ? LeashLogic.Dist2D(_lastX, _lastY, hx, hy) : -1, to = from;
         float residual = -1;
         try
@@ -571,7 +564,7 @@ public partial class GameBridge
             {
                 string ended = await AskModAsync("KCD2MP_W147EndDialog", 2000);   // WO-147: the hold ran out
                 Console.WriteLine($"MP-LEASH joiner: pull #{c.Seq} is forced (the host's hold ran out) -- the conversation is ended first: {ended}");
-                await Task.Delay(500);
+                await Task.Delay(500, ct);
             }
             if (mounted)
             {
@@ -586,7 +579,7 @@ public partial class GameBridge
                     string r = await AskModAsync("KCD2MP_Wo114Dismount", 2000);
                     Console.WriteLine($"MP-LEASH joiner: pull #{c.Seq} dismount try {i + 1}: {r}");
                     off = r.Contains("mounted=no");
-                    if (!off) await Task.Delay(500);
+                    if (!off) await Task.Delay(500, ct);
                 }
                 if (!off)
                 {
@@ -594,39 +587,26 @@ public partial class GameBridge
                     Console.WriteLine($"MP-LEASH joiner: pull #{c.Seq} NOT done -- still mounted after 6 dismount tries (never teleported on a horse)");
                     return;
                 }
-                await Task.Delay(300);
+                await Task.Delay(300, ct);
             }
-            var pr = await _combat.JoinPlaceAsync(hx, hy, hz, LeashPlaceDistM);
-            if (pr is null)
-            {
-                result = Protocol.LeashResultNoPlugin;
-                Console.WriteLine($"MP-LEASH joiner: pull #{c.Seq} -- no answer from the plugin (not placed)");
-                return;
-            }
-            bool fallback = false;
-            if (!pr.Ok && !pr.Snapped)
-            {
-                // WO-147: no ground beside the host here (not loaded this far out): a spot the host itself
-                // stood on, placed exactly (the DLL's dist 0), the fall damage held.
-                var spot = Wo147PullFallbackSpot(hx, hy, hz);
-                var fb = await _combat.JoinPlaceAsync(spot.X, spot.Y, spot.Z, 0f);
-                Console.WriteLine(FormattableString.Invariant(
-                    $"MP-LEASH joiner: pull #{c.Seq}: no ground beside the host here yet -- placed on a spot the host stood on ({spot.X:F1}, {spot.Y:F1}, {spot.Z:F1}): {(fb is { Ok: true } ? "placed" : "NOT placed")}"));
-                if (fb is not null) { pr = fb; fallback = true; }
-            }
+            ct.ThrowIfCancellationRequested();
+            if (!origin()) return;
+            byte host = _leashHostId != 0xFF ? _leashHostId : _hostModeFrom;
+            var target = await T3TpPeerAsync(host, TeleportSource.Leash, world, ct);
+            if (target is null || !origin()) { result = Protocol.LeashResultNoHost; return; }
+            hx = target.X; hy = target.Y; hz = target.Z;
+            var pr = await T3TpPlaceAsync(target, LeashPlaceDistM, TeleportSource.Leash, ct);
+            if (pr is null) { result = Protocol.LeashResultNotPlaced; return; }
             residual = pr.Residual;
             to = LeashLogic.Dist2D(pr.After[0], pr.After[1], hx, hy);
             if (from < 0) from = LeashLogic.Dist2D(pr.Before[0], pr.Before[1], hx, hy);
             result = pr.Ok ? Protocol.LeashResultPlaced : Protocol.LeashResultNotPlaced;
             _leashPulledUtc = DateTime.UtcNow;
             Console.WriteLine(FormattableString.Invariant(
-                $"MP-LEASH pulled from={from:F0} to={to:F1} residual={pr.Residual:F2} -- pull #{c.Seq} reason={reason} {(pr.Ok ? "placed" : "NOT placed")}{(fallback ? " (on the host's own spot)" : "")} snapped={On114(pr.Snapped)} fall_held={On114(pr.FallHeld)} mounted_before={On114(mounted)} at ({pr.After[0]:F1}, {pr.After[1]:F1}, {pr.After[2]:F1})"));
+                $"MP-LEASH pulled from={from:F0} to={to:F1} residual={pr.Residual:F2} -- pull #{c.Seq} reason={reason} {(pr.Ok ? "placed" : "NOT placed")} snapped={On114(pr.Snapped)} fall_held={On114(pr.FallHeld)} mounted_before={On114(mounted)} at ({pr.After[0]:F1}, {pr.After[1]:F1}, {pr.After[2]:F1})"));
             if (pr.Ok)
                 await Wo114SayAsync(Protocol.LeashReasonBase(c.Arg) == Protocol.LeashReasonFastTravel ? LeashLogic.Text.JoinerPulledFastTravel : LeashLogic.Text.JoinerPulledDistance);
-            if (pr.Ok && fallback) _ = Wo147SettleBesideHostAsync(c.Seq);   // WO-147: the ground beside the host once it has loaded
-            // Read it back once more after the landing settles (the emitter's position, 1.5 s on).
-            _ = Task.Delay(1500).ContinueWith(_ => Console.WriteLine(FormattableString.Invariant(
-                $"MP-LEASH joiner: pull #{c.Seq} settled at ({_lastX:F1}, {_lastY:F1}, {_lastZ:F1}) -- {LeashLogic.Dist2D(_lastX, _lastY, hx, hy):F1} m from the host's spot")));
+
         }
         catch (Exception ex)
         {
@@ -635,44 +615,46 @@ public partial class GameBridge
         }
         finally
         {
-            _leashLastPullSeq = c.Seq;
-            _leashLastResult = result;
-            _leashFromM = LeashCommand.Metres(from);
-            _leashToM = LeashCommand.Metres(to);
-            _leashResidualCm = (ushort)Math.Clamp(Math.Round(residual < 0 ? 0 : residual * 100), 0, ushort.MaxValue);
             Interlocked.Exchange(ref _leashPulling, 0);
-            await Wo114SendStateAsync(JoinerLeashFlags());
+            if (origin() && !ct.IsCancellationRequested)
+            {
+                _leashLastPullSeq = c.Seq;
+                _leashLastResult = result;
+                _leashFromM = LeashCommand.Metres(from);
+                _leashToM = LeashCommand.Metres(to);
+                _leashResidualCm = (ushort)Math.Clamp(Math.Round(residual < 0 ? 0 : residual * 100), 0, ushort.MaxValue);
+                await Wo114SendStateAsync(JoinerLeashFlags());
+            }
         }
     }
 
     // ---------------------------------------------------------------- both: the partner for the DLL's wake choice
 
+    private int _t3TpPartnerBusy;
     private async Task Wo114PartnerTickAsync(bool host, bool joiner)
     {
-        bool valid = false;
-        float x = 0, y = 0, z = 0, radius = 0;
-        if (host && _sharedWorld && _leashEnabled)
+        if (Interlocked.CompareExchange(ref _t3TpPartnerBusy, 1, 0) != 0) return;
+        var origin = T3TpOperationGuard();
+        try
         {
-            // The joiner in this world (fresh state, in-world), else any peer with a fresh position.
-            byte? pick = null;
-            foreach (var (id, (st, at)) in _leashJoinerState.OrderBy(k => k.Key))
-                if ((st.Flags & Protocol.LeashFlagInWorld) != 0 && (DateTime.UtcNow - at).TotalSeconds < LeashFreshS) { pick = id; break; }
-            pick ??= _ghostLastPos.Where(k => (DateTime.UtcNow - k.Value.AtUtc).TotalSeconds < LeashFreshS).Select(k => (byte?)k.Key).OrderBy(k => k).FirstOrDefault();
-            if (pick is byte p && _ghostLastPos.TryGetValue(p, out var gp) && (DateTime.UtcNow - gp.AtUtc).TotalSeconds < LeashFreshS)
-            { valid = true; x = gp.X; y = gp.Y; z = gp.Z; radius = _leashWarnM; }
+            byte? peer = null;
+            if (host && _sharedWorld && _leashEnabled)
+                peer = _leashJoinerState.Where(k => (k.Value.S.Flags & Protocol.LeashFlagInWorld) != 0 &&
+                    (DateTime.UtcNow - k.Value.AtUtc).TotalSeconds < LeashFreshS).OrderBy(k => k.Key).Select(k => (byte?)k.Key).FirstOrDefault();
+            else if (joiner && _joinedWorld && _leashHostOn)
+            {
+                byte id = _leashHostId != 0xFF ? _leashHostId : _hostModeFrom;
+                if (id != 0xFF) peer = id;
+            }
+            _ = await T3TpLocalAsync(); // also refreshes real local combat/KO hold flags
+            var target = peer is byte p ? await T3TpPeerAsync(p, TeleportSource.Respawn, _w206.World) : null;
+            if (target is not null)
+                await _combat.SetPartnerAsync(true, target.X, target.Y, target.Z, 30,
+                    T3TpProof(target, TeleportSource.Respawn), target.Context.Token);
+            else if (origin()) await _combat.SetPartnerAsync(false, 0, 0, 0, 0,
+                new(TeleportSource.Respawn, Environment.TickCount64 + 2000, P1Lifecycle.Current.Generation, () => true));
         }
-        else if (joiner && _joinedWorld && _leashHostOn)
-        {
-            byte hid = _leashHostId != 0xFF ? _leashHostId : _hostModeFrom;
-            if (hid != 0xFF && _ghostLastPos.TryGetValue(hid, out var gp) && (DateTime.UtcNow - gp.AtUtc).TotalSeconds < LeashFreshS)
-            { valid = true; x = gp.X; y = gp.Y; z = gp.Z; radius = _leashHostWarnM; }
-        }
-        // Only on a change (or 5 m of movement) and every 4 s: the DLL forgets a partner after 10 s of silence.
-        var last = _leashPartnerSent;
-        bool due = valid != last.Valid || (DateTime.UtcNow - last.AtUtc).TotalSeconds >= 4
-                   || (valid && (LeashLogic.Dist2D(x, y, last.X, last.Y) > 5 || Math.Abs(radius - last.R) > 0.5f));
-        if (!due) return;
-        _leashPartnerSent = (valid, x, y, radius, DateTime.UtcNow);
-        try { await _combat.SetPartnerAsync(valid, x, y, z, radius); } catch { }
+        catch (OperationCanceledException) { }
+        finally { Interlocked.Exchange(ref _t3TpPartnerBusy, 0); }
     }
 }

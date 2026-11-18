@@ -272,7 +272,7 @@ public partial class GameBridge
                 OnJoinStatusIn(src, joinId, body);
                 return;
             case Protocol.LeashDown:        // WO-114
-                Wo114OnLeashIn(src, body);
+                Wo114OnLeashIn(src, body, ct, receiveWorld);
                 return;
             case Protocol.LeashStateDown:   // WO-114
                 Wo114OnLeashStateIn(src, joinId, body);   // WO-206 E: the joinId slot is the join epoch the joiner's state belongs to

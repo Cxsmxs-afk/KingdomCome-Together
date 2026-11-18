@@ -137,29 +137,6 @@ public static class Wo147Rules
         public void Reset() { _prev = null; _fastSinceMs = -1; Last = Motion.Normal; SpeedMps = 0; StepM = 0; }
     }
 
-    /// <summary>
-    /// WO-147: where a pull puts the joiner when the game has no ground beside the host (the field's
-    /// "no ground in 8 directions -- NOT placed", 1.2 and 1.9 km out: the navigation mesh around the host
-    /// is not loaded on the joiner's machine that far away). A spot the host itself stood on a moment ago,
-    /// 1.5-6 m from where he stands now, is ground; with none (the host stood still, or just arrived) the
-    /// host's own spot, 1 m toward where the joiner comes from. The caller places the joiner there exactly
-    /// with the fall damage held, then on the ground beside the host once the area has loaded.
-    /// </summary>
-    public static (float X, float Y, float Z) PullFallbackSpot(float hx, float hy, float hz, float fromX, float fromY,
-                                                               IReadOnlyList<(float X, float Y, float Z, long AtMs)> hostTrail, long nowMs)
-    {
-        for (int i = hostTrail.Count - 1; i >= 0; i--)
-        {
-            var t = hostTrail[i];
-            if (nowMs - t.AtMs > 30_000) break;
-            double d = LeashLogic.Dist2D(hx, hy, t.X, t.Y);
-            if (d >= 1.5 && d <= 6.0 && Math.Abs(t.Z - hz) < 3.0) return (t.X, t.Y, t.Z + 0.3f);
-        }
-        double dx = fromX - hx, dy = fromY - hy, len = Math.Sqrt(dx * dx + dy * dy);
-        if (!(len > 0.01) || !double.IsFinite(len)) { dx = 1; dy = 0; len = 1; }
-        return ((float)(hx + dx / len), (float)(hy + dy / len), hz + 0.5f);
-    }
-
     // ================================================================ the frame backlog (mp_npc_catchup)
 
     /// <summary>
@@ -400,12 +377,12 @@ public static class Wo147Rules
 
     /// <summary>
     /// WO-147: the joiner's own verdict on a pull: which of its holds refuse it. The unsafe ones (a load,
-    /// a dialogue, a cutscene, a down); a menu never. A forced pull (the host's hold cap ran out) is
-    /// refused by a load alone -- a dialogue is ended first, a cutscene or a down is pulled through.
+    /// a dialogue, a cutscene, combat or a down); a menu never. A forced pull may end a dialogue,
+    /// but loading, combat and KO remain hard barriers.
     /// </summary>
     public static LeashLogic.Hold JoinerRefusesPull(LeashLogic.Hold joinerHold, bool forced)
     {
-        var unsafeHolds = LeashLogic.Hold.JoinerLoading | LeashLogic.Hold.JoinerDialogue | LeashLogic.Hold.JoinerCutscene | LeashLogic.Hold.JoinerDowned;
-        return joinerHold & (forced ? LeashLogic.Hold.JoinerLoading : unsafeHolds);
+        var unsafeHolds = LeashLogic.Hold.JoinerLoading | LeashLogic.Hold.JoinerDialogue | LeashLogic.Hold.JoinerCutscene | LeashLogic.Hold.JoinerDowned | LeashLogic.Hold.JoinerCombat;
+        return joinerHold & (forced ? LeashLogic.Hold.JoinerLoading | LeashLogic.Hold.JoinerDowned | LeashLogic.Hold.JoinerCombat : unsafeHolds);
     }
 }

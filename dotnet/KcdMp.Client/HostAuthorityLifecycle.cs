@@ -81,12 +81,12 @@ public sealed class HostAuthorityLifecycle
 
     public async Task<bool> GameplayAsync(ulong generation, CancellationToken ct)
     {
-        lock (_gate) if (_state.Generation != generation || !_state.Enabled || !_state.Confirmed) return false;
+        lock (_gate) if (_state.Generation != generation || !_state.Confirmed) return false;
         var response = await _send(Gameplay, generation, ct);
         ct.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            if (_state.Generation != generation || response is not { Accepted: true, Enabled: true, Phase: Gameplay } ack || ack.Generation != generation) return false;
+            if (_state.Generation != generation || response is not { Accepted: true, Phase: Gameplay } ack || ack.Enabled != _state.Enabled || ack.Generation != generation || (!ack.Enabled && ack.Active)) return false;
             _state = _state with { GameplaySent = true, Active = ack.Active, GameplayAgeMs = ack.GameplayAgeMs }; return true;
         }
     }
@@ -102,7 +102,7 @@ public sealed class HostAuthorityLifecycle
             if (response is { } observed) _maximum = Math.Max(_maximum, observed.Generation);
             if (_state.Generation != before.Generation || response is not { Accepted: true } ack) return false;
             if (ack.Generation != before.Generation || ack.Enabled != before.Enabled ||
-                (before.Enabled && ack.Phase != (before.GameplaySent ? Gameplay : Load)) || (!before.Enabled && ack.Phase != Disabled))
+                ack.Phase != (before.GameplaySent ? Gameplay : before.Enabled ? Load : Disabled))
             {
                 _state = _state with { Confirmed = false, Active = false }; return false;
             }
@@ -123,6 +123,6 @@ public sealed class HostAuthorityLifecycle
         ulong? generation = state.Confirmed ? state.Generation : await PendingCoreAsync(enabled, false, ct, request);
         if (generation is not ulong expected || Current.Generation != expected) return false;
         state = Current;
-        return !gameplayObserved || !state.Enabled || state.GameplaySent || await GameplayAsync(expected, ct);
+        return !gameplayObserved || state.GameplaySent || await GameplayAsync(expected, ct);
     }
 }
