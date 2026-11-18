@@ -20,7 +20,7 @@ public class T3AuthorityReportTests
         var body = new byte[header[1] | header[2] << 8]; await stream.ReadExactlyAsync(body, ct); return body;
     }
     private static async Task Reply(Stream stream, byte seq, byte op, CancellationToken ct, bool truncated = false,
-        bool worldStats = false, int statsFields = 30, bool timeline = false, bool controller = false, bool refused = false)
+        bool worldStats = false, int statsFields = 30, bool timeline = false, bool controller = false, bool combat = false, bool refused = false)
     {
         byte[] payload = op == Protocol.Wo216OpBrains ? Encoding.ASCII.GetBytes(truncated ? "B decision_blocked=999 npc_hidden=999" : Snapshot) : [];
         if (worldStats)
@@ -29,9 +29,10 @@ public class T3AuthorityReportTests
             payload = new byte[2 + count * 9]; payload[0] = 1; payload[1] = (byte)count;
             for (int i = 0; i < count; i++) { payload[2 + i * 9] = (byte)i; BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(3 + i * 9), (ulong)(10 + i)); }
         }
-        if (timeline || controller)
+        if (timeline || controller || combat)
         {
-            ulong[] values = timeline ? [86, 42, 2, 18, 360, 4] : [1500, 1499, 1, 2, 3, 4, 5, 6, 7, 8, 0, 199, 1, 301508];
+            ulong[] values = timeline ? [86, 42, 2, 18, 360, 4] : controller
+                ? [1500, 1499, 1, 2, 3, 4, 5, 6, 7, 8, 0, 199, 1, 301508] : [20, 19, 0, 24, 19, 3, 0, 81, 2, 1];
             payload = new byte[2 + values.Length * 9]; payload[0] = 1; payload[1] = (byte)values.Length;
             for (int i = 0; i < values.Length; i++)
             {
@@ -61,8 +62,10 @@ public class T3AuthorityReportTests
     [InlineData(false, 2, false, 56)]
     [InlineData(true, 1, false, 55, true)]
     [InlineData(false, 2, false, 55, true)]
+    [InlineData(true, 1, false, 55, true, true)]
+    [InlineData(false, 2, false, 55, true, true)]
     public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role,
-        bool truncated, int statsFields, bool controllerSupported = false)
+        bool truncated, int statsFields, bool controllerSupported = false, bool combatSupported = false)
     {
         string name = "t3r-" + Guid.NewGuid().ToString("N")[..16];
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -100,9 +103,15 @@ public class T3AuthorityReportTests
             await Reply(server, 4, Protocol.T3OpStats, stop.Token, controller: controllerSupported, refused: !controllerSupported);
             mirrorSequence++;
         }
+        if (controllerSupported)
+        {
+            Assert.Equal(new byte[] { Protocol.T3OpStats, Protocol.T3CombatStatsCommand }, await Read(server, stop.Token));
+            await Reply(server, 5, Protocol.T3OpStats, stop.Token, combat: combatSupported, refused: !combatSupported);
+            mirrorSequence++;
+        }
         var mirror = await Read(server, stop.Token);
         Assert.Equal(Protocol.T3OpStats, mirror[0]); Assert.Equal(role, mirror[1]);
-        Assert.InRange(mirror.Length, 4, 6146); // actual complete generic body, including op and role
+        Assert.InRange(mirror.Length, 4, 6402); // actual complete generic body, including op and role
         string fields = Encoding.ASCII.GetString(mirror, 2, mirror.Length - 2);
         Assert.InRange(fields.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length, 1, 160);
         Assert.True(T3AuthorityCounters.TryRead(fields, out var actual));
@@ -168,6 +177,24 @@ public class T3AuthorityReportTests
             Assert.Contains("rp_pull_observed_ms=301508", fields);
         }
         else Assert.DoesNotContain("rp_pull_observed_ms=", fields);
+        if (combatSupported)
+        {
+            Assert.Contains("rp_actions_in=20", fields);
+            Assert.Contains("rp_actions_played=19", fields);
+            Assert.Contains("rp_actions_pending=0", fields);
+            Assert.Equal("rp_action_lag_ms_p95=24", Assert.Single(fields.Split(' '), key => key.StartsWith("rp_action_lag_ms_p95=", StringComparison.Ordinal)));
+            Assert.Contains("rp_action_confirmed_n=19", fields);
+            Assert.Contains("dmg_double_blocked=3", fields);
+            Assert.Contains("dmg_double=0", fields);
+            Assert.Contains("rp_ko_up_lag_ms_p95=81", fields);
+            Assert.Contains("rp_ko_up_n=2", fields);
+            Assert.Contains("dmg_double_unconfirmed=1", fields);
+        }
+        else
+        {
+            Assert.DoesNotContain("rp_action_confirmed_n=", fields);
+            if (statsFields >= 47 && !worldUnavailable) Assert.Contains("rp_action_lag_ms_p95=49", fields);
+        }
         await Reply(server, mirrorSequence, Protocol.T3OpStats, stop.Token);
         await report.WaitAsync(stop.Token);
         var gate = (SemaphoreSlim)typeof(CombatPipe).GetField("_gate", Private)!.GetValue(pipe)!;

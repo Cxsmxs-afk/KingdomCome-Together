@@ -120,11 +120,19 @@ void dry_run_end();
 // engine-built 0x90-byte record copied into the capture, the victim's soul watched for kWatchS and the damage the engine applied
 // reported (measured, nothing put back) to the callback with the replay's sequence number.
 struct ReplayCapture { bool seen = false; void* self = nullptr; uint8_t rec[0x90]{}; };
-void replay_begin(uint32_t attackerEid, uint32_t victimEid, uint32_t seq, void* victimSoul, bool victimIsPlayer);
+void replay_begin(uint32_t attackerEid, uint32_t victimEid, uint32_t seq, void* attackerCombat, void* victimSoul, bool victimIsPlayer);
 void replay_end(ReplayCapture* out);
 using ReplayDmgFn = void (*)(uint32_t seq, uint32_t victimEid, float health, float stamina, bool victimLive);
 void set_replay_damage_callback(ReplayDmgFn fn);
 uint32_t replay_seen();
+
+// Presentation is never an authority to deal damage. The main thread checks
+// readiness before scheduling native figure actions. The melee entry gate
+// calls the filter on the engine's hit thread before creating a damage cause.
+struct VisualDamageStats { uint64_t blocked = 0, doubleApplied = 0, unconfirmed = 0; };
+bool visual_damage_ready(uint32_t figureEid);
+bool filter_visual_contact(void* attackerCombat, uint32_t victimEid);
+VisualDamageStats visual_damage_stats();
 
 // WO-170 F1 (docs/WO-170-findings.md): the figure guard. A partner's figure (an avatar) never lands a blow of its own on this machine: its
 // melee hit is applied only when it belongs to a swing the partner really sent -- the relayed swing the DLL queued on that figure

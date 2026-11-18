@@ -14,7 +14,7 @@ constexpr uint8_t kAttack = 1, kBlockImpulse = 6, kDodge = 7, kCommit = 1;
 // the existing SwingInbox spawn grace. If an accepted action still cannot
 // find a timed pose by then, it follows its ordinary guarded presentation.
 constexpr uint64_t kPoseWaitMs = 750;
-enum Receipt : uint8_t { Accepted = 0, Unavailable = 1, Invalid = 2 };
+enum Receipt : uint8_t { Accepted = 0, Unavailable = 1, Invalid = 2, Blocked = 3, RowNotRegistered = 4 };
 
 struct Action {
     uint8_t peer = 0, kind = 0, phase = 0;

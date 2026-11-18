@@ -40,7 +40,7 @@ def local_relay(value):
 def command_line(args, forwarded, parser):
     if args.legacy:
         if args.role != 'joiner' or any(value is not None for value in
-                (args.save, args.plan, args.scenario, args.origin, args.bow_class, args.tables_pak, args.duration, args.world_time, args.wire_version)):
+                (args.save, args.plan, args.scenario, args.origin, args.bow_class, args.ranged_kind, args.tables_pak, args.duration, args.world_time, args.wire_version)):
             parser.error('Pass existing PowerShell script options after -- when using --legacy.')
         shell = shutil.which('powershell') or shutil.which('pwsh')
         if not shell:
@@ -65,7 +65,7 @@ def command_line(args, forwarded, parser):
     if args.wire_version is not None:
         common += ['--wire-version', args.wire_version]
     if args.role == 'host':
-        if not args.save or args.world_time is None or args.scenario or args.bow_class or args.tables_pak:
+        if not args.save or args.world_time is None or args.scenario or args.bow_class or args.ranged_kind or args.tables_pak:
             parser.error('The host requires --save and --world-time. Pass --plan in place of --scenario.')
         if not math.isfinite(args.world_time) or args.world_time < 0:
             parser.error('--world-time must be finite and non-negative.')
@@ -85,6 +85,8 @@ def command_line(args, forwarded, parser):
             program_args += ['--origin', args.origin]
         if args.bow_class is not None:
             program_args += ['--bow-class', args.bow_class]
+        if args.ranged_kind is not None:
+            program_args += ['--ranged-kind', args.ranged_kind]
         if args.tables_pak is not None:
             program_args += ['--tables-pak', str(args.tables_pak.resolve())]
         project = AVATAR
@@ -106,7 +108,8 @@ def main(argv=None):
     parser.add_argument('--duration', type=int, help='Maximum run length in seconds.')
     parser.add_argument('--wire-version', help='Exact VERSION[+BUILD_ID] of the local test artifact.')
     parser.add_argument('--origin', help='Starting coordinates as x,y,z.')
-    parser.add_argument('--bow-class', help='Bow item class for the joiner scenario.')
+    parser.add_argument('--bow-class', help='Ranged item class for the joiner scenario.')
+    parser.add_argument('--ranged-kind', choices=('bow', 'crossbow'), help='Typed P6 ranged station for the joiner (default bow).')
     parser.add_argument('--tables-pak', type=Path, help='Tables.pak from the local Modding Tools installation.')
     parser.add_argument('--scenario', type=Path, help='Override the joiner scenario.')
     parser.add_argument('--save', type=Path, help='External test save for the host.')

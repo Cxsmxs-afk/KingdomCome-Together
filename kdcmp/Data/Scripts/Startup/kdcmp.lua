@@ -36939,7 +36939,7 @@ do
         combat_action_end = "mp_combat_action_end", talk_hold = "mp_talk_hold", drive = "mp_drive", holders = "mp_holders",
         shop_keeper = "mp_shop_keeper", own_horse = "mp_own_horse", talk_force = "mp_talk_force",
         corpse_look = "mp_corpse_look", horse_drop = "mp_horse_drop", saddlebags = "mp_saddlebags", route_quiet = "mp_route_quiet", cart_seat = "mp_cart_seat", cart_wheels = "mp_cart_wheels",
-        ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller",
+        ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller", rp_combat = "mp_rp_combat",
     }
     W221.HELP = {
         combat_action_end = "A: (both) no combat animation of ours outlives its body's combat part (the joiner's fight crash)",
@@ -36957,6 +36957,7 @@ do
         talk_force = "B: (joiner) a talk the person never answers (the request and its retry time out) is started the game's forced way",
         ragdoll_once = "A: (joiner) a fresh corpse is laid down by one ragdoll at a time, after the game's own death action had its time, never when it already lies",
         rp_controller = "Move the partner's figure through the game's movement request when the body supports it",
+        rp_combat = "Play the partner's timed combat through native requests",
     }
     function KCD2MP_W221On(name)
         local v = W221.on[tostring(name)]

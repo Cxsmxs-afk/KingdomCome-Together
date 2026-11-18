@@ -21,7 +21,7 @@ namespace {
 struct N { const char* n; uint32_t b; };
 const N kNames[] = {{"combat_action_end", kBitCombatActionEnd}, {"talk_hold", kBitTalkHold}, {"drive", kBitDrive},
                     {"holders", kBitHolders}, {"own_horse", kBitOwnHorse}, {"corpse_look", kBitCorpseLook},
-                    {"rp_controller", kBitRemoteController}};
+                    {"rp_controller", kBitRemoteController}, {"rp_combat", kBitRemoteCombat}};
 }
 
 uint32_t twin_off_bits(const char* names) {

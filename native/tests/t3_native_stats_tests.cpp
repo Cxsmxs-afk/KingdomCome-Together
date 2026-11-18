@@ -96,6 +96,17 @@ int t3_native_stats_tests(int* passed) {
     for (size_t i = 0; i < kcdmp::t3native::kControllerFields; ++i)
         check(controller[2 + 9*i] == i && kcdmp::p4rules::u64(controller.data() + 3 + 9*i) == controllerCounts[i],
             "controller page preserves every exact outcome, reason, or observation field");
+    std::array<uint8_t, 93> combat;
+    combat.fill(0xDC);
+    const auto untouchedCombat = combat;
+    const uint64_t combatCounts[] = {20, 19, 0, 24, 19, 3, 0, 81, 2, 1};
+    check(kcdmp::t3native::write_combat(combat.data(), 91, combatCounts) == 0 && combat == untouchedCombat,
+        "combat short reply is untouched");
+    check(kcdmp::t3native::write_combat(combat.data(), combat.size(), combatCounts) == 92 &&
+        combat[0] == 1 && combat[1] == 10 && combat[92] == 0xDC, "combat is a separate 92-byte page");
+    for (size_t i = 0; i < kcdmp::t3native::kCombatFields; ++i)
+        check(combat[2 + 9*i] == i && kcdmp::p4rules::u64(combat.data() + 3 + 9*i) == combatCounts[i],
+            "combat page preserves the exact native playback, damage and confirmation values");
     p6 = base;
     check(kcdmp::t3native::append_rp_measure(p6.data(), 272, 424, measure) == 0 && p6 == base,
         "short replies cannot contain partial measurement coverage");

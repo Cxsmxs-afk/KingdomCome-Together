@@ -304,12 +304,12 @@ int wo216_tests(int* passed) {
         WCHECK(!malformed.feed(huge, sizeof huge, noControl) && malformed.failed(), "P1: oversized length rejected at header, before payload allocation");
         pc::Reader longStats;
         std::vector<uint8_t> statsBody{kcdmp::t3stats::kOp, 1};
-        for (unsigned i = 0; i < 140; ++i) {
+        for (unsigned i = 0; i < 150; ++i) {
             const std::string field = (i ? " " : "") + std::string("edge_metric_sample_") + std::to_string(i) + "=1234567890123456789";
             statsBody.insert(statsBody.end(), field.begin(), field.end());
         }
         const auto statsWire = wireFrame(pc::kGeneric, statsBody);
-        WCHECK(statsBody.size() > pc::kLargePayload && statsBody.size() <= pc::kT3Payload &&
+        WCHECK(statsBody.size() > 6146 && statsBody.size() <= pc::kT3Payload &&
             kcdmp::t3stats::valid(statsBody.data() + 1, statsBody.size() - 1) && longStats.feed(statsWire.data(), statsWire.size(), noControl) && longStats.pop(&f) && f.body == statsBody,
             "s2-3: the extended numeric T3 mirror remains a single untruncated telemetry frame");
         pc::Reader forbiddenGeneric; const auto oversizedNormal = wireFrame(pc::kGeneric, std::vector<uint8_t>(1025, 42));

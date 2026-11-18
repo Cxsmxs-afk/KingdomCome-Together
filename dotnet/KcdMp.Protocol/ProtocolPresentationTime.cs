@@ -7,8 +7,10 @@ namespace KcdMp.Wire;
 public static partial class Protocol
 {
     public const ushort LinkCapPresentationTime = 0x0008;
+    public const ushort LinkCapPresentationCombat = 0x0010;
     public const byte PresentationClockUp = 0x88, PresentationClockDown = 0x89;
     public const byte PresentationPoseDown = 0x8A, PresentationActionDown = 0x8B;
+    public const byte PresentationCombatUp = 0x8C;
 }
 
 /// <summary>One value on the currently selected host agent's monotonic clock.</summary>
@@ -155,6 +157,7 @@ public sealed class PresentationClockClient
 /// <summary>Timing prefix around an unchanged relay body. The old type and its receiver fences remain visible on extraction.</summary>
 public static class PresentationTimeWire
 {
+    public const int SubjectStampLength = 1 + sizeof(uint);
     public const int HeaderLength = 25;
     private const int ActionHeaderLength = 1 + Protocol.ActionUpHeaderLen;
 
@@ -168,7 +171,7 @@ public static class PresentationTimeWire
 
     public static byte[] Wrap(byte innerType, ReadOnlySpan<byte> payload, PresentationStamp stamp)
     {
-        byte type = innerType == Protocol.ActionDown ? Protocol.PresentationActionDown : Protocol.PresentationPoseDown;
+        byte type = innerType is Protocol.Ghost or Protocol.NpcStateDown ? Protocol.PresentationPoseDown : Protocol.PresentationActionDown;
         byte[] frame = Frame(type, HeaderLength + payload.Length);
         BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(3), stamp.Epoch);
         BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(11), stamp.HostMs);
@@ -188,16 +191,50 @@ public static class PresentationTimeWire
         bool correctType = type switch
         {
             Protocol.PresentationPoseDown => inner is Protocol.Ghost or Protocol.NpcStateDown,
-            Protocol.PresentationActionDown => inner == Protocol.ActionDown,
+            Protocol.PresentationActionDown => inner is Protocol.ActionDown or Protocol.PlayerStateDown or Protocol.W164Down,
             _ => false
         };
-        if (!correctType || !TrySourceStamp(inner, body[HeaderLength..], out _)) return false;
+        if (!correctType || !(TrySourceStamp(inner, body[HeaderLength..], out _) || IsCombatDown(inner, body[HeaderLength..]))) return false;
         ulong epoch = BinaryPrimitives.ReadUInt64LittleEndian(body);
         ulong hostMs = BinaryPrimitives.ReadUInt64LittleEndian(body[8..]);
         if (epoch == 0 || hostMs == 0 || hostMs > long.MaxValue) return false;
         stamp = new(epoch, hostMs, BinaryPrimitives.ReadInt64LittleEndian(body[16..]));
         innerType = inner;
         payloadOffset = HeaderLength;
+        return true;
+    }
+
+    public static bool IsCombatDown(byte type, ReadOnlySpan<byte> body) =>
+        type == Protocol.PlayerStateDown && body.Length == Protocol.PlayerStateDownPayloadLen ||
+        type == Protocol.W164Down && IsRangedStep(body, 1 + Protocol.JoinHeaderLen);
+
+    private static bool IsRangedStep(ReadOnlySpan<byte> body, int header) => body.Length > header &&
+        LootMsg.TryDecode(body[header..], out var message) && message.Kind == Protocol.W164RangedStep &&
+        RangedStepV2.TryDecode(message.Text, out _);
+
+    private static bool IsCombatUp(byte type, ReadOnlySpan<byte> body) =>
+        type == Protocol.PlayerStateUp && body.Length == Protocol.PlayerStateUpPayloadLen ||
+        type == Protocol.W164Up && IsRangedStep(body, Protocol.JoinHeaderLen);
+
+    /// <summary>Keep the combat event intact while sending its source's monotonic timestamp to the relay.</summary>
+    public static byte[] StampCombatUp(byte[] packet, uint senderMs)
+    {
+        if (senderMs == 0 || packet.Length < 3 || !IsCombatUp(packet[0], packet.AsSpan(3))) return packet;
+        byte[] frame = Frame(Protocol.PresentationCombatUp, SubjectStampLength + packet.Length - 3);
+        frame[3] = packet[0];
+        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(4), senderMs);
+        packet.AsSpan(3).CopyTo(frame.AsSpan(3 + SubjectStampLength));
+        return frame;
+    }
+
+    public static bool TryReadCombatUp(ReadOnlySpan<byte> body, out byte type, out uint stamp)
+    {
+        type = 0;
+        stamp = 0;
+        if (body.Length <= SubjectStampLength || !IsCombatUp(body[0], body[SubjectStampLength..])) return false;
+        stamp = BinaryPrimitives.ReadUInt32LittleEndian(body[1..]);
+        if (stamp == 0) return false;
+        type = body[0];
         return true;
     }
 

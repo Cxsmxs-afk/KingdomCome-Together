@@ -123,6 +123,7 @@ public partial class GameBridge
                 {
                     long age = Environment.TickCount64 - unchecked((long)row.CapturedTick);
                     if (age < 0 || age > Protocol.RangedCaptureMaxAgeMs || unchecked((long)row.CapturedTick) <= Interlocked.Read(ref _p6VisualModeAtTick)) { T3Increment("ranged_stale"); continue; }
+                    uint sourceMs = unchecked((uint)(PresentationClock.NowMs() - age));
                     var weapon = catalog?.Classify(row) ?? default;
                     if (weapon.Kind == RangedWeaponKind.Unknown) T3Increment("ranged_capture_kind_unknown");
                     int written = 0;
@@ -138,7 +139,8 @@ public partial class GameBridge
                             weapon.Kind, weapon.ItemClass, (uint)age, row.Source);
                         await P6SendAsync(context, peer, Protocol.W164RangedStep, step.Encode(),
                             () => CurrentMode() && Environment.TickCount64 - unchecked((long)row.CapturedTick) <= Protocol.RangedCaptureMaxAgeMs,
-                            context.Cancellation, AfterWrite, () => (step with { AgeMs = (uint)(Environment.TickCount64 - unchecked((long)row.CapturedTick)) }).Encode());
+                            context.Cancellation, AfterWrite, () => (step with { AgeMs = (uint)(Environment.TickCount64 - unchecked((long)row.CapturedTick)) }).Encode(),
+                            presentationSenderMs: sourceMs);
                     }
                 }
                 if (reply.Rows.Count < RangedCaptureCodec.MaxRows) break;
@@ -148,13 +150,19 @@ public partial class GameBridge
         catch (Exception ex) { T3Increment("ranged_poll_refused"); Console.WriteLine($"P6 ranged poll: {ex.GetType().Name}"); }
         finally { _p6PollGate.Release(); }
     }
-    private async Task<bool> P6SendAsync(P6Context context, byte target, byte kind, string text, Func<bool> extra, CancellationToken ct, Action? afterWrite = null, Func<string>? textAtWrite = null)
+    private async Task<bool> P6SendAsync(P6Context context, byte target, byte kind, string text, Func<bool> extra,
+        CancellationToken ct, Action? afterWrite = null, Func<string>? textAtWrite = null, uint presentationSenderMs = 0)
     {
         var lease = ProcessorFrameScope.Capture();
         bool Current() => !ct.IsCancellationRequested && lease?.IsAbandoned != true && P6Current(context) && extra();
         if (!Current()) return false;
         uint token = Interlocked.Increment(ref _w137Tok);
-        byte[] Build(string value) => new LootMsg(kind, token, value).BuildUp(Protocol.W164Up, target);
+        byte[] Build(string value)
+        {
+            var packet = new LootMsg(kind, token, value).BuildUp(Protocol.W164Up, target);
+            return (_w213Caps & Protocol.LinkCapPresentationCombat) == 0 ? packet :
+                PresentationTimeWire.StampCombatUp(packet, presentationSenderMs);
+        }
         byte[] packet = Build(text);
         void Written() { T3Increment("ranged_peer_tx"); afterWrite?.Invoke(); }
         try
@@ -226,6 +234,22 @@ public partial class GameBridge
             _p6RemoteSteps.TryGetValue(src, out var latest) && latest == (frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence) &&
             Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds + step.AgeMs <= Protocol.RangedCaptureMaxAgeMs;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, _p5Peers[src].Token);
+        if (frame.Presentation.SampleMs != 0 && W221On("rp_combat") &&
+            _ghostEntityIds.TryGetValue(src.ToString(System.Globalization.CultureInfo.InvariantCulture), out uint eid))
+        {
+            var data = new byte[18];
+            data[0] = (byte)step.Kind;
+            data[1] = step.Phase;
+            step.ItemClass.TryWriteBytes(data.AsSpan(2));
+            var admission = await TrySubmitPresentationCombatAsync(src, eid, frame.Presentation,
+                unchecked((ushort)step.Sequence), 0x82, data, linked.Token, beforeWrite: Current);
+            if (admission != PresentationCombatAdmission.Fallback)
+            {
+                string result = admission == PresentationCombatAdmission.Accepted ? "accepted" : "suppressed";
+                Console.WriteLine(FormattableString.Invariant($"MP-RP-RANGED-IN peer={src} eid=0x{eid:X} weapon={step.Kind} phase={step.Phase} seq={step.Sequence} event_host_ms={frame.Presentation.SampleMs} result={result}"));
+                return;
+            }
+        }
         var id = await _combat.RangedOneShotAsync(Wo141Rules.AvatarName(src), fragment, tags, Current, linked.Token);
         if (id is >= 0 && Current()) { Interlocked.Increment(ref _w201RangedShown); if (step.Kind == RangedWeaponKind.Bow) T3Increment("ranged_bow_played"); }
         else T3Increment("ranged_animation_refused");

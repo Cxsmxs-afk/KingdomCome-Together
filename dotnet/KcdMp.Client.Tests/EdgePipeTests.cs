@@ -1,7 +1,9 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.IO.Pipes;
 using System.Reflection;
+using System.Text;
 using KcdMp.Wire;
 
 namespace KcdMp.Client.Tests;
@@ -83,6 +85,176 @@ public sealed class EdgePipeTests
     }
 
     private static uint Id(byte[] request) => BinaryPrimitives.ReadUInt32LittleEndian(request);
+
+    private sealed class PresentationCombatHarness(GameBridge bridge, object stamp)
+    {
+        public const byte Peer = 2;
+        public const uint Entity = 0x14151617;
+        private const BindingFlags Instance = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+        private static readonly MethodInfo Schedule = typeof(GameBridge).GetMethod("TrySchedulePresentationRowAsync", Instance)!;
+        private static readonly MethodInfo Submit = typeof(GameBridge).GetMethod("TrySubmitPresentationCombatAsync", Instance)!;
+
+        private static FieldInfo Field(string name) => typeof(GameBridge).GetField(name, Instance)!;
+        private static Type Nested(string name) => typeof(GameBridge).GetNestedType(name, BindingFlags.NonPublic)!;
+        public static async Task<PresentationCombatHarness> CreateAsync(Connection conn)
+        {
+            var bridge = new GameBridge(new ClientConfig());
+            Field("_combat").SetValue(bridge, conn.Pipe);
+            Field("_combatRoleApplied").SetValue(bridge, true);
+            Field("_isDamageAuthority").SetValue(bridge, true);
+            Field("_sharedWorld").SetValue(bridge, true);
+            Field("_where").SetValue(bridge, Enum.Parse(Field("_where").FieldType, "World"));
+            ((Wo206Epochs)Field("_w206").GetValue(bridge)!).EnsureHost();
+            ((PeerSet)Field("_peers").GetValue(bridge)!).Connected(Peer, "partner");
+            ((ConcurrentDictionary<string, uint>)Field("_ghostEntityIds").GetValue(bridge)!)["2"] = Entity;
+            ((ConcurrentDictionary<string, byte>)Field("_nativeBound").GetValue(bridge)!)["kcd2mp_2"] = 1;
+            ((ConcurrentDictionary<string, bool>)Field("_w221On").GetValue(bridge)!)["rp_combat"] = true;
+            var lifecycle = new HostAuthorityLifecycle((phase, gen, _) =>
+                Task.FromResult<HostAuthorityLifecycle.Ack?>(new(true, phase, false, false, gen, 0)));
+            Assert.True(await lifecycle.PendingAsync(false, true, conn.Token));
+            Assert.True(await lifecycle.GameplayAsync(lifecycle.Current.Generation, conn.Token));
+            Field("_p1Lifecycle").SetValue(bridge, lifecycle);
+
+            var session = Activator.CreateInstance(Nested("PresentationSession"), Instance, null, [Stream.Null, conn.Token], null)!;
+            Assert.True((bool)session.GetType().GetMethod("AcceptEpoch", Instance)!.Invoke(session, [3UL, false])!);
+            Field("_presentationSession").SetValue(bridge, session);
+            var config = Activator.CreateInstance(Nested("PresentationConfig"), Instance, null, [0L, conn.Pipe.EdgeConnectionRevision, true], null);
+            Field("_presentationNativeConfig").SetValue(bridge, config);
+            var stamp = Activator.CreateInstance(Nested("PresentationFrame"), Instance, null, [session, 3UL, 1150UL, 1190UL], null)!;
+            return new(bridge, stamp);
+        }
+
+        public Task<bool> Apply(ActionKind kind, string table, byte flags, ushort seq, CancellationToken ct)
+        {
+            var action = new InboundAction(Peer, kind, seq, ActionPhase.Commit, default, [70, 0, 0, 0]);
+            var row = new ActionRowCatalog.Row(table, "Combat", "tags", 0, 0, 0);
+            return (Task<bool>)Schedule.Invoke(bridge, [action, Entity, row, flags, stamp, ct])!;
+        }
+
+        public void Rebind() => ((ConcurrentDictionary<string, int>)Field("_ghostBodyGen").GetValue(bridge)!)["2"] = 1;
+
+        public void DisableModes()
+        {
+            ((ConcurrentDictionary<string, bool>)Field("_w221On").GetValue(bridge)!)["rp_combat"] = false;
+            Field("_presentationOn").SetValue(bridge, false);
+        }
+
+        public Task<PresentationCombatAdmission> Knockout(bool down, bool recovery, CancellationToken ct, Func<bool>? ready = null) =>
+            (Task<PresentationCombatAdmission>)Submit.Invoke(bridge,
+                [Peer, Entity, stamp, (ushort)62, (byte)0x81, new byte[] { down ? (byte)1 : (byte)0 }, ct, 0u, ready, recovery])!;
+    }
+
+    [Theory]
+    [InlineData(ActionKind.Attack, "combat_action_attack", 0, 1)]
+    [InlineData(ActionKind.BlockImpulse, "combat_action_block", 0, 6)]
+    [InlineData(ActionKind.BlockImpulse, "combat_action_perfect_block", Wo187Rules.NativeFlagPerfect, 0x83)]
+    [InlineData(ActionKind.AvatarHit, "combat_action_hit", 0, 0x84)]
+    [InlineData(ActionKind.AvatarRecoil, "combat_action_failed_attack", 0, 0x85)]
+    public async Task Presentation_combat_registers_a_row_once_then_sends_only_its_numeric_key(
+        ActionKind sourceKind, string table, byte flags, byte nativeKind)
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        var first = harness.Apply(sourceKind, table, flags, 12, conn.Token);
+        byte[] register = await conn.Read(Request);
+        Assert.Equal(new byte[] { 2, 0x3F, 0, 0, 0, 0, 2, 0x17, 0x16, 0x15, 0x14, nativeKind }, register[4..16]);
+        Assert.Equal("Combat, tags", Encoding.UTF8.GetString(register.AsSpan(20)));
+        byte[] key = register[16..20];
+        Assert.NotEqual(0u, BinaryPrimitives.ReadUInt32LittleEndian(key));
+        await conn.Respond(Id(register), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+
+        byte[] request = await conn.Read(Request);
+        byte[] expected = [1, 0x40, 0, 0, 0, 0, 2, 0x17, 0x16, 0x15, 0x14, 0x7E, 0x04, 0, 0, 0, 0, 0, 0, 12, 0, nativeKind, 1, .. key];
+        Assert.Equal(expected, request[4..]);
+        await conn.Respond(Id(request), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        Assert.True(await first);
+
+        var second = harness.Apply(sourceKind, table, flags, 13, conn.Token);
+        var repeated = await conn.Read(Request);
+        Assert.Equal(0x40, repeated[5]);
+        Assert.Equal(13, BinaryPrimitives.ReadUInt16LittleEndian(repeated.AsSpan(23)));
+        Assert.Equal(key, repeated[27..]);
+        await conn.Respond(Id(repeated), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        Assert.True(await second);
+    }
+
+    [Fact]
+    public async Task Presentation_combat_retries_unaccepted_busy_and_row_miss_but_never_repeats_an_ambiguous_effect()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        var action = harness.Apply(ActionKind.BlockImpulse, "combat_action_block", 0, 42, conn.Token);
+        var setup = await conn.Read(Request);
+        await conn.Respond(Id(setup), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        var first = await conn.Read(Request);
+        await conn.Respond(Id(first), EdgeOutcome.Busy);
+        var retry = await conn.Read(Request);
+        Assert.NotEqual(Id(first), Id(retry));
+        Assert.Equal(first[4..], retry[4..]);
+        await conn.Respond(Id(retry), EdgeOutcome.Completed, 0x81, [0, 0, 4]);
+        var reRegister = await conn.Read(Request);
+        Assert.Equal(setup[4..], reRegister[4..]);
+        await conn.Respond(Id(reRegister), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        var recovered = await conn.Read(Request);
+        Assert.Equal(retry[4..], recovered[4..]);
+        await conn.Respond(Id(recovered), (EdgeOutcome)5);   // Accepted local work faulted without a definitive result.
+        Assert.True(await action);
+
+        var next = harness.Apply(ActionKind.BlockImpulse, "combat_action_block", 0, 43, conn.Token);
+        var nextRequest = await conn.Read(Request);
+        Assert.Equal(43, BinaryPrimitives.ReadUInt16LittleEndian(nextRequest.AsSpan(23)));
+        await conn.Respond(Id(nextRequest), EdgeOutcome.Unsupported);
+        var old = await conn.Read(Request);
+        Assert.Equal(0x3B, old[5]);
+        await conn.Respond(Id(old), EdgeOutcome.Completed, 0x81, [0, 0, 1]);
+        Assert.False(await next);
+
+        var legacy = harness.Apply(ActionKind.BlockImpulse, "combat_action_block", 0, 44, conn.Token);
+        var legacyRequest = await conn.Read(Request);
+        Assert.Equal(0x3B, legacyRequest[5]);
+        Assert.Equal(44, BinaryPrimitives.ReadUInt16LittleEndian(legacyRequest.AsSpan(23)));
+        await conn.Respond(Id(legacyRequest), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        Assert.True(await legacy);
+    }
+
+    [Fact]
+    public async Task Presentation_combat_does_not_fall_back_after_its_actor_generation_retires()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        var action = harness.Apply(ActionKind.BlockImpulse, "combat_action_block", 0, 42, conn.Token);
+        var setup = await conn.Read(Request);
+        await conn.Respond(Id(setup), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        var request = await conn.Read(Request);
+        harness.Rebind();
+        await conn.Respond(Id(request), EdgeOutcome.Unsupported);
+        Assert.True(await action);
+    }
+
+    [Fact]
+    public async Task Presentation_wake_recovery_can_use_the_same_actor_with_both_modes_off()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        harness.DisableModes();
+        Assert.Equal(PresentationCombatAdmission.Fallback, await harness.Knockout(down: true, recovery: false, conn.Token));
+        Assert.Equal(PresentationCombatAdmission.Suppressed, await harness.Knockout(down: true, recovery: true, conn.Token));
+        Assert.Equal(PresentationCombatAdmission.Suppressed, await harness.Knockout(down: false, recovery: true, conn.Token, () => false));
+
+        var wake = harness.Knockout(down: false, recovery: true, conn.Token);
+        var request = await conn.Read(Request);
+        Assert.Equal(0x40, request[5]);
+        Assert.Equal(new byte[] { 0x81, 1, 0 }, request[25..]);
+        await conn.Respond(Id(request), EdgeOutcome.Busy);
+        var retry = await conn.Read(Request);
+        Assert.Equal(request[4..], retry[4..]);
+        await conn.Respond(Id(retry), EdgeOutcome.Busy);
+        Assert.Equal(PresentationCombatAdmission.Fallback, await wake);  // Keep the original typed wake pending in the caller.
+    }
 
     [Fact]
     public async Task A_realtime_reply_can_pass_unanswered_bulk_and_only_its_own_id_and_typed_reply_complete_it()
@@ -408,6 +580,7 @@ public sealed class EdgePipeTests
     [InlineData(4090, true)]
     [InlineData(4091, false)]
     [InlineData(6146, false)]
+    [InlineData(6402, false)]
     public async Task Only_a_stats_mirror_that_exceeds_the_batch_cap_uses_the_large_standalone_request(int length, bool batch)
     {
         await using var conn = new Connection();

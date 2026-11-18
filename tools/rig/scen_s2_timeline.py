@@ -24,7 +24,7 @@ BOT_SWINGS = 3
 SOURCE_SWING = re.compile(r'\bMP-ACTION section=outbound kind=Attack\b.*\bms=(\d+)\b')
 BOT_SWING = re.compile(r'^PEER t=\S+ attack\b.*\bms=(\d+)\b')
 INBOUND = re.compile(r'\bMP-RP-TIMELINE-IN (.+)$')
-INSTALLED = re.compile(r'\bMP-RP-TIMELINE-ACTION (.+)$')
+INSTALLED = re.compile(r'\bMP-RP-(?:TIMELINE|COMBAT)-ACTION (.+)$')
 FIGURE = re.compile(r'\bMP-RP-TIMELINE figure=kcd2mp_(\d+) (.+)$')
 FIELD = re.compile(r'\b([a-z][a-z0-9_]*)=([\w-]+)(?= |$)')
 METRICS = {'rp_buffer_ms', 'rp_extrap_ms_max', 'rp_late_samples', 'rp_action_pos_skew_ms_p95', 'rp_timeline_pose_n',
@@ -64,6 +64,8 @@ def paired_actions(sent, receiver_lines, native_lines, peer):
     for row in tagged_rows(native_lines, INSTALLED, peer):
         seq, event, pose, skew, scope, connection = (number(row, key) for key in (
             'seq', 'event_host_ms', 'pose_host_ms', 'skew_ms', 'scope', 'connection'))
+        if skew is None and 'lag_ms' in row and event and pose:
+            skew = abs(event - pose)
         identity = (seq, event)
         if row.get('result') != 'installed' or identity not in forwarded or not pose or skew != abs(event - pose):
             continue

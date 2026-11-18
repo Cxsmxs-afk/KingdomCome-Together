@@ -198,6 +198,8 @@ bool read_model(uint32_t eid, ModelRead* out);        // false = no actor for ei
 bool is_avatar_eid(uint32_t eid);
 // The local player's combat actor (main-thread cache; 0 when unknown).
 void* player_combat_actor();
+// Existing RTTI/owner fields only, no engine call. Safe at the hit gate.
+bool combat_actor_identity(void* combat, uint32_t* eid, void** actor);
 // WO-210 B.1 (any thread, read-only): a combat actor's opponent as a combat actor, or null.
 void* opponent_ca(void* ca);
 

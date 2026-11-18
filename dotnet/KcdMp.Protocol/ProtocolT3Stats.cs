@@ -39,6 +39,10 @@ public static class T3NativeCounters
         "rp_hard_tp_by_join", "rp_hard_tp_by_respawn", "rp_hard_tp_by_travel", "rp_hard_tp_unsafe",
         "rp_pulls_per_min", "rp_pull_n", "rp_pull_observed_ms"
     ];
+    private static readonly string[] CombatKeys = [
+        "rp_actions_in", "rp_actions_played", "rp_actions_pending", "rp_action_lag_ms_p95", "rp_action_confirmed_n",
+        "dmg_double_blocked", "dmg_double", "rp_ko_up_lag_ms_p95", "rp_ko_up_n", "dmg_double_unconfirmed"
+    ];
 
     private static bool TryReadFields(ReadOnlySpan<byte> payload, string[] keys, Span<bool> seen, out Dictionary<string, long> values)
     {
@@ -85,6 +89,10 @@ public static class T3NativeCounters
     /// <summary>Controller samples and elapsed observation time share their own Op250 page.</summary>
     public static bool TryReadController(ReadOnlySpan<byte> payload, out Dictionary<string, long> values) =>
         TryReadPage(payload, ControllerKeys, out values);
+
+    /// <summary>Playback counts and their confirmed observation counts share one Op250 page.</summary>
+    public static bool TryReadCombat(ReadOnlySpan<byte> payload, out Dictionary<string, long> values) =>
+        TryReadPage(payload, CombatKeys, out values);
 
     private static bool TryReadPage(ReadOnlySpan<byte> payload, string[] keys, out Dictionary<string, long> values)
     {

@@ -142,8 +142,8 @@ static partial class P
         var steps = new List<Step>(); double endT = 60;
         BotPlan? plan = bot is null ? null : bot.Scenario is string scenario
             ? ReadBotPlan(File.ReadLines(scenario)) : DefaultBotPlan(bot.Origin ?? (0, 0, 0));
-        Guid bow = bot is not null && plan!.Steps.Any(step => step.F[0] is "ranged" or "bow_equip")
-            ? FindBotBow(bot) : Guid.Empty;
+        Guid rangedClass = bot is not null && plan!.Steps.Any(step => step.F[0] is "ranged" or "bow_equip")
+            ? FindBotRangedClass(bot) : Guid.Empty;
         foreach (var raw in bot is null ? File.ReadLines(Arg(a, "--scenario", "scenario.txt")) : Array.Empty<string>())
         {
             var t = raw.Trim(); if (t.Length == 0 || t.StartsWith('#')) continue;
@@ -184,9 +184,12 @@ static partial class P
         int botPoses = 0, botActions = 0, botRanged = 0;
         ulong botRangedEpoch = 1;
         uint rangedSequence = 0;
-        async Task Emit(byte[] packet)
+        var presentation = bot is null ? null : new BotPresentationClock(st);
+        async Task Emit(byte[] packet, uint? combatStamp = null)
         {
-            await Send(st, packet, hard);
+            byte[] outgoing = combatStamp is uint captured && presentation?.SupportsCombat == true
+                ? PresentationTimeWire.StampCombatUp(packet, captured) : packet;
+            await Send(st, outgoing, hard);
             if (bot is null) return;
             switch (packet[0])
             {
@@ -216,7 +219,6 @@ static partial class P
         var recClock = Stopwatch.StartNew();
         byte[]? hostAppearance = null;   // WO-131: the last AppearanceDown classes (for `appearance mirror`)
         BodyState2Bits lastHostBits = BodyState2Bits.None;   // WO-135
-        var presentation = bot is null ? null : new BotPresentationClock(st);
         var reader = Task.Run(async () =>
         {
             try
@@ -346,6 +348,7 @@ static partial class P
         double lastT = 0;
         float vitalsHp = -1, vitalsSt = -1; double lastVitals = -9;   // WO-131
         byte vitalsFlags = 0;   // WO-132: vitals <hp> <st> downed -> the unconscious bit (0x01), as a floored joiner sends
+        byte? sentVitalsFlags = null;
         // WO-114: the joiner's side of the leash (off until "leash on").
         bool leashOn = false; ushort leashFlags = Protocol.LeashFlagInWorld; string leashObey = "on";
         byte leashSeq = 0, leashResult = 0; ushort leashFrom = 0, leashTo = 0, leashRes = 0; double lastLeash = -9;
@@ -451,10 +454,22 @@ static partial class P
                         break;
                     }
                     case "block_impulse":
+                    {
+                        uint sourceMs = SenderMs();
+                        bool perfect = f.Length > 2 && f[2] == "perfect";
                         await Emit(outbox.Build(ActionKind.BlockImpulse, ActionPhase.Commit,
-                            new RowEvent(SenderMs(), (byte)(f.Length > 2 && f[2] == "perfect" ? RowEvent.FlagPerfect : 0), Guid.Parse(f[1]), "").ToBytes()));
-                        Console.WriteLine($"PEER t={t:F1} block_impulse {f[1]}");
+                            new RowEvent(sourceMs, perfect ? RowEvent.FlagPerfect : (byte)0, Guid.Parse(f[1]), "").ToBytes()));
+                        Console.WriteLine(FormattableString.Invariant($"PEER t={t:F1} block_impulse row={f[1]} perfect={(perfect ? 1 : 0)} source_ms={sourceMs}"));
                         break;
+                    }
+                    case "hit_reaction" when botContext is not null:
+                    {
+                        uint sourceMs = SenderMs();
+                        await Emit(outbox.Build(ActionKind.AvatarHit, ActionPhase.Commit,
+                            new RowEvent(sourceMs, 0, Guid.Parse(f[1]), "").ToBytes()));
+                        Console.WriteLine(FormattableString.Invariant($"PEER t={t:F1} hit_reaction row={f[1]} source_ms={sourceMs}"));
+                        break;
+                    }
                     case "dodge":
                         await Emit(outbox.Build(ActionKind.Dodge, ActionPhase.Commit, new RowEvent(SenderMs(), 0, Guid.Parse(f[1]), "").ToBytes()));
                         Console.WriteLine($"PEER t={t:F1} dodge {f[1]}");
@@ -499,8 +514,13 @@ static partial class P
                         break;
                     case "vitals":   // WO-131
                         vitalsHp = F(f[1]); vitalsSt = F(f[2]); lastVitals = -9;
-                        vitalsFlags = f.Length > 3 && f[3] == "downed" ? Protocol.PlayerStateFlagUnconscious
-                                    : f.Length > 3 && f[3] == "knockeddown" ? (byte)(Protocol.PlayerStateFlagUnconscious | Protocol.PlayerStateFlagKnockedDown) : (byte)0;   // WO-154
+                        vitalsFlags = f.Length < 4 ? (byte)0 : f[3] switch
+                        {
+                            "downed" => Protocol.PlayerStateFlagUnconscious,
+                            "knockeddown" => (byte)(Protocol.PlayerStateFlagUnconscious | Protocol.PlayerStateFlagKnockedDown),
+                            "knockout" when bot is not null => (byte)(Protocol.PlayerStateFlagUnconscious | Protocol.PlayerStateFlagKnockedDown | Protocol.PlayerStateFlagEngineKnockout),
+                            _ => (byte)0
+                        };
                         Console.WriteLine($"PEER t={t:F1} vitals {vitalsHp}/{vitalsSt}{(vitalsFlags != 0 ? " DOWNED" : "")}");
                         break;
                     case "death":   // WO-131
@@ -526,15 +546,17 @@ static partial class P
                         Console.WriteLine(FormattableString.Invariant($"PEER t={t:F1} respawned at ({x:F1}, {y:F1}, {z:F1})"));
                         break;
                     }
-                    case "ranged" when botContext is not null:
+                    case "ranged" when botContext is not null && bot is not null:
                     {
                         uint delay = (uint)ScheduledAgeMs(plannedHostMs, SenderMs());
                         if (delay > Protocol.RangedCaptureMaxAgeMs) throw new IOException("T4 ranged station missed its deadline.");
-                        await Emit(BuildBotRanged(botContext.Host, botContext.World, botRangedEpoch, ++rangedSequence, BotRangedPhase(f[1]), bow, delay));
+                        uint sourceMs = SenderMs();
+                        await Emit(BuildBotRanged(botContext.Host, botContext.World, botRangedEpoch, ++rangedSequence, BotRangedPhase(f[1]), rangedClass, delay, bot.RangedKind), sourceMs);
+                        Console.WriteLine(FormattableString.Invariant($"PEER t={t:F1} ranged phase={f[1]} weapon={bot.RangedKind} item={rangedClass:D} seq={rangedSequence} epoch={botRangedEpoch} source_ms={sourceMs}"));
                         break;
                     }
                     case "bow_equip" when botContext is not null:
-                        f = ["appearance", bow.ToString("D")];
+                        f = ["appearance", rangedClass.ToString("D")];
                         goto case "appearance";
                     case "appearance":   // WO-131: appearance mirror | <guid,...>
                     {
@@ -763,7 +785,11 @@ static partial class P
                 BinaryPrimitives.WriteUInt16LittleEndian(vp.AsSpan(1), (ushort)Protocol.PlayerStateUpPayloadLen);
                 BinaryPrimitives.WriteSingleLittleEndian(vp.AsSpan(3), vitalsHp); BinaryPrimitives.WriteSingleLittleEndian(vp.AsSpan(7), vitalsSt);
                 vp[11] = vitalsFlags;
-                await Emit(vp);
+                uint sourceMs = SenderMs();
+                await Emit(vp, sourceMs);
+                if (bot is not null && sentVitalsFlags != vitalsFlags)
+                    Console.WriteLine(FormattableString.Invariant($"PEER t={t:F1} player_state down={((vitalsFlags & Protocol.PlayerStateFlagUnconscious) != 0 ? 1 : 0)} source_ms={sourceMs}"));
+                sentVitalsFlags = vitalsFlags;
             }
             if (!placed || frozen) { await Task.Delay(5, hard); continue; }
             bool moving = moveUntil > t && speed > 0;

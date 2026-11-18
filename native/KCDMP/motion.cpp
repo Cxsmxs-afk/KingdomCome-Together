@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // WO-121 -- movement and combat on native-written bodies. See motion.h.
 #include "motion.h"
+#include "wo131.h"
 #include "motion_remote_rules.h"
 #include "wo178.h"
 #include "wo163_rules.h"
@@ -1152,7 +1153,7 @@ void ensure_avatar_guard(Body& b, double now) {
     const uint8_t wantQuiet = g_cfgQuiet.load();   // WO-135: mp_avatar_quiet's groups
     if (wantQuiet != b.quietApplied) set_quiet(b, wantQuiet);
     if (!g_avatarGuardOk) return;
-    if (ko_held(b.eid)) return;   // WO-201 V.4: down the engine's way; the guard comes back at the wake (wo131's op)
+    if (ko_held(b.eid) || wo131::rp_knockout_holds(b.eid)) return;   // WO-201 V.4: the wake restores the full guard
     void* soul = nullptr;
     void* fn = vslot(b.actor, kActorGetSoul);
     if (!fn || !call_p0(fn, b.actor, &soul) || !soul) return;
@@ -2289,6 +2290,14 @@ bool is_avatar_eid(uint32_t eid) {
 }
 
 void* player_combat_actor() { return g_playerCa.load(); }
+
+bool combat_actor_identity(void* combat, uint32_t* eid, void** actor) {
+    *eid = 0;
+    *actor = nullptr;
+    void* ca = as_combat_actor(combat);
+    if (!ca || !rd(ca, kCaOwnerEntity, actor) || !*actor || !rd(*actor, kActorEntityId, eid) || !*eid) return false;
+    return combat_actor_of(*actor, false) == ca;
+}
 
 // WO-210 B.1 (any thread, read-only): a combat actor's opponent as a combat actor (its model +0x1118, checked by class), or null
 void* opponent_ca(void* ca) {

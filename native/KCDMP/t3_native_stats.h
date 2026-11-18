@@ -3,10 +3,12 @@
 #include "t3_native_stats_rules.h"
 #include "edge_lanes.h"
 #include "holders.h"
+#include "hits.h"
 #include "p4.h"
 #include "wo216.h"
 #include "respawn_actions.h"
 #include "rp_measure.h"
+#include "rp_combat.h"
 #include "rp_controller.h"
 #include "rp_timeline.h"
 #include "wo201.h"
@@ -58,5 +60,15 @@ inline size_t controller_stats(uint8_t* out, size_t cap) {
                                controller.hard_tp_unapproved, controller.pulls_per_min,
                                controller.pulls, controller.pull_observed_ms};
     return write_controller(out, cap, counts);
+}
+
+inline size_t combat_stats(uint8_t* out, size_t cap) {
+    const auto combat = rpcombat::snapshot();
+    const auto damage = hits::visual_damage_stats();
+    const uint64_t counts[] = {combat.actions_in, combat.actions_played, combat.actions_pending,
+                               combat.action_lag_ms_p95, combat.action_confirmed_n,
+                               damage.blocked, damage.doubleApplied, combat.ko_up_lag_ms_p95, combat.ko_up_n,
+                               damage.unconfirmed};
+    return write_combat(out, cap, counts);
 }
 } // namespace kcdmp::t3native

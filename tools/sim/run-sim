@@ -2,7 +2,7 @@
 # Headless smoothness run against the tree you are in.
 #   tools/sim/run-sim
 #   tools/sim/run-sim pr3 tools/sim/out
-# Needs the .NET 8 SDK and a C++17 compiler for the native CI gates. No game, no root.
+# Needs the .NET 8 SDK. CI also runs portable C++17 and Python checks.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 label="${1:-this-tree}"
@@ -22,6 +22,9 @@ int edge_lanes_tests(int* passed);
 int rp_timeline_tests(int* passed);
 int rp_timeline_action_tests(int* passed);
 int rp_controller_tests(int* passed);
+int rp_combat_tests(int* passed);
+int rp_body_action_tests(int* passed);
+int visual_damage_tests(int* passed);
 
 bool run_tests(const char* name, int (*suite)(int*)) {
     int passed = 0;
@@ -36,15 +39,23 @@ int main() {
     passed &= run_tests("modeled presentation clock", &rp_timeline_tests);
     passed &= run_tests("presentation action order", &rp_timeline_action_tests);
     passed &= run_tests("remote movement and relocation", &rp_controller_tests);
+    passed &= run_tests("typed combat presentation", &rp_combat_tests);
+    passed &= run_tests("remote knockout and ranged animation", &rp_body_action_tests);
+    passed &= run_tests("visual replica damage authority", &visual_damage_tests);
     return passed ? 0 : 1;
 }
 EOF
     "${CXX:-c++}" -std=c++17 -I native/KCDMP "$native_tmp/main.cpp" \
         native/tests/holder_contract_tests.cpp native/tests/edge_lanes_tests.cpp \
         native/tests/rp_timeline_tests.cpp native/tests/rp_timeline_action_tests.cpp \
-        native/tests/rp_controller_tests.cpp -o "$native_tmp/native-contracts"
-    native_result="$("$native_tmp/native-contracts")"
+        native/tests/rp_controller_tests.cpp native/tests/rp_combat_tests.cpp \
+        native/tests/rp_body_action_tests.cpp native/tests/visual_damage_tests.cpp -o "$native_tmp/native-contracts"
+    if ! native_result="$("$native_tmp/native-contracts")"; then
+        printf '%s\n' "$native_result" >&2
+        exit 1
+    fi
     printf '%s\n' "$native_result"
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_rpcombat.py'
 fi
 dotnet run --project tools/sim/KcdMp.Sim/KcdMp.Sim.csproj -c Release -- --label "$label" --out "$out" "${extra[@]}"
 if [ "$label" = ci ]; then

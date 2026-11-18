@@ -21,10 +21,15 @@
 #include "motion.h"
 #include "npc_drive.h"
 #include "respawn_actions.h"
+#include "p4.h"
+#include "pipe_server.h"
+#include "rp_body_action_rules.h"
+#include "rp_timeline_actions.h"
 #include "script_context.h"
 #include "wo138.h"
 #include "wo216.h"
 #include "wo187.h"
+#include "wo172.h"
 
 #include <windows.h>
 #include <array>
@@ -592,6 +597,16 @@ static_assert(sizeof(AnimParams) == 0x58, "the scriptbind's block");
 // A one-shot this DLL started: until its request's callback (or a limit), a
 // paused body's NPC-state machine is ticked by this DLL, and an aligned one
 // holds the writer off the body.
+struct RangedProof {
+    uint64_t token = 0;
+    void* entity = nullptr;
+    uint8_t weapon = 0, phase = 0;
+    timelineactions::Scope scope{};
+};
+
+timelineactions::Scope ranged_scope() {
+    return {wo216::lifecycle_observation_stamp(), pipe::observation_connection(), p4::life_edge_tick()};
+}
 struct InFlight {
     uint32_t eid = 0; uint32_t seq = 0; int reqId = -1;
     std::string name; std::string frag;
@@ -600,6 +615,8 @@ struct InFlight {
     bool playCheck = false; const void* startActs[8]{};   // WO-201 B9: each scope's action when it was asked for
     bool guard = false; float from[3]{};   // an avatar's aligned entry: undone if it carries the body away
     std::string kept;                      // what its search state held (the seat, the object, the tools)
+    RangedProof ranged;
+    uint32_t completionId = 0;
 };
 constexpr uint8_t kResultMovedAway = 0xFD;   // the guard stopped it
 constexpr uint8_t kResultNeverPlayed = 0xFC;  // WO-201 B9: nothing of it ever started on the body
@@ -617,7 +634,11 @@ uint32_t g_seq = 0;
 
 void on_shot_done(uint32_t eid, uint32_t seq, unsigned int id, uint8_t result) {
     for (auto& f : g_flight)
-        if (f.eid == eid && f.seq == seq) { f.done = true; f.result = result; f.reqId = static_cast<int>(id); return; }
+        if (f.eid == eid && f.seq == seq) {
+            f.done = true; f.result = result; f.completionId = id;
+            if (!f.ranged.token) f.reqId = static_cast<int>(id);
+            return;
+        }
 }
 // The request's callback: small enough for std::function's inline storage, so
 // the engine's copies call back into this DLL's code only (MSVC ABI, as the
@@ -730,13 +751,14 @@ bool body_paused(uint32_t eid) {
 
 // Start a one-shot (or, fragment empty, end the running one) on a body.
 int start_shot(const std::string& name, const char* frag, const char* tags, uint64_t alignWuid, bool holdBody, char* why, size_t whyN,
-               bool guard = false) {
-    void* e = X::entity_named(name.c_str());
+               bool guard = false, RangedProof ranged = {}) {
+    void* e = ranged.token ? ranged.entity : X::entity_named(name.c_str());
     const uint32_t eid = e ? engine::entity_id(e) : 0;
     if (!eid) { _snprintf_s(why, whyN, _TRUNCATE, "no body named %s here", name.c_str()); return -3; }
     const uint32_t seq = ++g_seq;
     InFlight f{};
     f.eid = eid; f.seq = seq; f.name = name; f.frag = frag ? frag : ""; f.started = now_s();
+    f.ranged = ranged;
     g_flight.push_back(f);   // before the call: a synchronous callback finds it
     std::string kept;
     const int id = request_on(eid, frag && *frag, frag, tags, alignWuid, seq, why, whyN, &kept);
@@ -814,6 +836,12 @@ bool tick_body(uint32_t eid) {
 void flight_tick(double now) {
     for (auto it = g_flight.begin(); it != g_flight.end();) {
         InFlight& f = *it;
+        void* entity = engine::entity_by_id(f.eid);
+        if (f.ranged.token && (f.ranged.entity != entity || !(f.ranged.scope == ranged_scope()) || !npcdrive::is_bound_eid(f.eid))) {
+            timelineactions::observed(f.ranged.token, false);
+            it = g_flight.erase(it);
+            continue;
+        }
         // the limit bounds this DLL's own ticking of a paused copy; a body the game ticks (an avatar) keeps
         // its request until the game ends it (a minigame loop runs until the next request stops it)
         const bool expired = f.ticked ? now - f.started > K::kOneShotTickLimitS : now - f.started > K::kOneShotKeepS;
@@ -850,7 +878,14 @@ void flight_tick(double now) {
                 }
             }
         }
-        if (f.done || expired || !engine::entity_by_id(f.eid)) {
+        if (f.done || expired || !entity) {
+            if (f.ranged.token) {
+                const bool confirmed = rpbodyactions::ranged_completion_confirmed(f.done, f.result, f.reqId, f.completionId);
+                timelineactions::observed(f.ranged.token, confirmed);
+                logf("MP-RP-RANGED eid=0x%X token=%llu weapon=%u phase=%u request=%d result=%s", f.eid,
+                     static_cast<unsigned long long>(f.ranged.token), f.ranged.weapon, f.ranged.phase, f.reqId,
+                     confirmed ? "confirmed" : "unconfirmed");
+            }
             if (f.heldByUs) npcdrive::set_activity_hold(f.eid, false);
             if (f.done) { (f.result == 2 ? c_shotsDone : c_shotsFailed).fetch_add(1); }
             else c_shotsFailed.fetch_add(1);
@@ -1277,6 +1312,34 @@ bool shot_in_flight(uint32_t eid) {
     for (const auto& f : g_flight)
         if (f.eid == eid && !f.done && now - f.started <= (f.ticked ? K::kOneShotTickLimitS : K::kOneShotKeepS)) return true;
     return false;
+}
+
+bool rp_ranged_available(uint32_t eid, const uint8_t itemClass[16]) {
+    if (!itemClass || !g_animArmed || !(g_apply.load() & kBitAvatarShots) || !npcdrive::is_bound_eid(eid) ||
+        !npcdrive::unparented_body(eid) || wo172::copy_dead(eid)) return false;
+    using holders::Holder;
+    const auto owner = holders::of(eid);
+    if (owner != Holder::Writer && owner != Holder::Driver && owner != Holder::OneShot) return false;
+    K::Hands hands{};
+    K::ClassId requested{};
+    std::memcpy(requested.b, itemClass, sizeof requested.b);
+    if (requested.empty()) return false;
+    const uint8_t known = X::read_body_hands_strict(eid, &hands);
+    return ((known & 1) && hands.left == requested) || ((known & 2) && hands.right == requested);
+}
+
+bool rp_ranged(uint32_t eid, uint8_t weapon, uint8_t phase, const uint8_t itemClass[16], uint64_t token) {
+    const char* fragment = rpbodyactions::ranged_fragment(weapon, phase);
+    if (!token || !fragment || !rp_ranged_available(eid, itemClass)) return false;
+    void* e = engine::entity_by_id(eid);
+    const char* name = e ? engine::entity_name(e) : nullptr;
+    if (!name || std::strncmp(name, "kcd2mp_", 7)) return false;
+    const char* tags = weapon == rpbodyactions::kBow ? "l_bow" : "l_crossbow";
+    char why[128];
+    const int id = start_shot(name, fragment, tags, 0, false, why, sizeof why, false, {token, e, weapon, phase, ranged_scope()});
+    if (id < 0) logf("MP-RP-RANGED eid=0x%X token=%llu weapon=%u phase=%u request=%d result=refused (%s)", eid,
+                     static_cast<unsigned long long>(token), weapon, phase, id, why);
+    return id >= 0;
 }
 
 void on_pipe_closed() {

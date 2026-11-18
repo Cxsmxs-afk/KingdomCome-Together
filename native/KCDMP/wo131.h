@@ -74,4 +74,11 @@ constexpr uint8_t kRFailed     = 5;
 // reason. *outLen is the payload length.
 uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen);
 
+// S2-6: a scope-checked visual knockout/get-up with actual soul and physics reads.
+bool rp_knockout_available(uint32_t eid, bool down);
+bool rp_knockout_holds(uint32_t eid);
+bool rp_knockout_wake_pending(uint32_t eid);
+bool rp_knockout(uint32_t eid, bool down, uint64_t token);
+void rp_knockout_tick();
+
 } // namespace kcdmp::wo131

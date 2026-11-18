@@ -23,6 +23,7 @@
 #include "rttr_abi.h"
 #include "wo215.h"
 #include "wo216.h"
+#include "wo131.h"
 #include <windows.h>
 #include <atomic>
 #include <cstdio>
@@ -251,6 +252,22 @@ bool take_fall(uint32_t eid, const char* name, double now) {
            holders::handover(eid, name, holders::Holder::Fall, now);
 }
 
+bool rp_ragdoll_state(uint32_t eid, bool* down) {
+    void* rm = A.armed ? manager_of(eid) : nullptr;
+    if (!rm || !down) return false;
+    return fault::guarded(g_siteIs, [&] { *down = reinterpret_cast<bool (*)(void*)>(A.isRagdoll)(rm); });
+}
+
+bool rp_stand_up(uint32_t eid, const char* setter) {
+    void* rm = A.armed ? manager_of(eid) : nullptr;
+    if (!rm) return false;
+    auto permit = holders::may_place(eid, holders::Holder::Fall, setter, holders::Claim::Held);
+    if (!permit) return false;
+    if (!fault::guarded(g_siteUp, [&] { reinterpret_cast<void (*)(void*, int)>(A.requestStandUp)(rm, 1); })) return false;
+    permit.wrote();
+    return true;
+}
+
 void note_buff_pose(uint32_t eid, bool down) {
     if (void* e = engine::entity_by_id(eid)) g_buffPose[eid] = {e, wo216::lifecycle_generation(), down};
 }
@@ -362,7 +379,7 @@ bool copy_tick(uint32_t eid, const char* name, bool hostDown, double now) {
 // body is its own engine's again, and the next state settles it).
 constexpr double kHeldStaleS = 3.0;
 bool held_down(uint32_t eid) {
-    if (buff_holds(eid)) return true;
+    if (wo131::rp_knockout_holds(eid) || buff_holds(eid)) return true;
     if (g_heldAt.empty()) return false;
     const auto it = g_heldAt.find(eid);
     return it != g_heldAt.end() && npcdrive::now_s() - it->second <= kHeldStaleS;

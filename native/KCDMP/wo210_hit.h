@@ -18,5 +18,6 @@ namespace kcdmp::wo210hit {
 // pipe_server: the LocalHit frame body [guid:16][stamina:4f][health:4f][died:1][byPlayer:1][judge:1]
 using FrameFn = void (*)(const void* body, uint16_t len);
 void set_frame_callback(FrameFn fn);
+bool visual_gate_ready();
 
 } // namespace kcdmp::wo210hit

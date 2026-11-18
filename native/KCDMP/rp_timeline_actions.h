@@ -18,7 +18,10 @@ struct Scope {
 
 void configure(bool enabled);
 void reset();
+void forget(uint32_t eid);
 Receipt submit(const uint8_t* bytes, size_t size, Scope received, uint64_t readMs);
+Receipt register_combat(const uint8_t* bytes, size_t size, Scope received);
+Receipt submit_combat(const uint8_t* bytes, size_t size, Scope received, uint64_t readMs);
 void tick();
 void observed(uint64_t token, bool installed);
 

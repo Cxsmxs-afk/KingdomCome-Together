@@ -23,6 +23,8 @@ bool held_down(uint32_t eid);
 
 // Settle outgoing movement before the ragdoll/knockout owner takes the body.
 bool take_fall(uint32_t eid, const char* name, double now);
+bool rp_ragdoll_state(uint32_t eid, bool* down);
+bool rp_stand_up(uint32_t eid, const char* setter);
 // WO-131's temporary copy buff owns this body through the wake and physical stand-up.
 void note_buff_pose(uint32_t eid, bool down);
 void clear_buff_pose(uint32_t eid);

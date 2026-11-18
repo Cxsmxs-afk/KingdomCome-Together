@@ -149,6 +149,8 @@ public static partial class Protocol
         (StoryBeatUp,       "story-beat",        2, 2 + MaxStoryBeatTextLen),                   // and the len byte agrees
         (ClockSyncUp,       "clock-sync",        ClockSyncUpPayloadLen, ClockSyncUpPayloadLen),
         (PresentationClockUp, "presentation-clock", PresentationClock.QueryLength, PresentationClock.ConfirmLength),
+        (PresentationCombatUp, "presentation-combat", PresentationTimeWire.SubjectStampLength + PlayerStateUpPayloadLen,
+            PresentationTimeWire.SubjectStampLength + JoinHeaderLen + LootFixedLen + W164WireTextMax),
         (ActionUp,          "action",            ActionUpHeaderLen, ActionUpHeaderLen + ActionPayloadMaxLen),   // and the len byte agrees
         (PlayerRespawnedUp, "player-respawned",  PlayerRespawnedUpPayloadLen, PlayerRespawnedUpPayloadLen),
         (DeathMarkerUp,     "death-marker",       DeathMarkerUpLen, DeathMarkerUpLen),

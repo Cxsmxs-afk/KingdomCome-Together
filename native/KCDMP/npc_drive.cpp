@@ -29,6 +29,7 @@
 #include "respawn_actions.h"
 #include "rp_measure.h"
 #include "rp_timeline.h"
+#include "rp_timeline_actions.h"
 #include "rp_controller.h"
 #include "edge_lanes.h"
 #include "pipe_server.h"
@@ -505,6 +506,7 @@ bool drop(std::unordered_map<std::string, Puppet>::iterator it, uint8_t reason, 
     motion::body_released(it->second.key.c_str(), it->second.eid);   // WO-121: gait/combat hand the body back
     rpmeasure::forget(it->second.eid);
     rptimeline::forget(it->second.eid);
+    timelineactions::forget(it->second.eid);
     rpctrl::forget(it->second.eid);
     if (tell) notify_drop(reason, it->second.name);
     if (reason == kNotLiving) {   // WO-147: remembered for the hit gate (a ragdoll is a moment, not a release)
@@ -1316,6 +1318,12 @@ bool activity_held(uint32_t eid) {
 bool action_owns_pose(uint32_t eid) {
     return wo143::shot_in_flight(eid) || wo209::ai_owns_body(eid) ||
            (holders::of(eid) == holders::Holder::OneShot && combatactions::body_pose_holds(eid));
+}
+
+bool unparented_body(uint32_t eid) {
+    void* entity = engine::entity_by_id(eid);
+    void* parent = nullptr;
+    return entity && is_a(entity, g_vftEntity) && get_parent(entity, &parent) && !parent;
 }
 
 bool begin_oneshot(uint32_t eid, uint16_t holdMs) {

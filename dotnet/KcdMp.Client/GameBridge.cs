@@ -4417,6 +4417,8 @@ public partial class GameBridge(ClientConfig config)
         BinaryPrimitives.WriteSingleLittleEndian(packet.AsSpan(3), health);
         BinaryPrimitives.WriteSingleLittleEndian(packet.AsSpan(7), stamina);
         packet[11] = flags;
+        if ((_w213Caps & Protocol.LinkCapPresentationCombat) != 0)
+            packet = PresentationTimeWire.StampCombatUp(packet, SenderMsNow());
         try
         {
             await WritePacketAsync(stream, packet, ct);
@@ -4831,7 +4833,8 @@ public partial class GameBridge(ClientConfig config)
                     {
                         P6Generation = p6State.Generation, P6Serial = p6Serial, P6Life = p6Life,
                         P6PeerSerial = P6PeerAtRead(type, payload), P6Deadline = p6Deadline,
-                        P6VisualSerial = Interlocked.Read(ref _p6VisualSerial), P6Ready = p6Ready, P6ModeSerial = p6ModeSerial
+                        P6VisualSerial = Interlocked.Read(ref _p6VisualSerial), P6Ready = p6Ready, P6ModeSerial = p6ModeSerial,
+                        Presentation = presentation
                     }, type);
                     continue;
                 }
@@ -5394,7 +5397,7 @@ public partial class GameBridge(ClientConfig config)
                 float health   = ReadFloat(payload, 1);
                 float stamina  = ReadFloat(payload, 5);
                 byte  vflags   = payload[9];
-                await ApplyGhostVitalsAsync(sourceId, health, stamina, vflags, ct);
+                await ApplyGhostVitalsAsync(sourceId, health, stamina, vflags, ct, frame.Presentation);
             }
             else if (type == Protocol.PlayerHitDown && payloadLen == Protocol.PlayerHitDownPayloadLen)
             {
@@ -5933,9 +5936,10 @@ public partial class GameBridge(ClientConfig config)
     /// alive -- a completed save reload is exactly "their vitals started
     /// arriving again", so nothing else has to detect the end of a death.
     /// </summary>
-    private async Task ApplyGhostVitalsAsync(byte ghostId, float health, float stamina, byte flags, CancellationToken ct)
+    private async Task ApplyGhostVitalsAsync(byte ghostId, float health, float stamina, byte flags, CancellationToken ct,
+        PresentationFrame presentation)
     {
-        Wo132OnPeerVitals(ghostId, health, flags);   // WO-132: the downed bit's edges
+        Wo132OnPeerVitals(ghostId, health, flags, presentation);   // WO-132: the downed bit's edges
         string h = health.ToString("F1", CultureInfo.InvariantCulture);
         string s = stamina.ToString("F1", CultureInfo.InvariantCulture);
         try

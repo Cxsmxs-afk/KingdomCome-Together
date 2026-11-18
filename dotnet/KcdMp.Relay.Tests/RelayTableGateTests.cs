@@ -311,6 +311,14 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
                 await OpenPresentationAsync(host);
                 await CalibratePresentationAsync(host, 0);
                 return;
+            case Protocol.PresentationCombatUp:
+                await OpenPresentationAsync(host, Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat);
+                var vitals = new byte[Protocol.PlayerStateUpPayloadLen];
+                var stamped = PresentationTimeWire.StampCombatUp(Frame(Protocol.PlayerStateUp, vitals), 1);
+                Assert.Equal(3 + len, stamped.Length);
+                await host.SendRawAsync(stamped);
+                await ArrivesAsync(joiner, Protocol.PlayerStateDown, Protocol.PlayerStateDownPayloadLen, host.Id);
+                return;
             case Protocol.LinkHelloUp:   // WO-213: relay-local, the answer comes back to the sender
                 b[0] = Protocol.LinkVersion;
                 await host.SendRawAsync(Frame(up, b));
@@ -598,12 +606,12 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
         var fatal = await ArrivesAsync(joiner, Protocol.NpcDamageDown, 1 + body.Length, host.Id);
         Assert.NotEqual(0, fatal[^1] & Protocol.NpcDamageFlagFatal);
     }
-    private static async Task OpenPresentationAsync(Peer peer)
+    private static async Task OpenPresentationAsync(Peer peer, ushort capabilities = Protocol.LinkCapPresentationTime)
     {
-        await peer.SendRawAsync(Protocol.BuildLinkHelloUp(Protocol.LinkCapPresentationTime));
+        await peer.SendRawAsync(Protocol.BuildLinkHelloUp(capabilities));
         var reply = await ArrivesAsync(peer, Protocol.LinkHelloDown, Protocol.LinkHelloDownLen);
         Assert.True(Protocol.TryParseLinkHello(reply, out _, out ushort caps, out _, out _));
-        Assert.Equal(Protocol.LinkCapPresentationTime, caps);
+        Assert.Equal(capabilities, caps);
     }
 
     private static async Task CalibratePresentationAsync(Peer peer, long simulatedOffset)
@@ -685,6 +693,62 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
         Assert.True(PresentationTimeWire.TryRead(wrapper, body, out var stamp, out byte type, out int offset));
         Assert.Equal(inner, type);
         return (stamp, body[offset..]);
+    }
+
+    [Fact]
+    public async Task Combat_stamps_preserve_original_vitals_and_ranged_step_with_capability_and_authority_checks()
+    {
+        var (host, joiner) = await HostAndJoinerAsync();
+        await using var _h = host; await using var _j = joiner;
+        await using var older = await Peer.ConnectAsync(_relay.TcpPort, "timeline-only-listener");
+        const ushort both = Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat;
+        await OpenPresentationAsync(host, both);
+        await OpenPresentationAsync(joiner, both);
+        await OpenPresentationAsync(older);
+        await CalibratePresentationAsync(host, 80_000);
+        await CalibratePresentationAsync(joiner, -12_000);
+        long captured = PresentationClock.NowMs();
+        var vitals = new byte[Protocol.PlayerStateUpPayloadLen];
+        BitConverter.TryWriteBytes(vitals, 65f);
+        vitals[^1] = Protocol.PlayerStateFlagKnockedDown;
+        await host.SendRawAsync(PresentationTimeWire.StampCombatUp(Frame(Protocol.PlayerStateUp, vitals),
+            unchecked((uint)(captured + 80_000))));
+        var timed = await TimedDown(joiner, Protocol.PresentationActionDown, Protocol.PlayerStateDown);
+        Assert.Equal((ulong)(captured + 80_000), timed.Stamp.HostMs);
+        byte[] expectedVitals = [host.Id, .. vitals];
+        Assert.Equal(expectedVitals, timed.Original);
+        Assert.Equal(expectedVitals, await ArrivesAsync(older, Protocol.PlayerStateDown, expectedVitals.Length, host.Id));
+
+        foreach (var (target, kind) in new[] { (host, RangedWeaponKind.Bow), (older, RangedWeaponKind.Crossbow) })
+        {
+            var step = new RangedStepV2(1, 2, 3, 4, 3, kind, Guid.Parse("8e9283fb-0306-4879-a64d-cb7d2aab8000"), 11, 1);
+            byte[] original = new LootMsg(Protocol.W164RangedStep, 0, step.Encode()).BuildUp(Protocol.W164Up, target.Id);
+            byte[] expected = [joiner.Id, .. original.AsSpan(3)];
+            await joiner.SendRawAsync(PresentationTimeWire.StampCombatUp(original, unchecked((uint)(captured - 12_000))));
+            if (target == host)
+            {
+                var ranged = await TimedDown(host, Protocol.PresentationActionDown, Protocol.W164Down);
+                Assert.Equal(timed.Stamp, ranged.Stamp);
+                Assert.Equal(expected, ranged.Original);
+            }
+            else Assert.Equal(expected, await ArrivesAsync(older, Protocol.W164Down, expected.Length, joiner.Id));
+        }
+
+        string malformed = $"{Hex(Protocol.PresentationCombatUp)}:invalid-combat-stamp";
+        long prior = Drops(malformed);
+        byte[] hit = new byte[PlayerHitV8.UpLen];
+        hit[0] = host.Id;
+        var wrappedHit = new byte[PresentationTimeWire.SubjectStampLength + hit.Length];
+        wrappedHit[0] = Protocol.PlayerHitV8Up;
+        BinaryPrimitives.WriteUInt32LittleEndian(wrappedHit.AsSpan(1), 1);
+        hit.CopyTo(wrappedHit.AsSpan(PresentationTimeWire.SubjectStampLength));
+        await joiner.SendRawAsync(Frame(Protocol.PresentationCombatUp, wrappedHit));
+        await joiner.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await ArrivesAsync(joiner, Protocol.Pong, Protocol.PingPayloadLen);
+        await older.SendRawAsync(PresentationTimeWire.StampCombatUp(Frame(Protocol.PlayerStateUp, vitals), 1));
+        await older.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await ArrivesAsync(older, Protocol.Pong, Protocol.PingPayloadLen);
+        Assert.Equal(prior + 2, Drops(malformed));
     }
 
     [Fact]

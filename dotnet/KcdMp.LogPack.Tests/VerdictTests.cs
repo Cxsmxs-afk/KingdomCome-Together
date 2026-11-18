@@ -288,7 +288,71 @@ public class VerdictTests
     [Theory]
     [InlineData("MP-RP-CTRL figure=kcd2mp_1 eid=0x42 ctrl_frames=480")]
     [InlineData("MP-RP-CTRL-STANCE body=kcd2mp_1 eid=0x42 owner=driver crouch=1 result=confirmed")]
-    public void Collection_keeps_scoped_controller_and_stance_readback(string line) => Assert.True(NoiseRules.IsProtected(line));
+    [InlineData("MP-RP-COMBAT-ACTION eid=0x42 token=21 result=confirmed")]
+    [InlineData("MP-RP-KO eid=0x42 token=22 down=1 result=confirmed")]
+    [InlineData("MP-RP-DAMAGE escaped_cause attacker=0x42 victim=0x43 missile=0 application=unconfirmed n=1")]
+    public void Collection_keeps_scoped_engine_readback(string line) => Assert.True(NoiseRules.IsProtected(line));
+
+    [Theory]
+    [InlineData("rp_actions_in=0 rp_actions_played=0 rp_actions_pending=0", VerdictStatus.Grey, "–")]
+    [InlineData("rp_actions_in=20 rp_actions_played=18", VerdictStatus.Grey, "–")]
+    [InlineData("rp_actions_in=20 rp_actions_played=18 rp_actions_pending=2", VerdictStatus.Grey, "–")]
+    [InlineData("rp_actions_in=20 rp_actions_played=21 rp_actions_pending=0", VerdictStatus.Grey, "–")]
+    [InlineData("rp_actions_in=20 rp_actions_played=18 rp_actions_pending=0", VerdictStatus.Yellow, "18/20 (90.00 %)")]
+    [InlineData("rp_actions_in=20 rp_actions_played=19 rp_actions_pending=0", VerdictStatus.Green, "19/20 (95.00 %)")]
+    [InlineData("rp_actions_in=21 rp_actions_played=20 rp_actions_pending=0", VerdictStatus.Green, "20/21 (95.24 %)")]
+    public void Playback_rate_uses_settled_same_snapshot_confirmations(string fields, VerdictStatus expected, string measurement)
+    {
+        var input = new Briefing.Input();
+        input.Logs["kcdmp-native.log"] = [$"MP-T3-STATS origin=dll source=agent role=host {fields}"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "rp_actions_played");
+        Assert.Equal(expected, row.Status);
+        Assert.Equal(measurement, row.Measurement);
+    }
+
+    [Theory]
+    [InlineData("dmg_double_blocked=0 dmg_double=0 dmg_double_unconfirmed=0", VerdictStatus.Grey)]
+    [InlineData("dmg_double_blocked=2 dmg_double=0", VerdictStatus.Grey)]
+    [InlineData("dmg_double_blocked=2 dmg_double=0 dmg_double_unconfirmed=1", VerdictStatus.Grey)]
+    [InlineData("dmg_double_blocked=2 dmg_double=0 dmg_double_unconfirmed=0", VerdictStatus.Green)]
+    [InlineData("dmg_double=1", VerdictStatus.Red)]
+    [InlineData("dmg_double_blocked=2 dmg_double=1 dmg_double_unconfirmed=3", VerdictStatus.Red)]
+    public void Double_damage_zero_requires_an_observed_guard_and_nonzero_is_always_red(string fields, VerdictStatus expected)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [$"MP-T3-STATS origin=agent role=joiner {fields}"];
+        var rows = VerdictRules.Evaluate(input).Rows;
+        Assert.Equal(expected, Assert.Single(rows, row => row.Id == "dmg_double").Status);
+        Assert.Equal(VerdictStatus.Grey, Assert.Single(rows, row => row.Id == "dmg_double_blocked").Status);
+    }
+
+    [Theory]
+    [InlineData(0, "–")]
+    [InlineData(3, "24 ms")]
+    public void New_action_lag_uses_only_native_confirmed_samples_and_counts(int confirmed, string measurement)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [
+            "MP-T3-STATS origin=agent role=joiner rp_action_lag_ms_p95=180 rp_action_n=100",
+            $"MP-T3-STATS origin=agent role=joiner rp_action_lag_ms_p95=24 rp_action_n=140 rp_action_confirmed_n={confirmed}"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "rp_action_lag_ms_p95");
+        Assert.Equal(VerdictStatus.Grey, row.Status);
+        Assert.Equal(measurement, row.Measurement);
+        Assert.Contains(confirmed == 0 ? "rp_action_confirmed_n" : "n=3, DLL-Empfang bis bestätigter Engine-Wiedergabe", row.Evidence);
+    }
+
+    [Theory]
+    [InlineData(0, "–")]
+    [InlineData(2, "81 ms")]
+    public void Knockout_and_wake_latency_needs_its_specific_readback_count(int count, string measurement)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [
+            $"MP-T3-STATS origin=agent role=host rp_action_confirmed_n=19 rp_ko_up_lag_ms_p95=81 rp_ko_up_n={count}"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "rp_ko_up_lag_ms_p95");
+        Assert.Equal(VerdictStatus.Grey, row.Status);
+        Assert.Equal(measurement, row.Measurement);
+    }
 
     [Fact]
     public void The_pairing_role_comes_from_the_current_agent_and_conflicting_roles_are_unknown()

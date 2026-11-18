@@ -136,10 +136,11 @@ public class TcpBroadcastService
     /// Appearance -- it is current state, not an event, so a duplicate or a
     /// stale resend is harmless.
     /// </summary>
-    public void BroadcastPlayerState(ClientSession source, byte[] body)
+    public void BroadcastPlayerState(ClientSession source, byte[] body, uint senderTicks = 0)
     {
+        var stamp = HostStamp(source, senderTicks);
         foreach (var target in Others(source))
-            target.EnqueuePlayerState(source.Id, body);
+            target.EnqueuePlayerState(source.Id, body, stamp);
     }
 
     /// <summary>
@@ -313,7 +314,8 @@ public class TcpBroadcastService
     /// host's are accepted only from it; aborts go either way. Returns the
     /// destination, or null with the drop counted under <paramref name="why"/>.
     /// </summary>
-    public ClientSession? RouteJoin(ClientSession source, byte downType, KcdMp.Wire.Protocol.JoinFrom from, byte[] body, out string why)
+    public ClientSession? RouteJoin(ClientSession source, byte downType, KcdMp.Wire.Protocol.JoinFrom from, byte[] body, out string why,
+        uint senderTicks = 0)
     {
         why = "";
         bool fromHost = _clientHandler.IsDamageAuthority(source);
@@ -336,7 +338,7 @@ public class TcpBroadcastService
                 break;
         }
         if (dest is null || ReferenceEquals(dest, source)) { why = "no-target"; return null; }
-        dest.EnqueueSenderFact(downType, source.Id, body);
+        dest.EnqueueSenderFact(downType, source.Id, body, HostStamp(source, senderTicks));
         return dest;
     }
 

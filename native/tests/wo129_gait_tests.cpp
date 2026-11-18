@@ -69,8 +69,11 @@ int edge_lanes_tests(int* passed);
 int rp_timeline_tests(int* passed);
 int rp_timeline_action_tests(int* passed);
 int rp_controller_tests(int* passed);
+int rp_combat_tests(int* passed);
+int rp_body_action_tests(int* passed);
 int motion_remote_tests(int* passed);
 int edge_console_tests(int* passed);
+int visual_damage_tests(int* passed);
 int p4_rules_review_tests(int* passed); // independent P4 boundary review
 int p4_flow_tests(int* passed); // actual p4.cpp with engine/clock test doubles
 int wo218_tests(int* passed);              // wo218_tests.cpp (WO-218: the pipe's batch)
@@ -480,8 +483,11 @@ int main() {
     { int pp = 0; const int pf = rp_timeline_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_timeline_action_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_controller_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = rp_combat_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = rp_body_action_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = motion_remote_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = edge_console_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = visual_damage_tests(&pp); g_pass += pp; g_fail += pf; }
     {
         int pp = 0;
         const int pf = p4_flow_tests(&pp);
