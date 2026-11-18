@@ -2,6 +2,10 @@ mods - Shortcut.lnk
 memory.md
 .claude
 
+# Local test recordings. Only synthetic replay fixtures belong in Git.
+*.kcdrec
+!dotnet/KcdMp.Client.Tests/Fixtures/Replay/*.kcdrec
+
 # Build output
 bin/
 obj/

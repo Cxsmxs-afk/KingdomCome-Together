@@ -42,13 +42,16 @@ public sealed class P6RangedBridgeTests
     private sealed class Link : Stream
     {
         private readonly Channel<byte[]> _incoming = Channel.CreateUnbounded<byte[]>(); private byte[]? _buffer; private int _at;
-        private long _read; public long ReadBytes => Interlocked.Read(ref _read);
+        private long _read, _readRequestedAfterBytes;
+        // The next read request proves the previous frame was dispatched by the reader.
+        public long ReadRequestedAfterBytes => Interlocked.Read(ref _readRequestedAfterBytes);
         public readonly Channel<byte[]> Sent = Channel.CreateUnbounded<byte[]>();
         public void Feed(params byte[][] frames) { foreach (var f in frames) _incoming.Writer.TryWrite(f); }
         public void End() => _incoming.Writer.TryComplete();
         public Task<byte[]> Next() => Sent.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(4));
         public override async ValueTask<int> ReadAsync(Memory<byte> b, CancellationToken ct = default)
         {
+            Interlocked.Exchange(ref _readRequestedAfterBytes, _read);
             while (_buffer is null || _at == _buffer.Length) { if (!await _incoming.Reader.WaitToReadAsync(ct)) return 0; if (!_incoming.Reader.TryRead(out _buffer)) continue; _at = 0; }
             int n = Math.Min(b.Length, _buffer.Length - _at); _buffer.AsMemory(_at, n).CopyTo(b); _at += n; Interlocked.Add(ref _read, n); return n;
         }
@@ -238,7 +241,7 @@ public sealed class P6RangedBridgeTests
         await r.Game.HorseEntered.Task.WaitAsync(TimeSpan.FromSeconds(3)); var lifecycle = Get<HostAuthorityLifecycle>(r.Bridge, "_p1Lifecycle");
         await lifecycle.PendingAsync(false, true, default); Set(r.Bridge, "_p1Loading", true); Set(r.Bridge, "_p1Serial", 1L);
         byte[] incoming = Down(measured ? Protocol.W164MeasuredMissile : Protocol.W164RangedStep, measured ? Hit().Encode() : Step().Encode()); r.Link.Feed(incoming);
-        await Until(() => r.Link.ReadBytes >= horse.Length + incoming.Length);
+        await Until(() => r.Link.ReadRequestedAfterBytes >= horse.Length + incoming.Length);
         await lifecycle.GameplayAsync(lifecycle.Current.Generation, default); Set(r.Bridge, "_p1Loading", false); r.Game.ReleaseHorse.TrySetResult();
         await Until(() => Count(r.Bridge, "ranged_stale") > 0); Assert.False(r.Pipe.IsConnected);
         Assert.Equal(0, Count(r.Bridge, "ranged_missile_measured_accept")); Assert.Equal(0, Count(r.Bridge, "ranged_bow_played"));
@@ -275,7 +278,7 @@ public sealed class P6RangedBridgeTests
         if (change == "life") { await (Task)Call(r.Bridge, "OnLocalDownedAsync", true, (byte)0)!; await (Task)Call(r.Bridge, "OnLocalDownedAsync", false, (byte)0)!; }
         if (change == "world") Get<Wo206Epochs>(r.Bridge, "_w206").LearnWorld(8, 2);
         if (change == "eof") { r.Link.End(); await Until(() => Get<Stream?>(r.Bridge, "_p6ReceiveStream") is null); }
-        if (change == "scene") { Set(r.Bridge, "_w179Bus", false); byte[] scene = Down(Protocol.W164SceneBus, Wo179Rules.Start(1, 'V', "test_video")); r.Link.Feed(scene); await Until(() => r.Link.ReadBytes >= frame.Length + scene.Length); }
+        if (change == "scene") { Set(r.Bridge, "_w179Bus", false); byte[] scene = Down(Protocol.W164SceneBus, Wo179Rules.Start(1, 'V', "test_video")); r.Link.Feed(scene); await Until(() => r.Link.ReadRequestedAfterBytes >= frame.Length + scene.Length); }
         writer.Release(); await Task.Delay(80); Assert.Equal(0, Count(r.Bridge, "ranged_bow_played"));
         using var stop = new CancellationTokenSource(100);
         try { Assert.Equal(0, await r.Server.ReadAsync(new byte[3], stop.Token)); } catch (OperationCanceledException) { }
@@ -302,7 +305,7 @@ public sealed class P6RangedBridgeTests
         await using var r = await Rig.Create(); Set(r.Bridge, "_t3ProcFrameTimeoutMs", 3000); var connect = r.Pipe.EnsureConnectedAsync(); await r.Accept; Assert.True(await connect);
         var writer = Get<SemaphoreSlim>(r.Pipe, "_writeLock"); await writer.WaitAsync(); r.Receive(); var hit = Hit();
         byte[] ranged = Down(Protocol.W164RangedStep, Step().Encode()), measured = Down(Protocol.W164MeasuredMissile, hit.Encode());
-        r.Link.Feed(ranged, measured); await Until(() => r.Link.ReadBytes >= ranged.Length + measured.Length);
+        r.Link.Feed(ranged, measured); await Until(() => r.Link.ReadRequestedAfterBytes >= ranged.Length + measured.Length);
         var ack = Message(await r.Link.Next()); Assert.True(MeasuredMissileResult.TryDecode(ack.Text, out var result)); Assert.Equal(MeasuredMissileStatus.Expired, result.Status);
         writer.Release(); Assert.Equal(0, Count(r.Bridge, "ranged_missile_measured_accept")); Assert.True(Count(r.Bridge, "proc_stalls") > 0);
     }

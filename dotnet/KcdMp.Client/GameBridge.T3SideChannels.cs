@@ -101,7 +101,7 @@ public partial class GameBridge
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, lease.Token);
         using var scope = ProcessorFrameScope.Link(linked.Token);
         T3SideGuard(lease, true);
-        await _transport.ExecuteNowAsync(string.Create(CultureInfo.InvariantCulture,
+        await GameCalls.ExecuteNowAsync(string.Create(CultureInfo.InvariantCulture,
             $"if KCD2MP_ApplyWeather then KCD2MP_ApplyWeather(\"{profile}\",{blendSec}) end"), linked.Token);
         T3SideGuard(lease, true);
         _lastAppliedWeatherProfile = profile;

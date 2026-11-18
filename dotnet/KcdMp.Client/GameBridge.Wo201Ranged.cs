@@ -172,7 +172,15 @@ public partial class GameBridge
             {
                 using var frame = ProcessorFrameScope.Link(ct); using var linked = CancellationTokenSource.CreateLinkedTokenSource(frame.Token, context.Cancellation);
                 await _tcpWriteLock.WaitAsync(linked.Token);
-                try { if (!Current()) return false; if (textAtWrite is not null) packet = Build(textAtWrite()); if (!Current()) return false; await context.Stream.WriteAsync(packet, linked.Token); Written(); }
+                try
+                {
+                    if (!Current()) return false;
+                    if (textAtWrite is not null) packet = Build(textAtWrite());
+                    if (!Current()) return false;
+                    await context.Stream.WriteAsync(packet, linked.Token);
+                    if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
+                    Written();
+                }
                 finally { _tcpWriteLock.Release(); }
             }
             return true;

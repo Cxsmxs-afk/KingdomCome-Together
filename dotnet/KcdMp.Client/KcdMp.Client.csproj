@@ -43,6 +43,7 @@
     <ProjectReference Include="..\KcdMp.Protocol\KcdMp.Protocol.csproj" />
     <!-- WO-127: Steam as an optional connection path (RelayConnector). -->
     <ProjectReference Include="..\KcdMp.Steam\KcdMp.Steam.csproj" />
+    <InternalsVisibleTo Include="KcdMp.Client.Tests" />
   </ItemGroup>
 
   <!-- WO-96: the generated main-quest objective registry (tools/Build-MainQuestObjectives.ps1). -->

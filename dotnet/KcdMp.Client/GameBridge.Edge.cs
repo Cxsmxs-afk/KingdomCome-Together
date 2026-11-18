@@ -110,7 +110,14 @@ public partial class GameBridge
         Console.WriteLine(FormattableString.Invariant($"MP-LANES agent nonce={nonce} frames={frames} started={(started ? 1 : 0)}"));
     }
 
-    private async Task EdgeExecLuaAsync(string lua, EdgeLane lane)
+    private Task EdgeExecLuaAsync(string lua, EdgeLane lane)
+    {
+        var recording = Volatile.Read(ref _recordingTransport);
+        return recording is null ? ExecuteEdgeLuaAsync(lua, lane) :
+            recording.ObserveExecuteAsync(lua, () => ExecuteEdgeLuaAsync(lua, lane));
+    }
+
+    private async Task ExecuteEdgeLuaAsync(string lua, EdgeLane lane)
     {
         using var scope = ProcessorFrameScope.Link(default);
         var ct = scope.Token;

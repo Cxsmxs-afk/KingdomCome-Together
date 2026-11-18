@@ -19,10 +19,13 @@
   <ItemGroup>
     <Using Include="Xunit" />
     <Using Include="KcdMp.Client" />
+    <None Update="Fixtures/Replay/*.kcdrec" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\KcdMp.Client\KcdMp.Client.csproj" />
+    <!-- T2 runs synthetic replay frames through the production relay's TCP sessions. -->
+    <ProjectReference Include="..\KcdMp.Server\KcdMp.Server.csproj" />
   </ItemGroup>
 
   <!-- WO-129: the launcher's agent-status rules, compiled here by link (the
