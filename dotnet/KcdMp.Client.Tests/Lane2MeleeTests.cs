@@ -1,14 +1,21 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Reflection;
 using KcdMp.Wire;
 
 namespace KcdMp.Client.Tests;
 
+[CollectionDefinition("Lane 2 console output", DisableParallelization = true)]
+public sealed class Lane2ConsoleOutputCollection { }
+
+[Collection("Lane 2 console output")]
 public sealed class Lane2MeleeTests
 {
+    private const string UnavailableCounter = "melee_presentation_unavailable";
+
     [Theory]
     [InlineData(ActionKind.Attack, "combat_action_attack", 0, 1, -1)]
     [InlineData(ActionKind.Attack, "combat_action_attack", AttackEvent.FlagCombo, 1, -1)]
@@ -91,6 +98,85 @@ public sealed class Lane2MeleeTests
         EdgePipeReply receipt = new(EdgeOutcome.Completed, [0, 0, 1]);
         Assert.Equal(PresentationCombatAdmission.Fallback, CombatPipe.GetPresentationCombatAdmission(receipt));
         Assert.Equal(PresentationCombatAdmission.Suppressed, GameBridge.PresentationMeleeAdmission(receipt));
+    }
+
+    [Theory]
+    [InlineData(false, 0x3F, "MP-RP-MELEE-ROW ")]
+    [InlineData(true, 0x40, "MP-RP-TIMELINE-IN ")]
+    public async Task A_native_unavailable_row_is_counted_logged_and_consumed(bool registered, byte rejectedOp, string logPrefix)
+    {
+        // Reuse EdgePipeTests' active-session fixture so both typed operations traverse the real scheduler.
+        const BindingFlags privateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
+        var fixtures = typeof(EdgePipeTests);
+        var connectionType = fixtures.GetNestedType("Connection", BindingFlags.NonPublic)!;
+        var harnessType = fixtures.GetNestedType("PresentationCombatHarness", BindingFlags.NonPublic)!;
+        await using var connection = (IAsyncDisposable)Activator.CreateInstance(connectionType)!;
+        await (Task)connectionType.GetMethod("Connect")!.Invoke(connection, [true])!;
+        var create = (Task)harnessType.GetMethod("CreateAsync")!.Invoke(null, [connection])!;
+        await create;
+        var harness = create.GetType().GetProperty("Result")!.GetValue(create)!;
+        var bridge = (GameBridge)harnessType.GetFields(privateInstance).Single(field => field.FieldType == typeof(GameBridge)).GetValue(harness)!;
+        var token = (CancellationToken)connectionType.GetProperty("Token")!.GetValue(connection)!;
+
+        Task<byte[]> Read() => (Task<byte[]>)connectionType.GetMethod("Read")!.Invoke(connection, [(byte)0x38])!;
+        Task Reply(byte[] request, byte[] payload) => (Task)connectionType.GetMethod("Respond")!.Invoke(connection,
+            [BinaryPrimitives.ReadUInt32LittleEndian(request), EdgeOutcome.Completed, (byte)0x81, payload])!;
+        void EmitStats() => typeof(GameBridge).GetMethod("T3EmitStats", privateInstance)!.Invoke(bridge,
+            [(byte)0, token, null, null, null, null, null]);
+
+        using var output = new StringWriter();
+        var original = Console.Out;
+        Console.SetOut(output);
+        try
+        {
+            var action = (Task<bool>)harnessType.GetMethod("Apply")!.Invoke(harness,
+                [ActionKind.Attack, "combat_action_attack", AttackEvent.FlagCombo, (ushort)12, token])!;
+            byte[] request = await Read();
+            Assert.Equal(0x3F, request[5]);
+            EmitStats();
+            if (registered)
+            {
+                await Reply(request, [1, 0, 0]);
+                request = await Read();
+            }
+            Assert.Equal(rejectedOp, request[5]);
+            await Reply(request, [0, 0, 1]);
+            // A legacy call would need another pipe reply. The caller's older playback also needs a false return.
+            Assert.True(await action.WaitAsync(TimeSpan.FromSeconds(3)));
+            EmitStats();
+        }
+        finally
+        {
+            Console.SetOut(original);
+        }
+
+        string[] lines = output.ToString().Split('\n');
+        var diagnostic = Assert.Single(lines, line => line.Contains("reason=typed-provider-unavailable", StringComparison.Ordinal));
+        Assert.StartsWith(logPrefix, diagnostic);
+        Assert.Contains(" peer=2 ", diagnostic);
+        Assert.Contains(" seq=12 ", diagnostic);
+        Assert.Contains(" result=unavailable ", diagnostic);
+        Assert.Collection(lines.Where(line => line.StartsWith("MP-T3-STATS ", StringComparison.Ordinal) && line.Contains(UnavailableCounter)),
+            before => Assert.Contains(UnavailableCounter + "=0", before),
+            after => Assert.Contains(UnavailableCounter + "=1", after));
+    }
+
+    [Fact]
+    public void Other_receipts_do_not_count_as_native_melee_unavailable()
+    {
+        const BindingFlags privateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
+        var bridge = new GameBridge(new ClientConfig());
+        var record = typeof(GameBridge).GetMethod("RecordMeleePresentationUnavailable", privateInstance)!;
+        EdgePipeReply[] otherReceipts = [
+            new(EdgeOutcome.Completed, [1, 0, 0]), new(EdgeOutcome.Completed, [0, 0, 3]), new(EdgeOutcome.Completed, [0, 0, 4]),
+            new(EdgeOutcome.Completed, [0, 1, 1]), new(EdgeOutcome.Completed, [0, 0, 1, 0]),
+            new(EdgeOutcome.Busy, []), new(EdgeOutcome.Unsupported, []), new(EdgeOutcome.Ambiguous, []),
+            new(EdgeOutcome.Unavailable, [0, 0, 1])
+        ];
+        foreach (var reply in otherReceipts) Assert.Null(record.Invoke(bridge, [reply]));
+
+        var counters = (ConcurrentDictionary<string, long>)typeof(GameBridge).GetField("_t3Counters", privateInstance)!.GetValue(bridge)!;
+        Assert.Equal(0, counters.GetValueOrDefault(UnavailableCounter));
     }
 
     private static Task<bool> Schedule(bool typedPresentation, ActionKind kind, string table, byte flags, int actionType = -1,

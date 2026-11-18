@@ -22,6 +22,7 @@ RECOIL = re.compile(r'\bMP-ACTION section=outbound kind=AvatarRecoil (.+)$')
 ROW_RESULT = re.compile(r'\bMP-RP-MELEE-ROW (.+)$')
 OUTBOUND_KINDS = {'Attack': (ACTION_KINDS['swing'],), 'BlockImpulse': (ACTION_KINDS['block'], ACTION_KINDS['parry'])}
 DAMAGE_FIELDS = ('dmg_double', 'dmg_double_blocked', 'dmg_double_unconfirmed')
+MELEE_UNAVAILABLE = 'melee_presentation_unavailable'
 FF_READBACK = ('if KCD2MP and KCD2MP.w121 then System.LogAlways("[LANE2-FF] " .. '
                '(KCD2MP.w121.ffSession and "on" or "off")) end')
 
@@ -110,9 +111,33 @@ def damage_evidence(before, after, receiver, stable):
     return {'status': 'green' if measured else 'grey', 'deltas': deltas}
 
 
+def unavailable_evidence(before, after, receiver, stable):
+    start = before.get(receiver, {}).get(MELEE_UNAVAILABLE)
+    end = after.get(receiver, {}).get(MELEE_UNAVAILABLE)
+    if not stable or start is None or end is None or end < start:
+        return {'status': 'grey', 'delta': None}
+    return {'status': 'red' if end > start else 'green', 'delta': end - start}
+
+
+def role_totals(lines, role):
+    for line in reversed(lines):
+        totals = combat.role_totals((line,), role)
+        if totals:
+            unavailable = number(dict(FIELD.findall(line)), MELEE_UNAVAILABLE)
+            if unavailable is not None:
+                totals[MELEE_UNAVAILABLE] = unavailable
+            return totals
+    return {}
+
+
+def totals_after(copy, role, offset):
+    pulse = copy.wait('a', offset, rf'MP-T3-STATS origin=agent role={role} .*\brp_actions_pending=0\b', 85)
+    return role_totals(copy.lines(copy.alog, offset), role) if pulse else {}
+
+
 def fresh_stats(copies, marks):
     with ThreadPoolExecutor(max_workers=len(copies)) as workers:
-        jobs = {role: workers.submit(combat.totals_after, copy, role, marks[role]) for role, copy in copies.items()}
+        jobs = {role: workers.submit(totals_after, copy, role, marks[role]) for role, copy in copies.items()}
         return {role: job.result() for role, job in jobs.items()}
 
 
@@ -168,7 +193,8 @@ def exercise(S, run, args, send_role):
     changed_world = any('MP-LOAD-SEQUENCE role=' in line for lines in agent.values() for line in lines)
     if changed_world:
         failures.append('world-lifecycle-changed')
-    damage = damage_evidence(before, stats, receive_role, not replaced and not changed_world)
+    stable = not replaced and not changed_world
+    damage = damage_evidence(before, stats, receive_role, stable)
     if damage['status'] != 'green':
         failures.append('double-damage-observed' if damage['status'] == 'red' else 'double-damage-guard-unmeasured')
     if any(row.get('owner_violations', 0) for row in stats.values()) or any(
@@ -176,6 +202,7 @@ def exercise(S, run, args, send_role):
         failures.append('owner-violations')
     report.update(sender=send_role, receiver=receive_role, sender_peer=ids[send_role], stages=stages,
                   t3_before=before, t3_stats=stats, damage_guard=damage['status'], damage_deltas=damage['deltas'],
+                  melee_presentation_unavailable=unavailable_evidence(before, stats, receive_role, stable),
                   failures=list(dict.fromkeys(failures)), network=network)
     path = Path(run.dir, f'lane2-melee-{send_role}.json')
     path.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')

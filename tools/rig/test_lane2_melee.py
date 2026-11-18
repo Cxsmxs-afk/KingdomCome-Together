@@ -67,6 +67,24 @@ class Lane2EvidenceTests(unittest.TestCase):
         self.assertEqual('green', report['status'])
         self.assertEqual(1, report['deltas']['joiner']['dmg_double_blocked'])
 
+    def test_unavailable_counter_is_optional_and_read_from_the_selected_role_pulse(self):
+        fields = ' '.join(f'{key}=0' for key in sorted(lane.combat.TOTALS))
+        host = f'MP-T3-STATS origin=agent role=host {fields}'
+        joiner = f'MP-T3-STATS origin=agent role=joiner {fields} {lane.MELEE_UNAVAILABLE}=3'
+        incomplete_host = f'MP-T3-STATS origin=agent role=host {lane.MELEE_UNAVAILABLE}=4'
+        self.assertNotIn(lane.MELEE_UNAVAILABLE, lane.role_totals([host, joiner, incomplete_host], 'host'))
+        complete_host = f'{host} {lane.MELEE_UNAVAILABLE}=0'
+        self.assertEqual(0, lane.role_totals([complete_host, joiner, incomplete_host], 'host')[lane.MELEE_UNAVAILABLE])
+        self.assertEqual(3, lane.role_totals([complete_host, joiner, incomplete_host], 'joiner')[lane.MELEE_UNAVAILABLE])
+
+    def test_unavailable_delta_requires_both_receiver_pulses_in_one_scope(self):
+        before = {'host': {lane.MELEE_UNAVAILABLE: 1}, 'joiner': {lane.MELEE_UNAVAILABLE: 2}}
+        after = {'host': {lane.MELEE_UNAVAILABLE: 1}, 'joiner': {lane.MELEE_UNAVAILABLE: 5}}
+        self.assertEqual({'status': 'green', 'delta': 0}, lane.unavailable_evidence(before, after, 'host', True))
+        self.assertEqual({'status': 'red', 'delta': 3}, lane.unavailable_evidence(before, after, 'joiner', True))
+        for start, end, stable in ((before, after, False), ({}, after, True), (before, {}, True), (after, before, True)):
+            self.assertEqual({'status': 'grey', 'delta': None}, lane.unavailable_evidence(start, end, 'joiner', stable))
+
 
 if __name__ == '__main__':
     unittest.main()

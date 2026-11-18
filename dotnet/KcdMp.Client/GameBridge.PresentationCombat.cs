@@ -11,7 +11,7 @@ namespace KcdMp.Client;
 public partial class GameBridge
 {
     private const int PresentationCombatRowsPerBody = 192;  // native rp_timeline_actions.cpp
-    private const string PresentationMeleeUnavailableReason = "legacy-visual-damage-gate-unverified";
+    private const string PresentationMeleeUnavailableCounter = "melee_presentation_unavailable";
     private readonly record struct PresentationCombatScope(RemoteRelocationScope Actor, long Revision);
 
     private sealed class PresentationCombatRows(PresentationCombatScope scope)
@@ -73,22 +73,22 @@ public partial class GameBridge
         return current() ? await request() : reply;
     }
 
-    private static PresentationCombatAdmission RecordPresentationCombatAdmission(byte peer, ushort seq, byte kind, ulong hostMs,
+    private PresentationCombatAdmission RecordPresentationCombatAdmission(byte peer, ushort seq, byte kind, ulong hostMs,
         uint sourceMs, EdgePipeReply reply, bool current, bool recovery = false, bool melee = false)
     {
         if (!current) return PresentationCombatAdmission.Suppressed;
         var admission = recovery && (reply.Outcome is EdgeOutcome.Busy or EdgeOutcome.Unavailable) ? PresentationCombatAdmission.Fallback :
             melee ? PresentationMeleeAdmission(reply) : CombatPipe.GetPresentationCombatAdmission(reply);
-        bool meleeUnavailable = melee && PresentationMeleeProviderUnavailable(reply);
+        string? meleeUnavailableReason = melee ? RecordMeleePresentationUnavailable(reply) : null;
         string status = admission switch
         {
             PresentationCombatAdmission.Accepted => "accepted",
             PresentationCombatAdmission.Fallback => "unavailable",
-            _ when meleeUnavailable => "unavailable",
+            _ when meleeUnavailableReason is not null => "unavailable",
             _ when reply.Outcome == EdgeOutcome.Ambiguous => "ambiguous",
             _ => "refused"
         };
-        string reason = meleeUnavailable ? $" reason={PresentationMeleeUnavailableReason}" : "";
+        string reason = meleeUnavailableReason is null ? "" : $" reason={meleeUnavailableReason}";
         Console.WriteLine(FormattableString.Invariant($"MP-RP-TIMELINE-IN peer={peer} kind={kind} phase=1 seq={seq} source_ms={sourceMs} event_host_ms={hostMs} result={status}{reason}"));
         return admission;
     }
@@ -96,8 +96,15 @@ public partial class GameBridge
     private static bool PresentationMeleeProviderUnavailable(EdgePipeReply reply) =>
         reply is { Outcome: EdgeOutcome.Completed, Payload: [0, 0, 1] };
 
-    // Native Unavailable does not identify which owner or timeline switch is off.
-    // A timed or direct legacy swing has no equivalent to the typed visual damage gate.
+    private string? RecordMeleePresentationUnavailable(EdgePipeReply reply)
+    {
+        if (!PresentationMeleeProviderUnavailable(reply)) return null;
+        T3Increment(PresentationMeleeUnavailableCounter);
+        return "typed-provider-unavailable";
+    }
+
+    // Receipt::Unavailable is native reason 1. The typed row readiness gate returns Blocked (3).
+    // Legacy ghost_swing lacks queue_ghost_row's required visual_damage_ready check.
     internal static PresentationCombatAdmission PresentationMeleeAdmission(EdgePipeReply reply) =>
         PresentationMeleeProviderUnavailable(reply)
             ? PresentationCombatAdmission.Suppressed
@@ -151,6 +158,7 @@ public partial class GameBridge
             return true;
         }
         if (!TryPresentationCombatScope(peer, eid, stamp, out var scope)) return true;
+        _t3Counters.TryAdd(PresentationMeleeUnavailableCounter, 0);
         bool Current() => TryPresentationCombatScope(peer, eid, stamp, out var current) && current == scope;
         if (Interlocked.Read(ref _presentationCombatUnsupportedConnection) == scope.Actor.Pipe) return await LegacyAsync(Current);
         var rows = _presentationCombatRows.AddOrUpdate(peer, _ => new(scope),
@@ -170,8 +178,8 @@ public partial class GameBridge
             if (!Current()) return PresentationCombatAdmission.Suppressed;
             if (receipt.Outcome == EdgeOutcome.Unsupported)
                 Interlocked.Exchange(ref _presentationCombatUnsupportedConnection, scope.Actor.Pipe);
-            if (PresentationMeleeProviderUnavailable(receipt))
-                ReportRow($"result=unavailable reason={PresentationMeleeUnavailableReason}");
+            if (RecordMeleePresentationUnavailable(receipt) is { } unavailableReason)
+                ReportRow($"result=unavailable reason={unavailableReason}");
             var status = PresentationMeleeAdmission(receipt);
             entry.Registered = status == PresentationCombatAdmission.Accepted;
             return status;
