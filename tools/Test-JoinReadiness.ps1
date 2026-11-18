@@ -41,7 +41,8 @@ if ($aborts.Count -ne 5) { throw "H19 probe recorded $($aborts.Count) of 5 produ
 if ($ExpectKnownFailure) {
     if ($status -eq 19 -and $outputLines[-1] -ceq 'JOIN-ABORT-GATE attempts=5 retained_slots=5 own_save_unchanged=1') {
         Write-Warning 'EXPECTED FAILURE H19: five pre-load aborts retained five join slots. The personal save was preserved.'
-        return
+        # The Actions pwsh wrapper exits with LASTEXITCODE after the script returns.
+        exit 0
     }
     if ($status -eq 0) { throw 'H19 probe passed. Enable the required join-abort assertion.' }
     throw "H19 probe did not reproduce the exact known failure (exit $status)"
