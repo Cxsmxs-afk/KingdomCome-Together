@@ -102,6 +102,7 @@ public partial class GameBridge
     private void Wo192OnMenu(bool opened)
     {
         _w192MenuOpen = opened;
+        Interlocked.Exchange(ref _t3InputNextMs, 0);
         Wo203CamOnMenu(opened);   // WO-203B: the ESC menu ends listening (the view first)
     }
 

@@ -9,9 +9,11 @@ if (-not $KdcmpLua) { $KdcmpLua = Join-Path $toolsDir '..\kdcmp\Data\Scripts\Sta
 $source = Get-Content $KdcmpLua -Raw
 $at = $source.IndexOf('-- ===== P0/T3:', [StringComparison]::Ordinal)
 if ($at -lt 0) { throw 'P0/T3 console block missing from kdcmp.lua' }
+$end = $source.IndexOf('-- ===== P1:', $at, [StringComparison]::Ordinal)
+if ($end -lt 0) { $end = $source.Length }
 $isolated = Join-Path ([IO.Path]::GetTempPath()) ('kcd-t3-console-' + [Guid]::NewGuid().ToString('N') + '.lua')
 try {
-    [IO.File]::WriteAllText($isolated, $source.Substring($at), (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($isolated, $source.Substring($at, $end - $at), (New-Object Text.UTF8Encoding($false)))
     & (Join-Path $toolsDir 'Test-NpcSmoothSynthetic.ps1') -KdcmpLua $isolated -MoonSharpVersion $MoonSharpVersion `
         -Scenario (Join-Path $toolsDir 'Test-T3ConsoleSynthetic.lua') -Title 'P0/T3 console synthetic test'
     $code = $LASTEXITCODE

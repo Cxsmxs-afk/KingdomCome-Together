@@ -173,6 +173,8 @@ public partial class GameBridge
 
     private void Wo207ArmLinkRejoin(uint joinId)
     {
+        Console.WriteLine($"T3-AUTO-REJOIN trigger=link-cut-during-join decision=recover-aborted-transfer join_id={joinId} joined={_joinedWorld} loaded_epoch={_t3JoinedHostWorld} host_epoch={_w206.World}");
+        if (_joinedWorld && !T3HostWorldChanged) return;
         _w207LinkRejoin = true;
         _joinFromWorldOnce = true;
         Console.WriteLine($"MP-W202 rejoin: the relay dropped while {(joinId != 0 ? $"join 0x{joinId:x8}" : "an in-world rejoin")} ran -- once it is back this game asks for the host's world again (WO-207 C.4)");

@@ -155,15 +155,22 @@ public partial class GameBridge
     private void Wo211OnEpochHeard(uint world)
     {
         if (!_w211Holding) return;
-        if (Wo211Rules.ResumeInPlace(_w211HoldEpoch, world))
+        if (world == 0) return; // an unknown world cannot authorize a reload
+        if (Wo211Rules.ResumeInPlace(_w211HoldEpoch, world) && !T3HostWorldChanged)
         {
             _hostCalendarResumeEpoch = world;   // only this confirmed same world can re-arm without another load
+            Console.WriteLine($"T3-AUTO-REJOIN trigger=relay-reconnected decision=resume-in-place loaded_epoch={_w211HoldEpoch} host_epoch={world}");
             Interlocked.Increment(ref _w211ResumedInPlace);
             _ = Task.Run(async () =>
             {
                 await Wo211EndHoldAsync(true, $"the link is back and the host's world is the same (epoch {world}) -- no load, no jump");
                 await Wo210AfterSkipAsync("reconnect");   // every body's whole-body state afresh
             });
+            return;
+        }
+        if (!T3HostWorldChanged)
+        {
+            Console.WriteLine($"T3-AUTO-REJOIN trigger=relay-reconnected decision=wait-world-proof loaded_epoch={_t3JoinedHostWorld} hold_epoch={_w211HoldEpoch} host_epoch={world}");
             return;
         }
         Interlocked.Increment(ref _w211ResumedRejoin);
@@ -173,8 +180,7 @@ public partial class GameBridge
             Wo125OnHostReloading();
             if (_peerSeedKnown && _peerTag is not null && _peerTag == _joinedTag && !_rejoinPending)
             {
-                _rejoinPending = true;
-                _rejoinSinceUtc = DateTime.UtcNow;
+                T3ArmInWorldRejoin("relay-reconnected-host-world-changed");
                 Console.WriteLine($"MP-HENRY joiner: the host reloaded world {_peerTag} while the link was down -- rejoining from inside the world");
             }
         });

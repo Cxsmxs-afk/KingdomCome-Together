@@ -292,7 +292,7 @@ local late = mkBody("late_body", 101, 100, 10)
 late.inventory:CreateItem(SWORD, 1, 1)
 BasicAIActions.OnLoot(late, player, 1)
 KCD2MP_W134BodyState("late_body", "open", 1, 1, 1, { { SWORD, 1, 1, false } })
-NOW = NOW + 4
+NOW = NOW + 3
 KCD2MP_W217LootPoll()
 for _, timer in ipairs(TIMERS) do if timer.ms == 3000 then timer.f() end end
 check("E1 a delayed live list never falls back to the unconfirmed legacy loot screen", #LOOTS == 0 and KCD2MP.w134.pendingOpen.late_body ~= nil)
@@ -391,6 +391,81 @@ KCD2MP_W217Set("long_names", "off")
 W217.alias.map = {}; W217.alias.at = -1e9
 check("B3 long_names off: an alias is no name", System.GetEntityByName("lhe580b514") == nil)
 KCD2MP_W217Set("long_names", "on")
+
+
+-- ================= P3: no-open takes, held deadlines and local subchunks =================
+do
+    world(); asHost(2)
+    local body = mkBody("p3_no_open", 101, 100, 10)
+    body.inventory:CreateItem(SWORD, 1, 1)
+    local item = body.inventory.list[1]
+    KCD2MP_W217HostTakeReq(1, "p301", "p3_no_open", key(item), SWORD, 1)
+    check("P3 valid take without Open registers peer and reserves exactly once", W217.L.hostLive.p3_no_open and W217.L.hostLive.p3_no_open.peers["1"] ~= nil and count(body.inventory, SWORD) == 0 and esc().inventory:HasItem(item))
+    local moves = W217.L.stats.moves
+    KCD2MP_W217HostTakeReq(1, "p301", "p3_no_open", key(item), SWORD, 1)
+    KCD2MP_W217HostTakeReq(2, "p302", "p3_no_open", key(item), SWORD, 1)
+    check("P3 no-open duplicate replays and competing peer receives no second item", W217.L.stats.moves == moves and #ledger("grant") == 1 and (events("w217_tres")[#events("w217_tres")] or ""):find(" gone 0", 1, true) ~= nil)
+    local forged = mkBody("p3_invalid_no_open", 101, 100, 10)
+    forged.inventory:CreateItem(APPLE, 1, 2)
+    local fid = key(forged.inventory.list[1])
+    KCD2MP_W217HostTakeReq(1, "p303", "p3_invalid_no_open", fid, SWORD, 1)
+    KCD2MP_W217HostTakeReq(1, "p304", "p3_invalid_no_open", fid, APPLE, 1.5)
+    check("P3 forged class and fractional amount never register an implicit peer", W217.L.hostLive.p3_invalid_no_open == nil and count(forged.inventory, APPLE) == 2)
+
+    world(); asJoiner()
+    local target = mkBody("p3_hold_take", 101, 100, 10)
+    target.inventory:CreateItem(SWORD, 1, 1)
+    BasicAIActions.OnLoot(target, player, 1)
+    KCD2MP_W217BodyList("p3_hold_take", 1, 1, 1, {{id="p3h",cls=SWORD,amt=1,hp=1,worn=0,stolen=0,owner="-"}})
+    local taken = moveTo(target.inventory, player.inventory, SWORD)
+    LOG = {}; KCD2MP_W217LootPoll()
+    local req = events("w217_treq")[1]
+    local tok = req and req:match("^(%S+)")
+    local session, at = W217.L.sess.p3_hold_take, NOW
+    local held = KCD2MP_W136Held
+    KCD2MP_W136Held = function() return true end
+    NOW = at + 4.999; KCD2MP.w134.loopOnce()
+    check("P3 take deadline is not early while held", session.pend[tok] ~= nil)
+    NOW = at + 5; KCD2MP.w134.loopOnce()
+    check("P3 local loop cancels the wait at five seconds without an Agent poll", session.pend[tok] == nil and session.done[tok] == "cancel")
+    check("P3 held timeout leaves inventory writes for cleanup after load", ITEMS[taken] ~= nil and esc().inventory:HasItem(taken) and count(player.inventory, SWORD) == 0)
+    KCD2MP_W217TakeResult(tok, "grant", "p3_hold_take", "p3h", "-", 0)
+    check("P3 grant after held timeout cannot enter the player's pack", count(player.inventory, SWORD) == 0 and session.done[tok] == "cancel")
+    KCD2MP_W136Held = held; KCD2MP_W217LootPoll()
+    check("P3 cancel cleanup after hold deletes only the ticket's escrow item", ITEMS[taken] == nil and next(W217.L.cancelClean) == nil)
+
+    world(); asJoiner()
+    local chunked = mkBody("p3_live_chunks", 101, 100, 10)
+    BasicAIActions.OnLoot(chunked, player, 1)
+    local auth = KCD2MP.hostAuthority
+    local oldGeneration = auth.generation
+    auth.generation = "100"
+    local heldFn = KCD2MP_W136Held
+    KCD2MP_W136Held = function() return true end
+    local rows = {{id="p3a",cls=APPLE,amt=2,hp=1,worn=0,stolen=0,owner="-"}}
+    KCD2MP_W217BodyListChunk("p3_live_chunks", 1, 1, 1, 2, 2, rows, nil, "100")
+    check("P3 live body incomplete subchunks do not mutate or open", #LOOTS == 0 and count(chunked.inventory, APPLE) == 0)
+    KCD2MP_W217BodyListChunk("p3_live_chunks", 1, 1, 1, 1, 2, {}, nil, "100")
+    check("P3 live body complete subchunks stay read-only during hold", #LOOTS == 0 and count(chunked.inventory, APPLE) == 0)
+    auth.generation = "101"; KCD2MP_W136Held = heldFn; KCD2MP_W217LootPoll()
+    check("P3 a new load generation rejects a previously complete held list", #LOOTS == 0 and count(chunked.inventory, APPLE) == 0)
+    KCD2MP_W217BodyListChunk("p3_live_chunks", 2, 1, 1, 1, 1, rows, nil, "101")
+    KCD2MP_W217BodyListChunk("p3_live_chunks", 2, 1, 1, 1, 1, rows, nil, "101")
+    check("P3 current live chunks apply exactly once preserving revision", #LOOTS == 1 and W217.L.sess.p3_live_chunks.rev == 2 and count(chunked.inventory, APPLE) == 2)
+    auth.generation = oldGeneration
+
+    world(); asJoiner()
+    local many = mkBody("p3_legal_many", 101, 100, 10)
+    BasicAIActions.OnLoot(many, player, 1)
+    local first, second = {}, {}
+    for i=1,25 do
+        local r={id="many"..i,cls=APPLE,amt=1,hp=1,worn=0,stolen=0,owner="-"}
+        if i<=12 then first[#first+1]=r else second[#second+1]=r end
+    end
+    KCD2MP_W217BodyListChunk("p3_legal_many", 7, 1, 1, 1, 2, first)
+    KCD2MP_W217BodyListChunk("p3_legal_many", 7, 1, 1, 2, 2, second)
+    check("P3 legal wire part above sender's usual eight items survives local subchunking", count(many.inventory, APPLE) == 25 and #LOOTS == 1)
+end
 
 -- ================= T: the twin =================
 world(); asHost(1)

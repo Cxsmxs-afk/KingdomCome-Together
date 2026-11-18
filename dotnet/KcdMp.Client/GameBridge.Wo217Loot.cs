@@ -151,7 +151,7 @@ public partial class GameBridge
     }
 
     /// <summary>WO-134's frame handler hands the WO-217 kinds here first; true when it was one.</summary>
-    private async Task<bool> Wo217OnLootFrameAsync(int type, byte src, LootMsg m)
+    private async Task<bool> Wo217OnLootFrameAsync(int type, byte src, LootMsg m, CancellationToken ct = default)
     {
         var f = m.Text.Split(' ');
         if (type == Protocol.LootAskDown)
@@ -161,21 +161,21 @@ public partial class GameBridge
                 case Protocol.LootAskTakeReq when f.Length == 4 && Wo134Rules.BodyName.IsMatch(f[0]) && Wo217LootRules.ItemId.IsMatch(f[1])
                         && Wo134Rules.TryClass(f[2], out var cls) && Wo134Rules.TryAmount(f[3], out int amt):
                     if (!Wo134HostRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
-                    await ExecLuaAsync($"if KCD2MP_W217HostTakeReq then KCD2MP_W217HostTakeReq({src}, \"{m.Tok}\", \"{f[0]}\", \"{f[1]}\", \"{cls:D}\", {amt}) end");
+                    await T3LootExecAsync($"if KCD2MP_W217HostTakeReq then KCD2MP_W217HostTakeReq({src}, \"{m.Tok}\", \"{f[0]}\", \"{f[1]}\", \"{cls:D}\", {amt}, \"{T3LootGeneration}\") end", ct);
                     return true;
                 case Protocol.LootAskTakeAck when f.Length == 2 && Wo134Rules.BodyName.IsMatch(f[0]) && f[1] is "applied" or "cancel":
                     if (!Wo134HostRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
-                    await ExecLuaAsync($"if KCD2MP_W217HostAck then KCD2MP_W217HostAck({src}, \"{m.Tok}\", \"{f[1]}\", \"{f[0]}\") end");
+                    await T3LootExecAsync($"if KCD2MP_W217HostAck then KCD2MP_W217HostAck({src}, \"{m.Tok}\", \"{f[1]}\", \"{f[0]}\", \"{T3LootGeneration}\") end", ct);
                     return true;
                 case Protocol.LootAskBodyApplied when f.Length == 3 && Wo134Rules.BodyName.IsMatch(f[0]) && int.TryParse(f[1], out int appliedRev)
                         && appliedRev > 0 && f[2] is "ok" or "failed":
                     if (!Wo134HostRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
                     Interlocked.Increment(ref _w217LootBodyAcksIn);
-                    await ExecLuaAsync($"if KCD2MP_W217HostStateAck then KCD2MP_W217HostStateAck({src}, \"{f[0]}\", {appliedRev}, {(f[2] == "ok" ? "true" : "false")}) end");
+                    await T3LootExecAsync($"if KCD2MP_W217HostStateAck then KCD2MP_W217HostStateAck({src}, \"{f[0]}\", {appliedRev}, {(f[2] == "ok" ? "true" : "false")}, \"{T3LootGeneration}\") end", ct);
                     return true;
                 case Protocol.LootAskLiveEnd when f.Length == 1 && Wo134Rules.BodyName.IsMatch(f[0]):
                     if (!Wo134HostRole) return true;
-                    await ExecLuaAsync($"if KCD2MP_W217HostEnd then KCD2MP_W217HostEnd({src}, \"{f[0]}\") end");
+                    await T3LootExecAsync($"if KCD2MP_W217HostEnd then KCD2MP_W217HostEnd({src}, \"{f[0]}\", \"{T3LootGeneration}\") end", ct);
                     return true;
                 case Protocol.LootAskTakeReq or Protocol.LootAskTakeAck or Protocol.LootAskLiveEnd or Protocol.LootAskBodyApplied:
                     Interlocked.Increment(ref _w217LootDropped);
@@ -192,13 +192,14 @@ public partial class GameBridge
                     && int.TryParse(f[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out int np) && part >= 1 && np >= 1 && part <= np && np <= 40
                     && Wo217LootRules.ParseItems(f[4]) is { } items:
                 if (!Wo134JoinerRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
-                await ExecLuaAsync($"if KCD2MP_W217BodyList then KCD2MP_W217BodyList(\"{f[0]}\", {rev}, {part}, {np}, {Wo217LootRules.LuaItems(items)}, \"{m.Tok}\") end");
+                await T3LootItemsAsync(items, rows => Wo217LootRules.LuaItems(rows.ToList()), (chunk, chunks, table) =>
+                    $"if KCD2MP_W217BodyListChunk then KCD2MP_W217BodyListChunk(\"{f[0]}\", {rev}, {part}, {np}, {chunk}, {chunks}, {table}, \"{m.Tok}\", \"{T3LootGeneration}\") end", ct);
                 return true;
             case Protocol.LootHostTakeVerdict when f.Length == 5 && f[0] is "grant" or "refuse" && Wo134Rules.BodyName.IsMatch(f[1])
                     && Wo217LootRules.ItemId.IsMatch(f[2]) && Wo217LootRules.Owner.IsMatch(f[3]) && f[4] is "0" or "1":
                 if (!Wo134JoinerRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
                 Interlocked.Increment(ref _w217LootVerdicts);
-                await ExecLuaAsync($"if KCD2MP_W217TakeResult then KCD2MP_W217TakeResult(\"{m.Tok}\", \"{f[0]}\", \"{f[1]}\", \"{f[2]}\", \"{f[3]}\", {f[4]}) end");
+                await T3LootExecAsync($"if KCD2MP_W217TakeResult then KCD2MP_W217TakeResult(\"{m.Tok}\", \"{f[0]}\", \"{f[1]}\", \"{f[2]}\", \"{f[3]}\", {f[4]}, \"{T3LootGeneration}\") end", ct);
                 return true;
             case Protocol.LootHostCorpses when Wo217LootRules.ParseCorpses(m.Text) is { } corpses:
                 if (!Wo134JoinerRole) { Interlocked.Increment(ref _w217LootDropped); return true; }

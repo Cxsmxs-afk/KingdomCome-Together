@@ -729,8 +729,7 @@ public partial class GameBridge
             {
                 // WO-202 III.3: never home without a word -- the rejoin is tried (and, after three failures, the player asked)
                 Console.WriteLine("WO184-FLAG the host's reload never came back in 10 min -- asking the host for its world again (WO-202 rejoin_recover)");
-                _rewinding = false;
-                if (!_rejoinPending) { _rejoinPending = true; _rejoinSinceUtc = DateTime.UtcNow; }
+                if (T3ArmInWorldRejoin("host-reload-silence-10min")) _rewinding = false;
                 _autoNextUtc = DateTime.UtcNow;
             }
             else

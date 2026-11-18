@@ -19,6 +19,12 @@ public partial class GameBridge
     private void T3Increment(string name, long amount = 1) => _t3Counters.AddOrUpdate(name, amount, (_, n) => n + amount);
     private void T3Max(string name, long value) => _t3Counters.AddOrUpdate(name, value, (_, n) => Math.Max(n, value));
 
+    private void T3LuaStats(string kind, string? fields)
+    {
+        if (!T3LootCounters.TryRead(kind, fields, out var values)) { T3Increment("loot_stats_unreadable"); return; }
+        foreach (var field in values) _t3Counters[field.Key] = field.Value;
+    }
+
     private sealed class T3FrameAccounting
     {
         private readonly W207Frame _frame;
@@ -74,6 +80,7 @@ public partial class GameBridge
                             return Task.CompletedTask;
                         }, Volatile.Read(ref _t3ProcFrameTimeoutMs), ct);
                         _ = T3RunSideChannelDrainAsync(ct);
+                        _ = T3SyncInputOwnersAsync(ct);
                         T3StatsTick(ct);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
@@ -151,6 +158,9 @@ public partial class GameBridge
 
     private void T3EmitStats(byte role, CancellationToken ct)
     {
+        foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(new[] {
+            "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable" }))
+            _t3Counters.TryAdd(key, 0);
         foreach (string key in new[] { "proc_stalls", "proc_stall_max_ms", "proc_frames_abandoned", "deferred_sidechannel", "proc_frame_faults", "proc_tick_faults" })
             _t3Counters.TryAdd(key, 0);
         _t3Counters["w136_held"] = Interlocked.Read(ref _w136Held);

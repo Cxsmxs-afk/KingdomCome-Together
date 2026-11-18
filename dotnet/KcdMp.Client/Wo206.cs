@@ -1,4 +1,4 @@
-// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+﻿// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Collections.Concurrent;
@@ -126,7 +126,9 @@ public static class Wo206Rules
         byte kind = p[6];
         if (type == Protocol.QuestHostDown && kind is Protocol.QuestHostChange or Protocol.QuestHostCheckpoint or Protocol.QuestHostResult) return Wo206Cat.Quest;
         if (type == Protocol.QuestAskDown && kind == Protocol.QuestAskRequest) return Wo206Cat.Quest;
-        if (type == Protocol.LootHostDown && kind == Protocol.LootHostLedger) return Wo206Cat.Loot;
+        // Build is available at the menu before a host-world epoch is known.
+        // Every other loot kind addresses this world's bodies/items/escrow.
+        if (type == Protocol.LootAskDown || (type == Protocol.LootHostDown && kind != Protocol.LootHostBuild)) return Wo206Cat.Loot;
         return null;
     }
 

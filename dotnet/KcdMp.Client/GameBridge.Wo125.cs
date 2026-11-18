@@ -288,12 +288,13 @@ public partial class GameBridge
             // The host is back from its load.
             if (_joinedWorld && tag == _joinedTag)
             {
-                if (!_rejoinPending) { _rejoinPending = true; _rejoinSinceUtc = DateTime.UtcNow; Console.WriteLine($"MP-HENRY joiner: the host reloaded world {tag} -- rejoining from inside the world (the Henry rewinds to the matching snapshot)"); }
+                if (!_rejoinPending) T3ArmInWorldRejoin("host-identity-after-reload");
             }
             else if (_joinedWorld)
             {
                 _rewinding = false;
                 _joinFromWorldOnce = true;
+                Console.WriteLine($"T3-AUTO-REJOIN trigger=host-playthrough-changed decision=leave-then-join loaded_tag={_joinedTag} host_tag={tag}");
                 if (_jj is not null)
                 {
                     // Never two loads at once (observed: a leave fired mid-join raced the join's own load).
@@ -322,6 +323,8 @@ public partial class GameBridge
             if (r is not ("" or "-")) Console.WriteLine($"WO184-FINAL host reload: the owed snapshot was not taken ({r})");
         });
         _rewinding = true;
+        if (_t3JoinedHostWorld == 0) _t3JoinedHostWorld = _w206.World;
+        Console.WriteLine($"T3-AUTO-REJOIN trigger=host-load-status decision=await-epoch loaded_epoch={_t3JoinedHostWorld} host_epoch={_w206.World}");
         _w206RewindJoinEpoch = _w206.Join;   // WO-206 E: this "reloading" belongs to the join epoch it began under
         _rejoinPending = false;
         Wo202RejoinReset("the host reloads");   // WO-202 III.3: a new reload, a new count
@@ -726,10 +729,12 @@ public partial class GameBridge
     }
 
     /// <summary>After Ready: the join save pairs with the Henry just loaded (a matched pair: the joiner has not played in it yet).</summary>
-    private void Wo125AfterReady(string tag, string mode, WhsSave.HenryParts parts, byte[]? offerMd5, uint seq)
+    private void Wo125AfterReady(string tag, string mode, WhsSave.HenryParts parts, byte[]? offerMd5, uint seq, uint hostWorldEpoch)
     {
         if (_rejoinPending || _rewinding) _ = W164NoticeAsync(Wo164Rules.ReloadBackText);   // WO-164 RL: the rejoin after the host's reload
         _joinedTag = tag;
+        _t3JoinedHostWorld = hostWorldEpoch;
+        _t3RejoinReason = "-";
         _rewinding = false;
         _rejoinPending = false;
         Wo202RejoinReset("joined");   // WO-202 III.3
@@ -741,6 +746,7 @@ public partial class GameBridge
             // was in that world at it), then this game leaves for its own save and joins the new world.
             _newWorldLeavePending = false;
             _joinFromWorldOnce = true;
+            Console.WriteLine($"T3-AUTO-REJOIN trigger=host-playthrough-changed-during-join decision=leave-then-join loaded_tag={tag} host_tag={_peerTag}");
             Console.WriteLine($"MP-HENRY joiner: the host is in another playthrough now ({_peerTag}) -- leaving world {tag} after this join");
             _ = Task.Run(() => LeaveSharedWorldAsync("host-new-world", "Your host loaded a different game."));
         }

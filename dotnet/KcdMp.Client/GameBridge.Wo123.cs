@@ -231,7 +231,7 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- inbound frames
 
-    private async Task Wo123OnFrameAsync(int type, byte[] payload, CancellationToken ct)
+    private async Task Wo123OnFrameAsync(int type, byte[] payload, CancellationToken ct, uint receiveWorld = 0)
     {
         if (!SplitJoinDown(payload, out byte src, out uint joinId, out var body)) return;
         switch (type)
@@ -279,7 +279,7 @@ public partial class GameBridge
                 return;
             case Protocol.LootAskDown:      // WO-134
             case Protocol.LootHostDown:
-                await Wo134OnFrameAsync(type, src, body);
+                await Wo134OnFrameAsync(type, src, body, ct);
                 return;
             case Protocol.QuestHostDown:    // WO-137
             case Protocol.QuestAskDown:
@@ -327,7 +327,7 @@ public partial class GameBridge
                 await Wo203OnSideFrameAsync(src, body);
                 return;
             case Protocol.WorldOfferDown:
-                await OnWorldOfferInAsync(src, joinId, body, ct);
+                await OnWorldOfferInAsync(src, joinId, body, ct, receiveWorld);
                 return;
             case Protocol.WorldChunkDown:
                 await OnWorldChunkInAsync(src, joinId, body, ct);
@@ -793,7 +793,7 @@ public partial class GameBridge
         }
     }
 
-    private async Task OnWorldOfferInAsync(byte host, uint joinId, byte[] body, CancellationToken ct)
+    private async Task OnWorldOfferInAsync(byte host, uint joinId, byte[] body, CancellationToken ct, uint receiveWorld)
     {
         if (!JoinerSharedEffective || _isDamageAuthority)
         {
@@ -817,7 +817,7 @@ public partial class GameBridge
         _joinRx?.Abort();
         string dir = WorldReceiver.DefaultStagingDir();
         int swept = WorldReceiver.SweepStaging(dir);
-        try { _joinRx = new WorldReceiver(dir, joinId, host, offer.Value); }
+        try { _joinRx = new WorldReceiver(dir, joinId, host, offer.Value) { HostWorldEpoch = receiveWorld }; }
         catch (Exception ex)
         {
             Console.WriteLine($"MP-JOIN joiner: cannot stage the world: {ex.Message}");
@@ -878,7 +878,7 @@ public partial class GameBridge
         SetJoinUi("received", "World received. Loading...");
         Console.WriteLine(FormattableString.Invariant(
             $"MP-JOIN joiner: join 0x{joinId:x8} received {rx.Received} B in {secs:F2} s -- sha256 ok, WhsSave.Verify ok, md5 = the offer's -> <data>/join-staging/{Path.GetFileName(rx.FinalPath)}"));
-        _ = Wo124OnWorldReceivedAsync(joinId, host, rx.FinalPath, rx.Offer.WorldSavedSeq);   // WO-124: splice, place, load -- off the frame loop (a load takes ~50 s)
+        _ = Wo124OnWorldReceivedAsync(joinId, host, rx.FinalPath, rx.Offer.WorldSavedSeq, rx.HostWorldEpoch);   // WO-124: splice, place, load -- off the frame loop (a load takes ~50 s)
     }
 
     private void SetJoinUi(string state, string message, string reason = "", bool canFresh = false)
