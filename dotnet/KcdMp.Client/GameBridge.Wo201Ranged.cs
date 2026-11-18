@@ -125,6 +125,7 @@ public partial class GameBridge
                     if (age < 0 || age > Protocol.RangedCaptureMaxAgeMs || unchecked((long)row.CapturedTick) <= Interlocked.Read(ref _p6VisualModeAtTick)) { T3Increment("ranged_stale"); continue; }
                     uint sourceMs = unchecked((uint)(PresentationClock.NowMs() - age));
                     var weapon = catalog?.Classify(row) ?? default;
+                    Wo214ObserveOwnRangedHand(context, visualMode, row, weapon.Kind, weapon.ItemClass);
                     if (weapon.Kind == RangedWeaponKind.Unknown) T3Increment("ranged_capture_kind_unknown");
                     int written = 0;
                     void AfterWrite()
@@ -132,6 +133,12 @@ public partial class GameBridge
                         if (Interlocked.Exchange(ref written, 1) != 0) return;
                         T3Increment("ranged_out"); Interlocked.Increment(ref _w201RangedOut);
                         Console.WriteLine($"WO201-RANGED out {Wo201Rules.RangedPhaseName(row.Phase)} weapon={weapon.Kind} item={weapon.ItemClass:D} seq={row.Sequence} epoch={reply.Epoch}");
+                        if (W214On("figure_hands") && weapon.Kind == RangedWeaponKind.Bow &&
+                            weapon.ItemClass != Guid.Empty && BowHandProof.IsDrawnPhase(row.Phase))
+                        {
+                            T3Increment(BowHandEmptyCounter, 0);
+                            Console.WriteLine($"MP-LANE1-BOW out cls={weapon.ItemClass:D} source=native");
+                        }
                     }
                     foreach (byte peer in Wo134Peers())
                     {
@@ -230,18 +237,23 @@ public partial class GameBridge
         if (!P6Current(context) || !P6PeerCurrent(src, frame.P6PeerSerial)) return;
         if (step.Kind == RangedWeaponKind.Unknown || catalog?.Kind(step.ItemClass) != step.Kind)
         { T3Increment("ranged_kind_unknown"); return; }
-        // No guessed Aim/Charge animation and no broad BodyStop that could abort a scene.
-        string fragment = Wo201Rules.RangedFragment(step.Phase);
-        if (fragment.Length == 0) { T3Increment("ranged_phase_unrenderable"); return; }
-        // The old goatsfoot/medium reload is not proof for all crossbow subclasses.
-        if (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4) { T3Increment("ranged_phase_unrenderable"); return; }
-        string tags = step.Kind == RangedWeaponKind.Bow ? "l_bow" : "l_crossbow";
         bool Current() => P6Current(context) && W201("figure_ranged") && P6PeerCurrent(src, frame.P6PeerSerial) &&
             frame.P6ModeSerial == Interlocked.Read(ref _p6VisualModeSerial) &&
             frame.P6VisualSerial == Interlocked.Read(ref _p6VisualSerial) && (!_w179Remote.TryGetValue(src, out var scene) || (scene.Ended && !scene.CopyPlaying && scene.Landing != 1)) &&
             _p6RemoteSteps.TryGetValue(src, out var latest) && latest == (frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence) &&
             Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds + step.AgeMs <= Protocol.RangedCaptureMaxAgeMs;
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, _p5Peers[src].Token);
+        if (!_p5Peers.TryGetValue(src, out var peer) || peer.Serial != frame.P6PeerSerial) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, peer.Token);
+        if (step.Kind == RangedWeaponKind.Bow && BowHandProof.IsDrawnPhase(step.Phase))
+        {
+            long capturedAt = Environment.TickCount64 - step.AgeMs - (long)Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds;
+            await Wo214OnRangedBowHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, capturedAt, Current, linked.Token);
+        }
+        // Charge and Aim still lack a verified animation entry. Crossbow reload tags vary by subclass.
+        string fragment = Wo201Rules.RangedFragment(step.Phase);
+        if (fragment.Length == 0 || (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4))
+        { T3Increment("ranged_phase_unrenderable"); return; }
+        string tags = step.Kind == RangedWeaponKind.Bow ? "l_bow" : "l_crossbow";
         if (frame.Presentation.SampleMs != 0 && W221On("rp_combat") &&
             _ghostEntityIds.TryGetValue(src.ToString(System.Globalization.CultureInfo.InvariantCulture), out uint eid))
         {
