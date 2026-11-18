@@ -30,6 +30,9 @@
   <ItemGroup>
     <ProjectReference Include="..\KcdMp.Server\KcdMp.Server.csproj" />
     <ProjectReference Include="..\KcdMp.Client\KcdMp.Client.csproj" />
+    <!-- Build the test-only processes for the relay smoke without linking them. -->
+    <ProjectReference Include="..\..\tools\wo121\avatarpeer\AvatarPeer.csproj" ReferenceOutputAssembly="false" Private="false" />
+    <ProjectReference Include="..\..\tools\wo118\synthpeer\SynthPeer.csproj" ReferenceOutputAssembly="false" Private="false" />
   </ItemGroup>
 
 </Project>

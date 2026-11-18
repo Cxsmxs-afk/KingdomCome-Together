@@ -950,6 +950,35 @@ def s_verdict(r):
     return fn
 
 
+def s_bot_joiner(r):
+    """Use the scripted joiner and the rig's real running host as the two peers."""
+    def fn():
+        if os.environ.get('KCDMP_TEST_BOT') != '1':
+            return False, 'bot-disabled', 'KCDMP_TEST_BOT=1 is required'
+        origin = r.a.pos()
+        if not origin:
+            return False, 'no-host-position', r.a.id
+        tables = os.path.join(r.a.p['root'], 'Data', 'Tables.pak')
+        if not os.path.isfile(tables):
+            return False, 'no-ranged-data', 'Data/Tables.pak'
+        tool = os.path.join(HERE, '..', 'bothost', 'bot-joiner')
+        # The plan is fixed after this start point is sampled.
+        start = '%.3f,%.3f,%.3f' % (origin[0] + 2, origin[1], origin[2])
+        command = [sys.executable, '-X', 'utf8', tool, '--test-bot', '--port', str(pair.RELAY_PORT),
+                   '--origin=' + start, '--tables-pak', tables]
+        log = os.path.join(r.dir, 'bot-t4.log')
+        with open(log, 'w', encoding='utf-8') as stream:
+            status = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT).returncode
+        bundles = pair.collect('bot-%d' % time.time_ns(), write_verdict=True, copies=(r.a.id,), bot_log=log)
+        report = os.path.join(bundles[r.a.id] + '.packed', 'ERGEBNIS.txt')
+        with open(report, encoding='utf-8') as stream:
+            route_ok = any(line.startswith('bot_plan_complete\tGRÜN\t') for line in stream)
+        detail = {'log': log, 'report': report, 'exit': status}
+        ok = status == 0 and route_ok
+        return ok, ('ok' if ok else 'bot-route'), detail
+    return fn
+
+
 def bones_chunks():
     """tools/rig/bones.lua as console sends: comments dropped, whitespace collapsed, split at its @@SPLIT@@ mark."""
     src = open(os.path.join(HERE, 'bones.lua'), encoding='utf-8').read()
@@ -3942,6 +3971,7 @@ def run(name, args):
         'b1': [('b1', s_b1(r))],
         'stats': [('stats', s_stats(r))],
         'verdict': [('join', s_join(r)), ('verdict', s_verdict(r))],
+        'botjoiner': [('bot-joiner', s_bot_joiner(r))],
         'perfab': [('join', s_join(r)), ('perfab', s_perfab(r))],
         'perfprobe': [('join', s_join(r)), ('perfab-probe', s_perfab(r, which='probe'))],
         'joinidle': [('join', s_join(r)), ('idle', lambda: (time.sleep(float(args[0]) if args else 180.0), (True, 'ok', 'idle'))[1])],

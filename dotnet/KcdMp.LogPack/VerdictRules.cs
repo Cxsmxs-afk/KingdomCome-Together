@@ -65,6 +65,7 @@ public static class VerdictRules
     private static readonly Regex AgentPrefixOnly = new(AgentPrefix + @"\z", RegexOptions.Compiled);
     private static readonly Regex AgentSessionRole = new(AgentPrefix
         + @"MP-WO137-STATS role=(host|joiner)(?: |$)", RegexOptions.Compiled);
+    private static readonly Regex BotProgress = new(@"^(?:SYNTH125 t=[\d.]+s )?BOT-T4 role=(host|joiner) (started|ready|complete)=1(?: |$)", RegexOptions.Compiled);
 
     private sealed record CounterRule(string Id, VerdictStatus AboveLimit, long Limit = 0, string Unit = "",
         string? Role = null, string? RequiresActivity = null, string? Unreadable = null, string Marker = T3,
@@ -118,12 +119,33 @@ public static class VerdictRules
         var queue = Queue(agent);
         var rows = new List<VerdictRow> { queue };
         rows.AddRange(Counters.Select(rule => Evaluate(rule, samples)));
+        rows.Add(BotPlan(input));
 
         // Traffic observable on this machine is required for green. Optional
         // rows are still shown as grey and any measured warning or fault wins.
         var status = rows.Where(row => row.Status is VerdictStatus.Yellow or VerdictStatus.Red)
             .Select(row => row.Status).DefaultIfEmpty(queue.Status).Max();
         return new(status, Role(agent, samples), rows.AsReadOnly());
+    }
+
+    private static VerdictRow BotPlan(Briefing.Input input)
+    {
+        const string id = "bot_plan_complete";
+        const string entry = "bot-t4.log";
+        if (!input.Logs.TryGetValue(entry, out var lines)) return Missing(id, "Kein Bot-Protokoll im Bundle");
+        var runs = new Dictionary<string, bool>(StringComparer.Ordinal);
+        foreach (var line in lines)
+        {
+            var match = BotProgress.Match(line);
+            if (!match.Success) continue;
+            var role = match.Groups[1].Value;
+            if (match.Groups[2].Value is "started" or "ready") runs[role] = false;
+            else if (runs.ContainsKey(role)) runs[role] = true;
+        }
+        if (runs.Count == 0) return Missing(id, "Kein belegter Bot-Start");
+        return runs.Values.All(completed => completed)
+            ? new(id, VerdictStatus.Green, "Abgeschlossen", entry)
+            : new(id, VerdictStatus.Red, "Abschluss fehlt", entry);
     }
 
     private static string Role(IReadOnlyList<string> agent, IReadOnlyList<Sample> samples)
