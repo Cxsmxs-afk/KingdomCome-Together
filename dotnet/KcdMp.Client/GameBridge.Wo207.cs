@@ -16,18 +16,11 @@ public partial class GameBridge
 {
     private readonly record struct W207Frame(int Type, long Arrival, long Start);
 
-    private W207Frame Wo207Begin(InFrame f)
-    {
-        Wo207Trace.Dequeued(f.Type);
-        Wo207Trace.Kind.Value = f.Type;
-        return new W207Frame(f.Type, f.Arrival, Stopwatch.GetTimestamp());
-    }
-
-    private static void Wo207End(W207Frame w)
+    private static void Wo207End(W207Frame w, int? finalKind = null)
     {
         long end = Stopwatch.GetTimestamp();
         long wait = w.Arrival > 0 ? Math.Max(0, (w.Start - w.Arrival) * 1000 / Stopwatch.Frequency) : 0;
-        Wo207Trace.Frame(Wo207Trace.Kind.Value is int k && k != 0 ? k : w.Type, wait, (end - w.Start) * 1000 / Stopwatch.Frequency);
+        Wo207Trace.Frame(finalKind is int k && k != 0 ? k : w.Type, wait, (end - w.Start) * 1000 / Stopwatch.Frequency);
         Wo207Trace.Kind.Value = 0;
     }
 

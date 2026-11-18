@@ -5,10 +5,13 @@
 #include <cstdio>
 #include "wo218_rules.h"
 #include "pipe_outbox.h"
+#include "t3_stats_rules.h"
 #include <future>
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <cstring>
+#include <string>
 
 namespace {
 int g_fail = 0, g_pass = 0;
@@ -126,6 +129,22 @@ int wo218_tests(int* passed) {
     CHECK(takeover_family(4) && takeover_family(5) && takeover_family(7) && !takeover_family(1) && !takeover_family(3) && !takeover_family(9));
     CHECK(takeover_class("CAnimActionAIMovement") && takeover_class("C_VariationAction") && takeover_class("C_CallbackAction"));
     CHECK(!takeover_class("C_CombatAnimAction") && !takeover_class("CAnimActionLooking") && !takeover_class(nullptr) && !takeover_class("C_Variation"));
+    // T3: the native log mirrors agent counters, never arbitrary text/formatting.
+    auto stats = [](uint8_t role, const char* text) {
+        std::vector<uint8_t> b{role};
+        b.insert(b.end(), text, text + std::strlen(text));
+        return kcdmp::t3stats::valid(b.data(), b.size());
+    };
+    CHECK(stats(1, "proc_stalls=0 proc_stall_max_ms=2000 proc_frames_abandoned=1 deferred_sidechannel=5 w136_held=8 w136_replayed=8"));
+    CHECK(stats(2, "counter=18446744073709551615"));
+    CHECK(!stats(0, "counter=1") && !stats(3, "counter=1"));
+    CHECK(!stats(1, "counter=18446744073709551616"));
+    CHECK(!stats(1, "counter=-1") && !stats(1, "counter=1.5"));
+    CHECK(!stats(1, "counter=1\nforged=1") && !stats(1, "counter=1%"));
+    CHECK(!stats(1, " counter=1") && !stats(1, "counter=1 ") && !stats(1, "counter=1  other=2"));
+    CHECK(!stats(1, "counter=") && !stats(1, "=1") && !stats(1, ""));
+    CHECK(!stats(1, (std::string(49, 'a') + "=1").c_str()));
+    CHECK(!stats(1, (std::string(513, 'a') + "=1").c_str()));
     *passed = g_pass;
     return g_fail;
 }

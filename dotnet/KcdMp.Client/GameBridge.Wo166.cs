@@ -175,14 +175,27 @@ public partial class GameBridge
     private async Task Wo166OnHostWeatherAsync(float rain, string? profile)
     {
         if (!config.WeatherSyncEnabled) return;
-        Interlocked.Increment(ref _w166WeatherApplied);
-        Console.WriteLine(FormattableString.Invariant($"WO166-WEATHER joiner rain={rain:F2} profile={profile ?? "-"} -- applied on this machine, not only the time-of-day blend"));
-        await _transport.ExecuteNowAsync(FormattableString.Invariant($"if KCD2MP_W166WeatherApply then KCD2MP_W166WeatherApply({rain:F2}, \"{profile ?? "-"}\") end"));
+        ProcessorFrameScope.ThrowIfAbandoned();
+        var lease = T3SideLease();
+        if (!T3SideReady)
+        {
+            _t3SideChannels.Put(T3Weather, new(0, rain, profile, WeatherBlendSeconds), lease);
+            T3Increment("deferred_sidechannel"); return;
+        }
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, lease.Token);
+        using var scope = ProcessorFrameScope.Link(linked.Token);
+        T3SideGuard(lease, true);
+        await _transport.ExecuteNowAsync(FormattableString.Invariant($"if KCD2MP_W166WeatherApply then KCD2MP_W166WeatherApply({rain:F2}, \"{profile ?? "-"}\") end"), linked.Token);
+        T3SideGuard(lease, true);
         if (profile is not null)
         {
             await Wo151OnHostWeatherAsync(profile);
-            await ApplyWeatherAsync(profile, WeatherBlendSeconds);
+            T3SideGuard(lease, true);
+            await T3ApplyWeatherProfileAsync(profile, WeatherBlendSeconds);
+            T3SideGuard(lease, true);
         }
+        Interlocked.Increment(ref _w166WeatherApplied);
+        Console.WriteLine(FormattableString.Invariant($"WO166-WEATHER joiner rain={rain:F2} profile={profile ?? "-"} -- applied on this machine, not only the time-of-day blend"));
     }
 
     // ---------------------------------------------------------------- R1: the respawn amnesty

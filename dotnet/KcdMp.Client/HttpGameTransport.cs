@@ -90,12 +90,13 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
 
     private void EnsureRotLoop()
     {
+        ProcessorFrameScope.ThrowIfAbandoned();
         if (_rotTask is not null) return;
         lock (_rotStart)
         {
             if (_rotTask is not null) return;
             _rotCts = CancellationTokenSource.CreateLinkedTokenSource(_rotToken);
-            _rotTask = Task.Run(() => RotStateLoopAsync(_rotCts.Token), CancellationToken.None);
+            _rotTask = StartTransportLoop(() => RotStateLoopAsync(_rotCts.Token));
         }
     }
 
@@ -118,7 +119,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     {
         try
         {
-            var xml = await _http.GetStringAsync($"{gameApiBase}/api/rpg/Calendar?depth=1", ct);
+            var xml = await GetStringAsync($"{gameApiBase}/api/rpg/Calendar?depth=1", ct);
             var m = GameTimeRegex().Match(xml);
             return m.Success
                 && float.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out float t)
@@ -135,7 +136,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     {
         try
         {
-            var xml = await _http.GetStringAsync($"{gameApiBase}/api/rpg/Calendar?depth=1", ct);
+            var xml = await GetStringAsync($"{gameApiBase}/api/rpg/Calendar?depth=1", ct);
             var m = GameTimeRegex().Match(xml);
             return (true, m.Success && float.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out float t) ? t : 0f);
         }
@@ -157,7 +158,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
             try
             {
                 await SendNowAsync(@"System.SetCVar(""sv_servername"",System.GetEntityByName(""Dude"") and ""kcdmp-where=world"" or ""kcdmp-where=menu"")", ct);
-                var xml = await _http.GetStringAsync($"{gameApiBase}/api/System/Console/GetCvarValue?name=sv_servername", ct);
+                var xml = await GetStringAsync($"{gameApiBase}/api/System/Console/GetCvarValue?name=sv_servername", ct);
                 var m = CvarValueRegex().Match(xml);
                 if (m.Success && m.Groups[1].Value.StartsWith("kcdmp-where=", StringComparison.Ordinal))
                     return m.Groups[1].Value == "kcdmp-where=world";
@@ -196,7 +197,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     {
         try
         {
-            var xml = await _http.GetStringAsync($"{gameApiBase}/api/rpg/SoulList/PlayerSoul?depth=1", ct);
+            var xml = await GetStringAsync($"{gameApiBase}/api/rpg/SoulList/PlayerSoul?depth=1", ct);
             var m = PosRegex().Match(xml);
             if (!m.Success) return null;
 
@@ -230,7 +231,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
                 @"local ride=KCD2MP and KCD2MP.isRiding and 'r' or 's';" +
                 @"return string.format('%.4f,%s',r,ride)end)())", ct);
 
-            var xml = await _http.GetStringAsync(
+            var xml = await GetStringAsync(
                 $"{gameApiBase}/api/System/Console/GetCvarValue?name=sv_servername", ct);
 
             var m = CvarValueRegex().Match(xml);
@@ -290,6 +291,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     public long Expired { get { lock (_queueLock) return _queue.Expired; } }
     public long Overflowed { get { lock (_queueLock) return _queue.Overflowed; } }
     public long StaleDropped { get { lock (_queueLock) return _queue.StaleDropped; } }
+    public long AbandonedStatements { get { lock (_queueLock) return _queue.Abandoned; } }
 
     private static string Wrap(string lua) => "pcall(function() " + lua + " end)\n";
     private static string WrapOnce(string lua, string id) =>
@@ -297,6 +299,12 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
 
     public async Task ExecuteAsync(string lua, CancellationToken ct = default)
     {
+        var frame = ProcessorFrameScope.Capture();
+        CancellationToken caller = ct;
+        using var link = ProcessorFrameScope.Link(ct);
+        ct = link.Token;
+        ct.ThrowIfCancellationRequested();
+        frame?.ThrowIfAbandoned();
         if (!BatchingEnabled)
         {
             await SendNowAsync(lua, ct);
@@ -339,7 +347,9 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
         {
             lock (_queueLock)
             {
-                _queue.Add(new BatchQueue.Entry { Lua = lua, Text = text, Kind = kind, Key = key, OnceId = onceId, Encoded = enc, EnqueuedMs = NowMs(), Kind207 = Wo207Trace.Kind.Value });
+                ct.ThrowIfCancellationRequested();
+                frame?.ThrowIfAbandoned();
+                _queue.Add(new BatchQueue.Entry { Lua = lua, Text = text, Kind = kind, Key = key, OnceId = onceId, Encoded = enc, EnqueuedMs = NowMs(), Kind207 = Wo207Trace.Kind.Value, Frame = frame, CallerToken = caller });
                 full = _queue.QueuedEncoded >= MaxBatchChars - 200;   // full enough: do not wait for the loop
             }
         }
@@ -362,6 +372,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
 
     public void RequestFlush()
     {
+        ProcessorFrameScope.ThrowIfAbandoned();
         if (!Decoupled) { _ = FlushAsync(); return; }
         EnsureFlusher();
         if (_kick.CurrentCount == 0) { try { _kick.Release(); } catch (SemaphoreFullException) { } }
@@ -370,7 +381,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     private void EnsureFlusher()
     {
         if (_flusher is not null) return;
-        lock (_flusherStart) _flusher ??= Task.Run(() => FlusherLoopAsync(_flusherCts.Token), CancellationToken.None);
+        lock (_flusherStart) _flusher ??= StartTransportLoop(() => FlusherLoopAsync(_flusherCts.Token));
     }
 
     /// <summary>
@@ -439,6 +450,9 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
 
     public async Task FlushAsync(CancellationToken ct = default)
     {
+        using var link = ProcessorFrameScope.Link(ct);
+        ct = link.Token;
+        ct.ThrowIfCancellationRequested();
         if (_held) return;   // the recovery task owns sending until the game answers again
         await _sendLock.WaitAsync(ct);
         try
@@ -458,12 +472,15 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     /// <summary>One command with these statements. True when the game answered; false when it did not (the statements are kept, or dropped under RetryBatches=false).</summary>
     private async Task<bool> SendEntriesAsync(List<BatchQueue.Entry> batch, CancellationToken ct)
     {
+        lock (_queueLock) batch = _queue.KeepActive(batch);
+        if (batch.Count == 0) return true;
+        using var delivery = LinkEntries(batch, ct);
         var sb = new StringBuilder();
         foreach (var e in batch) sb.Append(e.Text);
         long sentMs = NowMs();
         try
         {
-            await SendNowAsync(sb.ToString(), ct);
+            await SendNowAsync(sb.ToString(), delivery.Token);
             _consecutiveFailures = 0;
             long answeredMs = NowMs();
             foreach (var e in batch)
@@ -475,6 +492,19 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
         }
         catch (Exception ex)
         {
+            if (delivery.IsCancellationRequested)
+            {
+                // Cancellation is not a failed game or a reason to start recovery.
+                // A mixed batch retains only independent live rows, with their same once ids.
+                lock (_queueLock)
+                {
+                    var active = _queue.KeepActive(batch);
+                    var safe = active.Where(e => RetryBatches && (e.Kind != BatchKind.Edge || e.OnceId is not null)).ToList();
+                    _queue.Requeue(safe);
+                    if (safe.Count != active.Count) { BatchesDropped++; StatementsDropped += active.Count - safe.Count; }
+                }
+                return false;
+            }
             bool transient = RetryBatches && !ct.IsCancellationRequested && IsNoAnswer(ex);
             if (!transient)
             {
@@ -509,7 +539,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
         Console.WriteLine($"MP-BATCH-HOLD down: the game did not answer {failures} batches in a row -- {queued} statement(s) wait in the queue (bounded, a stale state is replaced by a newer one); trying again every {RecoveryIntervalMs} ms");
         _recoveryCts = new CancellationTokenSource();
         var tok = _recoveryCts.Token;
-        _recovery = Task.Run(() => RecoverAsync(tok), CancellationToken.None);
+        _recovery = StartTransportLoop(() => RecoverAsync(tok));
     }
 
     private async Task RecoverAsync(CancellationToken ct)
@@ -534,9 +564,11 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
                     else
                     {
                         // a failure here is expected while the game is away: the statements go back, nothing is counted twice
+                        lock (_queueLock) batch = _queue.KeepActive(batch);
+                        using var delivery = LinkEntries(batch, ct);
                         var sb = new StringBuilder();
                         foreach (var e in batch) sb.Append(e.Text);
-                        try { await SendNowAsync(sb.ToString(), ct); answered = true; }
+                        try { await SendNowAsync(batch.Count == 0 ? Wrap("local _ = 1").TrimEnd('\n') : sb.ToString(), delivery.Token); answered = true; }
                         catch (Exception ex) when (IsNoAnswer(ex)) { answered = false; lock (_queueLock) _queue.Requeue(batch); }
                     }
                     if (answered)
@@ -581,11 +613,38 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     private DateTime _lastDropLogUtc = DateTime.MinValue;
     private DateTime _lastRetryLogUtc = DateTime.MinValue;
 
+    private static Task StartTransportLoop(Func<Task> loop)
+    {
+        if (ExecutionContext.IsFlowSuppressed()) return Task.Run(loop, CancellationToken.None);
+        using var flow = ExecutionContext.SuppressFlow();
+        return Task.Run(loop, CancellationToken.None);
+    }
+
+    private static CancellationTokenSource LinkEntries(IEnumerable<BatchQueue.Entry> batch, CancellationToken caller)
+    {
+        var tokens = batch.SelectMany(e => new[] { e.CallerToken, e.Frame?.Token ?? default })
+            .Append(caller).Where(t => t.CanBeCanceled).Distinct().ToArray();
+        return tokens.Length == 0 ? new CancellationTokenSource() : CancellationTokenSource.CreateLinkedTokenSource(tokens);
+    }
+
+    private async Task<string> GetStringAsync(string url, CancellationToken ct)
+    {
+        using var link = ProcessorFrameScope.Link(ct);
+        link.Token.ThrowIfCancellationRequested();
+        ProcessorFrameScope.ThrowIfAbandoned();
+        string result = await _http.GetStringAsync(url, link.Token);
+        // A custom/slow handler can finish despite cancellation. Its continuation
+        // must not advance to an equip, Lua send or other second mutation.
+        link.Token.ThrowIfCancellationRequested();
+        ProcessorFrameScope.ThrowIfAbandoned();
+        return result;
+    }
+
     /// <summary>Sends immediately, bypassing the batch buffer.</summary>
     private async Task SendNowAsync(string lua, CancellationToken ct = default)
     {
         var cmd = Uri.EscapeDataString($"#{lua}");
-        await _http.GetStringAsync($"{gameApiBase}/api/System/Console/ExecuteString?command={cmd}", ct);
+        await GetStringAsync($"{gameApiBase}/api/System/Console/ExecuteString?command={cmd}", ct);
     }
 
     // -------------------------------------------------------------------------
@@ -611,9 +670,13 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     {
         try
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            using var link = ProcessorFrameScope.Link(ct);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(link.Token);
             cts.CancelAfter(TimeSpan.FromSeconds(10));
-            var xml = await new HttpClient { Timeout = TimeSpan.FromSeconds(10) }.GetStringAsync($"{gameApiBase}/api/rpg/SoulList/SoulsByGuid?depth=1", cts.Token);
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+            var xml = await client.GetStringAsync($"{gameApiBase}/api/rpg/SoulList/SoulsByGuid?depth=1", cts.Token);
+            link.Token.ThrowIfCancellationRequested();
+            ProcessorFrameScope.ThrowIfAbandoned();
             var keys = new List<Guid>();
             foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(xml, "Key=\"([0-9a-fA-F-]{36})\""))
                 if (Guid.TryParse(m.Groups[1].Value, out var g)) keys.Add(g);
@@ -627,7 +690,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     {
         try
         {
-            var xml = await _http.GetStringAsync($"{gameApiBase}/api/rpg/SoulList/SoulsByGuid/{key}?depth=1&exclude=DerivedStatsByName,Buffs,Roles,StaticData,PersistentData,Archetype,Inventory,CombatSoul,CompanionManager,EquipmentManager,FactionNode,SoulClass,SocialClass,StormDebug", ct);
+            var xml = await GetStringAsync($"{gameApiBase}/api/rpg/SoulList/SoulsByGuid/{key}?depth=1&exclude=DerivedStatsByName,Buffs,Roles,StaticData,PersistentData,Archetype,Inventory,CombatSoul,CompanionManager,EquipmentManager,FactionNode,SoulClass,SocialClass,StormDebug", ct);
             var n = System.Text.RegularExpressions.Regex.Match(xml, "Name=\"([^\"]*)\"");
             var p = System.Text.RegularExpressions.Regex.Match(xml, "Position=\"([^\"]*)\"");
             return (n.Success ? n.Groups[1].Value : "", p.Success ? p.Groups[1].Value : "");
@@ -692,7 +755,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     {
         try
         {
-            var xml = await _http.GetStringAsync(url, ct);
+            var xml = await GetStringAsync(url, ct);
             return ParseItemClasses(xml);
         }
         catch { return null; }
@@ -709,19 +772,19 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
             // ItemClassDescriptor with no readable properties at this depth,
             // and the only verification that matters is the equip that
             // follows actually taking effect.
-            await _http.GetStringAsync(
+            await GetStringAsync(
                 $"{gameApiBase}/api/rpg/SoulList/{SoulPath(ghostSoulName)}/Inventory/CreateItems" +
                 $"?ItemClass={cls}&Amount=1&ShowUINotification=false", ct);
         }
 
-        await _http.GetStringAsync(
+        await GetStringAsync(
             $"{gameApiBase}/api/rpg/SoulList/{SoulPath(ghostSoulName)}/EquipmentManager/EquipItem?itemClassId={cls}", ct);
     }
 
     public async Task UnequipItemOnGhostAsync(string ghostSoulName, Guid itemClass, CancellationToken ct = default)
     {
         string soul = Uri.EscapeDataString(ghostSoulName);
-        await _http.GetStringAsync(
+        await GetStringAsync(
             $"{gameApiBase}/api/rpg/SoulList/{SoulPath(ghostSoulName)}/EquipmentManager/UnequipItem?itemClassId={itemClass}", ct);
     }
 
@@ -739,7 +802,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
         string soul = Uri.EscapeDataString(ghostSoulName);
         try
         {
-            var xml = await _http.GetStringAsync(
+            var xml = await GetStringAsync(
                 $"{gameApiBase}/api/rpg/SoulList/{SoulPath(ghostSoulName)}?depth=1&exclude=" +
                 "DerivedStatsByName,Buffs,Roles,StaticData,PersistentData,Archetype,Inventory," +
                 "CombatSoul,CompanionManager,EquipmentManager,FactionNode,SoulClass,SocialClass,StormDebug", ct);
@@ -762,7 +825,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
         {
             try
             {
-                var xml = await _http.GetStringAsync(
+                var xml = await GetStringAsync(
                     $"{gameApiBase}/api/rpg/SoulList/{route}/{soulGuid}?depth=1&exclude=" +
                     "DerivedStatsByName,Buffs,Roles,StaticData,PersistentData,Archetype,Inventory," +
                     "CombatSoul,CompanionManager,EquipmentManager,FactionNode,SoulClass,SocialClass,StormDebug", ct);
@@ -784,7 +847,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     {
         try
         {
-            var xml = await _http.GetStringAsync(
+            var xml = await GetStringAsync(
                 $"{gameApiBase}/api/rpg/SoulList/PlayerSoul?depth=1&exclude=" +
                 "DerivedStatsByName,Buffs,Roles,StaticData,PersistentData,Archetype,Inventory," +
                 "CombatSoul,CompanionManager,EquipmentManager,FactionNode,SoulClass,SocialClass,StormDebug", ct);
@@ -819,6 +882,8 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     /// </summary>
     public Task ExecuteNowAsync(string lua, CancellationToken ct = default)
     {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ct.ThrowIfCancellationRequested();
         int enc = LuaCommandBudget.EncodedLength(lua) + LuaCommandBudget.WrapperEncodedChars;
         if (enc > MaxBatchChars)
         {

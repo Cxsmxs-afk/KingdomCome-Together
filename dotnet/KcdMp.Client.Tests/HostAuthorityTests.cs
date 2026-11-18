@@ -85,4 +85,41 @@ public class HostAuthorityTests
         Assert.Equal(HostAuthorityFailure.NotConfirmed, prepared.FailureReason);
         Assert.Equal(0, roleCalls);
     }
+
+    [Fact]
+    public async Task Abandoned_native_probe_cannot_later_configure_a_role()
+    {
+        var native = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<HostAuthorityReadiness.Preparation>? pending = null;
+        int roleCalls = 0;
+        var result = await ProcessorFrameScope.RunAsync(async token =>
+        {
+            pending = HostAuthorityReadiness.ProbeAndConfigureAsync(() => native.Task,
+                () => { roleCalls++; return Task.FromResult(true); }, token);
+            await pending;
+        }, 50);
+        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
+        native.SetResult("B decision_gate=armed story_gate=armed");
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await pending!);
+        Assert.Equal(0, roleCalls);
+    }
+
+    [Fact]
+    public async Task Abandoned_native_configuration_cannot_report_late_success()
+    {
+        var native = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<HostAuthorityReadiness.Preparation>? pending = null;
+        int confirmed = 0;
+        var result = await ProcessorFrameScope.RunAsync(async token =>
+        {
+            pending = HostAuthorityReadiness.ProbeAndConfigureAsync(
+                () => Task.FromResult<string?>("B decision_gate=armed story_gate=armed"), () => native.Task, token);
+            await pending;
+            confirmed++;
+        }, 50);
+        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
+        native.SetResult(true);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await pending!);
+        Assert.Equal(0, confirmed);
+    }
 }

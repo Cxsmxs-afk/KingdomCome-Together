@@ -90,6 +90,10 @@ public sealed class BatchQueue
         public long EnqueuedMs;
         public int Sends;                // how many batches carried it (a retry is a second send)
         public int Kind207;              // WO-207 B.1: the inbound kind whose handler queued it (Wo207Trace.Kind; 0 = none)
+        public ProcessorFrameScope.Lease? Frame; // survives normal frame completion; only abandonment revokes this row
+        public CancellationToken CallerToken;
+        internal bool AbandonCounted;
+        public bool Cancelled => CallerToken.IsCancellationRequested || Frame?.IsAbandoned == true || Frame?.Token.IsCancellationRequested == true;
     }
 
     public int MaxEntries { get; init; } = 256;
@@ -135,6 +139,8 @@ public sealed class BatchQueue
     public long StaleDropped { get; private set; }
     /// <summary>Statements that went back in front of the queue after a batch got no answer.</summary>
     public long Requeued { get; private set; }
+    /// <summary>Rows whose frame or caller was cancelled, discarded before a later send/retry.</summary>
+    public long Abandoned { get; private set; }
     /// <summary>Level statements pulled to the front because the queue was already a second or more behind.</summary>
     public long Snapped { get; private set; }
     /// <summary>Edges and stale relays dropped because they were already seconds old when the queue caught up.</summary>
@@ -147,6 +153,8 @@ public sealed class BatchQueue
 
     public void Add(Entry e)
     {
+        if (DiscardCancelled(e)) return; // a cancelled replacement must not displace a still valid state
+        PurgeCancelled();
         if (e.Kind == BatchKind.Level && e.Key is { } k && _byKey.TryGetValue(k, out var old))
         {
             Remove(old);
@@ -183,9 +191,11 @@ public sealed class BatchQueue
     /// </summary>
     public void Requeue(IReadOnlyList<Entry> failed)
     {
+        PurgeCancelled();
         for (int i = failed.Count - 1; i >= 0; i--)
         {
             var e = failed[i];
+            if (DiscardCancelled(e)) continue;
             if (e.Kind == BatchKind.Stale) { StaleDropped++; continue; }
             if (e.Kind == BatchKind.Level && e.Key is { } k && _byKey.ContainsKey(k)) { Superseded++; continue; }
             var node = _q.AddFirst(e);
@@ -206,8 +216,29 @@ public sealed class BatchQueue
         if (e.Kind == BatchKind.Level && e.Key is { } k && _byKey.TryGetValue(k, out var cur) && ReferenceEquals(cur, n)) _byKey.Remove(k);
     }
 
+    /// <summary>Recheck rows already taken from the queue immediately before their HTTP send.</summary>
+    public List<Entry> KeepActive(IEnumerable<Entry> entries) => entries.Where(e => !DiscardCancelled(e)).ToList();
+
+    private bool DiscardCancelled(Entry e)
+    {
+        if (!e.Cancelled) return false;
+        if (!e.AbandonCounted) { e.AbandonCounted = true; Abandoned++; }
+        return true;
+    }
+
+    private void PurgeCancelled()
+    {
+        for (var n = _q.First; n is not null;)
+        {
+            var next = n.Next;
+            if (DiscardCancelled(n.Value)) Remove(n);
+            n = next;
+        }
+    }
+
     private void Purge(long nowMs)
     {
+        PurgeCancelled();
         for (var n = _q.First; n is not null;)
         {
             var next = n.Next;

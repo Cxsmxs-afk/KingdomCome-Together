@@ -196,6 +196,38 @@ public class PackerTests
     }
 
     [Fact]
+    public void T3_stats_from_both_roles_and_native_survive_actual_bundle_collapse()
+    {
+        var dir = Temp();
+        try
+        {
+            const int repeats = 20; // Identical unprotected lines would be collapsed.
+            var src = new List<SourceFile>();
+            var expected = new Dictionary<string, string[]>();
+            foreach (var native in new[] { false, true })
+            {
+                string name = native ? "kcdmp-native.mirror.log" : "agent.log";
+                string origin = native ? "origin=dll source=agent" : "origin=agent";
+                var lines = new[] { "host", "joiner" }.Select(role =>
+                    $"12:00:00.000 MP-T3-STATS {origin} role={role} proc_stalls=0 proc_stall_max_ms=0 proc_frames_abandoned=0 deferred_sidechannel=7 w136_held=8 w136_replayed=8").ToArray();
+                expected[name] = lines;
+                string text = string.Concat(lines.Select(line => string.Concat(Enumerable.Repeat(line + "\n", repeats))));
+                src.Add(new(name, Bytes: Encoding.UTF8.GetBytes(text)));
+            }
+
+            var packed = Packer.Pack(src, dir, "KCDMP-logs-t3");
+            var files = Open(Assert.Single(packed.Parts));
+            foreach (var (name, lines) in expected)
+            {
+                var restored = Encoding.UTF8.GetString(files[name]).Split('\n');
+                foreach (var line in lines)
+                    Assert.Equal(repeats, restored.Count(value => value == line));
+            }
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
     public void A_big_bundle_splits_into_numbered_parts_that_each_open_and_fit()
     {
         var dir = Temp();

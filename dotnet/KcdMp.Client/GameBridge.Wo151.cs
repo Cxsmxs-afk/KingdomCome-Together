@@ -23,6 +23,7 @@ public partial class GameBridge
     private volatile bool _w151SwitchOff = true;
     private volatile bool _w151MainCost;
     private volatile bool _w151Connected;
+    private int _w151SessionLife;
     private int _w151CfgKey = -1;
     private long _w151CfgAtMs;
 
@@ -599,10 +600,17 @@ public partial class GameBridge
     }
 
     /// <summary>Host (2 s): a new blend of the host's own game is the session's weather.</summary>
-    private async Task Wo151WeatherTickAsync()
+    private async Task Wo151WeatherTickAsync(CancellationToken ct = default)
     {
         if (!config.WeatherSyncEnabled || !_isDamageAuthority) return;
-        var r = await _combat.Wo151WeatherReadAsync();
+        if (!T3SideReady) return;
+        var lease = T3SideLease();
+        using var caller = ProcessorFrameScope.Link(ct);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(caller.Token, lease.Token);
+        using var scope = ProcessorFrameScope.Link(linked.Token);
+        T3SideGuard(lease, true);
+        var r = await _combat.Wo151WeatherReadAsync(linked.Token);
+        T3SideGuard(lease, true);
         if (r is not { } w || w.Count == 0 || w.Count == _w151WeatherCount || !WeatherNamePattern.IsMatch(w.Name)) return;
         _w151WeatherCount = w.Count;
         bool first = !_w151WeatherNative;
@@ -618,8 +626,20 @@ public partial class GameBridge
     /// <summary>Joiner: the host's weather arrived -- the gate lets only it blend here.</summary>
     private async Task Wo151OnHostWeatherAsync(string profile)
     {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        var lease = T3SideLease();
+        if (!T3SideReady)
+        {
+            _t3SideChannels.Put(T3WeatherProfile, new(0, Profile: profile, Blend: WeatherBlendSeconds), lease);
+            T3Increment("deferred_sidechannel"); return;
+        }
         if (_isDamageAuthority || _w151WeatherGate == profile) return;
-        if (await _combat.Wo151WeatherGateAsync(profile))
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, lease.Token);
+        using var scope = ProcessorFrameScope.Link(linked.Token);
+        T3SideGuard(lease, true);
+        bool accepted = await _combat.Wo151WeatherGateAsync(profile, linked.Token);
+        T3SideGuard(lease, true);
+        if (accepted)
         {
             _w151WeatherGate = profile;
             Interlocked.Increment(ref _w151WeatherGates);
@@ -630,6 +650,7 @@ public partial class GameBridge
     /// <summary>Any world load: the applied memory goes (a load restores the save's own weather); a joiner re-applies the host's.</summary>
     private void Wo151OnGameplayStarted()
     {
+        T3SideChannelsGameplayStarted();
         Wo151SceneReset("load");   // 3.4: a load interrupts every scene (the field's two never-released ones)
         Wo179Reset("load");        // WO-179: no shared scene survives a load
         Wo184OnLoad();             // WO-184: a load ends every conversation and arrest step and cancels any pending save (LoadSavedGame does)
@@ -640,15 +661,16 @@ public partial class GameBridge
         Wo167SceneReset();         // WO-167 T4: the conversation scenes' counts start again
         if (_w151CatchUp && W137Host) _ = Task.Run(async () => { await Task.Delay(2000); await Wo151HostRebaseAsync(); });   // 3.1
         _lastAppliedWeatherProfile = null;
-        if (!_isDamageAuthority && _w151WeatherGate is string g)
-            _ = Task.Run(async () => { await Task.Delay(3000); await ApplyWeatherAsync(g, WeatherBlendSeconds); });
     }
 
     private void Wo151OnConnect(CancellationToken ct)
     {
+        int sessionLife = Interlocked.Increment(ref _w151SessionLife);
+        T3SideChannelsInvalidate("connect");
+        if (_where == GameWhere.World) T3SideChannelsGameplayStarted();
         _w151Connected = true;
         _w151CfgKey = -1;
-        _ = Wo151LoopAsync(ct);
+        _ = Wo151LoopAsync(ct, sessionLife);
         Wo179OnConnect(ct);   // WO-179: the scene watch (10 Hz) and the bus
         Wo200OnConnect(ct);   // WO-200: the gates' config, their events (4 Hz), the host's replay queue
         Wo201OnConnect(ct);   // WO-201: the DLL's config (B1), the stale scene queue (B2), the parts' ticks
@@ -656,7 +678,7 @@ public partial class GameBridge
         Wo203OnConnect(ct);   // WO-203: every area's loops and switches
     }
 
-    private async Task Wo151LoopAsync(CancellationToken ct)
+    private async Task Wo151LoopAsync(CancellationToken ct, int sessionLife)
     {
         long lastStatus = Environment.TickCount64;
         while (!ct.IsCancellationRequested)
@@ -667,7 +689,7 @@ public partial class GameBridge
                 await Wo151PushConfigAsync();
                 await Wo151FightTickAsync();
                 await Wo151CopyContextsAsync();
-                await Wo151WeatherTickAsync();
+                await Wo151WeatherTickAsync(ct);
                 await Wo151SceneTickAsync();
                 await Wo151CatchUpTickAsync();
                 await Wo164TickAsync();   // WO-164: the torch side-channel, the flee watchdog, the stale seats, quest values, the marker notice
@@ -691,6 +713,7 @@ public partial class GameBridge
             }
             catch (Exception ex) { Console.WriteLine($"MP-W151 tick failed: {ex.GetType().Name}: {ex.Message}"); }
         }
+        if (sessionLife != Volatile.Read(ref _w151SessionLife)) return;
         _w151Connected = false;
         Wo200OnDisconnect();   // WO-200: captures, parked steps and quiet comparisons of this session go
         Wo201OnDisconnect();   // WO-201: its parts' session state goes
@@ -700,7 +723,20 @@ public partial class GameBridge
         Wo184Reset("disconnect");
         Wo167SceneReset();
         // the session is over: the weather gate opens (the DLL also opens it when the pipe closes)
-        if (_w151WeatherGate is not null) { _w151WeatherGate = null; try { await _combat.Wo151WeatherGateAsync(null); } catch { } }
+        if (_w151WeatherGate is not null)
+        {
+            var life = T3SideLease();
+            using var stop = new CancellationTokenSource(2000);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token, stop.Token);
+            try
+            {
+                T3SideGuard(life);
+                bool released = await _combat.Wo151WeatherGateAsync(null, linked.Token);
+                T3SideGuard(life);
+                if (released && sessionLife == Volatile.Read(ref _w151SessionLife)) _w151WeatherGate = null;
+            }
+            catch (OperationCanceledException) { }
+        }
         // the session is over: every copy gets its own reactions back
         foreach (var kv in _w151CtxOn.ToArray())
         {

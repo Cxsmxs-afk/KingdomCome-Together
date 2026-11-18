@@ -38068,5 +38068,29 @@ if not ok2 then
     System.LogAlways("[KCD2-MP] Hook error: " .. tostring(err2))
 end
 
+-- ===== P0/T3: bounded agent frame processor ======================================================
+do
+    KCD2MP.t3 = KCD2MP.t3 or { procFrameTimeoutMs = 2000 }
+    function KCD2MP_T3ReportCfg()
+        KCD2MP_EmitEvent("t3_proc_timeout", tostring(KCD2MP.t3.procFrameTimeoutMs))
+        return true
+    end
+    function KCD2MP_T3SetProcFrameTimeout(arg)
+        local text = tostring(arg or ""):match("^%s*(.-)%s*$")
+        if text ~= "" then
+            local value = tonumber(text)
+            if not text:match("^%d+$") or not value or value < 50 or value > 30000 then
+                mp_log("mp_proc_frame_timeout: expected whole milliseconds 50..30000")
+                return false
+            end
+            KCD2MP.t3.procFrameTimeoutMs = value
+        end
+        mp_log(string.format("T3-CONFIG proc_frame_timeout_ms=%d", KCD2MP.t3.procFrameTimeoutMs))
+        return KCD2MP_T3ReportCfg()
+    end
+    System.AddCCommand("mp_proc_frame_timeout", 'KCD2MP_T3SetProcFrameTimeout(%line)',
+        "Frame timeout in milliseconds (default 2000, 50..30000): mp_proc_frame_timeout <ms>; bare = report")
+end
+
 
 

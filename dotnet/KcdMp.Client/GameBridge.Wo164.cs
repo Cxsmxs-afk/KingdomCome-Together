@@ -323,9 +323,19 @@ public partial class GameBridge
         }
     }
 
-    private async Task W164SendAsync(byte target, byte kind, string text)
+    private async Task W164SendAsync(byte target, byte kind, string text, CancellationToken ct = default)
     {
-        try { await WriteJoinAsync(new LootMsg(kind, Interlocked.Increment(ref _w137Tok), text).BuildUp(Protocol.W164Up, target)); }
+        using var frame = ProcessorFrameScope.Link(ct);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(frame.Token, _wo122Ct);
+        ProcessorFrameScope.ThrowIfAbandoned();
+        linked.Token.ThrowIfCancellationRequested();
+        try
+        {
+            if (_wo122Stream is not Stream stream) throw new IOException("no relay connection");
+            await WritePacketAsync(stream, new LootMsg(kind, Interlocked.Increment(ref _w137Tok), text).BuildUp(Protocol.W164Up, target), linked.Token);
+            ProcessorFrameScope.ThrowIfAbandoned(); linked.Token.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex) { Console.WriteLine($"WO164 {Protocol.W164KindName(kind)} not sent to {target}: {ex.Message}"); }
     }
 

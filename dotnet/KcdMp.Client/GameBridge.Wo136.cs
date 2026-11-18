@@ -95,9 +95,10 @@ public partial class GameBridge
         return Encoding.UTF8.GetString(payload, 2, nameLen);
     }
 
-    /// <summary>The processor's flush tick: the hold has ended -> everything kept goes through the normal path now.</summary>
-    private void Wo136ReplayIfReleased()
+    /// <summary>The independent receive-lifetime tick: replay only into its still-live connection.</summary>
+    private void Wo136ReplayIfReleased(ChannelWriter<InFrame> writer, CancellationToken ct)
     {
+        if (ct.IsCancellationRequested || !ReferenceEquals(_frameWriter, writer)) return;
         if (!_w136WasHolding || Wo136Holding) return;
         List<InFrame> replay;
         TimeSpan heldFor;
@@ -109,17 +110,18 @@ public partial class GameBridge
             replay = [.. _w136NpcHeld.Values, .. _w136GhostHeld.Values, .. _w136DoorHeld.Values, .. _w136OrderedHeld];
             _w136NpcHeld.Clear(); _w136GhostHeld.Clear(); _w136DoorHeld.Clear(); _w136OrderedHeld.Clear();
         }
-        var w = _frameWriter;
         int n = 0, stale = 0;
         foreach (var f in replay)
         {
+            if (ct.IsCancellationRequested || !ReferenceEquals(_frameWriter, writer)) break;
+            ProcessorFrameScope.ThrowIfAbandoned();
             // WO-144: a peer who left while the world loaded is not brought back by its held frame.
             if (f.Type == Protocol.Ghost && f.Payload.Length > 0 && Wo144DropFromRemoved(f.Payload[0])) continue;
             // WO-206 E: a frame held across a load of the host's world is that old world's -- never fed or replayed into the new one
             if (Wo206Rules.WorldCategory(f.Type, f.Payload) is Wo206Cat cat && !Wo206Admit(cat, f.Stamp, $"held frame 0x{f.Type:X2}")) { stale++; continue; }
             long now = Stopwatch.GetTimestamp();
             FeedNativeAtRead(f.Type, f.Payload, now, replay: true);
-            if (w is not null && Wo207Queue(w, new InFrame(f.Type, f.Payload, now, f.Stamp), f.Type)) n++;
+            if (Wo207Queue(writer, new InFrame(f.Type, f.Payload, now, f.Stamp), f.Type)) n++;
         }
         Interlocked.Add(ref _w136Replayed, n);
         Console.WriteLine(FormattableString.Invariant(
@@ -129,6 +131,7 @@ public partial class GameBridge
     /// <summary>"Loading saved game" / "[CryAction] LoadGame": the mod's hold, best effort (the join's own load call already set it).</summary>
     private void Wo136OnLoadSeen(string what)
     {
+        T3SideChannelsInvalidate("load-" + what);
         _ = Wo134InvalidateLedgerAsync("load-" + what);
         Wo147ForgetGuardsOnLoad(what);   // WO-147: a load re-creates the copies -- their guards are gone with the old ones
         _w136SettleUntilUtc = DateTime.MinValue;
