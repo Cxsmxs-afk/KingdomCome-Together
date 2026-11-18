@@ -24,7 +24,12 @@ public partial class GameBridge
     private long _p6VisualSerial;
     private long _p6VisualModeSerial, _p6VisualModeAtTick;
     private void P6VisualModeChanged()
-    { Interlocked.Exchange(ref _p6VisualModeAtTick, Environment.TickCount64); Interlocked.Increment(ref _p6VisualModeSerial); }
+    {
+        long now = Environment.TickCount64;
+        Interlocked.Exchange(ref _p6VisualModeAtTick, now);
+        Interlocked.Increment(ref _p6VisualModeSerial);
+        Wo214ResetOwnBow("mode", now);
+    }
     private readonly SemaphoreSlim _p6PollGate = new(1, 1);
     private RangedItemCatalog? _p6Catalog;
     private Task<RangedItemCatalog?>? _p6CatalogTask;
@@ -64,7 +69,11 @@ public partial class GameBridge
         lock (_p6StateGate)
         {
             var old = _p6Context; _p6Context = null; _p6RemoteSteps.Clear();
-            if (old is not null) _ = old.Stop.CancelAsync(); // retained token must still cancel queued writer rows
+            if (old is not null)
+            {
+                _ = old.Stop.CancelAsync(); // retained token must still cancel queued writer rows
+                Wo214ResetOwnBow("session", Environment.TickCount64);
+            }
         }
     }
     private async Task<RangedItemCatalog?> P6CatalogAsync()
@@ -133,11 +142,10 @@ public partial class GameBridge
                         if (Interlocked.Exchange(ref written, 1) != 0) return;
                         T3Increment("ranged_out"); Interlocked.Increment(ref _w201RangedOut);
                         Console.WriteLine($"WO201-RANGED out {Wo201Rules.RangedPhaseName(row.Phase)} weapon={weapon.Kind} item={weapon.ItemClass:D} seq={row.Sequence} epoch={reply.Epoch}");
-                        if (W214On("figure_hands") && weapon.Kind == RangedWeaponKind.Bow &&
-                            weapon.ItemClass != Guid.Empty && BowHandProof.IsDrawnPhase(row.Phase))
+                        if (W214On("figure_hands") && weapon.Kind == RangedWeaponKind.Bow && weapon.ItemClass != Guid.Empty)
                         {
                             T3Increment(BowHandEmptyCounter, 0);
-                            Console.WriteLine($"MP-LANE1-BOW out cls={weapon.ItemClass:D} source=native");
+                            Console.WriteLine(FormattableString.Invariant($"MP-LANE1-BOW out cls={weapon.ItemClass:D} source=native phase={row.Phase} capture_ms={row.CapturedTick}"));
                         }
                     }
                     foreach (byte peer in Wo134Peers())
@@ -157,12 +165,9 @@ public partial class GameBridge
         catch (Exception ex) { T3Increment("ranged_poll_refused"); Console.WriteLine($"P6 ranged poll: {ex.GetType().Name}"); }
         finally { _p6PollGate.Release(); }
     }
-    private async Task<bool> P6SendAsync(P6Context context, byte target, byte kind, string text, Func<bool> extra,
+    private Task<bool> P6SendAsync(P6Context context, byte target, byte kind, string text, Func<bool> extra,
         CancellationToken ct, Action? afterWrite = null, Func<string>? textAtWrite = null, uint presentationSenderMs = 0)
     {
-        var lease = ProcessorFrameScope.Capture();
-        bool Current() => !ct.IsCancellationRequested && lease?.IsAbandoned != true && P6Current(context) && extra();
-        if (!Current()) return false;
         uint token = Interlocked.Increment(ref _w137Tok);
         byte[] Build(string value)
         {
@@ -170,11 +175,19 @@ public partial class GameBridge
             return (_w213Caps & Protocol.LinkCapPresentationCombat) == 0 ? packet :
                 PresentationTimeWire.StampCombatUp(packet, presentationSenderMs);
         }
-        byte[] packet = Build(text);
         void Written() { T3Increment("ranged_peer_tx"); afterWrite?.Invoke(); }
+        return P6WriteAsync(context, Build(text), extra, ct, Written, textAtWrite is null ? null : () => Build(textAtWrite()));
+    }
+
+    private async Task<bool> P6WriteAsync(P6Context context, byte[] packet, Func<bool> extra, CancellationToken ct,
+        Action written, Func<byte[]>? packetAtWrite = null)
+    {
+        var lease = ProcessorFrameScope.Capture();
+        bool Current() => !ct.IsCancellationRequested && lease?.IsAbandoned != true && P6Current(context) && extra();
+        if (!Current()) return false;
         try
         {
-            if (_w213Writer is { } writer && ReferenceEquals(context.Stream, _w213Stream)) writer.Enqueue(packet, Current, Written, textAtWrite is null ? null : () => Build(textAtWrite()));
+            if (_w213Writer is { } writer && ReferenceEquals(context.Stream, _w213Stream)) writer.Enqueue(packet, Current, written, packetAtWrite);
             else
             {
                 using var frame = ProcessorFrameScope.Link(ct); using var linked = CancellationTokenSource.CreateLinkedTokenSource(frame.Token, context.Cancellation);
@@ -182,11 +195,11 @@ public partial class GameBridge
                 try
                 {
                     if (!Current()) return false;
-                    if (textAtWrite is not null) packet = Build(textAtWrite());
+                    if (packetAtWrite is not null) packet = packetAtWrite();
                     if (!Current()) return false;
                     await context.Stream.WriteAsync(packet, linked.Token);
                     if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
-                    Written();
+                    written();
                 }
                 finally { _tcpWriteLock.Release(); }
             }
@@ -249,6 +262,8 @@ public partial class GameBridge
             long capturedAt = Environment.TickCount64 - step.AgeMs - (long)Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds;
             await Wo214OnRangedBowHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, capturedAt, Current, linked.Token);
         }
+        else if (step.Kind == RangedWeaponKind.Crossbow && !linked.IsCancellationRequested && Current())
+            Wo214OnOtherRangedHand(src);
         // Charge and Aim still lack a verified animation entry. Crossbow reload tags vary by subclass.
         string fragment = Wo201Rules.RangedFragment(step.Phase);
         if (fragment.Length == 0 || (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4))

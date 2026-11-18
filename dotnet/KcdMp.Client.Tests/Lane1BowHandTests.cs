@@ -45,12 +45,57 @@ public sealed class Lane1BowHandTests
         Assert.Equal(1L, counters["bow_hand_empty_while_drawn"]);
     }
 
+    [Fact]
+    public async Task A_drawn_bow_heartbeat_keeps_its_class_after_the_native_capture_window()
+    {
+        await using var link = new MemoryStream();
+        var bridge = await CreateHostAsync(link);
+        Observe(bridge, 2, RangedWeaponKind.Bow, Bow);
+        SendOwnHand(bridge, "1 -");
+        Assert.Equal($"v1|1|{Bow:D}", ReadHandPacket(link));
+
+        long observedBy = Environment.TickCount64;
+        await Task.Delay(Protocol.RangedCaptureMaxAgeMs + 1);
+        while (Environment.TickCount64 - observedBy <= Protocol.RangedCaptureMaxAgeMs)
+            await Task.Delay(1);
+
+        link.SetLength(0);
+        SendOwnHand(bridge, "1 -");
+        Assert.Equal($"v1|1|{Bow:D}", ReadHandPacket(link));
+    }
+
+    [Fact]
+    public async Task The_same_bow_report_and_an_unknown_capture_keep_the_class_until_a_typed_crossbow_arrives()
+    {
+        await using var link = new MemoryStream();
+        var bridge = await CreateHostAsync(link);
+        Observe(bridge, 2, RangedWeaponKind.Bow, Bow);
+
+        SendOwnHand(bridge, $"1 {Bow:D}");
+        Assert.Equal($"v1|1|{Bow:D}", ReadHandPacket(link));
+        link.SetLength(0);
+
+        long reportedBy = Environment.TickCount64;
+        while (Environment.TickCount64 <= reportedBy)
+            await Task.Delay(1);
+        Observe(bridge, 2, RangedWeaponKind.Unknown, Guid.Empty);
+        SendOwnHand(bridge, "1 -");
+        Assert.Equal($"v1|1|{Bow:D}", ReadHandPacket(link));
+        link.SetLength(0);
+
+        Observe(bridge, 2, RangedWeaponKind.Crossbow, Crossbow);
+        SendOwnHand(bridge, "1 -");
+        Assert.Equal("v1|1|-", ReadHandPacket(link));
+    }
+
     [Theory]
     [InlineData("missing")]
     [InlineData("unknown")]
     [InlineData("crossbow")]
-    [InlineData("stale")]
+    [InlineData("initially-stale")]
+    [InlineData("initially-stale-empty")]
     [InlineData("mode-changed")]
+    [InlineData("session-reset")]
     [InlineData("sheathed")]
     [InlineData("sword")]
     public async Task An_empty_one_slot_report_stays_empty_without_current_bow_proof(string scenario)
@@ -65,12 +110,19 @@ public sealed class Lane1BowHandTests
             case "crossbow":
                 Observe(bridge, 2, RangedWeaponKind.Crossbow, Crossbow);
                 break;
-            case "stale":
+            case "initially-stale":
                 Observe(bridge, 2, RangedWeaponKind.Bow, Bow, Protocol.RangedCaptureMaxAgeMs + 1);
+                break;
+            case "initially-stale-empty":
+                Observe(bridge, 2, RangedWeaponKind.Bow, Guid.Empty, Protocol.RangedCaptureMaxAgeMs + 1);
                 break;
             case "mode-changed":
                 Observe(bridge, 2, RangedWeaponKind.Bow, Bow);
                 Call(bridge, "P6VisualModeChanged");
+                break;
+            case "session-reset":
+                Observe(bridge, 2, RangedWeaponKind.Bow, Bow);
+                Call(bridge, "Wo214HandsReset");
                 break;
             case "sheathed":
                 Observe(bridge, 2, RangedWeaponKind.Bow, Bow);
@@ -113,6 +165,53 @@ public sealed class Lane1BowHandTests
 
         await ReceiveFigureHandAsync(bridge, "v1|0|-");
         Assert.DoesNotContain(Bow, (HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, outfit)!);
+    }
+
+    [Fact]
+    public async Task A_drawn_empty_report_keeps_a_confirmed_bow_beyond_the_generic_hand_timeout()
+    {
+        await using var link = new MemoryStream();
+        using var game = new GameCalls();
+        await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
+        var bridge = await CreateHostAsync(link);
+        Field("_transport").SetValue(bridge, transport);
+        await ReceiveRangedBowAsync(bridge, Environment.TickCount64);
+
+        // Advance the receipt timestamp past the ordinary 25-second WO-214 deadline.
+        var hands = Field("_w214FigureHand").GetValue(bridge)!;
+        var hand = hands.GetType().GetProperty("Item")!.GetValue(hands, [(object)Peer])!;
+        hand.GetType().GetProperty("AtMs")!.SetValue(hand, Environment.TickCount64 - Wo214Rules.HandFreshMs - 1);
+
+        await ReceiveFigureHandAsync(bridge, "v1|1|-");
+
+        var kept = (HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!;
+        Assert.Equal(Bow, Assert.Single(kept));
+        Assert.Single(game.Requests);
+
+        Call(bridge, "P6VisualModeChanged");
+        Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
+    }
+
+    [Fact]
+    public async Task Pre_draw_re_equips_the_latest_ranged_bow_instead_of_the_previous_sword()
+    {
+        await using var link = new MemoryStream();
+        using var game = new GameCalls();
+        await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
+        var bridge = await CreateHostAsync(link);
+        Field("_transport").SetValue(bridge, transport);
+        await ReceiveFigureHandAsync(bridge, $"v1|1|{Sword:D}");
+        await ReceiveRangedBowAsync(bridge, Environment.TickCount64);
+        await ReceiveFigureHandAsync(bridge, "v1|0|-");
+        game.Requests.Clear();
+
+        await (Task)Call(bridge, "Wo214PreDrawAsync", Peer, CancellationToken.None)!;
+
+        Assert.Contains(game.Requests, request => request.Contains($"kcd2mp_{Peer}/EquipmentManager/EquippedArmorsByClassId", StringComparison.Ordinal));
+        Assert.Contains(game.Requests, request => request.Contains($"kcd2mp_{Peer}/EquipmentManager/EquippedWeaponsByClassId", StringComparison.Ordinal));
+        string equip = Assert.Single(game.Requests.Where(request => request.Contains("KCD2MP_W144Equip(", StringComparison.Ordinal)));
+        Assert.Contains($"KCD2MP_W144Equip(\"kcd2mp_{Peer}\",\"{Bow:D}\")", equip);
+        Assert.DoesNotContain(Sword.ToString("D"), equip);
     }
 
     [Fact]
@@ -214,8 +313,10 @@ public sealed class Lane1BowHandTests
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
-            Requests.Enqueue(Uri.UnescapeDataString(request.RequestUri!.ToString()));
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("ok") });
+            string url = Uri.UnescapeDataString(request.RequestUri!.ToString());
+            Requests.Enqueue(url);
+            string response = url.Contains("/EquipmentManager/Equipped", StringComparison.Ordinal) ? "<Items />" : "ok";
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(response) });
         }
     }
 }

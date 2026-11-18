@@ -1,8 +1,8 @@
 # B1 Bogenklasse in der Hand
 
-Der Agent übernimmt die echte Bogen-GUID aus der vorhandenen typisierten P6-Erfassung. Ein frischer Erfassungswert ergänzt einen gezogenen WO-214-Handeintrag mit fehlender Klasse. Ein ausdrückliches Wegstecken, eine gemeldete Klasse oder ein Wechsel des P6-Geltungsbereichs beendet die Übernahme des alten Erfassungswerts. Ohne frischen Nachweis bleibt die Handmeldung mit leerer Klasse für unbewaffnete Figuren verfügbar.
+Der Agent übernimmt die Bogen-GUID aus einer typisierten P6-Erfassung, die beim Eingang höchstens zwei Sekunden alt ist. Die gemessene Klasse ergänzt beim Sender auch spätere gezogene WO-214-Handmeldungen. Wegstecken, eine andere nachgewiesene Waffenklasse, ein Wechsel des P6-Modus oder ein Session-Reset beenden die Übernahme. Eine unklare Messung lässt eine bereits bestätigte Klasse bestehen. Ohne je bestätigte Klasse kann der Agent weiterhin eine leere Hand melden.
 
-Der Empfänger übergibt die geprüfte Bogen-GUID beim Spannen, Zielen oder Schießen an den bestehenden WO-214-Handeinstieg. Eine leere Meldung aus dem Ein-Slot-Leser verdrängt eine aktuelle Messung aus beiden Händen nicht. Die vorhandene 25-Sekunden-Frist für WO-214 schützt die gemessene Klasse beim Outfit-Abgleich. Ein neuerer Steckvorgang oder eine andere gemeldete Waffenklasse hat Vorrang.
+Der Empfänger übergibt die geprüfte Bogen-GUID beim Spannen, Zielen oder Schießen an den bestehenden WO-214-Handeinstieg. Die gemessene Bogenklasse bleibt beim Outfit-Abgleich auch über die allgemeine 25-Sekunden-Frist hinaus geschützt, solange Handzustand und P6-Geltungsbereich passen. PreDraw verwendet die zuletzt angeforderte gezogene Klasse. Nach einem Wechsel vom Schwert zum Bogen legt es beim nächsten Ziehen damit den Bogen zurück.
 
 Das Rig liest getrennte Agent-Logs desselben Durchlaufs.
 
@@ -10,7 +10,7 @@ Das Rig liest getrennte Agent-Logs desselben Durchlaufs.
 python3 tools/rig/scen_lane1_bogen.py --sender-log sender.log --receiver-log receiver.log --bow-class BOGENKLASSEN-UUID
 ```
 
-Die Prüfung verlangt übereinstimmende Bogen-GUIDs im gesendeten Schritt und im Handauftrag des Empfängers sowie einen nachfolgenden T3-Zähler `bow_hand_empty_while_drawn=0`. Ein Handauftrag belegt die Übergabe an den vorhandenen Spieleeinstieg. Die tatsächliche Handbelegung und Sichtbarkeit brauchen die Spielabnahme.
+Für das Rig den Bogen nach einer erfassten Spann-, Ziel- oder Schießphase gezogen halten. Die Prüfung verlangt einen tatsächlich gesendeten WO-214-Heartbeat mit derselben Klasse mehr als zwei Sekunden nach der letzten Messung, einen Handauftrag des Empfängers und danach `bow_hand_empty_while_drawn=0` im T3-Bericht des Senders. Der Zähler sammelt Ereignisse über die Laufzeit. Die tatsächliche Handbelegung und Sichtbarkeit brauchen die Spielabnahme.
 
 ## Übergabe an H4
 
