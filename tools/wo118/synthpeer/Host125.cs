@@ -185,6 +185,7 @@ static class Host125
         byte leashSeq = 0;
         // WO-134: the scripted host world
         var bodies = new Dictionary<string, List<Wo134Rules.Item>>(StringComparer.Ordinal);
+        var liveLoot = bot?.BaselineEvents == true ? new BotHostLiveLoot(bodies) : null;
         var witems = new List<(Guid Cls, float X, float Y, float Z, bool Taken)>();
         var npcFlags = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);   // WO-135: a running npc stream's flags, changeable
         var npcHp = new System.Collections.Concurrent.ConcurrentDictionary<string, float>(StringComparer.Ordinal);   // WO-147: ... and its hp (a dead row carries 0)
@@ -1248,7 +1249,7 @@ static class Host125
                 {
                     var f = la.Text.Split(' ');
                     var key = (la.Kind, la.Tok);
-                    bool remember = bot is not null && la.Kind is Protocol.LootAskItemTake or Protocol.LootAskBodyTake;
+                    bool remember = bot is not null && la.Kind is Protocol.LootAskItemTake or Protocol.LootAskBodyTake or Protocol.LootAskTakeReq;
                     async Task SendPickup(LootMsg reply)
                     {
                         if (peer is null) { await W(reply.BuildUp(Protocol.LootHostUp, src)); return; }
@@ -1259,10 +1260,11 @@ static class Host125
                     if (bot is not null)
                     {
                         var scope = botSessions!.ReadyFor(peer);
-                        if (scope is null || scope.Peer.Id != src || !BotPickupRequest(la.Kind, f)) continue;
+                        if (scope is null || scope.Peer.Id != src || !BotPickupRequest(la.Kind, f, liveLoot is not null)) continue;
                         if (pickupJoin != scope)
                         {
                             pickupReplies.Clear();
+                            liveLoot?.CancelPending();
                             pickupJoin = scope;
                         }
                         if (remember && pickupReplies.TryGetValue(key, out var previous))
@@ -1282,6 +1284,11 @@ static class Host125
                     {
                         case Protocol.LootAskBodyOpen:
                         {
+                            if (liveLoot is not null)
+                            {
+                                foreach (var list in liveLoot.List(f[0], la.Tok)) await SendPickup(list);
+                                break;
+                            }
                             var items = bodies.GetValueOrDefault(f[0]);
                             string bst = items is null ? $"{f[0]} open 2 1 1 -" : $"{f[0]} open 1 1 1 {Wo134Rules.FormatItems(items)}";
                             await SendPickup(new LootMsg(Protocol.LootHostBodyState, la.Tok, bst));
@@ -1299,6 +1306,20 @@ static class Host125
                             Say($"  -> TakeResult {v}");
                             break;
                         }
+                        case Protocol.LootAskTakeReq when liveLoot is not null:
+                        {
+                            var verdict = liveLoot.Reserve(la.Tok, f[0], f[1], Guid.Parse(f[2]), int.Parse(f[3], CultureInfo.InvariantCulture));
+                            await ReplyPickup(verdict);
+                            Say($"BOT-T4 role=host synthetic_loot=verdict peer={src} token={la.Tok} body={f[0]} result={(verdict.Text.StartsWith("grant ", StringComparison.Ordinal) ? "grant" : "refuse")}");
+                            break;
+                        }
+                        case Protocol.LootAskTakeAck when liveLoot is not null:
+                            if (liveLoot.Settle(la.Tok, f[0], f[1] == "applied"))
+                            {
+                                foreach (var list in liveLoot.List(f[0], 0)) await SendPickup(list);
+                                Say($"BOT-T4 role=host synthetic_loot=game_receipt peer={src} token={la.Tok} body={f[0]} result={f[1]}");
+                            }
+                            break;
                         case Protocol.LootAskBodyPut:
                             if (bodies.TryGetValue(f[0], out var pitems)) pitems.Add(new Wo134Rules.Item(Guid.Parse(f[1]), int.Parse(f[2], CultureInfo.InvariantCulture), float.Parse(f[3], CultureInfo.InvariantCulture), false));
                             break;
@@ -1406,7 +1427,7 @@ static class Host125
         return bot is null || Volatile.Read(ref played) != 0 && !roleLost ? 0 : 1;
     }
 
-    private static bool BotPickupRequest(byte kind, string[] fields) => kind switch
+    private static bool BotPickupRequest(byte kind, string[] fields, bool live) => kind switch
     {
         Protocol.LootAskItemTake => fields.Length is >= 4 and <= 6 && Wo134Rules.TryClass(fields[0], out _)
             && Wo134Rules.TryCoord(fields[1], out _) && Wo134Rules.TryCoord(fields[2], out _) && Wo134Rules.TryCoord(fields[3], out _)
@@ -1414,6 +1435,10 @@ static class Host125
         Protocol.LootAskBodyOpen => fields.Length == 1 && Wo134Rules.BodyName.IsMatch(fields[0]),
         Protocol.LootAskBodyTake or Protocol.LootAskBodyPut => fields.Length == 4 && Wo134Rules.BodyName.IsMatch(fields[0])
             && Wo134Rules.TryClass(fields[1], out _) && Wo134Rules.TryAmount(fields[2], out _) && Wo134Rules.TryHealth(fields[3], out _),
+        Protocol.LootAskTakeReq => live && fields.Length == 4 && Wo134Rules.BodyName.IsMatch(fields[0])
+            && Wo217LootRules.ItemId.IsMatch(fields[1]) && Wo134Rules.TryClass(fields[2], out _) && Wo134Rules.TryAmount(fields[3], out _),
+        Protocol.LootAskTakeAck => live && fields.Length == 2 && Wo134Rules.BodyName.IsMatch(fields[0])
+            && fields[1] is "applied" or "cancel",
         _ => false
     };
 }

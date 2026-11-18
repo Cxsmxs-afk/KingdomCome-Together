@@ -69,12 +69,16 @@ public static class VerdictRules
 
     private const string T3 = "MP-T3-STATS";
     private const string W136 = "MP-WO136-STATS";
+    private const string WorldEventFault = "MP-WORLD-EVENT-FAULT";
+    private const string WorldEventScope = "MP-WORLD-EVENT-SCOPE";
     private const string StepPair = "MP-RP-STEP";
     private const string OwnerViolation = "WO221-OWNER-VIOLATION";
     private static readonly string[] LoadPhases = ["Menu", "Offer", "Load", "Reconstruct", "Settle", "Play", "Exit"];
     // The agent's TeeTextWriter supplies the wall clock and optional shared-clock metadata.
     private const string AgentPrefix = @"^(?:\d\d:\d\d:\d\d(?:\.\d+)? (?:m=\d+ off=(?:[+-]?\d+|\?) )?)?";
     private static readonly Regex AgentPrefixOnly = new(AgentPrefix + @"\z", RegexOptions.Compiled);
+    private static readonly Regex NativePrefixOnly = new(@"^(?:\[\d\d:\d\d:\d\d\.\d{3}\] t\d+ L[0-9a-f]{6} )?\z",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex AgentSessionRole = new(AgentPrefix
         + @"MP-WO137-STATS role=(host|joiner)(?: |$)", RegexOptions.Compiled);
     private static readonly Regex BotProgress = new(@"^(?:SYNTH125 t=[\d.]+s )?BOT-T4 role=(host|joiner) (started=1|ready=1|complete=[01]|refused=\S+|stopped=\S+)(?: |$)", RegexOptions.Compiled);
@@ -190,6 +194,7 @@ public static class VerdictRules
         rows.AddRange(PresentationCounters.Select(rule => EvaluatePresentation(rule, samples)));
         rows.Add(ActionPlayback(samples));
         rows.AddRange(LoadSequence(samples));
+        rows.AddRange(WorldEvents(samples));
         rows.Add(BotPlan(input));
 
         // Traffic observable on this machine is required for green. Optional
@@ -438,6 +443,65 @@ public static class VerdictRules
             maximum > 0 ? $"{source} hat veraltete Frames verworfen" : $"Kein veralteter Frame beim {source} beobachtet");
     }
 
+    private static IEnumerable<VerdictRow> WorldEvents(IReadOnlyList<Sample> samples)
+    {
+        var reports = samples.Where(sample => sample.Marker is T3 or WorldEventFault or WorldEventScope
+            && sample.Origin is "Agent" or "DLL-Spiegel" && sample.Fields.GetValueOrDefault("section") == "events"
+            && sample.Number("evt_world") is > 0 and <= uint.MaxValue
+            && sample.Number("evt_gen") > 0 && sample.Number("evt_snapshot") is > 0 and <= uint.MaxValue
+            && sample.Number("evt_recipient") is >= 0 and <= byte.MaxValue
+            && (sample.Marker != WorldEventScope || sample.Number("evt_scope_active") == 0 && sample.Number("evt_receiver") > 0)).ToList();
+        var latest = reports.LastOrDefault(sample => sample.Origin == "Agent") ?? reports.LastOrDefault();
+        var receiver = latest?.Number("evt_receiver");
+        if (latest?.Marker == WorldEventScope || (receiver > 0 && reports.Any(sample => sample.Marker == WorldEventScope
+                && sample.Role == latest!.Role && sample.Number("evt_receiver") == receiver)))
+            latest = null; // A heartbeat captured just before retirement may be written afterward.
+        var version = latest?.Number("baseline_version");
+        bool baselineApplied = version is > 0 and <= ushort.MaxValue;
+        yield return baselineApplied
+            ? new("baseline_version", VerdictStatus.Green, Format(version.GetValueOrDefault(), ""), "Empfänger meldet angewendeten Startzustand")
+            : Missing("baseline_version", "Kein angewendeter Startzustand gemeldet");
+        var baselineMs = latest?.Number("baseline_ms");
+        yield return baselineApplied && baselineMs.HasValue
+            ? new("baseline_ms", VerdictStatus.Grey, Format(baselineMs.Value, " ms"), "Empfang bis Anwendung des Startzustands, ohne Grenzwert")
+            : Missing("baseline_ms", "Keine Dauer für angewendeten Startzustand gemessen");
+
+        foreach (var (id, evidence) in new[] {
+            ("evt_sent", "Relay hat Ereignisse zur ersten Übertragung angenommen"), ("evt_applied", "Empfänger meldet angewendete Ereignisse"),
+            ("evt_acked", "Relay hat Anwendungsbestätigungen erhalten"), ("evt_retx", "Relay hat Wiederholungen zur Übertragung angenommen")
+        })
+        {
+            var count = latest?.Number(id);
+            yield return count.HasValue ? new(id, VerdictStatus.Grey, Format(count.Value, ""), evidence + ", ohne Grenzwert")
+                : Missing(id, "Kein Zähler für den aktuellen Startzustand");
+        }
+
+        // A zero is a pass only after the same recipient installed its
+        // baseline and the relay observed ACKs for the complete measured send.
+        var sent = latest?.Number("evt_sent");
+        bool covered = baselineApplied && sent > 0 && latest!.Number("evt_acked") == sent && latest.Number("evt_applied") == sent;
+        var gap = reports.Max(sample => sample.Number("evt_gap"));
+        var localDrop = reports.Max(sample => sample.Number("evt_dropped"));
+        var writerDrop = reports.Max(sample => sample.Number("evt_sender_dropped"));
+        yield return gap > 0 ? new("evt_gap", VerdictStatus.Red, Format(gap.Value, ""), "Empfänger meldet eine nicht aufgelöste Reihenfolgelücke")
+            : WorldEventZero("evt_gap", latest?.Number("evt_gap") == 0, covered);
+        if (localDrop > 0 || writerDrop > 0)
+        {
+            var reasons = new List<string>();
+            if (localDrop > 0) reasons.Add("Empfänger " + Format(localDrop.Value, ""));
+            if (writerDrop > 0) reasons.Add("Relay " + Format(writerDrop.Value, ""));
+            yield return new("evt_dropped", VerdictStatus.Red, string.Join(", ", reasons), "Endgültiger Verlust gemeldet");
+        }
+        else
+            yield return WorldEventZero("evt_dropped", latest?.Number("evt_dropped") == 0 && latest.Number("evt_sender_dropped") == 0, covered);
+    }
+
+    private static VerdictRow WorldEventZero(string id, bool measured, bool covered) =>
+        measured ? new(id, covered ? VerdictStatus.Green : VerdictStatus.Grey, "0",
+            covered ? "Gesendete Ereignisse im selben Startzustand angewendet und bestätigt" :
+                "Vollständige Anwendung und Bestätigung fehlen im Messfenster")
+            : Missing(id, "Kein gültiger Zähler für den aktuellen Startzustand");
+
     private static bool HasOwnerCounters(Sample sample) => sample.Number("owner_handovers").HasValue
         && sample.Number("owner_denied_sets").HasValue;
 
@@ -479,6 +543,16 @@ public static class VerdictRules
             {
                 start = line.IndexOf(W136 + " ", StringComparison.Ordinal);
                 marker = W136;
+                if (start < 0)
+                {
+                    start = line.IndexOf(WorldEventFault + " ", StringComparison.Ordinal);
+                    marker = WorldEventFault;
+                    if (start < 0)
+                    {
+                        start = line.IndexOf(WorldEventScope + " ", StringComparison.Ordinal);
+                        marker = WorldEventScope;
+                    }
+                }
             }
             if (start < 0 || (start > 0 && line[start - 1] != ' ')) continue;
             if (!fromNativeLog && start > 0 && !AgentPrefixOnly.IsMatch(line.AsSpan(0, start))) continue;
@@ -495,6 +569,7 @@ public static class VerdictRules
                 }
             }
             if (fields.Count == 0) continue;
+            if (fromNativeLog && fields.GetValueOrDefault("section") == "events" && !NativePrefixOnly.IsMatch(line.AsSpan(0, start))) continue;
 
             if (marker == W136)
             {

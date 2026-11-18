@@ -3990,6 +3990,9 @@ def run(name, args):
     if name in ('reload', 'weatherload'):
         import scen_s3_load
         return scen_s3_load.run(sys.modules[__name__], name, args)
+    if name in ('pickup', 'corpse', 'dialog'):
+        import scen_s3_events
+        return scen_s3_events.run(sys.modules[__name__], name, args)
     r = Run(name, include_joiner=name != 'botjoiner')
     plan = {
         'join': [('join', s_join(r))],

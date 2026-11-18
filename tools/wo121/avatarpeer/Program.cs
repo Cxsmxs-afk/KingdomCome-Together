@@ -125,6 +125,7 @@ static partial class P
                 IOException or UnauthorizedAccessException => "io-or-join",
                 _ => ex.GetType().Name
             };
+            if (ex is FormatException && (a.Contains(BaselineFlag) || a.Contains(DialogFlag))) Console.Error.WriteLine(ex.Message);
             Console.Error.WriteLine($"BOT-T4 role=joiner complete=0 reason={reason}");
             return 1;
         }
@@ -140,9 +141,9 @@ static partial class P
         SkewMs = long.Parse(Arg(a, "--skew-ms", "0"), CultureInfo.InvariantCulture);
         string release = bot?.WireVersion ?? File.ReadAllText(FindUp("VERSION")).Trim();
         var steps = new List<Step>(); double endT = 60;
-        BotPlan? plan = bot is null ? null : bot.Scenario is string scenario
+        BotPlan? plan = bot is null || bot.DialogVotes ? null : bot.Scenario is string scenario
             ? ReadBotPlan(File.ReadLines(scenario)) : DefaultBotPlan(bot.Origin ?? (0, 0, 0));
-        Guid rangedClass = bot is not null && plan!.Steps.Any(step => step.F[0] is "ranged" or "bow_equip")
+        Guid rangedClass = bot is not null && plan?.Steps.Any(step => step.F[0] is "ranged" or "bow_equip") == true
             ? FindBotRangedClass(bot) : Guid.Empty;
         foreach (var raw in bot is null ? File.ReadLines(Arg(a, "--scenario", "scenario.txt")) : Array.Empty<string>())
         {
@@ -174,6 +175,12 @@ static partial class P
         BotContext? botContext = null;
         if (bot is not null)
         {
+            if (bot.DialogVotes)
+            {
+                var context = await PrepareBotAsync(st, myId, needsOrigin: false, token: hard, dialogOnly: true);
+                Console.WriteLine($"BOT-T4 role=joiner ready=1 world={context.World} mode=dialog-votes");
+                return await RunBotDialogueAsync(st, myId, context, hard);
+            }
             bool needsOrigin = bot.Scenario is null && !bot.Origin.HasValue;
             botContext = await PrepareBotAsync(st, myId, needsOrigin, hard);
             if (needsOrigin) plan = DefaultBotPlan(botContext.Origin!.Value);

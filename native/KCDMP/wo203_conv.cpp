@@ -26,6 +26,9 @@
 //      get-or-create the engine's dialogue and barks call, C_Actor +0x210 on the build the research read); bit 1 -- eid 0 is the
 //      entity named <name> here (the host listening: its own NPC, no copy id).
 #include "wo203.h"
+#include "dialog_vote_rules.h"
+#include "edge_console_rules.h"
+#include "load_sequence.h"
 #include "wo208_rules.h"
 #include "wo201.h"
 #include "motion.h"
@@ -183,6 +186,8 @@ SnapRow g_snap[kMaxRows];
 int g_snapN = 0;
 uint32_t g_snapSeq = 0;
 uint8_t g_snapOnRight = 0;
+void* g_snapSelf = nullptr;
+uint64_t g_snapLoad = 0;
 
 void before_flush(void* self) {
     char* b = nullptr; size_t n = 0;
@@ -198,6 +203,8 @@ void before_flush(void* self) {
         }
     }
     g_snapN = k;
+    g_snapSelf = self;
+    g_snapLoad = loadsequence::stamp();
     g_snapOnRight = wo201vote::last_on_right() ? 1 : 0;
     ++g_snapSeq;
     if (g_vote.on) { g_vote.on = false; c_clears.fetch_add(1); }   // a new set of rows: the old vote is over
@@ -252,9 +259,46 @@ uint8_t op_poll(uint8_t, const uint8_t* body, size_t len, uint8_t* out, size_t c
     return wo163::kROk;
 }
 
+uint8_t confirmed_mark(const uint8_t* body, size_t len, uint8_t* out, size_t* outLen) {
+    dialogvote::Request request;
+    if (!dialogvote::decode(body, len, request)) return wo163::kRBadRequest;
+    *outLen = 1;
+    void* self = hud_self();
+    if (!wo201vote::entry() || !g_origActive ||
+        !dialogvote::matches(request, g_snapSeq, g_snapN, self && self == g_snapSelf) ||
+        !loadsequence::allows(g_snapLoad, loadsequence::Access::Live)) {
+        out[0] = dialogvote::ScopeChanged;
+        return wo163::kROk;
+    }
+
+    const int index = request.index == dialogvote::kClear ? -1 : request.index;
+    const int current = g_activeSelf.load() == self ? g_current.load() : -1;
+    const auto result = edgeconsole::present_dialog_vote(request.token.data(), index, current, g_snapOnRight != 0);
+    if (result != edgeconsole::Result::Returned) {
+        out[0] = result == edgeconsole::Result::Uncertain ? dialogvote::Uncertain : dialogvote::NotEntered;
+        return wo163::kROk;
+    }
+
+    // An engine refresh can occur during the Lua call. Preserve the new
+    // snapshot's bookkeeping and wait for the Lua half's receipt either way.
+    if (g_snapSeq == request.snapshot && g_snapSelf == self) {
+        g_vote = Vote{};
+        if (index < 0) c_clears.fetch_add(1);
+        else {
+            g_vote.on = true;
+            g_vote.index = index;
+            std::strcpy(g_vote.text, g_snap[index].text);
+            c_marks.fetch_add(1);
+        }
+    }
+    out[0] = dialogvote::Submitted;
+    return wo163::kROk;
+}
+
 uint8_t op_mark(uint8_t, const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
     *outLen = 0;
     if (len < 3 || cap < 1) return wo163::kRBadRequest;
+    if (dialogvote::typed(body, len)) return confirmed_mark(body, len, out, outLen);
     const uint8_t index = body[1];
     const uint8_t nl = body[2];
     if (len != 3u + nl) return wo163::kRBadRequest;

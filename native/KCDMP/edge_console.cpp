@@ -2,6 +2,9 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #include "edge_console_rules.h"
+#include "dialog_vote_rules.h"
+
+#include <cstdio>
 #include "anchors.h"
 #include "engine.h"
 #include "fault_guard.h"
@@ -35,10 +38,10 @@ void resolve() {
     logf("S2-EDGE-CONSOLE slot=0x%zX readiness=%s", g_executeSlot, reason);
 }
 
-Result run(const Command& command) {
+Result run(const Command& command, bool requireProbe = true) {
     const unsigned long gameThread = main_thread::main_thread_id();
     if (!gameThread || GetCurrentThreadId() != gameThread || g_faulted) return Result::NotEntered;
-    if (command.kind == Kind::Lua && !g_probeReturned) return Result::NotEntered;
+    if (requireProbe && command.kind == Kind::Lua && !g_probeReturned) return Result::NotEntered;
     resolve();
     void* console = g_executeSlot ? engine::console() : nullptr;
     if (!console) return Result::NotEntered;
@@ -80,4 +83,19 @@ uint8_t handle(uint8_t, const uint8_t* body, size_t len, uint8_t* out, size_t ca
 const bool kRegistered = wo203::reg_op(kOp, handle) && wo203::reg_install("edge-console", resolve);
 
 } // namespace
+
+Result present_dialog_vote(const char* token, int index, int current, bool right) {
+    if (!token || std::strlen(token) != dialogvote::kTokenBytes) return Result::NotEntered;
+    for (const char* at = token; *at; ++at)
+        if (!dialogvote::token_character(static_cast<uint8_t>(*at))) return Result::NotEntered;
+    Command command{Kind::Lua, {}};
+    const int n = std::snprintf(command.text.data(), command.text.size(),
+        "#if KCD2MP_W204CommitVote then KCD2MP_W204CommitVote(\"%s\",%d,%d,%s) end",
+        token, index, current, right ? "true" : "false");
+    if (n < 0 || static_cast<size_t>(n) >= command.text.size()) return Result::NotEntered;
+    // Console slot and Main are still verified. A detached log nonce must
+    // prove this exact narrow function actually succeeded in Lua.
+    return run(command, false);
+}
+
 } // namespace kcdmp::edgeconsole

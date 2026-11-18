@@ -27,7 +27,11 @@ public partial class GameBridge
     private bool W206ResearchDeathFromHealth =>
         Wo206Rules.ResearchEffective(W206("research_death_from_health"), Environment.GetEnvironmentVariable(Wo206Rules.ResearchEnv));
 
-    private void Wo206SyncPublic() => Wo206Applied.SetEpochs(_w206.World, _w206.Join);
+    private void Wo206SyncPublic()
+    {
+        Wo206Applied.SetEpochs(_w206.World, _w206.Join);
+        if (W206Host) LoadSequenceObserveHostWorld(_w206.World);
+    }
 
     // ---------------------------------------------------------------- the reader
 

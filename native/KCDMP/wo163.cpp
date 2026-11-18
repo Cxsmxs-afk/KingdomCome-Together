@@ -43,6 +43,7 @@ namespace {
 std::atomic<uint32_t> c_asked{0}, c_answeredHostile{0}, c_answeredNot{0}, c_unanswered{0};
 std::atomic<uint64_t> g_t3ToldAtMs[3]{};
 std::atomic<uint64_t> g_t3LoadToldAtMs[3]{};
+std::atomic<uint64_t> g_t3WorldSyncToldAtMs[3]{};
 
 uint32_t player_eid() {
     void* e = engine::entity_by_id(0x7777);
@@ -114,17 +115,18 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             if (len == 3 && body[1] == rpmeasure::kClockControl)
                 return rpmeasure::configure_clock(body[2]) ? kROk : kRBadRequest;
             const bool load = body[1] == t3stats::kLoadCommand;
-            const size_t roleAt = load ? 2 : 1;
+            const bool events = body[1] == t3stats::kWorldSyncMirror;
+            const size_t roleAt = load || events ? 2 : 1;
             if (len <= roleAt || !t3stats::valid(body + roleAt, len - roleAt)) return kRBadRequest;
             const uint8_t role = body[roleAt];
             const uint64_t now = GetTickCount64();
-            auto& last = load ? g_t3LoadToldAtMs[role] : g_t3ToldAtMs[role];
+            auto& last = load ? g_t3LoadToldAtMs[role] : events ? g_t3WorldSyncToldAtMs[role] : g_t3ToldAtMs[role];
             uint64_t was = last.load();
             if (was && now - was < 60000) return kROk;
             if (!last.compare_exchange_strong(was, now)) return kROk;
             const std::string counters(reinterpret_cast<const char*>(body + roleAt + 1), len - roleAt - 1);
             logf("MP-T3-STATS origin=dll source=agent role=%s%s %s", role == 1 ? "host" : "joiner",
-                 load ? " section=load" : "", counters.c_str());
+                 load ? " section=load" : events ? " section=events" : "", counters.c_str());
             return kROk;
         }
         case kOpSkirmishHostile: {

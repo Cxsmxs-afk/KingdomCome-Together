@@ -338,6 +338,17 @@ public class TcpBroadcastService
                 break;
         }
         if (dest is null || ReferenceEquals(dest, source)) { why = "no-target"; return null; }
+        if (fromHost && downType == Protocol.W203Down && body.Length > Protocol.JoinHeaderLen &&
+            LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var message) && message.Kind == Protocol.W203Epoch)
+        {
+            var words = message.Text.Split('|');
+            if (words.Length >= 4 && words[0] == "v1" && words[3] != "ack" &&
+                uint.TryParse(words[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out uint world))
+            {
+                source.ObserveWorldSyncEpoch(source.Id, world);
+                dest.ObserveWorldSyncEpoch(source.Id, world);
+            }
+        }
         dest.EnqueueSenderFact(downType, source.Id, body, HostStamp(source, senderTicks));
         return dest;
     }

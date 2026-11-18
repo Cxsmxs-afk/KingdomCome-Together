@@ -54,6 +54,7 @@ public partial class GameBridge
     /// <summary>The processor: true = this frame waits for the world (the newest per NPC / per peer is kept).</summary>
     private bool Wo136Defer(in InFrame frame)
     {
+        if (WorldSyncEffective && frame.LoadScoped) return !LoadSequenceWritable || !WorldSyncReady;
         if (!(LoadSequenceEnabled ? frame.LoadScoped : Wo136HeldType(frame.Type)) || !Wo136Holding) return false;
         lock (_w136Gate)
         {
@@ -98,6 +99,7 @@ public partial class GameBridge
     /// <summary>The independent receive-lifetime tick: replay only into its still-live connection.</summary>
     private void Wo136ReplayIfReleased(ChannelWriter<InFrame> writer, CancellationToken ct)
     {
+        if (WorldSyncEffective) return;
         if (ct.IsCancellationRequested || !ReferenceEquals(_frameWriter, writer)) return;
         if (!_w136WasHolding || Wo136Holding) return;
         List<InFrame> replay;

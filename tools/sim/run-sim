@@ -26,6 +26,7 @@ int rp_combat_tests(int* passed);
 int rp_body_action_tests(int* passed);
 int visual_damage_tests(int* passed);
 int load_sequence_tests(int* passed);
+int wo203_conv_tests(int* passed);
 
 bool run_tests(const char* name, int (*suite)(int*)) {
     int passed = 0;
@@ -44,6 +45,7 @@ int main() {
     passed &= run_tests("remote knockout and ranged animation", &rp_body_action_tests);
     passed &= run_tests("visual replica damage authority", &visual_damage_tests);
     passed &= run_tests("world load scope and frame fence", &load_sequence_tests);
+    passed &= run_tests("ordered dialog votes and apply receipts", &wo203_conv_tests);
     return passed ? 0 : 1;
 }
 EOF
@@ -52,6 +54,7 @@ EOF
         native/tests/rp_timeline_tests.cpp native/tests/rp_timeline_action_tests.cpp \
         native/tests/rp_controller_tests.cpp native/tests/rp_combat_tests.cpp \
         native/tests/rp_body_action_tests.cpp native/tests/visual_damage_tests.cpp native/tests/load_sequence_tests.cpp \
+        native/tests/wo203_conv_tests.cpp \
         -o "$native_tmp/native-contracts"
     if ! native_result="$("$native_tmp/native-contracts")"; then
         printf '%s\n' "$native_result" >&2
@@ -60,6 +63,7 @@ EOF
     printf '%s\n' "$native_result"
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_rpcombat.py'
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_load_sequence.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_s3_events.py'
 fi
 dotnet run --project tools/sim/KcdMp.Sim/KcdMp.Sim.csproj -c Release -- --label "$label" --out "$out" "${extra[@]}"
 if [ "$label" = ci ]; then

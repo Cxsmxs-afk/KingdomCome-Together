@@ -68,8 +68,11 @@ public class T3AuthorityReportTests
     [InlineData(false, 2, false, 55, true, true)]
     [InlineData(true, 1, false, 55, true, true, true)]
     [InlineData(false, 2, false, 55, true, true, true)]
+    [InlineData(true, 1, false, 55, true, true, true, true)]
+    [InlineData(false, 2, false, 55, true, true, true, true)]
     public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role,
-        bool truncated, int statsFields, bool controllerSupported = false, bool combatSupported = false, bool loadSupported = false)
+        bool truncated, int statsFields, bool controllerSupported = false, bool combatSupported = false, bool loadSupported = false,
+        bool events = false)
     {
         string name = "t3r-" + Guid.NewGuid().ToString("N")[..16];
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -82,12 +85,25 @@ public class T3AuthorityReportTests
         Set(b, "_combat", pipe); Set(b, "_combatRoleApplied", true); Set(b, "_isDamageAuthority", host);
         Set(b, "_sharedWorld", true); Set(b, "_hostAuthority", true); Set(b, "_joinedWorld", true);
         Set(b, "_hostModeKnown", true); Set(b, "_hostSharedWorld", true);
+        long eventReceiver = 0;
         if (loadSupported)
         {
             Set(b, "_loadSequenceRuntime", true);
             Set(b, "_staleGenerationDropped", 2L);
             var load = (WorldLoadSequence)typeof(GameBridge).GetField("_worldLoad", Private)!.GetValue(b)!;
             Assert.True(load.TryBegin(0, WorldLoadStart.AdoptLoadedWorld, hostWorld: 58));
+        }
+        if (events)
+        {
+            var metrics = (WorldSyncMetrics)typeof(GameBridge).GetField("_worldSyncMetrics", Private)!.GetValue(b)!;
+            var scope = new WorldSyncScope(58, 18);
+            object receiver = new();
+            metrics.Track(receiver);
+            metrics.Begin(receiver, scope, 17, role);
+            metrics.BaselineApplied(receiver, scope, 17, 1, 24);
+            metrics.EventApplied(receiver, scope, 17);
+            metrics.RecordSender(receiver, new WorldSyncStatus(scope, 17, role, new(1, 1, 2, 0)));
+            eventReceiver = metrics.Snapshot!.Value.Receiver;
         }
         var counters = (ConcurrentDictionary<string, long>)typeof(GameBridge).GetField("_t3Counters", Private)!.GetValue(b)!;
         counters["postload_timeouts"] = 3;
@@ -142,6 +158,15 @@ public class T3AuthorityReportTests
             Assert.DoesNotContain("owner_violations=", part);
             await Reply(server, mirrorSequence++, Protocol.T3OpStats, stop.Token);
         }
+        if (events)
+        {
+            var eventMirror = await Read(server, stop.Token);
+            Assert.Equal(new byte[] { Protocol.T3OpStats, Protocol.T3WorldSyncStatsMirror, role }, eventMirror[..3]);
+            string part = Encoding.ASCII.GetString(eventMirror, 3, eventMirror.Length - 3);
+            Assert.Equal("baseline_ms=24 baseline_version=1 evt_acked=1 evt_applied=1 evt_dropped=0 evt_gap=0 evt_gen=18 " +
+                $"evt_receiver={eventReceiver} evt_recipient={role} evt_retx=2 evt_sender_dropped=0 evt_sent=1 evt_snapshot=17 evt_world=58", part);
+            await Reply(server, mirrorSequence++, Protocol.T3OpStats, stop.Token);
+        }
         var mirror = await Read(server, stop.Token);
         Assert.Equal(Protocol.T3OpStats, mirror[0]); Assert.Equal(role, mirror[1]);
         Assert.InRange(mirror.Length, 4, 6402); // actual complete generic body, including op and role
@@ -149,6 +174,7 @@ public class T3AuthorityReportTests
         Assert.InRange(fields.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length, 1, 160);
         Assert.True(T3AuthorityCounters.TryRead(fields, out var actual));
         Assert.DoesNotContain("load_phase=", fields);
+        Assert.DoesNotContain("evt_applied=", fields);
         Assert.Equal(truncated ? 9 : 44, actual["decision_blocked"]);
         Assert.Equal(truncated ? 8 : 60, actual["npc_hidden"]);
         Assert.Contains("postload_timeouts=3", fields);

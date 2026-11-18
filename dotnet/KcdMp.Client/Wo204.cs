@@ -1,6 +1,9 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+using System.Buffers.Binary;
+using System.Text;
+
 namespace KcdMp.Client;
 
 /// <summary>
@@ -245,6 +248,20 @@ public static class Wo204Rules
             || !int.TryParse(f[2], System.Globalization.NumberStyles.None, Inv, out decId)) return false;
         if (f[3] == "clear") return true;
         return int.TryParse(f[3], System.Globalization.NumberStyles.None, Inv, out index) && index < 8;
+    }
+
+    /// <summary>Wo163 op 92 arguments for the exact native HUD snapshot and the staged Lua vote.</summary>
+    public static byte[] ConfirmedVoteMark(uint snapshot, int index, string token)
+    {
+        if (snapshot == 0 || index is < -1 or >= 8 || token.Length != 32 ||
+            !token.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9'))
+            throw new ArgumentException("The dialog vote requires a scoped snapshot, row and lowercase receipt token.");
+        var args = new byte[38];
+        args[0] = index < 0 ? byte.MaxValue : (byte)index;
+        args[1] = byte.MaxValue; // typed marker replaces the legacy name length
+        BinaryPrimitives.WriteUInt32LittleEndian(args.AsSpan(2, 4), snapshot);
+        Encoding.ASCII.GetBytes(token, args.AsSpan(6));
+        return args;
     }
 
     /// <summary>ConvChosen (kind 9): "v1|cid|decId|index".</summary>

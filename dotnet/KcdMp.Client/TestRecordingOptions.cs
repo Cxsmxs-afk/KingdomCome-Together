@@ -62,6 +62,14 @@ internal sealed class TestRecordingOptions(string? path)
 
     public static bool AllowsFrame(byte type, ReadOnlySpan<byte> body)
     {
+        if (type == Protocol.WorldEventDown)
+            return WorldSyncWire.TryReadEvent(body, out var item) && AllowsFrame(item.Type, item.Payload);
+        if (type == Protocol.WorldBaselineDown)
+            return WorldSyncWire.TryReadBaseline(body, out var chunk) &&
+                (chunk.Payload.Length == 0 || (chunk.Payload[0] is not (Protocol.WorldBaselineDown or Protocol.WorldEventDown or
+                    Protocol.WorldSyncUp or Protocol.WorldSyncStatusDown) && AllowsFrame(chunk.Payload[0], chunk.Payload.AsSpan(1))));
+        if (type == Protocol.WorldSyncUp) return WorldSyncWire.TryReadSync(body, out _);
+        if (type == Protocol.WorldSyncStatusDown) return WorldSyncStatusWire.TryRead(body, out _);
         if (type is Protocol.PresentationPoseDown or Protocol.PresentationActionDown)
         {
             return PresentationTimeWire.TryRead(type, body, out _, out byte inner, out int offset) &&
@@ -76,8 +84,11 @@ internal sealed class TestRecordingOptions(string? path)
         {
             int header = Protocol.JoinHeaderLen + (type == Protocol.W164Down ? 1 : 0);
             return body.Length > header && LootMsg.TryDecode(body[header..], out var msg) &&
-                msg.Kind is Protocol.W164RangedStep or Protocol.W164Clock or Protocol.W164CorpseAsk or Protocol.W164CorpseAnswer;
+                msg.Kind is Protocol.W164RangedStep or Protocol.W164Clock or Protocol.W164Weather or Protocol.W164CorpseAsk or Protocol.W164CorpseAnswer;
         }
+        if (type == Protocol.ConvDown)
+            return body.Length > 1 + Protocol.JoinHeaderLen &&
+                LootMsg.TryDecode(body[(1 + Protocol.JoinHeaderLen)..], out var message) && message.Kind == Protocol.ConvVote;
         return type is Protocol.Position or Protocol.Ghost or Protocol.NpcStateUp or Protocol.NpcStateDown or
             Protocol.NpcStateQDown or Protocol.ActionUp or Protocol.ActionDown or Protocol.PlayerStateUp or Protocol.PlayerStateDown or
             Protocol.PlayerDeathUp or Protocol.PlayerDeathDown or Protocol.PlayerRespawnedUp or Protocol.PlayerRespawnedDown or

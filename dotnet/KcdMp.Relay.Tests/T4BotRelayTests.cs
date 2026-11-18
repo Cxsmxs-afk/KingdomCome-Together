@@ -245,6 +245,63 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
         await ExpectPickupAsync(replacement, replacementHost, Bow, 52, "ok");
     }
 
+    [Fact]
+    public async Task World_events_bot_host_sends_corpse_inventory_verdict_and_settles_actual_peer_receipts()
+    {
+        await WaitForAsync(() => Clients.ReadyClientCount == 0, "Previous relay peers did not disconnect");
+        using var fixture = new BotFixture();
+        byte[] save = BotFixture.Save();
+        string savePath = fixture.Write("world.whs", save);
+        const string body = "test_corpse";
+        string plan = fixture.Write("host-plan.txt", $"setup bodyset {body} {Item:D}:2:1\nat 0 pos 1 2 3\n");
+        await using var bot = T4BotTools.StartBaselineEvents("SynthPeer", true, "--test-bot", "--test-baseline-events",
+            "--join-host125", savePath, "--bot-plan", plan, "--world-time", "28800", "--port", Port,
+            "--name", "t4-corpse-host", "--duration", "22");
+        await WaitForAsync(() => Clients.DamageAuthority?.Name == "t4-corpse-host", "Bot-Host did not acquire relay authority", bot);
+        await using var joiner = await Peer.ConnectAsync(relay.TcpPort, "t4-corpse-joiner");
+        Assert.Equal(new byte[] { 0 }, await joiner.ReadUntilAsync(Protocol.CombatRole, Wait));
+        byte host = await LoadHostedWorldAsync(joiner, fixture, save, 127);
+
+        Task Ask(byte kind, uint token, string text) =>
+            joiner.SendRawAsync(new LootMsg(kind, token, text).BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost));
+        async Task<LootMsg> Expect(byte kind)
+        {
+            while (true)
+            {
+                var (source, _, payload) = ReadJoin(await joiner.ReadUntilAsync(Protocol.LootHostDown, Wait));
+                Assert.Equal(host, source);
+                Assert.True(LootMsg.TryDecode(payload, out var message));
+                if (message.Kind == kind) return message;
+            }
+        }
+        async Task<Wo217LootRules.Item> ItemList()
+        {
+            var list = await Expect(Protocol.LootHostBodyList);
+            string[] fields = list.Text.Split(' ');
+            Assert.Equal(body, fields[0]);
+            return Assert.Single(Wo217LootRules.ParseItems(fields[4])!);
+        }
+
+        await Ask(Protocol.LootAskBodyOpen, 70, body);
+        var initial = await ItemList();
+        Assert.Equal(2, initial.Amt);
+        Assert.Equal(Item, initial.Cls);
+        string take = $"{body} {initial.Id} {Item:D} 1";
+        await Ask(Protocol.LootAskTakeReq, 71, take);
+        Assert.Equal(new LootMsg(Protocol.LootHostTakeVerdict, 71, $"grant {body} {initial.Id} - 0"),
+            await Expect(Protocol.LootHostTakeVerdict));
+        await Ask(Protocol.LootAskTakeAck, 71, $"{body} cancel");
+        Assert.Equal(initial, await ItemList());
+
+        await Ask(Protocol.LootAskTakeReq, 72, take);
+        var granted = await Expect(Protocol.LootHostTakeVerdict);
+        Assert.Equal(new LootMsg(Protocol.LootHostTakeVerdict, 72, $"grant {body} {initial.Id} - 0"), granted);
+        await Ask(Protocol.LootAskTakeReq, 72, take); // wire retry of the same transaction
+        Assert.Equal(granted, await Expect(Protocol.LootHostTakeVerdict));
+        await Ask(Protocol.LootAskTakeAck, 72, $"{body} applied");
+        Assert.Equal(initial with { Amt = 1 }, await ItemList());
+    }
+
     private static byte[] Pickup(Guid item, uint token) => new LootMsg(Protocol.LootAskItemTake, token, $"{item:D} 1 2 3 0")
         .BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost);
 

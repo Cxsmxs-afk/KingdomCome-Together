@@ -25,6 +25,8 @@ public sealed class DeathMarkerRevisions
     { lock (_gate) return _entries.TryGetValue((owner, world, id), out var e) ? e.Fact : null; }
     public bool Current(byte owner, DeathMarkerFact fact)
     { lock (_gate) return _entries.TryGetValue((owner, fact.World, fact.Id), out var e) && e.Fact == fact; }
+    public bool IsApplied(byte owner, DeathMarkerFact fact)
+    { lock (_gate) return _entries.TryGetValue((owner, fact.World, fact.Id), out var e) && e.Applied && e.Fact == fact; }
     public void Applied(byte owner, DeathMarkerFact fact)
     { lock (_gate) if (Current(owner, fact)) _entries[(owner, fact.World, fact.Id)] = new(fact, true); }
     public void Clear(byte owner = 255)

@@ -148,20 +148,24 @@ public partial class GameBridge
         finally { Interlocked.Exchange(ref _p5ReannounceBusy, 0); }
     }
 
-    private async Task P5ReceiveMarkerAsync(byte owner, DeathMarkerFact fact, uint receiveWorld, long receivedPeer, CancellationToken ct)
+    private async Task<bool> P5ReceiveMarkerAsync(byte owner, DeathMarkerFact fact, uint receiveWorld, long receivedPeer, CancellationToken ct)
     {
-        if (!_p5Peers.TryGetValue(owner, out var peer) || !peer.Connected || peer.Serial != receivedPeer) return;
+        if (!_p5Peers.TryGetValue(owner, out var peer) || !peer.Connected || peer.Serial != receivedPeer) return false;
         using var peerLife = CancellationTokenSource.CreateLinkedTokenSource(ct, peer.Token); ct = peerLife.Token;
-        if (receiveWorld == 0 || receiveWorld != fact.World || fact.World != P5LoadedWorld || !_p5PeerRevisions.Observe(owner, fact)) return;
+        if (receiveWorld == 0 || receiveWorld != fact.World || fact.World != P5LoadedWorld || ct.IsCancellationRequested) return false;
+        if (!_p5PeerRevisions.Observe(owner, fact)) return _p5PeerRevisions.IsApplied(owner, fact);
         ulong generation = P1Lifecycle.Current.Generation; long serial = Interlocked.Read(ref _p5ScopeSerial);
-        if (_wo122Stream is not Stream stream) return;
+        if (_wo122Stream is not Stream stream) return false;
         var current = P5Fence(stream, ct, fact.World, generation, serial);
         await _p5MarkerGate.WaitAsync(ct);
         try
         {
-            if (!current() || !_p5PeerRevisions.Current(owner, fact) || !await P5EnsureScopeAsync(ct) || !current()) return;
+            if (!current() || !_p5PeerRevisions.Current(owner, fact) || !await P5EnsureScopeAsync(ct) || !current()) return false;
+            if (_p5PeerRevisions.IsApplied(owner, fact)) return true;
             var ack = await _combat.DeathMarkerControlAsync(fact.Action, fact.Kind, owner, generation, fact.World, fact.Id, fact.Revision, fact.X, fact.Y, fact.Z, ct);
-            if (ack is { Safe: true } && current()) _p5PeerRevisions.Applied(owner, fact);
+            if (ack is not { Safe: true } || !current()) return false;
+            _p5PeerRevisions.Applied(owner, fact);
+            return _p5PeerRevisions.IsApplied(owner, fact);
         }
         finally { _p5MarkerGate.Release(); }
     }

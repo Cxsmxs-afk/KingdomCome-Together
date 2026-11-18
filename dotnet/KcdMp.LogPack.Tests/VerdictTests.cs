@@ -293,6 +293,9 @@ public class VerdictTests
     [InlineData("MP-RP-DAMAGE escaped_cause attacker=0x42 victim=0x43 missile=0 application=unconfirmed n=1")]
     [InlineData("MP-LOAD-SEQUENCE role=joiner gen=23 world=8 phase=Reconstruct link_hold=0")]
     [InlineData("MP-LOAD-STALE role=host gen=23 stale_gen=22 world=8 stale_world=7 type=0x11 n=1")]
+    [InlineData("MP-WORLD-BASELINE role=host world=8 gen=23 snapshot=4 result=applied")]
+    [InlineData("MP-WORLD-EVENT role=joiner world=8 gen=23 snapshot=4 channel=Loot id=1 type=0x00 source=0 result=applied")]
+    [InlineData("MP-WORLD-EVENT-SCOPE origin=agent role=joiner section=events evt_scope_active=0")]
     public void Collection_keeps_gameplay_and_load_evidence(string line) => Assert.True(NoiseRules.IsProtected(line));
 
     [Theory]
@@ -412,6 +415,83 @@ public class VerdictTests
         Assert.Equal((agent, agentStatus), (agentRow.Measurement, agentRow.Status));
         var nativeRow = Assert.Single(rows, row => row.Id == "stale_gen_native_dropped");
         Assert.Equal((native, nativeStatus), (nativeRow.Measurement, nativeRow.Status));
+    }
+
+    private const string EventScope = "section=events evt_world=8 evt_gen=23 evt_snapshot=4 evt_recipient=0";
+
+    [Theory]
+    [InlineData("baseline_version=1 baseline_ms=0 evt_sent=4 evt_acked=4 evt_applied=4 evt_retx=2 evt_gap=0 evt_dropped=0 evt_sender_dropped=0",
+        VerdictStatus.Green, VerdictStatus.Green)]
+    [InlineData("baseline_version=1 evt_sent=4 evt_acked=3 evt_applied=4 evt_gap=0 evt_dropped=0 evt_sender_dropped=0",
+        VerdictStatus.Grey, VerdictStatus.Grey)]
+    [InlineData("evt_sent=4 evt_acked=4 evt_applied=4 evt_gap=0 evt_dropped=0 evt_sender_dropped=0",
+        VerdictStatus.Grey, VerdictStatus.Grey)]
+    [InlineData("baseline_version=1 evt_sent=0 evt_acked=0 evt_applied=0 evt_gap=0 evt_dropped=0 evt_sender_dropped=0",
+        VerdictStatus.Grey, VerdictStatus.Grey)]
+    [InlineData("baseline_version=1 evt_sent=4 evt_acked=4 evt_applied=4 evt_gap=0 evt_dropped=0",
+        VerdictStatus.Green, VerdictStatus.Grey)]
+    [InlineData("evt_gap=1 evt_dropped=0 evt_sender_dropped=1", VerdictStatus.Red, VerdictStatus.Red)]
+    [InlineData("evt_gap=0 evt_dropped=2", VerdictStatus.Grey, VerdictStatus.Red)]
+    public void World_event_counters_require_application_coverage_for_zero_and_report_terminal_loss(string fields,
+        VerdictStatus gap, VerdictStatus dropped)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [$"MP-T3-STATS origin=agent role=host {EventScope} {fields}"];
+        var rows = VerdictRules.Evaluate(input).Rows;
+        Assert.Equal(gap, Assert.Single(rows, row => row.Id == "evt_gap").Status);
+        Assert.Equal(dropped, Assert.Single(rows, row => row.Id == "evt_dropped").Status);
+    }
+
+    [Fact]
+    public void World_event_loss_before_the_heartbeat_survives_a_reset_and_relay_totals_remain_separate()
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [
+            $"00:00:01.500 MP-WORLD-EVENT-FAULT origin=agent role=joiner {EventScope} evt_gap=1 evt_dropped=2 evt_sender_dropped=3",
+            "MP-T3-STATS origin=agent role=joiner section=events evt_gen=24 evt_world=9 evt_snapshot=5 evt_recipient=0 " +
+            "baseline_version=1 baseline_ms=0 evt_sent=4 evt_acked=4 evt_applied=4 evt_retx=2 evt_gap=0 evt_dropped=0 evt_sender_dropped=0"];
+        var report = VerdictRules.Evaluate(input).ToText();
+        Assert.Contains("evt_gap\tROT\t1\t", report);
+        Assert.Contains("evt_dropped\tROT\tEmpfänger 2, Relay 3\t", report);
+        Assert.Contains("baseline_version\tGRÜN\t1\t", report);
+        Assert.Contains("baseline_ms\tGRAU\t0 ms\t", report);
+        Assert.Contains("evt_retx\tGRAU\t2\t", report);
+    }
+
+    [Theory]
+    [InlineData("kcdmp-native.log", "MP-T3-STATS origin=dll role=host ")]
+    [InlineData("kcdmp-native.log", "[00:00:01.500] t000001 L000002 nested log MP-T3-STATS origin=dll source=agent role=host ")]
+    [InlineData("agent.log", "Injected MP-WORLD-EVENT-FAULT origin=agent role=host ")]
+    [InlineData("agent.log", "MP-T3-STATS origin=dll source=agent role=host ")]
+    public void Unqualified_sources_cannot_vote_on_world_events(string source, string prefix)
+    {
+        var input = new Briefing.Input();
+        input.Logs[source] = [prefix + EventScope + " evt_gap=3 evt_dropped=1"];
+        var rows = VerdictRules.Evaluate(input).Rows;
+        Assert.Equal(VerdictStatus.Grey, Assert.Single(rows, row => row.Id == "evt_gap").Status);
+        Assert.Equal(VerdictStatus.Grey, Assert.Single(rows, row => row.Id == "evt_dropped").Status);
+    }
+
+    [Fact]
+    public void World_event_retirement_prevents_late_heartbeat_or_mirror_from_reviving_an_old_snapshot()
+    {
+        const string covered = "baseline_version=1 baseline_ms=24 evt_sent=4 evt_applied=4 evt_acked=4 evt_gap=0 evt_dropped=0 evt_sender_dropped=0";
+        var input = new Briefing.Input();
+        input.Logs["kcdmp-native.log"] = [
+            $"[00:00:01.500] t000001 L000002 MP-T3-STATS origin=dll source=agent role=host {EventScope} evt_receiver=101 {covered}"];
+        Assert.Equal(VerdictStatus.Green, Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "evt_gap").Status);
+
+        input.Logs["agent.log"] = [
+            $"MP-WORLD-EVENT-SCOPE origin=agent role=host {EventScope} evt_receiver=101 evt_scope_active=0",
+            $"MP-T3-STATS origin=agent role=host {EventScope} evt_receiver=101 {covered}"];
+        var rows = VerdictRules.Evaluate(input).Rows;
+        Assert.Equal(VerdictStatus.Grey, Assert.Single(rows, row => row.Id == "evt_gap").Status);
+        Assert.Equal(VerdictStatus.Grey, Assert.Single(rows, row => row.Id == "baseline_version").Status);
+
+        input.Logs["agent.log"] = [..input.Logs["agent.log"],
+            $"MP-T3-STATS origin=agent role=host {EventScope} evt_receiver=102 {covered}"];
+        rows = VerdictRules.Evaluate(input).Rows;
+        Assert.Equal(VerdictStatus.Green, Assert.Single(rows, row => row.Id == "evt_gap").Status);
     }
 
     [Fact]
