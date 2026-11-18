@@ -18,15 +18,52 @@ namespace KcdMp.Client;
 // Log: WO214-HAND own ... -> sent (the sender), WO214-HAND figure kcd2mp_<id> ... (the receiver; the mod's own line says how).
 public partial class GameBridge
 {
-    private readonly ConcurrentDictionary<byte, (bool Drawn, Guid? Cls, long AtMs)> _w214FigureHand = new();
+    private const string BowHandEmptyCounter = "bow_hand_empty_while_drawn";
+    private sealed record FigureHand(bool Drawn, Guid? Cls, long AtMs, P6Context? BowContext = null, long BowMode = 0, long PeerSerial = 0);
+    private readonly ConcurrentDictionary<byte, FigureHand> _w214FigureHand = new();
     private readonly ConcurrentDictionary<byte, Guid> _w214LastHeld = new();   // the weapon each partner last held drawn
+    private readonly object _w214OwnHandGate = new();
+    private (P6Context? Context, long Mode, BowHandProof Proof) _w214OwnBow;
+    private long _w214OwnHandChangedAtMs = long.MinValue;
     private long _w214HandSent, _w214HandIn, _w214HandOff, _w214HandOk, _w214HandFixed, _w214HandFailed, _w214HandKept, _w214PreDraw;
+
+    private void Wo214ObserveOwnRangedHand(P6Context context, long mode, RangedCapture row, RangedWeaponKind kind, Guid cls)
+    {
+        bool bow = kind == RangedWeaponKind.Bow;
+        if (bow && cls == Guid.Empty && W214On("figure_hands") && BowHandProof.IsDrawnPhase(row.Phase))
+        {
+            T3Increment(BowHandEmptyCounter);
+            Console.WriteLine("MP-LANE1-BOW out cls=- source=native result=refused");
+        }
+        long captured = unchecked((long)row.CapturedTick);
+        lock (_w214OwnHandGate)
+        {
+            if (captured <= _w214OwnHandChangedAtMs) return;
+            _w214OwnBow = bow ? (context, mode, new BowHandProof(cls, captured)) : default;
+        }
+    }
 
     /// <summary>This player's own hand (the mod's "w214_hand" event, "&lt;0|1&gt; &lt;class|-&gt;"): to the partner(s).</summary>
     private void Wo214OnOwnHand(string? arg)
     {
         if (!W214On("figure_hands")) return;
         if (!Wo214Rules.TryParseOwnHand(arg, out bool drawn, out Guid? cls)) { Console.WriteLine($"MP-W214 hand refused: '{arg}'"); return; }
+        if (cls == Guid.Empty) cls = null;
+        lock (_w214OwnHandGate)
+        {
+            long now = Environment.TickCount64;
+            if (!drawn || cls.HasValue)
+            {
+                _w214OwnHandChangedAtMs = now;
+                _w214OwnBow = default;
+            }
+            else if (_w214OwnBow is { Context: { } context } sample && sample.Proof.Fresh(now) &&
+                     P6Current(context) && W201("figure_ranged") && sample.Mode == Interlocked.Read(ref _p6VisualModeSerial))
+            {
+                if (sample.Proof.ItemClass == Guid.Empty) return;
+                cls = sample.Proof.ItemClass;
+            }
+        }
         var to = W137Host ? Wo134Peers() : W137Joiner ? [Protocol.JoinTargetHost] : new List<byte>();
         string text = Wo214Rules.HandText(drawn, cls);
         foreach (byte t in to) _ = Wo203SendSideAsync(t, Protocol.W203FigureHand, text);
@@ -41,13 +78,64 @@ public partial class GameBridge
         if (!Wo214Rules.TryParseHand(m.Text, out bool drawn, out Guid? cls)) { Interlocked.Increment(ref _w203SideMalformed); return; }
         Interlocked.Increment(ref _w214HandIn);
         if (!W214On("figure_hands")) { Interlocked.Increment(ref _w214HandOff); return; }
-        _w214FigureHand[src] = (drawn, cls, Environment.TickCount64);
-        if (drawn && cls is Guid held) _w214LastHeld[src] = held;
-        string c = cls is Guid g ? g.ToString("D") : "-";
+        if (cls == Guid.Empty) cls = null;
+        long now = Environment.TickCount64;
+        if (drawn && _w214FigureHand.TryGetValue(src, out var hand) && Wo214BowHandCurrent(src, hand) &&
+            (cls is null && now - hand.AtMs <= Wo214Rules.HandFreshMs ||
+             cls == hand.Cls && now - hand.AtMs < Protocol.RangedCaptureMaxAgeMs))
+            return; // Keep the ongoing Lua check for the measured bow.
+        _ = Wo214SetFigureHandAsync(src, new(drawn, cls, now));
+    }
+
+    private bool Wo214BowHandCurrent(byte src, FigureHand hand) =>
+        hand.BowContext is { } context && P6Current(context) && P6PeerCurrent(src, hand.PeerSerial) &&
+        W201("figure_ranged") && hand.BowMode == Interlocked.Read(ref _p6VisualModeSerial);
+
+    private async Task Wo214OnRangedBowHandAsync(byte src, Guid cls, P6Context context, long mode, long peerSerial,
+        long capturedAt, Func<bool> current, CancellationToken ct)
+    {
+        if (!W214On("figure_hands") || cls == Guid.Empty || !current() || ct.IsCancellationRequested) return;
+        long now = Environment.TickCount64;
+        var hand = new FigureHand(true, cls, now, context, mode, peerSerial);
+        if (_w214FigureHand.TryGetValue(src, out var previous))
+        {
+            if (previous.BowContext is null && previous.AtMs > capturedAt &&
+                (!previous.Drawn || (previous.Cls is Guid held && held != cls))) return;
+            if (previous.Cls == cls && now - previous.AtMs < Protocol.RangedCaptureMaxAgeMs &&
+                Wo214BowHandCurrent(src, previous))
+            {
+                // The Lua owner verifies asynchronously. A second request cancels its pending check.
+                _w214FigureHand.TryUpdate(src, hand, previous);
+                return;
+            }
+        }
+        try
+        {
+            await Wo214SetFigureHandAsync(src, hand, ct);
+            if (current()) Console.WriteLine(FormattableString.Invariant($"MP-LANE1-BOW in peer={src} cls={cls:D} result=hand-requested"));
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            _w214FigureHand.TryRemove(KeyValuePair.Create(src, hand));
+        }
+        catch (Exception ex)
+        {
+            _w214FigureHand.TryRemove(KeyValuePair.Create(src, hand));
+            Console.WriteLine(FormattableString.Invariant($"MP-LANE1-BOW in peer={src} cls={cls:D} result=hand-request-failed reason={ex.GetType().Name}"));
+        }
+    }
+
+    private Task Wo214SetFigureHandAsync(byte src, FigureHand hand, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        _w214FigureHand[src] = hand;
+        if (hand.BowContext is null && hand.Drawn && hand.Cls is Guid held) _w214LastHeld[src] = held;
+        string c = hand.Cls is Guid g ? g.ToString("D") : "-";
         bool oversized = false;
-        if (drawn && cls is Guid gc && _swingCatalog.IsCompletedSuccessfully && _swingCatalog.Result is { } cat) oversized = cat.OversizedItemOf([gc]) is not null;
-        Console.WriteLine($"WO214-HAND figure kcd2mp_{src} told drawn={(drawn ? 1 : 0)} cls={c}{(oversized ? " (oversized)" : "")}");
-        _ = _transport.ExecuteNowAsync($"if KCD2MP_W214FigureHand then KCD2MP_W214FigureHand(\"{src}\", {(drawn ? "true" : "false")}, \"{c}\", {(oversized ? "true" : "false")}) end");
+        if (hand.Drawn && hand.Cls is Guid gc && _swingCatalog.IsCompletedSuccessfully && _swingCatalog.Result is { } cat)
+            oversized = cat.OversizedItemOf([gc]) is not null;
+        Console.WriteLine($"WO214-HAND figure kcd2mp_{src} told drawn={(hand.Drawn ? 1 : 0)} cls={c}{(oversized ? " (oversized)" : "")}");
+        return _transport.ExecuteNowAsync($"if KCD2MP_W214FigureHand then KCD2MP_W214FigureHand(\"{src}\", {(hand.Drawn ? "true" : "false")}, \"{c}\", {(oversized ? "true" : "false")}) end", ct);
     }
 
     /// <summary>The mod's verdict on one figure ("w214_figure_hand": "&lt;id&gt; &lt;ok|fixed|failed&gt; &lt;how&gt;").</summary>
@@ -68,7 +156,8 @@ public partial class GameBridge
     private HashSet<Guid> Wo214KeepHeld(byte ghostId, HashSet<Guid> target)
     {
         if (!W214On("figure_hands") || !_w214FigureHand.TryGetValue(ghostId, out var h)
-            || Environment.TickCount64 - h.AtMs > Wo214Rules.HandFreshMs) return target;
+            || Environment.TickCount64 - h.AtMs > Wo214Rules.HandFreshMs
+            || (h.BowContext is not null && !Wo214BowHandCurrent(ghostId, h))) return target;
         var kept = Wo214Rules.KeepHeld(target, true, h.Drawn, h.Cls);
         if (kept.Count > target.Count)
         {
@@ -97,7 +186,16 @@ public partial class GameBridge
             Console.WriteLine($"WO214-HAND figure {soul}: its partner's weapon {cls:D} was off the figure at his draw -- put back before the figure's draw [n={k}]");
     }
 
-    private void Wo214HandsReset() { _w214FigureHand.Clear(); _w214LastHeld.Clear(); }
+    private void Wo214HandsReset()
+    {
+        _w214FigureHand.Clear();
+        _w214LastHeld.Clear();
+        lock (_w214OwnHandGate)
+        {
+            _w214OwnBow = default;
+            _w214OwnHandChangedAtMs = Environment.TickCount64;
+        }
+    }
 
     // ---- the bench's fault (KCDMP_TEST_W214_FIGURE_STRIP=1; the host's agent only, never set by an installer) ----
     // The field's end state, made at will: the partner's figure without the weapon its partner draws. On the bench a figure whose outfit
