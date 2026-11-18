@@ -355,6 +355,9 @@ public partial class GameBridge
                 // the host passes a joiner's ping on to the other joiners
                 if (W137Host) foreach (byte j in Wo134Peers()) if (j != src) await W164SendAsync(j, Protocol.W164MarkPing, m.Text);
                 return;
+            case Protocol.W164MarkNote when m.Text.StartsWith(Wo171Rules.SlotTable.WirePrefix, StringComparison.Ordinal):
+                Wo171OnSlotSnapshot(src, m.Text);
+                return;
             case Protocol.W164MarkNote when Wo204Rules.TryParseMarkNote(m.Text, out string nid, out string nnote):   // WO-204 Act V
                 Console.WriteLine($"MP-MARK note from player {src}: mark={nid} note={nnote}");
                 if (W137Host) foreach (byte j in Wo134Peers()) if (j != src) await W164SendAsync(j, Protocol.W164MarkNote, m.Text);
@@ -709,7 +712,6 @@ public partial class GameBridge
     {
         bool inSession = W137Host || W137Joiner;
         bool want = _w164PinOn && inSession;
-        if (!inSession) _w171Slots.Reset();
         var fresh = new HashSet<byte>();
         // WO-166 M1: only a live peer has a pin, and one per partner (a crash-rejoin's old id is gone from the relay's set at once)
         var keep = Wo166Rules.PinOwners(LivePartners(), _myGhostId, g => _ghostNames.TryGetValue(g, out var nm) ? nm : null,
@@ -750,6 +752,7 @@ public partial class GameBridge
             SetJoinedWorld(true);
             Console.WriteLine("WO164-TEST KCDMP_TEST_JOINER_IN_WORLD: this agent is a joiner in its host's shared world (the harness; no join load)");
         }
+        await Wo171SyncSlotsAsync();   // The host assigns from the relay roster even with its local pins disabled.
         if (!_w164On) return;
         long n = ++_w164TickN;
         await W164TorchOutTickAsync(false);
