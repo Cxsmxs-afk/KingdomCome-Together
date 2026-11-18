@@ -253,6 +253,7 @@ public class PackerTests
             {
                 var f = Open(r.Parts[i]);
                 Assert.Equal(i == 0, f.ContainsKey("MANIFEST.txt"));
+                Assert.Equal(i == 0, f.ContainsKey("ERGEBNIS.txt"));
                 foreach (var kv in f) all[kv.Key] = kv.Value;
             }
             for (int i = 0; i < 6; i++) Assert.Equal(src[i].Bytes, all[$"leash/f{i}.csv"]);

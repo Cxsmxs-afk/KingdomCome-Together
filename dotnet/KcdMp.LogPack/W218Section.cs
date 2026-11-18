@@ -17,8 +17,8 @@ public static class W218Section
 {
     public const string Heading = "## The queue";
 
-    private static readonly Regex Lag = new(@"MP-W207-Q lag_ms=(\d+)", RegexOptions.Compiled);
-    private static readonly Regex ActLag = new(@" act_lag_ms=(\d+)", RegexOptions.Compiled);
+    private static readonly Regex Lag = new(@"(?:^| )MP-W207-Q lag_ms=(\d+)(?: |$)", RegexOptions.Compiled);
+    private static readonly Regex ActLag = new(@" act_lag_ms=(\d+)(?: |$)", RegexOptions.Compiled);
     private static readonly Regex Role = new(@"MP-WO122 cfg .*?role=(host|joiner)", RegexOptions.Compiled);
     private static readonly Regex Num = new(@"(?<k>[a-z_0-9]+)=(?<v>-?[\d.]+)", RegexOptions.Compiled);
 

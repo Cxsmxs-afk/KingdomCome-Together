@@ -114,13 +114,16 @@ public static class Briefing
     private static readonly Regex Mark = new(@"^(?<t>\d\d:\d\d:\d\d\.\d+) .*?MP-MARK (?<w>[A-Za-z0-9_]+)(?: note=(?<n>.*?))? -- the tester's marker", RegexOptions.Compiled);
     private static readonly Regex PeerMark = new(@"^(?<t>\d\d:\d\d:\d\d\.\d+) .*?MP-MARK ping from player (?<p>\d+): mark=(?<m>\S+)", RegexOptions.Compiled);
     private static readonly Regex Ping = new(@"\[ping\] (\d+) ms", RegexOptions.Compiled);
-    private static readonly Regex QueueLag = new(@"\[ping\] \d+ ms .*?the game's queue is (\d+) ms behind(, the game is in the background)?", RegexOptions.Compiled);
+    internal static readonly Regex QueueLag = new(@"\[ping\] \d+ ms .*?the game's queue is (\d+) ms behind(, the game is in the background)?", RegexOptions.Compiled);
     private static readonly Regex QueueOverflow = new(@"attempting to queue too many actions on entity '([^']+)'", RegexOptions.Compiled);
 
-    public static string Build(Input inp)
+    public static string Build(Input inp) => Build(inp, VerdictRules.Evaluate(inp));
+
+    internal static string Build(Input inp, VerdictReport verdict)
     {
         var sb = new StringBuilder();
         sb.Append("# Kingdom Come: Together -- briefing\n\n");
+        sb.Append(verdict.ToMarkdown());
         sb.Append("Written by the bug report itself (WO-202). Times are this machine's clock.\n\n");
         var (bv, bid) = BuildOf(inp);   // WO-211 0.2: the build id in the first lines (the installer's name carries the same)
         sb.Append($"**Build:** {bv} build {bid}\n\n");
@@ -160,7 +163,7 @@ public static class Briefing
         return sb.ToString();
     }
 
-    private static IEnumerable<string> AgentLines(Input inp) => SessionAgentKeys(inp).SelectMany(k => inp.Logs[k]);
+    internal static IEnumerable<string> AgentLines(Input inp) => SessionAgentKeys(inp).SelectMany(k => inp.Logs[k]);
 
     // WO-204 Act V: the briefing is this launch's session only. The bundle keeps the earlier agent logs (agent.prev*.log), but one
     // counts only when it was still being written within 30 minutes before this launch's agent log began (an agent restarted inside
@@ -207,7 +210,7 @@ public static class Briefing
 
     /// <summary>WO-221 F: the native log's lines of this launch only -- one file (the DLL's own, else its mirror: they hold the same
     /// lines and both were counted before), and of it the newest launch's lines. Read once per briefing.</summary>
-    private static IEnumerable<string> NativeLines(Input inp)
+    internal static IEnumerable<string> NativeLines(Input inp)
     {
         if (inp.NativeLaunch is null)
         {

@@ -11,7 +11,7 @@ last 200 lines of each log. Nothing here reads input; nothing takes focus.
     scenarios: join, walk, sleep, wait, fight, talk, loot, smoke (join walk sleep wait fight talk loot), soak [min], c2, c3,
     e2, e2twin, b1, b1twin, joinfight (B3), joinscene (B1 + twin), stats, long [min] (join soak c2 c3 fight e2 e2twin)
 """
-import collections, json, math, os, re, sys, time
+import collections, json, math, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -928,6 +928,25 @@ def s_stats(r):
         if not all(st.values()): return False, 'no-stats', st
         if any(v is not None and v >= 2.0 for v in stall.values()): return False, 'w189-stall', st
         return True, 'ok', st
+    return fn
+
+
+def s_verdict(r):
+    """Collect both sides after a fresh T3 heartbeat and run the paired verdict."""
+    def fn():
+        copies = ((r.a, 'host'), (r.b, 'joiner'))
+        offsets = {copy.id: copy.size(copy.alog) for copy, _ in copies}
+        deadline = time.monotonic() + 90
+        for copy, role in copies:
+            pattern = r'MP-T3-STATS origin=agent role=' + role + r' '
+            if not copy.wait('a', offsets[copy.id], pattern, max(1, deadline - time.monotonic())):
+                return False, 'no-verdict-telemetry', role
+        bundles = pair.collect('verdict-%d' % time.time_ns(), write_verdict=True)
+        tool = os.path.join(HERE, '..', 'verdict', 'pair.py')
+        process = subprocess.run([sys.executable, tool, bundles[r.a.id] + '.packed', bundles[r.b.id] + '.packed'],
+                                 cwd=r.dir, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        detail = {'report': os.path.join(r.dir, 'ERGEBNIS-PAAR.md'), 'output': (process.stdout + process.stderr).strip()}
+        return process.returncode == 0, ('ok' if process.returncode == 0 else 'pair-verdict'), detail
     return fn
 
 
@@ -3922,6 +3941,7 @@ def run(name, args):
         'soak': [('soak', s_soak(r, float(args[0]) if args else 20.0))],
         'b1': [('b1', s_b1(r))],
         'stats': [('stats', s_stats(r))],
+        'verdict': [('join', s_join(r)), ('verdict', s_verdict(r))],
         'perfab': [('join', s_join(r)), ('perfab', s_perfab(r))],
         'perfprobe': [('join', s_join(r)), ('perfab-probe', s_perfab(r, which='probe'))],
         'joinidle': [('join', s_join(r)), ('idle', lambda: (time.sleep(float(args[0]) if args else 180.0), (True, 'ok', 'idle'))[1])],
