@@ -21,7 +21,9 @@
 namespace kcdmp::combatactions {
 
 // Main thread, right after C_CombatAnimActionManager::QueueAction took the action: one reference of ours is added.
-void track(uint32_t eid, void* actor, void* action);
+void track(uint32_t eid, void* actor, void* action, bool movesBody = false);
+// True while a tracked combat one-shot still occupies the engine's pose controller.
+bool body_pose_holds(uint32_t eid);
 
 // Any thread. Every recorded action of this body (or of every body) is ended; returns how many.
 int end_for_entity(uint32_t eid, const char* why);

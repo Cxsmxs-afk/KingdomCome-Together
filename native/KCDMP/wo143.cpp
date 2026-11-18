@@ -15,6 +15,7 @@
 #include "engine.h"
 #include "hits.h"
 #include "hook_prologues.h"
+#include "holders.h"
 #include "inline_hook.h"
 #include "log.h"
 #include "motion.h"
@@ -35,9 +36,11 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace kcdmp::wo143 {
@@ -636,6 +639,16 @@ int call_request(void* ctx, void* req) {
     return id;
 }
 
+std::optional<holders::Permit> request_pose(uint32_t eid, uint16_t holdMs) {
+    using holders::Holder;
+    const Holder old = holders::of(eid);
+    const bool activity = old == Holder::Seat || old == Holder::Activity;
+    if (!activity && !npcdrive::begin_oneshot(eid, holdMs)) return std::nullopt;
+    auto permit = holders::may_place(eid, activity ? old : Holder::OneShot, "wo143.one_shot_pose");
+    if (!permit) return std::nullopt;
+    return std::optional<holders::Permit>(std::move(permit));
+}
+
 // Play fragment/tags on the body with this entity id, the way PlayAnimationAction
 // does it for the player; action == false: a request with no extra action (ends
 // whatever one-shot or loop the body plays). alignWuid 0 = in place.
@@ -646,6 +659,8 @@ int request_on(uint32_t eid, bool action, const char* fragment, const char* tags
     void* ctx = X::context_of(eid);
     void* obj = npc_object(eid);
     if (!ctx || !obj) { _snprintf_s(why, whyN, _TRUNCATE, "no NPC-state context"); return -3; }
+    auto permit = request_pose(eid, 300);
+    if (!permit) { _snprintf_s(why, whyN, _TRUNCATE, "body held by another path"); return -3; }
     uint64_t noAlign = 0, noTrig = 0;
     rd64(g_invalidAlign, 0, &noAlign); rd64(g_invalidTrigger, 0, &noTrig);
     const char* empty = intern("");
@@ -693,6 +708,7 @@ int request_on(uint32_t eid, bool action, const char* fragment, const char* tags
     if (X::prepare_request(eid, &keptText)) c_prepared.fetch_add(1, std::memory_order_relaxed);
     if (kept) *kept = keptText;
     const int id = call_request(ctx, req);
+    if (id >= 0) permit->wrote();
     // our request goes: the callback, the references it held, what the block may hold
     cb->~ResultFn();
     if (act.p) { X::release(act.ctrl); X::release(ev.ctrl); }
@@ -782,13 +798,17 @@ bool defer_if_pending(const std::string& nm, const std::string& frag, const std:
     return true;
 }
 
-void tick_body(uint32_t eid) {
+bool tick_body(uint32_t eid) {
     void* obj = npc_object(eid);
     void* ctx = X::context_of(eid);
-    if (!obj || !ctx) return;
-    fcall_void(g_ctxPreUpdate, ctx);
-    fcall_void(g_execUpdate, static_cast<void*>(static_cast<char*>(obj) + kObjExec));
-    fcall_void(g_ctxUpdate, ctx);
+    if (!obj || !ctx) return false;
+    auto permit = request_pose(eid, 1);
+    if (!permit) return false;
+    const bool pre = fcall_void(g_ctxPreUpdate, ctx);
+    const bool exec = fcall_void(g_execUpdate, static_cast<void*>(static_cast<char*>(obj) + kObjExec));
+    const bool update = fcall_void(g_ctxUpdate, ctx);
+    if (pre || exec || update) permit->wrote();
+    return pre && exec && update;
 }
 
 void flight_tick(double now) {
@@ -801,7 +821,8 @@ void flight_tick(double now) {
         // and queued its look action again -- the field's look-pose flood); 0 = every frame (the old rule)
         const double minGap = g_tickHz.load() > 0 ? 1.0 / g_tickHz.load() : 0.0;
         if (!f.done && !expired && f.ticked && now - f.lastTick >= minGap && engine::entity_by_id(f.eid)) {
-            f.lastTick = now; tick_body(f.eid); ++f.ticks; c_ticks.fetch_add(1);
+            f.lastTick = now;
+            if (tick_body(f.eid)) { ++f.ticks; c_ticks.fetch_add(1); }
         }
         // WO-201 B9: a paused copy's one-shot that never started anything of its own in kPlayCheckS (the field: 734 of 1,363 gave up
         // only after 15 s, each tick re-planning the body -- a lumberjack's copy shown without its woodchopping can never play its chop)
@@ -882,12 +903,12 @@ void settle_tick(double now) {
     if (g_tickArmed && g_settleOn.load())
         for (uint32_t eid : g_hoeing) {
             if (!engine::entity_by_id(eid) || !body_paused(eid) || flying_ticked(eid)) continue;
-            tick_body(eid); c_settleTicks.fetch_add(1, std::memory_order_relaxed);
+            if (tick_body(eid)) c_settleTicks.fetch_add(1, std::memory_order_relaxed);
         }
     for (auto it = g_settleUntil.begin(); it != g_settleUntil.end();) {
         const uint32_t eid = it->first;
         if (now > it->second || !engine::entity_by_id(eid)) { it = g_settleUntil.erase(it); continue; }
-        if (!flying_ticked(eid) && !g_hoeing.count(eid)) { tick_body(eid); c_settleTicks.fetch_add(1, std::memory_order_relaxed); }
+        if (!flying_ticked(eid) && !g_hoeing.count(eid) && tick_body(eid)) c_settleTicks.fetch_add(1, std::memory_order_relaxed);
         ++it;
     }
 }

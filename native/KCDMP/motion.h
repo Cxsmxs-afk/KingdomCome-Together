@@ -97,6 +97,8 @@ void body_frame(const char* key, void* ent, uint32_t eid, float renderSpeedMps, 
 // The writer stopped driving this body (unbind, drop, disarm): give it back. An avatar keeps its identity
 // (WO-154 2: its reaction contexts and speech gate stay through every unbind).
 void body_released(const char* key, uint32_t eid);
+// The accepted engine jump owns the attached figure until it lands or falls.
+bool figure_jump_hold(uint32_t eid, void* ent, double now);
 // WO-154 2: the avatar's identity at spawn, by its soul's guid (the agent's isolate call); main thread.
 void identity(const unsigned char guid[16], bool on);
 // WO-154 2: the session is over: every avatar identity this DLL set is cleared; main thread.

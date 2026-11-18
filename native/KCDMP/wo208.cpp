@@ -332,7 +332,7 @@ void probe_apply(double now) {
             case Do::Install: {
                 if (o.act) retire(o, now, "the host's next action");
                 void* act = nullptr;
-                const rttr::SwingResult r = rttr::install_fragment(eid, hs->frag, hs->tags, hs->prio, hs->flags, &act);
+                const rttr::SwingResult r = rttr::install_fragment(eid, hs->frag, hs->tags, hs->prio, hs->flags, &act, k == 0);
                 if (r == rttr::SwingResult::Ok && act) {
                     o.act = act; o.hostAct = hs->act; o.frag = hs->frag; o.prio = hs->prio; o.queuedAt = now; o.started = false;
                     ++g_p.installs;
@@ -734,7 +734,7 @@ bool own_handover(uint32_t eid, OwnCopy& oc, double now, uint8_t path) {
         if (oc.own[0].act && oc.own[0].hostAct == hs->act) installed = true;   // ours already plays it
         else {
             void* act = nullptr;
-            const rttr::SwingResult r = rttr::install_fragment(eid, hs->frag, hs->tags, hs->prio, hs->flags, &act);
+            const rttr::SwingResult r = rttr::install_fragment(eid, hs->frag, hs->tags, hs->prio, hs->flags, &act, true);
             if (r == rttr::SwingResult::Ok && act) {
                 if (oc.own[0].act) own_retire(oc, oc.own[0], now, "the hand-over");
                 oc.own[0].act = act; oc.own[0].hostAct = hs->act; oc.own[0].frag = hs->frag; oc.own[0].prio = hs->prio; oc.own[0].queuedAt = now; oc.own[0].started = false;
@@ -950,7 +950,7 @@ void own_apply(uint32_t eid, OwnCopy& oc, int cm, const HostScope hsc[2], const 
                 if (queueFull) { if (k == 0) wo217::place_note(oc.ep217, wo217::Note::QueueFull, qi.first); break; }   // the host's action waits for room (the queue cap above)
                 if (o.act) own_retire(oc, o, now, "the host's next action");
                 void* act = nullptr;
-                const rttr::SwingResult r = rttr::install_fragment(eid, hs->frag, hs->tags, hs->prio, hs->flags, &act);
+                const rttr::SwingResult r = rttr::install_fragment(eid, hs->frag, hs->tags, hs->prio, hs->flags, &act, k == 0);
                 if (r == rttr::SwingResult::Ok && act) {
                     o.act = act; o.hostAct = hs->act; o.frag = hs->frag; o.prio = hs->prio; o.queuedAt = now; o.started = false;
                     if (k == 0) wo217::place_note(oc.ep217, wo217::Note::InstallOk);

@@ -52,6 +52,7 @@
 #include "wo208_rules.h"
 #include "wo163.h"
 #include "engine.h"
+#include "holders.h"
 #include "anchors.h"
 #include "respawn_actions.h"
 #include "fault_guard.h"
@@ -318,10 +319,14 @@ constexpr uint8_t kWhySilence = 2, kWhyFault = 8, kWhyLost = 9, kWhyReenter = 11
 bool set_entity_pose(uint32_t eid, const Pose& p) {
     void* e = engine::entity_by_id(eid);
     if (!e) return false;
+    auto permit = holders::may_place(eid, holders::Holder::Probe, "dialogue-camera");
+    if (!permit) return false;
     const float pos[3] = {p.p[0], p.p[1], p.p[2]};
     const float q[4] = {p.q.x, p.q.y, p.q.z, p.q.w};
     const float sc[3] = {1, 1, 1};
-    return vcall_void(g_callSite, e, kEntSetPosRotScale, pos, q, sc, uint32_t(0));
+    const bool placed = vcall_void(g_callSite, e, kEntSetPosRotScale, pos, q, sc, uint32_t(0));
+    if (placed) permit.wrote();
+    return placed;
 }
 
 bool set_view_fov(void* view, float fov) {

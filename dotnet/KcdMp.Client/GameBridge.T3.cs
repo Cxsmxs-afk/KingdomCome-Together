@@ -226,10 +226,11 @@ public partial class GameBridge
         _t3Counters["proc_lua_abandoned"] = _httpForMenu?.AbandonedStatements ?? 0;
         _t3Counters["proc_outbound_abandoned"] = _w213Writer?.Scheduler.CancelledDropped ?? 0;
         IEnumerable<KeyValuePair<string, long>> counters = _t3Counters;
-        // Presentation values and their sample counts must come from the same
+        // Presentation and owner values and their sample counts must come from the same
         // reply. A failed or old DLL read cannot repeat an earlier window.
         if (presentation is not null)
             counters = counters.Concat(T3NativeCounters.Keys.Skip(T3NativeCounters.PresentationStart)
+                .Where(presentation.ContainsKey)
                 .Select(key => KeyValuePair.Create(key, presentation[key])));
         string fields = string.Join(' ', counters.OrderBy(p => p.Key, StringComparer.Ordinal)
             .Select(p => p.Key + "=" + p.Value.ToString(CultureInfo.InvariantCulture)));

@@ -6,6 +6,7 @@
 #include "npc_drive.h"
 #include "wo216.h"
 #include "wo217.h"
+#include "wo143.h"
 #include "wo187.h"
 #include "wo187_rules.h"
 #include "wo209.h"
@@ -362,6 +363,9 @@ struct Puppet {
     uint32_t eid = 0;
     void*    ent = nullptr;
     uint64_t wuid = 0;
+    uint8_t  pendingDrop = kOk;
+    bool     tellDrop = false;
+    bool     pendingSeatPlace = false;
     float    anchor[3]{};
     double   delay = 0.12;
     double   lateApplied = 0;       // the jitter allowance in use (slewed toward late_target)
@@ -466,13 +470,19 @@ void notify_drop(uint8_t reason, const std::string& name) {
 }
 
 std::unordered_set<uint32_t> g_driftBlocked;   // WO-209: bodies whose hold ended for drift -- no hold again until the body is back by its host NPC
-void drop(std::unordered_map<std::string, Puppet>::iterator it, uint8_t reason, bool tell) {
+bool stop_movement(uint32_t eid, const char* why) {
+    const bool driverStopped = bodydrive::release(eid, why);
+    const bool routeStopped = wo215::route_release(eid, why);
+    return driverStopped && routeStopped;
+}
+
+bool drop(std::unordered_map<std::string, Puppet>::iterator it, uint8_t reason, bool tell) {
+    it->second.pendingDrop = reason;
+    it->second.tellDrop = tell;
+    if (!stop_movement(it->second.eid, reason_name(reason)) || !holders::forget(it->second.eid)) return false;
     logf("MP-NPCWRITE npc=%s event=drop reason=%s eid=0x%X writes=%llu", it->second.name.c_str(), reason_name(reason),
          it->second.eid, static_cast<unsigned long long>(it->second.writes));
     motion::body_released(it->second.key.c_str(), it->second.eid);   // WO-121: gait/combat hand the body back
-    wo215::route_release(it->second.eid, "dropped");                  // WO-215 A: its movement request ends with it
-    bodydrive::release(it->second.eid, "dropped");                    // WO-221 C: a driven copy's request ends with it
-    holders::forget(it->second.eid);
     rpmeasure::forget(it->second.eid);
     if (tell) notify_drop(reason, it->second.name);
     if (reason == kNotLiving) {   // WO-147: remembered for the hit gate (a ragdoll is a moment, not a release)
@@ -484,6 +494,7 @@ void drop(std::unordered_map<std::string, Puppet>::iterator it, uint8_t reason, 
     g_driftBlocked.erase(it->second.eid);
     g_playoutByEid.erase(it->second.eid);   // WO-213 E.1
     g_bound.erase(it);
+    return true;
 }
 
 // WO-110 R6, ported from kdcmp.lua mp_sender_stamp: the per-source offset
@@ -782,7 +793,7 @@ void pull_flush(Puppet& p, double now) {
 }
 
 // One puppet, one frame. Returns false on an engine fault (the caller disarms).
-bool write_one(Puppet& p, void* e, const float pose[4], bool* wrote, double* measuredCorrectionCm) {
+bool write_one(Puppet& p, void* e, const float pose[4], holders::Holder who, bool* wrote, double* measuredCorrectionCm) {
     *wrote = false;
     float cur[3]{};
     const bool haveCur = read_pos(e, cur);
@@ -843,6 +854,14 @@ bool write_one(Puppet& p, void* e, const float pose[4], bool* wrote, double* mea
     float scale[3] = { 1, 1, 1 };
     get_scale(e, scale);
 
+    auto permit = holders::may_place(p.eid, who,
+        who == holders::Holder::Seat ? "wo217-seat-place" : holders::kStreamSetter, holders::Claim::Held);
+    if (!permit) {
+        p.blendPending = true;
+        p.blendWhy = "owner-denied";
+        return true;
+    }
+
     // 1. The living body, keeping its ground collider (bit 32).
     void* phys = get_physics(e);
     if (phys && is_a(phys, g_vftLiving)) {
@@ -855,12 +874,20 @@ bool write_one(Puppet& p, void* e, const float pose[4], bool* wrote, double* mea
         std::memcpy(pp + 0x3C, &kRecalcKeepGround, 4);
         void* fn = vslot(phys, kPhysSetParams);
         int r = 0;
-        if (!fn || !call_int2(fn, phys, pp, 0, &r)) return false;
+        if (!fn) return false;
+        if (!call_int2(fn, phys, pp, 0, &r)) {
+            permit.wrote(); // The engine may have accepted part of the pose before faulting.
+            return false;
+        }
+        if (r != 0) permit.wrote();
     }
     // 2. The entity (the render, the animated character's teleport re-base,
     //    and the proxy's follow-up physics move, now zero-length).
     void* prs = vslot(e, kEntSetPosRotScale);
-    if (!prs || !call_prs(prs, e, pose, q, scale)) return false;
+    if (!prs) return false;
+    const bool applied = call_prs(prs, e, pose, q, scale);
+    permit.wrote();
+    if (!applied) return false;
 
     if (p.haveLast) { p.prev[0] = p.last[0]; p.prev[1] = p.last[1]; p.prev[2] = p.last[2]; p.havePrev = true; }
     p.last[0] = pose[0]; p.last[1] = pose[1]; p.last[2] = pose[2]; p.lastRot = pose[3];
@@ -878,15 +905,8 @@ bool write_one(Puppet& p, void* e, const float pose[4], bool* wrote, double* mea
 void disarm(const char* why) {
     if (!g_armed.exchange(false)) return;
     logf("MP-NPCWRITE DISARMED -- %s; every bound puppet dropped, Lua writes them again", why);
-    for (auto it = g_bound.begin(); it != g_bound.end();) {
-        motion::body_released(it->second.key.c_str(), it->second.eid);
-        wo215::route_release(it->second.eid, "writer disarmed");
-        rpmeasure::forget(it->second.eid);
-        notify_drop(kFault, it->second.name);
-        it = g_bound.erase(it);
-    }
-    g_playoutByEid.clear();   // WO-213 E.1
-    g_statBound.store(0);
+    for (auto it = g_bound.begin(); it != g_bound.end();) drop(it++, kFault, true);
+    g_statBound.store(static_cast<uint16_t>(g_bound.size()));
 }
 
 } // namespace
@@ -908,18 +928,24 @@ const char* reason_name(uint8_t r) {
         case kUnbound: return "unbound";
         case kTableFull: return "table-full";
         case kPipeClosed: return "pipe-closed";
+        case kOwnerBusy: return "owner-busy";
         default: return "?";
     }
 }
 
-bool write_entity_tm(void* e, const float pos[3], const float q[4]) {
-    if (!e || !is_a(e, g_vftEntity)) return false;
+bool write_entity_tm(uint32_t eid, void* e, const float pos[3], const float q[4], holders::Holder who, const char* path) {
+    if (!eid || !e || engine::entity_by_id(eid) != e || !is_a(e, g_vftEntity)) return false;
     void* par = nullptr;
     if (!get_parent(e, &par) || par) return false;   // never a child: SetPosRotScale is its LOCAL transform (ef2-b11: a cart under its wagon)
     void* prs = vslot(e, kEntSetPosRotScale);
     float scale[3] = { 1, 1, 1 };
     get_scale(e, scale);
-    return prs && call_prs(prs, e, pos, q, scale);
+    if (!prs) return false;
+    auto permit = holders::may_place(eid, who, path);
+    if (!permit) return false;
+    const bool applied = call_prs(prs, e, pos, q, scale);
+    permit.wrote();
+    return applied;
 }
 
 double now_s() {
@@ -1107,15 +1133,79 @@ void set_snap_fix(bool on) {
 bool snap_fix() { return g_snapFix.load(std::memory_order_relaxed); }
 
 // WO-141: bodies an activity holds (main thread only: wo141's reconcile and this tick).
-std::unordered_set<uint32_t> g_activityHeld;
+std::unordered_map<uint32_t, holders::Holder> g_activityHeld;
+struct UnboundShot { void* entity = nullptr; double until = 0; };
+std::unordered_map<uint32_t, UnboundShot> g_unboundShots;
 std::atomic<uint32_t> c_driftRefused{0};
+uint64_t g_activityScope = 0;
+void synchronize_activity_scope() {
+    const auto scope = wo216::lifecycle_observation_stamp();
+    if (scope == g_activityScope) return;
+    g_activityHeld.clear();
+    g_unboundShots.clear();
+    g_activityScope = scope;
+}
+
 void set_activity_hold(uint32_t eid, bool on) {
     if (!eid) return;
+    synchronize_activity_scope();
     if (on && g_driftBlocked.count(eid)) { c_driftRefused.fetch_add(1, std::memory_order_relaxed); return; }
-    if (on) { if (g_activityHeld.insert(eid).second) logf("MP-NPCWRITE eid=%u event=activity-hold (the activity owns the body)", eid); }
-    else if (g_activityHeld.erase(eid)) logf("MP-NPCWRITE eid=%u event=activity-release (the stream takes the body back)", eid);
+    if (on) {
+        const auto owner = holders::of(eid);
+        const auto [it, inserted] = g_activityHeld.try_emplace(eid, holders::Holder::Activity);
+        if (owner == holders::Holder::Seat || owner == holders::Holder::Activity) it->second = owner;
+        if (inserted) logf("MP-NPCWRITE eid=%u event=activity-hold (the activity owns the body)", eid);
+    } else if (g_activityHeld.erase(eid)) {
+        logf("MP-NPCWRITE eid=%u event=activity-release (the stream takes the body back)", eid);
+        const auto owner = holders::of(eid);
+        if (!is_bound_eid(eid) && (owner == holders::Holder::Seat || owner == holders::Holder::Activity))
+            holders::forget(eid);
+    }
 }
-bool activity_held(uint32_t eid) { return eid && g_activityHeld.count(eid) != 0; }
+bool activity_held(uint32_t eid) {
+    synchronize_activity_scope();
+    return eid && g_activityHeld.count(eid) != 0;
+}
+
+bool action_owns_pose(uint32_t eid) {
+    return wo143::shot_in_flight(eid) || wo209::ai_owns_body(eid) ||
+           (holders::of(eid) == holders::Holder::OneShot && combatactions::body_pose_holds(eid));
+}
+
+bool begin_oneshot(uint32_t eid, uint16_t holdMs) {
+    if (!eid || !holdMs || wo210kd::held_down(eid)) return false;
+    synchronize_activity_scope();
+    void* entity = engine::entity_by_id(eid);
+    void* parent = nullptr;
+    if (!entity || !is_a(entity, g_vftEntity) || !get_parent(entity, &parent) || parent) return false;
+    const auto owner = holders::of(eid);
+    if (owner != holders::Holder::None && owner != holders::Holder::Writer && owner != holders::Holder::Driver &&
+        owner != holders::Holder::Route && owner != holders::Holder::OneShot)
+        return false;
+    for (auto& entry : g_bound) {
+        auto& body = entry.second;
+        if (body.eid != eid) continue;
+        const auto stream = g_streams.find(body.key);
+        if (body.ent != entity || body.pendingDrop != kOk || activity_held(eid) ||
+            (stream != g_streams.end() && (stream->second.flags & (0x01 | 0x02 | 0x10))))
+            return false;
+        const double now = now_s();
+        if (!stop_movement(eid, "one-shot") || !holders::handover(eid, body.name.c_str(), holders::Holder::OneShot, now))
+            return false;
+        body.holdUntil = (std::max)(body.holdUntil, now + holdMs / 1000.0);
+        body.haveLast = body.havePrev = false;
+        body.blendPending = true;
+        body.blendWhy = "one-shot";
+        return true;
+    }
+    if (owner != holders::Holder::None && owner != holders::Holder::OneShot) return false;
+    const double now = now_s();
+    if (!holders::handover(eid, nullptr, holders::Holder::OneShot, now)) return false;
+    auto& shot = g_unboundShots[eid];
+    if (shot.entity != entity) shot = {entity, 0};
+    shot.until = (std::max)(shot.until, now + holdMs / 1000.0);
+    return true;
+}
 
 bool parse_bind(const uint8_t* body, size_t len, BindRequest* out) {
     // [on:1][eid:4][wuid:8][ax:4f][ay:4f][az:4f][delayMs:2][nameLen:1][name]
@@ -1141,7 +1231,7 @@ uint8_t bind_main(const BindRequest& req) {
         auto it = g_bound.find(key);
         if (it != g_bound.end()) {
             pull_flush(it->second, now_s());
-            drop(it, kUnbound, false);
+            if (!drop(it, kUnbound, false)) return kOwnerBusy;
         }
         g_statBound.store(static_cast<uint16_t>(g_bound.size()));
         return kOk;
@@ -1206,10 +1296,13 @@ uint8_t bind_main(const BindRequest& req) {
             return kOk;
         }
     }
-    Puppet& p = g_bound[key];
-    const bool rebind = p.eid != 0;
     const uint64_t wuid = nativeWuid ? nativeWuid : req.wuid;
-    if (rebind && (p.eid != req.eid || p.ent != e || p.wuid != wuid)) rpmeasure::forget(p.eid);
+    const auto existing = g_bound.find(key);
+    const bool rebind = existing != g_bound.end();
+    if (rebind && (existing->second.eid != req.eid || existing->second.ent != e || existing->second.wuid != wuid) &&
+        !drop(existing, kUnbound, false))
+        return refuse(kOwnerBusy, "the previous body is still releasing its engine request");
+    Puppet& p = g_bound[key];
     // WO-214 B: how long the stream this bind is for had been silent (a bind for a stream the host no longer sends drops at once)
     double streamAge = -1;
     { auto si = g_streams.find(key); if (si != g_streams.end() && si->second.lastSampleAt > 0) streamAge = now - si->second.lastSampleAt; }
@@ -1261,6 +1354,29 @@ void tick() {
     // Trace: the traced entity's position before any write of ours.
     npctrace::frame_begin(now);
 
+    // A release can span the AI queue. Keep retrying after a disconnect or
+    // writer disarm, without ever re-entering the stream for a departing body.
+    const bool pipeClosed = g_dropAll.exchange(false);
+    if (pipeClosed) {
+        g_activityHeld.clear();
+        g_unboundShots.clear();
+    }
+    synchronize_activity_scope();
+    for (auto shot = g_unboundShots.begin(); shot != g_unboundShots.end();) {
+        const auto eid = shot->first;
+        if (engine::entity_by_id(eid) == shot->second.entity && (now < shot->second.until || action_owns_pose(eid))) {
+            ++shot;
+            continue;
+        }
+        if (!is_bound_eid(eid) && holders::of(eid) == holders::Holder::OneShot) holders::forget(eid);
+        shot = g_unboundShots.erase(shot);
+    }
+    for (auto it = g_bound.begin(); it != g_bound.end();) {
+        auto body = it++;
+        if (pipeClosed) drop(body, kPipeClosed, false);
+        else if (body->second.pendingDrop != kOk)
+            drop(body, body->second.pendingDrop, body->second.tellDrop);
+    }
     if (!g_armed.load(std::memory_order_relaxed)) { npctrace::frame_end(); return; }
     const double gap = (g_lastTickAt > 0 && now > g_lastTickAt) ? now - g_lastTickAt : 0.0;
     double dt = gap;
@@ -1326,16 +1442,6 @@ void tick() {
             hp.havePrev = false;
         }
     }
-    if (g_dropAll.exchange(false)) {
-        for (auto it = g_bound.begin(); it != g_bound.end();) {
-            logf("MP-NPCWRITE npc=%s event=drop reason=pipe-closed writes=%llu", it->second.name.c_str(),
-                 static_cast<unsigned long long>(it->second.writes));
-            motion::body_released(it->second.key.c_str(), it->second.eid);
-            wo215::route_release(it->second.eid, "pipe closed");
-            g_playoutByEid.erase(it->second.eid);   // WO-213 E.1
-            it = g_bound.erase(it);
-        }
-    }
     if (!g_nativeOn.load(std::memory_order_relaxed) && !g_bound.empty()) {
         for (auto it = g_bound.begin(); it != g_bound.end();) {
             auto cur = it++;
@@ -1351,6 +1457,7 @@ void tick() {
     uint16_t writing = 0;
     for (auto it = g_bound.begin(); it != g_bound.end();) {
         Puppet& p = it->second;
+        if (p.pendingDrop != kOk) { ++it; continue; }
         auto sIt = g_streams.find(p.key);
         // WO-201 B10: a copy that was moving when its stream fell silent is not handed to the slower path before kSilenceMovingS
         const bool keepMoving = sIt != g_streams.end() && g_walkFromHost.load(std::memory_order_relaxed) &&
@@ -1454,7 +1561,11 @@ void tick() {
             } else p.seatPrevHave = false;
             p.seatPrevWriter = "stream";   // the default below; a hold says otherwise
         }
-        if (seatPlace) {   // far from its host NPC's seat: one write puts it there (no blend), the seat holds it after
+        if (seatPlace) p.pendingSeatPlace = true;
+        else if (!seatHeld) p.pendingSeatPlace = false;
+        if (p.pendingSeatPlace) {  // Keep a one-time seat request during an engine cancellation.
+            seatPlace = true;
+            seatHeld = false;
             p.blendPending = false; p.blending = false; p.off[0] = p.off[1] = p.off[2] = 0; p.offRot = 0;
             p.sitting = wo213rules::PostureSitting{};
         }
@@ -1472,40 +1583,36 @@ void tick() {
         // WO-221 C.3 (mp_holders): one table says who holds this body. The claims are found as before (above); the table's one rule
         // decides among them, records the holder and counts every hand-over. Off (the twin): the writer's own yield rules, as 0.65.0.
         const bool tableOn = holders::on();
-        holders::Holder hold = holders::Holder::Writer;
-        if (tableOn) {
-            holders::Claims hc;
-            hc.fall = (s.flags & (0x01 | 0x02 | 0x10)) != 0 || wo210kd::held_down(p.eid);
-            hc.mount = parented;
-            hc.oneShot = now < p.holdUntil;
-            hc.seat = seatHeld;
-            // the insisting engine (write_one): held until the time is up or its host NPC has walked 3 m from where it stood
-            bool engineHeld = now < p.engineHoldUntil;
-            if (engineHeld) {
-                const float hx = s.n > 0 ? s.ring[s.n - 1].x - p.engineHoldHost[0] : 0.0f, hy = s.n > 0 ? s.ring[s.n - 1].y - p.engineHoldHost[1] : 0.0f;
-                if (hx * hx + hy * hy > 9.0f) { engineHeld = false; p.engineHoldUntil = -1e9; p.engineHoldS = 60.0; }
-                p.engineHoldEndedAt = now;
-            }
-            hc.activity = activity_held(p.eid) || postureHeld || engineHeld;
-            hc.probe = wo215::probe_owned(p.eid);
-            hold = holders::decide(hc);
+        holders::Claims hc;
+        hc.fall = (s.flags & (0x01 | 0x02 | 0x10)) != 0 || wo210kd::held_down(p.eid);
+        hc.mount = parented;
+        hc.oneShot = now < p.holdUntil || g_unboundShots.count(p.eid) != 0 ||
+                     motion::figure_jump_hold(p.eid, e, now) || action_owns_pose(p.eid);
+        const auto activity = g_activityHeld.find(p.eid);
+        hc.seat = seatHeld || (!seatPlace && activity != g_activityHeld.end() && activity->second == holders::Holder::Seat);
+        // The old switch retains its yield policy. Admission at the actual
+        // setter and ownership of an existing engine request always apply.
+        bool engineHeld = tableOn && now < p.engineHoldUntil;
+        if (engineHeld) {
+            const float hx = s.n > 0 ? s.ring[s.n - 1].x - p.engineHoldHost[0] : 0.0f;
+            const float hy = s.n > 0 ? s.ring[s.n - 1].y - p.engineHoldHost[1] : 0.0f;
+            if (hx * hx + hy * hy > 9.0f) { engineHeld = false; p.engineHoldUntil = -1e9; p.engineHoldS = 60.0; }
+            p.engineHoldEndedAt = now;
         }
-        const bool heldNow = tableOn ? hold != holders::Holder::Writer
-                                     : ((s.flags & (0x01 | 0x02 | 0x10)) != 0 || now < p.holdUntil || parented || activity_held(p.eid) || wo210kd::held_down(p.eid) ||
-                                        postureHeld || seatHeld || wo215::probe_owned(p.eid));
+        hc.activity = activity != g_activityHeld.end() || postureHeld || engineHeld;
+        hc.probe = wo215::probe_owned(p.eid);
+        const auto hold = holders::decide(hc);
+        const bool heldNow = hold != holders::Holder::Writer;
         if (heldNow) {
-            if (tableOn) holders::set(p.eid, p.name.c_str(), hold, now);
-            bodydrive::release(p.eid, "held");   // WO-221 C: a held body is not driven
-            p.seatPrevWriter = tableOn ? holders::name(hold)
-                                       : seatHeld ? "seat" : postureHeld ? "posture" : activity_held(p.eid) ? "activity" : now < p.holdUntil ? "swing-hold" : "held";
-            // Dead / unconscious / carried stay on Lua's own behaviour; a swing
-            // one-shot owns the body for its hold. Neither is a pull.
-            // WO-215 A: a held body is not routed -- its request (if any) ends; A.0's probe owns its own body
-            if (wo215::walk_own(p.eid)) wo215::route_release(p.eid, "held");
+            if (hold != holders::Holder::Seat) p.pendingSeatPlace = false;
             p.haveLast = false;
             p.havePrev = false;
             p.blendPending = true;   // it resumes from wherever the engine or the one-shot leaves the body
             p.blendWhy = "hold-end";
+            const bool stopped = hold == holders::Holder::Probe ? bodydrive::release(p.eid, "probe")
+                                                                 : stop_movement(p.eid, "held");
+            if (!stopped || !holders::handover(p.eid, p.name.c_str(), hold, now)) { ++it; continue; }
+            p.seatPrevWriter = holders::name(hold);
             // WO-163 (A5): a swing hold is a fight hold -- the frame is an unwritten one, the engine's position is what is seen.
             // The other reasons are not a fight: no hold, no step across them.
             float held[3];
@@ -1595,7 +1702,7 @@ void tick() {
         // WO-215 A: the route. A copy on the ground moves by the engine's own movement request toward its stream (the writer does not
         // write it); the writer corrects a body the stream left over mp_route_correct_m behind (a blend, never a snap) and keeps what the
         // route cannot do: figures, beasts, riders, falls, fighting bodies, a body whose request the engine refused (wo215_rules.h).
-        {
+        if (!seatPlace) {
             wo215::RouteIn ri;
             ri.eid = p.eid; ri.ent = e; ri.name = p.name.c_str();
             const RingSample& nsm = s.ring[s.n - 1];
@@ -1624,6 +1731,10 @@ void tick() {
             // it. The driver's snap (a body left behind) is one plain write of this frame's pose, no blend; its arrival hands the body to
             // the writer, which blends the last half metre and the facing from where the body stands.
             {
+                if (!kcdmp::walkhold::consult_route(oneHolder) && !wo215::route_release(p.eid, "driver handover")) {
+                    ++it;
+                    continue;
+                }
                 bodydrive::In di;
                 di.eid = p.eid; di.ent = e; di.name = p.name.c_str();
                 std::memcpy(di.render, pose, sizeof di.render);
@@ -1634,7 +1745,6 @@ void tick() {
                 di.now = now;
                 const bodydrive::Out dv = bodydrive::frame(di);
                 if (dv == bodydrive::Out::Driven) {
-                    if (tableOn) holders::set(p.eid, p.name.c_str(), holders::Holder::Driver, now);
                     p.haveLast = false;
                     p.havePrev = false;
                     p.blendPending = true;   // when the writer takes it again (an arrival, a fight, a fall), from where the body stands
@@ -1649,15 +1759,16 @@ void tick() {
                     ++it;
                     continue;
                 }
+                if (!bodydrive::release(p.eid, "driver handover")) { ++it; continue; }
                 if (dv == bodydrive::Out::Snap) { p.blendPending = false; p.blending = false; p.off[0] = p.off[1] = p.off[2] = 0; p.offRot = 0; }
                 if (dv == bodydrive::Out::Arrive) { p.blendPending = true; p.blendWhy = "arrive"; }
-                if (tableOn) holders::set(p.eid, p.name.c_str(), holders::Holder::Writer, now);
             }
             // The route is the old second holder. A person the driver class owns never
             // consults it, including when the driver hands the body to the writer.
             wo215::RouteOut ro;
             ro.v = wo215::Verdict::Writer;
             if (kcdmp::walkhold::consult_route(oneHolder)) ro = wo215::route_frame(ri);
+            if (ro.v == wo215::Verdict::Draining) { ++it; continue; }
             if (ro.v == wo215::Verdict::Routed) {
                 p.haveLast = false;
                 p.havePrev = false;
@@ -1674,6 +1785,18 @@ void tick() {
                 continue;
             }
             if (ro.v == wo215::Verdict::Correct && p.blendPending) p.blendFar = true;
+        } else if (!stop_movement(p.eid, "seat placement")) { ++it; continue; }
+        const auto who = seatPlace ? holders::Holder::Seat : holders::Holder::Writer;
+        const auto previous = holders::of(p.eid);
+        if (!holders::handover(p.eid, p.name.c_str(), who, now)) { ++it; continue; }
+        if (tableOn && who == holders::Holder::Writer && previous != holders::Holder::None && previous != who) {
+            // Leave the handover frame at the observed pose. The following
+            // interpolation starts from an engine read, never a prior setter.
+            p.haveLast = p.havePrev = false;
+            p.blendPending = true;
+            p.blendWhy = "holder-handover";
+            ++it;
+            continue;
         }
         if (p.blendPending) {
             blend_start(p, e, pose);
@@ -1724,13 +1847,14 @@ void tick() {
         const auto reachedScope = reached ? reachedSample->reader : rpmeasure::SampleScope{};
         const uint32_t reachedSender = reached ? reachedSample->senderMs : 0;
         double correctionCm = 0.0;
-        if (!write_one(p, e, pose, &wrote, measure ? &correctionCm : nullptr)) {
+        if (!write_one(p, e, pose, who, &wrote, measure ? &correctionCm : nullptr)) {
             if (!g_announcedFault) { g_announcedFault = true; logf("MP-NPCWRITE npc=%s engine call FAULTED", p.name.c_str()); }
             disarm("an engine call faulted inside the per-frame write");
             npctrace::frame_end();
             return;
         }
         if (wrote) { ++writing; g_statWrites.fetch_add(1, std::memory_order_relaxed); npctrace::note_write(e, pose); }
+        if (seatPlace && (wrote || !p.blendPending)) p.pendingSeatPlace = false;
         if (wrote && measure && p.curValid) {
             const double dx = static_cast<double>(pose[0]) - p.curRead[0];
             const double dy = static_cast<double>(pose[1]) - p.curRead[1];

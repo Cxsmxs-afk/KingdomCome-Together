@@ -3972,6 +3972,9 @@ def run(name, args):
     if name == 'rpmeasure':
         import scen_s2_measure
         return scen_s2_measure.run(sys.modules[__name__], args)
+    if name == 'ownerhandover':
+        import scen_s2_owner
+        return scen_s2_owner.run(sys.modules[__name__], args)
     r = Run(name, include_joiner=name != 'botjoiner')
     plan = {
         'join': [('join', s_join(r))],

@@ -35,6 +35,7 @@
 #include "buffs.h"
 #include "engine.h"
 #include "gait_logic.h"
+#include "holders.h"
 #include "hook_prologues.h"
 #include "inline_hook.h"
 #include "log.h"
@@ -310,9 +311,20 @@ std::string g_whyTags = "not installed";
 std::atomic<uint32_t> c_tagApplied{0};
 void* g_fnSpeedMap = nullptr;          // the manager's vtbl[0x78] body, byte-checked (the round(x)-1 mapper)
 
+holders::Permit stream_permit(uint32_t eid) {
+    // These animation inputs belong to the same pose author as the transform.
+    const auto current = holders::of(eid);
+    const auto writer = current == holders::Holder::Figure ? current : holders::Holder::Writer;
+    return holders::may_place(eid, writer, holders::kStreamSetter, holders::Claim::Held);
+}
+
 bool write_tag_inputs(void* actor, float cls, float vx, float vy) {
+    uint32_t eid = 0;
+    if (!rd(actor, kActorEntityId, &eid) || !eid) return false;
+    auto permit = stream_permit(eid);
+    if (!permit) return false;
     KCDMP_FAULT_READ(site, "motion::write_tag_inputs");
-    return fault::guarded(site, [&] {
+    const bool ok = fault::guarded(site, [&] {
         void* comp = *reinterpret_cast<void**>(static_cast<char*>(actor) + kActorPseudoComp);
         if (comp) *reinterpret_cast<float*>(static_cast<char*>(comp) + 0x18) = cls;
         float* rv = reinterpret_cast<float*>(static_cast<char*>(actor) + kActorReqVel);
@@ -320,6 +332,8 @@ bool write_tag_inputs(void* actor, float cls, float vx, float vy) {
         float* mv = reinterpret_cast<float*>(static_cast<char*>(actor) + kActorMoveVec);
         mv[0] = vx; mv[1] = vy;
     });
+    if (ok) permit.wrote();
+    return ok;
 }
 
 // UpdateMannequinTags entry (any thread). Cheap when nothing is driven.
@@ -339,6 +353,8 @@ void on_update_tags(void* actor) {
 struct PendingEvent { uint8_t kind; uint32_t eid; };
 std::mutex g_evMutex;
 std::vector<PendingEvent> g_events;
+struct FigureJump { void* ent = nullptr; double acceptedAt = 0; bool airborne = false; };
+std::unordered_map<uint32_t, FigureJump> g_figureJumps;   // main thread only
 
 // ---- captured actions (any thread -> main thread) --------------------------------
 struct Captured {
@@ -792,7 +808,10 @@ void log_piece(const char* name, bool armed, const std::string& why) {
 void apply_gait(Body& b, float speed) {
     void* fn = vslot(b.actor, kActorSetPseudoSpeed);
     if (fn != A.fnSetPseudo) return;   // the body's own vtable must dispatch to the anchored function
+    auto permit = stream_permit(b.eid);
+    if (!permit) return;
     if (!call_f(fn, b.actor, speed)) { c_faults.fetch_add(1); g_gait = false; g_whyGait = "SetPseudoSpeed faulted"; logf("WO121-MOTION gait DISARMED -- SetPseudoSpeed faulted on %s", b.key.c_str()); return; }
+    permit.wrote();
     b.gaitWritten = true;
     c_gaitWrites.fetch_add(1, std::memory_order_relaxed);
 }
@@ -803,7 +822,10 @@ void release_gait(Body& b) {
     unpublish_gait(b);   // WO-129: the tag update is the engine's own again from the next frame
     if (!b.gaitWritten || !b.actor) return;
     void* fn = vslot(b.actor, kActorSetPseudoSpeed);
-    if (fn == A.fnSetPseudo) call_f(fn, b.actor, 0.0f);
+    if (fn == A.fnSetPseudo) {
+        auto permit = stream_permit(b.eid);
+        if (permit && call_f(fn, b.actor, 0.0f)) permit.wrote();
+    }
     b.gaitWritten = false;
 }
 
@@ -818,7 +840,10 @@ void apply_crouch(Body& b, bool want) {
     if (!b.exp) { if (c_crouchApplyFail.fetch_add(1) < 5) logf("WO135-CROUCH body=%s apply refused: no state expansion", b.key.c_str()); return; }
     void* fn = vslot(b.exp, kExpSetCrouch);
     if (fn != A.fnSetCrouch) { if (c_crouchApplyFail.fetch_add(1) < 5) logf("WO135-CROUCH body=%s apply refused: SetCrouch slot mismatch", b.key.c_str()); return; }
+    auto permit = stream_permit(b.eid);
+    if (!permit) return;
     if (!call_bb(fn, b.exp, want, false)) { c_faults.fetch_add(1); g_moves = false; g_whyMoves = "SetCrouch faulted"; return; }
+    permit.wrote();
     b.crouchApplied = want;
     c_crouch.fetch_add(1);
     logf("WO121-MOTION body=%s crouch=%d", b.key.c_str(), want ? 1 : 0);
@@ -928,7 +953,7 @@ void release_body(Body& b, const char* why) {
         if (b.ctxApplied) set_avatar_contexts(b, false);
         if (b.quietApplied) set_quiet(b, 0);
     }
-    if (b.crouchApplied && b.exp && vslot(b.exp, kExpSetCrouch) == A.fnSetCrouch) { call_bb(A.fnSetCrouch, b.exp, false, false); b.crouchApplied = false; }
+    if (b.crouchApplied) apply_crouch(b, false);
     if (b.ca && is_a(b.ca, A.vftCa)) {
         if (b.blockApplied) call_setblock(A.fnSetBlock, b.ca, false, 0);
         if (b.combatHeld) set_guard_flag(b, 0);
@@ -1246,7 +1271,13 @@ void clear_turn(void* actor) {
     float v = 0; std::memcpy(&v, b + at * 4, 4);
     if (v == 0.0f) return;
     v = 0.0f; std::memcpy(b + at * 4, &v, 4);
-    if (call_setparams(fs, anim, b)) c_turnCleared.fetch_add(1, std::memory_order_relaxed);
+    uint32_t eid = 0;
+    if (!rd(actor, kActorEntityId, &eid) || !eid) return;
+    auto permit = stream_permit(eid);
+    if (permit && call_setparams(fs, anim, b)) {
+        permit.wrote();
+        c_turnCleared.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 int __fastcall hk_aim_update(void* self, float dt) {
     if (g_cfgNoTurn.load(std::memory_order_relaxed) && g_copyTable.live() > 0) {
@@ -1734,12 +1765,34 @@ void identity(const unsigned char guid[16], bool on) { avatar_identity(guid, on)
 void on_pipe_closed() { release_identities("the agent went away"); }
 
 void body_released(const char* key, uint32_t eid) {
+    g_figureJumps.erase(eid);
     auto it = g_bodies.find(eid);
     if (it == g_bodies.end()) return;
     if (it->second.avatar) hits::note_avatar(eid, nullptr, false);
     unpublish_gait(it->second);   // WO-129: even when the entity is already gone
     if (it->second.actor && engine::entity_by_id(eid) == it->second.ent) release_body(it->second, key);
     g_bodies.erase(it);
+}
+
+bool figure_jump_hold(uint32_t eid, void* ent, double now) {
+    auto it = g_figureJumps.find(eid);
+    if (it == g_figureJumps.end()) return false;
+    FigureJump& jump = it->second;
+    if (ent == jump.ent && holders::of(eid) == holders::Holder::OneShot) {
+        int flying = 0;
+        const bool read = npcdrive::living_flying(ent, &flying);
+        if (read && flying) {
+            jump.airborne = true;
+            return true;
+        }
+        // The request is consumed by the next controller update. Wait briefly
+        // for its first readback, then follow the engine's landing edge.
+        constexpr double kTakeoffReadbackS = 0.25;
+        if (!jump.airborne && now - jump.acceptedAt < kTakeoffReadbackS) return true;
+        if (jump.airborne && !read) return true;
+    }
+    g_figureJumps.erase(it);
+    return false;
 }
 
 // WO-154 2: the local player's body is down when its physics is no living entity: the ragdoll of a
@@ -1850,14 +1903,37 @@ void tick() {
         if (e.kind != 1) continue;
         if (!g_moves || !g_cfgMoves) continue;
         auto it = g_bodies.find(e.eid);
-        void* actor = it != g_bodies.end() ? it->second.actor : actor_by_eid(e.eid);
-        void* exp = it != g_bodies.end() && it->second.exp ? it->second.exp : (actor ? expansion_of(actor) : nullptr);
+        void* ent = engine::entity_by_id(e.eid);
+        // Only this attached figure's current actor may receive the request.
+        if (!ent || it == g_bodies.end() || !it->second.avatar || it->second.ent != ent) continue;
+        Body& b = it->second;
+        void* exp = b.exp ? b.exp : (b.actor ? expansion_of(b.actor) : nullptr);
+        void* fn = exp ? vslot(exp, kExpRequestJump) : nullptr;
+        const bool hooked = fn == reinterpret_cast<void*>(&hk_request_jump) && g_origJump;
+        if (!hooked && (!fn || fn != A.fnRequestJump)) continue;
+        float origin[3];
+        int flying = 0;
+        if (!engine::entity_world_pos(ent, origin) || !npcdrive::living_flying(ent, &flying) || flying) continue;
+        using holders::Holder;
+        const Holder previous = holders::of(e.eid);
+        const bool fromStream = previous == Holder::Writer || previous == Holder::Figure;
+        if (!fromStream) continue;
+        const double now = npcdrive::now_s();
+        if (!holders::handover(e.eid, b.key.c_str(), Holder::OneShot, now)) continue;
         bool ok = false;
-        if (exp && vslot(exp, kExpRequestJump) == reinterpret_cast<void*>(&hk_request_jump) && g_origJump) {
-            if (!call_jump(g_origJump, exp, &ok)) { ok = false; c_faults.fetch_add(1); }
-        } else if (exp && vslot(exp, kExpRequestJump) == A.fnRequestJump) {
-            call_ret_b(A.fnRequestJump, exp, &ok);
+        bool attempted = false;
+        bool ran = false;
+        {
+            auto permit = holders::may_place(e.eid, Holder::OneShot, "motion::RequestJump", holders::Claim::Held);
+            if (permit) {
+                attempted = true;
+                ran = hooked ? call_jump(g_origJump, exp, &ok) : call_ret_b(fn, exp, &ok);
+                if (ran && ok) permit.wrote();
+                if (!ran) c_faults.fetch_add(1);
+            }
         }
+        if (attempted && (ok || !ran)) g_figureJumps[e.eid] = {ent, now, false};
+        else holders::handover(e.eid, b.key.c_str(), previous, now);
         (ok ? c_jumps : c_jumpFail).fetch_add(1);
         logf("WO121-MOTION eid=0x%X jump -> %s", e.eid, ok ? "accepted" : "refused");
     }
@@ -1931,7 +2007,12 @@ bool player_set_crouch(bool on) {
     void* actor = player_actor();
     void* exp = actor ? expansion_of(actor) : nullptr;
     if (!exp || vslot(exp, kExpSetCrouch) != A.fnSetCrouch) return false;
-    return call_bb(A.fnSetCrouch, exp, on, false);
+    uint32_t eid = 0;
+    if (!rd(actor, kActorEntityId, &eid) || !eid) return false;
+    auto permit = holders::may_place(eid, holders::Holder::Probe, "motion::player_crouch_probe");
+    if (!permit || !call_bb(A.fnSetCrouch, exp, on, false)) return false;
+    permit.wrote();
+    return true;
 }
 
 bool test_fight(uint32_t eid) {

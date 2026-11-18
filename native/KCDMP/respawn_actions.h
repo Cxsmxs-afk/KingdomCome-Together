@@ -14,6 +14,8 @@
 #include <cstddef>
 #include "fader_rules.h"
 
+namespace kcdmp::p4rules { enum class Source : uint8_t; }
+
 namespace kcdmp::actions {
 
 // Resolve every piece once (idempotent). Logs one line per piece:
@@ -39,10 +41,9 @@ bool teleport_available();
 // slot 0xEE0 -> ExecuteTeleportImpl: XGenAI teleport with a physics reset, the
 // spot's authored transform). The caller checks the player actually moved.
 bool teleport_to_spot(uint64_t spotWuid);
-// Fallback: the `goto` shape (entity SetPos, why 0) plus the ground re-snap.
-bool teleport_player(float x, float y, float z);
-// C_Actor ground re-snap (+-1.75 m ray correction).
-bool resnap_player();
+// XGenAI relocation, with IEntity::SetPos fallback and a ground re-snap.
+// The validated P4 source identifies the one owner of the entire placement.
+bool teleport_player(float x, float y, float z, p4rules::Source source);
 
 // wh_rpg_ExcludePlayerFromTargeting for the knockdown wake-up.
 bool exclude_from_targeting(bool on);

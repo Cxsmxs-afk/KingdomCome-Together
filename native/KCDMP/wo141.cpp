@@ -18,12 +18,15 @@
 #include "combat_swing.h"
 #include "engine.h"
 #include "hits.h"
+#include "body_drive.h"
+#include "holders.h"
 #include "local_state.h"
 #include "log.h"
 #include "npc_drive.h"
 #include "pe_exports.h"
 #include "respawn_actions.h"
 #include "wo138.h"
+#include "wo215.h"
 
 #include <windows.h>
 #include <atomic>
@@ -449,10 +452,11 @@ std::string hands_text(const KH::Hands& h) { return " hands L=" + class_text(h.l
 // ---------------------------------------------------------------------------
 // Apply: the loaded state := the activity; the game's own post-load placement.
 // ---------------------------------------------------------------------------
-enum Applied : uint8_t { kApOk = 0, kApNoBody = 1, kApNoObject = 2, kApBuild = 3, kApExec = 4, kApNotArmed = 5 };
+enum Applied : uint8_t { kApOk = 0, kApNoBody = 1, kApNoObject = 2, kApBuild = 3, kApExec = 4, kApNotArmed = 5, kApOwnerBusy = 6 };
 const char* applied_name(uint8_t r) {
     switch (r) { case kApOk: return "ok"; case kApNoBody: return "no-body"; case kApNoObject: return "object-not-here";
-                 case kApBuild: return "build-failed"; case kApExec: return "execute-faulted"; case kApNotArmed: return "not-armed"; }
+                 case kApBuild: return "build-failed"; case kApExec: return "execute-faulted"; case kApNotArmed: return "not-armed";
+                 case kApOwnerBusy: return "body-owner-busy"; }
     return "?";
 }
 
@@ -694,11 +698,22 @@ void neutralise_loaded(uint32_t eid, const char* name);
 uint8_t apply_now(uint32_t eid, const R::Activity& want, uint8_t* execResult, const KH::Hands* hands = nullptr,
                   const char* name = nullptr, KH::Hands* missing = nullptr) {
     *execResult = 0;
+    using holders::Holder;
+    const Holder old = holders::of(eid);
+    if (old != Holder::None && old != Holder::Writer && old != Holder::Figure && old != Holder::Driver &&
+        old != Holder::Route && old != Holder::Seat && old != Holder::Activity) return kApOwnerBusy;
+    if (!bodydrive::release(eid, "NPC-state placement") || !wo215::route_release(eid, "NPC-state placement")) return kApOwnerBusy;
+    const Holder who = R::object_stance(want.stance) || (old == Holder::Seat && !R::owns_position(want)) ? Holder::Seat : Holder::Activity;
+    const bool published = old != Holder::None || R::owns_position(want);
+    if (published && !holders::handover(eid, name, who, npcdrive::now_s())) return kApOwnerBusy;
+    auto permit = holders::may_place(eid, who, "wo141.loaded_state_pose");
+    if (!permit) return kApOwnerBusy;
     void* ctx = nullptr;
     const uint8_t b = build_loaded(eid, want, hands, name, missing, &ctx);
     if (b != kApOk) return b;
     uint8_t res = 0;
     if (!fcall(g_execLoaded, &res, ctx)) return kApExec;
+    if (res) permit.wrote();
     *execResult = res;
     return kApOk;
 }
@@ -1045,6 +1060,8 @@ void reconcile_tick(double now) {
             ++it; continue;   // the next tick applies the activity alone
         }
         const uint8_t r = apply_now(d.eid, d.a, &res, useHands ? &d.hands : nullptr, d.name.c_str(), &missing);
+        if (r == kApOwnerBusy) { ++it; continue; }   // wait for the previous engine owner; no planner refusal was observed
+        if (r == kApOk && res && owns) { npcdrive::set_activity_hold(d.eid, true); d.held = true; }
         if (useHands && missing.empty()) ++d.handsTries;   // a temporary tool still on its way does not count
         c_applies.fetch_add(1); ++d.applies;
         if (r == kApOk && useHands && g_handApplied) g_handApplied(d.eid);
@@ -1456,7 +1473,16 @@ void* loaded_state(void* ctx) { void* l = ctx ? static_cast<char*>(ctx) + kCtxLo
 void* current_state(void* ctx) { return ctx ? static_cast<char*>(ctx) + kCtxCurrent : nullptr; }
 bool clear_loaded(void* loaded) { return loaded && fcall_void(vslot(loaded, kStateClear), loaded); }
 bool set_loaded_slot(void* loaded, unsigned slot, void* p, void* ctrl) { return state_set_slot(loaded, slot, SharedPtr{p, ctrl}); }
-bool execute_loaded(void* ctx, uint8_t* res) { *res = 0; return g_execLoaded && ctx && fcall(g_execLoaded, res, ctx); }
+bool execute_loaded(uint32_t eid, void* ctx, uint8_t* res) {
+    *res = 0;
+    if (!g_execLoaded || !ctx || ctx != ctx_of_eid(eid)) return false;
+    const auto who = holders::of(eid);
+    if (who != holders::Holder::Seat && who != holders::Holder::Activity) return false;
+    auto permit = holders::may_place(eid, who, "wo141.loaded_state_pose", holders::Claim::Held);
+    const bool ok = permit && fcall(g_execLoaded, res, ctx);
+    if (ok && *res) permit.wrote();
+    return ok;
+}
 std::string describe_state(void* state) { return state_text(state); }
 const char* unstance_label(uint16_t id, char* buf, size_t n) { return unstance_name(id, buf, n); }
 int unstance_index(const char* name) { return unstance_id(name); }

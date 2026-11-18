@@ -125,6 +125,23 @@ int wo210_tests(int* passed) {
         KdState x;
         WCHECK(kd_step(x, false, true, false, false, 40.0) == KdAct::None && !x.held, "the twin (off): no fall");
         WCHECK(!std::strcmp(kd_act_name(KdAct::StandUp), "stand-up"), "the act names");
+
+        KdState owner;
+        WCHECK(kd_step(owner, true, true, false, false, 50.0, true) == KdAct::Fall && owner.held,
+               "fall takes ownership before the ragdoll request");
+        WCHECK(kd_step(owner, true, false, true, false, 51.0, true) == KdAct::StandUp && owner.held && owner.upRequested,
+               "the get-up request keeps the body while it lies");
+        WCHECK(kd_step(owner, true, false, true, false, 51.5, true) == KdAct::None && owner.held,
+               "get-up is asynchronous and needs no duplicate request");
+        WCHECK(kd_step(owner, true, false, false, false, 52.0, true) == KdAct::None && !owner.held,
+               "natively standing releases the holder");
+
+        kd_step(owner, true, true, true, false, 53.0, true);
+        kd_step(owner, true, false, true, false, 54.0, true);
+        WCHECK(kd_step(owner, true, true, true, false, 54.5, true) == KdAct::None && owner.held && owner.hostDown && !owner.upRequested,
+               "a newer fall supersedes the outstanding get-up for an already lying body");
+        WCHECK(kd_step(owner, true, false, true, true, 55.0, true) == KdAct::Release && !owner.held,
+               "a corpse never gets a stand-up request");
     }
 
     {

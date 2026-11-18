@@ -53,8 +53,13 @@ public class VerdictTests
     [Theory]
     [InlineData("owner_violations=0", VerdictStatus.Grey)]
     [InlineData("owner_violations=0 rp_owner_n=0", VerdictStatus.Grey)]
-    [InlineData("owner_violations=0 rp_owner_n=50", VerdictStatus.Green)]
+    [InlineData("owner_violations=0 rp_owner_n=50", VerdictStatus.Grey)]
+    [InlineData("owner_violations=0 rp_owner_n=50 owner_handovers=2", VerdictStatus.Grey)]
+    [InlineData("owner_violations=0 rp_owner_n=50 owner_handovers=2 owner_denied_sets=x", VerdictStatus.Grey)]
+    [InlineData("owner_violations=0 rp_owner_n=0 owner_handovers=0 owner_denied_sets=0", VerdictStatus.Grey)]
+    [InlineData("owner_violations=0 rp_owner_n=50 owner_handovers=2 owner_denied_sets=10", VerdictStatus.Green)]
     [InlineData("owner_violations=1", VerdictStatus.Red)]
+    [InlineData("owner_violations=1 rp_owner_n=0 owner_handovers=0 owner_denied_sets=0", VerdictStatus.Red)]
     [InlineData("owner_violations=0 owner_violations=1", VerdictStatus.Grey)]
     public void Owner_observations_are_explicit_and_ambiguous_samples_never_pass(string fields, VerdictStatus expected)
     {
@@ -62,6 +67,50 @@ public class VerdictTests
         input.Logs["agent.log"] = [$"12:00:00.000 MP-T3-STATS origin=agent role=joiner {fields}"];
         var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "owner_violations");
         Assert.Equal(expected, row.Status);
+    }
+
+    [Fact]
+    public void Owner_handovers_and_denials_from_a_qualified_mirror_have_no_failure_threshold()
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [
+            "12:00:00.000 MP-W207-Q lag_ms=25 waiting=0",
+            "12:00:00.000 MP-T3-STATS origin=agent role=host owner_violations=0 rp_owner_n=0 owner_handovers=0 owner_denied_sets=0"
+        ];
+        input.Logs["kcdmp-native.log"] = [
+            "MP-T3-STATS origin=dll source=agent role=host owner_violations=0 rp_owner_n=123 owner_handovers=7 owner_denied_sets=42"
+        ];
+        var verdict = VerdictRules.Evaluate(input);
+        Assert.Equal(VerdictStatus.Green, verdict.Status);
+        Assert.Contains("owner_violations\tGRÜN\t0\tMP-T3-STATS, DLL-Spiegel, n=123", verdict.ToText());
+        Assert.Contains("owner_handovers\tGRAU\t7\tMP-T3-STATS, DLL-Spiegel, n=123, ohne Grenzwert", verdict.ToText());
+        Assert.Contains("owner_denied_sets\tGRAU\t42\tMP-T3-STATS, DLL-Spiegel, n=123, ohne Grenzwert", verdict.ToText());
+        var violation = new Briefing.Input();
+        violation.Logs["agent.log"] = input.Logs["agent.log"];
+        violation.Logs["kcdmp-native.log"] = [input.Logs["kcdmp-native.log"][0].Replace("owner_violations=0", "owner_violations=1")];
+        Assert.Equal(VerdictStatus.Red, VerdictRules.Evaluate(violation).Status);
+    }
+
+    [Fact]
+    public void Owner_violation_before_the_next_counters_is_red_only_for_the_current_native_launch()
+    {
+        const string marker = "WO221-OWNER-VIOLATION eid=0x4A holder=fall path=writer frame=123";
+        const string tally = "MP-T3-STATS origin=dll source=agent role=joiner owner_violations=0 rp_owner_n=20 owner_handovers=1 owner_denied_sets=0";
+        var input = new Briefing.Input();
+        input.Logs["kcdmp-native.log"] = [
+            "[12:00:00.000] t000001 Laaaaaa " + marker,
+            "[12:01:00.000] t000001 Lbbbbbb " + tally
+        ];
+        input.Logs["agent.log"] = ["12:01:00.001 " + marker];
+        Assert.Contains("owner_violations\tGRÜN\t0\t", VerdictRules.Evaluate(input).ToText());
+
+        var current = new Briefing.Input();
+        current.Logs["kcdmp-native.log"] = [.. input.Logs["kcdmp-native.log"],
+            "[12:02:00.000] t000001 Lbbbbbb " + marker];
+        var verdict = VerdictRules.Evaluate(current);
+        Assert.Equal(VerdictStatus.Red, verdict.Status);
+        Assert.Contains("owner_violations\tROT\t≥1\tWO221-OWNER-VIOLATION, DLL", verdict.ToText());
+        Assert.True(NoiseRules.IsProtected(current.Logs["kcdmp-native.log"][^1]));
     }
 
     [Theory]

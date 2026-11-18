@@ -10,6 +10,7 @@
 #include "engine.h"
 #include "fault_guard.h"
 #include "hook_prologues.h"
+#include "holders.h"
 #include "inline_hook.h"
 #include "log.h"
 #include "npc_drive.h"
@@ -113,7 +114,6 @@ constexpr size_t kNpcAgentType = 0x208;     // C_NPC vtable: the navigation agen
 constexpr size_t kNpcPosition = 0x50;       // C_NPC vtable: its position (Vec3*)
 constexpr size_t kNpcWuid = 0x10;           // C_NPC: the soul's WUID
 constexpr size_t kMgrNpcOf = 0x20;          // C_NPCManager vtable: the C_NPC of an entity id (the debug door's own lookup)
-constexpr uint32_t kNoRequest = 0xFFFFFFFFu;
 // The AI update (C_XGenAIModule::UpdateInternal, found by its profiler label): a job on a worker thread, where the engine's brains make
 // their own movement requests. The route makes every request of its own there too (ai_drain, an entry hook): a9's joiner crashed in that
 // update's navigation while the route, on the main thread, replaced a task's request -- freeing the path request the update was walking.
@@ -426,7 +426,7 @@ constexpr size_t kReqStyle = 0xFC, kReqTolA = 0x110, kReqTolB = 0x114;
 
 // plain (WO-221): the calls are made with no fault guard around them -- the manager's queue takes the manager's own mutex, and a fault
 // caught inside it would leave it held (the standing rule of WO-221 for every engine call it adds).
-uint32_t queue_request(void* npc, const float target[3], int speedEnum, bool exact, float yaw, const ReqX* x = nullptr, bool plain = false) {
+uint32_t queue_request(void* npc, const float target[3], int speedEnum, bool exact, float yaw, const ReqX* x, bool plain, bool& uncertain) {
     if (!g_api.armed || !npc) return kNoRequest;
     void* mgr = task_manager();
     if (!mgr) return kNoRequest;
@@ -438,6 +438,7 @@ uint32_t queue_request(void* npc, const float target[3], int speedEnum, bool exa
     const float dir[3] = {-std::sin(yaw), std::cos(yaw), 0.0f};   // CryEngine: yaw 0 faces +Y
     const int flags = include_flags();
     uint32_t id = kNoRequest;
+    bool queueEntered = false;
     bool built = false;
     KCDMP_FAULT_CALL(site, "wo215::queue_request");
     auto body = [&] {
@@ -479,6 +480,7 @@ uint32_t queue_request(void* npc, const float target[3], int speedEnum, bool exa
             const float xd[3] = {-std::sin(x->exactYaw), std::cos(x->exactYaw), 0.0f};
             reinterpret_cast<Setter>(g_api.exactSet)(req, x->exactPt, xd);
         } else if (exact) reinterpret_cast<Setter>(g_api.exactSet)(req, tgt, dir);
+        queueEntered = true;
         id = reinterpret_cast<Queue>(g_api.queue)(mgr, req);
         // ours, not the engine's: detach it, destroy it in place (the scalar destructor without the free), then the request
         void* none = nullptr;
@@ -492,7 +494,8 @@ uint32_t queue_request(void* npc, const float target[3], int speedEnum, bool exa
     if (!ok) {
         c_faults.fetch_add(1, std::memory_order_relaxed);
         disarm(built ? "a fault inside the movement request (queue)" : "a fault inside the movement request (build)");
-        return kNoRequest;
+        uncertain = queueEntered;
+        return id;
     }
     if (id == kNoRequest) c_refused.fetch_add(1, std::memory_order_relaxed);
     else c_queued.fetch_add(1, std::memory_order_relaxed);
@@ -502,26 +505,32 @@ uint32_t queue_request(void* npc, const float target[3], int speedEnum, bool exa
 std::atomic<uint32_t> c_cancelStale{0};
 // The stop: the manager's cancel of our request -- only while it is still the NPC's current one (task +0x10); a request that already ended
 // (the body arrived, or the task took another) needs none, and the manager's lookup of a stale id is not safe.
-bool cancel_request(void* npc, uint32_t id) {
-    if (!g_api.armed || id == kNoRequest || !npc) return false;
+enum class StopResult { Pending, Gone, Stopped };
+StopResult cancel_request(void* npc, uint32_t id, bool plain, bool checking) {
+    if (!g_api.taskOf || !g_api.taskCancel || !npc) return StopResult::Pending;
     void* mgr = task_manager();
-    if (!mgr) return false;
+    if (!mgr) return StopResult::Pending;
     void* task = nullptr;
     KCDMP_FAULT_CALL(tsite, "wo215::task_of");
-    if (!fault::guarded(tsite, [&] { task = reinterpret_cast<void* (*)(void*, void*)>(g_api.taskOf)(mgr, npc); }) || !task) return false;
+    if (!fault::guarded(tsite, [&] { task = reinterpret_cast<void* (*)(void*, void*)>(g_api.taskOf)(mgr, npc); })) return StopResult::Pending;
+    if (!task) return StopResult::Gone;
     uint32_t cur = kNoRequest;
-    if (!rd(task, 0x10, &cur) || cur != id) {
+    if (!rd(task, 0x10, &cur)) return StopResult::Pending;
+    if (request_released(cur, id)) {
         const uint32_t k = c_cancelStale.fetch_add(1, std::memory_order_relaxed) + 1;
         if (k <= 30 || k % 200 == 0) logf("WO215-CANCEL stale: the task's current request is %d, ours was %u -- nothing to cancel [n=%u]", static_cast<int>(cur), id, k);
-        return false;
+        return StopResult::Gone;
     }
+    if (checking) return StopResult::Pending;
     // the task's own cancel (what the queue runs before a new request): no manager mutex is taken, so no fault inside it can leave one held
     // (the a1 bench run: the manager's cancel faulted on a stale id inside its mutex, and the next frame's movement update hung on it)
     KCDMP_FAULT_CALL(site, "wo215::cancel_request");
-    const bool ok = fault::guarded(site, [&] { reinterpret_cast<void (*)(void*)>(g_api.taskCancel)(task); });
-    if (!ok) { c_faults.fetch_add(1); disarm("a fault inside the movement cancel"); return false; }
+    const auto cancel = [&] { reinterpret_cast<void (*)(void*)>(g_api.taskCancel)(task); };
+    bool ok = true;
+    if (plain) cancel(); else ok = fault::guarded(site, cancel);
+    if (!ok) { c_faults.fetch_add(1); disarm("a fault inside the movement cancel"); return StopResult::Pending; }
     c_cancels.fetch_add(1, std::memory_order_relaxed);
-    return true;
+    return StopResult::Stopped;
 }
 
 // ---------------------------------------------------------------------------------------------------- the AI update's own thread
@@ -529,31 +538,105 @@ bool cancel_request(void* npc, uint32_t id) {
 // before the update runs -- the engine's brains make their requests in the same update. Posting keeps one order per body (a newer one
 // replaces it: a request cancels the task's current one by itself), so a paused AI update never piles orders up.
 enum : uint8_t { kOrdWalk = 1, kOrdExact = 2, kOrdCancel = 3, kOrdReplay = 4, kOrdCancelAny = 5, kOrdGoPlain = 6, kOrdStopPlain = 7 };   // 4: WO-216 A.1; 5: WO-221 C (B1d)
+using holders::Holder;
 size_t tasks_by_wuid(void* mgr, std::unordered_map<uint64_t, void*>* out);
 std::atomic<uint32_t> c_planCancels{0};
 enum : uint8_t { kOutQueued = 1, kOutRefused = 2, kOutNoNpc = 3 };
-struct Order { uint8_t kind = 0; float target[3]{}; int speed = 1; float yaw = 0; uint32_t seq = 0; ReqX x; };
+struct Order {
+    uint8_t kind = 0;
+    float target[3]{};
+    int speed = 1;
+    float yaw = 0;
+    uint32_t seq = 0;
+    ReqX x;
+    Holder owner = Holder::Route;
+    void* ent = nullptr;
+    bool verifyingStop = false;
+};
 struct Outcome { uint32_t seq = 0; uint32_t id = kNoRequest; uint8_t what = 0; };
-std::mutex g_ordMu;                                // guards g_orders and g_outcomes only (never held across an engine call)
+struct Lease { uint32_t seq = 0; Holder owner = Holder::None; bool stopping = false; };
+struct LiveOrder { uint32_t id = kNoRequest, seq = 0; void* ent = nullptr; Holder owner = Holder::None; };
+std::mutex g_ordMu;                                // protects messages and leases (never held across an engine call)
 std::unordered_map<uint32_t, Order> g_orders;      // eid -> the newest order not yet carried out
 std::unordered_map<uint32_t, Outcome> g_outcomes;  // eid -> the outcome of the newest order carried out (a request's, not a cancel's)
+std::unordered_map<uint32_t, Lease> g_leases;      // queued, active or stopping (only the AI thread confirms the body is free)
 std::atomic<bool> g_ordersPending{false};
 std::atomic<uint32_t> g_ordSeq{0}, c_aiTicks{0}, c_drained{0}, c_noNpcAi{0};
-std::unordered_map<uint32_t, uint32_t> g_ourId;    // eid -> the request id the route last got (the AI update's thread only)
+std::unordered_map<uint32_t, LiveOrder> g_ourId;   // the last accepted request (AI update's thread only)
 
-uint32_t post_order(uint32_t eid, uint8_t kind, const float target[3], int speed, float yaw) {
+bool stop_order(uint8_t kind) { return kind == kOrdCancel || kind == kOrdStopPlain; }
+
+uint32_t submit_order(uint32_t eid, Order& o) {
+    if (!stop_order(o.kind)) {
+        o.ent = engine::entity_by_id(eid);
+        if (!o.ent) return 0;
+    }
+    const double now = now_s();
+    std::lock_guard<std::mutex> l(g_ordMu);
+    auto lease = g_leases.find(eid);
+    o.seq = g_ordSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!o.seq) o.seq = g_ordSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (o.kind == kOrdCancelAny) {
+        if (lease != g_leases.end()) return 0;
+    } else if (stop_order(o.kind)) {
+        if (lease == g_leases.end() || lease->second.owner != o.owner) return 0;
+        if (lease->second.stopping) return lease->second.seq;
+        lease->second = {o.seq, o.owner, true};
+    } else {
+        if (lease != g_leases.end() && (lease->second.owner != o.owner || lease->second.stopping)) return 0;
+        const Holder current = holders::of(eid);
+        if (current != Holder::None && current != Holder::Writer && current != o.owner) return 0;
+        if (!holders::handover(eid, nullptr, o.owner, now)) return 0;
+        g_leases[eid] = {o.seq, o.owner, false};
+    }
+    g_orders[eid] = o;
+    g_ordersPending.store(true, std::memory_order_release);
+    return o.seq;
+}
+
+uint32_t post_order(uint32_t eid, uint8_t kind, const float target[3], int speed, float yaw, Holder owner = Holder::Route) {
     Order o;
     o.kind = kind;
     if (target) std::memcpy(o.target, target, 12);
     o.speed = speed;
     o.yaw = yaw;
-    o.seq = g_ordSeq.fetch_add(1, std::memory_order_relaxed) + 1;
-    {
-        std::lock_guard<std::mutex> l(g_ordMu);
-        g_orders[eid] = o;
+    o.owner = owner;
+    return submit_order(eid, o);
+}
+
+bool lease_current(uint32_t eid, uint32_t seq) {
+    std::lock_guard<std::mutex> l(g_ordMu);
+    const auto it = g_leases.find(eid);
+    return it != g_leases.end() && it->second.seq == seq;
+}
+
+void retire_lease(uint32_t eid, uint32_t seq, Holder owner) {
+    std::lock_guard<std::mutex> l(g_ordMu);
+    auto it = g_leases.find(eid);
+    if (it != g_leases.end() && it->second.seq == seq) {
+        holders::engine_stopped(eid, owner);
+        g_leases.erase(it);
     }
+}
+
+bool motion_pending(uint32_t eid, Holder owner) {
+    std::lock_guard<std::mutex> l(g_ordMu);
+    const auto it = g_leases.find(eid);
+    return it != g_leases.end() && it->second.owner == owner;
+}
+
+bool motion_stopping(uint32_t eid) {
+    std::lock_guard<std::mutex> l(g_ordMu);
+    const auto it = g_leases.find(eid);
+    return it != g_leases.end() && it->second.stopping;
+}
+
+void retry_stop(uint32_t eid, const Order& o) {
+    std::lock_guard<std::mutex> l(g_ordMu);
+    const auto it = g_leases.find(eid);
+    if (it == g_leases.end() || it->second.seq != o.seq) return;
+    g_orders[eid] = o;
     g_ordersPending.store(true, std::memory_order_release);
-    return o.seq;
 }
 
 bool take_outcome(uint32_t eid, Outcome* out) {
@@ -595,16 +678,36 @@ void ai_drain() {
     for (const auto& kv : work) {
         const uint32_t eid = kv.first;
         const Order& o = kv.second;
+        constexpr const char* kPath = "wo215::movement_task";
+        if (o.kind != kOrdCancelAny && !lease_current(eid, o.seq)) continue;
         Outcome oc;
         oc.seq = o.seq;
-        void* npc = g_armed.load(std::memory_order_relaxed) ? npc_of(eid) : nullptr;
-        if (!g_armed.load(std::memory_order_relaxed)) {
-            oc.what = kOutRefused;
-        } else if (!npc) {
-            oc.what = kOutNoNpc;
-            g_ourId.erase(eid);
-            c_noNpcAi.fetch_add(1, std::memory_order_relaxed);
+        void* ent = engine::entity_by_id(eid);
+        void* npc = ent ? npc_of(eid) : nullptr;
+        if (stop_order(o.kind)) {
+            auto live = g_ourId.find(eid);
+            bool stopped = live == g_ourId.end() || !ent || ent != live->second.ent;
+            if (!stopped && npc) {
+                auto permit = holders::may_place(eid, o.owner, kPath, holders::Claim::Release);
+                if (permit) {
+                    const auto result = cancel_request(npc, live->second.id, o.kind == kOrdStopPlain, o.verifyingStop);
+                    if (result == StopResult::Stopped) permit.wrote();
+                    stopped = result == StopResult::Gone;
+                    if (result == StopResult::Stopped) {
+                        // The engine processes the requested stop after this hook returns.
+                        Order verify = o;
+                        verify.verifyingStop = true;
+                        retry_stop(eid, verify);
+                        continue;
+                    }
+                }
+            }
+            if (stopped) {
+                g_ourId.erase(eid);
+                retire_lease(eid, o.seq, o.owner);
+            } else retry_stop(eid, o);
         } else if (o.kind == kOrdCancelAny) {
+            if (!npc || ent != o.ent || !g_armed.load(std::memory_order_relaxed) || motion_pending(eid, Holder::Route) || motion_pending(eid, Holder::Probe)) continue;
             // WO-221 C (B1d): whatever request the body's movement task holds (its paused brain's last one: the source of the joiner's
             // "Agent is stuck" lines) ends by the task's own cancel -- here, on the AI update's thread at its entry, where the engine's
             // brains make and cancel their requests themselves. The cancel only marks the task's request ended (WO-215 read it whole).
@@ -615,10 +718,13 @@ void ai_drain() {
                 auto ti = s_any.find(w);
                 uint32_t cur = kNoRequest;
                 if (ti != s_any.end() && rd(ti->second, 0x10, &cur) && cur != kNoRequest) {
+                    auto permit = holders::may_place(eid, Holder::Writer, holders::kStreamSetter);
+                    if (!permit) continue;
                     void* task = ti->second;
                     // a plain call: an engine AI call of this work order runs under no fault guard (the task was looked up just now,
                     // on this thread, in the manager's own table; the reads above are memory reads only)
                     reinterpret_cast<void (*)(void*)>(g_api.taskCancel)(task);
+                    permit.wrote();
                     const bool okc = true;
                     const uint32_t k = c_planCancels.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (k <= 60 || k % 200 == 0)
@@ -626,34 +732,28 @@ void ai_drain() {
                              eid, cur, okc ? "cancelled" : "NOT cancelled", k);
                 }
             }
-        } else if (o.kind == kOrdStopPlain) {
-            // WO-221 D.2: our own request ends by the task's own cancel, plain, only while it is still the body's current one
-            auto it = g_ourId.find(eid);
-            if (it != g_ourId.end()) {
-                void* mgr = task_manager();
-                static std::unordered_map<uint64_t, void*> s_own;
-                uint64_t w = 0;
-                if (mgr && rd(npc, kNpcWuid, &w) && tasks_by_wuid(mgr, &s_own)) {
-                    auto ti = s_own.find(w);
-                    uint32_t cur = kNoRequest;
-                    if (ti != s_own.end() && rd(ti->second, 0x10, &cur) && cur == it->second) {
-                        reinterpret_cast<void (*)(void*)>(g_api.taskCancel)(ti->second);
-                        c_cancels.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            oc.what = npc && ent == o.ent ? kOutRefused : kOutNoNpc;
+            if (oc.what == kOutNoNpc) c_noNpcAi.fetch_add(1, std::memory_order_relaxed);
+            else if (g_armed.load(std::memory_order_relaxed)) {
+                auto permit = holders::may_place(eid, o.owner, kPath, holders::Claim::Held);
+                if (permit) {
+                    bool uncertain = false;
+                    oc.id = queue_request(npc, o.target, o.speed, o.kind == kOrdExact, o.yaw, o.kind == kOrdReplay ? &o.x : nullptr, o.kind == kOrdGoPlain, uncertain);
+                    if (oc.id != kNoRequest || uncertain) {
+                        // Faults after entering the queue can still leave a
+                        // live task. Keep the lease until the AI confirms it ended.
+                        permit.wrote();
+                        if (!uncertain) oc.what = kOutQueued;
+                        g_ourId[eid] = {oc.id, o.seq, ent, o.owner};
                     }
                 }
-                g_ourId.erase(it);
             }
-        } else if (o.kind == kOrdCancel) {
-            auto it = g_ourId.find(eid);
-            if (it != g_ourId.end()) { cancel_request(npc, it->second); g_ourId.erase(it); }
-        } else {
-            const uint32_t id = queue_request(npc, o.target, o.speed, o.kind == kOrdExact, o.yaw, o.kind == kOrdReplay ? &o.x : nullptr, o.kind == kOrdGoPlain);
-            oc.id = id;
-            oc.what = id == kNoRequest ? kOutRefused : kOutQueued;
-            if (id != kNoRequest) g_ourId[eid] = id; else g_ourId.erase(eid);
+            // A refused replacement does not prove the previous request stopped.
+            if (oc.what != kOutQueued && g_ourId.count(eid) == 0) retire_lease(eid, o.seq, o.owner);
         }
         c_drained.fetch_add(1, std::memory_order_relaxed);
-        if (o.kind != kOrdCancel && o.kind != kOrdCancelAny && o.kind != kOrdStopPlain) {
+        if (!stop_order(o.kind) && o.kind != kOrdCancelAny) {
             std::lock_guard<std::mutex> l(g_ordMu);
             g_outcomes[eid] = oc;
         }
@@ -826,7 +926,7 @@ void ended_ai(double now) {
         bool ended = false;
         if (npc && rd(npc, kNpcWuid, &w)) {
             auto t = s_tasks.find(w);
-            if (t != s_tasks.end() && rd(t->second, kTaskId, &cur)) ended = cur != it->second;
+            if (t != s_tasks.end() && rd(t->second, kTaskId, &cur)) ended = request_released(cur, it->second.id);
         }
         if (ended) {
             c_endedSeen.fetch_add(1, std::memory_order_relaxed);
@@ -834,6 +934,7 @@ void ended_ai(double now) {
                 std::lock_guard<std::mutex> l(g_ordMu);
                 g_ended[it->first] = now;
             }
+            retire_lease(it->first, it->second.seq, it->second.owner);
             it = g_ourId.erase(it);
         } else ++it;
     }
@@ -966,13 +1067,7 @@ uint32_t post_replay(uint32_t eid, const wo216rules::RouteRec& L) {
     o.x.exact = (L.flags & wo216rules::kRecExact) != 0;
     std::memcpy(o.x.exactPt, L.exact, 12);
     o.x.exactYaw = L.exactYaw;
-    o.seq = g_ordSeq.fetch_add(1, std::memory_order_relaxed) + 1;
-    {
-        std::lock_guard<std::mutex> l(g_ordMu);
-        g_orders[eid] = o;
-    }
-    g_ordersPending.store(true, std::memory_order_release);
-    return o.seq;
+    return submit_order(eid, o);
 }
 
 enum class Rp : uint8_t { Fallback = 0, Routed = 1, Correct = 2, Budget = 3 };
@@ -983,7 +1078,7 @@ bool player_pos(float out[3]) {
 }
 
 void release_route(Route& r, const char* why) {
-    if (r.active || r.pendingSeq) post_order(r.eid, kOrdCancel, nullptr, 0, 0.0f);   // carried out at the AI update's entry
+    post_order(r.eid, kOrdCancel, nullptr, 0, 0.0f);   // carried out at the AI update's entry
     r.pendingSeq = 0;
     if (r.active) {
         c_releases.fetch_add(1, std::memory_order_relaxed);
@@ -1076,7 +1171,7 @@ void probe_line(double now) {
 void probe_tick(double now) {
     if (!g_probe.on) return;
     if (now >= g_probe.until) {
-        if (g_probe.mode == 3) post_order(g_probe.eid, kOrdCancel, nullptr, 0, 0.0f);
+        post_order(g_probe.eid, kOrdCancel, nullptr, 0, 0.0f, Holder::Probe);
         logf("WO215-PROBE npc=%s done after %.1f s, %u orders", g_probe.name.c_str(), now - g_probe.startAt, g_probe.orders);
         g_probe = Probe{};
         return;
@@ -1084,7 +1179,7 @@ void probe_tick(double now) {
     if (g_probe.mode == 3) {
         const float s = g_probe.speed * static_cast<float>(now - g_probe.startAt);
         const float tgt[3] = {g_probe.start[0] + g_probe.dir[0] * s, g_probe.start[1] + g_probe.dir[1] * s, g_probe.start[2]};
-        g_probe.reqId = post_order(g_probe.eid, kOrdWalk, tgt, speed_enum(g_probe.gait), 0.0f);   // the order's number (the AI update makes it)
+        g_probe.reqId = post_order(g_probe.eid, kOrdWalk, tgt, speed_enum(g_probe.gait), 0.0f, Holder::Probe);
         ++g_probe.orders;
     }
     if (now - g_probe.lastLine >= 0.1) { g_probe.lastLine = now; probe_line(now); }
@@ -1109,10 +1204,12 @@ uint8_t probe_op(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size
     const char* why = "ok";
     if (!g_api.armed) why = g_api.why;
     else if (!eid) why = "no entity of that name";
+    else if ((mode == 1 || mode == 3) && motion_pending(eid, Holder::Route) && !route_release(eid, "probe takeover")) why = "body still held by a route";
     else if (mode == 1 || mode == 3) {
         const Gait gait = static_cast<Gait>((g & 0x7F) < kGaits ? (g & 0x7F) : 0);
         const double now = now_s();
         // the body leaves every writer for the probe's run (the main thread releases its route: the probe's body is "off" there)
+        if (g_probe.on && g_probe.eid != eid) post_order(g_probe.eid, kOrdCancel, nullptr, 0, 0.0f, Holder::Probe);
         g_probe = Probe{};
         g_probe.on = true; g_probe.eid = eid; g_probe.name = name; g_probe.mode = mode; g_probe.gait = gait;
         g_probe.startAt = now; g_probe.until = now + (secs ? secs : 15);
@@ -1122,18 +1219,19 @@ uint8_t probe_op(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size
         g_probe.exactAsked = (g & 0x80) != 0;
         g_probe.yawAsked = v[3];
         if (mode == 1) {
-            id = post_order(eid, (g & 0x80) ? kOrdExact : kOrdWalk, v, speed_enum(gait), v[3]);   // the order's number
+            id = post_order(eid, (g & 0x80) ? kOrdExact : kOrdWalk, v, speed_enum(gait), v[3], Holder::Probe);
             g_probe.reqId = id;
             ++g_probe.orders;
+            if (!id) { why = "another owner holds the body"; g_probe = Probe{}; }
         }
         logf("WO215-PROBE npc=%s eid=0x%X mode=%d gait=%s exact=%d target=(%.2f,%.2f,%.2f) yaw=%.2f secs=%u -> id=%u (%s)", name, eid, mode,
              gait_name(gait), (g & 0x80) ? 1 : 0, v[0], v[1], v[2], v[3], secs, id, why);
     } else if (mode == 2) {
-        post_order(eid, kOrdCancel, nullptr, 0, 0.0f);
+        post_order(eid, kOrdCancel, nullptr, 0, 0.0f, Holder::Probe);
         logf("WO215-PROBE npc=%s stop (the task's own cancel, at the AI update's entry; order %u was the last)", name, g_probe.reqId);
         id = g_probe.reqId;
     } else if (mode == 4) {
-        post_order(eid, kOrdCancel, nullptr, 0, 0.0f);
+        post_order(eid, kOrdCancel, nullptr, 0, 0.0f, Holder::Probe);
         logf("WO215-PROBE npc=%s released to the writer", name);
         g_probe = Probe{};
     } else return wo163::kRBadRequest;
@@ -1461,13 +1559,18 @@ Rp replay_frame(Route& r, const RouteIn& in, const float body[3], int& used) {
 
 RouteOut route_frame_inner(const RouteIn& in);
 RouteOut route_frame(const RouteIn& in) {
-    const RouteOut o = route_frame_inner(in);
+    if (motion_stopping(in.eid)) return {Verdict::Draining, WriterWhy::Off};
+    RouteOut o = route_frame_inner(in);
+    if (o.v != Verdict::Routed && motion_pending(in.eid, Holder::Route)) {
+        post_order(in.eid, kOrdCancel, nullptr, 0, 0.0f);
+        o.v = Verdict::Draining;
+    }
     auto it = g_routes.find(in.eid);
     if (it != g_routes.end()) {
         Route& r = it->second;
         if (o.v == Verdict::Routed) { if (r.replay) ++r.fReplay; else ++r.fRoute; }
         else if (o.v == Verdict::Correct) ++r.fCorrect;
-        else { ++r.fWriter; ++r.fWhy[static_cast<int>(o.why) < static_cast<int>(WriterWhy::kCount) ? static_cast<int>(o.why) : 0]; }
+        else if (o.v == Verdict::Writer) { ++r.fWriter; ++r.fWhy[static_cast<int>(o.why) < static_cast<int>(WriterWhy::kCount) ? static_cast<int>(o.why) : 0]; }
     }
     return o;
 }
@@ -1684,11 +1787,15 @@ RouteOut route_frame_inner(const RouteIn& in) {
     return out;
 }
 
-void route_release(uint32_t eid, const char* why) {
+bool route_release(uint32_t eid, const char* why) {
     auto it = g_routes.find(eid);
-    if (it == g_routes.end()) return;
-    release_route(it->second, why);
-    g_routes.erase(it);
+    if (it != g_routes.end()) {
+        release_route(it->second, why);
+        g_routes.erase(it);
+    }
+    post_order(eid, kOrdCancel, nullptr, 0, 0.0f);
+    post_order(eid, kOrdCancel, nullptr, 0, 0.0f, Holder::Probe);
+    return !motion_pending(eid, Holder::Route) && !motion_pending(eid, Holder::Probe);
 }
 
 bool routed(uint32_t eid) {
@@ -1699,11 +1806,11 @@ bool walk_own(uint32_t eid) {
     auto it = g_routes.find(eid);
     return it != g_routes.end() && it->second.active;
 }
-bool probe_owned(uint32_t eid) { return g_probe.on && g_probe.eid == eid; }
+bool probe_owned(uint32_t eid) { return (g_probe.on && g_probe.eid == eid) || motion_pending(eid, Holder::Probe); }
 uint32_t order_go(uint32_t eid, const float target[3], uint8_t gait) {
-    return post_order(eid, kOrdGoPlain, target, speed_enum(static_cast<Gait>(gait < kGaits ? gait : 0)), 0.0f);
+    return post_order(eid, kOrdGoPlain, target, speed_enum(static_cast<Gait>(gait < kGaits ? gait : 0)), 0.0f, Holder::Probe);
 }
-void order_stop(uint32_t eid) { post_order(eid, kOrdStopPlain, nullptr, 0, 0.0f); }
+void order_stop(uint32_t eid) { post_order(eid, kOrdStopPlain, nullptr, 0, 0.0f, Holder::Probe); }
 bool ai_post(std::function<void()> fn) {
     if (!g_hooked.load(std::memory_order_relaxed)) return false;   // no door: the caller decides
     { std::lock_guard<std::mutex> l(g_aiFnMu); g_aiFns.push_back(std::move(fn)); }

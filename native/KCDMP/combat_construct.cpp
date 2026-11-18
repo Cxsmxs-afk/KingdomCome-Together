@@ -60,9 +60,13 @@
 #include "engine.h"
 #include "pe_exports.h"
 #include "log.h"
+#include "motion.h"
+#include "npc_drive.h"
 #include "wo167_rules.h"
 #include "wo202.h"
 #include "wo202_rules.h"
+#include "wo210_kd.h"
+#include "wo214_rules.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -74,6 +78,7 @@
 #include <iterator>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace kcdmp::rttr {
@@ -804,6 +809,23 @@ const char* swing_result_name(SwingResult r) {
     return "unknown";
 }
 
+std::optional<holders::Permit> begin_combat_pose(uint32_t eid, const char* path, uint16_t holdMs) {
+    void* body = engine::entity_by_id(eid);
+    if (!body || wo210kd::held_down(eid) || motion::figure_jump_hold(eid, body, npcdrive::now_s()) ||
+        !npcdrive::begin_oneshot(eid, holdMs)) return std::nullopt;
+    auto permit = holders::may_place(eid, holders::Holder::OneShot, path);
+    if (!permit) return std::nullopt;
+    return std::optional<holders::Permit>(std::move(permit));
+}
+
+static std::optional<holders::Permit> begin_death_pose(uint32_t eid) {
+    void* body = engine::entity_by_id(eid);
+    if (!body || !wo210kd::take_fall(eid, engine::entity_name(body), npcdrive::now_s())) return std::nullopt;
+    auto permit = holders::may_place(eid, holders::Holder::Fall, "rttr.death_pose", holders::Claim::Held);
+    if (!permit) return std::nullopt;
+    return std::optional<holders::Permit>(std::move(permit));
+}
+
 SwingResult ghost_swing(uint32_t entityId, const char* fragSpec) {
     if (!fragSpec || !fragSpec[0] || std::strlen(fragSpec) > 191) {
         logf("SWING: rejected -- missing/oversized fragment spec");
@@ -930,6 +952,9 @@ SwingResult ghost_swing(uint32_t entityId, const char* fragSpec) {
         return SwingResult::FragmentUnknown;
     }
 
+    const bool death = wo214rules::death_row(fragSpec);
+    auto permit = death ? begin_death_pose(entityId) : begin_combat_pose(entityId, "rttr.swing_pose");
+    if (!permit) return SwingResult::OwnerOwns;
     void* mem = nullptr;
     if (!call_combat_alloc(reinterpret_cast<CombatAllocFn>(allocFn), 0x1A8, &mem) || !mem) {
         logf("SWING: entity=%u -- allocator faulted/null", entityId);
@@ -954,7 +979,8 @@ SwingResult ghost_swing(uint32_t entityId, const char* fragSpec) {
         call_release(anim);   // still drop our ref; the object outlives the fault path
         return SwingResult::QueueFaulted;
     }
-    combatactions::track(entityId, actor, anim);   // WO-221 A: recorded, and ended before this body's combat part goes
+    permit->wrote();
+    combatactions::track(entityId, actor, anim, !death);   // WO-221 A: ended before this body's combat part goes
     uint32_t status = ~0u, refc = ~0u;
     read_u32(anim, 0x28, &status);
     read_u32(anim, 0x58, &refc);
@@ -974,7 +1000,8 @@ SwingResult ghost_swing(uint32_t entityId, const char* fragSpec) {
 // block, read on the host) at the host's priority, through the copy's own C_CombatAnimActionManager. The same engine calls, in the
 // same order; one reference stays ours (*outAction, dropped with release_action) so the owner can read the action's status, step its
 // priority as the host's did, and never stack a second one. Main thread.
-SwingResult install_fragment(uint32_t entityId, uint32_t fragmentId, const uint8_t tags[20], int32_t priority, uint32_t flags, void** outAction) {
+SwingResult install_fragment(uint32_t entityId, uint32_t fragmentId, const uint8_t tags[20], int32_t priority, uint32_t flags,
+                             void** outAction, bool movesBody) {
     *outAction = nullptr;
     HMODULE entityModule = GetModuleHandleA("EntityModule.dll");
     HMODULE combatModule = GetModuleHandleA("CombatModule.dll");
@@ -1001,6 +1028,14 @@ SwingResult install_fragment(uint32_t entityId, uint32_t fragmentId, const uint8
     if (!read_ptr(combatActor, kOffAnimActionManager, &manager) || !manager) return SwingResult::ManagerMissing;
     void* allocFn = nullptr;
     if (!read_ptr(combatModule, kRvaCombatAllocGlobal, &allocFn) || !allocFn) return SwingResult::AllocatorMissing;
+    std::optional<holders::Permit> permit;
+    if (movesBody && holders::of(entityId) == holders::Holder::Probe) {
+        auto probe = holders::may_place(entityId, holders::Holder::Probe, "wo208.full_body_pose", holders::Claim::Held);
+        if (probe) permit.emplace(std::move(probe));
+    } else if (movesBody) {
+        if (auto pose = begin_combat_pose(entityId, "wo208.full_body_pose")) permit.emplace(std::move(*pose));
+    }
+    if (movesBody && !permit) return SwingResult::OwnerOwns;
     void* mem = nullptr;
     if (!call_combat_alloc(reinterpret_cast<CombatAllocFn>(allocFn), 0x1A8, &mem) || !mem) return SwingResult::AllocFailed;
     void* anim = nullptr;
@@ -1022,6 +1057,7 @@ SwingResult install_fragment(uint32_t entityId, uint32_t fragmentId, const uint8
         call_release(anim);
         return SwingResult::QueueFaulted;
     }
+    if (permit) permit->wrote();
     combatactions::track(entityId, actor, anim);   // WO-221 A: recorded, and ended before this body's combat part goes
     *outAction = anim;
     return SwingResult::Ok;

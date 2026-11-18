@@ -17,6 +17,13 @@ int g_fail = 0, g_pass = 0;
 } // namespace
 
 int wo215_tests(int* passed) {
+    // An enqueued stop is only the start of a handover. The next AI read-back
+    // must show that the original request is gone before the writer starts.
+    WCHECK(!request_released(31, 31), "a successful stop call with its prior request still in the task is not a released body");
+    WCHECK(request_released(kNoRequest, 31) && request_released(32, 31), "empty or replaced task proves the known preceding request ended");
+    WCHECK(!request_released(31, kNoRequest) && request_released(kNoRequest, kNoRequest),
+           "a fault after queue entry with no confirmed ID stays owned until an empty task is observed");
+
     // ---- the switch word and the bench's twin names
     int nk = 0;
     const Name* k = switch_names(&nk);

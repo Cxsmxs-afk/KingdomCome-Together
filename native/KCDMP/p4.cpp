@@ -127,7 +127,7 @@ Placement place(const float partner[3], float dist, Context c, bool recovery, co
     r.fallHeld = actions::suppress_fall_damage(true);
     if (!r.fallHeld) { logf("T3-TP refused=fall_guard_unavailable source=%s", p4rules::source_name(c.source)); return r; }
     if (!ready_context(c)) { if (!previousLease) actions::suppress_fall_damage(false); bump(8); return r; }
-    const bool ran = actions::teleport_player(r.target[0], r.target[1], r.target[2]);
+    const bool ran = actions::teleport_player(r.target[0], r.target[1], r.target[2], c.source);
     const bool afterKnown = actions::player_position(r.after);
     r.residual = afterKnown ? p4rules::distance(r.target, r.after) : -1;
     r.ok = ran && afterKnown && r.residual < 1.5f;

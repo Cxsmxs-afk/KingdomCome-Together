@@ -30,6 +30,7 @@ public enum NativeNpcReason : byte
     Unbound = 12,
     TableFull = 13,
     PipeClosed = 14,
+    OwnerBusy = 15,
 }
 
 /// <summary>WO-118: the 0x89 heartbeat answer.</summary>
@@ -61,7 +62,7 @@ public static class NativeNpcCodec
     {
         0 => "ok", 1 => "disarmed", 2 => "toggle-off", 3 => "no-entity", 4 => "name-mismatch",
         5 => "wuid-mismatch", 6 => "not-living", 7 => "parented", 8 => "bad-request", 9 => "entity-gone",
-        10 => "silence", 11 => "fault", 12 => "unbound", 13 => "table-full", 14 => "pipe-closed",
+        10 => "silence", 11 => "fault", 12 => "unbound", 13 => "table-full", 14 => "pipe-closed", 15 => "owner-busy",
         200 => "not-connected", 201 => "no-answer", 17 => "task-faulted", 18 => "unknown-command",
         _ => $"reason-{r}",
     };

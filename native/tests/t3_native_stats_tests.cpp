@@ -53,6 +53,16 @@ int t3_native_stats_tests(int* passed) {
         check(p6[272 + 9*i] == 30 + i, "measurement field identity is append-only");
         check(kcdmp::p4rules::u64(p6.data() + 273 + 9*i) == measure[i], "measurement field retains the full integer value");
     }
+    check(p6[272 + 9*kcdmp::t3native::kRpOwnerViolationsIndex] == 40 &&
+          p6[272 + 9*kcdmp::t3native::kRpOwnerChecksIndex] == 46, "owner violations and checks keep their measurement IDs");
+    const auto measured = p6;
+    const uint64_t owner_counts[] = {7, 42};
+    check(kcdmp::t3native::append_owners(p6.data(), 425, 442, owner_counts) == 0 && p6 == measured,
+        "insufficient capacity cannot modify or emit part of the owner group");
+    check(kcdmp::t3native::append_owners(p6.data(), 425, p6.size(), owner_counts) == 443 && p6[1] == 49 &&
+          std::memcmp(p6.data() + 2, measured.data() + 2, 423) == 0, "owner group keeps the complete measurement prefix and stays under the reply budget");
+    check(p6[425] == 47 && kcdmp::p4rules::u64(p6.data() + 426) == 7 &&
+          p6[434] == 48 && kcdmp::p4rules::u64(p6.data() + 435) == 42, "owner handover and denial IDs carry exact counts");
     p6 = base;
     check(kcdmp::t3native::append_rp_measure(p6.data(), 272, 424, measure) == 0 && p6 == base,
         "short replies cannot contain partial measurement coverage");

@@ -64,6 +64,7 @@ public static class VerdictRules
     private const string T3 = "MP-T3-STATS";
     private const string W136 = "MP-WO136-STATS";
     private const string StepPair = "MP-RP-STEP";
+    private const string OwnerViolation = "WO221-OWNER-VIOLATION";
     // The agent's TeeTextWriter supplies the wall clock and optional shared-clock metadata.
     private const string AgentPrefix = @"^(?:\d\d:\d\d:\d\d(?:\.\d+)? (?:m=\d+ off=(?:[+-]?\d+|\?) )?)?";
     private static readonly Regex AgentPrefixOnly = new(AgentPrefix + @"\z", RegexOptions.Compiled);
@@ -71,6 +72,8 @@ public static class VerdictRules
         + @"MP-WO137-STATS role=(host|joiner)(?: |$)", RegexOptions.Compiled);
     private static readonly Regex BotProgress = new(@"^(?:SYNTH125 t=[\d.]+s )?BOT-T4 role=(host|joiner) (started=1|ready=1|complete=[01]|refused=\S+|stopped=\S+)(?: |$)", RegexOptions.Compiled);
     private static readonly Regex StepPairSample = new(@"^MP-RP-STEP rp_step_n=([1-9][0-9]*) rp_step_ratio=([1-9][0-9]*)\r?$", RegexOptions.Compiled);
+    private static readonly Regex NativeOwnerViolation = new(@"^\[\d\d:\d\d:\d\d\.\d{3}\] t\d+ L[0-9a-f]{6} " + OwnerViolation
+        + @" eid=0x[0-9A-Fa-f]+ holder=\S+ path=\S+ frame=\d+$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private sealed record CounterRule(string Id, VerdictStatus AboveLimit, long Limit = 0, string Unit = "",
         string? Role = null, string? RequiresActivity = null, string? Unreadable = null, string Marker = T3,
@@ -123,7 +126,9 @@ public static class VerdictRules
         new("rp_hard_place", "rp_pose_n"),
         new("rp_step_ratio", "rp_step_n"),
         new("rp_action_lag_ms_p95", "rp_action_n", " ms"),
-        new("owner_violations", "rp_owner_n")
+        new("owner_violations", "rp_owner_n"),
+        new("owner_handovers", "rp_owner_n"),
+        new("owner_denied_sets", "rp_owner_n")
     ];
 
     private sealed record Sample(string Marker, string Role, string Origin, Dictionary<string, string> Fields)
@@ -243,9 +248,12 @@ public static class VerdictRules
 
     private static VerdictRow EvaluatePresentation(PresentationRule rule, IReadOnlyList<Sample> samples)
     {
-        var observations = samples.Where(sample => sample.Marker == T3 || (rule.Id == "rp_step_ratio" && sample.Marker == StepPair))
+        var observations = samples.Where(sample => sample.Marker == T3 ||
+                (rule.Id == "rp_step_ratio" && sample.Marker == StepPair) ||
+                (rule.Id == "owner_violations" && sample.Marker == OwnerViolation))
             .Select(sample => (Sample: sample, Value: sample.Number(rule.Id), Count: sample.Number(rule.Coverage)))
-            .Where(observation => observation.Value.HasValue && (observation.Count > 0 ||
+            .Where(observation => observation.Value.HasValue && ((observation.Count > 0 &&
+                (rule.Coverage != "rp_owner_n" || HasOwnerCounters(observation.Sample))) ||
                 (rule.Id == "owner_violations" && observation.Value > 0))).ToList();
         if (observations.Count == 0)
             return Missing(rule.Id, $"Keine belegte Stichprobe in {T3}, {rule.Coverage}");
@@ -268,6 +276,8 @@ public static class VerdictRules
                 var hop = value > PresentationAgentHopReviewAboveMs ? VerdictStatus.Yellow : VerdictStatus.Green;
                 return new(rule.Id, hop, measurement, evidence + ", Agent-Empfang bis DLL-Empfang");
             case "owner_violations":
+                // The native guard can assert before the next periodic count.
+                if (source.Marker == OwnerViolation) return new(rule.Id, VerdictStatus.Red, "≥1", evidence);
                 return new(rule.Id, value == 0 ? VerdictStatus.Green : VerdictStatus.Red, measurement, evidence);
             case "rp_action_lag_ms_p95":
                 return new(rule.Id, VerdictStatus.Grey, measurement, evidence + ", DLL-Empfang bis zur angenommenen Aktion, ohne Grenzwert");
@@ -275,6 +285,9 @@ public static class VerdictRules
                 return new(rule.Id, VerdictStatus.Grey, measurement, evidence + ", ohne Grenzwert");
         }
     }
+
+    private static bool HasOwnerCounters(Sample sample) => sample.Number("owner_handovers").HasValue
+        && sample.Number("owner_denied_sets").HasValue;
 
     private static Sample? ReadStepPair(Briefing.Input input)
     {
@@ -299,6 +312,11 @@ public static class VerdictRules
     {
         foreach (string line in lines)
         {
+            if (fromNativeLog && line.Contains(OwnerViolation, StringComparison.Ordinal) && NativeOwnerViolation.IsMatch(line))
+            {
+                yield return new(OwnerViolation, "", "DLL", new(StringComparer.Ordinal) { ["owner_violations"] = "1" });
+                continue;
+            }
             int start = line.IndexOf(T3 + " ", StringComparison.Ordinal);
             string marker = T3;
             if (start < 0 && !fromNativeLog)
