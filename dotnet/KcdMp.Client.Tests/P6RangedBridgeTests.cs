@@ -65,13 +65,14 @@ public sealed class P6RangedBridgeTests
     {
         public readonly TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously), Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public readonly List<byte[]> Writes = new(); private int _calls;
+        public readonly List<long> WriteTicks = new();
         public string Transport => "test"; public bool CanSendUnreliable => false;
         public LinkPathStatus Status() => default;
         public async ValueTask SendAsync(ReadOnlyMemory<byte> frame, bool state, CancellationToken ct)
         {
             if (Interlocked.Increment(ref _calls) == 1) { Entered.TrySetResult(); await Release.Task.WaitAsync(ct); }
             else if (failSecond) throw new IOException("physical writer failed");
-            Writes.Add(frame.ToArray());
+            WriteTicks.Add(Environment.TickCount64); Writes.Add(frame.ToArray());
         }
     }
     private sealed class Rig : IAsyncDisposable
@@ -202,10 +203,15 @@ public sealed class P6RangedBridgeTests
         writer.Enqueue(Wire(Protocol.Ping, new byte[8])); Task pump = writer.PumpOnceAsync(r.Stop.Token); await path.Entered.Task;
         Call(r.Bridge, "Wo201RangedTick"); await r.Accept; await Read(r.Server); long capture = Environment.TickCount64 - 100;
         var p = Poll(r.Generation, 19, 3); BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(26), (ulong)capture);
-        await Reply(r.Server, 0xAC, 0, 86, p); await Until(() => writer.Scheduler.EventCount == 1); await Task.Delay(1100);
+        await Reply(r.Server, 0xAC, 0, 86, p); await Until(() => writer.Scheduler.EventCount == 1);
+        long queuedAt = Environment.TickCount64; await Task.Delay(100);
+        long releaseAt = Environment.TickCount64;
         path.Release.TrySetResult(); await pump;
-        Assert.True(RangedStepV2.TryDecode(Message(path.Writes.Last()).Text, out var step)); Assert.InRange(step.AgeMs, 1200u, 1999u);
-        Assert.InRange(Math.Abs((Environment.TickCount64 - capture) - step.AgeMs), 0, 100); Assert.Equal(1, Count(r.Bridge, "ranged_out"));
+        Assert.True(releaseAt > queuedAt); // measure the actual clock advance; Task.Delay is not an age lower bound on Windows
+        Assert.True(RangedStepV2.TryDecode(Message(path.Writes.Last()).Text, out var step));
+        Assert.InRange((long)step.AgeMs, releaseAt - capture, path.WriteTicks.Last() - capture);
+        Assert.True(step.AgeMs > queuedAt - capture); // the queued age cannot survive the physical writer wait
+        Assert.Equal(1, Count(r.Bridge, "ranged_out"));
     }
     [Theory]
     [InlineData(false)] [InlineData(true)]
