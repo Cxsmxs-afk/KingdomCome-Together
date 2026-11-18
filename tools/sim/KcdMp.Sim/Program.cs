@@ -57,7 +57,8 @@ public static class Program
         var feel = Feel.RunAll();
         var life = SessionLife.RunAll();
         var join = await JoinDiscovery.RunAsync();
-        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + Report.Load(load) + Report.Queue(queued) + Report.Feel(feel) + Report.Life(life) + join.Report);
+        var ingress = Report.RemoteIngress(results, loadOnly);
+        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + ingress.Markdown + Report.Load(load) + Report.Queue(queued) + Report.Feel(feel) + Report.Life(life) + join.Report);
         int gated = results.Count(r => r.Gate);
         int failed = results.Count(r => r.Gate && !r.Pass);
         // Phase 3: a flooded console freezes the figure for seconds. The ring's
@@ -68,7 +69,8 @@ public static class Program
         bool lifeOk = life.All(r => r.Pass);
         Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. queue ringFlat={ringFlat} consoleTrails={consoleTrails} feel={feelOk} life={lifeOk}. {mdPath}");
         Console.WriteLine($"join-save lifecycle: {(join.Pass ? "PASS" : "FAIL")}");
-        return failed == 0 && ringFlat && consoleTrails && feelOk && lifeOk && join.Pass ? 0 : 1;
+        Console.WriteLine($"remote figure relay ingress: {(loadOnly ? "not measured" : ingress.Pass ? "PASS" : "FAIL")}");
+        return failed == 0 && ringFlat && consoleTrails && feelOk && lifeOk && join.Pass && ingress.Pass ? 0 : 1;
     }
 
     static async Task<RunResult> RunOne(int players, Profile profile, string label, string commit)
@@ -141,6 +143,7 @@ sealed class Bot : IDisposable
     readonly LinkScheduler _sched = new();
     readonly BatchQueue _queue = new();
     readonly List<double> _netLag = new();
+    readonly List<double> _freshGhostLag = new();
     readonly List<(uint Ms, float X, float Y, float Speed)> _truth = new();
     readonly List<(byte Id, uint Ms, float X, float Y)> _got = new();
     readonly object _gate = new();
@@ -240,7 +243,9 @@ sealed class Bot : IDisposable
                 {
                     lock (_gate)
                     {
-                        _netLag.Add(Unchecked(now, g.SenderMs));
+                        double age = Unchecked(now, g.SenderMs);
+                        _netLag.Add(age);
+                        if (!g.IsStale) _freshGhostLag.Add(age);
                         _got.Add((g.GhostId, g.SenderMs, g.X, g.Y));
                     }
                     lock (_gate) _queue.Add(Level("KCD2MP_UpdateGhost(\"g\",1,0,0,0,false)", now));
@@ -356,6 +361,11 @@ sealed class Bot : IDisposable
             Label = label, Commit = commit, Players = players, Profile = profile,
             Samples = lags.Count,
             P50 = Pct(lags, 0.50), P95 = Pct(lags, 0.95), P99 = Pct(lags, 0.99), Max = lags.Count == 0 ? -1 : lags[^1],
+            RemoteIngress = players == 2 ? bots.Select(bot =>
+            {
+                var stamps = bot._freshGhostLag.Order().ToList();
+                return new RemoteIngressRow(bot.Host ? "Host" : "Joiner", stamps.Count, Pct(stamps, 0.95));
+            }).ToArray() : [],
             QueueMax = qmax, StateDelayMs = stateDelay, EdgesShed = shed, StaleDropped = stale,
             Snaps = snaps, VelocityBreaks = discont, ExtrapMs = extrap,
             BytesPerClient = players == 0 ? 0 : bytes / players / Math.Max(seconds, 0.001),
@@ -408,6 +418,7 @@ sealed class RunResult
     public double P95 { get; set; }
     public double P99 { get; set; }
     public double Max { get; set; }
+    public RemoteIngressRow[] RemoteIngress { get; set; } = [];
     public int QueueMax { get; set; }
     public int StateDelayMs { get; set; }
     public long EdgesShed { get; set; }
@@ -424,8 +435,38 @@ sealed class RunResult
     public string Why { get; set; } = "";
 }
 
+sealed record RemoteIngressRow(string Role, int Samples, double P95Ms);
+
 static class Report
 {
+    public static (bool Pass, string Markdown) RemoteIngress(List<RunResult> results, bool loadOnly)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine().AppendLine("## Empfang der Partnerfigur am Relay-Client").AppendLine();
+        if (loadOnly) return (true, sb.AppendLine("Die Messung setzt einen Netzlauf voraus.").ToString());
+
+        const double limitMs = 150;
+        const int minSamples = 5;
+        var trials = results.Where(row => row.Players == 2 && row.Profile is "good" or "bad").ToList();
+        bool pass = trials.Count == 2;
+        sb.AppendLine("Sender-Tick bis zum gelesenen Positionspaket auf demselben Rechner. Die Grenzprüfung bestätigt den Messpfad auf guter und verschlechterter Leitung. Anzeige und DLL-Übergabe bleiben hier ungemessen.").AppendLine();
+        sb.AppendLine("| Profil | Empfangsrolle | Messungen | p95 | Kontrolle |");
+        sb.AppendLine("|---|---|---:|---:|---|");
+        foreach (var trial in trials)
+        {
+            pass &= trial.RemoteIngress.Length == 2 && trial.RemoteIngress.Select(row => row.Role).Distinct().Count() == 2;
+            foreach (var row in trial.RemoteIngress)
+            {
+                bool observed = row.Samples >= minSamples && row.P95Ms is >= 0 and <= 30_000;
+                bool expected = observed && (trial.Profile == "good" ? row.P95Ms < limitMs : row.P95Ms >= limitMs);
+                pass &= expected;
+                string measurement = observed ? $"{row.P95Ms:0} ms" : "–";
+                sb.AppendLine($"| {trial.Profile} | {row.Role} | {row.Samples} | {measurement} | {(expected ? "PASS" : "FAIL")} |");
+            }
+        }
+        return (pass, sb.ToString());
+    }
+
     public static string Markdown(string label, string commit, List<RunResult> rows)
     {
         int gated = rows.Count(r => r.Gate);

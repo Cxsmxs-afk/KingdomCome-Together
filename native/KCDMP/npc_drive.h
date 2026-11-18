@@ -77,7 +77,7 @@ bool armed();
 // ---- pipe thread: parse + queue, no engine access ----------------------------
 // 0x10: [count:1]{[src:1][nameLen:1][name][x:4f][y:4f][z:4f][rot:4f][flags:1]
 //                  [seq:2][senderMs:4][arrivalQpc:8]}*count
-uint8_t on_samples(const uint8_t* body, size_t len);
+uint8_t on_samples(const uint8_t* body, size_t len, int64_t readerQpc, uint64_t readerGeneration);
 // 0x12: [ms:2][nameLen:1][name]
 uint8_t on_hold(const uint8_t* body, size_t len);
 // 0x13: [nativeOn:1][senderClockOn:1]

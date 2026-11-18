@@ -20,6 +20,7 @@
 #include "p5_marker.h"
 #include "p6_missile.h"
 #include "p6_render_rules.h"
+#include "rp_measure.h"
 #include "respawn_actions.h"
 #include "npc_drive.h"
 #include "motion.h"
@@ -384,6 +385,17 @@ void w218_note_single(double usedUs) {
     w218_maybe_log(w218_now_us());
 }
 
+// Measure native acceptance on either pipe path. The request ID proves a
+// submitted one-shot; this is the local receipt-to-request stage only.
+void rp_note_ranged(const uint8_t* body, size_t len, const p6render::Stamp& stamp,
+                    uint8_t reason, const uint8_t* reply, size_t replySize) {
+    if (reason != wo143::kROk || replySize != sizeof(int32_t) || !p6render::ranged_shot(body, len)) return;
+    int32_t requestId = -1;
+    std::memcpy(&requestId, reply, sizeof requestId);
+    if (requestId >= 0)
+        rpmeasure::note_action(std::string_view(reinterpret_cast<const char*>(body + 2), body[1]), stamp.readTick);
+}
+
 // One generic request, here on the main thread: the reply frame's body into rb (the exact bytes the single path sends, seq 0).
 size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, size_t cap, bool* faulted, uint64_t calendarEpoch,const p6render::Stamp& renderStamp) {
     *faulted = false;
@@ -413,6 +425,7 @@ size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, 
             case kWo141: reason = kcdmp::wo141::handle(body, len, rb + 4, pcap < 420 ? pcap : 420, &n); break;
             case kWo143:
                 if(!p6render::invoke(body,len,renderStamp,GetTickCount64(),wo216::lifecycle_generation(),p4::life_edge_tick(),wo216::lifecycle_gameplay(),[&]{reason=kcdmp::wo143::handle(body,len,rb+4,pcap<420?pcap:420,&n);})){reason=wo143::kRFailed;n=0;}
+                rp_note_ranged(body, len, renderStamp, reason, rb + 4, n);
                 break;
             case kWo147: reason = kcdmp::wo147::handle(body, len, rb + 4, pcap < 200 ? pcap : 200, &n); break;
             case kWo151: reason = kcdmp::wo151::handle(body, len, rb + 4, pcap < 200 ? pcap : 200, &n); break;
@@ -876,6 +889,10 @@ bool ingest(ReaderContext& input, const uint8_t* bytes, size_t n) {
         return send_frame(input.handle, kWo163Reply, out, static_cast<uint16_t>(4 + used), input.generation);
     },[](pipecontrol::Frame& f){
         f.readerTick=GetTickCount64();f.readerGeneration=wo216::lifecycle_generation();f.readerLife=p4::life_edge_tick();f.readerGameplay=wo216::lifecycle_gameplay();
+        if (f.type == kNpcSamples) {
+            LARGE_INTEGER tick{};
+            if (QueryPerformanceCounter(&tick)) f.readerQpc = tick.QuadPart;
+        }
     });
     g_seq = input.reader.next_sequence();
     if (!ok) { input.failed = true; logf("PIPE: control reader rejected malformed/over-limit input, deferred overflow or failed ACK -- disconnecting"); }
@@ -1119,7 +1136,7 @@ void serve(HANDLE h) {
 
                 rttr::SwingResult res = rttr::SwingResult::Ok;
                 const bool ran = run_sync_bounded<rttr::SwingResult>(
-                    [entityId, spec](rttr::SwingResult& result) {
+                    [entityId, spec, renderStamp](rttr::SwingResult& result) {
                         if (kcdmp::wo209::row_attack(entityId, spec.c_str())) { result = rttr::SwingResult::Ok; return; }   // WO-209 B: the copy's own attack
                         // WO-216 F.4 / G: the owner plays the host's row on its copy (never "owner-owns"): poses for a fight with a player,
                         // npc_fights for a fight among the host's NPCs; reaction rows keep WO-214's own path below
@@ -1135,7 +1152,11 @@ void serve(HANDLE h) {
                         }
                         if (kcdmp::wo208::probe_owned(entityId)) kcdmp::wo214::note_owned_reaction(kcdmp::wo214rules::death_row(spec.c_str()));
                         result = rttr::ghost_swing(entityId, spec.c_str());
-                        if (result == rttr::SwingResult::Ok) kcdmp::wo187::note_move(entityId);   // WO-187 C2: the move's scope is watched
+                        if (result == rttr::SwingResult::Ok) {
+                            kcdmp::wo187::note_move(entityId);   // WO-187 C2: the move's scope is watched
+                            if (renderStamp.gameplay && renderStamp.generation == wo216::lifecycle_generation() &&
+                                renderStamp.life == p4::life_edge_tick()) rpmeasure::note_action(entityId, renderStamp.readTick);
+                        }
                     },
                     "GhostSwing", res);
                 // A task that never ran is NOT the same failure as one that
@@ -1374,7 +1395,8 @@ void serve(HANDLE h) {
             // holds, config and status never wait for a frame; only a bind
             // (engine reads) is marshalled onto the main thread.
             case kNpcSamples: {
-                const uint8_t r = npcdrive::on_samples(body, len);
+                const uint8_t r = npcdrive::on_samples(body, len, incoming.readerQpc,
+                                                       incoming.readerGameplay ? incoming.readerGeneration : 0);
                 if (r != npcdrive::kOk) logf("PIPE: NpcSamples refused (%s, %u bytes)", npcdrive::reason_name(r), len);
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
@@ -1754,6 +1776,7 @@ void serve(HANDLE h) {
                     [copy,renderStamp](R& out) {
                         out.op = copy.empty() ? 0 : copy[0];
                         if(!p6render::invoke(copy.data(),copy.size(),renderStamp,GetTickCount64(),wo216::lifecycle_generation(),p4::life_edge_tick(),wo216::lifecycle_gameplay(),[&]{out.reason=kcdmp::wo143::handle(copy.data(),copy.size(),out.buf,sizeof(out.buf),&out.n);})){out.reason=wo143::kRFailed;out.n=0;}
+                        rp_note_ranged(copy.data(), copy.size(), renderStamp, out.reason, out.buf, out.n);
                     }, "Wo143", r, &faulted);
                 if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo143::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
                 BYTE rb[4 + 420]{};
@@ -1902,6 +1925,7 @@ void serve(HANDLE h) {
     logf("PIPE: agent disconnected");
     // WO-118: no agent, no stream -- every native binding is dropped.
     npcdrive::on_pipe_closed();
+    main_thread::post([] { rpmeasure::on_pipe_closed(); });
     main_thread::post([] { kcdmp::wo132::on_pipe_closed(); });   // WO-132: engaged copies let go (main-thread state)
     main_thread::post([] { kcdmp::motion::on_pipe_closed(); });  // WO-154 2: the avatars' identities go with the session
     main_thread::post([] { kcdmp::wo201::on_pipe_closed(); });   // WO-201: its session parts stand down

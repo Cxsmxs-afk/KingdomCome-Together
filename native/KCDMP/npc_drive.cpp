@@ -26,6 +26,7 @@
 #include "npc_trace.h"
 #include "motion.h"
 #include "respawn_actions.h"
+#include "rp_measure.h"
 #include "combat_actions.h"
 #include "body_drive.h"
 #include "walk_holder.h"
@@ -259,6 +260,7 @@ struct InSample {
     uint16_t seq = 0;
     uint32_t senderMs = 0;
     int64_t  arrivalQpc = 0;
+    rpmeasure::SampleScope reader{};
     bool     haveSt2 = false;      // WO-121: pipe flag 0x80 -- a peer's avatar sample carries its v8 state block
     motion::State2 st2{};
 };
@@ -269,7 +271,12 @@ std::vector<InSample> g_inSamples;
 std::vector<InHold>   g_inHolds;
 
 // ---- main-thread state --------------------------------------------------------
-struct RingSample { float x, y, z, rot; double at; };
+struct RingSample {
+    float x, y, z, rot;
+    double at;
+    uint32_t senderMs;
+    rpmeasure::SampleScope reader;
+};
 struct Stream {
     std::string name;             // as received (for logs)
     RingSample  ring[kRingDepth]{};
@@ -465,6 +472,7 @@ void drop(std::unordered_map<std::string, Puppet>::iterator it, uint8_t reason, 
     wo215::route_release(it->second.eid, "dropped");                  // WO-215 A: its movement request ends with it
     bodydrive::release(it->second.eid, "dropped");                    // WO-221 C: a driven copy's request ends with it
     holders::forget(it->second.eid);
+    rpmeasure::forget(it->second.eid);
     if (tell) notify_drop(reason, it->second.name);
     if (reason == kNotLiving) {   // WO-147: remembered for the hit gate (a ragdoll is a moment, not a release)
         const double t = now_s();
@@ -510,6 +518,14 @@ double late_target(const Stream& s, double delay) {
 
 void push_sample(const InSample& in, double now) {
     const std::string key = lower(in.name);
+    // The stamps were taken at the reader in each process. Time awaiting this
+    // main-thread drain belongs to the DLL and is outside the agent hop.
+    uint8_t measuredPeer = 0;
+    if (rpmeasure::partner_id(in.name, measuredPeer) && measuredPeer == in.src && in.arrivalQpc > 0 &&
+        in.reader.firstByteQpc >= in.arrivalQpc && g_qpcPeriod > 0.0) {
+        rpmeasure::note_hop(measuredPeer, in.reader, in.arrivalQpc,
+                            qpc_to_s(in.reader.firstByteQpc - in.arrivalQpc) * 1000.0);
+    }
     auto it = g_streams.find(key);
     if (it == g_streams.end()) {
         if (g_streams.size() >= kMaxStreams) return;
@@ -585,7 +601,7 @@ void push_sample(const InSample& in, double now) {
     s.lastArrival = nowPkt;
     s.lastMoved = moved;
     const double at = sender_stamp(in.src, in.senderMs, nowPkt);
-    RingSample r{ in.x, in.y, in.z, in.rot, at };
+    RingSample r{ in.x, in.y, in.z, in.rot, at, in.senderMs, in.reader };
     if (s.n > 0) {
         const RingSample& lastS = s.ring[s.n - 1];
         const float dx = in.x - lastS.x, dy = in.y - lastS.y;
@@ -604,7 +620,8 @@ float lerp_angle(float a, float b, float t) {
 
 // kdcmp.lua mp_npc_smooth_render, position/yaw half (the anim speed stays in Lua).
 // WO-201 B10: `extrap` (in: allowed; out: this frame was extrapolated) and `segMps` (the host's own speed on the segment rendered).
-bool render(const Stream& s, double renderAt, double delay, float out[4], bool* extrap = nullptr, float* segMps = nullptr, bool e1 = false) {
+bool render(const Stream& s, double renderAt, double delay, float out[4], bool* extrap = nullptr,
+            float* segMps = nullptr, bool e1 = false, const RingSample** reachedSample = nullptr) {
     const int n = s.n;
     if (n == 0) return false;
     const bool mayExtrap = extrap && *extrap;
@@ -629,6 +646,7 @@ bool render(const Stream& s, double renderAt, double delay, float out[4], bool* 
                 out[2] = static_cast<float>(z.z + vz * past); out[3] = z.rot;
                 *extrap = true;
                 if (segMps) *segMps = static_cast<float>(sp);
+                if (reachedSample) *reachedSample = &z;
                 return true;
             }
         }
@@ -640,7 +658,11 @@ bool render(const Stream& s, double renderAt, double delay, float out[4], bool* 
             if (s.ring[i - 1].at <= renderAt) { a = &s.ring[i - 1]; b = &s.ring[i]; break; }
         if (!a) { a = b = &s.ring[0]; }
     }
-    if (a == b) { out[0] = a->x; out[1] = a->y; out[2] = a->z; out[3] = a->rot; return true; }
+    if (a == b) {
+        out[0] = a->x; out[1] = a->y; out[2] = a->z; out[3] = a->rot;
+        if (reachedSample) *reachedSample = a;
+        return true;
+    }
     double aAt = a->at;
     if (b->at - aAt > delay) aAt = b->at - delay;                          // clip a moved-gated silence to one delay
     double segDur = b->at - aAt;
@@ -648,6 +670,9 @@ bool render(const Stream& s, double renderAt, double delay, float out[4], bool* 
     double t = (renderAt - aAt) / segDur;
     if (t < 0) t = 0; else if (t > 1) t = 1;
     const float tf = static_cast<float>(t);
+    // The previous sample's time was reached, even if the next sample is
+    // partly blended in. Measure the next sample when its own time is reached.
+    if (reachedSample) *reachedSample = tf >= 1.0f ? b : a;
     out[0] = a->x + (b->x - a->x) * tf;
     out[1] = a->y + (b->y - a->y) * tf;
     const float hx = b->x - a->x, hy = b->y - a->y;
@@ -756,7 +781,7 @@ void pull_flush(Puppet& p, double now) {
 }
 
 // One puppet, one frame. Returns false on an engine fault (the caller disarms).
-bool write_one(Puppet& p, void* e, const float pose[4], bool* wrote) {
+bool write_one(Puppet& p, void* e, const float pose[4], bool* wrote, double* measuredCorrectionCm) {
     *wrote = false;
     float cur[3]{};
     const bool haveCur = read_pos(e, cur);
@@ -799,6 +824,7 @@ bool write_one(Puppet& p, void* e, const float pose[4], bool* wrote) {
             } else p.bigPullAt = nowP;
         }
         if (cm > kPullFloorCm) {
+            if (measuredCorrectionCm) *measuredCorrectionCm = cm;
             ++p.winMoved;
             const float ax = p.anchor[0] - p.last[0], ay = p.anchor[1] - p.last[1];
             const float al = std::sqrt(ax * ax + ay * ay), dl = std::sqrt(dx * dx + dy * dy);
@@ -988,7 +1014,7 @@ bool armed() { return g_armed.load(); }
 void set_drop_callback(DropFn fn) { g_dropFn.store(fn); }
 
 // ---- pipe thread --------------------------------------------------------------
-uint8_t on_samples(const uint8_t* body, size_t len) {
+uint8_t on_samples(const uint8_t* body, size_t len, int64_t readerQpc, uint64_t readerGeneration) {
     if (len < 1) return kBadRequest;
     const int count = body[0];
     size_t o = 1;
@@ -1008,6 +1034,7 @@ uint8_t on_samples(const uint8_t* body, size_t len) {
         std::memcpy(&s.seq, body + o, 2); o += 2;
         std::memcpy(&s.senderMs, body + o, 4); o += 4;
         std::memcpy(&s.arrivalQpc, body + o, 8); o += 8;
+        s.reader = {readerQpc, readerGeneration};
         if (s.flags & 0x80) {   // WO-121: the agent's pipe-only "state block follows" bit
             if (o + sizeof(motion::State2) > len) return kBadRequest;
             std::memcpy(&s.st2, body + o, sizeof(motion::State2)); o += sizeof(motion::State2);
@@ -1528,6 +1555,9 @@ void tick() {
         } else p.playout = -1;
         g_playoutByEid[p.eid] = renderDelay;
         float pose[4];
+        uint8_t measuredPeer = 0;
+        const bool measure = figure && rpmeasure::partner_id(p.name, measuredPeer) && measuredPeer == s.src;
+        const RingSample* reachedSample = nullptr;
         // Phase 1: a walking person has one holder (the driver). Do not extrapolate
         // the place that request steers toward. A horse or a fight still may.
         // Phase 2 puts the other player on that same fixed clock.
@@ -1552,7 +1582,9 @@ void tick() {
         }
         bool ex = g_walkFromHost.load(std::memory_order_relaxed) && !p.beast && !fixedTl && kcdmp::walkhold::extrapolate_pose(oneHolder);   // WO-201 B10: in = allowed, out = extrapolated
         float segMps = 0.0f;
-        if (!render(s, now - renderDelay, renderDelay, pose, &ex, &segMps, e1)) { ++it; continue; }
+        if (!render(s, now - renderDelay, renderDelay, pose, &ex, &segMps, e1,
+                    measure && rpmeasure::shared_clock() ? &reachedSample : nullptr)) { ++it; continue; }
+        const float streamX = pose[0], streamY = pose[1];
         if (ex) c_extrapFrames.fetch_add(1, std::memory_order_relaxed);
         if (p.extrapolating && !ex) { p.blendPending = true; p.blendWhy = "extrap-end"; c_extrapEnds.fetch_add(1, std::memory_order_relaxed); }   // back onto the stream, from the body
         p.extrapolating = ex;
@@ -1681,13 +1713,27 @@ void tick() {
             if (p.speedMps > 0.001f && shown > 0.001f) { p.velX *= shown / p.speedMps; p.velY *= shown / p.speedMps; }
             p.speedMps = shown;
         }
-        if (!write_one(p, e, pose, &wrote)) {
+        // A catch-up or pace limiter that left the body short of this
+        // horizontal pose cannot confirm presentation of its source stamp.
+        const bool reached = reachedSample && pose[0] == streamX && pose[1] == streamY;
+        const auto reachedScope = reached ? reachedSample->reader : rpmeasure::SampleScope{};
+        const uint32_t reachedSender = reached ? reachedSample->senderMs : 0;
+        double correctionCm = 0.0;
+        if (!write_one(p, e, pose, &wrote, measure ? &correctionCm : nullptr)) {
             if (!g_announcedFault) { g_announcedFault = true; logf("MP-NPCWRITE npc=%s engine call FAULTED", p.name.c_str()); }
             disarm("an engine call faulted inside the per-frame write");
             npctrace::frame_end();
             return;
         }
         if (wrote) { ++writing; g_statWrites.fetch_add(1, std::memory_order_relaxed); npctrace::note_write(e, pose); }
+        if (wrote && measure && p.curValid) {
+            const double dx = static_cast<double>(pose[0]) - p.curRead[0];
+            const double dy = static_cast<double>(pose[1]) - p.curRead[1];
+            const double place = kcdmp::walkhold::kPlaceM;
+            const bool hard = dx * dx + dy * dy >= place * place;
+            const uint32_t appliedMs = reachedSender ? static_cast<uint32_t>(static_cast<uint64_t>(now_s() * 1000.0)) : 0;
+            rpmeasure::note_pose(measuredPeer, p.eid, reachedScope, reachedSender, appliedMs, correctionCm, hard);
+        }
         if (p.curValid) {   // WO-163 (A5): cur = the engine's position before our write; pose = ours; the applied one is the render position
             const bool engaged = now < p.holdUntil || p.blending || (s.haveSt2 && (s.st2.bits & motion::kBitCombat) != 0 && now - s.st2At < 2.0);
             p.snap.frame(now, {p.curRead[0], p.curRead[1], p.curRead[2]}, {pose[0], pose[1], pose[2]}, wrote, engaged);

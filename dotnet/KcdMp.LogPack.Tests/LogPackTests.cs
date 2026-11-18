@@ -204,12 +204,14 @@ public class PackerTests
             const int repeats = 20; // Identical unprotected lines would be collapsed.
             var src = new List<SourceFile>();
             var expected = new Dictionary<string, string[]>();
+            const string rp = "rp_e2e_ms_p50=25 rp_e2e_ms_p95=151 rp_e2e_ms_max=180 rp_e2e_n=80 rp_agent_hop_n=100 rp_agent_hop_ms_p95=5 rp_owner_n=0 owner_violations=0";
             foreach (var native in new[] { false, true })
             {
                 string name = native ? "kcdmp-native.mirror.log" : "agent.log";
                 string origin = native ? "origin=dll source=agent" : "origin=agent";
                 var lines = new[] { "host", "joiner" }.Select(role =>
-                    $"12:00:00.000 MP-T3-STATS {origin} role={role} proc_stalls=0 proc_stall_max_ms=0 proc_frames_abandoned=0 deferred_sidechannel=7 w136_held=8 w136_replayed=8 corpses_visible=9 corpse_hidden_blocked=10 grave_markers_added=11 grave_marker_fallbacks=12 markers_off_session=0 lua_corpse_visible=3 lua_corpse_hidden_blocked=4 lua_corpse_unknown_kept=5 ranged_out=13 ranged_in=14 ranged_kind_unknown=0 ranged_bow_played=15 ranged_hits_verdict=16 ranged_native_missing_actor=0 ranged_native_unreadable_phase=0 ranged_native_unknown_hand=0 ranged_native_queue_overflow=0 ranged_native_expired_rows=0 ranged_native_lifecycle_dropped=0").ToArray();
+                    $"12:00:00.000 MP-T3-STATS {origin} role={role} proc_stalls=0 proc_stall_max_ms=0 proc_frames_abandoned=0 deferred_sidechannel=7 w136_held=8 w136_replayed=8 corpses_visible=9 corpse_hidden_blocked=10 grave_markers_added=11 grave_marker_fallbacks=12 markers_off_session=0 lua_corpse_visible=3 lua_corpse_hidden_blocked=4 lua_corpse_unknown_kept=5 ranged_out=13 ranged_in=14 ranged_kind_unknown=0 ranged_bow_played=15 ranged_hits_verdict=16 ranged_native_missing_actor=0 ranged_native_unreadable_phase=0 ranged_native_unknown_hand=0 ranged_native_queue_overflow=0 ranged_native_expired_rows=0 ranged_native_lifecycle_dropped=0 {rp}").ToArray();
+                if (native) lines = [.. lines, $"MP-RP-MEASURE figure=kcd2mp_1 gen=2 clock=same_pc_qpc {rp}"];
                 expected[name] = lines;
                 string text = string.Concat(lines.Select(line => string.Concat(Enumerable.Repeat(line + "\n", repeats))));
                 src.Add(new(name, Bytes: Encoding.UTF8.GetBytes(text)));
@@ -217,6 +219,9 @@ public class PackerTests
 
             var packed = Packer.Pack(src, dir, "KCDMP-logs-t3");
             var files = Open(Assert.Single(packed.Parts));
+            string verdict = Encoding.UTF8.GetString(files["ERGEBNIS.txt"]);
+            Assert.Contains("rp_e2e_ms_p95\tGELB\t151 ms\t", verdict);
+            Assert.Contains("owner_violations\tGRAU\t", verdict);
             foreach (var (name, lines) in expected)
             {
                 var restored = Encoding.UTF8.GetString(files[name]).Split('\n');

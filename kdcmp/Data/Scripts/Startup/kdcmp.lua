@@ -38640,6 +38640,20 @@ do
         "Frame timeout in milliseconds (default 2000, 50..30000): mp_proc_frame_timeout <ms>; bare = report")
 end
 
+-- s2-1: the probe command only requests the shared-clock test mode. Both
+-- the receiving agent and DLL require their own test environment flag.
+function KCD2MP_RpMeasureClock(arg)
+    local text = tostring(arg or ""):match("^%s*(.-)%s*$")
+    if text ~= "on" and text ~= "off" then
+        mp_log("mp_rp_measure_clock: expected on|off")
+        return false
+    end
+    KCD2MP_EmitEvent("rp_measure_clock", text)
+    return true
+end
+System.AddCCommand("mp_rp_measure_clock", 'KCD2MP_RpMeasureClock(%line)',
+    "Shared-clock measurement for two instances on the same machine: mp_rp_measure_clock on|off")
+
 -- ===== P1: optional host decision authority, native load lifecycle owns activation =================
 do
     if KCD2MP.p1AuthorityEnabled == nil then KCD2MP.p1AuthorityEnabled = true end

@@ -6309,6 +6309,9 @@ public partial class GameBridge(ClientConfig config)
             case "t3_proc_timeout":
                 T3ProcessorTimeout(arg);
                 return;
+            case "rp_measure_clock":
+                _ = T3SetPresentationClockAsync(arg);
+                return;
             case "t3_loot_stats":
             case "t3_input_stats":
             case "t3_corpse_stats":

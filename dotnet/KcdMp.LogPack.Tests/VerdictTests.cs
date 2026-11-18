@@ -51,7 +51,9 @@ public class VerdictTests
     }
 
     [Theory]
-    [InlineData("owner_violations=0", VerdictStatus.Green)]
+    [InlineData("owner_violations=0", VerdictStatus.Grey)]
+    [InlineData("owner_violations=0 rp_owner_n=0", VerdictStatus.Grey)]
+    [InlineData("owner_violations=0 rp_owner_n=50", VerdictStatus.Green)]
     [InlineData("owner_violations=1", VerdictStatus.Red)]
     [InlineData("owner_violations=0 owner_violations=1", VerdictStatus.Grey)]
     public void Owner_observations_are_explicit_and_ambiguous_samples_never_pass(string fields, VerdictStatus expected)
@@ -60,6 +62,48 @@ public class VerdictTests
         input.Logs["agent.log"] = [$"12:00:00.000 MP-T3-STATS origin=agent role=joiner {fields}"];
         var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "owner_violations");
         Assert.Equal(expected, row.Status);
+    }
+
+    [Theory]
+    [InlineData("rp_e2e_ms_p95", "rp_e2e_n", 0, 0, VerdictStatus.Grey, "–")]
+    [InlineData("rp_e2e_ms_p95", "rp_e2e_n", 1, 149, VerdictStatus.Green, "149 ms")]
+    [InlineData("rp_e2e_ms_p95", "rp_e2e_n", 1, 150, VerdictStatus.Yellow, "150 ms")]
+    [InlineData("rp_e2e_ms_p95", "rp_e2e_n", 1, 299, VerdictStatus.Yellow, "299 ms")]
+    [InlineData("rp_e2e_ms_p95", "rp_e2e_n", 1, 300, VerdictStatus.Red, "300 ms")]
+    [InlineData("rp_agent_hop_ms_p95", "rp_agent_hop_n", 1, 20, VerdictStatus.Green, "20 ms")]
+    [InlineData("rp_agent_hop_ms_p95", "rp_agent_hop_n", 1, 21, VerdictStatus.Yellow, "21 ms")]
+    [InlineData("rp_step_ratio", "rp_step_n", 1, 1124, VerdictStatus.Grey, "1.124")]
+    [InlineData("rp_step_ratio", "rp_step_n", 0, 0, VerdictStatus.Grey, "–")]
+    [InlineData("rp_corr_n", "rp_pose_n", 1, 0, VerdictStatus.Grey, "0")]
+    [InlineData("rp_corr_cm_p95", "rp_corr_n", 0, 0, VerdictStatus.Grey, "–")]
+    [InlineData("rp_action_lag_ms_p95", "rp_action_n", 1, 40, VerdictStatus.Grey, "40 ms")]
+    public void Remote_presentation_thresholds_only_grade_qualified_timing_observations(string metric, string count, int samples, int value,
+        VerdictStatus status, string measurement)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [
+            $"12:00:00.000 MP-T3-STATS origin=agent role=joiner {metric}=999 {count}=0",
+            $"12:01:00.000 MP-T3-STATS origin=agent role=joiner {metric}={value} {count}={samples}"
+        ];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == metric);
+        Assert.Equal(status, row.Status);
+        Assert.Equal(measurement, row.Measurement);
+    }
+
+    [Theory]
+    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1245", "1.245")]
+    [InlineData("MP-RP-STEP rp_step_n=0 rp_step_ratio=1245", "–")]
+    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1.245", "–")]
+    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1245\nMP-RP-STEP rp_step_n=3 rp_step_ratio=1300", "–")]
+    public void Step_ratio_uses_a_scoped_record_from_the_two_game_probe(string record, string expected)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = ["MP-T3-STATS origin=agent role=joiner rp_step_n=0 rp_step_ratio=0"];
+        input.Logs["rp-step.log"] = record.Split('\n');
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "rp_step_ratio");
+        Assert.Equal(expected, row.Measurement);
+        Assert.Equal(VerdictStatus.Grey, row.Status);
+        if (expected != "–") Assert.Contains("rp-step.log, n=2", row.Evidence);
     }
 
     [Fact]

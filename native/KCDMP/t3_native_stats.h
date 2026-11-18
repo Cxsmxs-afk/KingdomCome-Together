@@ -4,6 +4,7 @@
 #include "p4.h"
 #include "wo216.h"
 #include "respawn_actions.h"
+#include "rp_measure.h"
 #include "wo201.h"
 
 namespace kcdmp::t3native {
@@ -19,6 +20,10 @@ inline size_t stats(uint8_t* out, size_t cap) {
     if (!corpses) return 0;
     uint64_t ranged[kRangedFields]{};
     wo201ranged::t3_counts(ranged);
-    return append_ranged(out, corpses, cap, ranged);
+    const size_t prior = append_ranged(out, corpses, cap, ranged);
+    if (!prior || cap < kRpMeasureBytes) return prior;
+    static_assert(rpmeasure::kFields == kRpMeasureFields);
+    const auto measure = rpmeasure::snapshot();
+    return append_rp_measure(out, prior, cap, measure.data());
 }
 } // namespace kcdmp::t3native
