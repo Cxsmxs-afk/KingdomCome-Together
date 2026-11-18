@@ -40,7 +40,7 @@ public sealed record VerdictReport(VerdictStatus Status, string Role, IReadOnlyL
         var text = new StringBuilder("## Ergebnis\n\n");
         text.Append("**Gesamt: ").Append(Label(Status)).Append("**\n\n");
         text.Append("**Rolle im Agent-Log:** ").Append(Role).Append("\n\n");
-        text.Append("Grau bedeutet, dass für die Regel eine Messung oder ein ausgeübter Vorgang fehlt. ")
+        text.Append("Grau bedeutet, dass für die Regel eine Messung, eine Prüfvoraussetzung oder ein Grenzwert fehlt. ")
             .Append("Für Grün im Gesamtergebnis ist eine gemessene Queue erforderlich. ")
             .Append("Sichtbares Spielverhalten erfordert einen Spieltest.\n\n");
         text.Append("| Regel | Status | Messwert | Beleg |\n| --- | --- | --- | --- |\n");
@@ -57,15 +57,20 @@ public static class VerdictRules
     public const long QueueGreenMaxMs = 1000;
     public const long QueueYellowP99Ms = 1000;
     public const long QueueYellowMaxMs = 2000;
+    public const long PresentationGreenBelowMs = 150;
+    public const long PresentationYellowBelowMs = 300;
+    public const long PresentationAgentHopReviewAboveMs = 20;
 
     private const string T3 = "MP-T3-STATS";
     private const string W136 = "MP-WO136-STATS";
+    private const string StepPair = "MP-RP-STEP";
     // The agent's TeeTextWriter supplies the wall clock and optional shared-clock metadata.
     private const string AgentPrefix = @"^(?:\d\d:\d\d:\d\d(?:\.\d+)? (?:m=\d+ off=(?:[+-]?\d+|\?) )?)?";
     private static readonly Regex AgentPrefixOnly = new(AgentPrefix + @"\z", RegexOptions.Compiled);
     private static readonly Regex AgentSessionRole = new(AgentPrefix
         + @"MP-WO137-STATS role=(host|joiner)(?: |$)", RegexOptions.Compiled);
     private static readonly Regex BotProgress = new(@"^(?:SYNTH125 t=[\d.]+s )?BOT-T4 role=(host|joiner) (started=1|ready=1|complete=[01]|refused=\S+|stopped=\S+)(?: |$)", RegexOptions.Compiled);
+    private static readonly Regex StepPairSample = new(@"^MP-RP-STEP rp_step_n=([1-9][0-9]*) rp_step_ratio=([1-9][0-9]*)\r?$", RegexOptions.Compiled);
 
     private sealed record CounterRule(string Id, VerdictStatus AboveLimit, long Limit = 0, string Unit = "",
         string? Role = null, string? RequiresActivity = null, string? Unreadable = null, string Marker = T3,
@@ -101,8 +106,24 @@ public static class VerdictRules
         new("ranged_native_queue_overflow", VerdictStatus.Red, RequiresActivity: "ranged_out",
             Unreadable: "ranged_stats_unreadable"),
         new("ranged_missile_uncertain", VerdictStatus.Red, RequiresActivity: "ranged_missile_requests",
-            RequiresHostActivity: "ranged_missile_measured_accept"),
-        new("owner_violations", VerdictStatus.Red)
+            RequiresHostActivity: "ranged_missile_measured_accept")
+    ];
+
+    private sealed record PresentationRule(string Id, string Coverage, string Unit = "");
+
+    private static readonly PresentationRule[] PresentationCounters =
+    [
+        new("rp_e2e_ms_p50", "rp_e2e_n", " ms"),
+        new("rp_e2e_ms_p95", "rp_e2e_n", " ms"),
+        new("rp_e2e_ms_max", "rp_e2e_n", " ms"),
+        new("rp_agent_hop_ms_p95", "rp_agent_hop_n", " ms"),
+        new("rp_corr_n", "rp_pose_n"),
+        new("rp_corr_cm_p95", "rp_corr_n", " cm"),
+        new("rp_corr_cm_max", "rp_corr_n", " cm"),
+        new("rp_hard_place", "rp_pose_n"),
+        new("rp_step_ratio", "rp_step_n"),
+        new("rp_action_lag_ms_p95", "rp_action_n", " ms"),
+        new("owner_violations", "rp_owner_n")
     ];
 
     private sealed record Sample(string Marker, string Role, string Origin, Dictionary<string, string> Fields)
@@ -116,9 +137,11 @@ public static class VerdictRules
         var agent = Briefing.AgentLines(input).ToList();
         var native = Briefing.NativeLines(input);
         var samples = ReadSamples(agent, fromNativeLog: false).Concat(ReadSamples(native, fromNativeLog: true)).ToList();
+        if (ReadStepPair(input) is { } stepPair) samples.Add(stepPair);
         var queue = Queue(agent);
         var rows = new List<VerdictRow> { queue };
         rows.AddRange(Counters.Select(rule => Evaluate(rule, samples)));
+        rows.AddRange(PresentationCounters.Select(rule => EvaluatePresentation(rule, samples)));
         rows.Add(BotPlan(input));
 
         // Traffic observable on this machine is required for green. Optional
@@ -216,6 +239,56 @@ public static class VerdictRules
         if (rule.ZeroMeansMissing && value == 0) return Missing(rule.Id, "Keine aufgezeichnete Stichprobe");
 
         return new(rule.Id, VerdictStatus.Green, measurement, evidence);
+    }
+
+    private static VerdictRow EvaluatePresentation(PresentationRule rule, IReadOnlyList<Sample> samples)
+    {
+        var observations = samples.Where(sample => sample.Marker == T3 || (rule.Id == "rp_step_ratio" && sample.Marker == StepPair))
+            .Select(sample => (Sample: sample, Value: sample.Number(rule.Id), Count: sample.Number(rule.Coverage)))
+            .Where(observation => observation.Value.HasValue && (observation.Count > 0 ||
+                (rule.Id == "owner_violations" && observation.Value > 0))).ToList();
+        if (observations.Count == 0)
+            return Missing(rule.Id, $"Keine belegte Stichprobe in {T3}, {rule.Coverage}");
+
+        var (source, observed, count) = observations.MaxBy(observation => observation.Value);
+        long value = observed!.Value;
+        string measurement = rule.Id == "rp_step_ratio"
+            ? (value / 1000m).ToString("0.000", CultureInfo.InvariantCulture)
+            : Format(value, rule.Unit);
+        string evidence = $"{source.Marker}, {source.Origin}";
+        if (count is long samplesCount && samplesCount > 0) evidence += $", n={Format(samplesCount, "")}";
+
+        switch (rule.Id)
+        {
+            case "rp_e2e_ms_p95":
+                var latency = value < PresentationGreenBelowMs ? VerdictStatus.Green :
+                    value < PresentationYellowBelowMs ? VerdictStatus.Yellow : VerdictStatus.Red;
+                return new(rule.Id, latency, measurement, evidence + ", gemeinsame Rechneruhr");
+            case "rp_agent_hop_ms_p95":
+                var hop = value > PresentationAgentHopReviewAboveMs ? VerdictStatus.Yellow : VerdictStatus.Green;
+                return new(rule.Id, hop, measurement, evidence + ", Agent-Empfang bis DLL-Empfang");
+            case "owner_violations":
+                return new(rule.Id, value == 0 ? VerdictStatus.Green : VerdictStatus.Red, measurement, evidence);
+            case "rp_action_lag_ms_p95":
+                return new(rule.Id, VerdictStatus.Grey, measurement, evidence + ", DLL-Empfang bis zur angenommenen Aktion, ohne Grenzwert");
+            default:
+                return new(rule.Id, VerdictStatus.Grey, measurement, evidence + ", ohne Grenzwert");
+        }
+    }
+
+    private static Sample? ReadStepPair(Briefing.Input input)
+    {
+        const string entry = "rp-step.log";
+        if (!input.Logs.TryGetValue(entry, out var lines)) return null;
+        var records = lines.Where(line => !string.IsNullOrWhiteSpace(line)).Take(2).ToArray();
+        if (records is not [string record]) return null;
+        var sample = StepPairSample.Match(record);
+        if (!sample.Success) return null;
+        return new(StepPair, "", entry, new(StringComparer.Ordinal)
+        {
+            ["rp_step_n"] = sample.Groups[1].Value,
+            ["rp_step_ratio"] = sample.Groups[2].Value
+        });
     }
 
     private static string Format(long value, string unit) => value.ToString(CultureInfo.InvariantCulture) + unit;

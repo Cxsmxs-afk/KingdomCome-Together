@@ -78,4 +78,31 @@ public class T3NativeCountersTests
         byte[] future = Payload(31); future[2 + 30 * 9] = 250;
         Assert.True(T3NativeCounters.TryRead(future, out values)); Assert.Equal(30, values.Count);
     }
+
+    [Fact]
+    public void Presentation_snapshot_pins_measurement_and_coverage_ids_and_requires_its_full_prefix()
+    {
+        const int fields = 47;
+        byte[] bytes = Payload(fields);
+        Assert.Equal(425, bytes.Length);
+        Assert.True(T3NativeCounters.TryRead(bytes, out var values));
+        string[] keys = [
+            "rp_e2e_ms_p50", "rp_e2e_ms_p95", "rp_e2e_ms_max", "rp_agent_hop_ms_p95",
+            "rp_corr_n", "rp_corr_cm_p95", "rp_corr_cm_max", "rp_hard_place", "rp_step_ratio",
+            "rp_action_lag_ms_p95", "owner_violations", "rp_e2e_n", "rp_agent_hop_n", "rp_action_n",
+            "rp_step_n", "rp_pose_n", "rp_owner_n"
+        ];
+        for (int i = 0; i < keys.Length; i++)
+        {
+            int id = 30 + i;
+            Assert.Equal(id, values[keys[i]]);
+            int offset = 2 + id * 9;
+            byte[] missing = [1, fields - 1, .. bytes.AsSpan(2, offset - 2), .. bytes.AsSpan(offset + 9)];
+            Assert.False(T3NativeCounters.TryRead(missing, out _));
+        }
+        byte[] missingRanged = [1, fields - 6, .. bytes.AsSpan(2, 24 * 9), .. bytes.AsSpan(2 + 30 * 9)];
+        Assert.False(T3NativeCounters.TryRead(missingRanged, out _));
+        Assert.True(T3NativeCounters.TryRead(Payload(30), out var previous));
+        Assert.DoesNotContain("rp_e2e_n", previous.Keys);
+    }
 }

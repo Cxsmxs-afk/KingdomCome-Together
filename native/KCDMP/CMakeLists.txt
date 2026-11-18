@@ -25,6 +25,7 @@ add_library(KCDMP SHARED
     hangover.cpp
     respawn.cpp
     respawn_actions.cpp
+    rp_measure.cpp
     p5_marker.cpp
     p6_missile.cpp
     punishment.cpp

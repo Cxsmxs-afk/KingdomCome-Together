@@ -15,6 +15,7 @@ the tick is live (the launcher's VerifyInjectionAsync); then the agent starts wi
 
     python tools/rig/pair.py prepare                     per-copy agent + DLL folders from the rig's newest build
     python tools/rig/pair.py relay [plan.json]           the relay on the test port (a fault plan: test-only switch)
+    python tools/rig/pair.py relay --netz schlecht       same, with the checked staircase measurement lag profile
     python tools/rig/pair.py up <A|B>                    a copy to its main menu (B: the A.3 checks first; its instance box answered)
     python tools/rig/pair.py guard <A|B> [--user-folder X]   dry run: refused when the user folder resolves to the real saves
     python tools/rig/pair.py host A <playline> <save> [--agent-delay S | --at-load S] [--hitch S] [--settle-freeze] [--twin]
@@ -31,6 +32,7 @@ import dialogs, mirror, procs, rig
 COPIES = os.path.join(rig.RIG, 'copies')
 RELAY_PORT = int(os.environ.get('KCDMP_RIG_RELAY_PORT', '7790'))
 RELAY_HTTP = int(os.environ.get('KCDMP_RIG_RELAY_HTTP', '7791'))
+POOR_NETWORK = os.path.join(HERE, 'netz-schlecht.json')
 SETTLE_S = 10.0          # the launcher's ConnectGateRule.SettleS
 VERIFY_S = 8.0           # the launcher's VerifyInjectionAsync window
 INJECTOR = os.path.join(rig.REPO, 'native', 'build', 'KCDMP_LauncherInjector', 'KCDMP_LauncherInjector.exe')
@@ -171,9 +173,17 @@ def seed_saves():
     rig.say('saves seeded: host', HOST_CID, SEED[HOST_CID], 'joiner', JOIN_CID, SEED[JOIN_CID], ('+ ' + os.path.basename(extra)) if extra else '')
 
 
-def relay(plan_file=None):
+def relay(plan_file=None, *, profile=None):
     st = state()
-    if procs.matches(st.get('relay')): rig.say('relay already up'); return 0
+    if profile == 'schlecht':
+        plan_file = POOR_NETWORK
+    active = st.get('relay')
+    if procs.matches(active):
+        if profile is not None and active.get('fault_plan', '') != (plan_file or ''):
+            rig.say('running relay has another network profile; stop it before starting the requested profile')
+            return 2
+        rig.say('relay already up')
+        return 0
     exe = os.path.join(mirror.BUILD, 'relay', 'KcdMpServer.exe')
     argv = [exe, '--port', str(RELAY_PORT), '--urls', 'http://127.0.0.1:%d' % RELAY_HTTP]
     env = rig.clean_env(test_env())
@@ -181,7 +191,9 @@ def relay(plan_file=None):
         env['KCDMP_TEST_RELAY_FAULTS'] = '1'
         argv += ['--test-faults', os.path.abspath(plan_file)]
     log = os.path.join(rig.run_dir(), 'relay.log')
+    offset = os.path.getsize(log) if os.path.isfile(log) else 0
     rec = procs.start(argv, os.path.dirname(exe), env, 'relay', log_path=log)
+    rec.update(fault_plan=os.path.abspath(plan_file) if plan_file else '', relay_log=log, relay_log_offset=offset)
     st['relay'] = rec; rig.save_state(st)
     rig.note('start', what='relay', **rec, argv=argv)
     rig.say('relay pid', rec['pid'], 'port', RELAY_PORT, 'faults' if plan_file else '')
@@ -500,7 +512,7 @@ def start_agent(cid, role, port, twin=False):
     rig.say('agent', cid, 'pid', rec['pid'], role, 'TWIN (the 0.62.7 tail fix off)' if twin else '')
 
 
-def collect(tag, *, write_verdict=False, copies=('A', 'B'), bot_log=None):
+def collect(tag, *, write_verdict=False, copies=('A', 'B'), bot_log=None, rp_step=None):
     """Both copies' files into <run>\\bundles\\<tag>-<id>\\ (the launcher's bundle layout), then LogPack's bundle."""
     out = {}
     for cid in copies:
@@ -516,11 +528,13 @@ def collect(tag, *, write_verdict=False, copies=('A', 'B'), bot_log=None):
         put(os.path.join(p['agent_dir'], 'agent.log'), 'agent.log')
         if bot_log is not None:
             put(bot_log, 'bot-t4.log')
+        if rp_step is not None and cid == rp_step[0]:
+            put(rp_step[1], 'rp-step.log')
         # WO-210: the probe's rotated piece too (E.1's overlap); WO-215 G: the whole session's file and its rotated piece
         for f in ('kcdmp-anim.jsonl', 'kcdmp-anim.1.jsonl', 'kcdmp-anim-session.jsonl', 'kcdmp-anim-session.1.jsonl', 'digest.jsonl', 'applied.jsonl'):
             put(os.path.join(p['root'], f), f)
             put(os.path.join(p['agent_dir'], f), f)
-        put(os.path.join(rig.run_dir(), 'relay.log'), 'relay.log')
+        put((state().get('relay') or {}).get('relay_log') or os.path.join(rig.run_dir(), 'relay.log'), 'relay.log')
         tool = os.path.join(mirror.BUILD, 'logpack', 'KcdMp.LogPack.Tool.exe')
         packed = os.path.join(d + '.packed')
         if os.path.exists(tool):
@@ -560,7 +574,12 @@ if __name__ == '__main__':
     v = sys.argv[1] if len(sys.argv) > 1 else ''
     a = sys.argv[2:]
     if v == 'prepare': prepare()
-    elif v == 'relay': sys.exit(relay(a[0] if a else None))
+    elif v == 'relay':
+        if a in (['--netz', 'normal'], ['--netz', 'schlecht']):
+            sys.exit(relay(profile=a[1]))
+        if len(a) > 1 or (a and a[0].startswith('--')):
+            sys.exit('usage: pair.py relay [plan.json | --netz normal | --netz schlecht]')
+        sys.exit(relay(a[0] if a else None))
     elif v == 'up': sys.exit(up(a[0]))
     elif v == 'guard':   # WO-207 0.2's dry run: would this copy (or this user folder) be started? Nothing is started.
         uf = a[a.index('--user-folder') + 1] if '--user-folder' in a else None

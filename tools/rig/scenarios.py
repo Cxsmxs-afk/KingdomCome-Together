@@ -121,10 +121,11 @@ class Copy:
 
 
 class Run:
-    def __init__(self, name):
+    def __init__(self, name, *, include_joiner=True):
         self.name = name
         self.steps = []
         self.a, self.b = Copy(pair.HOST_CID), Copy(pair.JOIN_CID)   # a = the host, b = the joiner (KCDMP_RIG_HOST swaps the copies)
+        self.copies = (self.a, self.b) if include_joiner else (self.a,)
         self.dir = os.path.join(rig.run_dir(), 'scenario-%s-%s' % (name, time.strftime('%H%M%S')))
         os.makedirs(self.dir, exist_ok=True)
 
@@ -141,10 +142,10 @@ class Run:
         # WO-207: a copy whose game exited during the step fails it, whatever the step measured (d5-c1fight "passed" with the host's game
         # gone a minute into the fight: an empty link reads as a queue that keeps up)
         st = rig.load_state()
-        gone = [c.id for c in (self.a, self.b) if st.get(c.id.lower()) and not procs.matches(st.get(c.id.lower()))]
+        gone = [c.id for c in self.copies if st.get(c.id.lower()) and not procs.matches(st.get(c.id.lower()))]
         if gone:
             crashes = []
-            for c in (self.a, self.b):
+            for c in self.copies:
                 cd = os.path.join(c.p['root'], 'kcdmp-crashes')
                 if os.path.isdir(cd): crashes += [os.path.join(cd, x) for x in os.listdir(cd) if os.path.getmtime(os.path.join(cd, x)) >= t0 - 5]
             ok, reason = False, 'copy-exited'
@@ -160,10 +161,10 @@ class Run:
         d = os.path.join(self.dir, 'FAIL-' + row['step'])
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, 'step.json'), 'w', encoding='utf-8') as f: json.dump(row, f, indent=1)
-        for c in (self.a, self.b):
+        for c in self.copies:
             for nm, p in (('kcd', c.klog), ('agent', c.alog), ('native', c.nlog)):
                 with open(os.path.join(d, '%s-%s.last200.log' % (c.id, nm)), 'w', encoding='utf-8') as f: f.write('\n'.join(c.tail(p)))
-        try: pair.collect('fail-' + row['step'])
+        try: pair.collect('fail-' + row['step'], copies=tuple(c.id for c in self.copies))
         except Exception as ex: rig.say('collect failed:', ex)
 
     def finish(self):
@@ -950,6 +951,18 @@ def s_verdict(r):
     return fn
 
 
+def bot_joiner_command(r, *options):
+    tool = os.path.join(HERE, '..', 'bothost', 'bot-joiner')
+    command = [sys.executable, '-X', 'utf8', tool, '--test-bot', '--port', str(pair.RELAY_PORT), *options]
+    for line in reversed(r.a.lines(r.a.alog, 0)):
+        build = re.search(r'MP-BUILD version=([\w.-]+) build=([\w.-]+)(?: |$)', line)
+        if build:
+            version, stamp = build.groups()
+            command += ['--wire-version', version if stamp == 'dev' else version + '+' + stamp]
+            break
+    return command
+
+
 def s_bot_joiner(r):
     """Use the scripted joiner and the rig's real running host as the two peers."""
     def fn():
@@ -961,17 +974,9 @@ def s_bot_joiner(r):
         tables = os.path.join(r.a.p['root'], 'Data', 'Tables.pak')
         if not os.path.isfile(tables):
             return False, 'no-ranged-data', 'Data/Tables.pak'
-        tool = os.path.join(HERE, '..', 'bothost', 'bot-joiner')
         # The plan is fixed after this start point is sampled.
         start = '%.3f,%.3f,%.3f' % (origin[0] + 2, origin[1], origin[2])
-        command = [sys.executable, '-X', 'utf8', tool, '--test-bot', '--port', str(pair.RELAY_PORT),
-                   '--origin=' + start, '--tables-pak', tables]
-        for line in reversed(r.a.lines(r.a.alog, 0)):
-            build = re.search(r'MP-BUILD version=([\w.-]+) build=([\w.-]+)(?: |$)', line)
-            if build:
-                version, stamp = build.groups()
-                command += ['--wire-version', version if stamp == 'dev' else version + '+' + stamp]
-                break
+        command = bot_joiner_command(r, '--origin=' + start, '--tables-pak', tables)
         log = os.path.join(r.dir, 'bot-t4.log')
         with open(log, 'w', encoding='utf-8') as stream:
             status = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT).returncode
@@ -3964,7 +3969,10 @@ def s_w214_hostkills(r, kills=int(os.environ.get('KCDMP_RIG_KILLS', '10')), per_
 
 
 def run(name, args):
-    r = Run(name)
+    if name == 'rpmeasure':
+        import scen_s2_measure
+        return scen_s2_measure.run(sys.modules[__name__], args)
+    r = Run(name, include_joiner=name != 'botjoiner')
     plan = {
         'join': [('join', s_join(r))],
         'walk': [('walk30', s_walk(r))],

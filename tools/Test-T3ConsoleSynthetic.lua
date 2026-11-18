@@ -14,5 +14,11 @@ for _, bad in ipairs({ "49", "30001", "-1", "2.5", "nan", "1e3", "on", "" .. str
     assert(KCD2MP.t3.procFrameTimeoutMs == 30000)
 end
 assert(KCD2MP_T3SetProcFrameTimeout("")); assert(events[#events][2] == "30000")
-OUT = "PASS P0/T3 console: defaults, report, bounds and malformed input"
+assert(commands.mp_rp_measure_clock == 'KCD2MP_RpMeasureClock(%line)')
+assert(KCD2MP_RpMeasureClock(" on ")); assert(events[#events][1] == "rp_measure_clock" and events[#events][2] == "on")
+assert(KCD2MP_RpMeasureClock("off")); assert(events[#events][1] == "rp_measure_clock" and events[#events][2] == "off")
+for _, bad in ipairs({ "", "ON", "1", "on off" }) do
+    local before = #events; assert(not KCD2MP_RpMeasureClock(bad)); assert(#events == before)
+end
+OUT = "PASS P0/T3 console: defaults, report, bounds and malformed input\nPASS s2-1 console: explicit on/off test-mode request"
 print(OUT)

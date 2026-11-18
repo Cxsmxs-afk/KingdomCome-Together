@@ -43,6 +43,19 @@ int t3_native_stats_tests(int* passed) {
         check(p6[218 + 9*i] == 24 + i, "P6 appended field identity");
         check(kcdmp::p4rules::u64(p6.data() + 219 + 9*i) == ranged[i], "P6 exact native little-endian value");
     }
+    const auto base = p6;
+    uint64_t measure[kcdmp::t3native::kRpMeasureFields]{};
+    for (size_t i = 0; i < kcdmp::t3native::kRpMeasureFields; ++i) measure[i] = 300 + i;
+    check(kcdmp::t3native::append_rp_measure(p6.data(), 272, p6.size(), measure) == 425 && p6[1] == 47,
+        "measurement group retains the existing 512-byte reply cap");
+    check(std::memcmp(p6.data() + 2, base.data() + 2, 270) == 0, "measurement group preserves the entire P6 prefix");
+    for (size_t i = 0; i < kcdmp::t3native::kRpMeasureFields; ++i) {
+        check(p6[272 + 9*i] == 30 + i, "measurement field identity is append-only");
+        check(kcdmp::p4rules::u64(p6.data() + 273 + 9*i) == measure[i], "measurement field retains the full integer value");
+    }
+    p6 = base;
+    check(kcdmp::t3native::append_rp_measure(p6.data(), 272, 424, measure) == 0 && p6 == base,
+        "short replies cannot contain partial measurement coverage");
     p6 = prefix;
     check(kcdmp::t3native::append_ranged(p6.data(), used, 271, ranged) == 0 && p6 == prefix, "no partial P6 group on short capacity");
     p6[2 + 9*23] = 22; const auto badPrefix = p6;

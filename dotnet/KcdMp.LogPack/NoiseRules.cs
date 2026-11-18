@@ -55,7 +55,8 @@ public static class NoiseRules
     };
 
     /// <summary>Keep marks, faults, measurements and summaries wherever they occur.</summary>
-    private static readonly Regex Protected = new(@"MP-MARK|FAULT|STATS|SUMMARY|summary|MP-W207-Q ", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex Protected = new(@"MP-MARK|FAULT|STATS|SUMMARY|summary|MP-W207-Q |MP-RP-(?:MEASURE|CONFIG) ",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>A line that is never collapsed, whatever it is next to.</summary>
     public static bool IsProtected(string line) => Protected.IsMatch(line)

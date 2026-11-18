@@ -1,0 +1,14 @@
+{
+  "seed": 221,
+  "rules": [
+    {
+      "name": "rpmeasure-netz-schlecht",
+      "kind": "lag",
+      "role": "joiner",
+      "dir": "both",
+      "at": "t:+0",
+      "ms": 150,
+      "jitter_ms": 35
+    }
+  ]
+}

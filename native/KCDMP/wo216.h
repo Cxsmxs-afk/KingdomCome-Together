@@ -45,6 +45,7 @@ bool authority_enabled();   // switch state, independent of hook readiness
 uint64_t lifecycle_generation();
 uint8_t lifecycle_role(); // cached session role, independent of authority gate
 bool lifecycle_gameplay(); // explicit local Gameplay proof, also while authority switch is off
+uint64_t lifecycle_observation_stamp(); // diagnostic revision, low bit is proven Gameplay
 bool decisions_blocked();    // Paket C: no local decision batch; direct host body actions still advance
 
 // P5 cached census scope: getter performs no engine reads or world iteration.

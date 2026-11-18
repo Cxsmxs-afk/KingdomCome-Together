@@ -39,6 +39,9 @@ public class T3AuthorityReportTests
     [InlineData(false, 2, true, 30)]
     [InlineData(false, 2, false, 24)]
     [InlineData(false, 2, false, 19)]
+    [InlineData(true, 1, false, 47)]
+    [InlineData(false, 2, false, 47)]
+    [InlineData(false, 2, false, 46)]
     public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role, bool truncated, int statsFields)
     {
         string name = "t3r-" + Guid.NewGuid().ToString("N")[..16];
@@ -75,13 +78,14 @@ public class T3AuthorityReportTests
         foreach (string key in new[] { "pickup_asks", "pickup_optimistic", "pickup_rollbacks", "pickup_unknown_kept", "ask_timeouts", "ask_latency_ms_p95", "take_busy_refusals", "input_held_max_s", "input_releases", "auto_rejoins_in_world" })
             Assert.Contains(key + "=0", fields);
         Assert.Equal(truncated ? 1 : 0, counters["authority_stats_unreadable"]);
-        Assert.Equal(truncated ? 1 : 0, counters["world_stats_unreadable"]);
-        bool corpseUnavailable = truncated || statsFields < 24;
-        bool rangedUnavailable = truncated || statsFields < 30;
+        bool worldUnavailable = truncated || statsFields == 46;
+        Assert.Equal(worldUnavailable ? 1 : 0, counters["world_stats_unreadable"]);
+        bool corpseUnavailable = worldUnavailable || statsFields < 24;
+        bool rangedUnavailable = worldUnavailable || statsFields < 30;
         Assert.Equal(corpseUnavailable ? 1 : 0, counters["corpse_stats_unreadable"]);
         Assert.Equal(rangedUnavailable ? 1 : 0, counters["ranged_stats_unreadable"]);
-        Assert.Contains("tp_total=" + (truncated ? 7 : 10), fields);
-        Assert.Contains("falldeath_after_tp=" + (truncated ? 0 : 24), fields);
+        Assert.Contains("tp_total=" + (worldUnavailable ? 7 : 10), fields);
+        Assert.Contains("falldeath_after_tp=" + (worldUnavailable ? 0 : 24), fields);
         Assert.Contains("corpses_visible=" + (corpseUnavailable ? 6 : 29), fields);
         Assert.Contains("grave_markers_added=" + (corpseUnavailable ? 0 : 31), fields);
         Assert.Contains("grave_marker_fallbacks=" + (corpseUnavailable ? 0 : 32), fields);
@@ -89,9 +93,55 @@ public class T3AuthorityReportTests
         Assert.Contains("ranged_native_unknown_hand=" + (rangedUnavailable ? 42 : 36), fields);
         foreach (string key in new[] { "ranged_out", "ranged_in", "ranged_kind_unknown", "ranged_bow_played", "ranged_hits_verdict" }) Assert.Contains(key + "=0", fields);
         foreach (string key in new[] { "lua_corpse_visible", "lua_corpse_hidden_blocked", "lua_corpse_unknown_kept" }) Assert.Contains(key + "=0", fields);
+        if (statsFields == 47 && !worldUnavailable)
+        {
+            Assert.Contains("rp_e2e_ms_p95=41", fields);
+            Assert.Contains("rp_step_ratio=48", fields);
+            Assert.Contains("rp_owner_n=56", fields);
+        }
+        else Assert.DoesNotContain("rp_e2e_n=", fields);
         await Reply(server, 3, Protocol.T3OpStats, stop.Token);
         await report.WaitAsync(stop.Token);
         var gate = (SemaphoreSlim)typeof(CombatPipe).GetField("_gate", Private)!.GetValue(pipe)!;
         await gate.WaitAsync(stop.Token); gate.Release(); // the fire-and-forget mirror has consumed its ACK
+    }
+
+    [Theory]
+    [InlineData("1", "on", 1)]
+    [InlineData("1", "off", 0)]
+    [InlineData(null, "on", null)]
+    [InlineData("true", "on", null)]
+    [InlineData("1", "on extra", null)]
+    public async Task Presentation_clock_command_is_test_gated_before_writing_to_the_pipe(string? environment, string command, int? mode)
+    {
+        const string variable = "KCDMP_TEST_RP_MEASURE";
+        string? previous = Environment.GetEnvironmentVariable(variable);
+        try
+        {
+            Environment.SetEnvironmentVariable(variable, environment);
+            string name = "rpt-" + Guid.NewGuid().ToString("N")[..16];
+            using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var server = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            var accepted = server.WaitForConnectionAsync(stop.Token);
+            await using var pipe = new CombatPipe(name) { BatchOn = false };
+            Assert.True(await pipe.EnsureConnectedAsync(stop.Token));
+            await accepted;
+            var bridge = new GameBridge(new ClientConfig());
+            await ((CombatPipe)typeof(GameBridge).GetField("_combat", Private)!.GetValue(bridge)!).DisposeAsync();
+            Set(bridge, "_combat", pipe);
+            var change = (Task)typeof(GameBridge).GetMethod("T3SetPresentationClockAsync", Private)!.Invoke(bridge, [command])!;
+            if (mode is int value)
+            {
+                Assert.Equal(new byte[] { Protocol.T3OpStats, 3, (byte)value }, await Read(server, stop.Token));
+                await Reply(server, 1, Protocol.T3OpStats, stop.Token);
+            }
+            await change.WaitAsync(stop.Token);
+            if (!mode.HasValue)
+            {
+                using var silence = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Read(server, silence.Token));
+            }
+        }
+        finally { Environment.SetEnvironmentVariable(variable, previous); }
     }
 }

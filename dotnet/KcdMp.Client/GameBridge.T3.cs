@@ -56,6 +56,28 @@ public partial class GameBridge
         Console.WriteLine($"MP-T3-CONFIG proc_frame_timeout_ms={ms}");
     }
 
+    private async Task T3SetPresentationClockAsync(string value)
+    {
+        if (value is not ("on" or "off")) return;
+        if (Environment.GetEnvironmentVariable("KCDMP_TEST_RP_MEASURE") != "1")
+        {
+            Console.WriteLine("MP-RP-MEASURE clock=off status=disabled");
+            return;
+        }
+
+        try
+        {
+            using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            byte mode = value == "on" ? (byte)1 : (byte)0;
+            var reply = await _combat.Wo163Async(Protocol.T3OpStats, [Protocol.T3PresentationClockCommand, mode], stop.Token);
+            Console.WriteLine($"MP-RP-MEASURE clock={value} status={(reply is { Ok: true } ? "ok" : "refused")}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"MP-RP-MEASURE clock={value} status=unavailable reason={ex.GetType().Name}");
+        }
+    }
+
     private void T3FrameResult(int kind, ProcessorFrameScope.Result result)
     {
         if (result.Status is ProcessorFrameScope.Outcome.Completed or ProcessorFrameScope.Outcome.SessionCancelled) return;
@@ -141,13 +163,14 @@ public partial class GameBridge
         try
         {
             foreach (string key in T3AuthorityCounters.NativeKeys) _t3Counters.TryAdd(key, 0);
-            foreach (string key in T3NativeCounters.Keys) _t3Counters.TryAdd(key, 0);
+            for (int i = 0; i < T3NativeCounters.PresentationStart; i++) _t3Counters.TryAdd(T3NativeCounters.Keys[i], 0);
             _t3Counters.TryAdd("postload_timeouts", 0);
             _t3Counters.TryAdd("authority_stats_unreadable", 0);
             _t3Counters.TryAdd("world_stats_unreadable", 0);
             _t3Counters.TryAdd("corpse_stats_unreadable", 0);
             _t3Counters.TryAdd("ranged_stats_unreadable", 0);
             byte role = W137Host ? (byte)1 : W137Joiner || _jj is not null ? (byte)2 : (byte)0;
+            Dictionary<string, long>? presentation = null;
             if (role != 0)
             {
                 var result = await ProcessorFrameScope.RunAsync(async token =>
@@ -160,13 +183,19 @@ public partial class GameBridge
                 }, 2000, ct);
                 if (result.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
                     T3Increment("authority_stats_unreadable");
+                Dictionary<string, long>? nativeCounters = null;
                 var worldStats = await ProcessorFrameScope.RunAsync(async token =>
                 {
                     var native = await _combat.Wo163Async(Protocol.T3OpStats, [], token);
                     ProcessorFrameScope.ThrowIfAbandoned();
                     if (native is { Ok: true } b && T3NativeCounters.TryRead(b.Payload, out var values))
                     {
-                        foreach (var field in values) _t3Counters[field.Key] = field.Value;
+                        for (int i = 0; i < T3NativeCounters.PresentationStart; i++)
+                        {
+                            string key = T3NativeCounters.Keys[i];
+                            if (values.TryGetValue(key, out long value)) _t3Counters[key] = value;
+                        }
+                        nativeCounters = values;
                         if (!values.ContainsKey("markers_off_session")) T3Increment("corpse_stats_unreadable");
                         if (!values.ContainsKey("ranged_native_missing_actor")) T3Increment("ranged_stats_unreadable");
                     }
@@ -174,16 +203,18 @@ public partial class GameBridge
                 }, 2000, ct);
                 if (worldStats.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
                 { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); T3Increment("ranged_stats_unreadable"); }
+                if (worldStats.Status == ProcessorFrameScope.Outcome.Completed && nativeCounters?.ContainsKey("rp_e2e_n") == true)
+                    presentation = nativeCounters;
             }
             ct.ThrowIfCancellationRequested();
-            T3EmitStats(role, ct);
+            T3EmitStats(role, ct, presentation);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex) { Console.WriteLine($"MP-T3-STATS report unavailable: {ex.GetType().Name}"); }
         finally { Interlocked.Exchange(ref _t3StatsBusy, 0); }
     }
 
-    private void T3EmitStats(byte role, CancellationToken ct)
+    private void T3EmitStats(byte role, CancellationToken ct, IReadOnlyDictionary<string, long>? presentation)
     {
         foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(T3LootCounters.CorpseKeys).Concat(T3RangedKeys).Concat(new[] {
             "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable", "corpse_lua_stats_unreadable" }))
@@ -194,7 +225,13 @@ public partial class GameBridge
         _t3Counters["w136_replayed"] = Interlocked.Read(ref _w136Replayed);
         _t3Counters["proc_lua_abandoned"] = _httpForMenu?.AbandonedStatements ?? 0;
         _t3Counters["proc_outbound_abandoned"] = _w213Writer?.Scheduler.CancelledDropped ?? 0;
-        string fields = string.Join(' ', _t3Counters.OrderBy(p => p.Key, StringComparer.Ordinal)
+        IEnumerable<KeyValuePair<string, long>> counters = _t3Counters;
+        // Presentation values and their sample counts must come from the same
+        // reply. A failed or old DLL read cannot repeat an earlier window.
+        if (presentation is not null)
+            counters = counters.Concat(T3NativeCounters.Keys.Skip(T3NativeCounters.PresentationStart)
+                .Select(key => KeyValuePair.Create(key, presentation[key])));
+        string fields = string.Join(' ', counters.OrderBy(p => p.Key, StringComparer.Ordinal)
             .Select(p => p.Key + "=" + p.Value.ToString(CultureInfo.InvariantCulture)));
         Console.WriteLine($"MP-T3-STATS origin=agent role={(role == 1 ? "host" : role == 2 ? "joiner" : "off")} {fields}");
         if (role != 0) _ = T3SendNativeStatsAsync(role, fields, ct);

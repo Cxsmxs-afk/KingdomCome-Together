@@ -9,7 +9,8 @@ public static class T3NativeCounters
 {
     public const byte Version = 1;
     public const int MaxFields = 56;
-    public const int CoreFields = 19, CorpseFields = 5, RangedFields = 6;
+    public const int CoreFields = 19, CorpseFields = 5, RangedFields = 6, PresentationFields = 17;
+    public const int PresentationStart = CoreFields + CorpseFields + RangedFields;
     // IDs are append-only. Distances are rounded UP to whole metres; detailed
     // teleport logs preserve the actual coordinates and fractional distances.
     public static readonly string[] Keys = [
@@ -19,7 +20,11 @@ public static class T3NativeCounters
         "tp_by_source_leash_settle", "tp_by_source_video_landing", "tp_by_source_video_rollback", "tp_by_source_scene_nudge",
         "corpses_visible", "corpse_hidden_blocked", "grave_markers_added", "grave_marker_fallbacks", "markers_off_session",
         "ranged_native_missing_actor", "ranged_native_unreadable_phase", "ranged_native_unknown_hand",
-        "ranged_native_queue_overflow", "ranged_native_expired_rows", "ranged_native_lifecycle_dropped"
+        "ranged_native_queue_overflow", "ranged_native_expired_rows", "ranged_native_lifecycle_dropped",
+        "rp_e2e_ms_p50", "rp_e2e_ms_p95", "rp_e2e_ms_max", "rp_agent_hop_ms_p95",
+        "rp_corr_n", "rp_corr_cm_p95", "rp_corr_cm_max", "rp_hard_place", "rp_step_ratio",
+        "rp_action_lag_ms_p95", "owner_violations", "rp_e2e_n", "rp_agent_hop_n", "rp_action_n",
+        "rp_step_n", "rp_pose_n", "rp_owner_n"
     ];
 
     public static bool TryRead(ReadOnlySpan<byte> payload, out Dictionary<string, long> values)
@@ -41,11 +46,12 @@ public static class T3NativeCounters
         for (int i = 0; i < CoreFields; i++) if (!seen[i]) return false;
         int corpse = 0;
         for (int i = CoreFields; i < CoreFields + CorpseFields; i++) if (seen[i]) corpse++;
-        int ranged = 0;
-        for (int i = CoreFields + CorpseFields; i < CoreFields + CorpseFields + RangedFields; i++) if (seen[i]) ranged++;
-        // Older P4/P5 DLLs remain readable. Each added group is atomic; the
-        // P6 group cannot pretend that an absent P5 prefix was present.
+        int ranged = 0, presentation = 0;
+        for (int i = CoreFields + CorpseFields; i < PresentationStart; i++) if (seen[i]) ranged++;
+        for (int i = PresentationStart; i < PresentationStart + PresentationFields; i++) if (seen[i]) presentation++;
+        // Older DLLs remain readable. Every extension is atomic and requires its prefix.
         return (corpse == 0 || corpse == CorpseFields) && (ranged == 0 || ranged == RangedFields) &&
-            (ranged == 0 || corpse == CorpseFields);
+            (ranged == 0 || corpse == CorpseFields) && (presentation == 0 || presentation == PresentationFields) &&
+            (presentation == 0 || ranged == RangedFields);
     }
 }
