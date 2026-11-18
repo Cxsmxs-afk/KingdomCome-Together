@@ -25,6 +25,7 @@
 #include "join_native.h"
 #include "savelist.h"
 #include "pipe_outbox.h"
+#include "pipe_control_reader.h"
 #include "leash.h"
 #include "wo131.h"
 #include "wo187.h"
@@ -858,6 +859,69 @@ struct PipeSyncState {
     T value{};
 };
 
+// One reader thread per connection. The same incremental decoder owns bytes
+// while serve() dispatches normal work and while a single waits on the game.
+struct ReaderContext {
+    HANDLE handle; uint64_t generation; pipecontrol::Reader reader; bool failed = false;
+    ReaderContext(HANDLE h, uint64_t gen) : handle(h), generation(gen), reader(g_seq) {}
+};
+thread_local ReaderContext* t_reader = nullptr;
+static_assert(pipecontrol::kGeneric == kWo163 && pipecontrol::kBatch == wo218rules::kBatch && pipecontrol::kSamples == kNpcSamples,
+              "control decoder frame types must match the pipe protocol");
+static_assert(pipecontrol::kLargePayload == kNpcSamplesMaxLen, "decoder must preserve the existing payload bound");
+
+bool ingest(ReaderContext& input, const uint8_t* bytes, size_t n) {
+    const bool ok = input.reader.feed(bytes, n, [&](const pipecontrol::Frame& f) {
+        // Only this opcode is pure lifecycle state. Do not route any other
+        // off-main op ahead of the normal FIFO, even if the registry allows it.
+        BYTE out[4 + 512]{}; size_t used = 0; uint8_t reason = wo163::kRFailed;
+        crash::note_pipe(f.type, f.body[0], static_cast<uint16_t>(f.body.size()));
+        if (!wo203::handle_off_main(wo216::kOpLifecycle, f.body.data(), f.body.size(), out + 4, 512, &used, &reason) || used > 512) return false;
+        out[0] = reason == wo163::kROk ? 1 : 0; out[1] = f.sequence; out[2] = wo216::kOpLifecycle; out[3] = reason;
+        return send_frame(input.handle, kWo163Reply, out, static_cast<uint16_t>(4 + used), input.generation);
+    });
+    g_seq = input.reader.next_sequence();
+    if (!ok) { input.failed = true; logf("PIPE: control reader rejected malformed/over-limit input, deferred overflow or failed ACK -- disconnecting"); }
+    return ok;
+}
+
+// Peek only determines how many bytes are currently available; every one of
+// those bytes may be consumed incrementally. Never wait for a complete frame.
+// The 64 KiB turn bound also prevents a flooding peer from extending the 3.5 s
+// single-request deadline forever. Reliable overflow fails the connection.
+bool pump_control_available() {
+    ReaderContext* input = t_reader;
+    if (!input) return true;
+    if (input->failed || input->generation != g_connGen.load() || !g_running) return false;
+    size_t budget = 64 * 1024;
+    while (budget) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(input->handle, nullptr, 0, nullptr, &available, nullptr)) { input->failed = true; return false; }
+        if (!available) return true;
+        BYTE bytes[4096];
+        DWORD take = available < sizeof bytes ? available : static_cast<DWORD>(sizeof bytes);
+        if (take > budget) take = static_cast<DWORD>(budget);
+        // This is the sole reader, and take <= the bytes Peek just observed.
+        // No pending overlapped read exists while this pump runs.
+        if (!read_all(input->handle, bytes, take) || !ingest(*input, bytes, take)) { input->failed = true; return false; }
+        budget -= take;
+    }
+    return true;
+}
+
+bool next_normal_frame(ReaderContext& input, pipecontrol::Frame* frame) {
+    while (!input.failed && g_running && input.generation == g_connGen.load()) {
+        if (input.reader.pop(frame)) return true;
+        if (!pump_control_available()) return false;
+        if (input.reader.pop(frame)) return true;
+        // Idle outer loop may block for one byte. Pump calls only consume known
+        // available bytes and never enter this path while a main task is pending.
+        BYTE byte = 0;
+        if (!read_all(input.handle, &byte, 1) || !ingest(input, &byte, 1)) { input.failed = true; return false; }
+    }
+    return false;
+}
+
 // WO-110 R12: SHORTER than the agent's 5 s reply deadline (CombatPipe.cs
 // ReplyDeadline). Both were 5 s, so when the game thread stalled the agent
 // timed out first and the DLL's late failure reply then sat in the pipe as
@@ -911,12 +975,13 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
     });
 
     std::unique_lock<std::mutex> lock(state->mutex);
-    if (!state->cv.wait_for(lock, std::chrono::milliseconds(kPipeSyncTimeoutMs),
-                             [&] { return state->done; })) {
+    const auto waited = pipecontrol::wait_pumped(state->cv, lock, std::chrono::milliseconds(kPipeSyncTimeoutMs),
+        [&] { return state->done; }, [&] { return pump_control_available() && generation == g_connGen.load() && g_running; });
+    if (waited != pipecontrol::Wait::Done) {
         if (!state->started) state->cancelled = true;
-        logf("PIPE: %s is still waiting on the main thread past %ums -- the frame loop "
-             "may be hung. Replying failure now; a pending call is cancelled, an already running engine call finishes safely.",
-             what, kPipeSyncTimeoutMs);
+        lock.unlock();
+        if (waited == pipecontrol::Wait::TimedOut)
+            logf("PIPE: %s is still waiting on the main thread past %ums -- replying failure; pending work cancelled, running engine work retains safe ownership", what, kPipeSyncTimeoutMs);
         return false;
     }
     if (faultedOut) *faultedOut = state->faulted;
@@ -931,25 +996,18 @@ void serve(HANDLE h) {
     g_connected = true;
     logf("PIPE: agent connected");
 
-    while (g_running) {
-        BYTE head[3];
-        if (!read_all(h, head, 3)) break;
-        const uint8_t  type = head[0];
-        const uint16_t len  = static_cast<uint16_t>(head[1] | (head[2] << 8));
-
-        // Bound the payload before allocating: the pipe is local, but a
-        // malformed length should not turn into a huge allocation. WO-118:
-        // the sample batch alone may run to kNpcSamplesMaxLen.
-        if (len > 1024 && !((type == kNpcSamples || type == wo218rules::kBatch) && len <= kNpcSamplesMaxLen)) {
-            logf("PIPE: payload of %u bytes is out of range; dropping the connection", len);
-            break;
-        }
-        BYTE body[kNpcSamplesMaxLen];
-        if (len && !read_all(h, body, len)) break;
-
-        kcdmp::crash::note_pipe(type, len ? body[0] : 0, len);   // WO-202 I.1: the crash report's last requests
-        if (type == wo218rules::kBatch) { w218_on_batch(h, body, len); continue; }   // WO-218 A.1: no sequence number taken
-        const uint8_t seq = g_seq++;
+    ReaderContext input(h, g_connGen.load());
+    t_reader = &input;
+    while (g_running && !input.failed) {
+        pipecontrol::Frame incoming;
+        if (!next_normal_frame(input, &incoming)) break;
+        const uint8_t type = incoming.type;
+        const uint16_t len = static_cast<uint16_t>(incoming.body.size());
+        // Keep a non-null address for old handlers' zero-length branches.
+        BYTE empty = 0; const BYTE* body = len ? incoming.body.data() : &empty;
+        const uint8_t seq = incoming.sequence;
+        crash::note_pipe(type, len ? body[0] : 0, len);
+        if (type == wo218rules::kBatch) { w218_on_batch(h, body, len); continue; }
 
         switch (type) {
             case kPing:
@@ -1828,6 +1886,7 @@ void serve(HANDLE h) {
         }
     }
 
+    t_reader = nullptr;
     g_connected = false;
     w218_on_disconnect();   // WO-218 A.1: a waiting batch's reply never reaches the next connection
     tx_disconnected(h);

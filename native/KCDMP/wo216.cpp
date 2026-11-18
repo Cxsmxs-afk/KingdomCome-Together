@@ -4,6 +4,7 @@
 // WO-216: the rest of the body -- the native half's switch word, status and B's census (wo216.h). A's read and replay live beside the
 // route they extend (wo215.cpp: the AI update's entry, the per-copy route).
 #include "wo216.h"
+#include "wo216_authority_rules.h"
 #include "wo203.h"
 #include "wo163.h"
 #include "wo215.h"
@@ -33,6 +34,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -67,7 +69,29 @@ double now_s() {
     return static_cast<double>(c.QuadPart) / static_cast<double>(f.QuadPart);
 }
 
-std::atomic<uint8_t> g_role{0};   // op 160: 0 own world, 1 host, 2 host-world joiner (armed before load, retained through holds)
+std::atomic<uint8_t> g_role{0};   // role 2 is pending until op168 confirms Gameplay + native settle
+std::mutex g_authorityMu;
+wo216authority::State g_authority; // only pure control state under this mutex, never an engine call
+std::atomic<uint64_t> g_activeFromMs{0}, g_authorityGeneration{0};
+std::atomic<bool> g_authorityEnabled{true}, g_legacyArmed{false};
+std::atomic<uint8_t> g_authorityPhase{static_cast<uint8_t>(wo216authority::Phase::Load)};
+std::atomic<uint32_t> c_blockedDuringLoad{0}, c_gateArmedAtS{0};
+std::atomic<uint32_t> c_npcNear{0}, c_npcBound{0}, c_npcHidden{0}, c_hideFailsafe{1}, c_unhidden10s{0};
+
+void publish_authority() {
+    g_activeFromMs.store(0, std::memory_order_release);
+    g_authorityEnabled.store(g_authority.enabled(), std::memory_order_release);
+    g_authorityPhase.store(static_cast<uint8_t>(g_authority.phase), std::memory_order_release);
+    g_legacyArmed.store(g_authority.legacyArmed, std::memory_order_release);
+    g_authorityGeneration.store(g_authority.generation, std::memory_order_release);
+    g_activeFromMs.store(g_authority.active_from(), std::memory_order_release);
+}
+bool lifecycle_active(uint64_t now, uint64_t* observedFrom = nullptr) {
+    const uint64_t from = g_activeFromMs.load(std::memory_order_acquire);
+    if (observedFrom) *observedFrom = from;
+    return g_role.load(std::memory_order_acquire) == 2 && g_authorityEnabled.load(std::memory_order_acquire) && from && now >= from;
+}
+bool legacy_active() { return g_role.load() == 2 && !g_authorityEnabled.load() && g_legacyArmed.load(); }
 std::atomic<bool> g_decisionGate{false};
 std::atomic<uint32_t> c_decisionBlocked{0};
 const char* g_decisionWhy = "not installed";
@@ -77,8 +101,18 @@ char g_decisionReason[192]{};   // inline_hook may return a thread-local decoder
 // nodes after their scheduler began left suspended nodes in a live tree. The AI
 // module's movement/navigation update is deliberately left running for host orders.
 bool decision_gate(void*, void*) {
-    const bool blocked = decision_suppressed(g_role.load(std::memory_order_acquire), g_decisionGate.load());
-    if (blocked) c_decisionBlocked.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t now = GetTickCount64(); uint64_t from = 0;
+    const bool blocked = lifecycle_active(now, &from) && g_decisionGate.load();
+    if (blocked) {
+        c_decisionBlocked.fetch_add(1, std::memory_order_relaxed);
+        // Count actual blocked callbacks observed in pending Load as well. The
+        // deadline rule should make this zero; a concurrent invalidation is
+        // deliberately counted conservatively instead of reporting a constant.
+        if (g_authorityPhase.load(std::memory_order_acquire) == static_cast<uint8_t>(wo216authority::Phase::Load))
+            c_blockedDuringLoad.fetch_add(1, std::memory_order_relaxed);
+        uint32_t zero = 0;
+        c_gateArmedAtS.compare_exchange_strong(zero, static_cast<uint32_t>((now - from + wo216authority::kSettleMs) / 1000));
+    }
     return blocked;
 }
 
@@ -112,7 +146,31 @@ void install_decision_gate() {
     logf("HOST-AUTHORITY decision_gate=%s (%s); UpdateIntellects blocked only for role 2; navigation remains live",
          g_decisionGate.load() ? "armed" : "unavailable", g_decisionWhy);
 }
+// Pure state control is deliberately handled on the pipe reader, including load invalidation.
+// The normal main-thread registry entry is also provided for older batch callers.
+uint8_t lifecycle_op(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
+    *outLen = 0;
+    wo216authority::Request r;
+    if (cap < wo216authority::kAckBytes || !wo216authority::request(body, len, &r)) return wo163::kRBadRequest;
+    const uint64_t now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(g_authorityMu);
+    const auto before = g_authority;
+    const bool accepted = g_authority.apply(r, now);
+    if (accepted && (before.generation != g_authority.generation || before.phase != g_authority.phase ||
+        before.gameplayAtMs != g_authority.gameplayAtMs || before.loadAccepted != g_authority.loadAccepted || before.legacyArmed != g_authority.legacyArmed)) {
+        if (before.generation != g_authority.generation) c_gateArmedAtS.store(0);
+        publish_authority();
+    }
+    g_authority.ack(out, g_role.load(), g_decisionGate.load(), now, r.id);
+    *outLen = wo216authority::kAckBytes;
+    return accepted ? wo163::kROk : wo163::kRBadRequest;
+}
+bool lifecycle_off_main(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen, uint8_t* reason) {
+    if (opc != kOpLifecycle) return false;
+    *reason = lifecycle_op(body, len, out, cap, outLen); return true;
+}
 void b_exempt(const char* name, bool on, double forS);
+void b_stop(const char* why);
 int b_status(char* out, int n);
 
 uint8_t d_read(uint8_t maxN, uint8_t* out, size_t cap, size_t* outLen);
@@ -120,6 +178,7 @@ uint8_t d_of(const char* name, uint8_t* out, size_t cap, size_t* outLen);
 
 uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
     *outLen = 0;
+    if (opc == kOpLifecycle) return lifecycle_op(body, len, out, cap, outLen);
     if (opc == kOpOutfitRead) { if (len != 2) return wo163::kRBadRequest; return d_read(body[1], out, cap, outLen); }
     if (opc == kOpOutfitOf) {
         if (len < 3 || len != 2u + body[1] || body[1] == 0 || body[1] > 63) return wo163::kRBadRequest;
@@ -147,23 +206,32 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
         return wo163::kROk;
     }
     if (opc == kOpConfig) {
-        if ((len != 5 && len != 6) || cap < 4) return wo163::kRBadRequest;
-        uint32_t bits = 0;
-        std::memcpy(&bits, body + 1, 4);
-        if (len == 6) {
-            if (body[5] > 2) return wo163::kRBadRequest;
-            if (body[5] == 2 && (!g_decisionGate.load() || !wo200::host_authority_ready())) return wo163::kRFailed;
-            const uint8_t was = g_role.exchange(body[5]);
-            if (was != body[5]) logf("WO216-CFG role %u -> %u (0 none, 1 the host, 2 a joiner in the host's world)", was, body[5]);
+        if ((len != 5 && len != 6 && len != 14) || cap < 4) return wo163::kRBadRequest;
+        uint32_t bits = 0; std::memcpy(&bits, body + 1, 4);
+        const bool tagged = len == 14;
+        const uint64_t generation = tagged ? wo216authority::read_u64(body + 6) : 0;
+        uint8_t oldRole = 0; uint32_t oldBits = 0; bool first = false;
+        {
+            // Short pure-state lock only. In particular, no console/engine call,
+            // log write or action on a body may delay off-main Load invalidation.
+            std::lock_guard<std::mutex> authorityLock(g_authorityMu);
+            if (!g_authority.role_generation(tagged, generation)) return wo163::kRBadRequest;
+            oldRole = g_role.load();
+            if (len >= 6) {
+                if (body[5] > 2) return wo163::kRBadRequest;
+                if (body[5] == 2 && g_authorityEnabled.load() && (!g_decisionGate.load() || !wo200::host_authority_ready())) return wo163::kRFailed;
+                g_role.store(body[5]); g_authority.role_changed(oldRole, body[5], tagged);
+                if (oldRole != body[5]) publish_authority();
+            }
+            oldBits = g_bits.exchange(bits); first = !g_configured.exchange(true);
         }
-        const uint32_t was = g_bits.exchange(bits);
-        if (was != bits || !g_configured.exchange(true))
+        if (len >= 6 && oldRole != body[5]) logf("WO216-CFG role %u -> %u (0 none, 1 the host, 2 a joiner in the host's world)", oldRole, body[5]);
+        if (oldBits != bits || first)
             logf("WO216-CFG bits=0x%X (was 0x%X; twin off 0x%X): route_replay=%d no_brains=%d activity_line=%d outfits=%d riders=%d poses=%d npc_fights=%d",
-                 bits, was, twin_off(), on(kBitRouteReplay), on(kBitNoBrains), on(kBitActivityLine), on(kBitOutfits), on(kBitRiders), on(kBitPoses),
+                 bits, oldBits, twin_off(), on(kBitRouteReplay), on(kBitNoBrains), on(kBitActivityLine), on(kBitOutfits), on(kBitRiders), on(kBitPoses),
                  on(kBitNpcFights));
         const uint32_t eff = bits & ~twin_off();
-        std::memcpy(out, &eff, 4);
-        *outLen = 4;
+        std::memcpy(out, &eff, 4); *outLen = 4;
         return wo163::kROk;
     }
     if (opc == kOpStatus) {
@@ -181,9 +249,11 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
 
 // ================================================================================================== B: no brain runs on the joiner
 // Paket C gates UpdateIntellects before its decision batch. The census now
-// controls visibility only: no per-body suspend/resume masks or polling pauses.
+// controls visibility. Only explicit disabled authority restores the PR14 per-body pause fallback.
 // CEntity::Hide stays unguarded because it may take an engine lock (WO-215).
 struct Api {
+    size_t conExecSlot = 0;
+    bool conResolved = false;
     size_t hideSlot = 0;           // CEntity::Hide(bool)
     bool armed = false;
     const char* why = "not resolved";
@@ -212,6 +282,40 @@ void b_resolve() {
     logf("WO216-BRAINS visibility armed: CEntity::Hide is slot 63 (its hidden bit checked)");
 }
 
+// Legacy fallback uses the PR14 console-call resolver, only when explicitly disabled.
+void b_legacy_resolve() {
+    if (g_b.conResolved) return;
+    g_b.conResolved = true;
+    // the console's ExecuteString: CScriptBind_System::ExecuteCommand (CryScriptSystem, found by its own error text) calls
+    // mov rcx,[rdi+78h]; xor r9d,r9d; mov rdx,[rsp+48h]; xor r8d,r8d; mov rax,[rcx]; call [rax+<slot>]   (bSilent = 0, bDefer = 0)
+    HMODULE ss = GetModuleHandleA("CryScriptSystem.dll");
+    if (!ss) { g_b.why = "CryScriptSystem.dll not loaded"; return; }
+    int nf = 0;
+    const uint8_t* door = anchor::function_by_string(ss, "CScriptBind_System::ExecuteCommand", &nf);
+    if (!door || nf != 1) { g_b.why = "System.ExecuteCommand's binding not found as one function"; return; }
+    uint8_t code[0x100]{};
+    KCDMP_FAULT_READ(rsite, "wo216::b_resolve");
+    if (!fault::guarded(rsite, [&] { std::memcpy(code, door, sizeof code); })) { g_b.why = "the binding unreadable"; return; }
+    static const uint8_t pat[] = {0x45, 0x33, 0xC9, 0x48, 0x8B, 0x54, 0x24, 0x48, 0x45, 0x33, 0xC0, 0x48, 0x8B, 0x01, 0xFF, 0x90};
+    size_t at = 0;
+    for (size_t i = 0; i + sizeof pat + 4 <= sizeof code && !at; ++i) if (std::memcmp(code + i, pat, sizeof pat) == 0) at = i + sizeof pat;
+    if (!at) { g_b.why = "the binding's console call not found"; return; }
+    int32_t slot = 0;
+    std::memcpy(&slot, code + at, 4);
+    if (slot <= 0 || slot > 0x400 || (slot & 7)) { g_b.why = "the console call's slot is implausible"; return; }
+    g_b.conExecSlot = static_cast<size_t>(slot);
+    logf("WO216-BRAINS legacy PauseNPC console slot +0x%zX resolved from ExecuteCommand", g_b.conExecSlot);
+}
+
+bool b_exec(const char* cmd, bool ownedCleanup = false) {
+    if ((!legacy_active() && !ownedCleanup) || !g_b.conExecSlot) return false;
+    void* con = engine::console();
+    if (!con) return false;
+    void* vt = *reinterpret_cast<void**>(con);
+    auto fn = reinterpret_cast<void (*)(void*, const char*, bool, bool)>(reinterpret_cast<void**>(vt)[g_b.conExecSlot / 8]);
+    fn(con, cmd, false, false); return true;
+}
+
 // The engine's own Hide, unguarded (see above), on a freshly resolved entity.
 bool b_hide(uint32_t eid, bool hide) {
     if (!g_b.armed) return false;
@@ -237,16 +341,24 @@ bool ours(const char* name) {
 
 struct BBody {
     std::string name;
-    bool hidden = false;       // hidden by B (shown again when bound, when it fights a player, or when B goes off)
+    wo216authority::HideLease visibility;
+    bool wantHide = false, bound = false, inNearRange = false, ready = false, lifeKnown = false, dead = false, exemptNow = false;
+    double pauseAt = -1e9;
+    wo216authority::PauseLease pause;
+    void* pauseEntity = nullptr;
+    uint64_t wuid = 0;
+    int brainState = -1;
     bool fightPlayer = false;  // its opponent is a player this census: the hide sweep must leave it shown
     bool keptFight = false;    // already logged that this fight kept it on screen
-    double visAt = -1e9;       // when hidden last flipped (a hide and a show inside 2 s is the flicker)
     double spawnAt = -1;       // a local spawn: when it was seen (its brain may come a frame or two later)
     int kind = 0;
 };
+struct PauseCleanup { wo216authority::PauseLease lease; void* entity = nullptr; std::string name; bool waitingLogged = false; };
+std::deque<PauseCleanup> g_pauseCleanup;
+uint64_t g_bodyGeneration = 0;
 std::unordered_map<uint32_t, BBody> g_bodies;           // main thread
 std::unordered_map<std::string, double> g_exempt;       // name -> until (s)
-std::vector<uint32_t> g_hideQ, g_showQ;       // main thread: the actions, at most kPerFrame a frame
+std::vector<uint32_t> g_pauseQ, g_hideQ;       // main thread: the actions, at most kPerFrame a frame
 constexpr int kPerFrame = 24;
 std::mutex g_spawnMu;
 std::vector<uint32_t> g_spawned;                        // the spawn watch's new entities (any thread -> main)
@@ -257,7 +369,7 @@ const char* g_spawnWhy = "not installed";
 bool g_active = false;
 bool g_act = false;                                     // no_brains on: the census acts (off: the twin -- it only counts)
 double g_censusAt = 0, g_activeSince = 0;
-bool g_swept = false;                                   // the first census after the join: every body here suspended (the join's sweep)
+bool g_swept = false;                                   // first complete census in this lifecycle
 struct Census { uint32_t samples = 0, nonzero = 0, maxRunning = 0, lastRunning = 0, lastExemptRunning = 0, lastBodies = 0, lastHidden = 0, lastBound = 0;
                 uint32_t nearNonzero = 0, maxNearRunning = 0, lastNearRunning = 0, lastNear = 0, lastDead = 0;
                 double lastCostMs = 0, maxCostMs = 0; } g_cen;
@@ -305,7 +417,7 @@ void b_hook_spawn() {
 
 // WO-217 B.4 (layer_watch): the entity system's EnableLayer (the function that logs its own "EnableLayer '%s', enable:%c, serialized:%c";
 // its vftable slot found at arm time, +0x250 in the bench's build) is wrapped like SpawnEntity: after the engine's own call, a layer switched
-// on is noted, and the census scans every entity at once and each second for kLayerBurstS -- the layer's bodies are suspended and hidden
+// on is noted, and the census scans every entity at once and each second for kLayerBurstS -- visibility still requires full coverage
 // at its activation, not at the next 30 s net (WO-216: eight bodies of another village switched on with their layer, found by the net).
 constexpr double kLayerBurstS = 30.0;   // a1-b7: a village's bodies started running 16 s after their layer came on
 std::unordered_map<uint32_t, double> g_layerBorn;   // WO-217 B.4 (main thread): bodies a layer burst's scan first listed, and when
@@ -350,7 +462,7 @@ void b_hook_layer() {
     g_layerSlot = static_cast<uint32_t>(slot) * 8;
     g_layerWhy = "armed";
     logf("WO217-LAYER the layer watch is in: the entity system's EnableLayer (+0x%X) wrapped -- a layer switched on is scanned at once and "
-         "each second for %.0f s (its bodies frozen and hidden at its activation)", g_layerSlot, kLayerBurstS);
+         "each second for %.0f s (visibility still requires initialized living bodies and complete nearby coverage)", g_layerSlot, kLayerBurstS);
 }
 
 bool exempt(const std::string& name, double now) {
@@ -360,8 +472,36 @@ bool exempt(const std::string& name, double now) {
     return true;
 }
 
-struct CensusCtx { double now; bool layerOn = false; uint32_t layerCaught = 0; std::string layerNames; uint32_t bodies = 0, running = 0, exemptRunning = 0, hidden = 0, bound = 0, nearRunning = 0, nearN = 0, deadRunning = 0; std::string names;
-                   const std::unordered_set<uint32_t>* fresh = nullptr; uint32_t freshRunning = 0; std::string freshNames;   // WO-217 B.4
+// These leases can outlive the active legacy mode; cleanup remains main-thread
+// only, lookup by EID then validate entity identity/WUID, never dereference an old
+// saved entity pointer. A foreign suspend mask is left untouched and retried.
+void b_cleanup_pauses() {
+    size_t budget = g_pauseCleanup.size() < 8 ? g_pauseCleanup.size() : 8;
+    while (budget--) {
+        PauseCleanup p = std::move(g_pauseCleanup.front()); g_pauseCleanup.pop_front();
+        void* e = engine::entity_by_id(p.lease.eid);
+        const char* name = e ? engine::entity_name(e) : nullptr;
+        if (!e || e != p.entity || !name || p.name != name || actions::entity_wuid(e) != p.lease.wuid) continue;
+        uint64_t w = 0; int st = -1, mask = -1;
+        if (!actions::brain_state(e, &w, &st, &mask) || st < 0 || mask < 0) { g_pauseCleanup.push_back(std::move(p)); continue; }
+        if (!p.lease.same_owner(p.lease.eid, w, p.lease.generation) || (mask & 0x08) == 0) continue;
+        if (!p.lease.may_resume(p.lease.eid, w, p.lease.generation, st, mask)) {
+            if (!p.waitingLogged) { p.waitingLogged = true; logf("WO216-LEGACY cleanup waits npc=%s generation=%llu mask=0x%X: another context remains, no ResumeNPC", p.name.c_str(), static_cast<unsigned long long>(p.lease.generation), mask); }
+            g_pauseCleanup.push_back(std::move(p)); continue;
+        }
+        char cmd[96]; std::snprintf(cmd, sizeof cmd, "wh_ai_ResumeNPC %s", p.name.c_str());
+        if (b_exec(cmd, true)) logf("WO216-LEGACY owned pause released npc=%s generation=%llu eid=0x%X", p.name.c_str(), static_cast<unsigned long long>(p.lease.generation), p.lease.eid);
+        else g_pauseCleanup.push_back(std::move(p));
+    }
+}
+
+void b_queue_pause(uint32_t eid, BBody& b, double now) {
+    if (!legacy_active() || now - b.pauseAt < 2.0) return;
+    b.pauseAt = now; g_pauseQ.push_back(eid);
+}
+
+struct CensusCtx { double now; bool layerOn = false; uint32_t layerCaught = 0; std::string layerNames; uint32_t bodies = 0, running = 0, exemptRunning = 0, hidden = 0, bound = 0, nearRunning = 0, nearN = 0, nearBound = 0, deadRunning = 0; std::string names;
+                   const std::unordered_set<uint32_t>* fresh = nullptr; uint32_t freshRunning = 0; std::string freshNames;
                    std::unordered_set<uint32_t> seen; bool havePlayer = false; float player[3]{}; };
 bool census_visit(void* e, void* ctx) {
     auto* c = static_cast<CensusCtx*>(ctx);
@@ -371,54 +511,72 @@ bool census_visit(void* e, void* ctx) {
     if (ours(nm)) return false;
     const uint32_t eid = engine::entity_id(e);
     if (!eid) return false;
-    uint64_t w = 0; int st = -1, mask = -1;
-    if (!actions::brain_state(e, &w, &st, &mask) || st < 0) return false;   // no brain (a corpse, a body not set up yet): nothing to freeze
-    ++c->bodies;
     c->seen.insert(eid);
     BBody& b = g_bodies[eid];
-    if (b.name.empty()) { b.name = nm; b.kind = kind; }
-    const bool bound = npcdrive::is_bound_eid(eid);
-    const bool ex = exempt(b.name, c->now);
-    if (bound) ++c->bound;
-    bool nearMe = false;   // within 150 m of this player (the bodies a player here could see)
+    uint64_t w = 0; int st = -1, mask = -1;
+    const bool brain = actions::brain_state(e, &w, &st, &mask) && w && st >= 0 && mask >= 0;
+    // EIDs can be reused. An expired hide lease never migrates to a different body.
+    if ((!b.name.empty() && b.name != nm) || (b.wuid && w && b.wuid != w)) b = BBody{};
+    b.name = nm; b.kind = kind; b.wuid = w; b.brainState = st;
+    b.bound = npcdrive::is_bound_eid(eid);
+    b.exemptNow = exempt(b.name, c->now);
+    b.inNearRange = false;
     if (c->havePlayer) {
         float q[3];
         if (engine::entity_world_pos(e, q)) {
-            const float dx = q[0] - c->player[0], dy = q[1] - c->player[1];
-            nearMe = dx * dx + dy * dy <= 150.0f * 150.0f;
+            const float dx = q[0] - c->player[0], dy = q[1] - c->player[1], dz = q[2] - c->player[2];
+            b.inNearRange = dx * dx + dy * dy + dz * dz <= 150.0f * 150.0f;
         }
     }
-    if (nearMe) ++c->nearN;
-    if (wo216rules::breach(st, decision_suppressed(g_role.load(), g_decisionGate.load()))) {
-        bool dead = false;
-        void* soul = hits::soul_of_eid(eid);
-        if (soul && rttr::soul_bool(soul, "IsDead", &dead) && dead) { ++c->deadRunning; return false; }   // a corpse: nothing to freeze
-        if (ex) ++c->exemptRunning;
+    b.dead = false;
+    void* soul = hits::soul_of_eid(eid);
+    b.lifeKnown = soul && rttr::soul_bool(soul, "IsDead", &b.dead);
+    // No verified reconstruction sub-entry exists in UpdateIntellects. A complete
+    // brain/life read plus the global post-load settle is the conservative proxy;
+    // a newly observed spawn also receives its own five-second initialization window.
+    b.ready = brain && (b.spawnAt < 0 || c->now - b.spawnAt >= 5.0);
+    if (b.ready && b.lifeKnown && !b.dead) {
+        if (b.bound) ++c->bound;
+        if (b.inNearRange) { ++c->nearN; if (b.bound) ++c->nearBound; }
+    }
+    b.fightPlayer = fighting_player(eid);
+    if (!b.fightPlayer) b.keptFight = false;
+    if (brain) ++c->bodies;
+    if (!brain || (b.lifeKnown && b.dead)) { if (brain && st == 0 && b.dead) ++c->deadRunning; return false; }
+    if (wo216rules::breach(st, decisions_blocked())) {
+        if (b.exemptNow) ++c->exemptRunning;
         else if (c->layerOn && g_layerBorn.count(eid) && c->now - g_layerBorn[eid] <= kLayerBurstS) {
-            // WO-217 B.4: a body a layer switched on, its brain started inside the layer's watch -- caught at the activation, suspended
             ++c->layerCaught;
             if (c->layerNames.size() < 300) { if (!c->layerNames.empty()) c->layerNames += ","; c->layerNames += b.name; }
+            if (g_act && b.ready && b.lifeKnown) b_queue_pause(eid, b, c->now);
         } else {
             ++c->running;
-            if (nearMe) ++c->nearRunning;
-            if (c->names.size() < 600) { if (!c->names.empty()) c->names += ","; c->names += b.name + (bound ? "(bound)" : "(unbound)"); }
+            if (b.inNearRange) ++c->nearRunning;
+            if (c->names.size() < 600) { if (!c->names.empty()) c->names += ","; c->names += b.name + (b.bound ? "(bound)" : "(unbound)"); }
             if (c->fresh && c->fresh->count(eid)) { ++c->freshRunning; if (c->freshNames.size() < 300) { if (!c->freshNames.empty()) c->freshNames += ","; c->freshNames += b.name; } }
+            if (g_act && b.ready && b.lifeKnown) b_queue_pause(eid, b, c->now);
         }
     }
-    const bool fight = fighting_player(eid);
-    b.fightPlayer = fight;
-    if (!fight) b.keptFight = false;
-    const bool wantHide = g_act && !ex && wo216rules::hide_unbound(bound, false, fight) && wo216rules::streamable_name(b.name.size());
-    const bool hidden = wo216rules::hide_holds(b.hidden, wantHide, b.visAt < 0 ? 1e9 : c->now - b.visAt);
-    if (hidden != b.hidden) { b.visAt = c->now; b.hidden = hidden; if (hidden) g_hideQ.push_back(eid); else g_showQ.push_back(eid); }
-    if (g_act && fight && !bound && wo216rules::streamable_name(b.name.size()) && !b.hidden && !b.keptFight) {
-        b.keptFight = true;
-        c_bFightKept.fetch_add(1, std::memory_order_relaxed);
-        logf("WO216-BRAINS npc=%s stays shown: in a fight with a player", b.name.c_str());
-    }
-    if ((bound || fight) && b.hidden) { b.hidden = false; b.visAt = c->now; g_showQ.push_back(eid); }
-    if (b.hidden) ++c->hidden;
     return false;
+}
+
+// Second pass only: the ratio must describe the complete nearby census, never
+// the order in which its entities happened to be visited.
+void b_visibility(CensusCtx& c) {
+    const bool covered = wo216authority::coverage(c.nearN, c.nearBound, c.havePlayer);
+    c_npcNear.store(c.nearN); c_npcBound.store(c.nearBound); c_hideFailsafe.store(covered ? 0 : 1);
+    const uint64_t ms = GetTickCount64();
+    for (uint32_t eid : c.seen) {
+        BBody& b = g_bodies[eid];
+        const bool eligible = g_act && wo216authority::hide_eligible(b.ready, b.lifeKnown, b.dead, b.inNearRange,
+            b.fightPlayer, b.exemptNow, wo216rules::streamable_name(b.name.size()));
+        const bool wasExpired = b.visibility.expired;
+        b.wantHide = b.visibility.desired(b.bound, eligible, covered, ms);
+        if (!b.wantHide && b.visibility.hidden) {
+            if (b_hide(eid, false)) { if (!wasExpired && b.visibility.expired) c_unhidden10s.fetch_add(1); b.visibility.applied(false, ms); c_bShows.fetch_add(1); if (c_npcHidden.load()) c_npcHidden.fetch_sub(1); }
+        } else if (b.wantHide && !b.visibility.hidden) g_hideQ.push_back(eid);
+        if (b.visibility.hidden) ++c.hidden;
+    }
 }
 
 std::vector<uint32_t> g_npcList;   // every NPC body with a brain here (the full scan's; local spawns added as they come)
@@ -467,18 +625,19 @@ void b_census(double now) {
     c.layerOn = layerScan || now < g_layerBurstUntil + kLayerBurstS;
     for (auto it = g_layerBorn.begin(); it != g_layerBorn.end();) { if (now - it->second > kLayerBurstS) it = g_layerBorn.erase(it); else ++it; }
     for (uint32_t eid : g_npcList) if (void* e = engine::entity_by_id(eid)) census_visit(e, &c);
+    b_visibility(c);
     // WO-217 B.4: bodies a layer switched on whose brains run inside the layer's watch -- caught at the activation (not the census's misses)
     if (c.layerCaught) {
         const uint32_t k = c_layerFound.fetch_add(c.layerCaught, std::memory_order_relaxed) + c.layerCaught;
         logf("WO217-LAYER found %u running at a layer's activation: %s -- %s [n=%u]", c.layerCaught, c.layerNames.c_str(),
-             g_act ? "suspended" : "left running (the twin)", k);
+             legacy_active() && g_act ? "legacy pause requested" : decisions_blocked() ? "decisions gated" : "left running", k);
     }
     // ... and bodies running that the list did not hold before this scan (a layer scan's, else the 30 s net's: missed)
     if (c.freshRunning) {
         if (layerScan) {
             const uint32_t k = c_layerFound.fetch_add(c.freshRunning, std::memory_order_relaxed) + c.freshRunning;
             logf("WO217-LAYER found %u running at a layer's activation: %s -- %s [n=%u]", c.freshRunning, c.freshNames.c_str(),
-                 g_act ? "suspended" : "left running (the twin)", k);
+                 legacy_active() && g_act ? "legacy pause requested" : decisions_blocked() ? "decisions gated" : "left running", k);
         } else {
             const uint32_t k = c_netFound.fetch_add(c.freshRunning, std::memory_order_relaxed) + c.freshRunning;
             logf("WO217-LAYER the 30 s net found %u running the list did not hold: %s [n=%u]", c.freshRunning, c.freshNames.c_str(), k);
@@ -486,10 +645,17 @@ void b_census(double now) {
     }
     const double ms = (now_s() - t0) * 1000.0;
     // bodies gone since the last census: forgotten
-    for (auto it = g_bodies.begin(); it != g_bodies.end();) { if (!c.seen.count(it->first)) it = g_bodies.erase(it); else ++it; }
+    for (auto it = g_bodies.begin(); it != g_bodies.end();) {
+        if (!c.seen.count(it->first)) {
+            BBody& gone = it->second;
+            if (gone.pause.owned && gone.pause.generation == g_bodyGeneration) g_pauseCleanup.push_back({gone.pause, gone.pauseEntity, gone.name, false});
+            if (it->second.visibility.hidden) { if (b_hide(it->first, false)) c_bShows.fetch_add(1); if (c_npcHidden.load()) c_npcHidden.fetch_sub(1); }
+            it = g_bodies.erase(it);
+        } else ++it;
+    }
     if (!g_swept) {
         g_swept = true;
-        c_bSweepPaused.store(0);
+        c_bSweepPaused.store(static_cast<uint32_t>(g_pauseQ.size()));
         c_bSweepHidden.store(static_cast<uint32_t>(g_hideQ.size()));
         logf("WO216-BRAINS the join's sweep: %u bodies with a brain here, %u running (%s), %u not streamed by the host (%s), %u bound, census %.1f ms",
              c.bodies, c.running, g_act ? "decision batch gated" : "left running: no_brains off", static_cast<uint32_t>(g_hideQ.size()),
@@ -529,51 +695,72 @@ void b_spawns(double now) {
         const char* nm = engine::entity_name(e);
         if (ours(nm)) continue;
         BBody& b = g_bodies[eid];
+        if (b.visibility.hidden && c_npcHidden.load()) c_npcHidden.fetch_sub(1);
+        b = BBody{};
         b.name = nm ? nm : "?";
         b.kind = kind;
         b.spawnAt = now;
         if (std::find(g_npcList.begin(), g_npcList.end(), eid) == g_npcList.end()) g_npcList.push_back(eid);
         const uint32_t k = c_bLocalSpawns.fetch_add(1, std::memory_order_relaxed) + 1;
-        const bool bound = npcdrive::is_bound_eid(eid);
-        const bool fight = fighting_player(eid);
-        b.fightPlayer = fight;
-        if (g_act && wo216rules::hide_unbound(bound, false, fight) && wo216rules::streamable_name(b.name.size()) && !b.hidden) {
-            b.hidden = true; b_hide(eid, true); c_bHides.fetch_add(1, std::memory_order_relaxed);
-        }   // this frame
         if (k <= 200 || k % 50 == 0)
-            logf("WO216-LOCALSPAWN npc=%s kind=%s eid=0x%X: spawned by this engine on its own -- %s [n=%u]",
-                 b.name.c_str(), kind == 0 ? "human" : kind == 1 ? "horse" : "animal", eid,
-                 !g_act ? "left as it is (no_brains off: the twin)" : bound ? "the host streams it (shown), decisions gated before the brain update"
-                                                                    : "hidden this frame, decisions gated before the brain update", k);
+            logf("WO216-LOCALSPAWN npc=%s eid=0x%X: stays shown until initialization and a complete coverage census [n=%u]", b.name.c_str(), eid, k);
     }
-    // A spawn may acquire its brain later. The entry gate covers it from its first update.
+    // Every hidden lease is checked each frame; its release cannot wait for the
+    // next one-second census or sit behind the hide-action budget.
+    const uint64_t ms = GetTickCount64();
     for (auto& kv : g_bodies) {
         BBody& b = kv.second;
+        if (b.visibility.hidden) {
+            const bool boundNow = npcdrive::is_bound_eid(kv.first);
+            const bool timedOut = ms >= b.visibility.hiddenAtMs && ms - b.visibility.hiddenAtMs >= wo216authority::kUnboundHideMs;
+            if (boundNow || timedOut) {
+                b.visibility.expired = !boundNow; b.wantHide = false;
+                if (b_hide(kv.first, false)) {
+                    b.visibility.applied(false, ms); if (!boundNow) c_unhidden10s.fetch_add(1); c_bShows.fetch_add(1); if (c_npcHidden.load()) c_npcHidden.fetch_sub(1);
+                }
+            }
+        }
         if (b.spawnAt < 0) continue;
-        if (now - b.spawnAt > 5.0) { b.spawnAt = -1; continue; }
+        if (now - b.spawnAt >= 5.0) { b.spawnAt = -1; continue; }
         void* e = engine::entity_by_id(kv.first);
         if (!e) { b.spawnAt = -1; continue; }
         uint64_t w = 0; int st = -1, mask = -1;
         if (!actions::brain_state(e, &w, &st, &mask) || st < 0) continue;
-        b.spawnAt = -1;
+        if (g_act && st == 0 && !exempt(b.name, now)) b_queue_pause(kv.first, b, now);
     }
 }
 
 void b_actions() {
     int budget = kPerFrame;
-    while (budget > 0 && !g_hideQ.empty()) {
-        const uint32_t eid = g_hideQ.back();
-        g_hideQ.pop_back();
-        if (npcdrive::is_bound_eid(eid)) continue;
-        auto bit = g_bodies.find(eid);
-        if (bit != g_bodies.end() && bit->second.fightPlayer) continue;   // queued before the fight started
-        if (b_hide(eid, true)) c_bHides.fetch_add(1, std::memory_order_relaxed);
+    char cmd[96];
+    while (budget > 0 && !g_pauseQ.empty()) {
+        const uint32_t eid = g_pauseQ.back(); g_pauseQ.pop_back();
+        auto it = g_bodies.find(eid);
+        if (!legacy_active() || it == g_bodies.end() || !it->second.ready || !it->second.lifeKnown || it->second.dead || it->second.exemptNow) continue;
+        BBody& b = it->second; void* e = engine::entity_by_id(eid);
+        const char* liveName = e ? engine::entity_name(e) : nullptr;
+        uint64_t w = 0; int st = -1, mask = -1;
+        wo216authority::PauseLease lease;
+        if (!e || !liveName || b.name != liveName || !actions::brain_state(e, &w, &st, &mask) ||
+            !lease.claim(eid, w, g_bodyGeneration, st, mask)) continue;
+        std::snprintf(cmd, sizeof cmd, "wh_ai_PauseNPC %s", b.name.c_str());
+        if (b_exec(cmd)) { b.pause = lease; b.pauseEntity = e; c_bPauses.fetch_add(1, std::memory_order_relaxed); }
         --budget;
     }
-    while (budget > 0 && !g_showQ.empty()) {
-        const uint32_t eid = g_showQ.back();
-        g_showQ.pop_back();
-        if (b_hide(eid, false)) c_bShows.fetch_add(1, std::memory_order_relaxed);
+    while (budget > 0 && !g_hideQ.empty()) {
+        const uint32_t eid = g_hideQ.back(); g_hideQ.pop_back();
+        auto it = g_bodies.find(eid);
+        if (it == g_bodies.end()) continue;
+        BBody& b = it->second;
+        if ((!authority_active() && !legacy_active()) || c_hideFailsafe.load() || !b.wantHide || b.visibility.hidden || npcdrive::is_bound_eid(eid)) continue;
+        // A queued intent can outlive a death or unfinished initialization. Re-read
+        // those facts immediately before Hide; unknown means leave it visible.
+        void* e = engine::entity_by_id(eid); bool dead = false; void* soul = hits::soul_of_eid(eid);
+        uint64_t w = 0; int st = -1, mask = -1;
+        const char* liveName = e ? engine::entity_name(e) : nullptr;
+        if (!e || !liveName || b.name != liveName || !soul || !rttr::soul_bool(soul, "IsDead", &dead) || dead ||
+            !actions::brain_state(e, &w, &st, &mask) || !w || st < 0 || mask < 0 || w != b.wuid || fighting_player(eid)) continue;
+        if (b_hide(eid, true)) { b.visibility.applied(true, GetTickCount64()); c_bHides.fetch_add(1); c_npcHidden.fetch_add(1); }
         --budget;
     }
 }
@@ -581,9 +768,15 @@ void b_actions() {
 // A world/role switch releases visibility; the decision gate reads role atomically.
 void b_stop(const char* why) {
     uint32_t shown = 0;
-    for (auto& kv : g_bodies) if (kv.second.hidden) { if (b_hide(kv.first, false)) ++shown; kv.second.hidden = false; }
+    for (auto& kv : g_bodies) {
+        BBody& b = kv.second;
+        if (b.pause.owned && b.pause.generation == g_bodyGeneration) g_pauseCleanup.push_back({b.pause, b.pauseEntity, b.name, false});
+        if (b.visibility.hidden) { if (b_hide(kv.first, false)) ++shown; b.visibility.hidden = false; }
+    }
+    b_cleanup_pauses();
     g_bodies.clear();
-    g_hideQ.clear(); g_showQ.clear();
+    c_npcHidden.store(0); c_npcNear.store(0); c_npcBound.store(0); c_hideFailsafe.store(1);
+    g_pauseQ.clear(); g_hideQ.clear();
     g_exempt.clear();
     { std::lock_guard<std::mutex> l(g_spawnMu); g_spawned.clear(); }
     { std::lock_guard<std::mutex> l(g_layerMu); g_layersOn.clear(); }
@@ -600,7 +793,14 @@ void b_stop(const char* why) {
 }
 
 void b_tick(double now) {
-    const bool want = g_role.load() == 2;   // the census measures on every joiner in the host's world (the twin too)
+    b_cleanup_pauses();
+    const bool want = authority_active() || legacy_active();
+    static uint64_t censusGeneration = 0;
+    const uint64_t generation = g_authorityGeneration.load(std::memory_order_acquire);
+    if (generation != censusGeneration) {
+        if (g_active) { b_stop("new lifecycle generation"); g_active = false; }
+        censusGeneration = generation;
+    }
     if (!want) {
         if (g_active) { g_active = false; b_stop("not a joiner in the host's world now"); }
         return;
@@ -610,12 +810,14 @@ void b_tick(double now) {
     g_act = act;
     if (!g_active) {
         b_resolve();
+        if (legacy_active()) b_legacy_resolve();
         if (!g_b.armed) {
             static bool s_told = false;
             if (!s_told) { s_told = true; logf("WO216-BRAINS visibility NOT armed: %s -- decision gate remains independent", g_b.why); }
             return;
         }
         g_active = true;
+        g_bodyGeneration = g_authorityGeneration.load(std::memory_order_acquire);
         g_activeSince = now;
         g_censusAt = 0;
         b_hook_spawn();
@@ -639,12 +841,16 @@ void b_exempt(const char* name, bool on, double forS) {
 }
 
 int b_status(char* out, int n) {
-    return std::snprintf(out, static_cast<size_t>(n),
-        "B decision_gate=%s story_gate=%s decision_blocked=%u decision_reason=%s no_brains=%s role=%u active=%d (%s; spawn watch %s) samples=%u nonzero=%u max_running=%u last_running=%u near_nonzero=%u max_near_running=%u "
+    if (!out || n <= 0) return 0;
+    const wo216authority::Stats stats{c_gateArmedAtS.load(), c_decisionBlocked.load(), c_blockedDuringLoad.load(), c_npcNear.load(), c_npcBound.load(), c_npcHidden.load(), c_hideFailsafe.load(), c_unhidden10s.load()};
+    const int prefix = wo216authority::stats_prefix(out, static_cast<size_t>(n), stats);
+    if (prefix < 0 || prefix >= n) return n > 0 ? n - 1 : 0;
+    return prefix + std::snprintf(out + prefix, static_cast<size_t>(n - prefix),
+        "B decision_gate=%s story_gate=%s authority_active=%d authority_enabled=%d authority_generation=%llu authority_phase=%u decision_reason=%s no_brains=%s role=%u active=%d (%s; spawn watch %s) samples=%u nonzero=%u max_running=%u last_running=%u near_nonzero=%u max_near_running=%u "
         "last_near_running=%u last_near=%u last_dead_with_brain=%u last_exempt_running=%u bodies=%u list=%zu "
         "hidden=%u bound=%u census_ms=%.1f max_ms=%.1f sweep_paused=%u sweep_hidden=%u pauses=%u hides=%u shows=%u fight_kept=%u local_spawns=%u spawns_seen=%u "
         "breaches=%u exempt_running=%u exempt_names=%zu layer_watch=%s(%s) layers_on=%u layer_scans=%u layer_found=%u net_scans=%u net_found=%u last=%s",
-        g_decisionGate.load() ? "armed" : "unavailable", wo200::host_authority_ready() ? "armed" : "unavailable", c_decisionBlocked.load(), g_decisionWhy,
+        g_decisionGate.load() ? "armed" : "unavailable", wo200::host_authority_ready() ? "armed" : "unavailable", authority_active() ? 1 : 0, authority_enabled() ? 1 : 0, static_cast<unsigned long long>(g_authorityGeneration.load()), g_authorityPhase.load(), g_decisionWhy,
         on(kBitNoBrains) ? "on" : "off", g_role.load(), g_active ? 1 : 0, g_b.why, g_spawnWhy, g_cen.samples, g_cen.nonzero, g_cen.maxRunning,
         g_cen.lastRunning, g_cen.nearNonzero, g_cen.maxNearRunning, g_cen.lastNearRunning, g_cen.lastNear, g_cen.lastDead, g_cen.lastExemptRunning, g_cen.lastBodies, g_npcList.size(), g_cen.lastHidden, g_cen.lastBound, g_cen.lastCostMs, g_cen.maxCostMs,
         c_bSweepPaused.load(), c_bSweepHidden.load(), c_bPauses.load(), c_bHides.load(), c_bShows.load(), c_bFightKept.load(), c_bLocalSpawns.load(), c_bSpawnSeen.load(),
@@ -775,6 +981,7 @@ void tick_reg() {
 }
 int status_reg(char* out, int n) { return status(out, n); }
 const bool kReg = wo203::reg_op(kOpConfig, &op) && wo203::reg_op(kOpStatus, &op) && wo203::reg_op(kOpBrains, &op) &&
+                  wo203::reg_op(kOpLifecycle, &op) && wo203::reg_op_off_main(kOpLifecycle, &lifecycle_off_main) &&
                   wo203::reg_op(kOpExempt, &op) && wo203::reg_op(kOpOutfitRead, &op) && wo203::reg_op(kOpOutfitOf, &op) &&
                   wo203::reg_install("host_authority", &install_decision_gate) && wo203::reg_tick("w216", &tick_reg) && wo203::reg_status("w216", &status_reg);
 
@@ -782,7 +989,9 @@ const bool kReg = wo203::reg_op(kOpConfig, &op) && wo203::reg_op(kOpStatus, &op)
 
 bool on(uint32_t bit) { return (g_bits.load(std::memory_order_relaxed) & ~twin_off() & bit) != 0; }
 bool configured() { return g_configured.load(std::memory_order_relaxed); }
-bool decisions_blocked() { return decision_suppressed(g_role.load(std::memory_order_acquire), g_decisionGate.load()); }
+bool authority_active() { return lifecycle_active(GetTickCount64()); }
+bool authority_enabled() { return g_authorityEnabled.load(std::memory_order_acquire); }
+bool decisions_blocked() { return authority_active() && g_decisionGate.load(); }
 
 int status(char* out, int n) {
     if (!out || n <= 0) return 0;

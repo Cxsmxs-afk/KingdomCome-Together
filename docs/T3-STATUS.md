@@ -4,8 +4,8 @@ Auftrag: [T3-AUFTRAG.md](T3-AUFTRAG.md). Alle Änderungen bleiben auf gestapelte
 
 | Paket | Branch | Basis | Stand |
 | --- | --- | --- | --- |
-| P0 | codex/t3-p0-processor-stall | codex/loot-ownership-polish, 339d78c | Implementierung und lokale Regression; PR/CI ausstehend |
-| P1 | codex/t3-p1-intellect-gate | P0 | offen |
+| P0 | codex/t3-p0-processor-stall | codex/loot-ownership-polish, 339d78c | [PR #18](https://github.com/Cxsmxs-afk/KingdomCome-Together/pull/18), CI 44208035940 grün, Drop-in install-verify PASS |
+| P1 | codex/t3-p1-intellect-gate | P0, 780075b | Implementierung |
 | P3 | codex/t3-p3-pickup-freeze | P1 | offen |
 | P4 | codex/t3-p4-respawn-wake | P3 | offen |
 | P5 | codex/t3-p5-corpses-marker | P4 | offen |

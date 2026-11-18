@@ -23,17 +23,22 @@ public partial class GameBridge
     private long _w216RoutePolls, _w216RouteBodiesOut, _w216RouteFramesIn, _w216RouteBodiesIn, _w216RouteUnknown, _w216RouteBad, _w216RouteSkipped;
 
     /// <summary>B: 0 none, 1 the host, 2 a joiner in the host's world and not in a load (the DLL's census runs only then).</summary>
-    private byte Wo216Role() => W137Host ? (byte)1 : HostAuthorityOwned ? (byte)2 : (byte)0;
+    private byte Wo216Role() => W137Host ? (byte)1 : _hostAuthorityEnabled ? (HostAuthorityOwned ? (byte)2 : (byte)0)
+        : W137Joiner && !Wo136Holding && !_p1Loading && P1HasGameplay ? (byte)2 : (byte)0;
     private byte _w216RolePushed = 0xFF;
 
     private async Task Wo216PushNativeAsync()
     {
-        await _hostAuthorityGate.WaitAsync();
+        using var scope = ProcessorFrameScope.Link(_wo122Ct);
+        await _hostAuthorityGate.WaitAsync(scope.Token);
         try
         {
+            ulong generation = await P1Lifecycle.KnownGenerationAsync(scope.Token);
+            ProcessorFrameScope.ThrowIfAbandoned(); scope.Token.ThrowIfCancellationRequested();
             byte role = Wo216Role();
-            if (!await PushHostAuthorityRoleAsync(role) && !_w216NativeToldOld) { _w216NativeToldOld = true; Console.WriteLine("MP-W216 native authority configuration refused -- join requires the current armed DLL"); }
+            if (!await PushHostAuthorityRoleAsync(role, scope.Token, generation) && !_w216NativeToldOld) { _w216NativeToldOld = true; Console.WriteLine("MP-W216 native authority configuration refused -- join requires the current armed DLL"); }
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex) { Console.WriteLine($"MP-W216 the native word was not sent: {ex.Message}"); }
         finally { _hostAuthorityGate.Release(); }
     }
@@ -64,6 +69,7 @@ public partial class GameBridge
     /// <summary>The 4 Hz session tick: the native word every 2 s, its status and the stats every 30 s.</summary>
     private void Wo216Tick(long n)
     {
+        _ = P1TickAsync();
         if (n % 8 == 5 || Wo216Role() != _w216RolePushed) _ = Wo216PushNativeAsync();   // a load or the join's end goes at once
         if (n % 4 == 3) Wo216AuditOneOutfit();
         if (n % 20 == 3 && W137Joiner && W216On("no_brains")) _ = ExecLuaAsync("if KCD2MP_W216Tick then KCD2MP_W216Tick() end");

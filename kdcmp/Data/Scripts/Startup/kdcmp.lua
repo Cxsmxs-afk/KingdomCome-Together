@@ -4552,7 +4552,25 @@ end
 --
 --   MP-AUTHORITY-VIOLATION npc=<name> kind=diverge|contention dist_m=<F2> owner=<id> paused=0|1 n=<int>
 --   (per-NPC throttled to one line per 10 s; the count is exact)
+-- P1: only this mod's pause/resume requests are barred for the whole joiner
+-- lifecycle. Retail initialization still owns its console calls until the native
+-- decision gate is active; no caller-stack inference is involved.
+function KCD2MP_ModBrainCommand(cmd, ...)
+    local verb, name = string.match(tostring(cmd or ""), "^%s*([^%s]+)%s*(.*)$")
+    local a = KCD2MP.hostAuthority
+    if a and a.joiner and (verb == "wh_ai_PauseNPC" or verb == "wh_ai_ResumeNPC") then
+        a.blocked = (a.blocked or 0) + 1
+        if a.blocked <= 5 or a.blocked % 100 == 0 then
+            mp_log(string.format("HOST-AUTHORITY ignored mod %s npc=%s decision_gate=%s [n=%d]",
+                verb, name, a.armed and "armed" or tostring(a.phase or "unavailable"), a.blocked))
+        end
+        return nil
+    end
+    return System.ExecuteCommand(cmd, ...)
+end
+
 KCD2MP._npcPaused = {}           -- name -> os.clock() when wh_ai_PauseNPC was issued. The mod's OWN bookkeeping,
+KCD2MP._npcPauseEntity = {}       -- exact current entity + soul identity for cleanup when leaving legacy mode
                                  -- not engine state (WO-107 s3.4): a field derived from it is `pause_issued`, never `paused`.
 KCD2MP._npcPauseExec = {}        -- name -> "ok" | "err:<msg>": pcall result of the last wh_ai_PauseNPC for the name
 KCD2MP._npcEverPaused = {}       -- name -> true for every name paused this Lua session (mp_resume_all sweeps this set)
@@ -4603,6 +4621,7 @@ end
 -- roster scan, never on the authority (its brains ARE the truth). A coverage
 -- gap therefore produces a jittery NPC (today's behaviour), never a statue.
 local function mp_wo102_pause(name, p, why)
+    if KCD2MP.hostAuthority and KCD2MP.hostAuthority.joiner then return end
     if not (KCD2MP.wo102.authorityHost and KCD2MP.wo102.authorityPause) then return end
     if KCD2MP_W136Held and KCD2MP_W136Held() then return end   -- WO-136: never while a world loads
     -- WO-137 Phase 4: the copy the local player is talking to runs its own brain
@@ -4641,9 +4660,17 @@ local function mp_wo102_pause(name, p, why)
     if KCD2MP._npcPaused[name] then return end
     KCD2MP._npcPaused[name] = os.clock()
     KCD2MP._npcEverPaused[name] = true
-    local ok, err = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. tostring(name))
+    local ok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. tostring(name))
     local exec = ok and "ok" or ("err:" .. tostring(err))
     KCD2MP._npcPauseExec[name] = exec
+    KCD2MP._npcPauseEntity[name] = nil -- a new pause cannot inherit a reused body's old cleanup lease
+    if ok then pcall(function()
+        local e = System.GetEntityByName(name)
+        if e and e.id ~= nil and e.soul and type(e.soul.GetId) == "function" then
+            local soulId = e.soul:GetId()
+            if soulId ~= nil then KCD2MP._npcPauseEntity[name] = { id = tostring(e.id), soul = tostring(soulId) } end
+        end
+    end) end
     mp_auth_log(name, "pause", p and p.owner or "?", "wh_ai_PauseNPC", 0)
     mp_pause_log(name, "pause", exec, why or "puppet-start", p and p.owner or "?", 0)
     if not ok then mp_log("WO102-PAUSE ExecuteCommand failed for " .. tostring(name) .. ": " .. tostring(err)) end
@@ -4663,9 +4690,10 @@ local function mp_wo102_resume(name, why)
     local at = KCD2MP._npcPaused[name]
     if not at then return end
     KCD2MP._npcPaused[name] = nil
+    KCD2MP._npcPauseEntity[name] = nil
     KCD2MP._npcResumePending[name] = nil
     W216_RELEASE = W216_RELEASE_WHY[tostring(why)] == true   -- WO-216 B: only the stream's release is refused on a joiner
-    local ok, err = pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. tostring(name))
+    local ok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. tostring(name))
     W216_RELEASE = false
     local exec = ok and "ok" or ("err:" .. tostring(err))
     if KCD2MP_W190CopyLook then pcall(KCD2MP_W190CopyLook, name, true, "resume") end   -- WO-190 A3: its own look again
@@ -4868,7 +4896,7 @@ local function mp_wo102_reconcile_pauses()
         KCD2MP._pauseReassertedAt = now
         for _, name in ipairs(reassert) do
             KCD2MP._pauseStats.reassert = KCD2MP._pauseStats.reassert + 1
-            local ok, err = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. tostring(name))
+            local ok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. tostring(name))
             local exec = ok and "ok" or ("err:" .. tostring(err))
             KCD2MP._npcPauseExec[name] = exec
             mp_pause_log(name, "reassert", exec, "chain-dead-restart", (KCD2MP.npcPuppets[name] or {}).owner or "?",
@@ -5011,7 +5039,7 @@ function KCD2MP_ResumeAllPaused(why)
     table.sort(names)
     local swept = 0
     for _, name in ipairs(names) do
-        local ok, err = pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name)
+        local ok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. name)
         mp_pause_log(name, "resume", ok and "ok" or ("err:" .. tostring(err)), why .. "-sweep", "?", 0)
         swept = swept + 1
     end
@@ -5433,7 +5461,7 @@ function KCD2MP_JoinScanNpcs(add)
                 if dead or ridden or KCD2MP._npcPaused[name] then
                     w.npcSkipped = w.npcSkipped + 1
                 elseif add then
-                    local ok = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. name)
+                    local ok = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. name)
                     if ok then
                         w.npcs[name] = os.clock()
                         w.npcN = w.npcN + 1
@@ -5540,7 +5568,7 @@ function KCD2MP_JoinResume(joinId, reason)
     for name in pairs(w.npcs) do
         if KCD2MP._npcPaused[name] then
             left = left + 1          -- the WO-102 lever took it over: its pause, its resume
-        elseif pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name) then
+        elseif pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. name) then
             resumed = resumed + 1
         end
     end
@@ -6168,7 +6196,7 @@ function KCD2MP_ProbeNpcPause()
     local anim0 = nil
     pcall(function() anim0 = best:GetCurAnimation() end)
     mp_log(string.format("MP-PAUSEPROBE step=0 npc=%s pos=(%.2f,%.2f,%.2f) anim=%s action=wh_ai_PauseNPC", name, p0.x, p0.y, p0.z, tostring(anim0)))
-    local okc, errc = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. name)
+    local okc, errc = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. name)
     mp_log(string.format("MP-PAUSEPROBE step=1 npc=%s execute_ok=%s err=%s", name, tostring(okc), tostring(errc)))
     local target = { x = p0.x + 2.0, y = p0.y, z = p0.z }
     Script.SetTimer(1000, function()
@@ -6190,7 +6218,7 @@ function KCD2MP_ProbeNpcPause()
                 local pc = e3:GetWorldPos()
                 mp_log(string.format("MP-PAUSEPROBE step=4 npc=%s anim_after=%s (was %s) pos=(%.2f,%.2f,%.2f) action=SetWorldPos(back)+wh_ai_ResumeNPC", name, tostring(anim1), tostring(anim0), pc.x, pc.y, pc.z))
                 pcall(function() e3:SetWorldPos(p0) end)
-                pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name)
+                pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. name)
                 Script.SetTimer(4000, function()
                     local e4 = System.GetEntityByName(name); if not e4 then return end
                     local pd = e4:GetWorldPos()
@@ -6306,7 +6334,7 @@ end
 
 local function w131_park(name, e, why)
     local w = KCD2MP.w131
-    local ok, err = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. tostring(name))
+    local ok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. tostring(name))
     pcall(function() e:Hide(1) end)
     w.parked[name] = { at = os.clock(), why = why }
     w.stats.park = w.stats.park + 1
@@ -6367,12 +6395,12 @@ function KCD2MP_W131UnparkAll(why)
     for name in pairs(w.parked) do
         local e = w131_body(name)
         if e then pcall(function() e:Hide(0) end) end
-        pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. tostring(name))
+        pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. tostring(name))
         n = n + 1
     end
     w.parked = {}
     for name in pairs(w.pausedAnimals or {}) do   -- WO-153 2
-        pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. tostring(name))
+        pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. tostring(name))
         n = n + 1
     end
     w.pausedAnimals = {}
@@ -6404,7 +6432,7 @@ local function w131_sweep()
             pcall(function() dead = e.actor and e.actor:IsDead() == true end)
             if not dead then
                 local first = w.pausedAnimals[aname] == nil
-                local okx, errx = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. tostring(aname))
+                local okx, errx = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. tostring(aname))
                 w.pausedAnimals[aname] = os.clock()
                 if first then
                     w.stats.park = w.stats.park + 1
@@ -6432,7 +6460,7 @@ local function w131_sweep()
                 local hidden = true
                 pcall(function() hidden = e:IsHidden() == true end)
                 if w.reassert or not hidden or repause then
-                    pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. tostring(name))
+                    pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. tostring(name))
                     pcall(function() e:Hide(1) end)
                     w.stats.reassert = w.stats.reassert + 1
                 end
@@ -7469,7 +7497,7 @@ function KCD2MP_W136RideTake(name)
     if KCD2MP.w131 then KCD2MP.w131.parked[name] = nil end
     KCD2MP._npcResumePending[name] = nil
     mp_wo102_resume(name, "ridden")
-    pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. tostring(name))
+    pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. tostring(name))
     local e = KCD2MP.w136.body(name)
     if e then pcall(function() e:Hide(0) end) end
     mp_log(string.format("WO136-RIDE take npc=%s puppet=%s parked=%s -- the rider owns the horse: unbound, its brain back, shown, the host's stream for it ignored",
@@ -8212,7 +8240,7 @@ function KCD2MP_W137HostHold(on, npc, peer, why)
     if KCD2MP.w123 and KCD2MP.w123.paused and KCD2MP.w123.npcs[npc] then
         exec = "left-to-the-join-pause"   -- a join paused the world meanwhile: its resume wakes it
     elseif h.paused then
-        local ok, err = pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. npc)
+        local ok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. npc)
         exec = ok and "ok" or ("err:" .. tostring(err))
     else
         exec = "was-not-paused"
@@ -8236,7 +8264,7 @@ function KCD2MP_W137HoldPause(npc, e, h)
         return string.format("block-only(why=%s,hold_freeze=off%s)", tostring(h.why), h.why == "talk" and ",mp_conv_hold=off" or "")
     end
     if busy then return "waits:in-a-conversation-here" end
-    local ok, err = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. npc)
+    local ok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. npc)
     if ok then h.paused = true end
     return ok and "ok" or ("err:" .. tostring(err))
 end
@@ -20563,7 +20591,7 @@ function KCD2MP_W139Stop(id, guard, crimesCsv)
     KCD2MP._npcResumePending[guard] = nil
     w.stopped[guard] = true
     mp_wo102_resume(guard, "w139-stop")
-    pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. guard)
+    pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. guard)
     pcall(function() e:Hide(0) end)
     local money = 0
     pcall(function() money = player.inventory:GetMoney() or 0 end)
@@ -20691,11 +20719,11 @@ function KCD2MP_W139StopEnd(why, result)
         local guard = s.guard
         w.stopped[guard] = true
         Script.SetTimer(4500, function()
-            pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. guard)
+            pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. guard)
             KCD2MP.w139.stopped[guard] = os.clock() + KCD2MP.w139.stopReturnS
         end)
     else
-        pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. s.guard)
+        pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. s.guard)
         w.stopped[s.guard] = os.clock() + w.stopReturnS
     end
     if result == "paid" or result == "punished" or result == "persuaded" or result == "executed" then w.crimes = {} end
@@ -22604,7 +22632,7 @@ local W164_RE_CVAR = "wh_pl_RandomEventsAutoSpawnEnabled"
 
 local function w164_exec(cmd)   -- the console, when this build has it (a test stub may not)
     if type(System.ExecuteCommand) ~= "function" then return false end
-    return pcall(System.ExecuteCommand, cmd)
+    return pcall(KCD2MP_ModBrainCommand, cmd)
 end
 
 local function w164_joiner()
@@ -23297,7 +23325,7 @@ end
 function KCD2MP_W176Pause(name, on, why)
     local w = KCD2MP.w176
     if on == (w.paused[name] ~= nil) then return end
-    local ok, err = pcall(System.ExecuteCommand, (on and "wh_ai_PauseNPC " or "wh_ai_ResumeNPC ") .. tostring(name))
+    local ok, err = pcall(KCD2MP_ModBrainCommand, (on and "wh_ai_PauseNPC " or "wh_ai_ResumeNPC ") .. tostring(name))
     if on then w.paused[name] = os.clock(); w.stats.pause = w.stats.pause + 1 else w.paused[name] = nil; w.stats.resume = w.stats.resume + 1 end
     mp_log(string.format("WO176-PAUSE figure=%s %s %s exec=%s -- %s", tostring(name), on and "on" or "off", tostring(why),
         ok and "ok" or ("err:" .. tostring(err)), on and "a quest's arranged fight is near: the figure's own brain stays out of it" or "no story fight near"))
@@ -27086,12 +27114,12 @@ do
         id = tostring(id)
         local name = "kcd2mp_" .. id
         if not ok and not W.failClosed[id] then
-            local pok, err = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. name)
+            local pok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. name)
             W.failClosed[id] = true
             mp_log(string.format("WO154-FAILCLOSED avatar=%s paused ok=%s%s -- its native protections are not on (no DLL, or the isolate call failed): its brain stays off, its stream still moves it",
                 name, tostring(pok), pok and "" or (" err=" .. tostring(err))))
         elseif ok and W.failClosed[id] then
-            local pok = pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name)
+            local pok = pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. name)
             W.failClosed[id] = nil
             mp_log(string.format("WO154-FAILCLOSED avatar=%s resumed ok=%s -- its native protections are on", name, tostring(pok)))
         end
@@ -27359,7 +27387,7 @@ do
             W.rideStats.off = W.rideStats.off + 1
             KCD2MP_EmitEvent("w154_ride", id .. " off")
             KCD2MP_EmitEvent("npc_native", n.name .. " off ride-over")
-            if n.paused then pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. n.name) end   -- as the avatar's take left it
+            if n.paused then pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. n.name) end   -- as the avatar's take left it
             mp_log(string.format("WO154-RIDE native off id=%s horse=%s after_s=%.1f -- the horse is let go", id, n.name, os.clock() - n.at))
             return true
         end
@@ -27376,7 +27404,7 @@ do
         if not hexid then return false end
         local wuid = "?"
         pcall(function() if hd.entity.soul and hd.entity.soul.GetId then wuid = string.match(tostring(hd.entity.soul:GetId()), "(%x+)%s*$") or "?" end end)
-        local paused = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. name)
+        local paused = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. name)
         hd.native = { name = name, dz = dz, at = os.clock(), bound = false, paused = paused }
         W.rideStats.on = W.rideStats.on + 1
         KCD2MP_EmitEvent("w154_ride", string.format("%s %s %.3f", id, name, dz))
@@ -27588,7 +27616,7 @@ do
         KCD2MP._npcResumePending[name] = nil
         if p or wasParked or KCD2MP._npcPaused[name] then
             mp_wo102_resume(name, "ridden-by-avatar")
-            pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. tostring(name))
+            pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. tostring(name))
         end
         local e = w.body(name)
         if e then pcall(function() e:Hide(0) end) end
@@ -27687,7 +27715,7 @@ do
                 local guard = false
                 pcall(function() guard = e.soul:HasScriptContext("crime_isAuthority") == true end)
                 if not paused or guard then
-                    if paused then pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name); woke[#woke + 1] = name end
+                    if paused then pcall(KCD2MP_ModBrainCommand, "wh_ai_ResumeNPC " .. name); woke[#woke + 1] = name end
                     local t = nil
                     pcall(function() t = XGenAIModule.MakeTableFromType("crime:forgetCrimesData") end)
                     if t then
@@ -27701,7 +27729,7 @@ do
         if #woke > 0 then
             Script.SetTimer(1500, function()
                 for _, n in ipairs(woke) do
-                    if KCD2MP._npcPaused and KCD2MP._npcPaused[n] then pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. n) end
+                    if KCD2MP._npcPaused and KCD2MP._npcPaused[n] then pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. n) end
                 end
             end)
         end
@@ -31851,7 +31879,7 @@ end
 function KCD2MP_DogSyncReleasePaused(name, e, why)
     if not KCD2MP.dogSync.on or not e or tostring(e.class) ~= "Dog" then return false end
     local w = KCD2MP.w131
-    pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. tostring(name))
+    pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. tostring(name))
     w.pausedAnimals[name] = os.clock()
     w.parked[name] = nil
     local s = KCD2MP.dogSync.stats
@@ -35721,7 +35749,7 @@ do
         local e = nil
         pcall(function() e = System.GetEntityByName(name) end)
         if e then pcall(function() e:Hide(1) end) end
-        pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. name)
+        pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. name)
         if KCD2MP.w131 then KCD2MP.w131.parked[name] = { at = now, why = "ghost" } end
         mp_log(string.format("WO215-GHOST npc=%s unbound=%s -- the engine could not set up its combat actor: parked (paused, hidden), its stream refused until it stops failing [n=%d]",
             name, tostring(p ~= nil), W215.gstats.marked))
@@ -35742,7 +35770,7 @@ do
         local e = nil
         pcall(function() e = System.GetEntityByName(name) end)
         if e then pcall(function() e:Hide(1) end) end
-        pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. name)
+        pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. name)
         if KCD2MP.w131 then KCD2MP.w131.parked[name] = { at = os.clock(), why = "dormant-host" } end
         W215.dormantUntil[name] = os.clock() + 10.0
         W215.gstats.dormant = W215.gstats.dormant + 1
@@ -35939,15 +35967,29 @@ do
     W216.stats = W216.stats or { blocked = 0, exempt = 0 }
     W216.exemptAt = W216.exemptAt or {}
     KCD2MP.hostAuthority = KCD2MP.hostAuthority or { joiner = false, armed = false, blocked = 0 }
-    function KCD2MP_HostAuthority(joiner, armed)
+    function KCD2MP_HostAuthority(joiner, armed, phase, generation)
         local a = KCD2MP.hostAuthority
+        phase = phase or (joiner and (armed and "active" or "unavailable") or "disabled")
+        if generation ~= nil then
+            generation = tostring(generation)
+            if not generation:match("^%d+$") or #generation > 20 then return false end
+            generation = generation:gsub("^0+", ""); if generation == "" then generation = "0" end
+            local old = a.generation
+            if old and (#generation < #old or (#generation == #old and generation < old)) then return false end
+            if old == generation and phase == "pending" and (a.phase == "active" or a.phase == "legacy" or a.phase == "disabled") then return false end
+            a.generation = generation
+        elseif a.generation ~= nil then return false end   -- an unversioned old call cannot override a confirmed load
         joiner, armed = joiner == true, armed == true and joiner == true
-        if a.joiner ~= joiner or a.armed ~= armed then
-            mp_log(string.format("HOST-AUTHORITY joiner=%s decision_gate=%s -- %s", tostring(joiner),
-                armed and "armed" or "unavailable", joiner and (armed and "only the host graph decides" or "join refused until the native gate is ready")
+        if joiner and phase == "pending" then
+            -- A load reconstructs new bodies under old names. Never resume them from an old Lua marker.
+            KCD2MP._npcPaused, KCD2MP._npcResumePending, KCD2MP._npcPauseExec, KCD2MP._npcPauseEntity, KCD2MP._npcEverPaused = {}, {}, {}, {}, {}
+        end
+        if a.joiner ~= joiner or a.armed ~= armed or a.phase ~= phase then
+            mp_log(string.format("HOST-AUTHORITY joiner=%s decision_gate=%s phase=%s -- %s", tostring(joiner),
+                armed and "armed" or (phase == "pending" and "pending" or "unavailable"), phase, joiner and (armed and "only the host graph decides" or (phase == "pending" and "waiting for load completion and native settle" or "join refused until the native gate is ready"))
                     or "local world decisions restored"))
         end
-        a.joiner, a.armed = joiner, armed
+        a.joiner, a.armed, a.phase = joiner, armed, phase
         if not joiner then W216.exemptAt = {} end
         return not joiner or armed
     end
@@ -35980,8 +36022,11 @@ do
                 local real = KCD2MP_W217RealName(al)
                 if real then s = verb .. " " .. real .. (rest or ""); cmd = s end
             end
+            -- Global callers (including retail init) are gated only after native activation.
+            -- This mod already passed through KCD2MP_ModBrainCommand above.
             local pauseVerb, copyName = string.match(s, "^%s*(wh_ai_%a+)%s+([^%s]+)")
-            if KCD2MP.hostAuthority.joiner and (pauseVerb == "wh_ai_PauseNPC" or pauseVerb == "wh_ai_ResumeNPC") then
+            if KCD2MP.hostAuthority.joiner and (KCD2MP.hostAuthority.armed or KCD2MP.hostAuthority.phase == "active")
+                and (pauseVerb == "wh_ai_PauseNPC" or pauseVerb == "wh_ai_ResumeNPC") then
                 local a = KCD2MP.hostAuthority
                 a.blocked = a.blocked + 1
                 if a.blocked <= 5 or a.blocked % 100 == 0 then
@@ -35991,7 +36036,7 @@ do
                 return nil
             end
             local name = string.match(s, "^%s*wh_ai_ResumeNPC%s+([%w_%-%.]+)")
-            if name and not string.find(name, "^kcd2mp") and KCD2MP_W216JoinerBrainsOff() then
+            if not KCD2MP.hostAuthority.joiner and name and not string.find(name, "^kcd2mp") and KCD2MP_W216JoinerBrainsOff() then
                 if W216_RELEASE then
                     W216.stats.blocked = W216.stats.blocked + 1
                     if W216.stats.blocked <= 100 or W216.stats.blocked % 50 == 0 then
@@ -36374,7 +36419,7 @@ do
             for _, h in pairs(w.peerHorses) do if h == old then still = true end end
             if not still and W221.waiting[old] then
                 W221.waiting[old] = nil
-                pcall(function() System.ExecuteCommand("wh_ai_ResumeNPC " .. old) end)
+                pcall(function() KCD2MP_ModBrainCommand("wh_ai_ResumeNPC " .. old) end)
                 mp_log("WO221-HORSE host: " .. old .. " is no joiner's horse any more -- its own brain again")
             end
         end
@@ -36473,7 +36518,7 @@ do
         local now = os.clock()
         W221.calls[src] = { horse = name, t0 = now, legAt = now, orderAt = -1e9, teleports = 0, orders = 0, d0 = d }
         st.started = st.started + 1
-        pcall(function() System.ExecuteCommand("wh_ai_PauseNPC " .. name) end)
+        pcall(function() KCD2MP_ModBrainCommand("wh_ai_PauseNPC " .. name) end)
         mp_log(string.format("WO221-CALL ghost=%s horse=%s start: %.0f m from his figure -- it comes by its own movement (its brain paused for the trip)", src, name, d))
         KCD2MP_W221CallTick()
         return true
@@ -36491,7 +36536,7 @@ do
             pcall(function() e = System.GetEntityByName(name) end)
             if e and e.class == "Horse" and W221.waiting[name] ~= tostring(e.id) then
                 W221.waiting[name] = tostring(e.id)
-                pcall(function() System.ExecuteCommand("wh_ai_PauseNPC " .. name) end)
+                pcall(function() KCD2MP_ModBrainCommand("wh_ai_PauseNPC " .. name) end)
                 mp_log("WO221-HORSE host: " .. name .. " waits where it is for its owner (its brain paused in this world)")
             end
         end
@@ -38090,6 +38135,47 @@ do
     end
     System.AddCCommand("mp_proc_frame_timeout", 'KCD2MP_T3SetProcFrameTimeout(%line)',
         "Frame timeout in milliseconds (default 2000, 50..30000): mp_proc_frame_timeout <ms>; bare = report")
+end
+
+-- ===== P1: optional host decision authority, native load lifecycle owns activation =================
+do
+    if KCD2MP.p1AuthorityEnabled == nil then KCD2MP.p1AuthorityEnabled = true end
+    function KCD2MP_P1ReleaseLegacy(generation)
+        local a = KCD2MP.hostAuthority
+        if not a or a.phase ~= "legacy" or a.generation ~= tostring(generation) then return false end
+        if KCD2MP_W136Held and KCD2MP_W136Held() then return false end
+        local loading = false
+        pcall(function() loading = Game.IsLoadingEngineSaveGame and Game.IsLoadingEngineSaveGame() == true end)
+        if loading then return false end
+        local names = {}
+        for name in pairs(KCD2MP._npcPaused or {}) do names[#names + 1] = name end
+        for _, name in ipairs(names) do
+            local identity, same = KCD2MP._npcPauseEntity[name], false
+            pcall(function()
+                local e = System.GetEntityByName(name)
+                same = identity and e and e.id ~= nil and e.soul and type(e.soul.GetId) == "function"
+                    and identity.id == tostring(e.id) and identity.soul == tostring(e.soul:GetId())
+            end)
+            if same and KCD2MP._npcPauseExec[name] == "ok" then mp_wo102_resume(name, "p1-mode-change") end
+        end
+        return true
+    end
+    function KCD2MP_P1ReportCfg()
+        KCD2MP_EmitEvent("p1_host_authority", KCD2MP.p1AuthorityEnabled and "on" or "off")
+        return true
+    end
+    function KCD2MP_P1SetHostAuthority(arg)
+        local text = tostring(arg or ""):match("^%s*(.-)%s*$")
+        if text ~= "" then
+            if text ~= "on" and text ~= "off" then mp_log("mp_host_authority: expected on|off"); return false end
+            KCD2MP.p1AuthorityEnabled = text == "on"
+        end
+        mp_log("P1-CONFIG host_authority=" .. (KCD2MP.p1AuthorityEnabled and "on" or "off"))
+        -- The agent confirms Pending/Disabled and the role transition before changing the Lua command guard.
+        return KCD2MP_P1ReportCfg()
+    end
+    System.AddCCommand("mp_host_authority", 'KCD2MP_P1SetHostAuthority(%line)',
+        "Host decision authority (default on): mp_host_authority on|off; off uses the legacy copy pause path after load")
 end
 
 

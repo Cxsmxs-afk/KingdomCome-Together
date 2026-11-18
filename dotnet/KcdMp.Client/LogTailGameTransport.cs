@@ -374,6 +374,8 @@ public sealed class LogTailGameTransport : IGameTransport
     /// s3.6), so the joiner's host-only lock is re-asserted from here.
     /// </summary>
     public event Action? GameplayStarted;
+    /// <summary>The real engine postload-reconstruction timeout line, never a synthetic settle deadline.</summary>
+    public event Action? PostLoadReconstructionTimeout;
 
     /// <summary>
     /// WO-123: the engine printed "[CryAction] LoadGame: '...'" -- a save load
@@ -1097,6 +1099,10 @@ public sealed class LogTailGameTransport : IGameTransport
         int tagIdx = line.IndexOf(Tag);
         if (tagIdx < 0)
         {
+            if (line.IndexOf("[KCD2-MP", StringComparison.Ordinal) < 0 &&
+                line.IndexOf("Loading screen timeouted while still in post load reconstruction", StringComparison.Ordinal) >= 0)
+                try { PostLoadReconstructionTimeout?.Invoke(); }
+                catch (Exception ex) { Console.WriteLine($"[load] timeout observer threw: {ex.GetType().Name}"); }
             // Not one of this mod's own tagged lines -- still worth scanning
             // for the raw engine markers WO-11 found (menu/inventory/skip-
             // time) and WO-80 added (Rendered cutscenes). Those never appear

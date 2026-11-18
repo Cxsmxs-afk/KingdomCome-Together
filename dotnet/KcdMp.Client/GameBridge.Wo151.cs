@@ -668,6 +668,7 @@ public partial class GameBridge
         int sessionLife = Interlocked.Increment(ref _w151SessionLife);
         T3SideChannelsInvalidate("connect");
         if (_where == GameWhere.World) T3SideChannelsGameplayStarted();
+        _ = P1ObserveAsync(_transport.ExecuteNowAsync("if KCD2MP_P1ReportCfg then KCD2MP_P1ReportCfg() end", ct), "config");
         _w151Connected = true;
         _w151CfgKey = -1;
         _ = Wo151LoopAsync(ct, sessionLife);

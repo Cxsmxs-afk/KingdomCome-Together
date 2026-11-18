@@ -77,6 +77,21 @@ int wo200_tests(int* passed) {
            horse_pass(kRoleHost, Kind::Behaviour, Method::PlayerHorse, true, false, false, false, false, true) == HorsePass::No,
            "the switch off (0.65.0), or not a function node: nothing is passed");
 
+    // P1: lifecycle controls story decisions, never the independent host clock.
+    for (bool storyActive : {false, true}) {
+        Cfg phaseCfg = on; phaseCfg.joined = storyActive;
+        for (const char* name : {"SetIsNight", "WhatTimeIsIt"}) {
+            WCHECK(method_kind(name) == Method::HostTime && host_clock_guard(kRoleJoiner, true, false),
+                "P1: %s stays host-only in pending/disabled and active phases", name);
+            WCHECK(decide(kRoleJoiner, Kind::SchedulerLink, Method::Other, Target::Other, false, false, false, false, phaseCfg) ==
+                (storyActive ? Verdict::PuppetRefused : Verdict::Run), "P1: reconstruction/story scheduler runs before active authority");
+        }
+    }
+    WCHECK(!host_clock_guard(kRoleHost, true, false) && !host_clock_guard(kRoleJoiner, false, false), "P1: host and own saves keep local clock decisions");
+    WCHECK(!host_clock_guard(kRoleJoiner, true, true), "P1: an actual mirrored State retains its apply scope exemption");
+    const bool mirrorDepth = true, nodeIsFunction = true;
+    WCHECK(host_clock_guard(kRoleJoiner, true, mirrorDepth && !nodeIsFunction), "P1: mirror depth alone does not exempt time Functions");
+
     // ---- I.5: no quest behaviours on puppets (the joiner in the host's world) ----
     for (Kind k : {Kind::Behaviour, Kind::EntityContext, Kind::SchedulerLink, Kind::Interrupt}) {
         WCHECK(decide(kRoleJoiner, k, Method::Other, Target::Other, false, false, false, false, on) == Verdict::PuppetRefused,

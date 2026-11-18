@@ -17,7 +17,7 @@ Die Pipe antwortet später weiter: S2 `agent.log:2361` RTT Mittel 7/max. 83 ms, 
 
 ## Gefundener Abbruchpfad
 
-Der Wetterpfad ist `Wo164OnFrameAsync` → `Wo166OnHostWeatherAsync` → `Wo151OnHostWeatherAsync`/`Wo151WeatherGateAsync` → `ApplyWeatherAsync`. Darin und im Kalender-/Authority-Pfad stehen Pipe- und `_transport.ExecuteNowAsync`-Awaits. Die HTTP-Konsole hat 800 ms Timeout. `HttpClient` meldet diesen als `OperationCanceledException`, auch wenn das Session-Token weiter gültig ist.
+Der Wetterpfad ist `Wo164OnFrameAsync` → `Wo166OnHostWeatherAsync`. Dessen erster Await nach der Wetterlogzeile ist `_transport.ExecuteNowAsync(...KCD2MP_W166WeatherApply...)` (Basis `339d78c`, Zeile 180); erst danach folgen `Wo151OnHostWeatherAsync`/`Wo151WeatherGateAsync` und `ApplyWeatherAsync`. Darin und im Kalender-/Authority-Pfad stehen Pipe- und `_transport.ExecuteNowAsync`-Awaits. Die HTTP-Konsole hat 800 ms Timeout. `HttpClient` meldet diesen als `OperationCanceledException`, auch wenn das Session-Token weiter gültig ist.
 
 In der Basis liegt der einzige äußere `catch (OperationCanceledException)` um **den gesamten** `ProcessFramesAsync`-Reader. Ein solcher Fehler beendet ihn deshalb dauerhaft. Der Watchdog bekommt kein Processor-Off und meldet den letzten Frame weiter als STALL. Die Ping-Frames werden ebenfalls dort verarbeitet; ihr Ende 590/790 ms nach dem Wetter passt zu diesem Pfad. Nicht jede Wetter-/Kalender-Unterfunktion fängt gleich ab, teils läuft zusätzlich eine verzögerte Gameplay-Aufgabe.
 
@@ -40,4 +40,4 @@ Konsole: `mp_proc_frame_timeout <ms>`; Standard **2000**, zulässig 50–30000. 
 
 Die Tests verwenden den tatsächlichen privaten Channel-Prozessor, einen absichtlich nie antwortenden HTTP-Handler, die echte WO136-Hold-/Replay-Logik und 100 nachfolgende Frames. Erste Messung: `proc_stall_max_ms=1951`, `catchup_ms=2034`, `backlog_after_ms=0`, `replayed=1`. Ein gültiger W164-Wetterframe während Loading führt zu keinem Spielaufruf; der folgende normale Frame wird verarbeitet. Weitere Tests prüfen verspätete HTTP-/Pipe-/Relay-Antworten, Session-Ende und Rollenkonfiguration.
 
-Windows-CI, Drop-in und finale Testzahlen werden im PR dokumentiert. **Im Spiel offen:** beide PCs, Laden/Quicksave/Menü mit `foggy_storm`, fortlaufende Pings, Replay, sichtbare NPC-Bindung und Loot-Antworten. Retail ohne Modding Tools nicht geprüft.
+[PR #18](https://github.com/Cxsmxs-afk/KingdomCome-Together/pull/18), CI 44208035940: Client 2271, Relay 236, Setup 110, LogPack 105, native 10921 bestanden; Lua-Suiten und Simulator grün. [Artifact 14384888661](https://github.com/Cxsmxs-afk/KingdomCome-Together/actions/runs/44208035940/artifacts/14384888661) enthält Drop-in, install-verify PASS. **Im Spiel offen:** beide PCs, Laden/Quicksave/Menü mit `foggy_storm`, fortlaufende Pings, Replay, sichtbare NPC-Bindung und Loot-Antworten. Retail ohne Modding Tools nicht geprüft.

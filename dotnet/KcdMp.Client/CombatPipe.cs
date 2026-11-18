@@ -391,6 +391,37 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// <summary>The sequence byte we expect next, or null until the first reply latches it.</summary>
     private byte? _expectedSeq;
 
+    // Capture the stream and its reply lane together before waiting at either
+    // request gate. A control reconnect cannot carry an older operation across.
+    private readonly record struct PipeSource(NamedPipeClientStream Pipe, Channel<(byte Type, byte[] Body)> Replies);
+    private PipeSource? CaptureSource()
+    {
+        lock (_connectionState) return _pipe?.IsConnected == true ? new(_pipe, _replies) : null;
+    }
+    private bool TrySourceSequence(PipeSource source, out byte? sequence)
+    {
+        lock (_connectionState)
+        {
+            sequence = _expectedSeq;
+            return ReferenceEquals(_pipe, source.Pipe);
+        }
+    }
+    private bool SetSourceSequence(PipeSource source, byte? sequence)
+    {
+        lock (_connectionState)
+        {
+            if (!ReferenceEquals(_pipe, source.Pipe)) return false;
+            _expectedSeq = sequence;
+            return true;
+        }
+    }
+    private void AdvanceSourceSequence(PipeSource source)
+    {
+        lock (_connectionState)
+            if (ReferenceEquals(_pipe, source.Pipe) && _expectedSeq is byte sequence) _expectedSeq = (byte)(sequence + 1);
+    }
+
+
     /// <summary>Replies discarded as stale (a late answer to a timed-out command).</summary>
     public long StaleRepliesDropped { get; private set; }
 
@@ -422,32 +453,46 @@ public sealed partial class CombatPipe : IAsyncDisposable
         ct = scope.Token;
         ProcessorFrameScope.ThrowIfAbandoned();
         ct.ThrowIfCancellationRequested();
+        if (Volatile.Read(ref _disposed) != 0) return false;
         if (IsConnected) return true;
 
-        await _gate.WaitAsync(ct);
+        // Connection establishment is independent of a main-thread command's
+        // reply gate. Pure lifecycle control must connect even while it is held.
+        await _connectLock.WaitAsync(ct);
+        NamedPipeClientStream? candidate = null;
         try
         {
-            if (IsConnected) return true;
-
-            _pipe?.Dispose();
-            _pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+            lock (_connectionState)
+            {
+                if (Volatile.Read(ref _disposed) != 0) return false;
+                if (IsConnected) return true;
+                if (_pipe is { } old) Drop(old);
+                candidate = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+                _pipe = candidate;
+            }
             try
             {
-                await _pipe.ConnectAsync(500, ct);
+                await candidate.ConnectAsync(500, ct);
                 ct.ThrowIfCancellationRequested();
                 ProcessorFrameScope.ThrowIfAbandoned();
             }
             catch (OperationCanceledException)
             {
-                _pipe.Dispose();
-                _pipe = null;
+                lock (_connectionState)
+                {
+                    candidate.Dispose();
+                    if (ReferenceEquals(_pipe, candidate)) _pipe = null;
+                }
                 throw;
             }
-            catch (Exception ex) when (ex is TimeoutException or IOException or UnauthorizedAccessException)
+            catch (Exception ex) when (ex is TimeoutException or IOException or UnauthorizedAccessException or ObjectDisposedException)
             {
-                _pipe.Dispose();
-                _pipe = null;
-                if (!_warnedUnavailable)
+                lock (_connectionState)
+                {
+                    candidate.Dispose();
+                    if (ReferenceEquals(_pipe, candidate)) _pipe = null;
+                }
+                if (!_warnedUnavailable && Volatile.Read(ref _disposed) == 0)
                 {
                     _warnedUnavailable = true;
                     Console.WriteLine("[combat] KCDMP.dll not injected — damage replication is unavailable.");
@@ -455,12 +500,18 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 return false;
             }
 
-            _warnedUnavailable = false;
-            Console.WriteLine("[combat] connected to KCDMP.dll");
-            _reader = RunDetached(ReadLoopAsync);
-            return true;
+            lock (_connectionState)
+            {
+                if (Volatile.Read(ref _disposed) != 0 || !ReferenceEquals(_pipe, candidate) || !candidate.IsConnected) return false;
+                _warnedUnavailable = false;
+                Console.WriteLine("[combat] connected to KCDMP.dll");
+                var connected = candidate;
+                var replies = _replies.Writer;
+                _reader = RunDetached(() => ReadLoopAsync(connected, replies));
+                return true;
+            }
         }
-        finally { _gate.Release(); }
+        finally { _connectLock.Release(); }
     }
 
     /// <summary>Apply damage from a remote peer to the soul with this SharedSoulGuid.</summary>
@@ -980,45 +1031,52 @@ public sealed partial class CombatPipe : IAsyncDisposable
         ct = scope.Token;
         ProcessorFrameScope.ThrowIfAbandoned();
         ct.ThrowIfCancellationRequested();
-        if (!await EnsureConnectedAsync(ct)) return false;
+        if (!await EnsureConnectedAsync(ct) || CaptureSource() is not { } source) return false;
         await _gate.WaitAsync(ct);
+        bool sent = false;
         try
         {
-            while (_replies.Reader.TryRead(out _)) StaleRepliesDropped++;
-            await WriteFrameAsync(Ping, [], ct);
+            if (!TrySourceSequence(source, out _)) return false;
+            while (source.Replies.Reader.TryRead(out _)) StaleRepliesDropped++;
+            await WriteFrameAsync(Ping, [], ct, source.Pipe);
+            sent = true;
             using var slice = CancellationTokenSource.CreateLinkedTokenSource(ct);
             slice.CancelAfter(ReplyDeadline);
             try
             {
-                var reply = await _replies.Reader.ReadAsync(slice.Token);
+                var reply = await source.Replies.Reader.ReadAsync(slice.Token);
+                ct.ThrowIfCancellationRequested();
+                ProcessorFrameScope.ThrowIfAbandoned();
+                if (!TrySourceSequence(source, out byte? expected)) return false;
                 // A Ping consumes a sequence number in the DLL even though it
-                // answers with Pong rather than Result, so the expectation has
-                // to advance with it or every later reply looks misordered.
-                if (_expectedSeq is byte want) _expectedSeq = (byte)(want + 1);
+                // answers with Pong rather than Result.
+                if (!SetSourceSequence(source, expected is byte want ? (byte)(want + 1) : null)) return false;
                 return reply.Type == Pong;
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
+                if (!TrySourceSequence(source, out _)) return false;
                 TimedOut++;
                 return false;
             }
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
+            if (sent) AdvanceSourceSequence(source);
             ProcessorFrameScope.ThrowIfAbandoned();
+            if (ct.IsCancellationRequested) throw;
+            if (!TrySourceSequence(source, out _)) return false;
             TimedOut++;
             return false;
         }
         catch (ChannelClosedException)
         {
-            // WO-154 6.6: the reader lost the pipe (the game quit) while this waited, and its Drop completed the
-            // channel; it is already dropped (a Drop here could close a connection made since)
+            // The reader already dropped this source. Never close a replacement.
             return false;
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
-            Drop();
-            return false;
+            return false; // the physical writer fences/drops only its own connection
         }
         finally { _gate.Release(); }
     }
@@ -2173,14 +2231,15 @@ public sealed partial class CombatPipe : IAsyncDisposable
         soul.TryWriteBytes(dest);
 
     /// <summary>Route frames: replies to the waiting command, hits to the callback.</summary>
-    private async Task ReadLoopAsync()
+    private async Task ReadLoopAsync(NamedPipeClientStream myPipe, ChannelWriter<(byte Type, byte[] Body)> replies)
     {
-        var myPipe = _pipe;   // WO-153 3: the pipe THIS reader serves (a reconnect has a new one)
         try
         {
-            while (_pipe?.IsConnected == true)
+            while (myPipe.IsConnected)
             {
-                var (type, body) = await ReadFrameAsync(CancellationToken.None);
+                var (type, body) = await ReadFrameAsync(myPipe, CancellationToken.None);
+                if (!ReferenceEquals(_pipe, myPipe)) break;
+                if (TryLifecycleReply(myPipe, type, body)) continue;
                 // WO-118: replies are logged by their callers; 0x81/0x86/0x89
                 // arrive at frame-feed and heartbeat rates and would flood.
                 if (type is not (Result or LocalStateReply or NpcStatusReply or BodyStateReply or LocalAction or PvpHitOut or NpcCombatOut or Wo132Reply or Wo131Reply or Wo137Reply or QuestChangeOut or BatchReply))
@@ -2369,7 +2428,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                     }
                 }
                 else if (type == BatchReply) OnBatchReply(body);   // WO-218 A.1: never through the single requests' line
-                else if (!_replies.Writer.TryWrite((type, body)))
+                else if (!replies.TryWrite((type, body)))
                 {
                     // DropOldest means TryWrite only fails on a completed
                     // writer, which happens on Drop(). Say so rather than
@@ -2394,7 +2453,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         // the waiting caller sat out its full 5 s deadline ("no answer to 0x28 after 5000 ms") and the loss was declared
         // 4.3-4.6 s late, in every one of the 12 field runs. The connection is dropped now, once, so every caller fails at
         // once -- but only if this reader's pipe is still the current one.
-        if (myPipe is not null && ReferenceEquals(_pipe, myPipe)) Drop();
+        Drop(myPipe);
     }
 
     private async Task<bool> SendAsync(byte type, byte[] payload, CancellationToken ct)
@@ -2571,6 +2630,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         if (Wo210PipeBlock.Blocks(type, type == Wo163 && payload.Length > 0 ? payload[0] : -1)) return (null, PipeReason.NotConnected);   // WO-210 H.3's bisect only
         if (!await EnsureConnectedAsync(ct)) return (null, PipeReason.NotConnected);
         if (UseBatch(type)) return await BatchSendAsync(type, payload, wantType, ct);   // WO-218 A.1: one round trip for every waiting request
+        if (CaptureSource() is not { } source) return (null, PipeReason.NotConnected);
 
         long gateAt = Environment.TickCount64;
         bool line = await EnterGateAsync(ct);
@@ -2578,17 +2638,18 @@ public sealed partial class CombatPipe : IAsyncDisposable
         bool sent = false;
         try
         {
+            if (!TrySourceSequence(source, out byte? expectedSequence)) return (null, PipeReason.NotConnected);
             // Drop anything left over from an earlier command that timed out.
             // Without this the first read below returns that command's answer
             // as if it were ours -- the defect described at _replies.
-            while (_replies.Reader.TryRead(out var leftover))
+            while (source.Replies.Reader.TryRead(out var leftover))
             {
                 StaleRepliesDropped++;
                 Console.WriteLine($"[combat] dropped a leftover reply 0x{leftover.Type:X2} " +
                                   $"before sending 0x{type:X2} (total {StaleRepliesDropped})");
             }
 
-            await WriteFrameAsync(type, payload, ct);
+            await WriteFrameAsync(type, payload, ct, source.Pipe);
             sent = true;
 
             // Bounded wait with an explicit give-up, and the waited time is
@@ -2600,6 +2661,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 var left = deadline - DateTime.UtcNow;
                 if (left <= TimeSpan.Zero)
                 {
+                    if (!SetSourceSequence(source, expectedSequence is byte missing ? (byte)(missing + 1) : null)) return (null, PipeReason.NotConnected);
                     TimedOut++;
                     // WO-110 R12 (docs/WO-109-audit.md R12): the DLL numbers
                     // every frame it READS, so the reply to this timed-out
@@ -2608,7 +2670,6 @@ public sealed partial class CombatPipe : IAsyncDisposable
                     // would take that late reply as its own answer. Advancing
                     // past it makes the late reply read as "older" above and be
                     // dropped, which is what it is.
-                    if (_expectedSeq is byte w) _expectedSeq = (byte)(w + 1);
                     Console.WriteLine($"[combat] no answer to 0x{type:X2} after " +
                                       $"{(DateTime.UtcNow - started).TotalMilliseconds:F0} ms " +
                                       $"(deadline {ReplyDeadline.TotalMilliseconds:F0} ms, timeouts {TimedOut}; seq advanced past the missing reply)");
@@ -2618,8 +2679,11 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 using var slice = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 slice.CancelAfter(left);
                 (byte Type, byte[] Body) reply;
-                try { reply = await _replies.Reader.ReadAsync(slice.Token); }
+                try { reply = await source.Replies.Reader.ReadAsync(slice.Token); }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested) { continue; }
+                ct.ThrowIfCancellationRequested();
+                ProcessorFrameScope.ThrowIfAbandoned();
+                if (!TrySourceSequence(source, out _)) return (null, PipeReason.NotConnected);
 
                 // WO-118: a DLL older than this command answers 0x81 with
                 // reason UnknownCommand (WO-110 R12) instead of the typed reply.
@@ -2627,9 +2691,9 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 // held the gate for 5 s -- per heartbeat, for the 0x14 status.
                 if (reply.Type == Result && wantType != Result && reply.Body.Length >= 3
                     && reply.Body[2] == (byte)PipeReason.UnknownCommand
-                    && (_expectedSeq is not byte ws || reply.Body[1] == ws))
+                    && (expectedSequence is not byte ws || reply.Body[1] == ws))
                 {
-                    _expectedSeq = (byte)(reply.Body[1] + 1);
+                    if (!SetSourceSequence(source, (byte)(reply.Body[1] + 1))) return (null, PipeReason.NotConnected);
                     return (null, PipeReason.UnknownCommand);
                 }
                 if (reply.Type != wantType || reply.Body.Length < 2)
@@ -2639,7 +2703,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 }
 
                 byte seq = reply.Body[1];
-                if (_expectedSeq is byte want && seq != want)
+                if (expectedSequence is byte want && seq != want)
                 {
                     // Older than what we are waiting for? Then it belongs to a
                     // command that already gave up. Anything else means we
@@ -2654,7 +2718,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                     }
                     Console.WriteLine($"[combat] reply seq={seq} is ahead of the expected {want} -- resyncing");
                 }
-                _expectedSeq = (byte)(seq + 1);
+                if (!SetSourceSequence(source, (byte)(seq + 1))) return (null, PipeReason.NotConnected);
                 return (reply.Body, PipeReason.Ok);
             }
         }
@@ -2662,10 +2726,11 @@ public sealed partial class CombatPipe : IAsyncDisposable
         {
             // A sent command still consumes its native sequence number. Its
             // eventual reply must not become the next command's result.
-            if (sent && _expectedSeq is byte expected) _expectedSeq = (byte)(expected + 1);
+            if (sent) AdvanceSourceSequence(source);
             ProcessorFrameScope.ThrowIfAbandoned();
             if (!ct.IsCancellationRequested)
             {
+                if (!TrySourceSequence(source, out _)) return (null, PipeReason.NotConnected);
                 TimedOut++;
                 return (null, PipeReason.NoAnswer); // bounded physical writer wait, not a caller cancellation
             }
@@ -2680,7 +2745,8 @@ public sealed partial class CombatPipe : IAsyncDisposable
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
-            Drop();
+            // The physical writer already drops only its own broken pipe.
+            // A reconnect may have been established before this continuation.
             return (null, PipeReason.NotConnected);
         }
         finally
@@ -2693,7 +2759,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     private static readonly TimeSpan ReplyDeadline = TimeSpan.FromSeconds(5);
 
-    private async Task WriteFrameAsync(byte type, byte[] payload, CancellationToken ct)
+    private async Task WriteFrameAsync(byte type, byte[] payload, CancellationToken ct, NamedPipeClientStream expectedPipe)
     {
         using var scope = ProcessorFrameScope.Link(ct);
         ct = scope.Token;
@@ -2702,14 +2768,14 @@ public sealed partial class CombatPipe : IAsyncDisposable
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(ReplyDeadline); // background calls also cannot own the writer indefinitely
         await _writeLock.WaitAsync(deadline.Token);
-        try { await WriteFrameLockedAsync(type, payload, deadline.Token); }
+        try { await WriteFrameLockedAsync(type, payload, deadline.Token, expectedPipe); }
         finally { _writeLock.Release(); }
     }
 
     // Caller owns _writeLock. Batch writers filter each request under the same
     // lock before building their frame, so queued cancellation cannot leak a
     // stale request after a blocked writer releases it.
-    private async Task WriteFrameLockedAsync(byte type, byte[] payload, CancellationToken ct)
+    private async Task WriteFrameLockedAsync(byte type, byte[] payload, CancellationToken ct, NamedPipeClientStream? expectedPipe = null)
     {
         ProcessorFrameScope.ThrowIfAbandoned();
         ct.ThrowIfCancellationRequested();
@@ -2719,7 +2785,8 @@ public sealed partial class CombatPipe : IAsyncDisposable
         payload.CopyTo(frame.AsSpan(3));
         // WO-144 5: the reader can drop the pipe while a command waits at the gate; a null pipe
         // here was the field's NullReferenceException in every tick after the game died
-        var pipe = _pipe ?? throw new IOException("pipe closed");
+        var pipe = expectedPipe ?? _pipe ?? throw new IOException("pipe closed");
+        if (expectedPipe is not null && !ReferenceEquals(_pipe, expectedPipe)) throw new IOException("pipe connection changed");
         bool writing = false;
         try
         {
@@ -2734,62 +2801,69 @@ public sealed partial class CombatPipe : IAsyncDisposable
             // A physical write/flush may have sent only part of this frame.
             // Reuse would corrupt framing. Waiting/queued cancellation never
             // comes here and must not reset unrelated requests.
-            if (writing && ReferenceEquals(_pipe, pipe)) Drop();
+            if (writing) Drop(pipe);
             throw;
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
-            if (ReferenceEquals(_pipe, pipe)) Drop();
+            Drop(pipe);
             throw;
         }
     }
 
-    private async Task<(byte Type, byte[] Body)> ReadFrameAsync(CancellationToken ct)
+    private static async Task<(byte Type, byte[] Body)> ReadFrameAsync(NamedPipeClientStream pipe, CancellationToken ct)
     {
         var head = new byte[3];
-        await ReadExactAsync(head, ct);
+        await ReadExactAsync(pipe, head, ct);
         int len = BinaryPrimitives.ReadUInt16LittleEndian(head.AsSpan(1));
         var body = new byte[len];
-        if (len > 0) await ReadExactAsync(body, ct);
+        if (len > 0) await ReadExactAsync(pipe, body, ct);
         return (head[0], body);
     }
 
-    private async Task ReadExactAsync(byte[] buffer, CancellationToken ct)
+    private static async Task ReadExactAsync(NamedPipeClientStream pipe, byte[] buffer, CancellationToken ct)
     {
         int got = 0;
         while (got < buffer.Length)
         {
-            var pipe = _pipe ?? throw new IOException("pipe closed");   // WO-144 5
             int n = await pipe.ReadAsync(buffer.AsMemory(got), ct);
             if (n <= 0) throw new IOException("pipe closed");
             got += n;
         }
     }
 
-    private void Drop()
+    private void Drop(NamedPipeClientStream? expected = null)
     {
-        bool had = _pipe is not null;   // WO-144 5: one line per lost connection, not one per caller
-        _pipe?.Dispose();
-        _pipe = null;
-        // A reconnect gets a fresh channel and no sequence expectation: the
-        // DLL's counter keeps running across connections, so carrying the old
-        // expectation over would reject the first real reply.
-        _replies.Writer.TryComplete();
-        _replies = NewReplyChannel();
-        _expectedSeq = null;
-        OnDropBatch();   // WO-218 A.1: the waiting batch and its line fail at once; the next connection is probed again
-        if (had) Console.WriteLine("[combat] lost the connection to KCDMP.dll");
+        lock (_connectionState)
+        {
+            if (expected is not null && !ReferenceEquals(_pipe, expected)) return;
+            var dropped = _pipe;
+            _pipe = null;
+            dropped?.Dispose();
+            // Complete old promises before a new connection can be published.
+            OnDropLifecycle(dropped);
+            _replies.Writer.TryComplete();
+            _replies = NewReplyChannel();
+            _expectedSeq = null;
+            OnDropBatch();
+            if (dropped is not null) Console.WriteLine("[combat] lost the connection to KCDMP.dll");
+        }
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        _pipe?.Dispose();
-        _pipe = null;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        Drop();
         _replies.Writer.TryComplete();
-        _gate.Dispose();
-        _line.Dispose();
-        return ValueTask.CompletedTask;
+        // An in-progress ConnectAsync owns this lock until the disposed pipe
+        // wakes it. Do not dispose its semaphore before its finally releases it.
+        await _connectLock.WaitAsync();
+        _connectLock.Release();
+        // In-flight callers can still release their request/connection gates.
+        // These managed semaphores never expose a wait handle; disposing them
+        // here could strand existing waiters or fault their finally blocks.
     }
+
 }
 
 
