@@ -91,6 +91,14 @@ public partial class GameBridge
         Volatile.Write(ref _w206dProcType, type);
     }
 
+    private void Wo206NoteProcessorOff()
+    {
+        long since = Interlocked.Exchange(ref _w206dProcSinceMs, 0);
+        if (since != 0 && _w206dStallLoggedFor == since)
+            Console.WriteLine($"MP-W206 STALL over: frame type {_w206dProcType} completed or abandoned after {(Environment.TickCount64 - since) / 1000.0:F1} s");
+        Volatile.Write(ref _w206dProcType, 0);
+    }
+
     private void Wo206StallWatch()
     {
         long since = Volatile.Read(ref _w206dProcSinceMs);

@@ -25,6 +25,7 @@
 #include "wo190.h"
 #include "wo194.h"
 #include "wo195.h"
+#include "t3_stats_rules.h"
 
 #include <windows.h>
 #include <atomic>
@@ -37,6 +38,7 @@ namespace kcdmp::wo163 {
 namespace {
 
 std::atomic<uint32_t> c_asked{0}, c_answeredHostile{0}, c_answeredNot{0}, c_unanswered{0};
+std::atomic<uint64_t> g_t3ToldAtMs[3]{};
 
 uint32_t player_eid() {
     void* e = engine::entity_by_id(0x7777);
@@ -87,6 +89,17 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
     c_byOp[body[0]].fetch_add(1, std::memory_order_relaxed);
     tell_ops();
     switch (body[0]) {
+        case t3stats::kOp: {
+            if (!t3stats::valid(body + 1, len - 1)) return kRBadRequest;
+            const uint8_t role = body[1];
+            const uint64_t now = GetTickCount64();
+            uint64_t was = g_t3ToldAtMs[role].load();
+            if (was && now - was < 60000) return kROk;
+            if (!g_t3ToldAtMs[role].compare_exchange_strong(was, now)) return kROk;
+            const std::string counters(reinterpret_cast<const char*>(body + 2), len - 2);
+            logf("MP-T3-STATS origin=dll source=agent role=%s %s", role == 1 ? "host" : "joiner", counters.c_str());
+            return kROk;
+        }
         case kOpSkirmishHostile: {
             if (len < 2 || cap < 2) return kRBadRequest;
             const size_t n = body[1];

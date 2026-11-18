@@ -32,6 +32,15 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// <summary>WO-154 6.6: another pipe name, for tests only (a test server must never take the game's "kcdmp").</summary>
     public CombatPipe(string pipeName) => _pipeName = pipeName;
 
+    // A connection reader/batch pump belongs to the session, never to the
+    // frame which happened to start it. Inheriting that frame's deadline
+    // would make an abandoned first request poison every later request.
+    private static Task RunDetached(Func<Task> work)
+    {
+        if (ExecutionContext.IsFlowSuppressed()) return Task.Run(work);
+        using (ExecutionContext.SuppressFlow()) return Task.Run(work);
+    }
+
     private const byte ApplyDamage       = 0x01;
     private const byte ApplyDeath        = 0x02;
     private const byte Ping              = 0x03;
@@ -409,6 +418,10 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// </summary>
     public async Task<bool> EnsureConnectedAsync(CancellationToken ct = default)
     {
+        using var scope = ProcessorFrameScope.Link(ct);
+        ct = scope.Token;
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ct.ThrowIfCancellationRequested();
         if (IsConnected) return true;
 
         await _gate.WaitAsync(ct);
@@ -421,6 +434,14 @@ public sealed partial class CombatPipe : IAsyncDisposable
             try
             {
                 await _pipe.ConnectAsync(500, ct);
+                ct.ThrowIfCancellationRequested();
+                ProcessorFrameScope.ThrowIfAbandoned();
+            }
+            catch (OperationCanceledException)
+            {
+                _pipe.Dispose();
+                _pipe = null;
+                throw;
             }
             catch (Exception ex) when (ex is TimeoutException or IOException or UnauthorizedAccessException)
             {
@@ -436,7 +457,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
             _warnedUnavailable = false;
             Console.WriteLine("[combat] connected to KCDMP.dll");
-            _reader = Task.Run(ReadLoopAsync);
+            _reader = RunDetached(ReadLoopAsync);
             return true;
         }
         finally { _gate.Release(); }
@@ -955,6 +976,10 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// <summary>Round-trip check that the DLL is alive and pumping frames.</summary>
     public async Task<bool> PingAsync(CancellationToken ct = default)
     {
+        using var scope = ProcessorFrameScope.Link(ct);
+        ct = scope.Token;
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ct.ThrowIfCancellationRequested();
         if (!await EnsureConnectedAsync(ct)) return false;
         await _gate.WaitAsync(ct);
         try
@@ -977,6 +1002,12 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 TimedOut++;
                 return false;
             }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            ProcessorFrameScope.ThrowIfAbandoned();
+            TimedOut++;
+            return false;
         }
         catch (ChannelClosedException)
         {
@@ -2533,6 +2564,10 @@ public sealed partial class CombatPipe : IAsyncDisposable
     private async Task<(byte[]? Body, PipeReason Fail)> SendAndAwaitAsync(
         byte type, byte[] payload, byte wantType, CancellationToken ct)
     {
+        using var scope = ProcessorFrameScope.Link(ct);
+        ct = scope.Token;
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ct.ThrowIfCancellationRequested();
         if (Wo210PipeBlock.Blocks(type, type == Wo163 && payload.Length > 0 ? payload[0] : -1)) return (null, PipeReason.NotConnected);   // WO-210 H.3's bisect only
         if (!await EnsureConnectedAsync(ct)) return (null, PipeReason.NotConnected);
         if (UseBatch(type)) return await BatchSendAsync(type, payload, wantType, ct);   // WO-218 A.1: one round trip for every waiting request
@@ -2540,6 +2575,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         long gateAt = Environment.TickCount64;
         bool line = await EnterGateAsync(ct);
         long sentAt = Environment.TickCount64;
+        bool sent = false;
         try
         {
             // Drop anything left over from an earlier command that timed out.
@@ -2553,6 +2589,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             }
 
             await WriteFrameAsync(type, payload, ct);
+            sent = true;
 
             // Bounded wait with an explicit give-up, and the waited time is
             // reported on expiry (WO-100 Phase 4 item 2).
@@ -2621,6 +2658,19 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 return (reply.Body, PipeReason.Ok);
             }
         }
+        catch (OperationCanceledException)
+        {
+            // A sent command still consumes its native sequence number. Its
+            // eventual reply must not become the next command's result.
+            if (sent && _expectedSeq is byte expected) _expectedSeq = (byte)(expected + 1);
+            ProcessorFrameScope.ThrowIfAbandoned();
+            if (!ct.IsCancellationRequested)
+            {
+                TimedOut++;
+                return (null, PipeReason.NoAnswer); // bounded physical writer wait, not a caller cancellation
+            }
+            throw;
+        }
         catch (ChannelClosedException)
         {
             // WO-154 6.6: the field's "tick failed: ChannelClosedException" at every game exit -- the reader lost the
@@ -2645,6 +2695,24 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     private async Task WriteFrameAsync(byte type, byte[] payload, CancellationToken ct)
     {
+        using var scope = ProcessorFrameScope.Link(ct);
+        ct = scope.Token;
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ct.ThrowIfCancellationRequested();
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(ReplyDeadline); // background calls also cannot own the writer indefinitely
+        await _writeLock.WaitAsync(deadline.Token);
+        try { await WriteFrameLockedAsync(type, payload, deadline.Token); }
+        finally { _writeLock.Release(); }
+    }
+
+    // Caller owns _writeLock. Batch writers filter each request under the same
+    // lock before building their frame, so queued cancellation cannot leak a
+    // stale request after a blocked writer releases it.
+    private async Task WriteFrameLockedAsync(byte type, byte[] payload, CancellationToken ct)
+    {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ct.ThrowIfCancellationRequested();
         var frame = new byte[3 + payload.Length];
         frame[0] = type;
         BinaryPrimitives.WriteUInt16LittleEndian(frame.AsSpan(1), (ushort)payload.Length);
@@ -2652,13 +2720,28 @@ public sealed partial class CombatPipe : IAsyncDisposable
         // WO-144 5: the reader can drop the pipe while a command waits at the gate; a null pipe
         // here was the field's NullReferenceException in every tick after the game died
         var pipe = _pipe ?? throw new IOException("pipe closed");
-        await _writeLock.WaitAsync(ct);   // WO-218 A.1: the batch's pump writes outside the gate
+        bool writing = false;
         try
         {
+            ct.ThrowIfCancellationRequested();
+            ProcessorFrameScope.ThrowIfAbandoned();
+            writing = true;
             await pipe.WriteAsync(frame, ct);
             await pipe.FlushAsync(ct);
         }
-        finally { _writeLock.Release(); }
+        catch (OperationCanceledException)
+        {
+            // A physical write/flush may have sent only part of this frame.
+            // Reuse would corrupt framing. Waiting/queued cancellation never
+            // comes here and must not reset unrelated requests.
+            if (writing && ReferenceEquals(_pipe, pipe)) Drop();
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            if (ReferenceEquals(_pipe, pipe)) Drop();
+            throw;
+        }
     }
 
     private async Task<(byte Type, byte[] Body)> ReadFrameAsync(CancellationToken ct)

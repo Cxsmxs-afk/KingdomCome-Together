@@ -182,8 +182,23 @@ public sealed class LinkSchedOptions
 /// </summary>
 public sealed class LinkScheduler
 {
+    // Optional producer authority. Shared by all pieces of one original packet,
+    // so a revoked multi-body packet is counted once, including after selection.
+    private sealed class Delivery(Func<bool> valid)
+    {
+        private int _counted;
+        public bool Allowed(LinkScheduler owner)
+        {
+            if (valid()) return true;
+            if (Interlocked.Exchange(ref _counted, 1) == 0) Interlocked.Increment(ref owner.CancelledDropped);
+            return false;
+        }
+    }
+    private bool Allowed(Delivery? delivery) => delivery?.Allowed(this) ?? true;
+
     private sealed class Slot
     {
+        public Delivery? Delivery;
         public StatePiece P;
         public long UpdatedTs, SentTs, AliveTs;
         public bool Dirty;
@@ -191,7 +206,7 @@ public sealed class LinkScheduler
     }
 
     private readonly object _lock = new();
-    private readonly Queue<(byte[] F, long Ts)> _events = new();
+    private readonly Queue<(byte[] F, long Ts, Delivery? Delivery)> _events = new();
     private readonly Dictionary<string, Slot> _slots = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _npcSeenTs = new(StringComparer.Ordinal);   // body name -> its last NPC state (repeats' liveness)
     private readonly Dictionary<string, int> _npcBand = new(StringComparer.Ordinal);      // body name -> the band of its last NPC state
@@ -206,6 +221,8 @@ public sealed class LinkScheduler
 
     // counters (the MP-LINK lines)
     public long EventsIn, StateIn, Coalesced, StaleDropped, Repeats, StateSent, EventsSent, FramesBuilt, PendingWaits, BudgetWaits, StateJumped;
+    /// <summary>Original packets revoked by their producer before physical send (never one count per split body).</summary>
+    public long CancelledDropped;
     private readonly List<double> _stateAgeAtSendMs = new(512), _eventAgeAtSendMs = new(512);
 
     public LinkScheduler(LinkSchedOptions? options = null) => Options = options ?? new LinkSchedOptions();
@@ -215,15 +232,18 @@ public sealed class LinkScheduler
     public int DirtySlots { get { lock (_lock) return _slots.Values.Count(s => s.Dirty); } }
 
     /// <summary>One whole frame (header included), from any thread.</summary>
-    public void Enqueue(byte[] frame)
+    public void Enqueue(byte[] frame, Func<bool>? stillValid = null)
     {
+        var delivery = stillValid is null ? null : new Delivery(stillValid);
+        if (!Allowed(delivery)) return; // a revoked replacement must not displace a live state
         long now = Stopwatch.GetTimestamp();
         lock (_lock)
         {
+            if (!Allowed(delivery)) return;
             _split.Clear();
             if (!Options.LatestWins || !LinkStateCodec.Split(frame, _split))
             {
-                _events.Enqueue((frame, now));
+                _events.Enqueue((frame, now, delivery));
                 _eventBytes += frame.Length;
                 EventsIn++;
                 return;
@@ -233,7 +253,7 @@ public sealed class LinkScheduler
             {
                 if (!_slots.TryGetValue(p.Slot, out var s)) _slots[p.Slot] = s = new Slot { SentTs = now - (long)(10_000 * TicksPerMs) };
                 else if (s.Dirty) Coalesced++;
-                s.P = p; s.UpdatedTs = now; s.Dirty = true; s.AliveTs = now;
+                s.P = p; s.Delivery = delivery; s.UpdatedTs = now; s.Dirty = true; s.AliveTs = now;
                 if (p.Kind == "npc-state")
                 {
                     _npcSeenTs[p.Body] = now;
@@ -249,12 +269,22 @@ public sealed class LinkScheduler
     /// The next frame to send, or false when nothing may go now. <paramref name="budgetBytes"/>: what the budget allows this moment
     /// (int.MaxValue = no budget); <paramref name="pendingBytes"/>: what the path already holds (-1 = it does not say).
     /// </summary>
-    public bool TryTake(int budgetBytes, int pendingBytes, out byte[] frame, out bool isState, bool eventsHeld = false)
+    public bool TryTake(int budgetBytes, int pendingBytes, out byte[] frame, out bool isState, bool eventsHeld = false) =>
+        TryTake(budgetBytes, pendingBytes, out frame, out isState, out _, eventsHeld);
+
+    /// <summary>The producer check travels with a selected frame, including merged state pieces, to its physical writer.</summary>
+    public bool TryTake(int budgetBytes, int pendingBytes, out byte[] frame, out bool isState, out Func<bool>? stillValid, bool eventsHeld = false)
     {
+        stillValid = null;
         long now = Stopwatch.GetTimestamp();
         frame = []; isState = false;
         lock (_lock)
         {
+            while (_events.Count > 0 && !Allowed(_events.Peek().Delivery))
+            {
+                var cancelled = _events.Dequeue();
+                _eventBytes -= cancelled.F.Length;
+            }
             bool eventFirst = _events.Count > 0 && !eventsHeld;
             if (eventFirst && Options.EventSnapMs > 0)
             {
@@ -263,7 +293,7 @@ public sealed class LinkScheduler
                 {
                     foreach (var s in _slots.Values)
                     {
-                        if (!s.Dirty) continue;
+                        if (!s.Dirty || !Allowed(s.Delivery)) continue;
                         eventFirst = false;
                         StateJumped++;
                         break;
@@ -277,6 +307,7 @@ public sealed class LinkScheduler
                 EventsSent++;
                 if (_eventAgeAtSendMs.Count < 20_000) _eventAgeAtSendMs.Add((now - e.Ts) / TicksPerMs);
                 frame = e.F;
+                stillValid = e.Delivery is null ? null : () => Allowed(e.Delivery);
                 return true;
             }
             if (_slots.Count == 0) return false;
@@ -288,6 +319,7 @@ public sealed class LinkScheduler
             long RepeatOf(Slot s) => s.P.Type is Protocol.ActivityExtraUp or Protocol.ActivityExtraDown ? repeatExtra : repeat;
             foreach (var s in _slots.Values)
             {
+                if (!Allowed(s.Delivery)) { s.Dirty = false; continue; }
                 if (s.Dirty && now - s.UpdatedTs > ageLimit) { s.Dirty = false; StaleDropped++; }
                 bool due = s.Dirty || repeats && s.P.Repeatable && now - s.SentTs >= RepeatOf(s) && Alive(s.P.Body, now, alive);
                 if (!due) continue;
@@ -304,7 +336,7 @@ public sealed class LinkScheduler
                 var (maxItems, maxPayload) = LinkStateCodec.Limits(best.P.Type);
                 int size = best.P.Prefix.Length + 1 + best.P.Item.Length;
                 foreach (var s in _slots.Values
-                             .Where(s => !ReferenceEquals(s, best) && s.P.Group == best.P.Group
+                             .Where(s => !ReferenceEquals(s, best) && s.P.Group == best.P.Group && Allowed(s.Delivery)
                                          && (s.Dirty || repeats && s.P.Repeatable && now - s.SentTs >= RepeatOf(s) && Alive(s.P.Body, now, alive)))
                              .OrderByDescending(s => (now - s.SentTs) / Period(s.Band)))
                 {
@@ -322,6 +354,13 @@ public sealed class LinkScheduler
             }
             StateSent++; FramesBuilt++;
             frame = built; isState = true;
+            var deliveries = take.Select(s => s.Delivery).Where(d => d is not null).Distinct().ToArray();
+            if (deliveries.Length != 0) stillValid = () =>
+            {
+                bool valid = true;
+                foreach (var delivery in deliveries) valid &= Allowed(delivery);
+                return valid;
+            };
             return true;
         }
     }
@@ -359,7 +398,7 @@ public sealed class LinkScheduler
         double Q(List<double> v, double q) => v.Count == 0 ? 0 : ArrivalStats.Quantile(v, q);
         return string.Create(CultureInfo.InvariantCulture,
             $" sched=on unreliable={(Options.Unreliable ? 1 : 0)} events_waiting={ev} event_bytes={evb} slots={slots} dirty={dirty} event_age_p99={Q(ea, 0.99):F1} state_age_p50={Q(sa, 0.5):F1} state_age_p99={Q(sa, 0.99):F1} " +
-            $"state_in={Interlocked.Read(ref StateIn)} coalesced={Interlocked.Read(ref Coalesced)} stale_dropped={Interlocked.Read(ref StaleDropped)} repeats={Interlocked.Read(ref Repeats)} state_sent={Interlocked.Read(ref StateSent)} events_sent={Interlocked.Read(ref EventsSent)} pending_waits={Interlocked.Read(ref PendingWaits)} budget_waits={Interlocked.Read(ref BudgetWaits)}");
+            $"state_in={Interlocked.Read(ref StateIn)} coalesced={Interlocked.Read(ref Coalesced)} cancelled_dropped={Interlocked.Read(ref CancelledDropped)} stale_dropped={Interlocked.Read(ref StaleDropped)} repeats={Interlocked.Read(ref Repeats)} state_sent={Interlocked.Read(ref StateSent)} events_sent={Interlocked.Read(ref EventsSent)} pending_waits={Interlocked.Read(ref PendingWaits)} budget_waits={Interlocked.Read(ref BudgetWaits)}");
     }
 }
 
@@ -388,10 +427,10 @@ public sealed class LinkWriter
     public ILinkPath Path => _path;
 
     /// <summary>One frame in (any thread); the writer wakes.</summary>
-    public void Enqueue(byte[] frame)
+    public void Enqueue(byte[] frame, Func<bool>? stillValid = null)
     {
         if (Failed is { } f) throw new IOException("the link's writer stopped: " + f.Message, f);
-        _sched.Enqueue(frame);
+        _sched.Enqueue(frame, stillValid);
         if (_signal.CurrentCount == 0) _signal.Release();
     }
 
@@ -428,10 +467,13 @@ public sealed class LinkWriter
             // B with C: a state lane of its own -- the events wait here while their lane holds enough, so the pump is never stuck in an
             // event's send and the state goes beside a burst (the world's transfer) at its lane's share instead of after it
             bool eventsHeld = _path.StateOwnLane && st.Known && st.EventPendingBytes > _sched.Options.EventPendingCapBytes;
-            if (!_sched.TryTake(budget, st.Known ? st.PendingBytes : -1, out var frame, out bool isState, eventsHeld)) return;
+            if (!_sched.TryTake(budget, st.Known ? st.PendingBytes : -1, out var frame, out bool isState, out var stillValid, eventsHeld)) return;
+            if (stillValid is not null && !stillValid()) continue;
             if (Transform is { } t) frame = t(frame);   // D.3: the link's own encoding (the relay's compact NPC states)
+            if (stillValid is not null && !stillValid()) continue;
             if (budget != int.MaxValue && (isState || !_path.StateOwnLane)) _tokens -= frame.Length;   // a lane of its own: events spend their lane's share
             onFrame?.Invoke(frame, isState);
+            if (stillValid is not null && !stillValid()) continue;
             await _path.SendAsync(frame, isState && _sched.Options.Unreliable, ct);
             Written++; WrittenBytes += frame.Length;
         }

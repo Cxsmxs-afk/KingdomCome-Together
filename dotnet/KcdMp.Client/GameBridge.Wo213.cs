@@ -269,11 +269,13 @@ public partial class GameBridge
         var w = new LinkWriter(sched, path);
         var cts = new CancellationTokenSource();
         _w213WriterCts = cts; _w213Stream = stream; _w213Writer = w;
-        _ = Task.Run(async () =>
+        async Task RunWriter()
         {
             try { await w.RunAsync(cts.Token, (f, _) => { if (f.Length >= 3) _w213Meter.CountFrame(true, f[0], f.AsSpan(3)); }); }
             catch (Exception ex) { Console.WriteLine($"MP-LINK the writer stopped: {ex.GetType().Name}: {ex.Message}"); try { link.Dispose(); } catch { } }
-        });
+        }
+        if (ExecutionContext.IsFlowSuppressed()) _ = Task.Run(RunWriter);
+        else { using (ExecutionContext.SuppressFlow()) _ = Task.Run(RunWriter); }
         ushort caps = (ushort)(Protocol.LinkCapLatestWins
                      | (W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
                      | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc));
@@ -319,10 +321,14 @@ public partial class GameBridge
     }
 
     /// <summary>A frame through the scheduler when it runs on this stream; false = write it the old way.</summary>
-    private bool Wo213TryQueue(Stream stream, byte[] packet)
+    private bool Wo213TryQueue(Stream stream, byte[] packet, CancellationToken ct = default)
     {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ct.ThrowIfCancellationRequested();
         if (_w213Writer is not { } w || !ReferenceEquals(stream, _w213Stream)) return false;
-        w.Enqueue(packet);   // throws when the writer died: the caller's write failed, as before
+        var lease = ProcessorFrameScope.Capture();
+        bool Current() => !ct.IsCancellationRequested && lease?.IsAbandoned != true && lease?.Token.IsCancellationRequested != true;
+        w.Enqueue(packet, Current);   // throws when the writer died: the caller's write failed, as before
         return true;
     }
 

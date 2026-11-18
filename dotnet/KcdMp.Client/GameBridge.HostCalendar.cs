@@ -22,45 +22,60 @@ public partial class GameBridge
     /// <summary>A real native reading, including a standing clock. No extrapolation from an old Lua poll while the host holds.</summary>
     private async Task<bool> SendHostCalendarAsync(byte? target = null, bool frozen = false, uint joinId = 0)
     {
+        var life = T3SideLease();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token);
+        using var scope = ProcessorFrameScope.Link(linked.Token);
+        T3SideGuard(life);
         // Serialize the complete read/send operation: an older periodic read must reach
         // the reliable channel before a later frozen snapshot, not after it.
-        await _hostCalendarSendGate.WaitAsync();
+        await _hostCalendarSendGate.WaitAsync(linked.Token);
         try
         {
-            if (!W137Host || _localSkipActive || _w140LocalSkipping) return false;
-            var read = await _combat.CalendarSnapshotAsync();
+            T3SideGuard(life);
+            if (!W137Host || _localSkipActive || _w140LocalSkipping || _where != GameWhere.World || (!frozen && !T3SideReady)) return false;
+            var read = await _combat.CalendarSnapshotAsync(linked.Token);
+            T3SideGuard(life);
+            if (_where != GameWhere.World) return false;
             if (read is not { } clock) return false;
             int rate = frozen || _w144ClockPaused ? 0 : (int)Math.Round(clock.Ratio * 1000);
             string text = HostCalendar.Format(clock.WorldMs, rate, CalendarRelayNowMs, _clockOffsetMs.HasValue, joinId != 0 ? joinId : _hostJoin?.JoinId ?? 0);
-            if (target is byte one) await W164SendAsync(one, Protocol.W164Clock, text);
-            else foreach (byte peer in Wo134Peers()) await W164SendAsync(peer, Protocol.W164Clock, text);
+            if (target is byte one) { T3SideGuard(life); await W164SendAsync(one, Protocol.W164Clock, text, linked.Token); T3SideGuard(life); }
+            else foreach (byte peer in Wo134Peers()) { T3SideGuard(life); await W164SendAsync(peer, Protocol.W164Clock, text, linked.Token); T3SideGuard(life); }
             Interlocked.Increment(ref _w200ClockOut);
             return true;
         }
         finally { _hostCalendarSendGate.Release(); }
     }
 
-    private async Task ReceiveHostCalendarAsync(byte source, string text)
+    private (HostCalendarSample Sample, long Generation)? CacheHostCalendar(byte source, string text)
     {
         long generation = Interlocked.Read(ref _hostCalendarGeneration);
         byte expected = _jj?.Host ?? (_hostModeKnown ? _hostModeFrom : (byte)0xFF);
         if (_isDamageAuthority || expected == 0xFF || source != expected ||
             !HostCalendar.TryParse(text, Environment.TickCount64, CalendarRelayNowMs, _clockOffsetMs.HasValue,
-                (_clockRttMedianMs ?? 0) / 2, out var sample)) return;
+                (_clockRttMedianMs ?? 0) / 2, out var sample)) return null;
         lock (_hostCalendarLock)
         {
-            if (generation != Interlocked.Read(ref _hostCalendarGeneration)) return;
+            if (generation != Interlocked.Read(ref _hostCalendarGeneration)) return null;
             _hostCalendar = sample;   // kept at the menu, before the first host-world frame
             // A pre-hold periodic read can finish sending after the frozen offer sample.
             // Only the frozen snapshot may own this attempt's bootstrap, even when that older read carries its JoinId.
             if (sample.IsJoinSnapshot) _hostCalendarBootstrap = sample;
         }
         Interlocked.Increment(ref _w200ClockIn);
-        if (!HostCalendarOwned && _hostCalendarResumeEpoch != 0 && _hostCalendarResumeEpoch == _w206.World && _joinedWorld &&
-            !_w211Holding && !_ownLoadExpected && !_loadGraceOwn && _jj is null)
-            await ResumeHostCalendarAsync(sample, generation);
-        if (!HostCalendarOwned) return;
-        await UpdateHostCalendarAsync(sample, generation);
+        return (sample, generation);
+    }
+
+    private Task ReceiveHostCalendarAsync(byte source, string text)
+    {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        var life = T3SideLease();
+        if (CacheHostCalendar(source, text) is { } clock)
+        {
+            _t3SideChannels.Put(T3Clock, new(source, Calendar: clock.Sample, CalendarGeneration: clock.Generation), life);
+            T3Increment("deferred_sidechannel");
+        }
+        return Task.CompletedTask;
     }
 
     private void RebaseCalendarPoll(long worldMs, double ratio)
@@ -76,27 +91,42 @@ public partial class GameBridge
 
     private async Task UpdateHostCalendarAsync(HostCalendarSample sample, long generation)
     {
-        await _hostCalendarGate.WaitAsync();
+        ProcessorFrameScope.ThrowIfAbandoned();
+        var life = T3SideLease();
+        if (!T3SideReady)
+        {
+            _t3SideChannels.Put(T3Clock, new(0, Calendar: sample, CalendarGeneration: generation), life);
+            T3Increment("deferred_sidechannel"); return;
+        }
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token);
+        using var scope = ProcessorFrameScope.Link(linked.Token);
+        await _hostCalendarGate.WaitAsync(linked.Token);
         try
         {
+            T3SideGuard(life, true);
             if (!HostCalendarOwned || generation != Interlocked.Read(ref _hostCalendarGeneration) || !sample.Fresh(Environment.TickCount64)) return;
             lock (_hostCalendarLock) if (_hostCalendar != sample) return;
             // The native prehook leaves the player's own picker/sleep/wait alone. It retains the newest host target for the first frame after it.
-            var r = await _combat.CalendarFollowAsync(1, sample.TargetMs(Environment.TickCount64), sample.Ratio);
+            var r = await _combat.CalendarFollowAsync(1, sample.TargetMs(Environment.TickCount64), sample.Ratio, linked.Token);
+            T3SideGuard(life, true);
             // The local pipe may reconnect while the relay and confirmed host world stay intact.
             // Native close clears its follower; only the already verified world may arm it again here.
             if (r is { Result: 0 } && generation == Interlocked.Read(ref _hostCalendarGeneration) &&
                 _hostCalendarResumeEpoch != 0 && _hostCalendarResumeEpoch == _w206.World && _joinedWorld &&
                 _jj is null && !_w211Holding && !_ownLoadExpected && !_loadGraceOwn)
             {
-                if (!await ResumeHostAuthorityAsync(generation)) return;
-                r = await _combat.CalendarFollowAsync(2, sample.TargetMs(Environment.TickCount64), sample.Ratio);
+                if (!await ResumeHostAuthorityAsync(generation, linked.Token)) return;
+                T3SideGuard(life, true);
+                r = await _combat.CalendarFollowAsync(2, sample.TargetMs(Environment.TickCount64), sample.Ratio, linked.Token);
+                T3SideGuard(life, true);
             }
             for (int i = 0; r is { Result: 2 } && i < 3 && !_localSkipActive && !_w140LocalSkipping; i++)
             {
                 if (generation != Interlocked.Read(ref _hostCalendarGeneration)) return;
-                await Task.Delay(50);
-                r = await _combat.CalendarFollowAsync(3);
+                await Task.Delay(50, linked.Token);
+                T3SideGuard(life, true);
+                r = await _combat.CalendarFollowAsync(3, ct: linked.Token);
+                T3SideGuard(life, true);
             }
             if (r is not { Result: 1 } read || generation != Interlocked.Read(ref _hostCalendarGeneration)) return;
             RebaseCalendarPoll(read.AfterMs, sample.Ratio);
@@ -109,6 +139,10 @@ public partial class GameBridge
     /// <summary>Arm the native pre-update latch before issuing the load, never from GameplayStarted.</summary>
     private async Task<bool> PrepareHostCalendarAsync(JoinerJoin join)
     {
+        var life = T3SideLease();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token);
+        using var scope = ProcessorFrameScope.Link(linked.Token);
+        T3SideGuard(life);
         long until = Environment.TickCount64 + 5000;
         HostCalendarSample? sample;
         do
@@ -116,7 +150,8 @@ public partial class GameBridge
             lock (_hostCalendarLock) sample = _hostCalendarBootstrap;
             if (sample is { } got && got.ReadyForJoin(Environment.TickCount64, join.JoinId)) break;
             if (!ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted) return false;
-            await Task.Delay(50);
+            await Task.Delay(50, linked.Token);
+            T3SideGuard(life);
         } while (Environment.TickCount64 < until);
         if (sample is not { } host || !host.ReadyForJoin(Environment.TickCount64, join.JoinId))
         {
@@ -124,16 +159,17 @@ public partial class GameBridge
             return false;
         }
         long generation = Interlocked.Read(ref _hostCalendarGeneration);
-        await _hostCalendarGate.WaitAsync();
+        await _hostCalendarGate.WaitAsync(linked.Token);
         try
         {
+            T3SideGuard(life);
             if (generation != Interlocked.Read(ref _hostCalendarGeneration) || !ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted) return false;
             lock (_hostCalendarLock) if (_hostCalendarBootstrap is { } latest && latest.ReadyForJoin(Environment.TickCount64, join.JoinId)) host = latest;
-            var r = await _combat.CalendarFollowAsync(2, host.TargetMs(Environment.TickCount64), host.Ratio);
+            var r = await _combat.CalendarFollowAsync(2, host.TargetMs(Environment.TickCount64), host.Ratio, linked.Token);
+            T3SideGuard(life);
             if (r is not { Result: 1 or 2 }) return false;
             if (generation != Interlocked.Read(ref _hostCalendarGeneration) || !ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted)
             {
-                await _combat.CalendarFollowAsync(0);
                 return false;
             }
             _hostCalendarArmed = true;
@@ -147,18 +183,26 @@ public partial class GameBridge
     /// <summary>Read the new load's latch before Ready; the menu's old calendar is not sufficient.</summary>
     private async Task<bool> VerifyHostCalendarAsync(JoinerJoin join)
     {
-        if (!await PrepareHostAuthorityAsync(join)) return false;
+        var life = T3SideLease();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token);
+        using var scope = ProcessorFrameScope.Link(linked.Token);
+        T3SideGuard(life);
+        if (!await PrepareHostAuthorityAsync(join, linked.Token)) return false;
+        T3SideGuard(life);
         long generation = Interlocked.Read(ref _hostCalendarGeneration);
-        await _hostCalendarGate.WaitAsync();
+        await _hostCalendarGate.WaitAsync(linked.Token);
         try
         {
+            T3SideGuard(life);
             if (!HostCalendarOwned || generation != Interlocked.Read(ref _hostCalendarGeneration) || !ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted) return false;
             CalendarReadback? r = null;
             for (int i = 0; i < 5; i++)
             {
-                r = await _combat.CalendarFollowAsync(3);
+                r = await _combat.CalendarFollowAsync(3, ct: linked.Token);
+                T3SideGuard(life);
                 if (r is { Result: 1 } || generation != Interlocked.Read(ref _hostCalendarGeneration) || !ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted) break;
-                await Task.Delay(50);
+                await Task.Delay(50, linked.Token);
+                T3SideGuard(life);
             }
             if (r is not { Result: 1 } read || generation != Interlocked.Read(ref _hostCalendarGeneration) || !ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted) return false;
             HostCalendarSample? host;
@@ -173,16 +217,24 @@ public partial class GameBridge
 
     private async Task ResetHostCalendarAsync(string why)
     {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        T3SideChannelsInvalidate(why);
+        var life = T3SideLease();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token);
+        using var scope = ProcessorFrameScope.Link(linked.Token);
         Interlocked.Increment(ref _hostCalendarGeneration);   // in-flight old samples cannot re-arm after this reset
         _hostCalendarArmed = false;
-        await ResetHostAuthorityAsync(why);
+        await ResetHostAuthorityAsync(why, linked.Token);
+        T3SideGuard(life);
         if (why != "role-change") _hostCalendarResumeEpoch = 0;
         lock (_hostCalendarLock) { _hostCalendar = null; _hostCalendarBootstrap = null; }
         _w210HostClock = null;
-        await _hostCalendarGate.WaitAsync();
+        await _hostCalendarGate.WaitAsync(linked.Token);
         try
         {
-            await _combat.CalendarFollowAsync(0);
+            T3SideGuard(life);
+            await _combat.CalendarFollowAsync(0, ct: linked.Token);
+            T3SideGuard(life);
             _w200Ratio = WorldTimeRatio;
         }
         catch (Exception ex) { Console.WriteLine($"MP-CALENDAR reset ({why}): {ex.GetType().Name}"); }
@@ -191,13 +243,21 @@ public partial class GameBridge
 
     private async Task ResumeHostCalendarAsync(HostCalendarSample sample, long generation)
     {
-        await _hostCalendarGate.WaitAsync();
+        var life = T3SideLease();
+        if (!T3SideReady) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token);
+        using var scope = ProcessorFrameScope.Link(linked.Token);
+        T3SideGuard(life, true);
+        await _hostCalendarGate.WaitAsync(linked.Token);
         try
         {
+            T3SideGuard(life, true);
             if (generation != Interlocked.Read(ref _hostCalendarGeneration) || _hostCalendarResumeEpoch != _w206.World ||
                 !_joinedWorld || _isDamageAuthority || _ownLoadExpected || _loadGraceOwn || _jj is not null || !sample.Fresh(Environment.TickCount64)) return;
-            if (!await ResumeHostAuthorityAsync(generation)) return;
-            var r = await _combat.CalendarFollowAsync(2, sample.TargetMs(Environment.TickCount64), sample.Ratio);
+            if (!await ResumeHostAuthorityAsync(generation, linked.Token)) return;
+            T3SideGuard(life, true);
+            var r = await _combat.CalendarFollowAsync(2, sample.TargetMs(Environment.TickCount64), sample.Ratio, linked.Token);
+            T3SideGuard(life, true);
             if (r is { Result: 1 or 2 } && generation == Interlocked.Read(ref _hostCalendarGeneration))
             {
                 _hostCalendarArmed = true;
@@ -209,6 +269,10 @@ public partial class GameBridge
 
     private async Task ApplyHostCalendarSkipEndAsync(byte source, uint worldTime, DateTime receivedUtc, CancellationToken ct)
     {
+        using var scope = ProcessorFrameScope.Link(ct);
+        var life = T3SideLease();
+        using var context = new T3SideContext(this, life);
+        T3SideGuard(life);
         long generation = Interlocked.Read(ref _hostCalendarGeneration);
         byte expected = _jj?.Host ?? (_hostModeKnown ? _hostModeFrom : (byte)0xFF);
         if (source != expected) return;
@@ -220,6 +284,9 @@ public partial class GameBridge
             _hostCalendar = sample;
         }
         await UpdateHostCalendarAsync(sample, generation);
+        T3SideGuard(life);
+        if (!T3SideReady) return;
         await RequestNpcResyncAsync(NpcResyncReason.Sleep, _resyncStream, ct);
+        T3SideGuard(life, true);
     }
 }

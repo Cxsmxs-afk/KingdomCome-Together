@@ -56,6 +56,9 @@ public sealed partial class CombatPipe
         public bool Reliable;
         public long EnqueuedAt;
         public int Kind;   // Wo207Trace.Kind at the call (the frame kind it is charged to)
+        public CancellationToken Cancellation;
+        public Func<bool>? FrameAbandoned;
+        public bool Stopped => Cancellation.IsCancellationRequested || FrameAbandoned?.Invoke() == true || Tcs.Task.IsCompleted;
     }
 
     private readonly object _bLock = new();
@@ -91,12 +94,32 @@ public sealed partial class CombatPipe
     /// <summary>A request of a generic family through the batch: the reply body (the single path's), or null (no answer).</summary>
     private async Task<(byte[]? Body, PipeReason Fail)> BatchSendAsync(byte type, byte[] payload, byte want, CancellationToken ct)
     {
-        var it = new BItem { Type = type, Payload = payload, Want = want, Reliable = true, EnqueuedAt = Stopwatch.GetTimestamp(), Kind = Wo207Trace.Kind.Value };
+        using var scope = ProcessorFrameScope.Link(ct);
+        ct = scope.Token;
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ct.ThrowIfCancellationRequested();
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(ReplyDeadline + ReplyDeadline);
+        var owner = ProcessorFrameScope.Capture();
+        var it = new BItem { Type = type, Payload = payload, Want = want, Reliable = true, EnqueuedAt = Stopwatch.GetTimestamp(), Kind = Wo207Trace.Kind.Value,
+            Cancellation = deadline.Token, FrameAbandoned = owner is null ? null : () => owner.IsAbandoned };
         Enqueue(it);
-        var done = await Task.WhenAny(it.Tcs.Task, Task.Delay(ReplyDeadline + ReplyDeadline, ct));
-        if (done != it.Tcs.Task) { it.Tcs.TrySetResult(null); Interlocked.Increment(ref _bFailed); return (null, PipeReason.NoAnswer); }
-        var body = await it.Tcs.Task;
-        return body is null ? (null, PipeReason.NoAnswer) : (body, PipeReason.Ok);
+        try
+        {
+            var body = await it.Tcs.Task.WaitAsync(deadline.Token);
+            ct.ThrowIfCancellationRequested();
+            ProcessorFrameScope.ThrowIfAbandoned();
+            return body is null ? (null, PipeReason.NoAnswer) : (body, PipeReason.Ok);
+        }
+        catch (OperationCanceledException)
+        {
+            RemoveWaiting(it);
+            it.Tcs.TrySetCanceled(deadline.Token);
+            Interlocked.Increment(ref _bFailed);
+            ct.ThrowIfCancellationRequested();
+            ProcessorFrameScope.ThrowIfAbandoned();
+            return (null, PipeReason.NoAnswer);
+        }
     }
 
     /// <summary>
@@ -107,9 +130,13 @@ public sealed partial class CombatPipe
     /// </summary>
     public bool PostLatest(byte type, byte[] payload, string key, Func<byte[], byte[], byte[]?>? merge = null)
     {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ProcessorFrameScope.CurrentToken.ThrowIfCancellationRequested();
         if (!UseBatch(type)) return false;
         Interlocked.Increment(ref _bPosted);
-        var it = new BItem { Type = type, Payload = payload, Want = 0, Key = key, Merge = merge, EnqueuedAt = Stopwatch.GetTimestamp(), Kind = Wo207Trace.Kind.Value };
+        var owner = ProcessorFrameScope.Capture();
+        var it = new BItem { Type = type, Payload = payload, Want = 0, Key = key, Merge = merge, EnqueuedAt = Stopwatch.GetTimestamp(), Kind = Wo207Trace.Kind.Value,
+            Cancellation = ProcessorFrameScope.CurrentToken, FrameAbandoned = owner is null ? null : () => owner.IsAbandoned };
         lock (_bLock)
         {
             if (_bKeyed.TryGetValue(key, out var node))
@@ -119,6 +146,8 @@ public sealed partial class CombatPipe
                 if (merged is not null && merged.Length <= 1500)
                 {
                     old.Payload = merged;
+                    old.FrameAbandoned = it.FrameAbandoned; // the newest state belongs to its own frame
+                    old.Cancellation = it.Cancellation;
                     if (merge is null) Interlocked.Increment(ref _bSuperseded); else Interlocked.Increment(ref _bMerged);
                     return true;
                 }
@@ -133,9 +162,24 @@ public sealed partial class CombatPipe
 
     private void Enqueue(BItem it)
     {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        it.Cancellation.ThrowIfCancellationRequested();
         lock (_bLock) _bReliable.AddLast(it);
         EnsurePump();
         _bSignal.Release();
+    }
+
+    private void RemoveWaiting(BItem it)
+    {
+        lock (_bLock)
+        {
+            if (_bReliable.Find(it) is { } reliable) _bReliable.Remove(reliable);
+            if (_bState.Find(it) is { } state)
+            {
+                _bState.Remove(state);
+                if (it.Key is { } key && _bKeyed.TryGetValue(key, out var node) && node == state) _bKeyed.Remove(key);
+            }
+        }
     }
 
     private void EnsurePump()
@@ -144,7 +188,7 @@ public sealed partial class CombatPipe
         lock (_bLock)
         {
             if (_bPump is { IsCompleted: false }) return;
-            _bPump = Task.Run(BatchPumpAsync);
+            _bPump = RunDetached(BatchPumpAsync);
         }
     }
 
@@ -159,6 +203,13 @@ public sealed partial class CombatPipe
             {
                 while (list.First is { } n && take.Count < BatchMaxItems)
                 {
+                    if (n.Value.Stopped)
+                    {
+                        list.RemoveFirst();
+                        if (n.Value.Key is { } stale && _bKeyed.TryGetValue(stale, out var keyed) && keyed == n) _bKeyed.Remove(stale);
+                        n.Value.Tcs.TrySetResult(null);
+                        continue;
+                    }
                     int sz = 3 + n.Value.Payload.Length;
                     if (take.Count > 0 && bytes + sz > BatchBudgetBytes) return take;
                     list.RemoveFirst();
@@ -194,31 +245,61 @@ public sealed partial class CombatPipe
 
     private async Task SendBatchAsync(List<BItem> take)
     {
-        ushort id = unchecked(++_bNextId);
-        var body = new byte[3 + take.Sum(t => 3 + t.Payload.Length)];
-        BinaryPrimitives.WriteUInt16LittleEndian(body, id);
-        body[2] = (byte)take.Count;
-        int o = 3;
-        foreach (var t in take)
-        {
-            body[o] = t.Type;
-            BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(o + 1), (ushort)t.Payload.Length);
-            t.Payload.CopyTo(body, o + 3);
-            o += 3 + t.Payload.Length;
-        }
+        ushort id = 0;
+        byte[]? body = null;
         var wait = new TaskCompletionSource<byte[]?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        lock (_bLock) { _bWaitId = id; _bWait = wait; }
         long sentAt = Stopwatch.GetTimestamp();
         byte[]? reply = null;
         try
         {
-            await WriteFrameAsync(Batch, body, CancellationToken.None);
-            var done = await Task.WhenAny(wait.Task, Task.Delay(ReplyDeadline));
-            if (done == wait.Task) reply = await wait.Task;
+            // This is shared session work, independent of any one item's frame.
+            // A stuck write is bounded, but cancelling one queued item never
+            // cancels the live requests sharing the batch or resets their pipe.
+            using var writeDeadline = new CancellationTokenSource(ReplyDeadline);
+            await _writeLock.WaitAsync(writeDeadline.Token);
+            try
+            {
+                // Re-check AFTER acquiring the writer: requests can have been
+                // abandoned while another physical write owned this lock.
+                foreach (var stopped in take.Where(t => t.Stopped)) stopped.Tcs.TrySetResult(null);
+                take = take.Where(t => !t.Stopped).ToList();
+                if (take.Count == 0) return;
+                id = unchecked(++_bNextId);
+                body = new byte[3 + take.Sum(t => 3 + t.Payload.Length)];
+                BinaryPrimitives.WriteUInt16LittleEndian(body, id);
+                body[2] = (byte)take.Count;
+                int o = 3;
+                foreach (var t in take)
+                {
+                    body[o] = t.Type;
+                    BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(o + 1), (ushort)t.Payload.Length);
+                    t.Payload.CopyTo(body, o + 3);
+                    o += 3 + t.Payload.Length;
+                }
+                lock (_bLock) { _bWaitId = id; _bWait = wait; }
+                sentAt = Stopwatch.GetTimestamp();
+                await WriteFrameLockedAsync(Batch, body, writeDeadline.Token);
+            }
+            finally { _writeLock.Release(); }
+            // Batch IDs fence late replies. If every sent request lost its
+            // authority, no live caller needs this reply and a later batch
+            // should not wait out five more seconds behind it.
+            var allCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void CheckCancelled() { if (take.All(t => t.Stopped)) allCancelled.TrySetResult(); }
+            var registrations = take.Select(t => t.Cancellation.Register(CheckCancelled)).ToArray();
+            try
+            {
+                CheckCancelled();
+                var done = await Task.WhenAny(wait.Task, Task.Delay(ReplyDeadline), allCancelled.Task);
+                if (done == wait.Task) reply = await wait.Task;
+            }
+            finally { foreach (var registration in registrations) registration.Dispose(); }
         }
+        catch (OperationCanceledException) { } // writer wait expired; no indefinite pump ownership
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
         {
-            Drop();
+            // The physical writer already closes only its own broken stream.
+            // A late failure must not drop a newer connection made meanwhile.
         }
         lock (_bLock) { if (_bWait == wait) _bWait = null; }
         long now = Stopwatch.GetTimestamp();
@@ -228,7 +309,7 @@ public sealed partial class CombatPipe
         InterlockedMax(ref _bMaxSubs, take.Count);
         Interlocked.Add(ref _bRttSumMs, rttMs);
         InterlockedMax(ref _bRttMaxMs, rttMs);
-        InterlockedMax(ref _bBytesMax, body.Length);
+        InterlockedMax(ref _bBytesMax, body?.Length ?? 0);
         var subs = reply is null ? null : Wo218Rules.SplitReply(reply, id);
         if (subs is null)
         {

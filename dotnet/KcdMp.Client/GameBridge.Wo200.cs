@@ -98,24 +98,30 @@ public partial class GameBridge
 
     private async Task<bool> Wo200PushConfigAsync()
     {
-        await _hostAuthorityGate.WaitAsync();
-        try { return await Wo200PushConfigCoreAsync(); }
+        using var scope = ProcessorFrameScope.Link();
+        ProcessorFrameScope.ThrowIfAbandoned(); scope.Token.ThrowIfCancellationRequested();
+        await _hostAuthorityGate.WaitAsync(scope.Token);
+        try { ProcessorFrameScope.ThrowIfAbandoned(); return await Wo200PushConfigCoreAsync(scope.Token); }
         finally { _hostAuthorityGate.Release(); }
     }
 
     // The authority lifecycle already owns _hostAuthorityGate when calling this.
-    private async Task<bool> Wo200PushConfigCoreAsync()
+    private async Task<bool> Wo200PushConfigCoreAsync(CancellationToken ct = default)
     {
+        using var scope = ProcessorFrameScope.Link(ct);
         try
         {
+            ProcessorFrameScope.ThrowIfAbandoned(); scope.Token.ThrowIfCancellationRequested();
             bool s1 = W200("s1_replay");
             byte role = Wo200Role();
             byte tap = Wo200Rules.TapBits(s1, W200("joiner_quiet_clocks"));
             byte gate = (byte)(Wo200Rules.GateBits(W200("joiner_no_puppet_quests"), s1, W200("s1_route")) | (W201("joiner_no_story_barks") ? 8 : 0));   // WO-201 B7: bit 8
             byte joined = (byte)(HostAuthorityOwned ? 1 : 0);
-            var r = await _combat.Wo163Async(Protocol.Wo200OpConfig, [role, joined, tap, gate, 1, Wo200ValueBits()]);
+            var r = await _combat.Wo163Async(Protocol.Wo200OpConfig, [role, joined, tap, gate, 1, Wo200ValueBits()], scope.Token);
+            ProcessorFrameScope.ThrowIfAbandoned(); scope.Token.ThrowIfCancellationRequested();
             return r is { Ok: true } x && x.Payload.Length >= 2 && x.Payload[0] == role && x.Payload[1] == joined;
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex) { Console.WriteLine($"MP-W200 config not pushed ({ex.GetType().Name})"); return false; }
     }
 

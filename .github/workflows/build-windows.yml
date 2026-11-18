@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/loot-ownership-polish
+      - codex/t3-p0-processor-stall
 
 jobs:
   build:
