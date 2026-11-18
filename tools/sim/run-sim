@@ -12,6 +12,7 @@ export SIM_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 extra=()
 if [ "$#" -ge 3 ]; then extra=("${@:3}"); fi
 if [ "$label" = ci ]; then
+    python3 -B tools/Test-Skills.py
     native_tmp="$(mktemp -d)"
     trap 'rm -rf -- "$native_tmp"' EXIT
     cat > "$native_tmp/main.cpp" <<'EOF'

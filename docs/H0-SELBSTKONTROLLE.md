@@ -20,6 +20,12 @@ H0 meldet die ausstehenden Prüfungen ausdrücklich als erwartete Fehler. H20, H
 
 Die Mindestzahlen des bisherigen Windows-Laufs sind Client 2.705, Relay 288, LogPack 285, Setup 110 und native Tests 12.488. Bei einer Änderung der Mindestzahlen nennt der Paketbericht die betroffene Suite und den Grund.
 
+## Repo-Skills
+
+H0 ergänzt die Projektkarte, den Fix-Ablauf, die Performance-Regeln, die Log-Analyse und den Koop-Vergleich. Ihre Einstiege stehen in [AGENTS.md](../AGENTS.md#skills). Die Projektkarte verweist auf die vorhandenen Architektur- und Entscheidungsdokumente.
+
+Der Netzsimulator prüft im CI-Modus zuerst die Skill-Namen, Beschreibungen und Pfade. Bewusst fehlende Pfade brauchen einen Eintrag `<!-- skill-path-pending: PFAD -->` auf derselben Zeile wie die Referenz. Der Marker gilt nur für den genannten Pfad. [Prüfskript](../tools/Test-Skills.py)
+
 ## Löschliste
 
 Die HostAuthority-Tests verwenden keine 50-ms-Wartezeit mehr als Nachweis, dass der Worker begonnen hat. Die bisherigen Aufrufe der vier .NET-Suiten, die nur den Exitcode prüften, sind durch die Auswertung ihrer TRX-Ergebnisse ersetzt. Der Paketcheck steht in `tools/Verify-DropIn.ps1` und wird vom Workflow aufgerufen.

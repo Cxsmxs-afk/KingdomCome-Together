@@ -6,7 +6,7 @@ The top goal of this fork is a smooth co-op for KCD2 that feels native, and play
 
 That is the bar for reviews, refactors and new work. A change that keeps the current machinery but still looks late, jerky or unreliable has not met it. A larger change is in scope when it is the way to meet it.
 
-The same rule is the opening of `docs/ARCHITEKTUR-V2.md`, which is the architecture proposal for getting there. `docs/DESIGN-AUDIT.md` is the measured audit of the body path (who decides is sound; how a body is shown is not). Do not treat either document as a licence to rewrite the campaign into an MMO.
+`docs/DECISIONS-coop-design.md` records the co-op design decisions. `docs/ARCHITECTURE-shared-world.md` describes which participant owns each kind of state. `docs/DESIGN-AUDIT.md` documents measurements of the body path. Do not treat these documents as a licence to rewrite the campaign into an MMO.
 
 Decided for this fork: two players are the primary case and must feel the best; design and keep working for a small group of three or four in the same world, and test the pair first. The core, in order, is the players themselves, the NPCs, the open world, and the story and quests. Build what you see every second first; the story is still core, not a leftover. Chests and herbs stay per player: each person looks into their own. Dialogue is a majority vote. Shops and traders are secondary and only need to be as good as is reasonable. The Modding Tools build stays required for now. Native frame hooks are allowed and get fixed after game patches.
 
@@ -38,6 +38,12 @@ Kingdom Come: Together is an unofficial co-op mod for Kingdom Come: Deliverance 
 | Master | `dotnet/KcdMp.MasterServer` | Optional directory of relays. Not the game world. |
 | Native DLL | `native/KCDMP` | In-process hooks, the named pipe, body driving. |
 | Launcher | `KCDMP_launcher` | Starts the game, the agent and the relay. |
+
+## Skills
+
+Zu Beginn jeder Aufgabe [kct-kontext](.agents/skills/kct-kontext/SKILL.md) laden und die dort genannten Dateien gründlich lesen. Für Code-Änderungen gelten [kct-fix-workflow](.agents/skills/kct-fix-workflow/SKILL.md) und sein Performance-Schritt aus [kct-performance](.agents/skills/kct-performance/SKILL.md).
+
+Logs mit [kct-log-analyse](.agents/skills/kct-log-analyse/SKILL.md) prüfen und Vergleiche mit anderen Koop-Mods anhand von [kct-coop-vergleich](.agents/skills/kct-coop-vergleich/SKILL.md) belegen. Mit jedem Paket die Projektkarte, Logsignale und Messbudgets aktualisieren, soweit das Paket sie ändert. Der Bericht nennt die betroffenen Skills und den zugrunde liegenden Commit.
 
 ## Definition of Done — Selbstkontrolle
 
