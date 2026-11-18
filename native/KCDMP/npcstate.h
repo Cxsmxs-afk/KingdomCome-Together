@@ -31,7 +31,7 @@ void* loaded_state(void* ctx);             // ctx+0x180, checked C_NPCRequiredSt
 void* current_state(void* ctx);            // ctx+0x90
 bool clear_loaded(void* loaded);           // its own Clear (slot 0x38)
 bool set_loaded_slot(void* loaded, unsigned slot, void* p, void* ctrl);   // hands the reference over
-bool execute_loaded(void* ctx, uint8_t* res);   // C_NPCContext::ExecuteStateChangeIntoLoadedState
+bool execute_loaded(uint32_t eid, void* ctx, uint8_t* res);   // C_NPCContext::ExecuteStateChangeIntoLoadedState
 std::string describe_state(void* state);
 const char* unstance_label(uint16_t id, char* buf, size_t n);
 int unstance_index(const char* name);

@@ -47,6 +47,7 @@
 #include <cstdint>
 
 namespace kcdmp::rpmeasure { struct SampleScope; }
+namespace kcdmp::holders { enum class Holder : uint8_t; }
 
 namespace kcdmp::npcdrive {
 
@@ -68,6 +69,7 @@ enum Reason : uint8_t {
     kUnbound      = 12,   // unbound by Lua (reported only in logs)
     kTableFull    = 13,   // more bound puppets than kMaxBound
     kPipeClosed   = 14,   // the agent went away
+    kOwnerBusy    = 15,   // the previous movement owner has not released the body yet
 };
 const char* reason_name(uint8_t r);
 
@@ -109,6 +111,7 @@ bool walk_from_host();
 // Main thread.
 void set_activity_hold(uint32_t eid, bool on);
 bool activity_held(uint32_t eid);
+bool begin_oneshot(uint32_t eid, uint16_t holdMs);
 
 // ---- 0x11 bind, main thread (the pipe marshals it) ---------------------------
 // [on:1][eid:4][wuid:8][ax:4f][ay:4f][az:4f][delayMs:2][nameLen:1][name]
@@ -145,7 +148,7 @@ void tick();
 
 // ---- shared helpers for npc_trace.cpp (main thread) --------------------------
 double now_s();                                    // QPC seconds
-bool   write_entity_tm(void* e, const float pos[3], const float q[4]);   // WO-217 F: IEntity::SetPosRotScale (its scale kept), guarded
+bool write_entity_tm(uint32_t eid, void* e, const float pos[3], const float q[4], holders::Holder who, const char* path);
 bool   entity_pos(void* e, float out[3]);          // world translation, SEH-guarded
 float  entity_yaw(void* e);                        // WO-155: the body's yaw (atan2 of the world matrix's x axis); forward = (-sin, cos)
 void*  entity_by_name(const char* name);           // one full walk; null when absent

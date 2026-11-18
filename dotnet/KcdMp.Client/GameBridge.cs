@@ -7352,8 +7352,8 @@ public partial class GameBridge(ClientConfig config)
 
     /// <summary>
     /// The mod's native-write events (docs/WO-118-findings.md):
-    ///   npc_native &lt;name&gt; on &lt;eidHex&gt; &lt;wuidHex|?&gt; &lt;ax&gt; &lt;ay&gt; &lt;az&gt; &lt;delayMs&gt;
-    ///   npc_native &lt;name&gt; off [why]
+    ///   npc_native &lt;name&gt; on &lt;eidHex&gt; &lt;wuidHex|?&gt; &lt;ax&gt; &lt;ay&gt; &lt;az&gt; &lt;delayMs&gt; [lease]
+    ///   npc_native &lt;name&gt; off [why] [lease]
     ///   npc_native_hold &lt;name&gt; &lt;ms&gt;
     ///   npc_native_cfg &lt;on|off&gt; &lt;senderclock on|off&gt;
     ///   npc_trace &lt;name&gt; &lt;seconds&gt;
@@ -7415,11 +7415,26 @@ public partial class GameBridge(ClientConfig config)
                 string npc = p[0];
                 if (p[1] == "off")
                 {
+                    if (p.Length > 4) return;
+                    if (p.Length == 4)
+                    {
+                        if (!uint.TryParse(p[3], NumberStyles.None, CultureInfo.InvariantCulture, out uint releaseLease) || releaseLease == 0) return;
+                        NativeBindInOrder(async () =>
+                        {
+                            var (ok, reason) = await _combat.NpcBindAsync(false, 0, 0, 0, 0, 0, 0, npc, requireConfirmed: true);
+                            if (!ok) return;
+                            _nativeBound.TryRemove(npc, out _);
+                            _ = ExecLuaAsync(FormattableString.Invariant($"if KCD2MP_NpcNativeAck then KCD2MP_NpcNativeAck(\"{npc}\", 1, \"{NativeNpcCodec.ReasonTag(reason)}\", {releaseLease}, true) end"));
+                        }, enforceOrder: true);
+                        return;
+                    }
                     _nativeBound.TryRemove(npc, out _);   // WO-118 follow-up: Lua writes it: full rate again
                     NativeBindInOrder(() => _combat.NpcBindAsync(false, 0, 0, 0, 0, 0, 0, npc));
                     return;
                 }
-                if (p.Length != 8
+                uint bindLease = 0;
+                if (p[1] != "on" || p.Length is not (8 or 9)
+                    || (p.Length == 9 && (!uint.TryParse(p[8], NumberStyles.None, CultureInfo.InvariantCulture, out bindLease) || bindLease == 0))
                     || !uint.TryParse(p[2], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint eid) || eid == 0
                     || !float.TryParse(p[4], NumberStyles.Float, CultureInfo.InvariantCulture, out float ax)
                     || !float.TryParse(p[5], NumberStyles.Float, CultureInfo.InvariantCulture, out float ay)
@@ -7439,14 +7454,17 @@ public partial class GameBridge(ClientConfig config)
                     Console.WriteLine($"[wo121] ghost {bindGhost} entity id 0x{eid:X} learned from its native bind");
                 NativeBindInOrder(async () =>
                 {
-                    var (ok, reason) = await _combat.NpcBindAsync(true, eid, wuid, ax, ay, az, delayMs, npc);
+                    var (ok, reason) = await _combat.NpcBindAsync(true, eid, wuid, ax, ay, az, delayMs, npc,
+                        requireConfirmed: bindLease != 0);
                     if (ok) Interlocked.Increment(ref _nativeBindsOk); else Interlocked.Increment(ref _nativeBindsRefused);
+                    if (bindLease != 0 && reason is (byte)PipeReason.NotConnected or (byte)PipeReason.NoAnswer) return;
                     if (ok) _nativeBound[npc] = 1; else _nativeBound.TryRemove(npc, out _);   // WO-118 follow-up
                     string tag = NativeNpcCodec.ReasonTag(reason);
                     if (!ok) Console.WriteLine($"[npcwrite] bind {npc} eid=0x{eid:X} refused: {tag}");
                     // the ack is not waited for: the next bind or unbind in the order goes out at once
-                    _ = ExecLuaAsync($"if KCD2MP_NpcNativeAck then KCD2MP_NpcNativeAck(\"{npc}\", {(ok ? 1 : 0)}, \"{tag}\") end");
-                });
+                    string lease = bindLease == 0 ? "" : FormattableString.Invariant($", {bindLease}");
+                    _ = ExecLuaAsync($"if KCD2MP_NpcNativeAck then KCD2MP_NpcNativeAck(\"{npc}\", {(ok ? 1 : 0)}, \"{tag}\"{lease}) end");
+                }, enforceOrder: bindLease != 0);
                 return;
             }
         }
@@ -7462,9 +7480,9 @@ public partial class GameBridge(ClientConfig config)
     /// stayed unbound, never written again, 16 m from its fight, while Lua held it bound). Twin: KCDMP_TEST_W209_OFF=native_bind_order
     /// (the old way: the unbind at once, the bind from its own task).
     /// </summary>
-    private void NativeBindInOrder(Func<Task> op)
+    private void NativeBindInOrder(Func<Task> op, bool enforceOrder = false)
     {
-        if (!W209("native_bind_order")) { _ = Task.Run(op); return; }
+        if (!enforceOrder && !W209("native_bind_order")) { _ = Task.Run(op); return; }
         Interlocked.Increment(ref _nativeBindChained);
         lock (_nativeBindLock)
             _nativeBindChain = _nativeBindChain.ContinueWith(_ => op(), CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
@@ -7501,7 +7519,7 @@ public partial class GameBridge(ClientConfig config)
             var st = await _combat.NpcStatusAsync(ct);
             if (st is not { } s) return;
             await ExecLuaAsync(FormattableString.Invariant(
-                $"if KCD2MP_NpcNativeAlive then KCD2MP_NpcNativeAlive({(s.Armed ? 1 : 0)}, {(s.NativeOn ? 1 : 0)}, {s.Bound}, {s.Writing}) end"));
+                $"if KCD2MP_NpcNativeAlive then KCD2MP_NpcNativeAlive({(s.Armed ? 1 : 0)}, {(s.NativeOn ? 1 : 0)}, {s.Bound}, {s.Writing}, 1) end"));
             if ((++_nativeHeartbeats % 10) == 0)
                 Console.WriteLine(FormattableString.Invariant(
                     $"MP-NPCWRITE-STATUS armed={(s.Armed ? 1 : 0)} on={(s.NativeOn ? 1 : 0)} bound={s.Bound} writing={s.Writing} frames={s.FramesWritten} writes={s.Writes} drops={s.Drops} samples={s.Samples} feed_enqueued={Interlocked.Read(ref _nativeFeed.Enqueued)} feed_sent={Interlocked.Read(ref _nativeFeed.Sent)} feed_batches={Interlocked.Read(ref _nativeFeed.Batches)} feed_failed={Interlocked.Read(ref _nativeFeed.FailedBatches)} feed_coalesced={Interlocked.Read(ref _nativeFeed.Coalesced)} binds_ok={Interlocked.Read(ref _nativeBindsOk)} binds_refused={Interlocked.Read(ref _nativeBindsRefused)} dll_drops_seen={Interlocked.Read(ref _nativeDrops)} holds={Interlocked.Read(ref _nativeHolds)} lua_bound={_nativeBound.Count} lua_pushed={_npcLua.Pushed} lua_coalesced={_npcLua.Coalesced}"));

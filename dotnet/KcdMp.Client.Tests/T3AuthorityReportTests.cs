@@ -42,6 +42,9 @@ public class T3AuthorityReportTests
     [InlineData(true, 1, false, 47)]
     [InlineData(false, 2, false, 47)]
     [InlineData(false, 2, false, 46)]
+    [InlineData(false, 2, false, 48)]
+    [InlineData(true, 1, false, 49)]
+    [InlineData(false, 2, false, 49)]
     public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role, bool truncated, int statsFields)
     {
         string name = "t3r-" + Guid.NewGuid().ToString("N")[..16];
@@ -78,7 +81,7 @@ public class T3AuthorityReportTests
         foreach (string key in new[] { "pickup_asks", "pickup_optimistic", "pickup_rollbacks", "pickup_unknown_kept", "ask_timeouts", "ask_latency_ms_p95", "take_busy_refusals", "input_held_max_s", "input_releases", "auto_rejoins_in_world" })
             Assert.Contains(key + "=0", fields);
         Assert.Equal(truncated ? 1 : 0, counters["authority_stats_unreadable"]);
-        bool worldUnavailable = truncated || statsFields == 46;
+        bool worldUnavailable = truncated || statsFields is 46 or 48;
         Assert.Equal(worldUnavailable ? 1 : 0, counters["world_stats_unreadable"]);
         bool corpseUnavailable = worldUnavailable || statsFields < 24;
         bool rangedUnavailable = worldUnavailable || statsFields < 30;
@@ -93,13 +96,24 @@ public class T3AuthorityReportTests
         Assert.Contains("ranged_native_unknown_hand=" + (rangedUnavailable ? 42 : 36), fields);
         foreach (string key in new[] { "ranged_out", "ranged_in", "ranged_kind_unknown", "ranged_bow_played", "ranged_hits_verdict" }) Assert.Contains(key + "=0", fields);
         foreach (string key in new[] { "lua_corpse_visible", "lua_corpse_hidden_blocked", "lua_corpse_unknown_kept" }) Assert.Contains(key + "=0", fields);
-        if (statsFields == 47 && !worldUnavailable)
+        if (statsFields >= 47 && !worldUnavailable)
         {
             Assert.Contains("rp_e2e_ms_p95=41", fields);
             Assert.Contains("rp_step_ratio=48", fields);
+            Assert.Contains("owner_violations=50", fields);
             Assert.Contains("rp_owner_n=56", fields);
         }
         else Assert.DoesNotContain("rp_e2e_n=", fields);
+        if (statsFields == 49 && !worldUnavailable)
+        {
+            Assert.Contains("owner_handovers=57", fields);
+            Assert.Contains("owner_denied_sets=58", fields);
+        }
+        else
+        {
+            Assert.DoesNotContain("owner_handovers=", fields);
+            Assert.DoesNotContain("owner_denied_sets=", fields);
+        }
         await Reply(server, 3, Protocol.T3OpStats, stop.Token);
         await report.WaitAsync(stop.Token);
         var gate = (SemaphoreSlim)typeof(CombatPipe).GetField("_gate", Private)!.GetValue(pipe)!;

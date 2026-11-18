@@ -14,6 +14,14 @@
 
 namespace kcdmp::wo215rules {
 
+constexpr uint32_t kNoRequest = 0xFFFFFFFFu;
+
+// Read-back of the movement task is required before a different path can
+// write. If a failed queue left an unknown ID, only an empty task is proof.
+inline bool request_released(uint32_t current, uint32_t installed) {
+    return current == kNoRequest || (installed != kNoRequest && current != installed);
+}
+
 // ---- the agent's switch word (op 150): every bit on until the agent says otherwise; the bench's twin: KCDMP_TEST_W215_OFF=<names|all>
 constexpr uint32_t kBitRoute = 0x001;        // A.1 route: a copy on the ground moves by the engine's movement request
 constexpr uint32_t kBitGait = 0x002;         // A.2 gait: the request's speed class follows the host's speed (off: every request walks)

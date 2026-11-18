@@ -55,3 +55,31 @@ Beim Einschalten beginnt ein frisches Messfenster. Bei einem bereits geladenen H
 3. Der Joiner läuft die 60-s-Route mit der Treppe. Das Tempo auf einem ebenen Abschnitt für mehrere Sekunden halten. Beide Logs sammeln.
 4. Die Route mit dem Host als Sender wiederholen. Sichtbare Korrekturen, harte Versetzungen und Laufbild pro Richtung festhalten.
 5. Pro Bundle Messquelle und Stichproben prüfen. Absolute Ende-zu-Ende-Zeit braucht eine belegte gemeinsame Uhr oder synchronisierte Zeitbasis. `mp_rp_measure_clock` ist die lokale Testfreigabe für einen gemeinsamen Rechner-Takt. Die Freigabe bleibt auf getrennten Rechnern `off`.
+
+## s2-2 · Besitzerwechsel pro Körper
+
+Für das Rig mit zwei Spielinstanzen einen Wegwerfstand mit Bank und Gelegenheit für eine Prügelei laden. Beide Henrys bleiben in Sichtweite. `ownerhandover` meldet die einzelnen Schritte im Terminal. Der Spieler am Sender führt sie im Spiel aus. Das Rig liest den Sitzwechsel aus dem Agent-Log und den KO, das Aufwachen und den Pferdestatus über die Spielkonsole. Beim Empfänger sucht es im nativen Log nach den passenden Übergängen derselben Partnerfigur und Körper-ID. `--reiten` ergänzt Auf- und Absteigen, wenn ein Pferd da ist. `--tod` ergänzt als letzten Schritt einen Tod im Wegwerfstand. `--sender host` vertauscht die Messrichtung.
+
+```powershell
+$env:KCDMP_TEST_OWNER_HANDOVER = '1'
+python tools/rig/pair.py relay --netz normal
+python tools/rig/scenarios.py ownerhandover --test-ownerhandover --netz normal
+```
+
+Für den Bot nur das Relay und den geladenen Host starten. `$Anlauf` enthält die Koordinaten `x,y,z`. Der Bot geht von dort drei Meter in Richtung `+Y` zur Bank. `$BankGuid` enthält die 16 Hex-Ziffern `obj=` aus `WO164-SITSTATE enter` des echten Sitzversuchs im selben Teststand. Der T4 Bot-Joiner sendet Sitz-, KO- und Aufstehzustände. `--horse` mit dem Namen eines erreichbaren Pferds ergänzt das Reiten. `--tod` sendet am Ende den Tod. Der Bot belegt den Versand der Skriptzustände. Belege für einen Wechsel des Halters kommen aus der echten Empfänger-DLL.
+
+```powershell
+$env:KCDMP_TEST_BOT = '1'
+python tools/rig/scenarios.py ownerhandover --test-ownerhandover --netz normal --bot --origin $Anlauf --seat $BankGuid
+```
+
+Beide Varianten mit einem neuen `KCDMP_RIG_RUN` und einem frischen Relay für `--netz schlecht` wiederholen. Das Rig prüft 150 ms Zusatzlatenz und 0–35 ms Jitter anhand des im aktuellen Relay geladenen Plans und der verzögerten Frames. `ownerhandover.json` enthält die angeforderten Schritte, Belege des Senders, native Übergänge und die Differenz der Zähler vor und nach dem Lauf. Das LogPack-Bundle enthält den T1-Bericht. `owner_violations` über null ist rot. Null mit belegten Setter-Prüfungen ist grün, fehlende Abdeckung grau. `owner_handovers` und `owner_denied_sets` zeigen die beobachteten Übergaben und abgewehrten Setter. Der Lauf braucht zusätzlich alle angeforderten Übergaben derselben Partnerfigur. Die tatsächlichen Bewegungen am Übergang bleiben im Spiel zu prüfen.
+
+### Zwei-PC-Checkliste
+
+1. Denselben Build verwenden. Beide Henrys in einem Wegwerfstand bei Bank und Pferd verbinden.
+2. Der Sender geht, setzt sich und steht wieder auf. Am Empfänger den Wechsel vom Writer zum Sitz und zurück prüfen. Auf sichtbare Sprünge oder Rutschen achten.
+3. Der Sender geht in einer Prügelei KO und steht wieder auf. Der Empfänger prüft, dass dieselbe Figur zu Boden geht, liegen bleibt und dort wieder aufsteht.
+4. Auf- und absteigen, wenn ein Pferd verfügbar ist. Den Übergang von `mount` zurück zum Writer und die Stelle des Abstiegs prüfen.
+5. Einen realen Tod im Wegwerfstand auslösen. Prüfen, dass die alte Figur liegen bleibt. Danach den Stand neu laden.
+6. Rollen tauschen und die Logs beider PCs sammeln. `owner_violations` bleibt bei null, `rp_owner_n` steigt. Abgewehrte Setter und zusätzliche Halterwechsel mit den beobachteten Aktionen abgleichen.

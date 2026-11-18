@@ -1,6 +1,7 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "t3_native_stats_rules.h"
+#include "holders.h"
 #include "p4.h"
 #include "wo216.h"
 #include "respawn_actions.h"
@@ -23,7 +24,13 @@ inline size_t stats(uint8_t* out, size_t cap) {
     const size_t prior = append_ranged(out, corpses, cap, ranged);
     if (!prior || cap < kRpMeasureBytes) return prior;
     static_assert(rpmeasure::kFields == kRpMeasureFields);
-    const auto measure = rpmeasure::snapshot();
-    return append_rp_measure(out, prior, cap, measure.data());
+    auto measure = rpmeasure::snapshot();
+    const auto owners = holders::owner_stats();
+    measure[kRpOwnerViolationsIndex] = owners.violations;
+    measure[kRpOwnerChecksIndex] = owners.checks;
+    const size_t measured = append_rp_measure(out, prior, cap, measure.data());
+    if (!measured || cap < kOwnerBytes) return measured;
+    const uint64_t owner_counts[] = {owners.handovers, owners.denied_sets};
+    return append_owners(out, measured, cap, owner_counts);
 }
 } // namespace kcdmp::t3native

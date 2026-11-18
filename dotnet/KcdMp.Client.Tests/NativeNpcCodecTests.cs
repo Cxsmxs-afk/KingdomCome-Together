@@ -125,6 +125,7 @@ public class NativeNpcCodecTests
         Assert.Equal("not-living", NativeNpcCodec.ReasonTag((byte)NativeNpcReason.NotLiving));
         Assert.Equal("entity-gone", NativeNpcCodec.ReasonTag((byte)NativeNpcReason.EntityGone));
         Assert.Equal("pipe-closed", NativeNpcCodec.ReasonTag((byte)NativeNpcReason.PipeClosed));
+        Assert.Equal("owner-busy", NativeNpcCodec.ReasonTag((byte)NativeNpcReason.OwnerBusy));
         Assert.Equal("no-answer", NativeNpcCodec.ReasonTag(201));
     }
 }

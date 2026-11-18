@@ -22,6 +22,7 @@ int playerObject = 0, otherObject = 0, entityObject = 0;
 bool worldReady = true, flagsKnown = true, combat = false, dead = false, ko = false;
 bool physicsKnown = true, physicalPresent = true, living = true, flyingKnown = true, bodyDown = false;
 int flying = 0, writes = 0, soulScans = 0, positionReads = 0, flagReads = 0, probes = 0, fallOff = 0;
+kcdmp::p4::Source writeSource = kcdmp::p4::Source::Unknown;
 float pos[3] = {0,0,10}, groundZ = 10;
 bool writeResult = true, writeMoves = true, writeFar = false, unknownAfter = false, positionKnown = true;
 bool groundKnown = true, changeGenAtProbe = false, lifeAtProbe = false, combatAtProbe = false;
@@ -38,6 +39,7 @@ void reset() {
     pos[0] = 0; pos[1] = 0; pos[2] = 10; playerWuid = 100;
     kcdmp::p4::tick(); ++clockMs; // retire the preceding world's lease before measuring this fixture
     writes = 0; soulScans = 0; positionReads = 0; flagReads = 0; probes = 0; fallOff = 0;
+    writeSource = kcdmp::p4::Source::Unknown;
 }
 kcdmp::p4::Context ctx(kcdmp::p4::Source source = kcdmp::p4::Source::Join) { return {source,clockMs+2000,worldGen}; }
 const float partner[3] = {0,0,10};
@@ -52,7 +54,13 @@ namespace kcdmp::actions {
 uint64_t entity_wuid(void*) { return playerWuid; }
 bool player_position(float* out) { ++positionReads; std::memcpy(out,pos,12); return positionKnown; }
 bool suppress_fall_damage(bool on) { if (!on) ++fallOff; return true; }
-bool teleport_player(float x,float y,float z) { ++writes; if (writeMoves) {pos[0]=writeFar?x+100:x;pos[1]=y;pos[2]=z;}if(unknownAfter)positionKnown=false;return writeResult; }
+bool teleport_player(float x, float y, float z, p4rules::Source source) {
+    writeSource = source;
+    ++writes;
+    if (writeMoves) { pos[0] = writeFar ? x + 100 : x; pos[1] = y; pos[2] = z; }
+    if (unknownAfter) positionKnown = false;
+    return writeResult;
+}
 }
 namespace kcdmp::motion { bool combat_mode_of(uint32_t,bool* out) { *out=combat;return flagsKnown; } bool local_down_now() { return bodyDown; } }
 namespace kcdmp::npcdrive {
@@ -85,9 +93,18 @@ int p4_flow_tests(int* passed) {
     PCHECK(r.ok && writes==1,"fresh grounded placement actually writes");
     PCHECK(world.size()==8198 && soulScans==0,"8198-soul world fixture never causes a teleport-frame world scan");
     PCHECK(positionReads<=3 && flagReads<=6 && probes<=8,"normal placement has bounded direct reads and at most8 ground probes");
+    using kcdmp::p4::Source;
+    const Source sources[] = {Source::Join, Source::Leash, Source::LeashSettle, Source::Respawn, Source::Unstuck,
+                              Source::VideoLanding, Source::VideoRollback, Source::SceneNudge};
+    for (const Source source : sources) {
+        reset();
+        r = kcdmp::p4::place(partner, 3, ctx(source), source == Source::Respawn);
+        PCHECK(r.ok && writes == 1 && writeSource == source, "placement forwards the exact validated source to its owner guard");
+    }
     reset();uint8_t beforeStats[173]{},afterStats[173]{};kcdmp::p4::stats(beforeStats,sizeof beforeStats);
     writeResult=false;writeMoves=false;r=kcdmp::p4::place(partner,3,ctx());kcdmp::p4::stats(afterStats,sizeof afterStats);
     PCHECK(!r.ok && kcdmp::p4rules::u64(beforeStats+3)==kcdmp::p4rules::u64(afterStats+3),"failed engine call never counts as actual teleport");
+    PCHECK(fallOff == 1, "a refused write relinquishes the newly acquired fall-damage lease");
     reset();kcdmp::p4::stats(beforeStats,sizeof beforeStats);writeMoves=false;r=kcdmp::p4::place(partner,3,ctx());kcdmp::p4::stats(afterStats,sizeof afterStats);
     PCHECK(!r.ok && kcdmp::p4rules::u64(beforeStats+3)==kcdmp::p4rules::u64(afterStats+3),"successful void return without observed movement is not a fake teleport count");
     reset();kcdmp::p4::stats(beforeStats,sizeof beforeStats);writeFar=true;r=kcdmp::p4::place(partner,3,ctx(kcdmp::p4::Source::Respawn),true);kcdmp::p4::stats(afterStats,sizeof afterStats);

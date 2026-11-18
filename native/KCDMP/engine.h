@@ -19,6 +19,8 @@
 
 #include <cstdint>
 
+namespace kcdmp::holders { enum class Holder : uint8_t; }
+
 namespace kcdmp::engine {
 
 bool resolve();
@@ -36,7 +38,7 @@ uint32_t    entity_id(void* e);
 uint64_t    entity_guid(void* e);
 const char* entity_name(void* e);
 bool        entity_world_pos(void* e, float out[3]);
-bool        entity_set_pos(void* e, const float pos[3]);
+bool        entity_set_pos(void* e, const float pos[3], holders::Holder owner, const char* path);
 bool        entity_add_flags(void* e, uint32_t flags);
 // LoadGeometry(slot, file, geomName=null, flags). Returns the slot or -1.
 int         entity_load_geometry(void* e, int slot, const char* file, int flags);

@@ -105,4 +105,28 @@ public class T3NativeCountersTests
         Assert.True(T3NativeCounters.TryRead(Payload(30), out var previous));
         Assert.DoesNotContain("rp_e2e_n", previous.Keys);
     }
+
+    [Fact]
+    public void Owner_counters_extend_a_complete_presentation_snapshot_atomically()
+    {
+        byte[] bytes = Payload(49);
+        Assert.Equal(443, bytes.Length);
+        Assert.True(T3NativeCounters.TryRead(bytes, out var values));
+        Assert.Equal(40, values["owner_violations"]);
+        Assert.Equal(46, values["rp_owner_n"]);
+        Assert.Equal(47, values["owner_handovers"]);
+        Assert.Equal(48, values["owner_denied_sets"]);
+
+        Assert.True(T3NativeCounters.TryRead(Payload(47), out var previous));
+        Assert.DoesNotContain("owner_handovers", previous.Keys);
+        Assert.DoesNotContain("owner_denied_sets", previous.Keys);
+        Assert.False(T3NativeCounters.TryRead(Payload(48), out _));
+        byte[] onlyDenials = Payload(48);
+        onlyDenials[2 + 47 * 9] = 48;
+        Assert.False(T3NativeCounters.TryRead(onlyDenials, out _));
+        byte[] missingPresentation = [1, 32, .. bytes.AsSpan(2, 30 * 9), .. bytes.AsSpan(2 + 47 * 9)];
+        Assert.False(T3NativeCounters.TryRead(missingPresentation, out _));
+        Assert.True(T3NativeCounters.TryRead(Payload(50), out var future));
+        Assert.Equal(49, future.Count);
+    }
 }

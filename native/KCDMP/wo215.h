@@ -48,11 +48,11 @@ struct RouteIn {
     float newestAgeS = 0;   // WO-216: how long ago the newest sample's pose was true (its host clock mapped here)
     double now = 0;
 };
-enum class Verdict : uint8_t { Writer = 0, Routed = 1, Correct = 2 };
+enum class Verdict : uint8_t { Writer = 0, Routed = 1, Correct = 2, Draining = 3 };
 struct RouteOut { Verdict v = Verdict::Writer; wo215rules::WriterWhy why = wo215rules::WriterWhy::Off; };
 RouteOut route_frame(const RouteIn& in);
-// The body left the writer (dropped, a hold, a posture): any request of ours on it is cancelled, its state forgotten. Main thread.
-void route_release(uint32_t eid, const char* why);
+// False while the AI thread still has a queued/live request or owes its stop confirmation. Main thread.
+bool route_release(uint32_t eid, const char* why);
 // motion.cpp: the engine's own movement drives this body's gait (our pseudo-speed and velocity stay off it). Main thread.
 bool routed(uint32_t eid);
 // wo208.cpp: the copy's walk start and stop come from its own movement system (the owner never installs them). Main thread.

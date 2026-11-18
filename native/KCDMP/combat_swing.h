@@ -17,7 +17,9 @@
 // no-retain lifecycle sound).
 
 #include <cstdint>
+#include <optional>
 
+#include "holders.h"
 #include "wo167_rules.h"
 
 namespace kcdmp::rttr {
@@ -67,10 +69,15 @@ const char* swing_result_name(SwingResult r);
 /// returns Ok, matching WO-45's live observation.
 SwingResult ghost_swing(uint32_t entityId, const char* fragSpec);
 
+// Reserve the body before entering an engine request that can animate its root.
+// The existing native pose hold outlives the call; the caller records acceptance.
+std::optional<holders::Permit> begin_combat_pose(uint32_t entityId, const char* path, uint16_t holdMs = 900);
+
 /// WO-208 A (main thread): queue the host's fragment (its id, its 20-byte tag block, its priority, its flags) on this body through its
 /// own C_CombatAnimActionManager -- ghost_swing's route without the spec text. On Ok, *outAction holds one reference of the caller's
 /// (read its status at +0x28, step its priority at +0x24, drop it with release_action).
-SwingResult install_fragment(uint32_t entityId, uint32_t fragmentId, const uint8_t tags[20], int32_t priority, uint32_t flags, void** outAction);
+SwingResult install_fragment(uint32_t entityId, uint32_t fragmentId, const uint8_t tags[20], int32_t priority, uint32_t flags,
+                             void** outAction, bool movesBody = false);
 bool release_action(void* action);
 /// WO-208 A.2: the game's own stop of an action (IAction::Stop: never installed when still pending, blended out when running);
 /// false when the game's function is not found in this build (the caller steps the priority down instead). Main thread.

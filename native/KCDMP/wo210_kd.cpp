@@ -11,14 +11,18 @@
 #include "wo163.h"
 #include "wo172.h"
 #include "anchors.h"
+#include "body_drive.h"
 #include "engine.h"
 #include "fault_guard.h"
 #include "hits.h"
+#include "holders.h"
 #include "log.h"
 #include "motion.h"
 #include "npc_drive.h"
 #include "npc_scan.h"
 #include "rttr_abi.h"
+#include "wo215.h"
+#include "wo216.h"
 #include <windows.h>
 #include <atomic>
 #include <cstdio>
@@ -68,6 +72,8 @@ std::atomic<uint32_t> c_falls{0}, c_fallRefused{0}, c_ups{0}, c_ownUps{0}, c_dea
 std::atomic<uint32_t> c_suppressSet{0}, c_suppressCleared{0}, c_refalls{0};   // WO-217 B.2
 struct Follow { bool suppressed = false; int refalls = 0; double lastFallAt = -1e9; };
 std::unordered_map<uint32_t, Follow> g_follow;   // WO-217 B.2, main thread
+struct BuffPose { const void* entity; uint64_t world; bool down; };
+std::unordered_map<uint32_t, BuffPose> g_buffPose;
 
 bool find_seq_exact(const uint8_t* b, size_t n, const uint8_t* pat, size_t pn, size_t* at) {
     for (size_t o = 0; o + pn <= n; ++o) if (!std::memcmp(b + o, pat, pn)) { *at = o; return true; }
@@ -220,12 +226,36 @@ bool is_ragdoll(void* rm) {
     return fault::guarded_or<bool>(g_siteIs, false, [&]() -> bool { using F = bool (*)(void*); return reinterpret_cast<F>(A.isRagdoll)(rm); });
 }
 
+bool buff_holds(uint32_t eid) {
+    const auto it = g_buffPose.find(eid);
+    if (it == g_buffPose.end()) return false;
+    void* entity = engine::entity_by_id(eid);
+    if (entity && entity == it->second.entity && wo216::lifecycle_generation() == it->second.world) {
+        const bool down = it->second.down;
+        npcdrive::PhysicsStatus physics{};
+        if (down || !npcdrive::physics_status(entity, &physics) || !physics.present || !physics.living) return true;
+    }
+    g_buffPose.erase(it);
+    return false;
+}
+
 void count_line(const char* npc, const char* what, double heldS, std::atomic<uint32_t>& c) {
     const uint32_t k = c.fetch_add(1) + 1;
     if (k <= 200 || k % 100 == 0) logf("WO210-KD %s npc=%s held_ms=%.0f [n=%u]", what, npc ? npc : "?", heldS * 1000.0, k);
 }
 
 } // namespace
+
+bool take_fall(uint32_t eid, const char* name, double now) {
+    return bodydrive::release(eid, "ragdoll handover") && wo215::route_release(eid, "ragdoll handover") &&
+           holders::handover(eid, name, holders::Holder::Fall, now);
+}
+
+void note_buff_pose(uint32_t eid, bool down) {
+    if (void* e = engine::entity_by_id(eid)) g_buffPose[eid] = {e, wo216::lifecycle_generation(), down};
+}
+
+void clear_buff_pose(uint32_t eid) { g_buffPose.erase(eid); }
 
 bool host_down(uint32_t eid, void* e, const char* fullBodyClass) {
     if (!e || npcscan::body_kind(e) != 0) return false;   // humans only: a horse's physics is never a living entity
@@ -240,6 +270,7 @@ bool host_down(uint32_t eid, void* e, const char* fullBodyClass) {
 }
 
 bool copy_tick(uint32_t eid, const char* name, bool hostDown, double now) {
+    if (buff_holds(eid)) return true;
     if (!A.armed) return false;
     auto it = g_kd.find(eid);
     if (!hostDown && it == g_kd.end()) return false;   // the common case: no knockdown, no state
@@ -250,15 +281,33 @@ bool copy_tick(uint32_t eid, const char* name, bool hostDown, double now) {
         g_kd.erase(eid);
         return false;
     }
-    const bool rag = is_ragdoll(rm);
+    bool rag = false;
+    if (!fault::guarded(g_siteIs, [&] { using F = bool (*)(void*); rag = reinterpret_cast<F>(A.isRagdoll)(rm); })) {
+        if (s.held) g_heldAt[eid] = now;
+        return s.held;
+    }
     const double fellAt = s.fellAt;
     // WO-217 B.2 (kd_follow): while its host NPC lies the copy is held down -- the suppress flag stops its engine's own stand-up; one its engine
     // stood up anyway is laid down again (bounded); the get-up is the host's up edge only (the twin: WO-210's "up how=own" after 1 s)
     const bool follow = wo217::on(wo217rules::kBitKdFollow) && wo210::on(kBitKnockdownSync) && !wo172::copy_dead(eid);
     Follow& fw = g_follow[eid];
+    const bool enabled = wo210::on(kBitKnockdownSync);
+    const bool dead = wo172::copy_dead(eid);
+    if (!s.held && !fw.suppressed && (!hostDown || s.hostDown || !enabled || dead)) {
+        kd_step(s, enabled, hostDown, rag, dead, now, holders::on());
+        g_heldAt.erase(eid);
+        if (!s.hostDown) { g_kd.erase(eid); g_follow.erase(eid); }
+        return false;
+    }
+    // Read/admit the edge before committing state so an asynchronous route cancellation
+    // cannot consume it. Leave the copy held while the outgoing movement stops.
+    if (!take_fall(eid, name, now)) { g_heldAt[eid] = now; return true; }
+    auto permit = holders::may_place(eid, holders::Holder::Fall, "wo210.ragdoll_pose");
+    if (!permit) { g_heldAt[eid] = now; return true; }
     auto set_suppress = [&](bool v) {
         if (!A.suppressOff || fw.suppressed == v) return;
         if (fault::guarded(g_siteRm, [&] { *(static_cast<uint8_t*>(rm) + A.suppressOff) = v ? 1 : 0; })) {
+            permit.wrote();
             fw.suppressed = v;
             (v ? c_suppressSet : c_suppressCleared).fetch_add(1, std::memory_order_relaxed);
         }
@@ -267,6 +316,7 @@ bool copy_tick(uint32_t eid, const char* name, bool hostDown, double now) {
         set_suppress(true);
         if (wo217rules::refall(true, s.held, hostDown, rag, now - (fw.lastFallAt > fellAt ? fw.lastFallAt : fellAt), fw.refalls)) {
             if (fault::guarded(g_siteFall, [&] { using F = void (*)(void*, int); reinterpret_cast<F>(A.requestRagdoll)(rm, 0); })) {
+                permit.wrote();
                 ++fw.refalls; fw.lastFallAt = now;
                 const uint32_t k = c_refalls.fetch_add(1) + 1;
                 if (k <= 200 || k % 50 == 0)
@@ -278,20 +328,23 @@ bool copy_tick(uint32_t eid, const char* name, bool hostDown, double now) {
         return true;   // held: no kd_step release while the host lies (the up edge below ends it)
     }
     if (!s.held || !hostDown) set_suppress(false);
-    const KdAct act = kd_step(s, wo210::on(kBitKnockdownSync), hostDown, rag, wo172::copy_dead(eid), now);
+    const KdState before = s;
+    const KdAct act = kd_step(s, enabled, hostDown, rag, dead, now, holders::on());
     if (act == KdAct::Fall) { fw.refalls = 0; fw.lastFallAt = now; if (follow) set_suppress(true); }
     switch (act) {
         case KdAct::Fall: {
             const bool ok = fault::guarded(g_siteFall, [&] { using F = void (*)(void*, int); reinterpret_cast<F>(A.requestRagdoll)(rm, 0); });
             if (!ok) { s = KdState{}; c_fallRefused.fetch_add(1); logf("WO210-KD fall npc=%s FAULTED -- the copy stands (its host NPC's knockdown not shown)", name ? name : "?"); break; }
+            permit.wrote();
             const uint32_t k = c_falls.fetch_add(1) + 1;
             if (k <= 200 || k % 100 == 0) logf("WO210-KD fall npc=%s (its host NPC is down: the engine's own ragdoll) [n=%u]", name ? name : "?", k);
             break;
         }
         case KdAct::StandUp: {
-            const bool off = !wo210::on(kBitKnockdownSync);
             const bool ok = fault::guarded(g_siteUp, [&] { using F = void (*)(void*, int); reinterpret_cast<F>(A.requestStandUp)(rm, 1); });
-            count_line(name, ok ? (off ? "up how=switch-off" : "up how=ours") : "up FAULTED", now - fellAt, off ? c_switchUps : c_ups);
+            if (ok) permit.wrote();
+            else if (holders::on()) s = before;   // keep the accepted fall; the next tick can repeat the up edge
+            count_line(name, ok ? (enabled ? "up how=ours" : "up how=switch-off") : "up FAULTED", now - fellAt, enabled ? c_ups : c_switchUps);
             break;
         }
         case KdAct::Release:
@@ -309,12 +362,13 @@ bool copy_tick(uint32_t eid, const char* name, bool hostDown, double now) {
 // body is its own engine's again, and the next state settles it).
 constexpr double kHeldStaleS = 3.0;
 bool held_down(uint32_t eid) {
+    if (buff_holds(eid)) return true;
     if (g_heldAt.empty()) return false;
     const auto it = g_heldAt.find(eid);
     return it != g_heldAt.end() && npcdrive::now_s() - it->second <= kHeldStaleS;
 }
 
-void forget(uint32_t eid) { g_kd.erase(eid); g_heldAt.erase(eid); }
+void forget(uint32_t eid) { g_kd.erase(eid); g_heldAt.erase(eid); g_follow.erase(eid); clear_buff_pose(eid); }
 
 // ---- C.1 / C.2: a body dead without the death reaction, finished the engine's way (op 142, main thread) ----------------------------
 namespace {
@@ -351,8 +405,14 @@ uint8_t finish(uint32_t eid, uint8_t* deadStateAfter, bool* ragdolled) {
         res = kFinDone;
     });
     if (!ok1 || res != kFinDone) return ok1 ? res : kFinFaulted;
+    if (!take_fall(eid, engine::entity_name(engine::entity_by_id(eid)), npcdrive::now_s())) return kFinFaulted;
+    auto permit = holders::may_place(eid, holders::Holder::Fall, "wo210.ragdoll_pose");
+    if (!permit) return kFinFaulted;
     if (void* rm = manager_of(eid)) {
-        if (!is_ragdoll(rm) && fault::guarded(g_siteFall, [&] { using F = void (*)(void*, int); reinterpret_cast<F>(A.requestRagdoll)(rm, 0); })) *ragdolled = true;
+        if (!is_ragdoll(rm) && fault::guarded(g_siteFall, [&] { using F = void (*)(void*, int); reinterpret_cast<F>(A.requestRagdoll)(rm, 0); })) {
+            *ragdolled = true;
+            permit.wrote();
+        }
     }
     const bool ok2 = fault::guarded(g_siteFinish, [&] {
         void* const* vt = *static_cast<void* const* const*>(actor);
@@ -361,6 +421,7 @@ uint8_t finish(uint32_t eid, uint8_t* deadStateAfter, bool* ragdolled) {
         void* exp = reinterpret_cast<P0>(A.expGetter)(holder);
         if (!exp) { res = kFinFaulted; return; }
         reinterpret_cast<VB>(A.startDead)(exp, false);
+        permit.wrote();
         void* const* mvt = *static_cast<void* const* const*>(model);
         *deadStateAfter = reinterpret_cast<BS>(mvt[A.isStateSlot / 8])(model, A.deadState) ? 1 : 0;
     });

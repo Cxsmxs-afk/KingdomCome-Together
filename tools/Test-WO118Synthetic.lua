@@ -561,6 +561,44 @@ do
     check("n: no Lua errors", #ERRS == 0, ERRS[1])
 end
 
+-- The installed Agent supplies release receipts. Model a native writer that
+-- received the bind while both of its responses are delayed.
+do
+    reset(); NOW = 1200
+    local name = "owner_lease_npc"
+    local e = mkEntity(name, 42, 20, 1)
+    local nativeWriting, collisions = false, 0
+    local write = e.SetWorldPos
+    e.SetWorldPos = function(self, p)
+        if nativeWriting then collisions = collisions + 1 end
+        write(self, p)
+    end
+    local function runFrames(n, x)
+        for i = 1, n do
+            KCD2MP_NpcNativeAlive(1, 1, 1, 1, 1)
+            tick(name, x + i * 0.08, 20, 1)
+        end
+    end
+    runFrames(1, 42)
+    local lease = KCD2MP._npcNative.leases[name].id
+    nativeWriting = true
+    runFrames(23, 42)
+    local events = evts("npc_native")
+    check("owner: silent bind requests release and blocks Lua", #e.writes == 0
+        and events[#events] == name .. " off lease " .. lease, events[#events])
+    KCD2MP_NpcNativeAck(name, 1, "ok", lease)
+    KCD2MP_NpcNativeAck(name, 1, "ok", lease + 1, true)
+    KCD2MP_NpcNativeAck(name, 0, "no-answer", lease, true)
+    runFrames(35, 44)
+    check("owner: late bind, stale release and failed release cannot restart Lua", #e.writes == 0)
+    nativeWriting = false
+    KCD2MP_NpcNativeAck(name, 1, "ok", lease, true)
+    runFrames(5, 46)
+    check("owner: confirmed native release resumes Lua", #e.writes > 0 and not KCD2MP_NpcNativeLeaseBusy(name))
+    check("owner: both paths exercised with zero dual writes", collisions == 0, collisions)
+    check("owner: no Lua errors", #ERRS == 0, ERRS[1])
+end
+
 -- Summary, in the shared driver's contract (Test-NpcSmoothSynthetic.ps1 reads
 -- the global OUT).
 local pass, fail = 0, 0

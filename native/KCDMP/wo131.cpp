@@ -14,11 +14,13 @@
 
 #include "buffs.h"
 #include "engine.h"
+#include "holders.h"
 #include "log.h"
 #include "npc_drive.h"
 #include "respawn_actions.h"
 #include "rttr_abi.h"
 #include "motion.h"
+#include "wo210_kd.h"
 
 namespace kcdmp::wo131 {
 namespace {
@@ -152,37 +154,48 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             break;
         case kGuardOff:
             motion::set_ko_hold(eid, false);
+            wo210kd::clear_buff_pose(eid);
             buffs::remove_all(cs, guard_guid());
             if (k) buffs::remove_all(cs, k->ko);
             c_guardOff.fetch_add(1);
             present = buffs::has(cs, guard_guid()) <= 0;
             break;
         case kGuardKnockout:
-            motion::set_ko_hold(eid, true);   // WO-201 V.4: a figure's own 5 s guard check would put upr=1 back and kill the unconsciousness
-            // Order: the imm-only guard first (never a moment without imm), then
-            // the full guard off (its upr=1 blocks unconsciousness), then the
-            // game's own unconsciousness.
-            if (buffs::has(cs, k->ko) <= 0 && !buffs::add(cs, k->ko)) { c_fail.fetch_add(1); return kRFailed; }
-            buffs::remove_all(cs, guard_guid());
-            if (buffs::has(cs, k->inf) <= 0) buffs::add(cs, k->inf);
-            if (buffs::has(cs, k->unc) <= 0 && !buffs::add(cs, k->unc)) { c_fail.fetch_add(1); return kRFailed; }
-            c_knockouts.fetch_add(1);
-            present = buffs::has(cs, k->unc) > 0;
-            logf("WO135-KO copy eid=0x%X knocked out (the host's NPC is): unconscious=%d imm-only guard=%d", eid,
-                 buffs::has(cs, k->unc), buffs::has(cs, k->ko));
+        case kGuardWake: {
+            if (!wo210kd::take_fall(eid, engine::entity_name(engine::entity_by_id(eid)), npcdrive::now_s()))
+                return kRFailed;
+            auto permit = holders::may_place(eid, holders::Holder::Fall, "wo131.unconscious_pose");
+            if (!permit) return kRFailed;
+            if (mode == kGuardKnockout) {
+                // The imm-only guard precedes the full guard's removal. Its upr=1 blocks unconsciousness.
+                if (buffs::has(cs, k->ko) <= 0 && !buffs::add(cs, k->ko)) { c_fail.fetch_add(1); return kRFailed; }
+                motion::set_ko_hold(eid, true);   // stop the figure's guard refresh from undoing the knockout
+                buffs::remove_all(cs, guard_guid());
+                if (buffs::has(cs, k->inf) <= 0) buffs::add(cs, k->inf);
+                if (buffs::has(cs, k->unc) <= 0) {
+                    if (!buffs::add(cs, k->unc)) { c_fail.fetch_add(1); return kRFailed; }
+                    permit.wrote();
+                }
+                wo210kd::note_buff_pose(eid, true);
+                c_knockouts.fetch_add(1);
+                present = buffs::has(cs, k->unc) > 0;
+                logf("WO135-KO copy eid=0x%X knocked out (the host's NPC is): unconscious=%d imm-only guard=%d", eid,
+                     present ? 1 : 0, buffs::has(cs, k->ko));
+            } else {
+                motion::set_ko_hold(eid, false);
+                buffs::remove_all(cs, k->inf);
+                const int removed = buffs::remove_all(cs, k->unc);
+                if (buffs::add(cs, k->rem) || removed > 0) permit.wrote();
+                if (buffs::has(cs, guard_guid()) <= 0) buffs::add(cs, guard_guid());
+                buffs::remove_all(cs, k->ko);
+                wo210kd::note_buff_pose(eid, false);
+                c_wakes.fetch_add(1);
+                present = buffs::has(cs, guard_guid()) > 0;
+                logf("WO135-KO copy eid=0x%X woken (the host's NPC is up): unconscious=%d guard=%d", eid,
+                     buffs::has(cs, k->unc), present ? 1 : 0);
+            }
             break;
-        case kGuardWake:
-            motion::set_ko_hold(eid, false);
-            buffs::remove_all(cs, k->inf);
-            buffs::remove_all(cs, k->unc);
-            buffs::add(cs, k->rem);
-            if (buffs::has(cs, guard_guid()) <= 0) buffs::add(cs, guard_guid());
-            buffs::remove_all(cs, k->ko);
-            c_wakes.fetch_add(1);
-            present = buffs::has(cs, guard_guid()) > 0;
-            logf("WO135-KO copy eid=0x%X woken (the host's NPC is up): unconscious=%d guard=%d", eid,
-                 buffs::has(cs, k->unc), buffs::has(cs, guard_guid()));
-            break;
+        }
         }
         out[0] = static_cast<uint8_t>(present ? 1 : 0);
         *outLen = 1;

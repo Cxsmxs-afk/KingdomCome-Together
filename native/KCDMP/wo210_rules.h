@@ -206,14 +206,30 @@ inline bool burst_ask(Burst& b, double now) {
 constexpr uint8_t kCmCombat = 0x01, kCmDown = 0x02;
 constexpr double kKdOwnUpGraceS = 1.0;   // a held copy not ragdolled this long after its fall was stood up by its own engine
 enum class KdAct : uint8_t { None = 0, Fall = 1, StandUp = 2, Release = 3 };
-struct KdState { bool hostDown = false, held = false, upPending = false; double fellAt = -1; };
+struct KdState { bool hostDown = false, held = false, upPending = false, upRequested = false; double fellAt = -1; };
 inline const char* kd_act_name(KdAct a) {
     switch (a) { case KdAct::Fall: return "fall"; case KdAct::StandUp: return "stand-up"; case KdAct::Release: return "release"; default: return "none"; }
 }
 // One step: the switch, the host's newest down bit, the copy's ragdoll, whether the copy is dead. Returns what to do now; the state moves.
-inline KdAct kd_step(KdState& s, bool on, bool hostDown, bool copyRagdoll, bool copyDead, double now) {
+inline KdAct kd_step(KdState& s, bool on, bool hostDown, bool copyRagdoll, bool copyDead, double now, bool confirmStandUp = false) {
     if (copyDead) { const bool was = s.held; s = KdState{}; s.hostDown = hostDown; return was ? KdAct::Release : KdAct::None; }
-    if (!on) { const bool was = s.held; s = KdState{}; return was ? (copyRagdoll ? KdAct::StandUp : KdAct::Release) : KdAct::None; }
+    if (s.upRequested) {
+        if (!copyRagdoll) s = KdState{};
+        else if (on && hostDown) { s.hostDown = true; s.upRequested = false; }
+        else return KdAct::None;   // the engine still owns the standing-up body
+    }
+    const auto finish_hold = [&] {
+        const double fellAt = s.fellAt;
+        s = KdState{};
+        if (!copyRagdoll) return KdAct::Release;
+        if (confirmStandUp) { s.held = true; s.upRequested = true; s.fellAt = fellAt; }
+        return KdAct::StandUp;
+    };
+    if (!on) {
+        if (s.held) return finish_hold();
+        s = KdState{};
+        return KdAct::None;
+    }
     if (hostDown && !s.hostDown) {                       // the host's down edge
         s.hostDown = true; s.upPending = false;
         s.held = true; s.fellAt = now;
@@ -223,7 +239,7 @@ inline KdAct kd_step(KdState& s, bool on, bool hostDown, bool copyRagdoll, bool 
         s.hostDown = false;
         if (s.held) s.upPending = true;
     }
-    if (s.held && s.upPending) { s = KdState{}; return copyRagdoll ? KdAct::StandUp : KdAct::Release; }
+    if (s.held && s.upPending) return finish_hold();
     if (s.held && s.hostDown && !copyRagdoll && now - s.fellAt >= kKdOwnUpGraceS) { s.held = false; return KdAct::Release; }   // its engine stood it up
     return KdAct::None;
 }

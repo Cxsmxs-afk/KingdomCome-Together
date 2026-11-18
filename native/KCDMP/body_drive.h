@@ -49,8 +49,8 @@ struct In {
 
 // The writer asks before it writes a bound body it holds (main thread, the frame hook).
 Out frame(const In& in);
-// The body left the driver (dropped, held by something else): its request is ended (no move target, no speed).
-void release(uint32_t eid, const char* why);
+// False while the previous controller request could still move the body.
+bool release(uint32_t eid, const char* why);
 // This body's gait, start and stop are the engine's own this frame (the gait inputs and the owner's walk family stay off it).
 bool driven(uint32_t eid);
 bool armed();

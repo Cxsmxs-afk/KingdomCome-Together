@@ -37,6 +37,7 @@
 #include "engine.h"
 #include "fault_guard.h"
 #include "gait_logic.h"
+#include "holders.h"
 #include "log.h"
 #include "motion.h"
 #include "npc_drive.h"
@@ -111,6 +112,7 @@ void read_knobs() {
 
 struct Drv {
     uint32_t eid = 0;
+    void* ent = nullptr;
     std::string name;
     bool active = false;        // a request of ours stands on its controller
     bool walking = false;       // the last request had a move target
@@ -163,7 +165,7 @@ void* controller_of(void* actor) {
 
 // One request to the body's controller. walking: a move target `to` at `mps` (class `cls`), `endM` to the path's end; standing: no
 // move target, no speed. Returns false when the body has no controller of the checked kind.
-bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float cls, float endM) {
+bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float cls, float endM, double now) {
     void* ctl = controller_of(actor);
     if (!ctl) return false;
     alignas(16) uint8_t req[kReqSize];
@@ -183,13 +185,27 @@ bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float
     std::memcpy(req + kReqTargetSpeed, &mps, 4);
     std::memcpy(req + kReqPseudoSpeed, &cls, 4);
     std::memcpy(req + kReqFlags, &flags, 8);
+    // The caller has already ended any previous owner. Clearing the request is
+    // the outgoing driver's last operation, so it never claims a new owner.
+    using holders::Holder;
+    const Holder current = holders::of(d.eid);
+    if (walking && (current == Holder::None || current == Holder::Writer || current == Holder::Figure || current == Holder::Driver) &&
+        !holders::handover(d.eid, d.name.c_str(), Holder::Driver, now)) return false;
+    const auto claim = walking ? holders::Claim::Held : holders::Claim::Release;
+    auto permit = holders::may_place(d.eid, Holder::Driver, "bodydrive::RequestMovement", claim);
+    if (!permit) return false;
     bool ok = false;
+    if (walking) d.active = true;   // a fault can follow a partial request merge
     if (!call_request(g_fnRequest, ctl, req, &ok)) {
+        if (walking) permit.wrote();   // the controller may have merged part of the request before the fault
         g_armed = false; g_why = "RequestMovement faulted";
-        logf("WO221-DRIVE RequestMovement FAULTED on %s: nothing is driven any more, the writer writes every copy", d.name.c_str());
+        logf("WO221-DRIVE RequestMovement FAULTED on %s: new requests disabled; an existing request must end before writing", d.name.c_str());
         return false;
     }
-    d.active = true;
+    permit.wrote();
+    // Even a declined movement request may have changed controller fields.
+    // Keep its claim until we have sent the matching stop successfully.
+    d.active = walking || !ok;
     d.walking = walking;
     return ok;
 }
@@ -212,16 +228,18 @@ void flush(Drv& d, double now) {
     d.errSum = d.errMax = d.jumpMaxCm = d.jumpSumCm = d.spdSum = d.wantSum = d.hostSum = 0;
 }
 
-void end_request(Drv& d, const char* why) {
-    if (!d.active) return;
-    void* actor = motion::actor_of(d.eid);
-    if (actor && engine::entity_by_id(d.eid)) {
+bool end_request(Drv& d, const char* why) {
+    if (!d.active) return true;
+    if (engine::entity_by_id(d.eid) == d.ent) {
+        void* actor = motion::actor_of(d.eid);
         const float to[3]{};
-        send(d, actor, false, to, 0.0f, 0.0f, 0.0f);
+        if (!actor || !send(d, actor, false, to, 0.0f, 0.0f, 0.0f, npcdrive::now_s())) return false;
     }
+    holders::engine_stopped(d.eid, holders::Holder::Driver);
     d.active = false; d.walking = false; d.havePrev = false; d.wantPrev = 0.0f; d.noMoveSince = 0;
     const uint32_t k = c_ends.fetch_add(1, std::memory_order_relaxed) + 1;
     if (k <= 60 || k % 500 == 0) logf("WO221-DRIVE end npc=%s why=%s: its request ends (no move target, no speed) [n=%u]", d.name.c_str(), why, k);
+    return true;
 }
 
 void install() {
@@ -271,7 +289,7 @@ void tick() {
     for (auto it = g_drv.begin(); it != g_drv.end();) {
         Drv& d = it->second;
         if (now - d.lastAt > 0.5) {
-            end_request(d, "no frame");
+            if (!end_request(d, "no frame")) { ++active; ++it; continue; }
             flush(d, now);
             it = g_drv.erase(it);
         } else { if (d.active) ++active; ++it; }
@@ -330,7 +348,7 @@ Out frame(const In& in) {
         const bool rest = hf == static_cast<uint8_t>(wo208rules::Fam::Idle) || hf == static_cast<uint8_t>(wo208rules::Fam::Empty);
         if (!loco && !(wasActive && rest)) {
             if (wasActive) {
-                end_request(found->second, "its host NPC took up something else");
+                if (!end_request(found->second, "its host NPC took up something else")) return Out::Driven;
                 c_famEnds.fetch_add(1, std::memory_order_relaxed);
                 return Out::Arrive;
             }
@@ -356,7 +374,7 @@ Out frame(const In& in) {
         const bool walkOn = wasActive ? (g_k.arrive ? (err > kArriveM || (!caughtUp && err > 0.15f)) : err > 0.15f) : (err > kRewalkM && err <= kSnapM);
         if (!walkOn) {
             if (wasActive) {
-                end_request(found->second, "arrived");
+                if (!end_request(found->second, "arrived")) return Out::Driven;
                 c_arrives.fetch_add(1, std::memory_order_relaxed);
                 return Out::Arrive;
             }
@@ -365,7 +383,7 @@ Out frame(const In& in) {
         }
     }
     Drv& d = g_drv[in.eid];
-    if (d.eid != in.eid) { d = Drv{}; d.eid = in.eid; d.name = in.name; d.winStart = now; }
+    if (d.eid != in.eid || d.ent != in.ent) { d = Drv{}; d.eid = in.eid; d.ent = in.ent; d.name = in.name; d.winStart = now; }
     // a body given back for being off its NPC's way is the writer's until it is back on it
     if (d.lost) {
         if (err > kRetakeM) { d.lastAt = now; c_lostFrames.fetch_add(1, std::memory_order_relaxed); return Out::Writer; }
@@ -376,7 +394,7 @@ Out frame(const In& in) {
         else if (now - d.farSince >= kLoseS && d.farErr - err >= kCloseInM) { d.farSince = now; d.farErr = err; }   // it is getting there: left to walk in
         else if (now - d.farSince >= kLoseS) {
             d.farSince = 0; d.lost = true;
-            end_request(d, "off its NPC's way");
+            if (!end_request(d, "off its NPC's way")) return Out::Driven;
             const uint32_t k = c_lost.fetch_add(1, std::memory_order_relaxed) + 1;
             if (k <= 100 || k % 100 == 0)
                 logf("WO221-DRIVE npc=%s is %.2f m from its place and came no nearer in %.1f s of walking at it: the writer brings it in, the driver takes it up again on its NPC's way [n=%u]",
@@ -467,7 +485,7 @@ Out frame(const In& in) {
                 d.restUntil = now + d.restS;
                 const double rested = d.restS;
                 d.restS = (std::min)(40.0, d.restS * 2.0);
-                end_request(d, "asked to walk and does not move");
+                if (!end_request(d, "asked to walk and does not move")) return Out::Driven;
                 const uint32_t k = c_noMove.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (k <= 100 || k % 100 == 0)
                     logf("WO221-DRIVE npc=%s was asked to walk for %.1f s and does not move (%.2f m from its place): the writer's for %.0f s [n=%u]",
@@ -477,7 +495,7 @@ Out frame(const In& in) {
         } else { d.noMoveSince = 0; if (d.spd >= 0.5f) d.restS = kNoMoveRestS; }
     }
     d.wantPrev = want;
-    if (!send(d, actor, true, to, want, cls, endM)) return Out::Writer;
+    if (!send(d, actor, true, to, want, cls, endM, now)) return Out::Writer;
     c_frames.fetch_add(1, std::memory_order_relaxed);
     // the window
     ++d.frames;
@@ -497,10 +515,9 @@ Out frame(const In& in) {
     return Out::Driven;
 }
 
-void release(uint32_t eid, const char* why) {
+bool release(uint32_t eid, const char* why) {
     auto it = g_drv.find(eid);
-    if (it == g_drv.end()) return;
-    end_request(it->second, why);
+    return it == g_drv.end() || end_request(it->second, why);
 }
 
 bool driven(uint32_t eid) {

@@ -10,6 +10,7 @@
 #include "wo203.h"
 #include "wo163.h"
 #include "engine.h"
+#include "holders.h"
 #include "log.h"
 #include "npc_drive.h"
 #include "npcstate.h"
@@ -91,7 +92,7 @@ void tick_carts() {
         float p[3], a[3], q[4];
         cart_pose(buf, n, now - g_offset - kCartDelayS, p, a);
         quat_xyz(a, q);
-        if (npcdrive::write_entity_tm(e, p, q)) { ++c.writes; c_writes.fetch_add(1, std::memory_order_relaxed); }
+        if (npcdrive::write_entity_tm(c.eid, e, p, q, holders::Holder::Cart, "wo217::cart")) { ++c.writes; c_writes.fetch_add(1, std::memory_order_relaxed); }
         else c_failed.fetch_add(1, std::memory_order_relaxed);
         ++it;
     }

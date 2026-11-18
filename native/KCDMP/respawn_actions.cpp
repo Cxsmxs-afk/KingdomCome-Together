@@ -9,7 +9,9 @@
 #include "anchors.h"
 #include "engine.h"
 #include "hangover.h"
+#include "holders.h"
 #include "local_state.h"
+#include "p4_rules.h"
 #include "pe_exports.h"
 #include "log.h"
 #include "wo171_rules.h"
@@ -1144,6 +1146,10 @@ bool player_position(float out[3]) {
 
 bool teleport_available() { return g_teleArmed; }
 
+namespace {
+constexpr uint32_t kLocalPlayerEid = 0x7777; // reserved for the Player classes
+}
+
 bool teleport_to_spot(uint64_t linkId) {
     void* p = c_player();
     if (!g_teleArmed || !p) return false;
@@ -1159,11 +1165,16 @@ bool teleport_to_spot(uint64_t linkId) {
              static_cast<unsigned long long>(linkId), ent);
         return false;
     }
-    if (!vcall_void(p, kPlayerTeleportToWuid, wuid)) {
+    auto permit = holders::may_place(kLocalPlayerEid, holders::Holder::Respawn, "respawn_hangover");
+    if (!permit) return false;
+    const bool ok = vcall_void(p, kPlayerTeleportToWuid, wuid);
+    permit.wrote();
+    if (!ok) {
         logf("MP-RESPAWN ExecuteTeleportImpl FAULTED -- teleport disarmed");
         g_teleArmed = false;
         return false;
     }
+    wo179::note_own_teleport();
     logf("MP-RESPAWN ExecuteTeleportImpl(wuid 0x%016llX) called for spot entity %u",
          static_cast<unsigned long long>(wuid), engine::entity_id(ent));
     return true;
@@ -1173,31 +1184,55 @@ bool teleport_to_spot(uint64_t linkId) {
 // object, slot 0x3A8 Teleport(const QuatT*, bool)): the call ExecuteTeleportImpl
 // itself makes, including the physics reset -- a bare SetPos leaves the
 // fall-damage state behind (observed: a 19 m "fall" after a 358 m SetPos).
+namespace {
 constexpr size_t kPlayerXGenObject = 0xB88;
 constexpr size_t kXGenTeleport     = 0x3A8;
 
-bool teleport_xgen(float x, float y, float z) {
+enum class XGenPlacement { Unavailable, Denied, Written };
+
+XGenPlacement teleport_xgen(const float pos[3], holders::Holder owner, const char* path) {
     void* p = c_player(); void* npc = nullptr;
-    if (!p || !vcall(p, kPlayerXGenObject, &npc) || !npc) return false;
+    if (!p || !vcall(p, kPlayerXGenObject, &npc) || !npc) return XGenPlacement::Unavailable;
     void* fn = vslot(npc, kXGenTeleport);
     HMODULE xg = GetModuleHandleA("XGenAIModule.dll");
     anchor::Range text{};
-    if (!fn || !xg || !anchor::section(xg, ".text", &text) || !text.contains(fn)) return false;
-    struct QuatT { float q[4]; float t[3]; } tm = { {0, 0, 0, 1}, {x, y, z} };
-    return vcall_void(npc, kXGenTeleport, static_cast<const void*>(&tm), false);
+    if (!fn || !xg || !anchor::section(xg, ".text", &text) || !text.contains(fn)) return XGenPlacement::Unavailable;
+    auto permit = holders::may_place(kLocalPlayerEid, owner, path);
+    if (!permit) return XGenPlacement::Denied;
+    struct QuatT { float q[4]; float t[3]; } tm = { {0, 0, 0, 1}, {pos[0], pos[1], pos[2]} };
+    const bool ok = vcall_void(npc, kXGenTeleport, static_cast<const void*>(&tm), false);
+    // The engine may have changed the actor before faulting. Only this path
+    // may use the fallback during the current frame.
+    permit.wrote();
+    return ok ? XGenPlacement::Written : XGenPlacement::Unavailable;
 }
 
-bool teleport_player(float x, float y, float z) {
-    wo179::note_own_teleport();   // WO-179: the relocation watch knows this jump is ours
-    if (teleport_xgen(x, y, z)) { resnap_player(); return true; }
-    // Last resort, the `goto` shape (Framework wh::framework::TeleportPlayer):
-    // the player entity's SetPos with why 0, then the ground re-snap. The
-    // player entity is the fixed id 0x7777 (reserved for the Player classes).
-    void* ent = engine::entity_by_id(0x7777);
-    if (!ent) return false;
+// C_Actor ground re-snap (+-1.75 m ray correction), within the same placement.
+void resnap_player(holders::Holder owner, const char* path) {
+    void* p = c_player();
+    if (!g_resnapArmed || !p) return;
+    auto permit = holders::may_place(kLocalPlayerEid, owner, path);
+    if (!permit) return;
+    if (vcall_void(p, kActorResnap, false, true)) permit.wrote();
+}
+} // namespace
+
+bool teleport_player(float x, float y, float z, p4rules::Source source) {
+    using p4rules::Source;
+    if (source == Source::Unknown) return false;
+    auto owner = holders::Holder::Leash; // JoinPlace, leash/settle, video and scene relocation
+    if (source == Source::Respawn) owner = holders::Holder::Respawn;
+    if (source == Source::Unstuck) owner = holders::Holder::Unstuck;
+    const char* path = p4rules::source_name(source);
     const float pos[3] = {x, y, z};
-    if (!engine::entity_set_pos(ent, pos)) return false;
-    resnap_player();
+    const auto result = teleport_xgen(pos, owner, path);
+    if (result == XGenPlacement::Denied) return false;
+    if (result == XGenPlacement::Unavailable) {
+        // Last resort, the Framework `goto` shape: IEntity::SetPos with why 0.
+        if (!engine::entity_set_pos(engine::entity_by_id(kLocalPlayerEid), pos, owner, path)) return false;
+    }
+    wo179::note_own_teleport();   // WO-179: the relocation watch knows this jump is ours
+    resnap_player(owner, path);
     return true;
 }
 
@@ -1227,12 +1262,6 @@ bool heal_bleeding(void* soul) {
         if (ok) ++applied;
     }
     return applied == 6;
-}
-
-bool resnap_player() {
-    void* p = c_player();
-    if (!g_resnapArmed || !p) return false;
-    return vcall_void(p, kActorResnap, false, true);
 }
 
 namespace {

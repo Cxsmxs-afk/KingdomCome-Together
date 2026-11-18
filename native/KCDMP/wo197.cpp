@@ -403,13 +403,17 @@ uint8_t sync_guard(const uint8_t* body, size_t len, uint8_t* out, size_t cap, si
     if (wo208::probe_owned(m) || wo208::probe_owned(s)) return wo163::kRNoActor;   // WO-208 A.1
     void* mca = nullptr; void* mm = nullptr; void* sca = nullptr; void* sm = nullptr;
     if (!motion::combat_parts(m, false, &mca, &mm) || !motion::combat_parts(s, false, &sca, &sm)) return wo163::kRNoActor;
+    auto masterPose = rttr::begin_combat_pose(m, "wo197.sync_guard");
+    if (!masterPose) return wo163::kRFailed;
+    auto slavePose = rttr::begin_combat_pose(s, "wo197.sync_guard");
+    if (!slavePose) return wo163::kRFailed;
     wo187::set_logical_target(mca, engine::entity_by_id(s));
     wo187::set_logical_target(sca, engine::entity_by_id(m));
     bool r = false;
     c_syncGuards.fetch_add(1);
     KCDMP_FAULT_CALL(site, "wo197::start_sync_guard");
     if (!fault::guarded(site, [&] { r = g_ssg(type, mca, sca, nullptr, nullptr); })) return wo163::kRNoActor;
-    if (r) c_syncGuardOk.fetch_add(1);
+    if (r) { masterPose->wrote(); slavePose->wrote(); c_syncGuardOk.fetch_add(1); }
     uint8_t mf = 255, sf = 255;
     void* mc = nullptr; void* sc = nullptr;
     if (rd(mca, 0x4E0, &mc) && mc) rd(mc, 0x18, &mf);
@@ -429,11 +433,17 @@ int start_sync_guard(int32_t type, uint32_t master, uint32_t slave, char* why, s
     // the engine's own refusals, read beforehand so a refused start says which (C_CombatActorClinch::StartSyncGuard: the master's guard
     // stance unset, a scope-0 action that is not a plain Guard on either; the rows' absence is the engine's own log line)
     const std::string md = wo187::director_text(mca, 0), sd = wo187::director_text(sca, 0);
+    auto masterPose = rttr::begin_combat_pose(master, "wo197.sync_guard");
+    auto slavePose = masterPose ? rttr::begin_combat_pose(slave, "wo197.sync_guard") : std::nullopt;
+    if (!masterPose || !slavePose) {
+        if (why) std::snprintf(why, whyN, "body held by another path");
+        return -1;
+    }
     bool r = false;
     c_syncGuards.fetch_add(1);
     KCDMP_FAULT_CALL(site, "wo197::start_sync_guard_owner");
     if (!fault::guarded(site, [&] { r = g_ssg(type, mca, sca, nullptr, nullptr); })) { if (why) std::snprintf(why, whyN, "faulted"); return -1; }
-    if (r) c_syncGuardOk.fetch_add(1);
+    if (r) { masterPose->wrote(); slavePose->wrote(); c_syncGuardOk.fetch_add(1); }
     else if (why) std::snprintf(why, whyN, "refused by the engine (master scope 0 %s, slave scope 0 %s; a missing guard_sync_movement row or an unset guard stance is the engine's own kcd.log line)",
                                 md.empty() ? "?" : md.c_str(), sd.empty() ? "?" : sd.c_str());
     return r ? 1 : 0;

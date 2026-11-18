@@ -11,6 +11,7 @@
 #include "wo195.h"
 #include "wo197.h"
 #include "engine.h"
+#include "combat_swing.h"
 #include "fault_guard.h"
 #include "hits.h"
 #include "log.h"
@@ -318,12 +319,15 @@ bool ai_attack_call(uint32_t eid, int zone, const void** act, const void** pre) 
     if (!fn) return false;
     void* ca = nullptr; void* model = nullptr;
     if (!motion::combat_parts(eid, false, &ca, &model) || !ca) return false;
+    auto permit = rttr::begin_combat_pose(eid, "wo209.ai_attack_pose");
+    if (!permit) return false;
     struct Brain { void* vt; void* ca; } brain{nullptr, ca};
     bool ok = false;
     if (pre) *pre = wo187::director_scope(ca, 0).act;
     KCDMP_FAULT_CALL(site, "wo209::ai_attack");
     c_aiCalls.fetch_add(1);
     if (!fault::guarded(site, [&] { ok = reinterpret_cast<bool(__fastcall*)(void*, int)>(fn)(&brain, zone); })) { c_aiFault.fetch_add(1); return false; }
+    if (ok) permit->wrote();
     // the director may install the attack on its next update: the scope-0 action read now can still be the one before it (d2's 57 ms
     // windows) -- then the window adopts the first other action that appears there
     if (ok && act) { *act = wo187::director_scope(ca, 0).act; if (pre && *act == *pre) *act = nullptr; }

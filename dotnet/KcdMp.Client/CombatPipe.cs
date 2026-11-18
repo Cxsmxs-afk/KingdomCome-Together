@@ -390,6 +390,11 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     /// <summary>The sequence byte we expect next, or null until the first reply latches it.</summary>
     private byte? _expectedSeq;
+    // The DLL numbers all non-batch writes, including lifecycle requests that
+    // bypass the normal reply queue. Leased binds need the exact wire position.
+    private byte _singleWriteOffset;
+    private byte? _singleSequenceBase;
+    private bool _singleSequenceUncertain;
 
     // Capture the stream and its reply lane together before waiting at either
     // request gate. A control reconnect cannot carry an older operation across.
@@ -419,6 +424,28 @@ public sealed partial class CombatPipe : IAsyncDisposable
     {
         lock (_connectionState)
             if (ReferenceEquals(_pipe, source.Pipe) && _expectedSeq is byte sequence) _expectedSeq = (byte)(sequence + 1);
+    }
+
+    private bool SettleSingleSequence(PipeSource source, byte offset, byte sequence, bool exact)
+    {
+        lock (_connectionState)
+        {
+            if (!ReferenceEquals(_pipe, source.Pipe)) return false;
+            if (_singleSequenceBase is not byte first)
+            {
+                if (_singleSequenceUncertain) return !exact;
+                _singleSequenceBase = (byte)(sequence - offset);
+                return true;
+            }
+            return !exact || (byte)(first + offset) == sequence;
+        }
+    }
+
+    private void NoteSingleReplyMissing(PipeSource source)
+    {
+        lock (_connectionState)
+            if (ReferenceEquals(_pipe, source.Pipe) && !_singleSequenceBase.HasValue)
+                _singleSequenceUncertain = true;
     }
 
 
@@ -683,11 +710,18 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// id, name, WUID, parent and living body on the game thread; the result's
     /// raw reason byte is a <see cref="NativeNpcReason"/>.
     /// </summary>
-    public async Task<(bool Ok, byte Reason)> NpcBindAsync(bool on, uint eid, ulong wuid, float ax, float ay, float az,
-                                                             ushort delayMs, string name, CancellationToken ct = default)
+    public Task<(bool Ok, byte Reason)> NpcBindAsync(bool on, uint eid, ulong wuid, float ax, float ay, float az,
+                                                      ushort delayMs, string name, CancellationToken ct = default) =>
+        NpcBindAsync(on, eid, wuid, ax, ay, az, delayMs, name, requireConfirmed: false, ct);
+
+    internal async Task<(bool Ok, byte Reason)> NpcBindAsync(bool on, uint eid, ulong wuid, float ax, float ay, float az,
+                                                              ushort delayMs, string name, bool requireConfirmed, CancellationToken ct = default)
     {
-        var (body, fail) = await SendAndAwaitAsync(NpcBind, NativeNpcCodec.BuildBind(on, eid, wuid, ax, ay, az, delayMs, name), Result, ct);
+        var (body, fail) = await SendAndAwaitAsync(NpcBind, NativeNpcCodec.BuildBind(on, eid, wuid, ax, ay, az, delayMs, name),
+            Result, ct, exactSequence: requireConfirmed);
         if (body is null) return (false, (byte)fail);
+        if (requireConfirmed && (body.Length != 3 || body[0] > 1 || (body[0] == 1) != (body[2] == 0)))
+            return (false, (byte)PipeReason.NoAnswer);
         return (body[0] == 1, body.Length >= 3 ? body[2] : (byte)255);
     }
 
@@ -2635,7 +2669,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// S3.1's fix, which this generalises rather than duplicates).
     /// </summary>
     private async Task<(byte[]? Body, PipeReason Fail)> SendAndAwaitAsync(
-        byte type, byte[] payload, byte wantType, CancellationToken ct, Func<bool>? beforeWrite = null)
+        byte type, byte[] payload, byte wantType, CancellationToken ct, Func<bool>? beforeWrite = null, bool exactSequence = false)
     {
         using var scope = ProcessorFrameScope.Link(ct);
         ct = scope.Token;
@@ -2653,6 +2687,15 @@ public sealed partial class CombatPipe : IAsyncDisposable
         try
         {
             if (!TrySourceSequence(source, out byte? expectedSequence)) return (null, PipeReason.NotConnected);
+            if (exactSequence)
+            {
+                lock (_connectionState)
+                {
+                    // A late result from before the first numbered reply
+                    // cannot establish a mapping. Retry on a fresh stream.
+                    if (_singleSequenceUncertain) { Drop(source.Pipe); return (null, PipeReason.NotConnected); }
+                }
+            }
             // Drop anything left over from an earlier command that timed out.
             // Without this the first read below returns that command's answer
             // as if it were ours -- the defect described at _replies.
@@ -2663,7 +2706,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                                   $"before sending 0x{type:X2} (total {StaleRepliesDropped})");
             }
 
-            await WriteFrameAsync(type, payload, ct, source.Pipe, beforeWrite);
+            byte writeOffset = await WriteFrameAsync(type, payload, ct, source.Pipe, beforeWrite);
             sent = true;
 
             // Bounded wait with an explicit give-up, and the waited time is
@@ -2675,6 +2718,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 var left = deadline - DateTime.UtcNow;
                 if (left <= TimeSpan.Zero)
                 {
+                    NoteSingleReplyMissing(source);
                     if (!SetSourceSequence(source, expectedSequence is byte missing ? (byte)(missing + 1) : null)) return (null, PipeReason.NotConnected);
                     TimedOut++;
                     // WO-110 R12 (docs/WO-109-audit.md R12): the DLL numbers
@@ -2707,6 +2751,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                     && reply.Body[2] == (byte)PipeReason.UnknownCommand
                     && (expectedSequence is not byte ws || reply.Body[1] == ws))
                 {
+                    SettleSingleSequence(source, writeOffset, reply.Body[1], exact: false);
                     if (!SetSourceSequence(source, (byte)(reply.Body[1] + 1))) return (null, PipeReason.NotConnected);
                     return (null, PipeReason.UnknownCommand);
                 }
@@ -2717,7 +2762,11 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 }
 
                 byte seq = reply.Body[1];
-                if (expectedSequence is byte want && seq != want)
+                if (exactSequence)
+                {
+                    if (!SettleSingleSequence(source, writeOffset, seq, exact: true)) { StaleRepliesDropped++; continue; }
+                }
+                else if (expectedSequence is byte want && seq != want)
                 {
                     // Older than what we are waiting for? Then it belongs to a
                     // command that already gave up. Anything else means we
@@ -2732,6 +2781,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                     }
                     Console.WriteLine($"[combat] reply seq={seq} is ahead of the expected {want} -- resyncing");
                 }
+                if (!exactSequence) SettleSingleSequence(source, writeOffset, seq, exact: false);
                 if (!SetSourceSequence(source, (byte)(seq + 1))) return (null, PipeReason.NotConnected);
                 return (reply.Body, PipeReason.Ok);
             }
@@ -2740,7 +2790,11 @@ public sealed partial class CombatPipe : IAsyncDisposable
         {
             // A sent command still consumes its native sequence number. Its
             // eventual reply must not become the next command's result.
-            if (sent) AdvanceSourceSequence(source);
+            if (sent)
+            {
+                NoteSingleReplyMissing(source);
+                AdvanceSourceSequence(source);
+            }
             ProcessorFrameScope.ThrowIfAbandoned();
             if (!ct.IsCancellationRequested)
             {
@@ -2773,7 +2827,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     private static readonly TimeSpan ReplyDeadline = TimeSpan.FromSeconds(5);
 
-    private async Task WriteFrameAsync(byte type, byte[] payload, CancellationToken ct, NamedPipeClientStream expectedPipe, Func<bool>? beforeWrite = null)
+    private async Task<byte> WriteFrameAsync(byte type, byte[] payload, CancellationToken ct, NamedPipeClientStream expectedPipe, Func<bool>? beforeWrite = null)
     {
         using var scope = ProcessorFrameScope.Link(ct);
         ct = scope.Token;
@@ -2785,7 +2839,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         try
         {
             if (beforeWrite is not null && !beforeWrite()) throw new OperationCanceledException("teleport proof superseded", ct);
-            await WriteFrameLockedAsync(type, payload, deadline.Token, expectedPipe);
+            return await WriteFrameLockedAsync(type, payload, deadline.Token, expectedPipe);
         }
         finally { _writeLock.Release(); }
     }
@@ -2793,7 +2847,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
     // Caller owns _writeLock. Batch writers filter each request under the same
     // lock before building their frame, so queued cancellation cannot leak a
     // stale request after a blocked writer releases it.
-    private async Task WriteFrameLockedAsync(byte type, byte[] payload, CancellationToken ct, NamedPipeClientStream? expectedPipe = null)
+    private async Task<byte> WriteFrameLockedAsync(byte type, byte[] payload, CancellationToken ct, NamedPipeClientStream? expectedPipe = null)
     {
         ProcessorFrameScope.ThrowIfAbandoned();
         ct.ThrowIfCancellationRequested();
@@ -2810,9 +2864,19 @@ public sealed partial class CombatPipe : IAsyncDisposable
         {
             ct.ThrowIfCancellationRequested();
             ProcessorFrameScope.ThrowIfAbandoned();
+            byte offset = 0;
+            if (type != Batch)
+            {
+                lock (_connectionState)
+                {
+                    if (!ReferenceEquals(_pipe, pipe)) throw new IOException("pipe connection changed");
+                    offset = _singleWriteOffset++;
+                }
+            }
             writing = true;
             await pipe.WriteAsync(frame, ct);
             await pipe.FlushAsync(ct);
+            return offset;
         }
         catch (OperationCanceledException)
         {
@@ -2863,6 +2927,9 @@ public sealed partial class CombatPipe : IAsyncDisposable
             _replies.Writer.TryComplete();
             _replies = NewReplyChannel();
             _expectedSeq = null;
+            _singleWriteOffset = 0;
+            _singleSequenceBase = null;
+            _singleSequenceUncertain = false;
             OnDropBatch();
             if (dropped is not null) Console.WriteLine("[combat] lost the connection to KCDMP.dll");
         }

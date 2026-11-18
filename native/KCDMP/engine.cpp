@@ -4,6 +4,7 @@
 #include "engine.h"
 #include "fault_guard.h"
 #include "anchors.h"
+#include "holders.h"
 #include "log.h"
 
 #include <windows.h>
@@ -215,9 +216,15 @@ bool entity_world_pos(void* e, float out[3]) {
     return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
 }
 
-bool entity_set_pos(void* e, const float pos[3]) {
-    if (!is_a(e, g_vftEntity)) return false;
-    return vcall_void(KCDMP_SITE_CALL("engine::entity_set_pos/SetPos"), e, kEntSetPos, pos, 0, false, false);
+bool entity_set_pos(void* e, const float pos[3], holders::Holder owner, const char* path) {
+    const uint32_t eid = entity_id(e);
+    if (!eid) return false;
+    auto permit = holders::may_place(eid, owner, path);
+    if (!permit) return false;
+    const bool ok = vcall_void(KCDMP_SITE_CALL("engine::entity_set_pos/SetPos"), e, kEntSetPos, pos, 0, false, false);
+    // Keep the reservation's write fence if the engine faulted after mutating the entity.
+    permit.wrote();
+    return ok;
 }
 
 bool entity_add_flags(void* e, uint32_t flags) {

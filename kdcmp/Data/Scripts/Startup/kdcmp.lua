@@ -3142,12 +3142,10 @@ end
 -- yielded), the pause lever, the detach, the locomotion loop, weapons, swing
 -- holds, death, release.
 --
--- Fail closed three ways: (1) Lua asks for binds only while the agent's 1 Hz
--- heartbeat says the writer is armed and on -- three seconds without one and
--- Lua writes every puppet itself again; (2) Lua stops writing a puppet only
--- after the DLL ACKNOWLEDGED its bind (identity checked natively: entity id,
--- name, WUID, no parent, a living body); (3) the DLL's own drops (entity gone,
--- silence, fault) come back as a nack and Lua takes that puppet over at once.
+-- With an Agent that supplies release receipts, Lua stops placing the body on
+-- offer, before the DLL can acquire it. A stale heartbeat, refusal or drop
+-- requests an unbind. Lua resumes after the DLL confirms that release, even
+-- when the bind's original answer was lost. Old Agents use the previous timers.
 --
 --   mp_npc_native_write on|off   default ON (WO-118); mp_preset_legacy = off
 --   events: npc_native <name> on <eidHex> <wuidHex|?> <ax> <ay> <az> <delayMs>
@@ -3163,10 +3161,8 @@ TUNE.NPC_NATIVE_STALE_S  = 3.0   -- heartbeat age at which Lua writes every pupp
 TUNE.NPC_NATIVE_RESEND_S = 3.0   -- an unanswered bind is re-sent after this long
 TUNE.NPC_NATIVE_RETRY_S  = 10.0  -- a refused or dropped puppet is offered again after this long
 TUNE.NPC_NATIVE_BIND_WAIT_S = 1.0 -- a fresh puppet waits this long for its first bind before Lua writes it
--- WO-153 2: after Lua tells the DLL to let a puppet go (a stale heartbeat), Lua waits this long before it writes the body
--- itself. The unbind reaches the DLL through the agent (the field's join bursts: up to 2.6 s of transport lag) while the
--- DLL keeps writing every frame; both writers on one body were the field's 28 MP-AUTHORITY-VIOLATION lines (every one
--- followed a native-to-legacy hand-over by 0.3-6.7 s), not an NPC's own brain.
+-- WO-153 2 old-agent compatibility hold. With confirmed releases it is the
+-- receipt retry interval. Join bursts delayed a release by up to 2.6 s.
 TUNE.NPC_NATIVE_UNBIND_HOLD_S = 1.5
 
 function KCD2MP_NpcNativeHealthy()
@@ -3180,13 +3176,14 @@ end
 
 -- The agent's heartbeat (GameBridge.NativeHeartbeatAsync), once a second while
 -- the DLL pipe answers.
-function KCD2MP_NpcNativeAlive(armed, on, bound, writing)
+function KCD2MP_NpcNativeAlive(armed, on, bound, writing, confirmedRelease)
     local n = KCD2MP._npcNative
     local was = KCD2MP_NpcNativeHealthy()
     n.aliveAt = os.clock()
     n.armed = (tonumber(armed) or 0) == 1
     n.on = (tonumber(on) or 0) == 1
     n.bound, n.writing = tonumber(bound) or 0, tonumber(writing) or 0
+    if confirmedRelease == 1 then n.confirmedRelease = true end
     n.beats = (n.beats or 0) + 1
     if n.beats % 30 == 0 then   -- WO-214 B: the bind traffic as this file sees it, every 30 beats (~30 s)
         mp_log(string.format("WO214-BINDS lua binds=%d resends=%d acks=%d nacks=%d ack_not_sent=%d ack_no_puppet=%d nack_no_puppet=%d unbinds=%d",
@@ -3199,19 +3196,119 @@ function KCD2MP_NpcNativeAlive(armed, on, bound, writing)
     end
 end
 
+-- The current Agent serializes binds and releases and reports the DLL's release
+-- receipt. Keep the lease by body name across replacement of the Lua puppet row.
+function KCD2MP_NpcNativeLeaseBusy(name)
+    local leases = KCD2MP._npcNative.leases
+    return leases ~= nil and leases[name] ~= nil
+end
+
+function KCD2MP_NpcNativeAfterRelease(name, stillCurrent, action)
+    if not stillCurrent() then return end
+    if KCD2MP_NpcNativeLeaseBusy(name) then
+        KCD2MP_NpcNativeLeaseRelease(name, nil, "body-action")
+        Script.SetTimer(250, function() KCD2MP_NpcNativeAfterRelease(name, stillCurrent, action) end)
+        return
+    end
+    action()
+end
+
+function KCD2MP_NpcNativeLeaseRelease(name, p, why)
+    local n = KCD2MP._npcNative
+    local lease = n.leases and n.leases[name]
+    if not lease then return false end
+    local now = os.clock()
+    if lease.state ~= "release" then
+        lease.state, lease.sent = "release", nil
+        if p then
+            p.nativeSent, p.nativeOwned = nil, false
+            p.lastWroteX, p.lastWroteY, p.lastWroteZ = nil, nil, nil
+        end
+        n.unbinds = n.unbinds + 1
+    end
+    if lease.sent == nil or now - lease.sent >= TUNE.NPC_NATIVE_UNBIND_HOLD_S then
+        lease.sent = now
+        KCD2MP_EmitEvent("npc_native", string.format("%s off %s %d", name, why, lease.id))
+    end
+    return true
+end
+
+function KCD2MP_NpcNativeLeaseWait(name, p, want)
+    local n = KCD2MP._npcNative
+    local lease = n.leases and n.leases[name]
+    if not lease then return false end
+    if not want or lease.state == "release" or (lease.state == "bind" and os.clock() - lease.sent >= TUNE.NPC_NATIVE_BIND_WAIT_S) then
+        KCD2MP_NpcNativeLeaseRelease(name, p, "lease")
+    end
+    return true
+end
+
+function KCD2MP_NpcNativeLeaseStart(name, arg)
+    local n = KCD2MP._npcNative
+    if n.confirmedRelease then
+        n.leases = n.leases or {}
+        n.leaseId = (n.leaseId or 0) + 1
+        n.leases[name] = { id = n.leaseId, state = "bind", sent = os.clock() }
+        arg = string.format("%s %d", arg, n.leaseId)
+    end
+    KCD2MP_EmitEvent("npc_native", arg)
+end
+
 -- The agent: the DLL's answer to a bind (ok=1), a refusal, or the writer's own
 -- drop (ok=0).
-function KCD2MP_NpcNativeAck(name, ok, reason)
+function KCD2MP_NpcNativeAck(name, ok, reason, leaseId, release)
     local n = KCD2MP._npcNative
-    if KCD2MP_W154RideAck and KCD2MP_W154RideAck(name, ok, reason) then return end   -- WO-154 5: a ridden horse
+    local lease = n.leases and n.leases[name]
+    if not lease and not leaseId and KCD2MP_W154RideAck and KCD2MP_W154RideAck(name, ok, reason) then return end
     ok = (tonumber(ok) or 0) == 1
     if ok then n.acks = n.acks + 1 else n.nacks = n.nacks + 1 end
-    local p = KCD2MP.npcPuppets[name]
+    local p, e = KCD2MP.npcPuppets[name], nil
     if not p then
         -- WO-118 Phase 2b: a ghost body ("kcd2mp_<id>") carries the same fields on its istate.
         local gid = string.match(tostring(name), "^kcd2mp_(.+)$")
         local g = gid and KCD2MP.ghosts and KCD2MP.ghosts[gid]
         p = g and g.istate
+        e = g and g.entity
+    elseif lease and release then
+        pcall(function() e = System.GetEntityByName(name) end)
+    end
+    if leaseId ~= nil then
+        if not lease or leaseId ~= lease.id then return end
+        if release then
+            if lease.state ~= "release" or not ok then return end
+            n.leases[name] = nil
+            if p then
+                p.nativeSent, p.nativeOwned = nil, false
+                p.nativeUnbindAt = nil
+                p.nativeRetryAt = os.clock() + TUNE.NPC_NATIVE_RETRY_S
+                if e then
+                    local current, angles = nil, nil
+                    pcall(function()
+                        current = e:GetWorldPos()
+                        if e.GetWorldAngles then angles = e:GetWorldAngles() end
+                    end)
+                    if current then p.cx, p.cy, p.cz = current.x, current.y, current.z end
+                    if angles and angles.z then p.cr = angles.z end
+                end
+                if lease.reason then KCD2MP_NpcNativeAck(name, 0, lease.reason) end
+            end
+            return
+        end
+        if lease.state ~= "bind" then return end
+        if ok and p and p.nativeSent then
+            lease.state = "owned"
+        else
+            -- A lost pipe response can leave a successfully installed native writer.
+            if not ok then lease.reason = reason end
+            KCD2MP_NpcNativeLeaseRelease(name, p, "bind-result")
+            return
+        end
+    elseif lease then
+        if not ok then
+            if lease.state ~= "release" then lease.reason = reason end
+            KCD2MP_NpcNativeLeaseRelease(name, p, "native-drop")
+        end
+        return
     end
     if not p then
         if ok then n.ackNoPuppet = (n.ackNoPuppet or 0) + 1 else n.nackNoPuppet = (n.nackNoPuppet or 0) + 1 end   -- WO-214 B
@@ -3253,6 +3350,7 @@ end
 -- unanswered bind. `e` is the body the puppet drives (unused for an unbind).
 function KCD2MP_NpcNativeSync(name, p, e, want, why)
     local now = os.clock()
+    if KCD2MP_NpcNativeLeaseWait(name, p, want) then return end
     if want then
         if p.nativeOwned or not e then return end
         -- WO-214 B (one_bind): an unanswered bind is sent again after 10 s, not 3 -- a busy joiner's console answers late (the bench:
@@ -3272,7 +3370,7 @@ function KCD2MP_NpcNativeSync(name, p, e, want, why)
         if p.nativeSent then KCD2MP._npcNative.resends = (KCD2MP._npcNative.resends or 0) + 1 end   -- WO-214 B: an unanswered bind, sent again
         p.nativeSent, p.nativeSentAt, p.nativeRetryAt = true, now, nil
         KCD2MP._npcNative.binds = KCD2MP._npcNative.binds + 1
-        KCD2MP_EmitEvent("npc_native", string.format("%s on %s %s %.3f %.3f %.3f %d", name, hexid, wuid,
+        KCD2MP_NpcNativeLeaseStart(name, string.format("%s on %s %s %.3f %.3f %.3f %d", name, hexid, wuid,
             p.ax or p.cx or 0, p.ay or p.cy or 0, p.cz or 0, math.floor(KCD2MP_NpcSmoothDelayS() * 1000 + 0.5)))
     elseif p.nativeSent or p.nativeOwned then
         p.nativeSent, p.nativeOwned = nil, false
@@ -3307,6 +3405,7 @@ function KCD2MP_GhostNativeSync(id, ghost, want)
     local name = "kcd2mp_" .. tostring(id)
     local now = os.clock()
     if want and st.dismountPending then want = false end   -- 0.28.3: still on the horse
+    if KCD2MP_NpcNativeLeaseWait(name, st, want) then return end
     if want then
         local e = ghost.entity
         if st.nativeOwned or not e then return end
@@ -3335,7 +3434,7 @@ function KCD2MP_GhostNativeSync(id, ghost, want)
         end)
         st.nativeSent, st.nativeSentAt, st.nativeRetryAt = true, now, nil
         KCD2MP._npcNative.binds = KCD2MP._npcNative.binds + 1
-        KCD2MP_EmitEvent("npc_native", string.format("%s on %s %s %.3f %.3f %.3f %d", name, hexid, wuid,
+        KCD2MP_NpcNativeLeaseStart(name, string.format("%s on %s %s %.3f %.3f %.3f %d", name, hexid, wuid,
             st.cx or 0, st.cy or 0, st.cz or 0, TUNE.GHOST_NATIVE_DELAY_MS))
     elseif st.nativeSent or st.nativeOwned then
         st.nativeSent, st.nativeOwned = nil, false
@@ -7198,8 +7297,15 @@ do
             Script.SetTimer(wakeMs, function()
                 local e2 = w135_body(name)
                 if not (e2 and e2.actor) or w135_dead(e2) or w135_down(e2) then return end
-                local rok = pcall(function() e2.actor:Revive(false) end)
-                mp_log("WO135-KO npc=" .. tostring(name) .. " woken -> Revive(false) ok=" .. tostring(rok) .. " (on its feet; the writer re-binds it)")
+                if KCD2MP_NpcNativeLeaseBusy(name) then
+                    KCD2MP_NpcNativeLeaseRelease(name, KCD2MP.npcPuppets[name], "revive")
+                end
+                KCD2MP_NpcNativeAfterRelease(name, function()
+                    return w135_body(name) == e2 and not w135_dead(e2) and not w135_down(e2)
+                end, function()
+                    local rok = pcall(function() e2.actor:Revive(false) end)
+                    mp_log("WO135-KO npc=" .. tostring(name) .. " woken -> Revive(false) ok=" .. tostring(rok) .. " (on its feet; the writer re-binds it)")
+                end)
             end)
         end
     end
@@ -10016,7 +10122,8 @@ function KCD2MP_ApplyNpcState(name, x, y, z, rot, hp, flags, src, seq, senderMs)
                     nearPlayer = ((cur.x - pp.x)^2 + (cur.y - pp.y)^2) < 4.0
                 end)
             end
-            local skip = locallyDead and "local-corpse" or inDialog and "in-dialog" or nearPlayer and "near-player" or nil
+            local skip = locallyDead and "local-corpse" or inDialog and "in-dialog" or nearPlayer and "near-player"
+                or KCD2MP_NpcNativeLeaseBusy(name) and "native-lease" or nil
             local moved = false
             if not skip and dist > 1.0 then
                 pcall(function() e:SetWorldPos({ x = x, y = y, z = z }) end)
@@ -10320,7 +10427,7 @@ function KCD2MP_PuppetDriftCorrect(name, p, e, now)
     end
     KCD2MP_DesyncNote("puppet-drift", string.format("npc=%s dist_m=%.1f near=%s", name, math.sqrt(d2), near and "1" or "0"))
     -- A native-owned body is the DLL's. Snapping it here fights that writer.
-    if near or p.nativeOwned then return end
+    if near or p.nativeOwned or KCD2MP_NpcNativeLeaseBusy(name) then return end
     pcall(function()
         e:SetWorldPos({ x = p.cx, y = p.cy, z = p.cz or ap.z })
         if p.cr then e:SetWorldAngles({ x = 0, y = 0, z = p.cr }) end
@@ -10661,6 +10768,7 @@ function KCD2MP_NpcPuppetTick(arg, gen)
             if p.dead or p.ko or locallyDead or locallyKo or remoteDead then
                 -- WO-118: dead, unconscious and carried bodies keep this Lua behaviour.
                 KCD2MP_NpcNativeSync(name, p, e, false, "down")
+                if KCD2MP_NpcNativeLeaseBusy(name) then return end
                 -- WO-148: a carried body is the carrier's -- no follow, no placement while it is held
                 if KCD2MP_W148Holds and KCD2MP_W148Holds(name) then return end
                 -- WO-86, the safeguard. Body-follow below exists for ONE case:
@@ -11064,7 +11172,7 @@ function KCD2MP_NpcPuppetTick(arg, gen)
             -- ground (the field's tbuk_man_1).
             local lying = (p.ragdollUntil or 0) > now
             local unbindHold = p.nativeUnbindAt ~= nil and (now - p.nativeUnbindAt) < TUNE.NPC_NATIVE_UNBIND_HOLD_S   -- WO-153 2
-            if p.nativeOwned or bindPending or lying or unbindHold then
+            if p.nativeOwned or bindPending or lying or unbindHold or KCD2MP_NpcNativeLeaseBusy(name) then
                 p.lastWroteX, p.lastWroteY, p.lastWroteZ = nil, nil, nil
             else
                 e:SetWorldPos({x = p.cx, y = p.cy, z = p.cz})
@@ -12072,6 +12180,22 @@ function KCD2MP_MountNPCOnHorse(id)
     -- WO-160 5: the mount gate -- the horse is polled for readiness (0.25 s, up to 5 s) before the ForceMount the engine would roll back
     local gateId = id
     if KCD2MP_W160MountGate and not KCD2MP_W160MountGate(id, ghost, horse, function() KCD2MP_MountNPCOnHorse(gateId) end) then return end
+    local ghostName = "kcd2mp_" .. tostring(id)
+    if KCD2MP_NpcNativeLeaseBusy(ghostName) then
+        local st = ghost.istate
+        if not st or st.nativeMountWait then return end
+        st.nativeMountWait = true
+        KCD2MP_GhostNativeSync(id, ghost, false)
+        KCD2MP_NpcNativeAfterRelease(ghostName, function()
+            if KCD2MP.ghosts[id] == ghost and st.isRiding then return true end
+            st.nativeMountWait = nil
+            return false
+        end, function()
+            st.nativeMountWait = nil
+            KCD2MP_MountNPCOnHorse(id)
+        end)
+        return
+    end
     local ok1 = pcall(function() human:ForceMount(horse.id) end)
     mp_log("ForceMount ok=" .. tostring(ok1) .. " id=" .. id)
     if not ok1 then return end
@@ -12131,6 +12255,11 @@ function KCD2MP_GhostDismount(id, ghost, why)
     if KCD2MP_W154RideNative then pcall(KCD2MP_W154RideNative, id, false) end   -- WO-154 5: the writer lets the horse go first
     local live = KCD2MP_GhostIsMounted(ghost)
     local flag = st.nativeMounted == true
+    if (flag or live == true) and KCD2MP_NpcNativeLeaseBusy("kcd2mp_" .. tostring(id)) then
+        KCD2MP_GhostNativeSync(id, ghost, false)
+        st.dismountPending, st.dismountAt = true, os.clock()
+        return false
+    end
     local force = "none"
     local h = ghost.entity and ghost.entity.human
     if (flag or live ~= false) and h and h.ForceDismount then
@@ -14150,7 +14279,7 @@ function KCD2MP_InterpTick(arg, gen)
                 if wp then x, y, sz = wp.x, wp.y, wp.z end
             elseif oneShot then
                 -- no position/angle writes; the one-shot owns the body
-            elseif istate.nativeOwned then
+            elseif istate.nativeOwned or KCD2MP_NpcNativeLeaseBusy("kcd2mp_" .. tostring(id)) then
                 -- WO-118 Phase 2b: KCDMP.dll writes this ghost every frame at its frame hook
             elseif not istate.nativeMounted and KCD2MP_PoseChanged(istate, x, y, sz, r) then
                 local _, err = pcall(function()
@@ -25083,6 +25212,10 @@ do
         local W = KCD2MP.w154
         if not (e and e.actor) then W197.ko[id] = nil; if W then W.down[id] = nil end; return end
         if W and W.dead and W.dead[id] then W197.ko[id] = nil; return end   -- a death took over (WO-155's collapse)
+        if KCD2MP_NpcNativeLeaseBusy("kcd2mp_" .. id) then
+            Script.SetTimer(400, function() KCD2MP_W197KoTick(id) end)
+            return
+        end
         local now = os.clock()
         local prof, anim = nil, nil
         pcall(function() prof = e.actor:GetPhysicalizationProfile() end)
@@ -25169,10 +25302,16 @@ do
             end
             if W then W.down[id] = os.clock() end
             pcall(KCD2MP_GhostNativeSync, id, ghost, false)   -- the writer lets go first
-            local ok, err = true, nil
-            if not native then ok, err = pcall(function() e.soul:AddBuff(W197.UNCONSCIOUS) end) end
-            W197.ko[id] = { at = os.clock(), native = native and true or nil }
-            mp_log(string.format("WO197-KO avatar=%s down ok=%s%s -- knocked out in his world: the game's own unconsciousness here", name, tostring(ok), ok and "" or (" err=" .. tostring(err))))
+            local k = { at = os.clock(), native = native and true or nil }
+            W197.ko[id] = k
+            KCD2MP_NpcNativeAfterRelease(name, function()
+                local _, current = body(id)
+                return W197.ko[id] == k and not k.up and current == e
+            end, function()
+                local ok, err = true, nil
+                if not native then ok, err = pcall(function() e.soul:AddBuff(W197.UNCONSCIOUS) end) end
+                mp_log(string.format("WO197-KO avatar=%s down ok=%s%s -- knocked out in his world: the game's own unconsciousness here", name, tostring(ok), ok and "" or (" err=" .. tostring(err))))
+            end)
             Script.SetTimer(400, function() KCD2MP_W197KoTick(id) end)
         else
             local k = W197.ko[id]
@@ -25183,7 +25322,7 @@ do
                 ok1 = pcall(function() e.soul:RemoveAllBuffsByGuid(W197.UNCONSCIOUS) end)
                 ok2 = pcall(function() e.soul:AddBuff(W197.WAKE) end)
             end
-            if k.fallback == "ragdoll" and e and e.actor and type(e.actor.StandUp) == "function" then   -- the engine's own get-up (WO-135)
+            if k.fallback == "ragdoll" and e and e.actor and type(e.actor.StandUp) == "function" and not KCD2MP_NpcNativeLeaseBusy(name) then
                 ok3 = pcall(function() e.actor:StandUp() end)
             end
             mp_log(string.format("WO197-KO avatar=%s up ok=%s/%s%s -- he woke: the game's own stand-up here", name, tostring(ok1), tostring(ok2),
@@ -27156,6 +27295,7 @@ function KCD2MP_W200RiderHeld(name, p, e, horse)
         return false
     end
     KCD2MP_NpcNativeSync(name, p, e, false, "rider")
+    if KCD2MP_NpcNativeLeaseBusy(name) then return false end
     pcall(function() e:SetWorldPos({ x = hp.x, y = hp.y, z = hp.z }) end)
     local ok = pcall(function() e.human:ForceMount(he.id) end)
     local now = false
@@ -27471,17 +27611,26 @@ do
         end
         W.down[id] = os.clock()
         pcall(KCD2MP_GhostNativeSync, id, ghost, false)   -- the writer lets go first
-        local ok, err = pcall(function() e.actor:Fall(e:GetWorldPos()) end)
-        if not ok then
-            W.down[id] = nil
-            W.stats.fallFail = W.stats.fallFail + 1
-            mp_log(string.format("WO155-FALL avatar=%s ok=false err=%s", name, tostring(err))); return
-        end
-        W.fall[id] = { at = os.clock() }
-        W.stats.fell = W.stats.fell + 1
-        mp_log(string.format("WO155-FALL avatar=%s ok=true -- his friendly-fire knockdown: the engine's own fall and get-up play here", name))
-        Script.SetTimer(1200, function() if KCD2MP_W174FfEnd then pcall(KCD2MP_W174FfEnd, id) end end)   -- WO-174: the punch's fight ends with the knockdown
-        Script.SetTimer(400, function() KCD2MP_W155FallTick(id) end)
+        local fall = {}
+        W.fall[id] = fall
+        KCD2MP_NpcNativeAfterRelease(name, function()
+            local _, current = w155_body(id)
+            if W.fall[id] ~= fall or W.dead[id] then return false end
+            if current ~= e then W.fall[id], W.down[id] = nil, nil; return false end
+            return true
+        end, function()
+            local ok, err = pcall(function() e.actor:Fall(e:GetWorldPos()) end)
+            if not ok then
+                W.fall[id], W.down[id] = nil, nil
+                W.stats.fallFail = W.stats.fallFail + 1
+                mp_log(string.format("WO155-FALL avatar=%s ok=false err=%s", name, tostring(err))); return
+            end
+            fall.at = os.clock()
+            W.stats.fell = W.stats.fell + 1
+            mp_log(string.format("WO155-FALL avatar=%s ok=true -- his friendly-fire knockdown: the engine's own fall and get-up play here", name))
+            Script.SetTimer(1200, function() if KCD2MP_W174FfEnd then pcall(KCD2MP_W174FfEnd, id) end end)
+            Script.SetTimer(400, function() KCD2MP_W155FallTick(id) end)
+        end)
     end
 
     -- ---- death: the figure collapses and lies until his respawn ----
@@ -27526,17 +27675,23 @@ do
             if hidden then mp_log("WO155-COLLAPSE avatar=" .. name .. " is hidden -- marked dead, no figure to lay down"); return end
             if KCD2MP_GhostIsMounted and KCD2MP_GhostIsMounted(ghost) then pcall(KCD2MP_GhostDismount, id, ghost, "death") end
             pcall(KCD2MP_GhostNativeSync, id, ghost, false)   -- the writer lets go first
-            local ok, err = false, nil
-            if type(e.actor.RagDollize) == "function" then
-                ok, err = pcall(function() e.actor:RagDollize() end)
-            elseif type(e.actor.Fall) == "function" then
-                ok, err = pcall(function() e.actor:Fall(e:GetWorldPos()) end)
-            else
-                err = "Actor.RagDollize / Actor.Fall are not registered on this build"
-            end
-            mp_log(string.format("WO155-COLLAPSE avatar=%s ok=%s%s -- he died in his world: his figure lies here until he respawns",
-                name, tostring(ok), ok and "" or (" err=" .. tostring(err))))
-            Script.SetTimer(1000, function() KCD2MP_W155HoldTick(id) end)
+            local death = W.dead[id]
+            KCD2MP_NpcNativeAfterRelease(name, function()
+                local _, current = w155_body(id)
+                return W.dead[id] == death and not death.released and current == e
+            end, function()
+                local ok, err = false, nil
+                if type(e.actor.RagDollize) == "function" then
+                    ok, err = pcall(function() e.actor:RagDollize() end)
+                elseif type(e.actor.Fall) == "function" then
+                    ok, err = pcall(function() e.actor:Fall(e:GetWorldPos()) end)
+                else
+                    err = "Actor.RagDollize / Actor.Fall are not registered on this build"
+                end
+                mp_log(string.format("WO155-COLLAPSE avatar=%s ok=%s%s -- he died in his world: his figure lies here until he respawns",
+                    name, tostring(ok), ok and "" or (" err=" .. tostring(err))))
+                Script.SetTimer(1000, function() KCD2MP_W155HoldTick(id) end)
+            end)
         else
             local d = W.dead[id]
             if not d then return end
@@ -34063,6 +34218,7 @@ do
                 name, under, p.tz, g, R.stats.disagree))
         end
         KCD2MP_NpcNativeSync(name, p, e, false, "rider-disagree")
+        if KCD2MP_NpcNativeLeaseBusy(name) then return true end
         pcall(function() e:SetWorldPos({ x = p.tx + 0.9, y = p.ty, z = g }) end)   -- beside the horse, on the ground
         return true
     end
@@ -34483,9 +34639,10 @@ function KCD2MP_W203Anim(cid, bodyName, clip, faceName, x, y, z, femaleClip)
     local e = w203_body(bodyName)
     if e and femaleClip and femaleClip ~= "" and string.find(tostring(e.class), "Female", 1, true) then clip = femaleClip end
     if not e or not clip or clip == "" then C.refused = C.refused + 1; return end
-    if x and y and z then pcall(function() e:SetWorldPos({ x = x, y = y, z = z }) end) end
+    local canPlace = not KCD2MP_NpcNativeLeaseBusy(bodyName)
+    if canPlace and x and y and z then pcall(function() e:SetWorldPos({ x = x, y = y, z = z }) end) end
     local f = w203_body(faceName)
-    if f then
+    if canPlace and f then
         local b, p = e:GetWorldPos(), f:GetWorldPos()
         if (p.x - b.x) ^ 2 + (p.y - b.y) ^ 2 > 0.01 then
             pcall(function() e:SetWorldAngles({ x = 0, y = 0, z = math.atan2(-(p.x - b.x), p.y - b.y) }) end)
@@ -35629,6 +35786,7 @@ do
         g = tonumber(g)
         if not g or p.tz < g + 0.5 then return false end   -- the stream has him on the ground already: nothing to correct
         KCD2MP_NpcNativeSync(name, p, e, false, "rider-ground")
+        if KCD2MP_NpcNativeLeaseBusy(name) then return true end
         pcall(function() e:SetWorldPos({ x = p.tx, y = p.ty, z = g }) end)
         local R = W210.riders
         local now = os.clock()

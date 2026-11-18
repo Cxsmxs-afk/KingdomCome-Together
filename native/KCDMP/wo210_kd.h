@@ -21,6 +21,12 @@ bool copy_tick(uint32_t eid, const char* name, bool hostDown, double now);
 // The position writer (npc_drive): this copy lies for its host NPC's knockdown -- leave its body to the engine's ragdoll.
 bool held_down(uint32_t eid);
 
+// Settle outgoing movement before the ragdoll/knockout owner takes the body.
+bool take_fall(uint32_t eid, const char* name, double now);
+// WO-131's temporary copy buff owns this body through the wake and physical stand-up.
+void note_buff_pose(uint32_t eid, bool down);
+void clear_buff_pose(uint32_t eid);
+
 // A copy the joiner's world no longer drives (released, gone): forgotten without a call.
 void forget(uint32_t eid);
 

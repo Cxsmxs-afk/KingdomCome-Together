@@ -204,7 +204,7 @@ public class PackerTests
             const int repeats = 20; // Identical unprotected lines would be collapsed.
             var src = new List<SourceFile>();
             var expected = new Dictionary<string, string[]>();
-            const string rp = "rp_e2e_ms_p50=25 rp_e2e_ms_p95=151 rp_e2e_ms_max=180 rp_e2e_n=80 rp_agent_hop_n=100 rp_agent_hop_ms_p95=5 rp_owner_n=0 owner_violations=0";
+            const string rp = "rp_e2e_ms_p50=25 rp_e2e_ms_p95=151 rp_e2e_ms_max=180 rp_e2e_n=80 rp_agent_hop_n=100 rp_agent_hop_ms_p95=5 rp_owner_n=26 owner_violations=0 owner_handovers=4 owner_denied_sets=6";
             foreach (var native in new[] { false, true })
             {
                 string name = native ? "kcdmp-native.mirror.log" : "agent.log";
@@ -221,7 +221,9 @@ public class PackerTests
             var files = Open(Assert.Single(packed.Parts));
             string verdict = Encoding.UTF8.GetString(files["ERGEBNIS.txt"]);
             Assert.Contains("rp_e2e_ms_p95\tGELB\t151 ms\t", verdict);
-            Assert.Contains("owner_violations\tGRAU\t", verdict);
+            Assert.Contains("owner_violations\tGRÜN\t0\t", verdict);
+            Assert.Contains("owner_handovers\tGRAU\t4\t", verdict);
+            Assert.Contains("owner_denied_sets\tGRAU\t6\t", verdict);
             foreach (var (name, lines) in expected)
             {
                 var restored = Encoding.UTF8.GetString(files[name]).Split('\n');

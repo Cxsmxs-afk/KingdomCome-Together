@@ -6,6 +6,7 @@
 #include "combat_swing.h"
 #include "wo221.h"
 #include "wo203.h"
+#include "wo216.h"
 #include "anchors.h"
 #include "engine.h"
 #include "fault_guard.h"
@@ -42,7 +43,16 @@ constexpr size_t kMaxTracked = 16384;
 constexpr double kEndedKeepS = 60.0;    // an ended (stopped, quiet) action that never finished is forgotten after this, our reference kept
 constexpr double kDoneKeepS = 30.0;     // a finished action is forgotten after this
 
-struct Entry { uint32_t eid = 0; void* actor = nullptr; void* action = nullptr; double t0 = 0; bool ended = false; double endedAt = 0; };
+struct Entry {
+    uint32_t eid = 0;
+    void* actor = nullptr;
+    void* action = nullptr;
+    double t0 = 0;
+    bool ended = false;
+    double endedAt = 0;
+    bool movesBody = false;
+    uint64_t bodyScope = 0;
+};
 
 std::mutex g_mu;
 std::vector<Entry> g_tracked;
@@ -261,8 +271,8 @@ const bool kReg = wo203::reg_install("combat_actions", &install) && wo203::reg_t
 
 bool armed() { return g_armed.load(); }
 
-void track(uint32_t eid, void* actor, void* action) {
-    if (!action || !wo221::on(wo221::kBitCombatActionEnd)) return;
+void track(uint32_t eid, void* actor, void* action, bool movesBody) {
+    if (!action || !(wo221::on(wo221::kBitCombatActionEnd) || (movesBody && holders::on()))) return;
     if (!add_ref(action)) return;
     c_tracked.fetch_add(1, std::memory_order_relaxed);
     void* evicted = nullptr;
@@ -275,9 +285,34 @@ void track(uint32_t eid, void* actor, void* action) {
             g_tracked.front() = g_tracked.back();
             g_tracked.pop_back();
         }
-        g_tracked.push_back(Entry{eid, actor, action, now_s(), false});
+        g_tracked.push_back(Entry{eid, actor, action, now_s(), false, 0.0, movesBody, wo216::lifecycle_observation_stamp()});
     }
     if (evicted) drop_ref(evicted);
+}
+
+bool body_pose_holds(uint32_t eid) {
+    if (!eid) return false;
+    std::lock_guard<std::mutex> lock(g_mu);
+    const double now = now_s();
+    const auto scope = wo216::lifecycle_observation_stamp();
+    for (Entry& e : g_tracked) {
+        if (e.eid != eid || !e.movesBody || e.bodyScope != scope) continue;
+        uint32_t status = 0;
+        if (!rd_u32(e.action, kActStatus, &status)) continue;
+        if (status == wo167rules::kStatusInstalled || status == wo167rules::kStatusExiting) return true;
+        if (status == wo167rules::kStatusPending) {
+            // A request the engine has not installed in the swing watch's window must stop
+            // before the next owner takes the body; it must not start late over its movement.
+            if (!e.ended && now - e.t0 >= wo167rules::kWatchS) {
+                int stopped = 0, quieted = 0;
+                end_entry(e, &stopped, &quieted);
+            }
+            return true;
+        }
+        if (status == wo167rules::kStatusNone && now - e.t0 < wo167rules::kWatchS) return true;
+        e.movesBody = false;
+    }
+    return false;
 }
 
 int end_for_entity(uint32_t eid, const char* why) {
