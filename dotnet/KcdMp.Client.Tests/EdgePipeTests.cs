@@ -9,6 +9,7 @@ namespace KcdMp.Client.Tests;
 public sealed class EdgePipeTests
 {
     private const byte Request = 0x38, Reply = 0xB8, Generic = 0x2B, GenericReply = 0xAC;
+    private const EdgeOutcome BusyAccepted = (EdgeOutcome)6;
 
     private sealed class Connection : IAsyncDisposable
     {
@@ -105,6 +106,59 @@ public sealed class EdgePipeTests
 
         await conn.Respond(Id(first), EdgeOutcome.Busy);
         Assert.Equal(EdgeOutcome.Busy, (await bulk).Outcome);
+        Assert.Equal(1, conn.Pipe.EdgeBusyReplies);
+    }
+
+    [Fact]
+    public async Task Busy_progress_keeps_its_id_pending_while_other_requests_complete_out_of_order()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var bulk = conn.Ask(9);
+        var first = await conn.Read(Request);
+        var realtime = conn.Ask(7, EdgeLane.Realtime);
+        var second = await conn.Read(Request);
+
+        await conn.Respond(Id(first) + 100, BusyAccepted);
+        await conn.Respond(Id(first), BusyAccepted, GenericReply);
+        await conn.Respond(Id(first), BusyAccepted, result: [1]);
+        await conn.Respond(Id(first), BusyAccepted);
+        await conn.Complete(second, 1, 0, 254, 0, 7);
+        Assert.Equal(new byte[] { 1, 0, 254, 0, 7 }, (await realtime).Payload);
+        Assert.False(bulk.IsCompleted);
+        Assert.Equal(1, conn.Pipe.EdgeBusyReplies);
+
+        var next = conn.Ask(12);
+        var third = await conn.Read(Request);
+        Assert.NotEqual(Id(first), Id(third));
+        Assert.Equal(12, third[11]);
+        await conn.Complete(first, 1, 0, 254, 0, 9);
+        await conn.Respond(Id(first), BusyAccepted); // progress on a completed ID is stale
+        await conn.Complete(third, 1, 0, 254, 0, 12);
+        Assert.Equal(new byte[] { 1, 0, 254, 0, 9 }, (await bulk).Payload);
+        Assert.Equal(new byte[] { 1, 0, 254, 0, 12 }, (await next).Payload);
+        Assert.Equal(1, conn.Pipe.EdgeBusyReplies);
+    }
+
+    [Fact]
+    public async Task Busy_progress_without_a_final_reply_still_times_out_as_ambiguous_without_replaying()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var pending = conn.Ask(1);
+        var first = await conn.Read(Request);
+        await conn.Respond(Id(first), BusyAccepted);
+        Assert.Equal(EdgeOutcome.Ambiguous, (await pending).Outcome);
+        Assert.Equal(1, conn.Pipe.EdgeBusyReplies);
+
+        var live = conn.Ask(2);
+        var second = await conn.Read(Request);
+        Assert.NotEqual(Id(first), Id(second));
+        Assert.Equal(2, second[11]);
+        await conn.Respond(Id(first), BusyAccepted);
+        await conn.Complete(first, 1, 0, 254, 0, 1);
+        await conn.Complete(second, 1, 0, 254, 0, 2);
+        Assert.Equal(new byte[] { 1, 0, 254, 0, 2 }, (await live).Payload);
         Assert.Equal(1, conn.Pipe.EdgeBusyReplies);
     }
 

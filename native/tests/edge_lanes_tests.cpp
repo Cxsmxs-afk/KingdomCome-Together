@@ -87,6 +87,44 @@ int edge_lanes_tests(int* passed) {
     check(may_work(true, 29, 1) && !may_work(true, 30, 1) && may_work(false, 49, 1) && !may_work(false, 50, 1),
           "realtime and bulk caps are applied independently");
 
+    PendingNotices notices;
+    constexpr auto entered = NoticeClock::time_point{};
+    constexpr auto deadline = entered + kPendingAfter;
+    constexpr auto oneMs = std::chrono::milliseconds(1);
+    check(kPendingAfter + kNoticeWaitSlice < std::chrono::milliseconds(50), "notification leaves scheduling headroom");
+    check(notices.admit({7, 11}, deadline) && notices.next() == deadline &&
+          !notices.admit({7, 11}, entered), "only one timer per accepted ID");
+    check(!notices.take_due(deadline - oneMs), "no notice before deadline");
+    auto pending = notices.take_due(deadline);
+    check(pending && pending->connection == 7 && pending->id == 11 && notices.contains(11) &&
+          !notices.next() && !notices.take_due(deadline + oneMs), "advisory leaves the same ID admitted and does not repeat");
+    check(!notices.finish({6, 11}) && notices.finish({7, 11}) && !notices.contains(11) &&
+          !notices.take_due(deadline + oneMs), "terminal is generation-scoped and prevents later notice");
+    check(notices.admit({7, 12}, deadline) && notices.finish({7, 12}) &&
+          !notices.take_due(deadline), "fast terminal cancels its notice before scheduling");
+    check(notices.admit({7, 15}, deadline) && notices.admit({7, 16}, deadline - oneMs),
+          "multiple independent timers accepted");
+    pending = notices.take_due(deadline - oneMs);
+    check(pending && pending->id == 16 && notices.next() == deadline, "notifier selects earliest deadline");
+    notices.clear();
+    check(notices.admit({8, 15}, deadline) && !notices.finish({7, 15}) && notices.next() == deadline,
+          "disconnect cancels old timers and isolates reused IDs");
+    notices.clear();
+
+    Queue stalled;
+    bool queued = true;
+    for (uint32_t id = 1; id <= 3; ++id)
+        queued &= stalled.push(request(id, Lane::Realtime), superseded) && notices.admit({9, id}, deadline);
+    check(queued && stalled.pop(true, parsed) && parsed.id == 1, "first request can stall after leaving queue");
+    auto first = notices.take_due(deadline);
+    auto second = notices.take_due(deadline);
+    auto third = notices.take_due(deadline);
+    check(first && second && third && first->id == 1 && second->id == 2 && third->id == 3,
+          "running and queued requests both receive a notice without game progress");
+    check(notices.finish({9, 1}) && stalled.pop(true, parsed) && parsed.id == 2 && notices.finish({9, 2}) &&
+          stalled.pop(true, parsed) && parsed.id == 3 && notices.finish({9, 3}) && !stalled.pop(true, parsed) &&
+          !notices.next(), "resumed work still finishes once and in FIFO order");
+
     struct Run {
         uint32_t rt = 0, bulk = 0, busy = 0;
         int64_t p95Us = 0;

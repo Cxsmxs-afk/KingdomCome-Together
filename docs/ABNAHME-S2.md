@@ -105,6 +105,8 @@ python tools/rig/scenarios.py lanes --test-lanes --netz normal --bot
 
 Beide Varianten mit neuem `KCDMP_RIG_RUN` und frisch gestartetem Relay für `--netz schlecht` wiederholen. Das Relay verzögert Frames um 150 ms plus 0–35 ms Jitter. Die in `lanes.json` gemessene Spurenzeit beginnt mit der Einreihung in der DLL. Das Rig verlangt pro Spielinstanz 3.600 abgearbeitete Echtzeit- und 6.000 geordnet abgearbeitete Bulk-Aufträge sowie Vorrang der Echtzeitspur bei gleichzeitiger Last. Die p95-Grenze für Echtzeit ist unter 34 ms grün, ab 34 ms rot. Fehlende Messabdeckung bleibt grau in T1. `proc_awaits_per_frame_max`, `http_calls_rt` und `owner_violations` müssen bei null liegen. `pipe_busy_replies` und `inproc_fallbacks` stehen im Bericht. Ein belegter Agent-Hop über 20 ms wird für die Entscheidung über den Netz-Empfang in der DLL ausgewiesen. Die Spieltests stehen aus.
 
+`pipe_busy_replies` zählt die sofortige Ablehnung bei voller Spur und die einmalige Wartemeldung eines bereits angenommenen Auftrags. Ein eigener Pipe-Thread stellt die Wartemeldung ab 30 ms zur priorisierten Zustellung bereit. Die Request-ID bleibt bis zur endgültigen Antwort offen und der Auftrag behält seinen Platz in der Spur. Die Zustellung innerhalb von 50 ms bei blockiertem Spielthread ist auf Windows im Spiel zu prüfen.
+
 ### Zwei-PC-Checkliste
 
 1. Beide PCs mit demselben Build und `KCDMP_TEST_LANES=1` in Spiel und Agent starten. Im Wegwerfstand verbinden und die Partnerfigur auf beiden Seiten prüfen.

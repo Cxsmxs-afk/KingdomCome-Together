@@ -7,6 +7,7 @@ namespace kcdmp::edge {
 
 struct Counts {
     uint64_t rt_age_ms_p95 = 0, rt_age_ms_max = 0, bulk_age_ms_p95 = 0;
+    // Terminal non-admission and one advisory notice per delayed accepted ID.
     uint64_t pipe_busy_replies = 0, rt_n = 0, bulk_n = 0;
 };
 

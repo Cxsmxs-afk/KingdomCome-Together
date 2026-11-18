@@ -348,7 +348,9 @@ double w218_now_us() {
 }
 
 std::mutex g_edgeMutex;
+std::condition_variable g_edgeCv;
 edgelanes::Queue g_edgeQueue;
+edgelanes::PendingNotices g_edgeNotices;
 std::atomic<uint64_t> g_edgeBusy{0};
 rpmeasure::detail::Histogram g_edgeRt, g_edgeBulk; // Main thread only.
 
@@ -365,17 +367,31 @@ int64_t edge_qpc() {
     return QueryPerformanceCounter(&q) ? q.QuadPart : 0;
 }
 
-void edge_observe(rpmeasure::detail::Histogram& histogram, int64_t firstByte) {
-    if (firstByte <= 0) return;
+double edge_ms_per_tick() {
     static const double msPerTick = [] {
         LARGE_INTEGER frequency{};
         return QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0 ? 1000.0 / frequency.QuadPart : 0.0;
     }();
+    return msPerTick;
+}
+
+void edge_observe(rpmeasure::detail::Histogram& histogram, int64_t firstByte) {
+    if (firstByte <= 0) return;
+    const double msPerTick = edge_ms_per_tick();
     const int64_t now = edge_qpc();
     uint32_t ms = 0;
     if (msPerTick > 0.0 && now >= firstByte &&
         rpmeasure::detail::rounded_measurement(static_cast<double>(now - firstByte) * msPerTick, ms))
         histogram.add(ms);
+}
+
+edgelanes::NoticeClock::time_point edge_deadline(int64_t firstByte) {
+    const auto now = edgelanes::NoticeClock::now();
+    const int64_t tick = edge_qpc();
+    if (firstByte <= 0 || tick < firstByte) return now + edgelanes::kPendingAfter;
+    const double elapsedMs = static_cast<double>(tick - firstByte) * edge_ms_per_tick();
+    const double remainingMs = (std::max)(0.0, static_cast<double>(edgelanes::kPendingAfter.count()) - elapsedMs);
+    return now + std::chrono::microseconds(static_cast<int64_t>(remainingMs * 1000.0));
 }
 
 bool edge_reply(HANDLE h, uint64_t generation, uint32_t id, edgelanes::Status status,
@@ -396,15 +412,53 @@ bool edge_reply(HANDLE h, uint64_t generation, uint32_t id, edgelanes::Status st
     return enqueue_raw(h, frame.data(), frame.size(), generation, priority);
 }
 
+void edge_notify_loop() {
+    using namespace edgelanes;
+    std::unique_lock<std::mutex> lock(g_edgeMutex);
+    while (g_running) {
+        const auto deadline = g_edgeNotices.next();
+        if (!deadline) {
+            g_edgeCv.wait(lock);
+            continue;
+        }
+        const auto now = NoticeClock::now();
+        if (*deadline > now) {
+            // A Windows wait may round up to one scheduler tick. Use an
+            // absolute deadline and a short requested wait for headroom.
+            g_edgeCv.wait_until(lock, (std::min)(*deadline, now + kNoticeWaitSlice));
+            continue;
+        }
+        const auto due = g_edgeNotices.take_due(now);
+        if (!due || !g_connected || due->connection != g_connGen.load()) continue;
+        // Serialize advisory enqueue with the terminal's accounting. The
+        // outbox sends admission notices before completion replies.
+        if (edge_reply(g_pipe.load(), due->connection, due->id, Status::Pending))
+            g_edgeBusy.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool edge_finish(HANDLE h, uint64_t generation, uint32_t id, edgelanes::Status status,
+                 const std::vector<uint8_t>* response = nullptr, bool rt = false) {
+    {
+        std::lock_guard<std::mutex> lock(g_edgeMutex);
+        if (!g_edgeNotices.finish({generation, id})) return false;
+    }
+    return edge_reply(h, generation, id, status, response, rt);
+}
+
 bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) {
     using namespace edgelanes;
+    const uint32_t id = outer.body.size() >= 4 ? read_u32(outer.body.data()) : 0;
+    const auto reject = [&](Status status) {
+        {
+            std::lock_guard<std::mutex> lock(g_edgeMutex);
+            if (!id || g_edgeNotices.contains(id)) return false;
+        }
+        return edge_reply(h, generation, id, status);
+    };
     Request request;
-    if (!decode(outer, request)) {
-        const uint32_t id = outer.body.size() >= 4 ? read_u32(outer.body.data()) : 0;
-        return id != 0 && edge_reply(h, generation, id, Status::Invalid);
-    }
+    if (!decode(outer, request)) return reject(Status::Invalid);
     const uint8_t nested = request.frame.type;
-    const uint32_t id = request.id;
     const bool lifecycle = nested == kWo163 && !request.frame.body.empty() &&
                            (request.frame.body[0] == wo216::kOpLifecycle ||
                             request.frame.body[0] == pipecontrol::kEdgeCapabilities);
@@ -412,21 +466,30 @@ bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) 
     if (lifecycle || (nested > kPinLabel && nested != kRawPose && nested != kProbe) ||
         (request.lane == Lane::Latest && !latest) ||
         (nested == kRawPose && request.lane != Lane::Realtime) || (nested == kProbe && request.lane != Lane::Bulk))
-        return edge_reply(h, generation, id, Status::Unsupported);
+        return reject(Status::Unsupported);
     if (nested != kRawPose && !pipecontrol::complete_payload_allowed(request.frame))
-        return edge_reply(h, generation, id, Status::Invalid);
+        return reject(Status::Invalid);
     request.connection = generation;
+    const auto deadline = edge_deadline(outer.readerQpc);
     bool accepted = false;
     uint32_t superseded = 0;
     {
         std::lock_guard<std::mutex> lock(g_edgeMutex);
+        // A second reply on an active ID would change the result of the
+        // original request. Close this malformed stream instead.
+        if (g_edgeNotices.contains(id)) return false;
         accepted = g_edgeQueue.push(std::move(request), superseded);
+        if (accepted) {
+            if (superseded && !g_edgeNotices.finish({generation, superseded})) return false;
+            g_edgeNotices.admit({generation, id}, deadline);
+        }
     }
     if (!accepted) {
         const bool sent = edge_reply(h, generation, id, Status::Busy);
         if (sent) g_edgeBusy.fetch_add(1, std::memory_order_relaxed);
         return sent;
     }
+    g_edgeCv.notify_one();
     return superseded == 0 || edge_reply(h, generation, superseded, Status::Superseded);
 }
 
@@ -2190,11 +2253,11 @@ void edge_dispatch(const edgelanes::Request& request, bool rt) {
     }
     t_edgeReply = previous;
     if (completed && !capture.frame.empty()) {
-        edge_reply(handle, request.connection, request.id, edgelanes::Status::Completed, &capture.frame, rt);
+        edge_finish(handle, request.connection, request.id, edgelanes::Status::Completed, &capture.frame, rt);
         return;
     }
     logf("PIPE: async dispatch type=0x%02X produced no direct result; its outcome is uncertain", type);
-    edge_reply(handle, request.connection, request.id, edgelanes::Status::Faulted);
+    edge_finish(handle, request.connection, request.id, edgelanes::Status::Faulted);
 }
 
 void edge_drain(bool rt) {
@@ -2233,6 +2296,7 @@ void serve(HANDLE h) {
     {
         std::lock_guard<std::mutex> lock(g_edgeMutex);
         g_edgeQueue.clear();
+        g_edgeNotices.clear();
     }
     tx_disconnected(h);
     logf("PIPE: agent disconnected");
@@ -2351,6 +2415,7 @@ bool start() {
     // The injected plugin has process lifetime. Detaching keeps DLL teardown
     // free of a blocking join under the Windows loader lock.
     std::thread(write_loop).detach();
+    std::thread(edge_notify_loop).detach();
     std::thread(listen_loop).detach();
     logf("PIPE: listening on %s", pipe_name());
     return true;
@@ -2360,6 +2425,11 @@ void stop() {
     if (!g_running.exchange(false)) return;
     main_thread::set_frame_lanes(nullptr, nullptr);
     g_tx.cv.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(g_edgeMutex);
+        g_edgeNotices.clear();
+    }
+    g_edgeCv.notify_all();
     const HANDLE current = g_pipe.load();
     if (current != INVALID_HANDLE_VALUE) CancelIoEx(current, nullptr);
     // Unblock ConnectNamedPipe by connecting to it once.

@@ -26,7 +26,7 @@ public sealed partial class CombatPipe
 {
     private const byte EdgeFrame = 0x38, EdgeReply = 0xB8, EdgeRawPose = 0x39, EdgeCapabilityOp = 255;
     private const byte EdgeLatest = 3;
-    private const byte EdgeFaulted = 5;
+    private const byte EdgeFaulted = 5, EdgeBusyAccepted = 6;
     private const int EdgeHeaderSize = 10, EdgeReplyHeaderSize = 6, EdgeMaxPayload = 4096;
     private const int EdgeMaxPending = 512, EdgeRealtimeBurst = 3;
     private readonly object _edgeLock = new();
@@ -44,6 +44,7 @@ public sealed partial class CombatPipe
     public bool EdgeTransportOn { get => _edgeTransportOn; set => _edgeTransportOn = value; }
     public bool EdgeActive => EdgeTransportOn && Volatile.Read(ref _edgeSupportedPipe) is { IsConnected: true } pipe &&
         ReferenceEquals(pipe, _pipe);
+    /// <summary>Matched native busy replies, including progress for requests that remain accepted.</summary>
     public long EdgeBusyReplies => Interlocked.Read(ref _edgeBusyReplies);
     public long EdgeStateSkipped => Interlocked.Read(ref _edgeStateSkipped);
     public long EdgeConnectionRevision => Interlocked.Read(ref _edgeConnectionRevision);
@@ -287,9 +288,11 @@ public sealed partial class CombatPipe
                 FinishEdge(work, new(outcome, body[EdgeReplyHeaderSize..]));
                 return true;
             }
-            if (body[4] is < (byte)EdgeOutcome.Busy or > EdgeFaulted || body[5] != 0 || body.Length != EdgeReplyHeaderSize)
+            if (body[4] is < (byte)EdgeOutcome.Busy or > EdgeBusyAccepted || body[5] != 0 || body.Length != EdgeReplyHeaderSize)
                 return true;
-            if (outcome == EdgeOutcome.Busy) Interlocked.Increment(ref _edgeBusyReplies);
+            if (body[4] is (byte)EdgeOutcome.Busy or EdgeBusyAccepted) Interlocked.Increment(ref _edgeBusyReplies);
+            // The DLL accepted this work. Keep its ID and original deadline until the terminal reply.
+            if (body[4] == EdgeBusyAccepted) return true;
             FinishEdge(work, EmptyEdge(outcome));
         }
         return true;

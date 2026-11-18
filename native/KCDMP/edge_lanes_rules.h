@@ -4,6 +4,9 @@
 #include "pipe_control_reader.h"
 
 #include <algorithm>
+#include <map>
+#include <optional>
+#include <unordered_map>
 #include <utility>
 
 namespace kcdmp::edgelanes {
@@ -14,8 +17,10 @@ constexpr size_t kRequestHeader = 10, kReplyHeader = 6;
 constexpr size_t kRtLimit = 192, kBulkLimit = 256;
 constexpr unsigned kRtPerFrame = 30, kBulkPerFrame = 50;
 constexpr double kRtBudgetUs = 1250, kBulkBudgetUs = 750;
+constexpr auto kPendingAfter = std::chrono::milliseconds(30);
+constexpr auto kNoticeWaitSlice = std::chrono::milliseconds(5);
 enum class Lane : uint8_t { Realtime = 1, Bulk = 2, Latest = 3 };
-enum class Status : uint8_t { Completed = 0, Busy = 1, Unsupported = 2, Superseded = 3, Invalid = 4, Faulted = 5 };
+enum class Status : uint8_t { Completed = 0, Busy = 1, Unsupported = 2, Superseded = 3, Invalid = 4, Faulted = 5, Pending = 6 };
 
 inline uint32_t read_u32(const uint8_t* b) {
     return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
@@ -99,5 +104,54 @@ inline bool may_work(bool rt, unsigned served, double elapsedUs) {
     return served < (rt ? kRtPerFrame : kBulkPerFrame) &&
            (served == 0 || elapsedUs < (rt ? kRtBudgetUs : kBulkBudgetUs));
 }
+
+using NoticeClock = std::chrono::steady_clock;
+struct Notice { uint64_t connection = 0; uint32_t id = 0; };
+
+// One advisory notice per admitted ID. Popping a notice leaves the ID active
+// until a terminal completion or connection reset. The caller serializes
+// deadline accounting and enqueues an advisory before releasing its lock.
+class PendingNotices {
+    using Schedule = std::multimap<NoticeClock::time_point, uint32_t>;
+    struct Entry {
+        uint64_t connection;
+        std::optional<Schedule::iterator> timer;
+    };
+    Schedule schedule_;
+    std::unordered_map<uint32_t, Entry> admitted_;
+
+public:
+    bool contains(uint32_t id) const { return admitted_.find(id) != admitted_.end(); }
+
+    bool admit(Notice request, NoticeClock::time_point deadline) {
+        if (contains(request.id)) return false;
+        admitted_.emplace(request.id, Entry{request.connection, schedule_.emplace(deadline, request.id)});
+        return true;
+    }
+
+    bool finish(Notice request) {
+        const auto it = admitted_.find(request.id);
+        if (it == admitted_.end() || it->second.connection != request.connection) return false;
+        if (it->second.timer) schedule_.erase(*it->second.timer);
+        admitted_.erase(it);
+        return true;
+    }
+
+    std::optional<NoticeClock::time_point> next() const {
+        return schedule_.empty() ? std::nullopt : std::optional{schedule_.begin()->first};
+    }
+
+    std::optional<Notice> take_due(NoticeClock::time_point now) {
+        const auto timer = schedule_.begin();
+        if (timer == schedule_.end() || timer->first > now) return std::nullopt;
+        const auto id = timer->second;
+        auto& entry = admitted_.at(id);
+        entry.timer.reset();
+        schedule_.erase(timer);
+        return Notice{entry.connection, id};
+    }
+
+    void clear() { admitted_.clear(); schedule_.clear(); }
+};
 
 } // namespace kcdmp::edgelanes
