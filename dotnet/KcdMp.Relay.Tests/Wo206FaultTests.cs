@@ -461,9 +461,9 @@ public class Wo206FaultTests
         "{ \"name\": \"onload\", \"kind\": \"lag\", \"role\": \"host\", \"dir\": \"up\", \"ms\": 1, \"for_s\": 0.1, \"at\": \"step:loaded\" }," +
         "{ \"name\": \"never\", \"kind\": \"lag\", \"ms\": 1, \"at\": \"t:+3600\" }");
 
-    /// <summary>Every step seen once, and "loaded" read from the joiner's world report (not the fallback).</summary>
+    /// <summary>The initial join steps occur once; recovery waits for its negotiated baseline receipt.</summary>
     private static bool StepsSeenWithLoadedFromTheReport(RelayFaults f) =>
-        RelayFaults.Steps.All(s => f.StepCount(s) == 1)
+        RelayFaults.Steps.All(s => f.StepCount(s) == (s == "recovery-joiner-ready" ? 0 : 1))
         && f.RecentLines().Any(l => l.StartsWith("RELAY-FAULT onload fired") && l.Contains("via=w203-join-progress"));
 
     [Fact]
