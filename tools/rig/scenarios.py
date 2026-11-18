@@ -943,7 +943,7 @@ def s_verdict(r):
                 return False, 'no-verdict-telemetry', role
         bundles = pair.collect('verdict-%d' % time.time_ns(), write_verdict=True)
         tool = os.path.join(HERE, '..', 'verdict', 'pair.py')
-        process = subprocess.run([sys.executable, tool, bundles[r.a.id] + '.packed', bundles[r.b.id] + '.packed'],
+        process = subprocess.run([sys.executable, '-X', 'utf8', tool, bundles[r.a.id] + '.packed', bundles[r.b.id] + '.packed'],
                                  cwd=r.dir, capture_output=True, text=True, encoding='utf-8', errors='replace')
         detail = {'report': os.path.join(r.dir, 'ERGEBNIS-PAAR.md'), 'output': (process.stdout + process.stderr).strip()}
         return process.returncode == 0, ('ok' if process.returncode == 0 else 'pair-verdict'), detail

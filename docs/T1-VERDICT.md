@@ -17,7 +17,7 @@ Bei den einzelnen Regeln steht Grau für fehlende oder nicht anwendbare Messunge
 python tools/verdict/pair.py <Host-Ergebnis> <Joiner-Ergebnis>
 ```
 
-Für beide Seiten sind `ERGEBNIS.txt` oder der entpackte Ordner gültig. Mit einer `tar`-Version, die Zstandard unterstützt, nimmt der Befehl auch `.tzst`-Archive an. Der Bericht `ERGEBNIS-PAAR.md` landet im aktuellen Verzeichnis. Rückgabe `0` bedeutet Grün, `1` einen anderen Paarstatus und `2` einen Eingabe- oder Ausgabefehler.
+Für beide Seiten sind `ERGEBNIS.txt` oder der entpackte Ordner gültig. Mit einer `tar`-Version, die Zstandard unterstützt, nimmt der Befehl auch `.tzst`-Archive an. Die Paarwertung setzt für Grün voraus, dass die Logs einen Host und einen Joiner belegen. Der Bericht `ERGEBNIS-PAAR.md` landet im aktuellen Verzeichnis. Rückgabe `0` bedeutet Grün, `1` einen gelben, roten oder grauen Paarstatus und `2` einen Eingabe- oder Ausgabefehler.
 
 ## Szenario mit zwei Instanzen
 

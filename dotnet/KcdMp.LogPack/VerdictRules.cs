@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace KcdMp.LogPack;
 
@@ -10,7 +11,7 @@ public enum VerdictStatus { Green, Grey, Yellow, Red }
 
 public sealed record VerdictRow(string Id, VerdictStatus Status, string Measurement, string Evidence);
 
-public sealed record VerdictReport(VerdictStatus Status, IReadOnlyList<VerdictRow> Rows)
+public sealed record VerdictReport(VerdictStatus Status, string Role, IReadOnlyList<VerdictRow> Rows)
 {
     public const string EntryName = "ERGEBNIS.txt";
 
@@ -26,6 +27,7 @@ public sealed record VerdictReport(VerdictStatus Status, IReadOnlyList<VerdictRo
     {
         var text = new StringBuilder("KCDMP-ERGEBNIS\t1\n");
         text.Append("Gesamt\t").Append(Label(Status)).Append('\n');
+        text.Append("Rolle\t").Append(Role).Append('\n');
         text.Append("Regel\tStatus\tMesswert\tBeleg\n");
         foreach (var row in Rows)
             text.Append(row.Id).Append('\t').Append(Label(row.Status)).Append('\t')
@@ -37,6 +39,7 @@ public sealed record VerdictReport(VerdictStatus Status, IReadOnlyList<VerdictRo
     {
         var text = new StringBuilder("## Ergebnis\n\n");
         text.Append("**Gesamt: ").Append(Label(Status)).Append("**\n\n");
+        text.Append("**Rolle im Agent-Log:** ").Append(Role).Append("\n\n");
         text.Append("Grau bedeutet, dass für die Regel eine Messung oder ein ausgeübter Vorgang fehlt. ")
             .Append("Für Grün im Gesamtergebnis ist eine gemessene Queue erforderlich. ")
             .Append("Sichtbares Spielverhalten erfordert einen Spieltest.\n\n");
@@ -57,10 +60,18 @@ public static class VerdictRules
 
     private const string T3 = "MP-T3-STATS";
     private const string W136 = "MP-WO136-STATS";
+    // The agent's TeeTextWriter supplies the wall clock and optional shared-clock metadata.
+    private const string AgentPrefix = @"^(?:\d\d:\d\d:\d\d(?:\.\d+)? (?:m=\d+ off=(?:[+-]?\d+|\?) )?)?";
+    private static readonly Regex AgentPrefixOnly = new(AgentPrefix + @"\z", RegexOptions.Compiled);
+    private static readonly Regex AgentSessionRole = new(AgentPrefix
+        + @"MP-WO137-STATS role=(host|joiner)(?: |$)", RegexOptions.Compiled);
 
     private sealed record CounterRule(string Id, VerdictStatus AboveLimit, long Limit = 0, string Unit = "",
         string? Role = null, string? RequiresActivity = null, string? Unreadable = null, string Marker = T3,
-        bool ZeroMeansMissing = false);
+        bool ZeroMeansMissing = false, string? RequiresHostActivity = null)
+    {
+        public string? ActivityFor(string role) => role == "host" ? RequiresHostActivity ?? RequiresActivity : RequiresActivity;
+    }
 
     // A threshold violation is evidence even when subsequent reads failed. For
     // a non-violating value, a failed source read or an unexercised operation
@@ -88,7 +99,8 @@ public static class VerdictRules
         new("ranged_kind_unknown", VerdictStatus.Yellow, RequiresActivity: "ranged_in"),
         new("ranged_native_queue_overflow", VerdictStatus.Red, RequiresActivity: "ranged_out",
             Unreadable: "ranged_stats_unreadable"),
-        new("ranged_missile_uncertain", VerdictStatus.Red, RequiresActivity: "ranged_missile_requests"),
+        new("ranged_missile_uncertain", VerdictStatus.Red, RequiresActivity: "ranged_missile_requests",
+            RequiresHostActivity: "ranged_missile_measured_accept"),
         new("owner_violations", VerdictStatus.Red)
     ];
 
@@ -111,7 +123,19 @@ public static class VerdictRules
         // rows are still shown as grey and any measured warning or fault wins.
         var status = rows.Where(row => row.Status is VerdictStatus.Yellow or VerdictStatus.Red)
             .Select(row => row.Status).DefaultIfEmpty(queue.Status).Max();
-        return new(status, rows.AsReadOnly());
+        return new(status, Role(agent, samples), rows.AsReadOnly());
+    }
+
+    private static string Role(IReadOnlyList<string> agent, IReadOnlyList<Sample> samples)
+    {
+        // A role can change during one game launch. Conflicting local observations
+        // cannot establish the side of a paired run. DLL mirrors do not vote.
+        var roles = samples.Where(sample => sample.Marker == T3 && sample.Origin == "Agent")
+            .Select(sample => sample.Role)
+            .Concat(agent.Select(line => AgentSessionRole.Match(line)).Where(match => match.Success)
+                .Select(match => match.Groups[1].Value))
+            .Distinct(StringComparer.Ordinal).Take(2).ToList();
+        return roles.Count == 1 ? roles[0] : "unbekannt";
     }
 
     private static VerdictRow Queue(IReadOnlyList<string> agent)
@@ -152,8 +176,9 @@ public static class VerdictRules
 
         if (rule.Unreadable is { } unreadable && observations.Any(observation => observation.Sample.Number(unreadable) != 0))
             return new(rule.Id, VerdictStatus.Grey, measurement, $"Lesbarkeit offen, {unreadable}");
-        if (rule.RequiresActivity is { } activity && observations.All(observation => !(observation.Sample.Number(activity) > 0)))
-            return new(rule.Id, VerdictStatus.Grey, measurement, $"Kein beobachteter Vorgang, {activity}");
+        if (observations.All(observation => rule.ActivityFor(observation.Sample.Role) is { } activity
+            && !(observation.Sample.Number(activity) > 0)))
+            return new(rule.Id, VerdictStatus.Grey, measurement, $"Kein beobachteter Vorgang, {rule.ActivityFor(source.Role)}");
         if (rule.ZeroMeansMissing && value == 0) return Missing(rule.Id, "Keine aufgezeichnete Stichprobe");
 
         return new(rule.Id, VerdictStatus.Green, measurement, evidence);
@@ -175,6 +200,7 @@ public static class VerdictRules
                 marker = W136;
             }
             if (start < 0 || (start > 0 && line[start - 1] != ' ')) continue;
+            if (!fromNativeLog && start > 0 && !AgentPrefixOnly.IsMatch(line.AsSpan(0, start))) continue;
 
             var fields = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var field in line[(start + marker.Length + 1)..].Split(' ', StringSplitOptions.RemoveEmptyEntries))

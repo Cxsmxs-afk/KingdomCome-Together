@@ -26,6 +26,7 @@ COLUMNS = "Regel\tStatus\tMesswert\tBeleg"
 GREEN, GRAY, YELLOW, RED = "GRÜN", "GRAU", "GELB", "ROT"
 STATUS_RANK = {status: rank for rank, status in enumerate((GREEN, GRAY, YELLOW, RED))}
 CORE_RULE = "queue"
+KNOWN_ROLES = ("host", "joiner")
 MAX_REPORT_BYTES = 256 * 1024
 RULE_ID = re.compile(r"[a-z][a-z0-9_]{0,95}")
 ARCHIVE_EXTS = (".tzst", ".tar.zst", ".tar")
@@ -50,6 +51,7 @@ class Side:
     status: str
     rules: dict[str, Rule] = field(default_factory=dict)
     error: str | None = None
+    role: str | None = None
 
 
 def _worst(*statuses: str) -> str:
@@ -105,14 +107,23 @@ def _parse(data: bytes) -> Side:
         lines = data.decode("utf-8-sig").splitlines()
     except UnicodeError as ex:
         raise BadReport(f"{REPORT} ist kein UTF-8-Text.") from ex
-    if len(lines) < 4 or lines[0] != HEADER or lines[2] != COLUMNS:
+    if len(lines) < 4 or lines[0] != HEADER:
         raise BadReport(f"{REPORT} hat ein unbekanntes oder unvollständiges Format.")
     total = lines[1].split("\t")
     if len(total) != 2 or total[0] != "Gesamt" or total[1] not in STATUS_RANK:
         raise BadReport(f"{REPORT} enthält kein gültiges Gesamturteil.")
 
+    columns = 2
+    roles = []
+    while columns < len(lines) and lines[columns].split("\t", 1)[0] == "Rolle":
+        roles.append(lines[columns].partition("\t")[2])
+        columns += 1
+    role = roles[0] if len(roles) == 1 and roles[0] in KNOWN_ROLES else None
+    if columns >= len(lines) - 1 or lines[columns] != COLUMNS:
+        raise BadReport(f"{REPORT} hat ein unbekanntes oder unvollständiges Format.")
+
     rules = {}
-    for line_no, line in enumerate(lines[3:], 4):
+    for line_no, line in enumerate(lines[columns + 1:], columns + 2):
         fields = line.split("\t")
         if len(fields) != 4 or CONTROL_CHARS.search(line):
             raise BadReport(f"{REPORT}, Zeile {line_no}: ungültige Messzeile.")
@@ -127,7 +138,7 @@ def _parse(data: bytes) -> Side:
     core = rules.get(CORE_RULE)
     status = _worst(total[1], core.status if core else GRAY,
                     *(rule.status for rule in rules.values() if rule.status in (YELLOW, RED)))
-    return Side(status, rules)
+    return Side(status, rules, role=role)
 
 
 def read_side(path: Path) -> Side:
@@ -139,9 +150,13 @@ def read_side(path: Path) -> Side:
         return Side(GRAY, error=f"{REPORT} konnte nicht gelesen werden.")
 
 
+def _role_coverage(host: Side, joiner: Side) -> str:
+    return GREEN if (host.role, joiner.role) == KNOWN_ROLES else GRAY
+
+
 def combine(host: Side, joiner: Side) -> str:
     coverage = GREEN if host.rules.keys() == joiner.rules.keys() else GRAY
-    return _worst(host.status, joiner.status, coverage)
+    return _worst(host.status, joiner.status, coverage, _role_coverage(host, joiner))
 
 
 def _cell(value: str) -> str:
@@ -162,16 +177,22 @@ def _render(host: Side, joiner: Side) -> str:
         "",
         f"Host **{host.status}** · Joiner **{joiner.status}**",
     ]
-    for role, side in (("Host", host), ("Joiner", joiner)):
+    for role, side in zip(KNOWN_ROLES, (host, joiner)):
+        label = role.capitalize()
         if side.error:
-            lines.extend(["", f"- **{role}** {_cell(side.error)}"])
+            lines.extend(["", f"- **{label}** {_cell(side.error)}"])
+        elif side.role is None:
+            lines.extend(["", f"- **{label}** Die Rolle ist unbekannt oder mehrdeutig."])
+        elif side.role != role:
+            lines.extend(["", f"- **{label}** Dieser Bericht gehört zur Rolle {side.role.capitalize()}."])
     if host.rules.keys() != joiner.rules.keys():
         lines.extend(["", "Die Berichte enthalten unterschiedliche Regeln. Fehlende Messzeilen sind grau."])
     if host.rules or joiner.rules:
         lines.extend(["", "| Regel | Host | Joiner | Paar |", "| --- | --- | --- | --- |"])
+        role_coverage = _role_coverage(host, joiner)
         for name in sorted(host.rules.keys() | joiner.rules.keys() | {CORE_RULE}):
             left, right = host.rules.get(name), joiner.rules.get(name)
-            status = _worst(left.status if left else GRAY, right.status if right else GRAY)
+            status = _worst(left.status if left else GRAY, right.status if right else GRAY, role_coverage)
             lines.append(f"| `{name}` | {_rule_cell(left)} | {_rule_cell(right)} | **{status}** |")
     return "\n".join(lines) + "\n"
 

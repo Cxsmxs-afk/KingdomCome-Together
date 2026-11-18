@@ -19,7 +19,7 @@ public class VerdictTests
             var bundle = Packer.Pack([new("agent.log", Bytes: Encoding.UTF8.GetBytes(log))], folder, "verdict");
             var files = PackerTests.Open(Assert.Single(bundle.Parts));
             var verdict = Encoding.UTF8.GetString(files["ERGEBNIS.txt"]).ReplaceLineEndings("\n");
-            Assert.StartsWith($"KCDMP-ERGEBNIS\t1\nGesamt\t{expected}\nRegel\tStatus\tMesswert\tBeleg\n", verdict);
+            Assert.StartsWith($"KCDMP-ERGEBNIS\t1\nGesamt\t{expected}\nRolle\tunbekannt\nRegel\tStatus\tMesswert\tBeleg\n", verdict);
             Assert.Contains($"\nqueue\t{expected}\t", verdict);
             var briefing = Encoding.UTF8.GetString(files["BRIEFING.md"]);
             var heading = briefing.IndexOf("## Ergebnis", StringComparison.Ordinal);
@@ -60,5 +60,36 @@ public class VerdictTests
         input.Logs["agent.log"] = [$"12:00:00.000 MP-T3-STATS origin=agent role=joiner {fields}"];
         var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "owner_violations");
         Assert.Equal(expected, row.Status);
+    }
+
+    [Fact]
+    public void The_pairing_role_comes_from_the_current_agent_and_conflicting_roles_are_unknown()
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = ["12:00:00.000 MP-T3-STATS origin=agent role=host proc_stalls=0"];
+        input.Logs["kcdmp-native.log"] = ["MP-T3-STATS origin=dll source=agent role=joiner proc_stalls=0"];
+        Assert.Contains("\nRolle\thost\n", VerdictRules.Evaluate(input).ToText());
+        input.Logs["agent.log"] = [..input.Logs["agent.log"], "12:01:00.000 MP-T3-STATS origin=agent role=joiner proc_stalls=0"];
+        Assert.Contains("\nRolle\tunbekannt\n", VerdictRules.Evaluate(input).ToText());
+    }
+
+    [Fact]
+    public void Repacking_keeps_a_queue_spike_inside_a_run_of_normal_pings()
+    {
+        var folder = Path.Combine(Path.GetTempPath(), "kcdmp-verdict-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            const string spike = "12:01:00.000 [ping] 24 ms (network), the game's queue is 230000 ms behind";
+            var pingLines = Enumerable.Range(0, 16).Select(i => i == 8 ? spike : "12:01:00.000 [ping] 24 ms (network)");
+            var log = "12:00:00.000 MP-W207-Q lag_ms=25 waiting=0\n" + string.Join('\n', pingLines) + "\n";
+            var first = Packer.Pack([new("agent.log", Bytes: Encoding.UTF8.GetBytes(log))], folder, "first");
+            var files = PackerTests.Open(Assert.Single(first.Parts));
+            Assert.Contains(spike, Encoding.UTF8.GetString(files["agent.log"]));
+            var repacked = Packer.Pack([new("agent.log", Bytes: files["agent.log"]), new("ERGEBNIS.txt", Bytes: files["ERGEBNIS.txt"])],
+                folder, "second");
+            Assert.Equal(first.Verdict, repacked.Verdict);
+            Assert.Contains("Gesamt\tROT", repacked.Verdict);
+        }
+        finally { if (Directory.Exists(folder)) Directory.Delete(folder, true); }
     }
 }

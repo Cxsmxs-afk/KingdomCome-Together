@@ -13,8 +13,11 @@ import unittest
 import pair
 
 
-def verdict(status, *rows):
-    fields = [pair.HEADER, f"Gesamt\t{status}", pair.COLUMNS]
+def verdict(status, *rows, role="host"):
+    fields = [pair.HEADER, f"Gesamt\t{status}"]
+    if role is not None:
+        fields.append(f"Rolle\t{role}")
+    fields.append(pair.COLUMNS)
     fields.extend("\t".join(row) for row in rows)
     return ("\n".join(fields) + "\n").encode("utf-8")
 
@@ -46,7 +49,8 @@ class PairTests(unittest.TestCase):
 
     def test_two_clean_reports_allow_optional_gray_rows(self):
         report = verdict(pair.GREEN, QUEUE_OK, NO_OWNERS)
-        with_bom = b"\xef\xbb\xbf" + report.replace(b"\n", b"\r\n")
+        joiner = verdict(pair.GREEN, QUEUE_OK, NO_OWNERS, role="joiner")
+        with_bom = b"\xef\xbb\xbf" + joiner.replace(b"\n", b"\r\n")
         self.write_sides(report, with_bom)
         result, markdown = self.run_pair()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -56,7 +60,7 @@ class PairTests(unittest.TestCase):
 
     def test_queue_stall_beats_gray_and_yellow(self):
         alert = ("queue", pair.YELLOW, "750 ms", "MP-W207-Q")
-        self.write_sides(verdict(pair.RED, QUEUE_STALL, NO_OWNERS), verdict(pair.YELLOW, alert))
+        self.write_sides(verdict(pair.RED, QUEUE_STALL, NO_OWNERS), verdict(pair.YELLOW, alert, role="joiner"))
         result, markdown = self.run_pair()
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("**Gesamt ROT**", markdown)
@@ -65,7 +69,7 @@ class PairTests(unittest.TestCase):
 
     def test_disagreeing_rule_sets_are_gray_and_escape_evidence(self):
         extra = ("extra", pair.GREEN, "<Tag> | 22", "[Text](url)")
-        self.write_sides(verdict(pair.GREEN, QUEUE_OK, extra), verdict(pair.GREEN, QUEUE_OK))
+        self.write_sides(verdict(pair.GREEN, QUEUE_OK, extra), verdict(pair.GREEN, QUEUE_OK, role="joiner"))
         result, markdown = self.run_pair()
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("**Gesamt GRAU**", markdown)
@@ -76,25 +80,23 @@ class PairTests(unittest.TestCase):
         owners = ("owner_violations", pair.GREEN, "0", "MP-T3-STATS")
         for queue in ([], [("queue", pair.GRAY, "–", "")], [("queue", pair.GREEN, "", "")]):
             with self.subTest(queue=queue):
-                report = verdict(pair.GREEN, owners, *queue)
-                self.write_sides(report, report)
+                self.write_sides(verdict(pair.GREEN, owners, *queue), verdict(pair.GREEN, owners, *queue, role="joiner"))
                 result, markdown = self.run_pair()
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("**Gesamt GRAU**", markdown)
                 self.assertIn("| `queue` | **GRAU**", markdown)
 
     def test_invalid_sources_are_reported_instead_of_reusing_an_old_green_report(self):
-        report = verdict(pair.GREEN, QUEUE_OK)
-        self.write_sides(report, report)
+        self.write_sides(verdict(pair.GREEN, QUEUE_OK), verdict(pair.GREEN, QUEUE_OK, role="joiner"))
         result, markdown = self.run_pair()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("**Gesamt GRÜN**", markdown)
         (self.host / pair.REPORT).unlink()
-        self.joiner.write_bytes(verdict(pair.GREEN, QUEUE_OK, QUEUE_OK))
+        self.joiner.write_bytes(verdict(pair.GREEN, QUEUE_OK, QUEUE_OK, role="joiner"))
         result, markdown = self.run_pair()
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("Host - ERGEBNIS.txt fehlt", result.stderr)
-        self.assertIn("Joiner - ERGEBNIS.txt, Zeile 5", result.stderr)
+        self.assertIn("Joiner - ERGEBNIS.txt, Zeile 6", result.stderr)
         self.assertIn("**Gesamt GRAU**", markdown)
         self.assertNotIn("**Gesamt GRÜN**", markdown)
         self.assertEqual(list(self.root.glob(".ERGEBNIS-PAAR.md-*")), [])
@@ -108,10 +110,30 @@ class PairTests(unittest.TestCase):
                 self.assertEqual(side.status, pair.GRAY)
                 self.assertTrue(side.error)
 
+    def test_unknown_missing_and_ambiguous_roles_cannot_claim_green(self):
+        host = verdict(pair.GREEN, QUEUE_OK)
+        for role in ("unbekannt", None, "host\nRolle\tjoiner"):
+            with self.subTest(role=role):
+                self.write_sides(host, verdict(pair.GREEN, QUEUE_OK, role=role))
+                result, markdown = self.run_pair()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("**Gesamt GRAU**", markdown)
+                self.assertIn("Die Rolle ist unbekannt oder mehrdeutig.", markdown)
+                self.assertIn("MP-W207-Q | **GRAU** |", markdown)
+
+    def test_wrong_roles_keep_measured_red(self):
+        self.write_sides(verdict(pair.GREEN, QUEUE_OK, role="joiner"), verdict(pair.RED, QUEUE_STALL))
+        result, markdown = self.run_pair()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("**Gesamt ROT**", markdown)
+        self.assertIn("Dieser Bericht gehört zur Rolle Joiner.", markdown)
+        self.assertIn("Dieser Bericht gehört zur Rolle Host.", markdown)
+        self.assertIn("MP-W207-Q | **ROT** |", markdown)
+
     @unittest.skipUnless(shutil.which("tar"), "tar unavailable")
     def test_reads_only_expected_root_archive_member(self):
         archive = self.root / "Bundle Host.tar"
-        self.joiner.write_bytes(verdict(pair.GREEN, QUEUE_OK))
+        self.joiner.write_bytes(verdict(pair.GREEN, QUEUE_OK, role="joiner"))
         with tarfile.open(archive, "w") as handle:
             for name, data in ((pair.REPORT, verdict(pair.GREEN, QUEUE_OK)), ("outside.txt", b"no extraction")):
                 entry = tarfile.TarInfo(name)
@@ -126,7 +148,7 @@ class PairTests(unittest.TestCase):
     def test_reads_part_one_of_split_tzst(self):
         archive = self.root / "Bundle-part1of2.tar"
         data = verdict(pair.GREEN, QUEUE_OK)
-        self.joiner.write_bytes(data)
+        self.joiner.write_bytes(verdict(pair.GREEN, QUEUE_OK, role="joiner"))
         with tarfile.open(archive, "w") as handle:
             entry = tarfile.TarInfo(pair.REPORT)
             entry.size = len(data)
@@ -138,6 +160,11 @@ class PairTests(unittest.TestCase):
         result, markdown = self.run_pair(part_two)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("**Gesamt GRÜN**", markdown)
+        (self.host / pair.REPORT).write_bytes(data)
+        result, markdown = self.run_pair(part_two, self.host)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("**Gesamt GRAU**", markdown)
+        self.assertIn("**Joiner** Dieser Bericht gehört zur Rolle Host.", markdown)
         part_one.unlink()
         self.assertIn("Der erste Bundle-Teil fehlt", pair.read_side(part_two).error)
 

@@ -54,11 +54,12 @@ public static class NoiseRules
         C("blank lines",                           @"^\s*$"),
     };
 
-    /// <summary>Lines that are kept in full wherever they are: the testers' marks, faults, the stat / summary lines of the work orders.</summary>
-    private static readonly Regex Protected = new(@"MP-MARK|FAULT|STATS|SUMMARY|summary", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    /// <summary>Keep marks, faults, measurements and summaries wherever they occur.</summary>
+    private static readonly Regex Protected = new(@"MP-MARK|FAULT|STATS|SUMMARY|summary|MP-W207-Q ", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>A line that is never collapsed, whatever it is next to.</summary>
-    public static bool IsProtected(string line) => Protected.IsMatch(line);
+    public static bool IsProtected(string line) => Protected.IsMatch(line)
+        || (line.Contains("[ping] ", StringComparison.Ordinal) && Briefing.QueueLag.IsMatch(line));
 
     private static readonly Regex Clock = new(
         @"^(?:\[\d\d:\d\d:\d\d(?:\.\d+)?\]\s*(?:t\d+\s*)?|\d\d:\d\d:\d\d(?:\.\d+)?\s+(?:m=\d+\s+off=\S+\s+)?|\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d+)? [+-]\d\d:\d\d \[[A-Z]{3}\]\s*)",
