@@ -18,22 +18,27 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
+$version = (Get-Content -LiteralPath (Join-Path $root "VERSION") -Raw).Trim()
+if ($version -cnotmatch '\A[0-9A-Za-z][0-9A-Za-z.+-]*\z') { throw "Invalid package version in VERSION: '$version'" }
 if (-not $ReleaseDir) { $ReleaseDir = Join-Path $root "release\KCDMP" }
-if (-not $OutZip) { $OutZip = Join-Path $root "release\KingdomComeTogether-DropIn.zip" }
+if (-not $OutZip) { $OutZip = Join-Path $root "release\KingdomComeTogether-$version.zip" }
+$OutZip = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutZip)
+if (Test-Path -LiteralPath $OutZip -PathType Container) { throw "ZIP output is a directory: $OutZip" }
 $pak = Join-Path $root "kdcmp\Data\kdcmp.pak"
 $manifest = Join-Path $root "kdcmp\mod.manifest"
 $launcher = Join-Path $ReleaseDir "KCDMP_launcher.exe"
 $dll = Join-Path $ReleaseDir "KCDMP.dll"
 foreach ($p in @($ReleaseDir, $pak, $manifest, $launcher, $dll)) {
-    if (-not (Test-Path $p)) { throw "missing: $p" }
+    if (-not (Test-Path -LiteralPath $p)) { throw "missing: $p" }
 }
 
-$version = (Get-Content (Join-Path $root "VERSION") -TotalCount 1).Trim()
-$stage = Join-Path $env:TEMP ("kct-dropin-" + [guid]::NewGuid().ToString("N"))
+$id = [guid]::NewGuid().ToString("N")
+$stage = Join-Path ([System.IO.Path]::GetTempPath()) "kct-dropin-$id"
+$zipTemp = Join-Path (Split-Path -Parent $OutZip) "kct-dropin-$id.tmp"
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 try {
     $app = Join-Path $stage "KingdomComeTogether"
-    Copy-Item $ReleaseDir $app -Recurse -Force
+    Copy-Item -LiteralPath $ReleaseDir -Destination $app -Recurse -Force
     foreach ($rel in @("Mods\kdcmp", "KingdomComeTogether\mod\kdcmp")) {
         $dest = Join-Path $stage $rel
         New-Item -ItemType Directory -Force -Path (Join-Path $dest "Data") | Out-Null
@@ -44,29 +49,27 @@ try {
     # Setup writes it when it finishes; a drop-in never ran Setup, and an older
     # folder may still hold FAIL or nothing. The zip has to bring PASS with it.
     $verify = @"
-PASS  drop-in $version : these files are the verified build
+PASS  drop-in $version
 version $version
 "@
     [System.IO.File]::WriteAllText((Join-Path $app "install-verify.txt"), $verify.Replace("`n", "`r`n"), [System.Text.UTF8Encoding]::new($false))
 
     $install = @"
 Kingdom Come: Together $version
-In den Ordner der KCD2 Modding Tools entpacken. Vorhandenes überschreiben.
 
 Installieren
 1. Spiel und Launcher schließen.
-2. Steam: Kingdom Come: Deliverance II Modding Tools, Verwalten, Durchsuchen. Das ist der Ordner.
-3. Diese Zip dort hinein entpacken. Überschreiben wählen.
-4. KingdomComeTogether\KCDMP_launcher.exe starten. Nicht das Spiel direkt aus Steam.
-5. Der Launcher prüft, ob die Programme zusammenpassen, und legt den Mod ins Spiel, falls er fehlt.
-6. Host oder Beitreten, dann Spielen. Beide brauchen dieselbe Zip.
+2. In Steam bei Kingdom Come: Deliverance II Modding Tools „Verwalten“ und „Lokale Dateien durchsuchen“ wählen.
+3. Die ZIP in den geöffneten Ordner entpacken und vorhandene Dateien überschreiben.
+   Die Ordner KingdomComeTogether und Mods liegen danach direkt im Ordner der Modding Tools.
+4. KingdomComeTogether\KCDMP_launcher.exe starten.
+5. Im Launcher „Host“ oder „Beitreten“ wählen, dann „Spielen“. Alle verwenden dieselbe ZIP.
 
 Aktualisieren
-7. Spiel und Launcher schließen. Die neue Zip wie in Schritt 3 darüber entpacken.
+Spiel und Launcher schließen. Die neue ZIP wie in Schritt 3 darüber entpacken.
 
 Entfernen
-8. Ordner KingdomComeTogether löschen.
-9. Ordner Mods\kdcmp löschen. Das Spiel selbst bleibt.
+Die Ordner KingdomComeTogether und Mods\kdcmp löschen.
 "@
     [System.IO.File]::WriteAllText((Join-Path $stage "INSTALL.txt"), $install.Replace("`n", "`r`n"), [System.Text.UTF8Encoding]::new($false))
 
@@ -82,11 +85,15 @@ Wenn das zu zweit stimmt, denselben Weg mit einer dritten und vierten Person in 
 "@
     [System.IO.File]::WriteAllText((Join-Path $stage "TEST.txt"), $test.Replace("`n", "`r`n"), [System.Text.UTF8Encoding]::new($false))
 
-    if (Test-Path $OutZip) { Remove-Item $OutZip -Force }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $OutZip)
-    Write-Output "Drop-in zip: $OutZip ($((Get-Item $OutZip).Length) bytes)"
+    [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zipTemp)
+    & (Join-Path $PSScriptRoot "package/Test-DropIn.ps1") -ZipPath $zipTemp
+    Move-Item -LiteralPath $zipTemp -Destination $OutZip -Force
+    $zip = Get-Item -LiteralPath $OutZip
+    Write-Host "Drop-in zip: $($zip.FullName) ($($zip.Length) bytes)"
+    $zip
 }
 finally {
     Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $zipTemp -Force -ErrorAction SilentlyContinue
 }
