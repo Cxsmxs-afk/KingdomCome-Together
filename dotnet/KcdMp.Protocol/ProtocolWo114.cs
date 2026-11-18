@@ -73,7 +73,7 @@ public static partial class Protocol
                         LeashFlagFastTravelRefused = 0x0080,   // the joiner tried to fast travel (count bumps)
                         LeashFlagSeparate = 0x0100,   // WO-140: this game is in its OWN world (connected from its own save): not leashed
                         LeashFlagFlying   = 0x0200,   // WO-147: this player moves faster than any horse, not a fast travel (the developer fly mode)
-                        LeashFlagTravelling = 0x0400; // WO-167 FT2: this joiner's own run of the shared fast travel is under way (the pull waits)
+                        LeashFlagTravelling = 0x0400, LeashFlagCombat = 0x0800; // WO-167 FT2: this joiner's own run of the shared fast travel is under way (the pull waits)
 
     // ---- Pull results (APPEND-ONLY) ----
     public const byte LeashResultNone = 0, LeashResultPlaced = 1, LeashResultBusy = 2, LeashResultNotPlaced = 3,
@@ -105,6 +105,7 @@ public static partial class Protocol
         if ((f & LeashFlagSeparate) != 0) parts.Add("separate-world");
         if ((f & LeashFlagFlying) != 0) parts.Add("flying");
         if ((f & LeashFlagTravelling) != 0) parts.Add("travelling");
+        if ((f & LeashFlagCombat) != 0) parts.Add("combat");
         return parts.Count == 0 ? "none" : string.Join(',', parts);
     }
 }

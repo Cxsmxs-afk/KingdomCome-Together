@@ -28,6 +28,7 @@
 #include "motion.h"
 #include "npc_drive.h"
 #include "respawn.h"
+#include "p4.h"
 #include "respawn_actions.h"
 #include "rttr_abi.h"
 #include "wo136.h"
@@ -640,6 +641,10 @@ bool apply_pvp_hit(const uint8_t* body, size_t len) {
     if (!std::isfinite(st) || !std::isfinite(hp) || st < 0 || hp < 0) return false;
     void* player = rttr::read_player_soul();
     if (!player) return false;
+    if (p4::protected_player(player)) {
+        logf("T3-RECOVERY hit=Pvp decision=protected_consumed applied_hp=0 applied_st=0 peer=%u", attacker);
+        return true;
+    }
     // The unarmed hint goes in FIRST: the damage below may be the one that
     // floors Henry, and the classifier runs off the next sample.
     respawn::note_pvp_hit((flags & 0x01) != 0, attacker);
@@ -655,7 +660,7 @@ bool apply_pvp_hit(const uint8_t* body, size_t len) {
     bool viaOld = false;
     if (!ok) { ok = rttr::apply_damage_soul(player, st, hp, nullptr); viaOld = suppress; }   // no attacker: naming one starts fights
     c_pvpIn.fetch_add(1);
-    if (ok) note_applied_damage(g_playerEid.load(std::memory_order_relaxed), st, hp);   // WO-170: never put back with a dropped figure blow
+    if (ok) { note_applied_damage(g_playerEid.load(std::memory_order_relaxed), st, hp); p4::note_damage(player, hp, "Pvp", attacker); }   // WO-170: never put back with a dropped figure blow
     logf("WO121-HITS friendly-fire hit on the player: hp -%.2f st -%.2f unarmed=%d from ghost %u -> %s",
          hp, st, (flags & 1) ? 1 : 0, attacker, ok ? "applied" : "FAILED");
     logf("WO155-FF knockdown=%s%s", noKnock ? "off(mp_ff_knockdown)" : downNow ? "no(he is down)" : suppress ? "no(inside the 5 s window)" : "allowed",

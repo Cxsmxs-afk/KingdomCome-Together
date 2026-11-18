@@ -3749,8 +3749,8 @@ public partial class GameBridge(ClientConfig config)
     private void OnLocalTeleport(string engineLine)
     {
         string tag = CatchupTag();
-        if (tag.Length > 0)
-            Console.WriteLine($"[quest] engine teleported the local player: {engineLine}{tag}");
+        T3Increment("engine_teleport_lines");
+        Console.WriteLine($"T3-TP-ENGINE attribution=unresolved engine teleported the local player: {engineLine}{tag}");
     }
 
     private void OnLocalCutscene(bool active)
@@ -4043,7 +4043,9 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private Task OnLocalDownedAsync(bool on, byte kind)
     {
+        long previousLife = Interlocked.Read(ref _t3InputLifeRevision);
         T3NoteInputLifeEdge(on);
+        if (previousLife != Interlocked.Read(ref _t3InputLifeRevision)) T3TpInvalidate();
         _localDownedKind = kind;
         if (on) Wo166NoteLocalDown(_lastX, _lastY, _lastZ);   // WO-166 R1: where this player went down
         if (on) _w132LocalGate.Down(DateTime.UtcNow); else _w132LocalGate.Up(DateTime.UtcNow);   // WO-132
@@ -4703,6 +4705,8 @@ public partial class GameBridge(ClientConfig config)
     private readonly record struct InFrame(int Type, byte[] Payload, long Arrival, uint Stamp)
     {
         public ulong LootGeneration { get; init; }
+        public long TeleportLifeRevision { get; init; }
+        public ulong TeleportGeneration { get; init; }
     }
 
     /// <summary>
@@ -4723,6 +4727,7 @@ public partial class GameBridge(ClientConfig config)
         // EOF must revoke its frame/side-channel leases before any teardown I/O.
         var receiveLife = CancellationTokenSource.CreateLinkedTokenSource(ct);
         ct = receiveLife.Token;
+        var tpConnection = T3TpBeginReceive(stream, ct);
         var frames = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
         _frameWriter = frames.Writer;   // WO-136: the load hold replays held frames through here
         T3StartIndependentTick(frames.Writer, ct);
@@ -4745,6 +4750,7 @@ public partial class GameBridge(ClientConfig config)
         void StopReceive()
         {
             if (Interlocked.Exchange(ref stopped, 1) != 0) return;
+            T3TpEndReceive(tpConnection);
             // CancelAsync marks the token immediately; callbacks and disposal
             // never hold the reader behind a slow transport's cancellation hook.
             _ = receiveLife.CancelAsync().ContinueWith(t => { _ = t.Exception; receiveLife.Dispose(); },
@@ -4805,13 +4811,14 @@ public partial class GameBridge(ClientConfig config)
                 if (W202("ping_network") && Wo202TakeAtRead(type, payload)) continue;   // WO-202 III.2: the network's answers, never behind the queue
                 if (Wo206TakeAtRead(type, payload)) continue;   // WO-206 E: an epoch is known from the frame it arrives in, never behind the queue
                 uint stamp = Wo206StampAtRead(payload);         // WO-206 E: the world epoch this frame was sent under
+                if (T3TpTakeAtRead(type, payload, stamp)) continue;
                 if (T3LootType(type))
                 {
                     Wo207Queue(lootLane.Writer, new InFrame(type, payload, arrival, stamp) { LootGeneration = P1Lifecycle.Current.Generation }, type);
                     continue;
                 }
                 if (T3TryDeferSideChannel(new InFrame(type, payload, arrival, stamp))) continue;
-                if (Wo147IsLeashFrame(type)) { leashLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
+                if (Wo147IsLeashFrame(type)) { leashLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp) { TeleportLifeRevision = Interlocked.Read(ref _t3InputLifeRevision), TeleportGeneration = P1Lifecycle.Current.Generation }); continue; }
                 if (type == Protocol.ConvDown && W207("conv_lane")) { convLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }   // WO-207 A.1
                 if ((type == Protocol.ActivityHostDown || type == Protocol.ActivityExtraDown) && W207("queue_decouple"))   // WO-207 B.3
                 { actLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }

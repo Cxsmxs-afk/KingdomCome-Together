@@ -28,6 +28,7 @@
 #include <mutex>
 
 #include "wake_pick.h"
+#include "p4.h"
 
 namespace kcdmp::respawn {
 
@@ -114,7 +115,7 @@ constexpr DWORD kMaintainMs       = 5000;
 constexpr float kHostileRadius    = 10.0f;    // m
 constexpr float kRecentHitS       = 3.0f;     // the flooring hit
 constexpr float kFightS           = 30.0f;    // "a hostile in this fight"
-constexpr float kKnockdownHealth  = 30.0f;    // hp after a knockdown wake-up
+constexpr float kKnockdownHealth  = 1000.0f;    // hp after a knockdown wake-up
 constexpr float kFullHealth       = 1000.0f;  // clamped to max by SetSoulState
 constexpr float kFullStamina      = 1000.0f;
 constexpr float kMinHunger        = 70.0f;
@@ -127,16 +128,6 @@ constexpr DWORD kSettleMs         = 700;
 // for a 5-10 s hold, for deaths and knockdowns alike.
 constexpr DWORD kBlackHoldMs      = 6000;
 constexpr DWORD kKnockdownImmuneMs = 8000;    // targeting exclusion after a knockdown
-constexpr float kExecutionMinDist = 450.0f;   // m from the execution spot, when the area test cannot answer
-// A death respawn skips every spot this close to where the player died
-// (observed: the nearest spot was 10 m from the killer, who killed the player
-// again on arrival). The maintainer's call: 100 m, nearest otherwise.
-constexpr float kDeathMinDist     = 100.0f;
-// A floor within this long of a completed respawn is the same downing's tail
-// (a wake-spot hazard, a late wound): restore again, no second grave, no
-// second teleport -- a grave-and-teleport loop is worse than one extra heal.
-constexpr DWORD kGraceMs          = 10000;
-constexpr DWORD kFallHoldMs       = 3000;    // fall damage stays off this long after the wake
 constexpr DWORD kKnockoutMs       = 10000;   // the fist-fight library's own knockout length (delka_knockoutu)
 constexpr DWORD kKnockoutMinMs    = 2000;    // an earlier wake by the game counts only after this
 constexpr DWORD kKnockoutTakeMs   = 1500;    // the unconscious state must show up within this
@@ -145,7 +136,9 @@ constexpr DWORD kKnockoutTakeMs   = 1500;    // the unconscious state must show 
 std::atomic<bool> g_session{false};
 std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_busy{false};              // an executor sequence is running
-std::atomic<int>  g_pendingGameOver{-1};      // a swallowed Game Over waiting for the tick
+std::atomic<int>  g_pendingGameOver{-1};
+std::atomic<bool> g_recoveryTail{false};
+std::atomic<uint64_t> g_pendingGeneration{0}, g_cancelEpoch{0}, g_pendingEpoch{0};      // a swallowed Game Over waiting for the tick
 
 Events g_ev{};
 bool   g_installed = false;
@@ -173,44 +166,30 @@ enum class Phase { Idle, FadeOut, Act, Settle, Hold, FadeIn, KnockedOut };
 struct Exec {
     Phase phase = Phase::Idle;
     Kind  kind = Kind::Death;
+    uint64_t generation = 0, sessionEpoch = 0;
+    uint32_t fadeToken = 0;
     int   gameOverId = -1;
     DWORD t0 = 0;
     float deathPos[3]{};
     float wakePos[3]{};
     bool  haveWake = false;
-    bool  fallbackDone = false;   // the goto-shaped teleport after ExecuteTeleportImpl did not move us
     DWORD immuneUntil = 0;
     bool  koSeen = false;         // IsUnconscious read true at least once during the knockout
     DWORD actAt = 0;              // when the act ran (the black hold counts from here)
 } g_x;
 
-// Execution rule: the nearest spot NOT inside any settlement / crime district.
-bool outside_settlement(const hangover::Spot& s, void*) {
-    const float p[3] = {s.nx, s.ny, s.nz};
-    bool inside = true;
-    if (!actions::in_settlement(p, &inside)) return false;
-    return !inside;
-}
-// WO-114 Phase 2: the other player (the agent sends it about once a second).
-struct Partner { bool valid = false; float x = 0, y = 0, z = 0, radius = 0; DWORD at = 0; };
+// Partner snapshots carry their original challenge deadline and local world generation.
+struct Partner { bool valid = false; float p[3]{}; float radius = 0; p4::Context context; };
 std::mutex g_partnerLock;
-Partner    g_partner;
-constexpr DWORD kPartnerStaleMs = 10000;
-constexpr float kBesidePartnerM = 3.0f;       // the WO-124 placement distance
-uint64_t   g_lastWakeId = 0;                  // the spot this player woke at last (rule 3)
-
-bool partner_get(float out[3], float* radius) {
+Partner g_partner;
+bool partner_get(float out[3], p4::Context* context) {
     std::lock_guard<std::mutex> lk(g_partnerLock);
-    if (!g_partner.valid || GetTickCount() - g_partner.at > kPartnerStaleMs) return false;
-    out[0] = g_partner.x; out[1] = g_partner.y; out[2] = g_partner.z;
-    *radius = g_partner.radius;
-    return true;
+    if (!g_partner.valid || !p4::ready_context(g_partner.context)) return false;
+    std::memcpy(out, g_partner.p, 12); *context = g_partner.context; return true;
 }
 
 DWORD g_immuneUntil = 0;
-DWORD g_lastDoneAt = 0;       // when the last sequence finished (the grace window)
 DWORD g_seqStartedAt = 0;
-DWORD g_fallHeldUntil = 0;    // fall damage held off until then (0 = not scheduled)
 
 const char* kind_name(Kind k) {
     switch (k) {
@@ -389,7 +368,7 @@ Kind classify(void* soul, const float pos[3]) {
 }
 
 // --- executor ---------------------------------------------------------------------------
-void clear_and_restore(void* soul, Kind k) {
+bool clear_and_restore(void* soul, Kind k) {
     int cleared = 0;
     for (const char* t : kClearOnWake) {
         unsigned char g[16];
@@ -424,24 +403,31 @@ void clear_and_restore(void* soul, Kind k) {
     if (rttr::soul_state(soul, "hunger", &hunger) && hunger < kMinHunger)
         okF = rttr::soul_set_state(soul, "hunger", kMinHunger);
     float h2 = 0, s2 = 0;
-    rttr::soul_state(soul, "health", &h2);
-    rttr::soul_state(soul, "stamina", &s2);
+    const bool readHealth = rttr::soul_state(soul, "health", &h2);
+    const bool readStamina = rttr::soul_state(soul, "stamina", &s2);
     logf("MP-RESPAWN restore kind=%s cleared_buffs=%d cleaners_added=%d/%zu health=%.1f(set %s) stamina=%.1f(set %s) hunger=%s",
          kind_name(k), cleared, added, sizeof(kAddOnWake) / sizeof(kAddOnWake[0]),
          h2, okH ? "ok" : "FAILED", s2, okS ? "ok" : "FAILED", okF ? "ok" : "set FAILED");
+    return okH && okS && readHealth && readStamina && h2 > kFloor + kFloorEpsilon && s2 > 0 && healed && rb && !stillBleeding;
 }
 
-void start(Kind k, int gameOverId) {
+void start(Kind k, int gameOverId, uint64_t expectedGeneration, uint64_t expectedEpoch) {
+    if (!g_session.load() || !g_enabled.load() || !p4::gameplay() || expectedGeneration != p4::generation() || expectedEpoch != g_cancelEpoch.load()) return;
     if (g_busy.exchange(true)) return;
+    p4::note_life_edge("respawn-down");
     g_seqStartedAt = GetTickCount();
     g_x = Exec{};
     g_x.kind = k;
+    g_x.generation = expectedGeneration; g_x.sessionEpoch = expectedEpoch;
+    static uint32_t nextFadeToken = 1; if (++nextFadeToken == 0) ++nextFadeToken; g_x.fadeToken = nextFadeToken;
     g_x.gameOverId = gameOverId;
     g_x.t0 = GetTickCount();
     actions::player_position(g_x.deathPos);
+    if (expectedGeneration != p4::generation() || expectedEpoch != g_cancelEpoch.load() || !p4::gameplay() || !g_session.load() || !g_enabled.load()) { g_busy.store(false); return; }
     logf("MP-RESPAWN downed kind=%s at (%.1f, %.1f, %.1f)%s", kind_name(k),
          g_x.deathPos[0], g_x.deathPos[1], g_x.deathPos[2],
          gameOverId >= 0 ? " (from a swallowed Game Over)" : "");
+    p4::note_downed(rttr::read_player_soul(), g_x.deathPos, static_cast<int>(k), gameOverId);
     if (g_ev.downed) g_ev.downed(true, k);
     // WO-136 Phase 4: the fight goes on while someone is still in it. Before the
     // downed player is moved away (the engine then reads him as fled:
@@ -455,7 +441,7 @@ void start(Kind k, int gameOverId) {
         g_x.phase = Phase::Act;
         return;
     }
-    const bool faded = actions::fade_out(kFadeOutS);
+    const bool faded = actions::fade_out(kFadeOutS, fader::Owner::Respawn, g_x.fadeToken);
     if (!faded) logf("MP-RESPAWN fade-out unavailable -- continuing without it");
     g_x.phase = Phase::FadeOut;
 }
@@ -473,6 +459,7 @@ bool add_ko_guard(void* soul) {
     return false;
 }
 
+void step_executor(DWORD now);
 void wake_up(void* soul, const char* why) {
     const DWORD now = GetTickCount();
     if (soul) {
@@ -500,6 +487,7 @@ void wake_up(void* soul, const char* why) {
          static_cast<unsigned long>(kKnockdownImmuneMs));
     g_x.haveWake = false;
     g_x.phase = Phase::FadeIn;                            // "done": events, no fade to undo
+    step_executor(now); // same main-frame restore/protection/up boundary
 }
 
 void knock_out(void* soul) {
@@ -602,113 +590,17 @@ void step_act() {
     clear_and_restore(soul, k);
 
     {
-        const float* d = g_x.deathPos;
-        const hangover::Spot* spot = nullptr;
-        const char* rule = "nearest";
-        if (k == Kind::Execution) {
-            // WO-139: with the other player in the world, the wake keeps the
-            // leash: of the spots outside every settlement, the one nearest the
-            // partner within the leash radius, >= kDeathMinDist from the death
-            // (wake_pick.h's rules on that subset).
-            float ep[3]{}, eradius = 0;
-            if (partner_get(ep, &eradius)) {
-                const hangover::Spot* list = nullptr;
-                const int n = hangover::spots(&list);
-                static wake::Cand ecands[hangover::kMaxSpots];
-                const int m = n < hangover::kMaxSpots ? n : hangover::kMaxSpots;
-                int outside = 0;
-                for (int i = 0; i < m; ++i) {
-                    ecands[i].x = list[i].nx; ecands[i].y = list[i].ny; ecands[i].z = list[i].nz;
-                    ecands[i].id = list[i].wuid;
-                    ecands[i].usable = list[i].onNavmesh && outside_settlement(list[i], nullptr);
-                    if (ecands[i].usable) ++outside;
-                }
-                const wake::Pick pk = wake::pick(ecands, m, d, ep, eradius, kDeathMinDist, g_lastWakeId);
-                logf("MP-RESPAWN-LEASH execution: partner at (%.1f, %.1f, %.1f) radius=%.0f: spots=%d outside_settlements=%d far_enough=%d in_leash=%d -> %s",
-                     ep[0], ep[1], ep[2], eradius, m, outside, pk.farEnough, pk.inLeash, pk.index >= 0 ? "picked" : "none (today's rule)");
-                if (pk.index >= 0) { spot = &list[pk.index]; rule = "outside a settlement, within the leash (WO-139)"; }
-            }
-            // "Respawn outside that settlement": the nearest spot the game's
-            // own area-label test puts outside every settlement/crime district;
-            // failing that, the nearest one kExecutionMinDist away.
-            if (!spot) {
-                spot = hangover::nearest_where(d[0], d[1], d[2], &outside_settlement, nullptr);
-                rule = "nearest outside a settlement (area labels)";
-            }
-            if (!spot) {
-                spot = hangover::nearest(d[0], d[1], d[2], kExecutionMinDist, d[0], d[1]);
-                rule = "nearest beyond the execution-distance fallback";
-            }
-        }
-        // WO-114 Phase 2: with the other player in the world, the wake stays
-        // inside the leash (wake_pick.h has the rules); none there -> beside them.
-        bool beside = false;
-        float partner[3]{}, radius = 0;
-        if (!spot && k == Kind::Death && partner_get(partner, &radius)) {
-            const hangover::Spot* list = nullptr;
-            const int n = hangover::spots(&list);
-            static wake::Cand cands[hangover::kMaxSpots];
-            const int m = n < hangover::kMaxSpots ? n : hangover::kMaxSpots;
-            for (int i = 0; i < m; ++i) {
-                cands[i].x = list[i].nx; cands[i].y = list[i].ny; cands[i].z = list[i].nz;
-                cands[i].id = list[i].wuid; cands[i].usable = list[i].onNavmesh;
-            }
-            const wake::Pick pk = wake::pick(cands, m, d, partner, radius, kDeathMinDist, g_lastWakeId);
-            logf("MP-RESPAWN-LEASH partner at (%.1f, %.1f, %.1f) radius=%.0f: spots=%d far_enough=%d in_leash=%d last=0x%016llX -> %s",
-                 partner[0], partner[1], partner[2], radius, m, pk.farEnough, pk.inLeash,
-                 static_cast<unsigned long long>(g_lastWakeId), wake::rule_name(pk.rule));
-            if (pk.index >= 0) {
-                spot = &list[pk.index];
-                rule = wake::rule_name(pk.rule);
-                logf("MP-RESPAWN-LEASH picked \"%s\" %.0f m from the partner, %.0f m from the death", spot->name, pk.toPartner, pk.fromDeath);
-            } else if (pk.rule == wake::Rule::BesidePartner) {
-                beside = true;
-            }
-        }
-        if (beside) {
-            float g[3]{};
-            int tried = 0;
-            if (joinnative::find_beside(partner[0], partner[1], partner[2], kBesidePartnerM, g, &tried)) {
-                g_x.wakePos[0] = g[0]; g_x.wakePos[1] = g[1]; g_x.wakePos[2] = g[2];
-                g_x.haveWake = true;
-                const bool fall = actions::suppress_fall_damage(true);
-                g_fallHeldUntil = 0;
-                const bool tp = actions::teleport_player(g[0], g[1], g[2]);
-                const float dx = g[0] - d[0], dy = g[1] - d[1];
-                logf("MP-RESPAWN wake beside the partner at (%.1f, %.1f, %.1f) %.0f m from the death (tried %d directions, fall damage %s) -- teleport %s",
-                     g[0], g[1], g[2], std::sqrt(dx * dx + dy * dy), tried, fall ? "held off" : "switch UNAVAILABLE",
-                     tp ? "ran" : "FAILED (the settle check retries)");
-            } else {
-                logf("MP-RESPAWN-LEASH no ground beside the partner in %d directions -- today's rule instead", tried);
-                beside = false;
-            }
-        }
-        if (!spot && !beside && k == Kind::Death) {
-            spot = hangover::nearest(d[0], d[1], d[2], kDeathMinDist, d[0], d[1]);
-            if (spot) rule = "nearest at least 100 m from the death";
-        }
-        if (!spot && !beside) spot = hangover::nearest(d[0], d[1], d[2]);
-        if (beside) {
-            // placed above; the settle phase checks it like a spot teleport
-        } else if (spot) {
-            g_lastWakeId = spot->wuid;
-            g_x.wakePos[0] = spot->nx; g_x.wakePos[1] = spot->ny; g_x.wakePos[2] = spot->nz;
-            g_x.haveWake = true;
-            const float dx = spot->nx - d[0], dy = spot->ny - d[1];
-            // Observed: after a hit, a teleport to a lower spot landed as a
-            // fatal fall (19 m drop -> floored 0.8 s later); with the game's
-            // own fall-damage switch held it did not. Held until kFallHoldMs
-            // after the wake, then the previous value is given back.
-            const bool fall = actions::suppress_fall_damage(true);
-            g_fallHeldUntil = 0;
-            logf("MP-RESPAWN fall damage %s for the wake teleport (drop %.1f m)",
-                 fall ? "held off" : "switch UNAVAILABLE", d[2] - spot->nz);
-            const bool tp = actions::teleport_to_spot(spot->wuid);
-            logf("MP-RESPAWN wake spot \"%s\" (%s) at (%.1f, %.1f, %.1f) %.0f m away -- ExecuteTeleportImpl %s",
-                 spot->name, rule, spot->nx, spot->ny, spot->nz, std::sqrt(dx * dx + dy * dy),
-                 tp ? "requested" : "UNAVAILABLE (the goto-shaped fallback follows)");
+        float partner[3]{}; p4::Context context;
+        if (partner_get(partner, &context)) {
+            context.source = p4::Source::Respawn;
+            const auto placed = p4::place(partner, 3.0f, context, true, g_x.deathPos);
+            g_x.haveWake = placed.ok;
+            if (placed.ok) std::memcpy(g_x.wakePos, placed.target, 12);
+            else logf("T3-WAKE placement refused: no safe nearby grounded point; no distant hangover fallback");
         } else {
-            logf("MP-RESPAWN NO usable hangoverSpot found -- waking at the death spot (fallback, loud)");
+            p4::refused_stale(p4::Source::Respawn);
+            logf("T3-WAKE placement refused: no fresh generation-bound partner snapshot; staying in place, no distant fallback");
+            actions::hud_message("No safe fresh landing point beside your partner. Recovering here.");
         }
     }
     if (graveMade) actions::hud_message(k == Kind::Execution ? "You were executed. Your belongings lie in your grave."
@@ -720,6 +612,12 @@ void step_act() {
 }
 
 void step_executor(DWORD now) {
+    if (g_x.generation != p4::generation() || !p4::gameplay() || !g_session.load() || !g_enabled.load() || g_x.sessionEpoch != g_cancelEpoch.load()) {
+        logf("T3-RECOVERY cancelled=world_or_session_changed generation=%llu; no old grave/restore/teleport is applied to the new world", static_cast<unsigned long long>(g_x.generation));
+        const bool released = actions::fade_in(0.1f, fader::Owner::Respawn, g_x.fadeToken);
+        logf("T3-RECOVERY cancelled_fade owner=respawn token=%u released=%d", g_x.fadeToken, released ? 1 : 0);
+        g_x.phase = Phase::Idle; g_busy.store(false); g_floorHits = 0; return;
+    }
     switch (g_x.phase) {
         case Phase::Idle: return;
         case Phase::FadeOut:
@@ -739,33 +637,28 @@ void step_executor(DWORD now) {
                 // Did the spot's own teleport land? If not (the game declined
                 // it, e.g. a quest context disabling blackout teleports), move
                 // the player the goto way once and settle again.
-                if (g_x.haveWake && !g_x.fallbackDone) {
-                    float p[3]{};
-                    const bool have = actions::player_position(p);
-                    const float dx = p[0] - g_x.wakePos[0], dy = p[1] - g_x.wakePos[1];
-                    const float off = std::sqrt(dx * dx + dy * dy);
-                    if (!have || off > 5.0f) {
-                        g_x.fallbackDone = true;
-                        const bool ok = actions::teleport_player(g_x.wakePos[0], g_x.wakePos[1], g_x.wakePos[2]);
-                        logf("MP-RESPAWN the spot teleport left the player %.1f m off the spot -- goto-shaped fallback %s",
-                             have ? off : -1.0f, ok ? "applied" : "FAILED (the player stays where they are)");
-                        g_x.t0 = now;
-                        return;
-                    }
-                    logf("MP-RESPAWN at the wake spot (%.1f m off) -- ground re-snap %s", off,
-                         actions::resnap_player() ? "ran" : "unavailable");
-                }
+                // There is no delayed untagged teleport retry. A retry needs a
+                // new peer challenge and must pass the complete placement gate.
                 g_x.phase = Phase::Hold;
             }
             return;
         case Phase::Hold:
             if (now - g_x.actAt >= kBlackHoldMs) {
-                actions::fade_in(kFadeInS);
                 g_x.phase = Phase::FadeIn;
                 g_x.t0 = now;
+                step_executor(now); // arm restoration/protection before releasing our fader
             }
             return;
         case Phase::FadeIn: {
+            // Restore at actual release, not six seconds earlier in the act.
+            // Existing guard is a survival floor; no universal vanilla-immunity hook is claimed.
+            p4::note_life_edge("respawn-wake");
+            void* wakeSoul = rttr::read_player_soul();
+            const bool guarded = wakeSoul && apply_guard(wakeSoul) && buffs::has(wakeSoul, g_guardGuid) == 1;
+            const bool restored = wakeSoul && clear_and_restore(wakeSoul, g_x.kind);
+            if (guarded && restored) p4::arm_recovery(wakeSoul);
+            else { logf("T3-RECOVERY unavailable guard=%d restore_readback=%d; no false protection claim", guarded ? 1 : 0, restored ? 1 : 0); actions::hud_message("Recovery protection could not be verified."); }
+            actions::fade_in(kFadeInS, fader::Owner::Respawn, g_x.fadeToken);
             float p[3]{};
             if (!actions::player_position(p)) std::memcpy(p, g_x.haveWake ? g_x.wakePos : g_x.deathPos, sizeof(p));
             logf("MP-RESPAWN done kind=%s now at (%.1f, %.1f, %.1f) after %lu ms", kind_name(g_x.kind),
@@ -809,10 +702,6 @@ void step_executor(DWORD now) {
             }
             g_x.phase = Phase::Idle;
             g_floorHits = 0;
-            // The grace covers a respawn's tail (a wake-spot hazard, a late
-            // wound). A knockdown that floors again is a new knockdown.
-            if (g_x.kind != Kind::Knockdown) g_lastDoneAt = now;
-            if (g_x.haveWake) g_fallHeldUntil = now + kFallHoldMs;
             g_busy.store(false);
             return;
         }
@@ -829,13 +718,18 @@ bool player_alive_now() {
 }
 
 bool policy(int id) {
-    if (!(g_session.load() && g_enabled.load())) return false;
+    const uint64_t gen = p4::generation(), epoch = g_cancelEpoch.load();
+    if (!(g_session.load() && g_enabled.load()) || !gen || !p4::gameplay()) return false;
     const bool deathShaped = (id >= 0 && id <= 8) || id == 26;
     const bool execution = (id == 44);
     if (!deathShaped && !execution) return false;
-    if (deathShaped && !player_alive_now()) return false;   // a real death: vanilla (revive is refused anyway)
-    if (g_busy.load()) return true;                          // already handling this downing
-    g_pendingGameOver.store(id);
+    if (deathShaped && !player_alive_now()) return false;
+    // A control Load/off->on received during that engine read cannot relabel
+    // an old GameOver with the new world's generation or session epoch.
+    if (gen != p4::generation() || epoch != g_cancelEpoch.load() || !g_session.load() || !g_enabled.load() || !p4::gameplay()) return false;
+    if (g_busy.load()) return true;
+    if (p4::recovery_policy()) { g_recoveryTail.store(true); return true; }
+    g_pendingEpoch.store(epoch); g_pendingGeneration.store(gen); g_pendingGameOver.store(id);
     return true;
 }
 
@@ -956,12 +850,14 @@ void set_events(const Events& e) { g_ev = e; }
 
 void set_session(bool on, const char* why) {
     const bool was = g_session.exchange(on);
+    if (!on) { g_cancelEpoch.fetch_add(1); g_pendingGameOver.store(-1); p4::invalidate(); }
     if (was != on) logf("MP-RESPAWN session %s (%s)", on ? "ON" : "OFF", why ? why : "");
 }
 bool session_active() { return g_session.load(); }
 
 void set_enabled(bool on, const char* why) {
     const bool was = g_enabled.exchange(on);
+    if (!on) { g_cancelEpoch.fetch_add(1); g_pendingGameOver.store(-1); p4::invalidate(); }
     logf("MP-RESPAWN mp_respawn %s (was %s) via %s", on ? "on" : "off", was ? "on" : "off", why ? why : "?");
 }
 bool enabled() { return g_enabled.load(); }
@@ -1000,9 +896,17 @@ void tick() {
     const DWORD now = GetTickCount();
     test_watch(now);
 
+    if (g_recoveryTail.exchange(false)) {
+        void* ps = rttr::read_player_soul(); float pos[3]{};
+        if (ps && actions::player_position(pos)) p4::note_downed(ps, pos, -1, -1);
+    }
     // A Game Over the guard swallowed: start its respawn on this (main) thread.
     const int go = g_pendingGameOver.exchange(-1);
-    if (go >= 0 && !g_busy.load()) start(go == 44 ? Kind::Execution : Kind::Death, go);
+    if (!p4::gameplay() || !p4::generation()) { if (g_busy.load()) step_executor(now); g_floorHits = 0; return; }
+    if (go >= 0 && g_session.load() && g_enabled.load() && g_pendingEpoch.load() == g_cancelEpoch.load() && g_pendingGeneration.load() == p4::generation() && !g_busy.load()) {
+        if (p4::recovery_policy()) { void* ps = rttr::read_player_soul(); if (ps) clear_and_restore(ps, Kind::Death); }
+        else start(go == 44 ? Kind::Execution : Kind::Death, go, g_pendingGeneration.load(), g_pendingEpoch.load());
+    }
 
     if (g_busy.load()) { step_executor(now); return; }
 
@@ -1010,10 +914,6 @@ void tick() {
         g_immuneUntil = 0;
         actions::exclude_from_targeting(false);
         logf("MP-RESPAWN targeting exclusion OFF");
-    }
-    if (g_fallHeldUntil && now >= g_fallHeldUntil) {
-        g_fallHeldUntil = 0;
-        logf("MP-RESPAWN fall damage given back (%s)", actions::suppress_fall_damage(false) ? "previous value restored" : "restore FAILED");
     }
 
     if (now - g_lastSample < kSampleMs) return;
@@ -1030,6 +930,7 @@ void tick() {
         for (int i = 0; i < nGone; ++i) if (g_ev.grave_remove) g_ev.grave_remove(gone[i]);
     }
 
+    const uint64_t sampleGeneration = p4::generation(), sampleEpoch = g_cancelEpoch.load();
     void* soul = rttr::read_player_soul();
     update_guard(soul, now);
 
@@ -1068,19 +969,15 @@ void tick() {
         return;
     }
 
-    if (g_lastDoneAt && now - g_lastDoneAt < kGraceMs) {
-        logf("MP-RESPAWN floored again %lu ms after a respawn (inside the %lu ms grace) -- restoring only, no grave, no teleport",
-             static_cast<unsigned long>(now - g_lastDoneAt), static_cast<unsigned long>(kGraceMs));
-        clear_and_restore(soul, Kind::Death);
-        g_floorHits = 0;
-        // Not re-armed: the grace is 10 s from the completed respawn, so a
-        // hazard cannot make the player permanently unkillable.
-        return;
+    if (p4::protected_player(soul)) {
+        float floorPos[3]{}; if (actions::player_position(floorPos)) p4::note_downed(soul, floorPos, -1, -1);
+        logf("T3-RECOVERY floor_tail=restored decision=no_second_downed");
+        clear_and_restore(soul, Kind::Death); g_floorHits = 0; return;
     }
 
     float pos[3]{};
     actions::player_position(pos);
-    start(classify(soul, pos), -1);
+    start(classify(soul, pos), -1, sampleGeneration, sampleEpoch);
 }
 
 void note_pvp_hit(bool unarmed, uint8_t attackerGhost) {
@@ -1089,14 +986,13 @@ void note_pvp_hit(bool unarmed, uint8_t attackerGhost) {
     g_pvpFrom = attackerGhost;
 }
 
-void set_partner(bool valid, float x, float y, float z, float radius) {
+bool set_partner(bool valid, float x, float y, float z, float radius, p4::Context context) {
     std::lock_guard<std::mutex> lk(g_partnerLock);
-    const bool was = g_partner.valid;
-    g_partner.valid = valid && std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && radius > 0.f;
-    if (g_partner.valid) { g_partner.x = x; g_partner.y = y; g_partner.z = z; g_partner.radius = radius; g_partner.at = GetTickCount(); }
-    if (was != g_partner.valid)
-        logf("MP-RESPAWN-LEASH partner %s%s", g_partner.valid ? "known" : "gone",
-             g_partner.valid ? " -- a death wakes within the leash of the other player" : " -- a death wakes by today's rule");
+    if (!valid) { g_partner.valid = false; return true; }
+    if (!p4::ready_context(context) || context.source != p4::Source::Respawn || !std::isfinite(x) || !std::isfinite(y) ||
+        !std::isfinite(z) || !std::isfinite(radius) || radius <= 0) { g_partner.valid = false; return false; }
+    g_partner.valid = true; g_partner.p[0] = x; g_partner.p[1] = y; g_partner.p[2] = z; g_partner.radius = radius; g_partner.context = context;
+    return true;
 }
 
 } // namespace kcdmp::respawn

@@ -23,6 +23,7 @@
 #include "hits.h"
 #include "npc_trace.h"
 #include "join_native.h"
+#include "p4.h"
 #include "savelist.h"
 #include "pipe_outbox.h"
 #include "pipe_control_reader.h"
@@ -1034,6 +1035,11 @@ void serve(HANDLE h) {
                 bool faultedFlag = false;
                 const bool ran = run_sync_bounded<bool>(
                     [guid, stamina, health, suppress, nonLethal](bool& result) {
+                        void* targetSoul = rttr::find_soul_by_guid(guid.data());
+                        if (targetSoul && p4::protected_player(targetSoul)) {
+                            logf("T3-RECOVERY hit=PlayerHenry decision=protected_consumed applied_hp=0 applied_st=0");
+                            result = true; return; // consume reliable order, never replay the hit after grace
+                        }
                         if (nonLethal) {
                             // WO-147: the field's fist-fight opponent died on the joiner's copy from the host's
                             // own non-fatal blow (9.35 on a copy the follow had just set to the host's 4.8).
@@ -1053,7 +1059,7 @@ void serve(HANDLE h) {
                         // WO-132: a forwarded hit on the local player (player_henry's
                         // soul id) is never put back by a discard watch.
                         static const unsigned char kHenry[16] = {0xfb, 0xcf, 0x2d, 0x4c, 0xa1, 0xde, 0x63, 0x62, 0x72, 0xd7, 0xb3, 0x9f, 0x4d, 0xb2, 0xd8, 0xb5};
-                        if (result && std::memcmp(guid.data(), kHenry, 16) == 0) kcdmp::hits::note_player_damage(stamina, health);
+                        if (result && std::memcmp(guid.data(), kHenry, 16) == 0) { kcdmp::hits::note_player_damage(stamina, health); p4::note_damage(targetSoul, health, "PlayerHenry"); }
                     }, "ApplyDamage", ok, &faultedFlag);
                 if (!ran) logf("PIPE: ApplyDamage timed out waiting for a frame");
                 logf("PIPE: ApplyDamage stamina=%.2f health=%.2f -> %s",
@@ -1318,8 +1324,10 @@ void serve(HANDLE h) {
                 std::memcpy(&y, body + 5, 4);
                 std::memcpy(&z, body + 9, 4);
                 std::memcpy(&r, body + 13, 4);
-                respawn::set_partner(body[0] != 0, x, y, z, r);
-                send_result(h, true, seq);
+                p4::Context context;
+                const bool decoded = p4rules::context(body + 17, len - 17, &context);
+                const bool accepted = decoded && respawn::set_partner(body[0] != 0, x, y, z, r, context);
+                send_result(h, accepted, seq);
                 break;
             }
 
@@ -1507,10 +1515,12 @@ void serve(HANDLE h) {
                 }
                 float x = 0, y = 0, z = 0, dist = 0;
                 std::memcpy(&x, body, 4); std::memcpy(&y, body + 4, 4); std::memcpy(&z, body + 8, 4); std::memcpy(&dist, body + 12, 4);
+                p4::Context context;
+                if (!p4rules::context(body + 16, len - 16, &context)) break;
                 joinnative::PlaceReport r{};
                 bool faultedFlag = false;
                 const bool ran = run_sync_bounded<joinnative::PlaceReport>(
-                    [x, y, z, dist](joinnative::PlaceReport& res) { res = joinnative::place(x, y, z, dist); },
+                    [x, y, z, dist, context](joinnative::PlaceReport& res) { res = joinnative::place(x, y, z, dist, context); },
                     "JoinPlace", r, &faultedFlag);
                 out[0] = (ran && r.ok) ? 1 : 0;
                 out[2] = r.snapped ? 1 : 0;

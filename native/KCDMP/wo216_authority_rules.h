@@ -25,14 +25,14 @@ inline bool request(const uint8_t* b, size_t n, Request* out) {
 struct State {
     Phase phase = Phase::Load;
     uint64_t generation = 0, gameplayAtMs = 0;
-    bool loadAccepted = false, legacyArmed = false;
-    bool enabled() const { return phase != Phase::Disabled; }
+    bool loadAccepted = false, legacyArmed = false, authorityOn = true;
+    bool enabled() const { return authorityOn; }
     bool active(uint8_t role, bool hooked, uint64_t now) const {
-        return role == 2 && hooked && phase == Phase::Gameplay && loadAccepted && now >= gameplayAtMs && now - gameplayAtMs >= kSettleMs;
+        return enabled() && role == 2 && hooked && phase == Phase::Gameplay && loadAccepted && now >= gameplayAtMs && now - gameplayAtMs >= kSettleMs;
     }
     bool legacy(uint8_t role) const { return role == 2 && !enabled() && legacyArmed; }
     uint64_t active_from() const {
-        if (phase != Phase::Gameplay || !loadAccepted || gameplayAtMs > (std::numeric_limits<uint64_t>::max)() - kSettleMs) return 0;
+        if (!enabled() || phase != Phase::Gameplay || !loadAccepted || gameplayAtMs > (std::numeric_limits<uint64_t>::max)() - kSettleMs) return 0;
         return gameplayAtMs + kSettleMs;
     }
     uint32_t age(uint64_t now) const {
@@ -46,7 +46,7 @@ struct State {
         legacyArmed = role == 2 && !enabled() && generationBound;
         // An explicit Load may precede role 2 preparation. Preserve that same
         // pending generation, while an arbitrary role switch cannot reuse Gameplay.
-        if (!(generationBound && role == 2 && phase == Phase::Load && loadAccepted)) {
+        if (!(generationBound && role == 2 && loadAccepted && (phase == Phase::Load || (!enabled() && phase == Phase::Gameplay)))) {
             loadAccepted = false; gameplayAtMs = 0;
             if (enabled()) phase = Phase::Load;
         }
@@ -56,10 +56,11 @@ struct State {
         if (r.generation == 0 || r.generation < generation) return false;
         if (r.phase == Phase::Disabled || r.phase == Phase::Load) {
             if (r.generation == generation) return r.phase == phase && (r.phase == Phase::Disabled || loadAccepted);
-            generation = r.generation; phase = r.phase; gameplayAtMs = 0; legacyArmed = false;
+            generation = r.generation; phase = r.phase; authorityOn = phase != Phase::Disabled; gameplayAtMs = 0; legacyArmed = false;
             loadAccepted = phase == Phase::Load; return true;
         }
-        if (r.phase != Phase::Gameplay || r.generation != generation || !loadAccepted || !enabled()) return false;
+        if (r.phase != Phase::Gameplay || r.generation != generation || (!loadAccepted && phase != Phase::Disabled)) return false;
+        loadAccepted = true;
         if (phase != Phase::Gameplay) { phase = Phase::Gameplay; gameplayAtMs = now; }
         return true;
     }

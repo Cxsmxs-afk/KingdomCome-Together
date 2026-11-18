@@ -46,6 +46,7 @@ public partial class GameBridge
 
     private Task<bool> P1BeginLoad(string why, CancellationToken ct)
     {
+        T3TpInvalidate();
         bool next = !_p1Loading;
         if (next) { Interlocked.Increment(ref _p1Serial); _p1GameplayMs = -1; _p1GameplayWorld = 0; }
         _p1Loading = true;
@@ -105,9 +106,9 @@ public partial class GameBridge
         async Task Gameplay()
         {
             if (_p1Pending is { } pending && !await pending) return;
-            if (serial != Interlocked.Read(ref _p1Serial) || !_hostAuthorityEnabled || !P1JoinerIntent || !P1HasGameplay) return;
+            if (serial != Interlocked.Read(ref _p1Serial) || !P1HasGameplay) return;
             var state = P1Lifecycle.Current;
-            if (state.Enabled && state.Confirmed) await P1Lifecycle.GameplayAsync(state.Generation, _wo122Ct);
+            if (state.Confirmed) await P1Lifecycle.GameplayAsync(state.Generation, _wo122Ct);
         }
     }
 
@@ -120,7 +121,8 @@ public partial class GameBridge
 
     private async Task P1ResetLifecycleAsync(string why, CancellationToken ct)
     {
-        bool keepGameplay = why is "role-change" or "disconnect" && P1HasGameplay && _joinedWorld && _jj is null &&
+        T3TpInvalidate();
+        bool keepGameplay = why is "role-change" or "disconnect" && P1HasGameplay && (_joinedWorld || _isDamageAuthority) && _jj is null &&
             _hostCalendarResumeEpoch == _w206.World && _where == GameWhere.World && !_ownLoadExpected && !_loadGraceOwn && !_p1Loading;
         long gameplay = keepGameplay ? _p1GameplayMs : -1;
         uint world = keepGameplay ? _p1GameplayWorld : 0;

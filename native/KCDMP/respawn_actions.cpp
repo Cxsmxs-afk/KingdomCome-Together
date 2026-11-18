@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #include "respawn_actions.h"
+#include "cvar_lease_rules.h"
 #include "wo179.h"
 #include "fault_guard.h"
 #include "anchors.h"
@@ -1216,24 +1217,17 @@ namespace {
 // before the first hold is the one restored, so a second hold (a knockdown
 // inside a knockdown) cannot make the held value permanent, and a release
 // without a hold touches nothing.
-struct HeldCVar {
-    const char* name;
-    int  prev;
-    bool held;
-};
-HeldCVar g_targeting{"wh_rpg_ExcludePlayerFromTargeting", 0, false};
-HeldCVar g_fallDamage{"wh_rpg_DisablePlayerFallDamage", 0, false};
-
+struct HeldCVar { const char* name; cvarlease::Lease lease; };
+HeldCVar g_targeting{"wh_rpg_ExcludePlayerFromTargeting", {}};
+HeldCVar g_fallDamage{"wh_rpg_DisablePlayerFallDamage", {}};
 bool hold_cvar(HeldCVar& h, bool on, int value) {
-    if (on) {
-        int prev = 0;
-        if (!engine::cvar_set_int(h.name, value, &prev)) return false;
-        if (!h.held) { h.prev = prev; h.held = true; }
-        return true;
-    }
-    if (!h.held) return true;
-    h.held = false;
-    return engine::cvar_set_int(h.name, h.prev, nullptr);
+    const auto result = cvarlease::change(h.lease, on, value,
+        [&](int* out) { return engine::cvar_get_int(h.name, out); },
+        [&](int desired) { return engine::cvar_set_int(h.name, desired, nullptr); });
+    if (result == cvarlease::Result::Foreign) logf("T3-CVAR lease-ended cvar=%s reason=foreign_value value_preserved=1 identical_foreign_write=unobservable", h.name);
+    if (result == cvarlease::Result::Unknown || result == cvarlease::Result::Failed) logf("T3-CVAR lease-unavailable cvar=%s on=%d reason=%s", h.name, on ? 1 : 0, result == cvarlease::Result::Unknown ? "read_unknown" : "write_failed");
+    // An acquire that lost ownership cannot authorize a placement.
+    return on ? result == cvarlease::Result::Held : cvarlease::success(result);
 }
 } // namespace
 

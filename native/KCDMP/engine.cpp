@@ -285,6 +285,14 @@ int for_each_entity(bool (*visit)(void* e, void* ctx), void* ctx) {
     return n;
 }
 
+bool cvar_get_int(const char* name, int* out) {
+    void* cv = nullptr; void* con = console();
+    if (!out || !con || !vcall(KCDMP_SITE_CALL("engine::cvar_get_int/GetCVar"), con, kConGetCVar, &cv, name) || !cv) return false;
+    int type = 0;
+    return vcall(KCDMP_SITE_CALL("engine::cvar_get_int/GetType"), cv, kCVarGetType, &type) && type == 1 &&
+        vcall(KCDMP_SITE_CALL("engine::cvar_get_int/GetIVal"), cv, kCVarGetIVal, out);
+}
+
 bool cvar_set_int(const char* name, int value, int* previous) {
     void* con = console();
     void* cv = nullptr;
@@ -292,7 +300,7 @@ bool cvar_set_int(const char* name, int value, int* previous) {
     int type = 0;
     if (!vcall(KCDMP_SITE_CALL("engine::cvar_set_int/GetType"), cv, kCVarGetType, &type) || type != 1) return false;
     int old = 0;
-    if (previous) { if (vcall(KCDMP_SITE_CALL("engine::cvar_set_int/GetIVal"), cv, kCVarGetIVal, &old)) *previous = old; }
+    if (previous) { if (!vcall(KCDMP_SITE_CALL("engine::cvar_set_int/GetIVal"), cv, kCVarGetIVal, &old)) return false; *previous = old; }
     return vcall_void(KCDMP_SITE_CALL("engine::cvar_set_int/SetInt"), cv, kCVarSetInt, value);
 }
 

@@ -33,6 +33,7 @@ add_library(KCDMP SHARED
     hits.cpp
     savelist.cpp
     join_native.cpp
+    p4.cpp
     leash.cpp
     wo131.cpp
     wo132.cpp

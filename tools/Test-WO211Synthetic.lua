@@ -184,14 +184,33 @@ do
     check("d: no Lua errors", #ERRS == 0, ERRS[1])
 end
 
--- (e) A.2.3: placed where he stood at the drop, held over the ground while it settles
+-- (e) P4: the loaded own save owns the position; even a delayed old agent cannot move it.
 do
-    local put = {}
-    player.SetWorldPos = function(self, v) put[#put + 1] = v end
-    player.SetWorldAngles = function() end
+    local savedPlayer = player
+    local oldPos, oldAngles, oldRead = player.SetWorldPos, player.SetWorldAngles, player.GetWorldPos
+    local oldGround = System.GetTerrainElevation
+    local put, turned, probed = 0, 0, 0
+    local savedPosition = { x = 120, y = 70, z = 3 }
+    player.GetWorldPos = function() return savedPosition end
+    player.SetWorldPos = function() put = put + 1 end
+    player.SetWorldAngles = function() turned = turned + 1 end
+    System.GetTerrainElevation = function() probed = probed + 1; return -80 end
     TIMERS = {}
-    check("e: the placement starts", KCD2MP_W211PlaceAt(10, 20, 5, 1.0) == true and #put == 1 and put[1].z >= 1.5)
-    player.SetWorldPos = nil
+    check("e: obsolete home placement is explicitly refused", KCD2MP_W211PlaceAt(10, 20, 50, 1.0) == false)
+    check("e: own-save position and rotation are never overwritten", put == 0 and turned == 0 and player:GetWorldPos() == savedPosition)
+    check("e: obsolete placement never probes guessed terrain or schedules a height hold", probed == 0 and #TIMERS == 0)
+    local diagnostic = false
+    for _, line in ipairs(LOG) do if line:find("T3-TP-REFUSED source=home why=removed-legacy-placement", 1, true) then diagnostic = true end end
+    check("e: refusal names the removed home-teleport source", diagnostic)
+    NOW = NOW + 4
+    player = { id = 2, SetWorldPos = function() put = put + 1 end, SetWorldAngles = function() turned = turned + 1 end }
+    check("e: a late legacy call cannot move a replacement player or start a timer", KCD2MP_W211PlaceAt(1000, 2000, 500, 3.0) == false and put == 0 and turned == 0 and #TIMERS == 0)
+    player = nil
+    check("e: the obsolete API also refuses safely outside a world", KCD2MP_W211PlaceAt(nil, nil, nil, nil) == false and #TIMERS == 0)
+    player = savedPlayer
+    player.SetWorldPos, player.SetWorldAngles, player.GetWorldPos = oldPos, oldAngles, oldRead
+    System.GetTerrainElevation = oldGround
+    check("e: no Lua errors", #ERRS == 0, ERRS[1])
 end
 
 -- Summary, in the shared driver's contract (Test-NpcSmoothSynthetic.ps1 reads the global OUT).

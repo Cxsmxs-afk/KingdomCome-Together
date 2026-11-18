@@ -188,15 +188,14 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- A.2.3: home with the drop moment's Henry
 
-    private (float X, float Y, float Z, float Rot) _w211LastOwnPos;   // the position loop writes, the leave reads (a torn read is one tick old)
-    private (float X, float Y, float Z, float Rot)? _w211HomePlace;
+    private (float X, float Y, float Z, float Rot) _w211LastOwnPos;   // the position loop writes; WO-213 reads this with the character snapshot
     private long _w211HomeSplices, _w211HomeSpliceFails;
 
     /// <summary>
     /// A.2.3 (the joiner, a leave after a dropped link, the final snapshot paired): the snapshot's Henry -- his stats, skills, inventory,
     /// money, health as they were at the drop -- spliced into his own newest save the way a join splices it into the host's (the same
     /// check and verify), his own world's quest items kept and the host world's left there (QuestItemMode.Host: the target's), placed as a
-    /// new file beside it and loaded instead; after the load he is put where he stood. Null (the plain own save, said why) on any failure.
+    /// new file beside it and loaded instead. The loaded own save keeps its position. Null (the plain own save, said why) on any failure.
     /// </summary>
     private async Task<HenrySource?> Wo211SpliceHomeAsync(string tag, HenrySource own)
     {
@@ -230,12 +229,10 @@ public partial class GameBridge
                 Interlocked.Increment(ref _w211HomeSpliceFails);
                 return null;
             }
-            var p = _w211LastOwnPos;
-            _w211HomePlace = (p.X != 0 || p.Y != 0) ? p : null;
             Interlocked.Increment(ref _w211HomeSplices);
             var rp = res.Report;
             Console.WriteLine(FormattableString.Invariant(
-                $"WO211-HOME own save {own.Display} + the drop moment's Henry (snapshot {snap!.Short}) -> {SaveDisplay(path)} ({res.File.Length} B, check PASS, verify ok; quest items: the host world's {rp.QuestItemsRemoved.Count} left there, his own {rp.QuestItemsAdded.Count} kept); placed at ({p.X:F1}, {p.Y:F1}, {p.Z:F1}) after the load"));
+                $"WO211-HOME own save {own.Display} + the drop moment's Henry (snapshot {snap!.Short}) -> {SaveDisplay(path)} ({res.File.Length} B, check PASS, verify ok; quest items: the host world's {rp.QuestItemsRemoved.Count} left there, his own {rp.QuestItemsAdded.Count} kept); the loaded own save keeps its position"));
             return new HenrySource(own.Playline, name + ".whs", path, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
@@ -246,19 +243,9 @@ public partial class GameBridge
         }
     }
 
-    /// <summary>A.2.3: the leave's own load is in -- the player stands where he stood at the drop (the safe placement holds him on the
-    /// ground while it settles).</summary>
-    private void Wo211AfterHomeLoad()
-    {
-        if (_w211HomePlace is not { } p) return;
-        _w211HomePlace = null;
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(3000);
-            try { await ExecLuaAsync(FormattableString.Invariant($"if KCD2MP_W211PlaceAt then KCD2MP_W211PlaceAt({p.X:F2}, {p.Y:F2}, {p.Z:F2}, {p.Rot:F3}) end")); } catch { }
-            Console.WriteLine(FormattableString.Invariant($"WO211-HOME placed where he stood at the drop ({p.X:F1}, {p.Y:F1}, {p.Z:F1})"));
-        });
-    }
+    /// <summary>The loaded own save supplies the position; no later movement is scheduled.</summary>
+    private void Wo211AfterHomeLoad() =>
+        Console.WriteLine("WO211-HOME own save loaded -- keeping its saved position; no automatic home teleport");
 
     // ---------------------------------------------------------------- A.1.5 / A.3: the host keeps the partner's figure
 

@@ -132,8 +132,10 @@ public partial class GameBridge
         try
         {
             foreach (string key in T3AuthorityCounters.NativeKeys) _t3Counters.TryAdd(key, 0);
+            foreach (string key in T3NativeCounters.Keys) _t3Counters.TryAdd(key, 0);
             _t3Counters.TryAdd("postload_timeouts", 0);
             _t3Counters.TryAdd("authority_stats_unreadable", 0);
+            _t3Counters.TryAdd("world_stats_unreadable", 0);
             byte role = W137Host ? (byte)1 : W137Joiner || _jj is not null ? (byte)2 : (byte)0;
             if (role != 0)
             {
@@ -147,6 +149,16 @@ public partial class GameBridge
                 }, 2000, ct);
                 if (result.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
                     T3Increment("authority_stats_unreadable");
+                var worldStats = await ProcessorFrameScope.RunAsync(async token =>
+                {
+                    var native = await _combat.Wo163Async(Protocol.T3OpStats, [], token);
+                    ProcessorFrameScope.ThrowIfAbandoned();
+                    if (native is { Ok: true } b && T3NativeCounters.TryRead(b.Payload, out var values))
+                        foreach (var field in values) _t3Counters[field.Key] = field.Value;
+                    else T3Increment("world_stats_unreadable");
+                }, 2000, ct);
+                if (worldStats.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
+                    T3Increment("world_stats_unreadable");
             }
             ct.ThrowIfCancellationRequested();
             T3EmitStats(role, ct);
@@ -161,7 +173,7 @@ public partial class GameBridge
         foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(new[] {
             "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable" }))
             _t3Counters.TryAdd(key, 0);
-        foreach (string key in new[] { "proc_stalls", "proc_stall_max_ms", "proc_frames_abandoned", "deferred_sidechannel", "proc_frame_faults", "proc_tick_faults" })
+        foreach (string key in new[] { "proc_stalls", "proc_stall_max_ms", "proc_frames_abandoned", "deferred_sidechannel", "proc_frame_faults", "proc_tick_faults", "engine_teleport_lines", "input_owner_sync_failed", "tp_snapshot_timeouts", "tp_snapshot_refused" })
             _t3Counters.TryAdd(key, 0);
         _t3Counters["w136_held"] = Interlocked.Read(ref _w136Held);
         _t3Counters["w136_replayed"] = Interlocked.Read(ref _w136Replayed);

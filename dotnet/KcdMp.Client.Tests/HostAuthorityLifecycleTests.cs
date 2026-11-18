@@ -50,10 +50,27 @@ public class HostAuthorityLifecycleTests
         Assert.False(native.Active); Assert.False(native.Legacy);
         Assert.True(native.Role(0, generation)); Assert.False(native.Legacy);
         Assert.True(native.Role(2, generation)); Assert.True(native.Legacy);
-        Assert.False(await agent.GameplayAsync(generation, default));
         Assert.True(await agent.PendingAsync(false, false, default)); Assert.True(native.Legacy); // duplicate Disabled is idempotent
+        Assert.True(await agent.GameplayAsync(generation, default)); Assert.False(agent.Current.Active);
+        Assert.True(await agent.RefreshAsync(default)); Assert.True(native.Legacy); // readiness does not change authority
         Assert.True(await agent.PendingAsync(false, true, default)); Assert.False(native.Legacy); // new load clears it off-main
         Assert.False(native.Role(2, generation)); // stale queued main-thread role2 cannot relatch the new load
+    }
+
+    [Fact]
+    public async Task Host_disabled_generation_needs_real_gameplay_and_repeats_never_restart_age_or_arm_authority()
+    {
+        var native = new Native(); var agent = new HostAuthorityLifecycle(native.Send);
+        Assert.True(await agent.PendingAsync(false, true, default)); ulong generation = agent.Current.Generation;
+        Assert.True(native.Role(1, generation));
+        native.Now = 50000; Assert.True(await agent.RefreshAsync(default)); Assert.False(agent.Current.GameplaySent);
+        Assert.True(await agent.GameplayAsync(generation, default));
+        native.Now = 51000; Assert.True(await agent.GameplayAsync(generation, default));
+        Assert.Equal(1000u, agent.Current.GameplayAgeMs); Assert.False(agent.Current.Enabled); Assert.False(agent.Current.Active); Assert.False(native.Legacy);
+        Assert.True(await agent.RefreshAsync(default)); Assert.True(agent.Current.GameplaySent);
+        Assert.True(await agent.PendingAsync(false, true, default));
+        Assert.True(agent.Current.Generation > generation); Assert.False(agent.Current.GameplaySent);
+        Assert.False(await agent.GameplayAsync(generation, default));
     }
 
     [Fact]
@@ -217,13 +234,13 @@ public class HostAuthorityLifecycleTests
                 if (generation > Generation)
                 {
                     Generation = generation; _phase = phase; _enabled = phase != HostAuthorityLifecycle.Disabled;
-                    _gameplay = -1; Legacy = false; _loadAccepted = phase == HostAuthorityLifecycle.Load;
+                    _gameplay = -1; Legacy = false; _loadAccepted = true;
                 }
                 else accepted = generation == Generation && phase == _phase;
             }
             else if (phase == HostAuthorityLifecycle.Gameplay)
             {
-                accepted = generation == Generation && _enabled && _loadAccepted;
+                accepted = generation == Generation && _loadAccepted;
                 if (accepted && _phase != phase) { _phase = phase; _gameplay = Now; }
             }
             uint age = _gameplay < 0 ? 0 : (uint)(Now - _gameplay);

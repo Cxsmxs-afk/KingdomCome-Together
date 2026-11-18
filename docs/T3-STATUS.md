@@ -6,8 +6,8 @@ Auftrag: [T3-AUFTRAG.md](T3-AUFTRAG.md). Alle Änderungen bleiben auf gestapelte
 | --- | --- | --- | --- |
 | P0 | codex/t3-p0-processor-stall | codex/loot-ownership-polish, 339d78c | [PR #18](https://github.com/Cxsmxs-afk/KingdomCome-Together/pull/18), CI 44208035940 grün, Drop-in install-verify PASS |
 | P1 | codex/t3-p1-intellect-gate | P0, 780075b | [PR #19](https://github.com/Cxsmxs-afk/KingdomCome-Together/pull/19), Head ad16c5f, CI 44218390184 grün, Drop-in install-verify PASS |
-| P3 | codex/t3-p3-pickup-freeze | P1, ad16c5f | Implementierung |
-| P4 | codex/t3-p4-respawn-wake | P3 | offen |
+| P3 | codex/t3-p3-pickup-freeze | P1, ad16c5f | [PR #21](https://github.com/Cxsmxs-afk/KingdomCome-Together/pull/21), Head bfd9500b, CI 44223046972 grün, Drop-in 14392880463 install-verify PASS |
+| P4 | codex/t3-p4-respawn-wake | P3, bfd9500b | Implementierung |
 | P5 | codex/t3-p5-corpses-marker | P4 | offen |
 | P6 | codex/t3-p6-bow | P5 | offen |
 | P2 | codex/t3-p2-frame-budget | P6 | nur nach Messung der Bedingung |

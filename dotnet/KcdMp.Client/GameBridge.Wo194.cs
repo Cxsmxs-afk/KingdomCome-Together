@@ -46,6 +46,7 @@ public partial class GameBridge
 
     private readonly object _w194Lock = new();
     private W194Own? _w194Own;
+    private long _w194TeleportGeneration;
     private readonly ConcurrentDictionary<byte, W194Remote> _w194Remote = new();
     private readonly ConcurrentDictionary<(byte, int), string> _w194Paths = new();
     private readonly ConcurrentDictionary<string, long> _w194Played = new(StringComparer.Ordinal);   // the scenes this machine played since its last load
@@ -164,7 +165,7 @@ public partial class GameBridge
             case 3:   // ... and the DLL held it (the joiner's own trigger first)
             {
                 var o = new W194Own { Name = e.Name, Path = e.Path, EnqueueMs = now - e.AgeMs, Held = e.Kind == 3, Seq = Interlocked.Increment(ref _w179Seq) };
-                lock (_w194Lock) _w194Own = o;
+                lock (_w194Lock) { _w194Own = o; Interlocked.Increment(ref _w194TeleportGeneration); }
                 if (o.Held) Interlocked.Increment(ref _w194Held);
                 Console.WriteLine($"WO194-SCENE this quest enqueued {tail}{(o.Held ? " -- HELD at initialized while the host's copy starts (3 s at most)" : "")}");
                 if (_w194Shared && W194Partnered && !Wo179Rules.IsCrimeScene(e.Name))
@@ -184,7 +185,7 @@ public partial class GameBridge
             {
                 W194Remote? rem = _w194Remote.Values.Where(r => r.Name == e.Name).OrderByDescending(r => r.AtMs).FirstOrDefault();
                 var o = new W194Own { Name = e.Name, Path = e.Path, EnqueueMs = now - e.AgeMs, Mod = true, Seq = Interlocked.Increment(ref _w179Seq), Partner = rem?.Src ?? 255, HostPlayedIt = rem is not null && !W137Host };
-                lock (_w194Lock) _w194Own = o;
+                lock (_w194Lock) { _w194Own = o; Interlocked.Increment(ref _w194TeleportGeneration); }
                 Console.WriteLine($"WO194-SCENE the partner's scene started here through this quest's own handler {tail}");
                 break;
             }
@@ -206,7 +207,7 @@ public partial class GameBridge
         {
             if (stage != "PlayCutscene") return;
             o = new W194Own { Name = name, EnqueueMs = now, Seq = Interlocked.Increment(ref _w179Seq) };   // an enqueue the hook did not see
-            lock (_w194Lock) _w194Own = o;
+            lock (_w194Lock) { _w194Own = o; Interlocked.Increment(ref _w194TeleportGeneration); }
         }
         switch (stage)
         {
@@ -254,7 +255,7 @@ public partial class GameBridge
     private void Wo194OnLoad()
     {
         var o = _w194Own;
-        lock (_w194Lock) _w194Own = null;
+        lock (_w194Lock) { _w194Own = null; Interlocked.Increment(ref _w194TeleportGeneration); }
         _w194Remote.Clear();
         _w194Paths.Clear();
         _w194Played.Clear();
@@ -295,11 +296,17 @@ public partial class GameBridge
     /// <summary>A: after OnPositioningFinished both Henrys stand on the same tag point -- the joiner's is moved about 1 m off it, on the ground.</summary>
     private async Task Wo194NudgeAsync(W194Own o)
     {
+        var origin = T3TpOperationGuard();
+        long sceneGeneration = Interlocked.Read(ref _w194TeleportGeneration);
+        bool Current() => origin() && sceneGeneration == Interlocked.Read(ref _w194TeleportGeneration) && (_w194Own is null || ReferenceEquals(_w194Own, o));
         await Task.Delay(300);   // the game's own placement settles first
-        if (W179NotInWorld || _jj is not null) return;
-        float x = _w179HavePos ? _w179X : _lastX, y = _w179HavePos ? _w179Y : _lastY, z = _w179HavePos ? _w179Z : _lastZ;
+        if (!Current() || W179NotInWorld || _jj is not null) return;
+        var target = await T3TpLocalAsync();
+        if (target is null || !Current()) return;
+        target = target with { CurrentOperation = Current };
+        float x = target.X, y = target.Y, z = target.Z;
         _w179OwnMoveMs = Environment.TickCount64;
-        var pr = await _combat.JoinPlaceAsync(x, y, z, Wo194Rules.NudgeM);
+        var pr = await T3TpPlaceAsync(target, Wo194Rules.NudgeM, TeleportSource.SceneNudge);
         if (pr is not { Ok: true }) { Console.WriteLine($"WO194-NUDGE '{o.Name}' not moved (the placement refused)"); return; }
         bool ground = false;
         for (int i = 0; i < 6 && !ground; i++)

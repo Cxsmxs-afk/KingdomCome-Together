@@ -642,12 +642,14 @@ public partial class GameBridge
 
     private async Task W164UnstuckBesideAsync()
     {
-        byte pick = W137Joiner ? (byte)0 : _ghostLastPos.Keys.OrderBy(k => k).FirstOrDefault();
-        if (!_ghostLastPos.TryGetValue(pick, out var gp) || (DateTime.UtcNow - gp.AtUtc).TotalSeconds > 10)
-        { Console.WriteLine("WO164-UNSTUCK step=2 stood=- moved=no why=no-partner-position"); await W164NoticeAsync("No partner to bring you to."); return; }
-        var pr = await _combat.JoinPlaceAsync(gp.X, gp.Y, gp.Z, 2.0f);
-        bool ok = pr is { Ok: true } || pr is { Snapped: true };
-        Console.WriteLine(FormattableString.Invariant($"WO164-UNSTUCK step=2 stood=- moved={(ok ? "yes" : "no")} to=({gp.X:F1},{gp.Y:F1},{gp.Z:F1}) partner={pick}"));
+        var origin = T3TpOperationGuard();
+        byte pick = W137Joiner ? (_leashHostId != 0xFF ? _leashHostId : _hostModeFrom) :
+            _leashJoinerState.Keys.OrderBy(k => k).FirstOrDefault((byte)0xFF);
+        var target = await T3TpPeerAsync(pick, TeleportSource.Unstuck, _w206.World);
+        if (target is null || !origin()) { await W164NoticeAsync("No fresh, safe partner position is available."); return; }
+        var pr = await T3TpPlaceAsync(target, 2.0f, TeleportSource.Unstuck);
+        bool ok = pr is { Ok: true };
+        Console.WriteLine(FormattableString.Invariant($"WO164-UNSTUCK step=2 moved={(ok ? "yes" : "no")} to=({target.X:F1},{target.Y:F1},{target.Z:F1}) partner={pick}"));
         if (ok) await W164NoticeAsync("You are beside your partner.");
     }
 

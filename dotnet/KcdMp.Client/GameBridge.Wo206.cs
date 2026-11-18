@@ -46,7 +46,7 @@ public partial class GameBridge
         }
         if (W206Host) return true;   // a host never takes another machine's epochs
         bool changed = _w206.LearnWorld(world, join);
-        if (changed) _ = ResetHostCalendarAsync("host-world-epoch");
+        if (changed) { T3TpInvalidate(); _ = ResetHostCalendarAsync("host-world-epoch"); }
         Wo206SyncPublic();
         if (changed) Console.WriteLine($"MP-W206 the host's world epoch is {world} now ({why}; join epoch {join}) -- what was read before this is the old world's");
         Wo211OnEpochHeard(world);   // WO-211 A.1: a link hold ends here -- the same world in place, a changed one through the in-world rejoin

@@ -5,6 +5,7 @@
 // route they extend (wo215.cpp: the AI update's entry, the per-copy route).
 #include "wo216.h"
 #include "wo216_authority_rules.h"
+#include "p4.h"
 #include "wo203.h"
 #include "wo163.h"
 #include "wo215.h"
@@ -158,7 +159,7 @@ uint8_t lifecycle_op(const uint8_t* body, size_t len, uint8_t* out, size_t cap, 
     const bool accepted = g_authority.apply(r, now);
     if (accepted && (before.generation != g_authority.generation || before.phase != g_authority.phase ||
         before.gameplayAtMs != g_authority.gameplayAtMs || before.loadAccepted != g_authority.loadAccepted || before.legacyArmed != g_authority.legacyArmed)) {
-        if (before.generation != g_authority.generation) c_gateArmedAtS.store(0);
+        if (before.generation != g_authority.generation) { c_gateArmedAtS.store(0); p4::invalidate(); }
         publish_authority();
     }
     g_authority.ack(out, g_role.load(), g_decisionGate.load(), now, r.id);
@@ -991,6 +992,8 @@ bool on(uint32_t bit) { return (g_bits.load(std::memory_order_relaxed) & ~twin_o
 bool configured() { return g_configured.load(std::memory_order_relaxed); }
 bool authority_active() { return lifecycle_active(GetTickCount64()); }
 bool authority_enabled() { return g_authorityEnabled.load(std::memory_order_acquire); }
+uint64_t lifecycle_generation() { return g_authorityGeneration.load(std::memory_order_acquire); }
+bool lifecycle_gameplay() { return g_authorityPhase.load(std::memory_order_acquire) == uint8_t(wo216authority::Phase::Gameplay); }
 bool decisions_blocked() { return authority_active() && g_decisionGate.load(); }
 
 int status(char* out, int n) {
