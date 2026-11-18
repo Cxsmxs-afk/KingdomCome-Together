@@ -87,6 +87,8 @@ public class T3ConnectionLifetimeTests
     {
         private readonly GameBridge _bridge;
         private readonly Type _type = typeof(GameBridge).GetNestedType("InFrame", BindingFlags.NonPublic)!;
+        private static readonly object NoPresentation =
+            Activator.CreateInstance(typeof(GameBridge).GetNestedType("PresentationFrame", BindingFlags.NonPublic)!)!;
         public readonly object Reader, Writer;
         public Frames(GameBridge bridge)
         {
@@ -104,7 +106,7 @@ public class T3ConnectionLifetimeTests
             Assert.True((bool)Call(_bridge, "Wo207Queue", Writer, frame, kind)!);
         }
         public void Coalesce(byte ghost) => Assert.True((bool)Call(_bridge, "Wo202Coalesce", Writer, (int)Protocol.Ghost,
-            new byte[] { ghost }, Stopwatch.GetTimestamp(), 0u)!);
+            new byte[] { ghost }, Stopwatch.GetTimestamp(), 0u, NoPresentation)!);
         public Task Run(CancellationToken token) => (Task)Call(_bridge, "ProcessFramesAsync", Reader, token)!;
     }
 

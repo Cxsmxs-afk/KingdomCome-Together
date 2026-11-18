@@ -35,6 +35,22 @@ public static class LinkStateCodec
                 if (p.Length < 1) return false;
                 into.Add(new StatePiece("pos|" + p[0], "02", type, [], p.ToArray(), "pos", "kcd2mp_" + p[0], false, false));
                 return true;
+            case Protocol.PresentationPoseDown:
+            {
+                if (!PresentationTimeWire.TryRead(type, p, out _, out byte inner, out int offset)) return false;
+                var source = p[offset..];
+                if (inner == Protocol.Ghost)
+                {
+                    bool state2 = source.Length >= Protocol.GhostPayloadLenV8 &&
+                        (source[17] & Protocol.PositionFlagBodyState2) != 0;
+                    string slot = $"rp-ghost|{source[0]}|{(state2 ? 1 : 0)}";
+                    into.Add(new StatePiece(slot, "rp-ghost", type, [], p.ToArray(), "pos", "kcd2mp_" + source[0], false, false));
+                    return true;
+                }
+                string name = Encoding.UTF8.GetString(source.Slice(2, source[1]));
+                into.Add(new StatePiece($"npc|{source[0]}|{name}", "rp-npc", type, [], p.ToArray(), "npc-state", name, false, false));
+                return true;
+            }
             case Protocol.NpcStateUp:
             {
                 if (p.Length < 2 || p.Length != 1 + p[0] + Protocol.NpcStateFixedTail) return false;

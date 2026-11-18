@@ -95,6 +95,7 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
         });
         var result = await bot.WaitAsync();
         Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Contains("BOT-T4 role=joiner presentation_clock=ready", result.Output);
         Assert.Contains("BOT-T4 role=joiner complete=1", result.Output);
         var planned = Regex.Matches(result.Output, @"BOT-T4-STATION role=joiner station=\w+ planned_host_ms=(\d+)")
             .Select(match => uint.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture)).ToArray();

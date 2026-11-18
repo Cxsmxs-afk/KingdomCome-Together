@@ -67,7 +67,7 @@ const char* swing_result_name(SwingResult r);
 /// engine's own parser. Returns false (with a logged reason) if any input
 /// fails to resolve; a visually inert success (weapon sheathed) still
 /// returns Ok, matching WO-45's live observation.
-SwingResult ghost_swing(uint32_t entityId, const char* fragSpec);
+SwingResult ghost_swing(uint32_t entityId, const char* fragSpec, uint64_t timelineToken = 0, bool* watching = nullptr);
 
 // Reserve the body before entering an engine request that can animate its root.
 // The existing native pose hold outlives the call; the caller records acceptance.
@@ -85,7 +85,7 @@ bool stop_action(void* action);
 
 // WO-167 C3: "shown" means rendered. ghost_swing hands its reference to the queued action to the watch (true = taken); each frame the
 // watch reads the action's status until it was installed or never will be (wo167_rules.h), then drops the reference. Main thread only.
-bool swing_watch_take(uint32_t eid, void* action);
+bool swing_watch_take(uint32_t eid, void* action, uint64_t timelineToken = 0);
 void swing_watch_tick();                                                        // every frame (dllmain post_repeating)
 // WO-202 IV.1 anim_shown: each copy's last swing keeps one reference of ours until its next swing, which steps it down 5 -> 3 (the
 // engine's own Withdraw value) so the new one installs at once (wo202_rules.h lower_previous). Main thread only.

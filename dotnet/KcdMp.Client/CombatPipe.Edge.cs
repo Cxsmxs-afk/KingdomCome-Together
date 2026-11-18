@@ -25,6 +25,7 @@ public readonly record struct EdgePipeReply(EdgeOutcome Outcome, byte[] Payload)
 public sealed partial class CombatPipe
 {
     private const byte EdgeFrame = 0x38, EdgeReply = 0xB8, EdgeRawPose = 0x39, EdgeCapabilityOp = 255;
+    private const byte EdgeTimedPose = 0x3C;
     private const byte EdgeLatest = 3;
     private const byte EdgeFaulted = 5, EdgeBusyAccepted = 6;
     private const int EdgeHeaderSize = 10, EdgeReplyHeaderSize = 6, EdgeMaxPayload = 4096;
@@ -105,14 +106,34 @@ public sealed partial class CombatPipe
     }
 
     /// <summary>Submit the unchanged relay pose payload. True routes this update exclusively through the native edge.</summary>
-    public bool PostEdgePose(byte relayKind, ReadOnlySpan<byte> payload, long arrivalQpc)
+    public bool PostEdgePose(byte relayKind, ReadOnlySpan<byte> payload, long arrivalQpc) =>
+        PostPose(relayKind, payload, arrivalQpc, 0, 0, null);
+
+    public bool PostPresentationPose(byte relayKind, ReadOnlySpan<byte> payload, long arrivalQpc, ulong sampleHostMs,
+        ulong hostAtArrivalMs, long? connectionRevision = null)
     {
-        if (!EdgeActive || arrivalQpc <= 0 || PoseStateKey(relayKind, payload) is not { } stateKey) return false;
-        var body = new byte[9 + payload.Length];
+        if (sampleHostMs is 0 or > long.MaxValue || hostAtArrivalMs is 0 or > long.MaxValue) return false;
+        return PostPose(relayKind, payload, arrivalQpc, sampleHostMs, hostAtArrivalMs, connectionRevision);
+    }
+
+    private bool PostPose(byte relayKind, ReadOnlySpan<byte> payload, long arrivalQpc, ulong sampleHostMs,
+        ulong hostAtArrivalMs, long? connectionRevision)
+    {
+        if (!EdgeActive || arrivalQpc <= 0 || PoseStateKey(relayKind, payload) is not { } stateKey ||
+            (connectionRevision.HasValue && connectionRevision.Value != EdgeConnectionRevision)) return false;
+        bool timed = sampleHostMs != 0;
+        int prefix = timed ? 25 : 9;
+        var body = new byte[prefix + payload.Length];
         body[0] = relayKind;
         BinaryPrimitives.WriteInt64LittleEndian(body.AsSpan(1), arrivalQpc);
-        payload.CopyTo(body.AsSpan(9));
-        _ = PostEdgeStateAsync(EdgeRawPose, body, Result, (byte)EdgeLane.Realtime, key: 0, stateKey, arrivalQpc);
+        if (timed)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(9), sampleHostMs);
+            BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(17), hostAtArrivalMs);
+        }
+        payload.CopyTo(body.AsSpan(prefix));
+        _ = PostEdgeStateAsync(timed ? EdgeTimedPose : EdgeRawPose, body, Result, (byte)EdgeLane.Realtime,
+            key: 0, stateKey, arrivalQpc, connectionRevision);
         return true;
     }
 
@@ -147,9 +168,9 @@ public sealed partial class CombatPipe
     }
 
     private async Task PostEdgeStateAsync(byte type, byte[] payload, byte expectedType, byte lane, uint key,
-        EdgeStateKey stateKey, long arrival = 0)
+        EdgeStateKey stateKey, long arrival = 0, long? connectionRevision = null)
     {
-        var result = await QueueEdgeAsync(type, payload, expectedType, lane, key, CancellationToken.None, stateKey: stateKey, arrival: arrival);
+        var result = await QueueEdgeAsync(type, payload, expectedType, lane, key, CancellationToken.None, connectionRevision, stateKey, arrival);
         if (result.Outcome != EdgeOutcome.Completed || result.Payload is [0, ..]) Interlocked.Increment(ref _edgeStateSkipped);
     }
 

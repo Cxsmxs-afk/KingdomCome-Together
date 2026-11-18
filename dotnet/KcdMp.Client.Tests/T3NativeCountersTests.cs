@@ -154,4 +154,29 @@ public class T3NativeCountersTests
         Assert.True(T3NativeCounters.TryRead(Payload(56), out var future));
         Assert.Equal(55, future.Count);
     }
+
+    [Fact]
+    public void Timeline_stats_are_an_independent_complete_page()
+    {
+        byte[] page = Payload(6);
+        Assert.Equal(56, page.Length);
+        Assert.True(T3NativeCounters.TryReadTimeline(page, out var values));
+        Assert.Equal(0, values["rp_buffer_ms"]);
+        Assert.Equal(1, values["rp_extrap_ms_max"]);
+        Assert.Equal(2, values["rp_late_samples"]);
+        Assert.Equal(3, values["rp_action_pos_skew_ms_p95"]);
+        Assert.Equal(4, values["rp_timeline_pose_n"]);
+        Assert.Equal(5, values["rp_timeline_skew_n"]);
+        Assert.False(T3NativeCounters.TryRead(page, out _));
+        Assert.False(T3NativeCounters.TryReadTimeline(Payload(55), out _));
+        Assert.False(T3NativeCounters.TryReadTimeline(Payload(5), out _));
+        Assert.False(T3NativeCounters.TryReadTimeline(page.AsSpan(0, page.Length - 1), out _));
+        page[2 + 5 * 9] = 6;
+        Assert.False(T3NativeCounters.TryReadTimeline(page, out _));
+        page[2 + 5 * 9] = 4;
+        Assert.False(T3NativeCounters.TryReadTimeline(page, out _));
+        page[2 + 5 * 9] = 5;
+        BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(3 + 5 * 9), ulong.MaxValue);
+        Assert.False(T3NativeCounters.TryReadTimeline(page, out _));
+    }
 }

@@ -307,6 +307,10 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
                 await host.SendRawAsync(Frame(up, b));
                 await ArrivesAsync(host, Protocol.ClockSyncDown, Protocol.ClockSyncDownPayloadLen);
                 return;
+            case Protocol.PresentationClockUp:
+                await OpenPresentationAsync(host);
+                await CalibratePresentationAsync(host, 0);
+                return;
             case Protocol.LinkHelloUp:   // WO-213: relay-local, the answer comes back to the sender
                 b[0] = Protocol.LinkVersion;
                 await host.SendRawAsync(Frame(up, b));
@@ -593,5 +597,120 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
         await host.SendRawAsync(Frame(Protocol.NpcDamageUp, body));
         var fatal = await ArrivesAsync(joiner, Protocol.NpcDamageDown, 1 + body.Length, host.Id);
         Assert.NotEqual(0, fatal[^1] & Protocol.NpcDamageFlagFatal);
+    }
+    private static async Task OpenPresentationAsync(Peer peer)
+    {
+        await peer.SendRawAsync(Protocol.BuildLinkHelloUp(Protocol.LinkCapPresentationTime));
+        var reply = await ArrivesAsync(peer, Protocol.LinkHelloDown, Protocol.LinkHelloDownLen);
+        Assert.True(Protocol.TryParseLinkHello(reply, out _, out ushort caps, out _, out _));
+        Assert.Equal(Protocol.LinkCapPresentationTime, caps);
+    }
+
+    private static async Task CalibratePresentationAsync(Peer peer, long simulatedOffset)
+    {
+        var clock = new PresentationClockClient();
+        long t0 = PresentationClock.NowMs() + simulatedOffset;
+        await peer.SendRawAsync(clock.Begin(t0));
+        byte[] reply = await ArrivesAsync(peer, Protocol.PresentationClockDown, PresentationClock.ReplyLength);
+        var t1 = BinaryPrimitives.ReadInt64LittleEndian(reply.AsSpan(8));
+        var t2 = BinaryPrimitives.ReadInt64LittleEndian(reply.AsSpan(16));
+        // Model a symmetric local exchange with a known independent monotonic epoch.
+        long t3 = t2 + simulatedOffset + (t1 + simulatedOffset - t0);
+        Assert.True(clock.TryComplete(reply, t3, out var proof));
+        await peer.SendRawAsync(proof);
+        await peer.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await ArrivesAsync(peer, Protocol.Pong, Protocol.PingPayloadLen);
+    }
+
+    private static byte[] TimedPosition(long sourceMs, bool hostClaim)
+    {
+        var body = new byte[Protocol.PositionPayloadLen + Protocol.SenderMsLen];
+        body[16] = (byte)(Protocol.PositionFlagSenderMs | (hostClaim ? Protocol.PositionFlagHostClaim : 0));
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(Protocol.PositionPayloadLen), unchecked((uint)sourceMs));
+        return Frame(Protocol.Position, body);
+    }
+
+    private static byte[] TimedJump(long sourceMs)
+    {
+        var body = new byte[Protocol.ActionUpHeaderLen + Protocol.SenderMsLen];
+        body[0] = (byte)ActionKind.Jump;
+        body[3] = (byte)ActionPhase.Commit;
+        body[Protocol.ActionUpHeaderLen - 1] = Protocol.SenderMsLen;
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(Protocol.ActionUpHeaderLen), unchecked((uint)sourceMs));
+        return Frame(Protocol.ActionUp, body);
+    }
+
+    private static async Task<(PresentationStamp Stamp, byte[] Original)> TimedDown(Peer to, byte wrapper, byte inner)
+    {
+        byte[] body = await to.ReadUntilAsync(wrapper, Wait);
+        Assert.True(PresentationTimeWire.TryRead(wrapper, body, out var stamp, out byte type, out int offset));
+        Assert.Equal(inner, type);
+        return (stamp, body[offset..]);
+    }
+
+    [Fact]
+    public async Task Both_roles_share_the_host_clock_and_preserve_legacy_receivers_and_action_phase()
+    {
+        var (host, joiner) = await HostAndJoinerAsync();
+        await using var _h = host; await using var _j = joiner;
+        await using var legacy = await Peer.ConnectAsync(_relay.TcpPort, "legacy-listener");
+        const long hostOffset = (1L << 34) + 90_000, joinerOffset = (1L << 33) + 20_000;
+        await OpenPresentationAsync(host);
+        await OpenPresentationAsync(joiner);
+        long now = PresentationClock.NowMs();
+        await host.SendRawAsync(TimedPosition(now + hostOffset, hostClaim: true));
+        await ArrivesAsync(joiner, Protocol.Ghost, Protocol.GhostPayloadLen + Protocol.SenderMsLen, host.Id);
+        await ArrivesAsync(legacy, Protocol.Ghost, Protocol.GhostPayloadLen + Protocol.SenderMsLen, host.Id);
+
+        await CalibratePresentationAsync(host, hostOffset);
+        await joiner.SendRawAsync(TimedPosition(now + joinerOffset, hostClaim: false));
+        await ArrivesAsync(host, Protocol.Ghost, Protocol.GhostPayloadLen + Protocol.SenderMsLen, joiner.Id);
+        await ArrivesAsync(legacy, Protocol.Ghost, Protocol.GhostPayloadLen + Protocol.SenderMsLen, joiner.Id);
+        await CalibratePresentationAsync(joiner, joinerOffset);
+
+        now = PresentationClock.NowMs();
+        long hostTime = now + hostOffset, joinerTime = now + joinerOffset;
+        byte[] hostPosition = TimedPosition(hostTime, hostClaim: true);
+        await host.SendRawAsync(hostPosition);
+        var first = await TimedDown(joiner, Protocol.PresentationPoseDown, Protocol.Ghost);
+        Assert.Equal((ulong)hostTime, first.Stamp.HostMs);
+        Assert.Equal(hostOffset, first.Stamp.RelayToHostMs);
+        byte[] hostGhost = [host.Id, .. hostPosition.AsSpan(3)];
+        hostGhost[17] &= unchecked((byte)~Protocol.PositionFlagHostClaim);
+        Assert.Equal(hostGhost, first.Original);
+        Assert.Equal(hostGhost, await ArrivesAsync(legacy, Protocol.Ghost, hostGhost.Length, host.Id));
+
+        byte[] joinerPosition = TimedPosition(joinerTime, hostClaim: false);
+        await joiner.SendRawAsync(joinerPosition);
+        var fromJoiner = await TimedDown(host, Protocol.PresentationPoseDown, Protocol.Ghost);
+        Assert.Equal(first.Stamp, fromJoiner.Stamp);
+        byte[] joinerGhost = [joiner.Id, .. joinerPosition.AsSpan(3)];
+        Assert.Equal(joinerGhost, fromJoiner.Original);
+
+        foreach (var (source, target, captured) in new[] { (host, joiner, hostTime), (joiner, host, joinerTime) })
+        {
+            byte[] action = TimedJump(captured);
+            await source.SendRawAsync(action);
+            var timedAction = await TimedDown(target, Protocol.PresentationActionDown, Protocol.ActionDown);
+            Assert.Equal(first.Stamp, timedAction.Stamp);
+            byte[] original = [source.Id, .. action.AsSpan(3)];
+            Assert.Equal(original, timedAction.Original);
+            Assert.Equal((byte)ActionPhase.Commit, timedAction.Original[4]);
+        }
+
+        byte[] npc = NpcCompact.BuildDown(host.Id, "timeline_npc", new(1, 2, 3, 0, 100, 0, 1, unchecked((uint)hostTime)));
+        await host.SendRawAsync(Frame(Protocol.NpcStateUp, npc[1..]));
+        var timedNpc = await TimedDown(joiner, Protocol.PresentationPoseDown, Protocol.NpcStateDown);
+        Assert.Equal(first.Stamp, timedNpc.Stamp);
+        Assert.Equal(npc, timedNpc.Original);
+
+        await host.SendRawAsync(TimedPosition(hostTime, hostClaim: false));
+        var relinquished = await TimedDown(joiner, Protocol.PresentationPoseDown, Protocol.Ghost);
+        Assert.Equal(first.Stamp, relinquished.Stamp);
+        await joiner.SendRawAsync(TimedPosition(joinerTime, hostClaim: true));
+        var changed = await TimedDown(host, Protocol.PresentationPoseDown, Protocol.Ghost);
+        Assert.True(changed.Stamp.Epoch > first.Stamp.Epoch);
+        Assert.Equal((ulong)joinerTime, changed.Stamp.HostMs);
+        Assert.Equal(joinerOffset, changed.Stamp.RelayToHostMs);
     }
 }

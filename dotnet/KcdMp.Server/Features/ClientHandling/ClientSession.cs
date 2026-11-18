@@ -54,6 +54,10 @@ public class ClientSession
     private readonly byte[] _pingPayload = new byte[8];
     private int _queuedBytes;
     private long _npcCoalesced;
+    private readonly object _presentationClockGate = new();
+    private (long Query, long Received, long Sent) _presentationProbe;
+    private PresentationClockSample? _presentationClock;
+    private volatile bool _linkPresentationTime;
 
     private readonly record struct QueuedWrite(byte[]? Packet, byte? GhostId, string? NpcKey = null, long Ts = 0);
 
@@ -95,7 +99,8 @@ public class ClientSession
     internal static ushort RelayLinkCaps =>
         (ushort)((W213Switch.TwinOff("link_sched") ? 0 : Protocol.LinkCapLatestWins)
                | (W213Switch.TwinOff("link_sched") || W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
-               | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc));
+               | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc)
+               | Protocol.LinkCapPresentationTime);
 
     private void OnLinkHello(byte[] hello)
     {
@@ -107,6 +112,11 @@ public class ClientSession
         LinkUnreliableState = (both & Protocol.LinkCapUnreliableState) != 0;
         if (_sched is not null && _writer is not null) _sched.Options.Unreliable = LinkUnreliableState && _writer.Path.CanSendUnreliable;
         LinkCompactNpc = (both & Protocol.LinkCapCompactNpc) != 0;
+        _linkPresentationTime = (both & Protocol.LinkCapPresentationTime) != 0;
+        if (!_linkPresentationTime)
+        {
+            lock (_presentationClockGate) { _presentationProbe = default; _presentationClock = null; }
+        }
         if (LinkCompactNpc && _writer is not null)
         {
             var enc = new NpcCompact.Encoder();
@@ -117,6 +127,40 @@ public class ClientSession
             Id, version, caps, both, Protocol.LinkTransportName(transport), rate);
         EnqueueRaw(Protocol.BuildLinkHelloDown(both, transport, rate));
     }
+
+    internal bool TryPresentationClock(long now, out PresentationClockSample sample)
+    {
+        lock (_presentationClockGate)
+        {
+            sample = _presentationClock.GetValueOrDefault();
+            return _linkPresentationTime && _presentationClock.HasValue && sample.FreshRelay(now);
+        }
+    }
+
+    private bool HandlePresentationClock(byte[] body, long received)
+    {
+        if (!_linkPresentationTime) return false;
+        if (PresentationClock.TryReadQuery(body, out long query))
+        {
+            long sent = PresentationClock.NowMs();
+            lock (_presentationClockGate) _presentationProbe = (query, received, sent);
+            EnqueueRaw(PresentationClock.BuildReply(query, received, sent));
+            return true;
+        }
+        if (!PresentationClock.TryReadConfirm(body, out long echoed, out long clientReceived)) return false;
+        lock (_presentationClockGate)
+        {
+            var probe = _presentationProbe;
+            if (echoed != probe.Query || received < probe.Sent || received - probe.Sent > PresentationClock.FreshMs ||
+                !PresentationClock.TrySample(echoed, probe.Received, probe.Sent, clientReceived, out var sample)) return false;
+            _presentationProbe = default;
+            _presentationClock = sample;
+            return true;
+        }
+    }
+
+    private byte[] BuildPresentationPacket(byte type, byte[] payload, PresentationStamp? stamp) =>
+        _linkPresentationTime && stamp is { } timing ? PresentationTimeWire.Wrap(type, payload, timing) : BuildPacket(type, payload);
 
     /// <summary>
     /// WO-76: assigned by <see cref="ClientHandler.TryMarkReady"/> from its
@@ -458,6 +502,15 @@ public class ClientSession
                     BinaryPrimitives.WriteInt64LittleEndian(body.AsSpan(8), t1);
                     BinaryPrimitives.WriteInt64LittleEndian(body.AsSpan(16), DateTime.UtcNow.Ticks);
                     EnqueueRaw(BuildPacket(Protocol.ClockSyncDown, body));
+                    continue;
+                }
+
+                if (type == Protocol.PresentationClockUp)
+                {
+                    var clock = new byte[payloadLen];
+                    await ReadExactAsync(clock);
+                    if (!HandlePresentationClock(clock, PresentationClock.NowMs()))
+                        _clientHandler.CountDrop(Protocol.PresentationClockUp, "invalid-exchange");
                     continue;
                 }
 
@@ -1071,7 +1124,7 @@ public class ClientSession
     /// byte -- empty for a 17-byte Position, so the Ghost is 18, 22, 23 or 27
     /// bytes and never anything else (WO-101).
     /// </summary>
-    public void EnqueueGhost(byte ghostId, float x, float y, float z, float rotZ, byte flags, byte[] tail)
+    public void EnqueueGhost(byte ghostId, float x, float y, float z, float rotZ, byte flags, byte[] tail, PresentationStamp? stamp = null)
     {
         var payload = new byte[Protocol.GhostPayloadLen + tail.Length];
         payload[0] = ghostId;
@@ -1081,7 +1134,7 @@ public class ClientSession
         WriteFloat(payload, 13, rotZ);
         payload[17] = flags;
         tail.CopyTo(payload, Protocol.GhostPayloadLen);
-        EnqueueGhostPacket(ghostId, BuildPacket(Protocol.Ghost, payload));
+        EnqueueGhostPacket(ghostId, BuildPresentationPacket(Protocol.Ghost, payload, stamp));
     }
 
     /// <summary>Thread-safe: enqueue a Disconnect packet (0x06) to be sent to this client.</summary>
@@ -1189,12 +1242,12 @@ public class ClientSession
     /// Thread-safe: enqueue an ActionDown (0x3C, WO-100.5 Phase 3). The body is
     /// the upstream payload verbatim, prefixed with who sent it.
     /// </summary>
-    public void EnqueueAction(byte sourceId, byte[] upstreamBody)
+    public void EnqueueAction(byte sourceId, byte[] upstreamBody, PresentationStamp? stamp = null)
     {
         var payload = new byte[1 + upstreamBody.Length];
         payload[0] = sourceId;
         Buffer.BlockCopy(upstreamBody, 0, payload, 1, upstreamBody.Length);
-        EnqueueRaw(BuildPacket(Protocol.ActionDown, payload));
+        EnqueueRaw(BuildPresentationPacket(Protocol.ActionDown, payload, stamp));
     }
 
     /// <summary>
@@ -1289,7 +1342,7 @@ public class ClientSession
     /// Thread-safe: enqueue an NpcStateDown (0x27, WO-32). The body is the
     /// upstream payload verbatim, prefixed with who sent it.
     /// </summary>
-    public void EnqueueNpcState(byte sourceId, byte[] upstreamBody)
+    public void EnqueueNpcState(byte sourceId, byte[] upstreamBody, PresentationStamp? stamp = null)
     {
         var payload = new byte[1 + upstreamBody.Length];
         payload[0] = sourceId;
@@ -1297,7 +1350,7 @@ public class ClientSession
         // WO-110 4.4: keyed by source + NPC name so pressure thinning is per NPC.
         int nameLen = upstreamBody[0];
         string key = sourceId + "|" + Encoding.UTF8.GetString(upstreamBody, 1, nameLen);
-        EnqueueNpcPacket(key, BuildPacket(Protocol.NpcStateDown, payload));
+        EnqueueNpcPacket(key, BuildPresentationPacket(Protocol.NpcStateDown, payload, stamp));
     }
 
     /// <summary>

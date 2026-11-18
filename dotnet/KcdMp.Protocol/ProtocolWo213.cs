@@ -34,7 +34,7 @@ public static partial class Protocol
 
     /// <summary>LinkHello caps: state as "latest wins" and unreliable on a link that has it (C), compact NPC states (D.3).</summary>
     public const ushort LinkCapLatestWins = 0x0001, LinkCapUnreliableState = 0x0002, LinkCapCompactNpc = 0x0004;
-    public const ushort LinkCapsAll = LinkCapLatestWins | LinkCapUnreliableState | LinkCapCompactNpc;
+    public const ushort LinkCapsAll = LinkCapLatestWins | LinkCapUnreliableState | LinkCapCompactNpc | LinkCapPresentationTime;
 
     public const byte LinkTransportTcp = 0, LinkTransportSteam = 1, LinkTransportShaped = 2;
 
@@ -92,6 +92,8 @@ public static class LinkKinds
         t[Protocol.Ping] = "ping"; t[Protocol.Pong] = "ping"; t[Protocol.ClockSyncUp] = "ping"; t[Protocol.ClockSyncDown] = "ping";
         t[Protocol.PlayerStateUp] = "vitals"; t[Protocol.PlayerStateDown] = "vitals";
         t[Protocol.LinkHelloUp] = "link"; t[Protocol.LinkHelloDown] = "link";
+        t[Protocol.PresentationClockUp] = "presentation-clock"; t[Protocol.PresentationClockDown] = "presentation-clock";
+        t[Protocol.PresentationPoseDown] = "presentation-pose"; t[Protocol.PresentationActionDown] = "presentation-action";
         t[Protocol.Name] = "name"; t[Protocol.ReleaseVersion] = "name"; t[Protocol.CombatRole] = "name"; t[Protocol.Ack] = "name";
         t[Protocol.Disconnect] = "name";
         return t;
@@ -153,7 +155,7 @@ public static class LinkState
 {
     public static bool IsStateType(int type) => type is Protocol.Position or Protocol.Ghost or Protocol.NpcStateUp or Protocol.NpcStateDown
         or Protocol.NpcStateQDown or Protocol.NpcAnimUp or Protocol.NpcAnimDown or Protocol.NpcOppUp or Protocol.NpcOppDown
-        or Protocol.NpcRouteUp or Protocol.NpcRouteDown;   // WO-216 A: the host's NPCs' movement requests
+        or Protocol.NpcRouteUp or Protocol.NpcRouteDown or Protocol.PresentationPoseDown;
 }
 
 /// <summary>

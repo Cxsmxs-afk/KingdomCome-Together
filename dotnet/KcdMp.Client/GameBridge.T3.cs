@@ -171,6 +171,7 @@ public partial class GameBridge
             _t3Counters.TryAdd("ranged_stats_unreadable", 0);
             byte role = W137Host ? (byte)1 : W137Joiner || _jj is not null ? (byte)2 : (byte)0;
             Dictionary<string, long>? nativeSnapshot = null;
+            IReadOnlyDictionary<string, long>? timelineSnapshot = null;
             if (role != 0)
             {
                 var result = await ProcessorFrameScope.RunAsync(async token =>
@@ -205,16 +206,34 @@ public partial class GameBridge
                 { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); T3Increment("ranged_stats_unreadable"); }
                 if (worldStats.Status == ProcessorFrameScope.Outcome.Completed && nativeCounters?.ContainsKey("rp_e2e_n") == true)
                     nativeSnapshot = nativeCounters;
+                // A DLL that implements the previous edge snapshot may also
+                // support the independent timeline page. Refusal leaves it absent.
+                if (nativeSnapshot?.ContainsKey("edge_rt_n") == true)
+                    timelineSnapshot = await T3ReadTimelineStatsAsync(ct);
             }
             ct.ThrowIfCancellationRequested();
-            T3EmitStats(role, ct, nativeSnapshot);
+            T3EmitStats(role, ct, nativeSnapshot, timelineSnapshot);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex) { Console.WriteLine($"MP-T3-STATS report unavailable: {ex.GetType().Name}"); }
         finally { Interlocked.Exchange(ref _t3StatsBusy, 0); }
     }
 
-    private void T3EmitStats(byte role, CancellationToken ct, IReadOnlyDictionary<string, long>? nativeSnapshot)
+    private async Task<IReadOnlyDictionary<string, long>?> T3ReadTimelineStatsAsync(CancellationToken ct)
+    {
+        Dictionary<string, long>? snapshot = null;
+        var result = await ProcessorFrameScope.RunAsync(async token =>
+        {
+            var reply = await _combat.Wo163Async(Protocol.T3OpStats, [Protocol.T3TimelineStatsCommand], token);
+            ProcessorFrameScope.ThrowIfAbandoned();
+            if (reply is { Ok: true } b && T3NativeCounters.TryReadTimeline(b.Payload, out var values))
+                snapshot = values;
+        }, 2000, ct);
+        return result.Status == ProcessorFrameScope.Outcome.Completed ? snapshot : null;
+    }
+
+    private void T3EmitStats(byte role, CancellationToken ct, IReadOnlyDictionary<string, long>? nativeSnapshot,
+        IReadOnlyDictionary<string, long>? timelineSnapshot)
     {
         foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(T3LootCounters.CorpseKeys).Concat(T3RangedKeys).Concat(new[] {
             "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable", "corpse_lua_stats_unreadable" }))
@@ -235,6 +254,7 @@ public partial class GameBridge
             counters = counters.Concat(T3NativeCounters.Keys.Skip(T3NativeCounters.PresentationStart)
                 .Where(nativeSnapshot.ContainsKey)
                 .Select(key => KeyValuePair.Create(key, nativeSnapshot[key])));
+        if (timelineSnapshot is not null) counters = counters.Concat(timelineSnapshot);
         string fields = string.Join(' ', counters.OrderBy(p => p.Key, StringComparer.Ordinal)
             .Select(p => p.Key + "=" + p.Value.ToString(CultureInfo.InvariantCulture)));
         Console.WriteLine($"MP-T3-STATS origin=agent role={(role == 1 ? "host" : role == 2 ? "joiner" : "off")} {fields}");

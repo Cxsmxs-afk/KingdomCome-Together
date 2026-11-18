@@ -41,6 +41,8 @@ public class ClientHandler
 	// allocates, and it takes the lowest free), so authority stays put.
 	private readonly SortedSet<byte> _freeIds = new(Enumerable.Range(0, 256).Select(i => (byte)i));
 	private byte? _lastAuthorityId;   // WO-110 R4: for the MP-AUTHORITY-OWNER change log
+	private ClientSession? _presentationHost;
+	private ulong _presentationEpoch;
 
 	// ---- WO-66 claim-update validation tunables ----
 	//
@@ -265,6 +267,20 @@ public class ClientHandler
 		get
 		{
 			lock (_lock) return PickAuthority(out _);
+		}
+	}
+
+	internal (ClientSession? Host, ulong Epoch) PresentationAnchor()
+	{
+		lock (_lock)
+		{
+			var host = PickAuthority(out _);
+			if (!ReferenceEquals(host, _presentationHost))
+			{
+				_presentationHost = host;
+				_presentationEpoch++;
+			}
+			return (host, _presentationEpoch);
 		}
 	}
 

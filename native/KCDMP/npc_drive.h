@@ -84,6 +84,9 @@ bool armed();
 uint8_t on_samples(const uint8_t* body, size_t len, rpmeasure::SampleScope reader);
 // Edge 0x39. One original Ghost/NpcStateDown body plus the Agent's receive QPC.
 uint8_t on_raw_pose(const uint8_t* body, size_t len, rpmeasure::SampleScope reader);
+// Edge 0x3C and 0x3D. Main thread, ordered with the action lane.
+uint8_t on_timed_pose(const uint8_t* body, size_t len, rpmeasure::SampleScope reader);
+uint8_t configure_timeline(uint8_t on);
 // 0x12: [ms:2][nameLen:1][name]
 uint8_t on_hold(const uint8_t* body, size_t len);
 // 0x13: [nativeOn:1][senderClockOn:1]

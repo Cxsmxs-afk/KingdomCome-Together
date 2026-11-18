@@ -8,6 +8,7 @@
 
 namespace kcdmp::t3stats {
 constexpr uint8_t kOp = 250;
+constexpr uint8_t kTimelineCommand = 4;
 constexpr size_t kMaxText = 6144, kMaxFields = 160;
 
 // Agent-origin numeric counters only: [role 1 host / 2 joiner][key=uint ...].

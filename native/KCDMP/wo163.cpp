@@ -94,6 +94,10 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
     switch (body[0]) {
         case t3stats::kOp: {
             if (len == 1) { *outLen = t3native::stats(out, cap); return *outLen ? kROk : kRFailed; }
+            if (len == 2 && body[1] == t3stats::kTimelineCommand) {
+                *outLen = t3native::timeline_stats(out, cap);
+                return *outLen ? kROk : kRFailed;
+            }
             if (len == 3 && body[1] == rpmeasure::kClockControl)
                 return rpmeasure::configure_clock(body[2]) ? kROk : kRBadRequest;
             if (!t3stats::valid(body + 1, len - 1)) return kRBadRequest;

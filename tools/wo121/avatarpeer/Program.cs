@@ -132,6 +132,7 @@ static partial class P
 
     private static async Task<int> RunAsync(string[] a, BotOptionsParsed? bot)
     {
+        uint SenderMs() => bot is null ? Ms() : unchecked((uint)PresentationClock.NowMs());
         string host = Arg(a, "--host", "127.0.0.1"); int port = int.Parse(Arg(a, "--port", "7778"));
         string name = bot?.Name ?? Arg(a, "--name", "wo121-peer");
         using var botTimeout = bot is null ? null : new CancellationTokenSource(bot.Duration);
@@ -215,6 +216,7 @@ static partial class P
         var recClock = Stopwatch.StartNew();
         byte[]? hostAppearance = null;   // WO-131: the last AppearanceDown classes (for `appearance mirror`)
         BodyState2Bits lastHostBits = BodyState2Bits.None;   // WO-135
+        var presentation = bot is null ? null : new BotPresentationClock(st);
         var reader = Task.Run(async () =>
         {
             try
@@ -222,6 +224,16 @@ static partial class P
                 while (!cts.IsCancellationRequested)
                 {
                     var (t2, b2) = await ReadPacket(st, cts.Token);
+                    if (presentation is not null)
+                    {
+                        if (await presentation.OnFrameAsync(t2, b2, cts.Token)) continue;
+                        if (t2 is Protocol.PresentationPoseDown or Protocol.PresentationActionDown)
+                        {
+                            if (!PresentationTimeWire.TryRead(t2, b2, out _, out byte inner, out int offset)) continue;
+                            t2 = inner;
+                            b2 = b2[offset..];
+                        }
+                    }
                     if (botContext is not null)
                     {
                         if ((t2 == Protocol.CombatRole && b2.Length == 1 && b2[0] != 0) ||
@@ -312,10 +324,17 @@ static partial class P
             catch when (bot is null) { }
         });
 
+        if (presentation is not null)
+        {
+            await presentation.NegotiateAsync(hard);
+            var probeBudget = Task.Delay(TimeSpan.FromSeconds(2), hard);
+            if (await Task.WhenAny(presentation.Initial, reader, probeBudget) == reader) await reader;
+            hard.ThrowIfCancellationRequested();
+        }
         var outbox = new ActionOutbox();
         uint lootTok = 0;   // WO-134
         var sw = Stopwatch.StartNew();
-        uint botStartMs = bot is null ? 0 : Ms();
+        uint botStartMs = bot is null ? 0 : SenderMs();
         float x = 0, y = 0, z = 0, yaw = 0, speed = 0, head = 0, moveDir = 0, zRate = 0;
         double moveUntil = -1, curveStart = -1, moveStart = -1;
         float curveFrom = 0, curveTo = 0;
@@ -349,6 +368,7 @@ static partial class P
         {
             hard.ThrowIfCancellationRequested();
             if (bot is not null && reader.IsCompleted) await reader;
+            if (presentation is not null) await presentation.RefreshAsync(hard);
             double t = sw.Elapsed.TotalSeconds, dt = t - lastT; lastT = t;
             // Live control: every line appended to the control file runs now.
             if (control is not null && t - lastPoll > 0.05)
@@ -420,23 +440,23 @@ static partial class P
                         if (f.Length > 1) jumpH = F(f[1]);
                         if (f.Length > 2) jumpDur = double.Parse(f[2], CultureInfo.InvariantCulture);
                         jumpT0 = t; zBase = z;
-                        await Emit(outbox.Build(ActionKind.Jump, ActionPhase.Commit, BitConverter.GetBytes(Ms())));
+                        await Emit(outbox.Build(ActionKind.Jump, ActionPhase.Commit, BitConverter.GetBytes(SenderMs())));
                         Console.WriteLine($"PEER t={t:F1} jump h={jumpH} dur={jumpDur}");
                         break;
                     case "attack":
                     {
-                        var ev = new AttackEvent(Ms(), 1, f.Length > 2 ? Zone(f[2]) : WireZone.UpperRight, 1, 0, Guid.Parse(f[1]));
+                        var ev = new AttackEvent(SenderMs(), 1, f.Length > 2 ? Zone(f[2]) : WireZone.UpperRight, 1, 0, Guid.Parse(f[1]));
                         await Emit(outbox.Build(ActionKind.Attack, ActionPhase.Commit, ev.ToBytes()));
                         Console.WriteLine($"PEER t={t:F1} attack {ev}");
                         break;
                     }
                     case "block_impulse":
                         await Emit(outbox.Build(ActionKind.BlockImpulse, ActionPhase.Commit,
-                            new RowEvent(Ms(), (byte)(f.Length > 2 && f[2] == "perfect" ? RowEvent.FlagPerfect : 0), Guid.Parse(f[1]), "").ToBytes()));
+                            new RowEvent(SenderMs(), (byte)(f.Length > 2 && f[2] == "perfect" ? RowEvent.FlagPerfect : 0), Guid.Parse(f[1]), "").ToBytes()));
                         Console.WriteLine($"PEER t={t:F1} block_impulse {f[1]}");
                         break;
                     case "dodge":
-                        await Emit(outbox.Build(ActionKind.Dodge, ActionPhase.Commit, new RowEvent(Ms(), 0, Guid.Parse(f[1]), "").ToBytes()));
+                        await Emit(outbox.Build(ActionKind.Dodge, ActionPhase.Commit, new RowEvent(SenderMs(), 0, Guid.Parse(f[1]), "").ToBytes()));
                         Console.WriteLine($"PEER t={t:F1} dodge {f[1]}");
                         break;
                     case "draw":
@@ -500,7 +520,7 @@ static partial class P
                         BinaryPrimitives.WriteSingleLittleEndian(rp.AsSpan(3), x); BinaryPrimitives.WriteSingleLittleEndian(rp.AsSpan(7), y);
                         BinaryPrimitives.WriteSingleLittleEndian(rp.AsSpan(11), z); rp[15] = 1;
                         await Emit(rp);
-                        await Emit(PositionCodec.BuildPosition(x, y, z, yaw, false, false, null, Ms()));
+                        await Emit(PositionCodec.BuildPosition(x, y, z, yaw, false, false, null, SenderMs()));
                         lastPos = t;
                         vitalsHp = 100; vitalsSt = 100; lastVitals = -9; vitalsFlags = 0;
                         Console.WriteLine(FormattableString.Invariant($"PEER t={t:F1} respawned at ({x:F1}, {y:F1}, {z:F1})"));
@@ -508,7 +528,7 @@ static partial class P
                     }
                     case "ranged" when botContext is not null:
                     {
-                        uint delay = (uint)ScheduledAgeMs(plannedHostMs, Ms());
+                        uint delay = (uint)ScheduledAgeMs(plannedHostMs, SenderMs());
                         if (delay > Protocol.RangedCaptureMaxAgeMs) throw new IOException("T4 ranged station missed its deadline.");
                         await Emit(BuildBotRanged(botContext.Host, botContext.World, botRangedEpoch, ++rangedSequence, BotRangedPhase(f[1]), bow, delay));
                         break;
@@ -605,7 +625,7 @@ static partial class P
                         BinaryPrimitives.WriteUInt16LittleEndian(hip.AsSpan(1), (ushort)(1 + hnb.Length));
                         hip[3] = (byte)hnb.Length; hnb.CopyTo(hip, 4);
                         await Emit(hip);
-                        await Emit(PositionCodec.BuildPosition(x, y, z, yaw, riding, false, null, Ms()));
+                        await Emit(PositionCodec.BuildPosition(x, y, z, yaw, riding, false, null, SenderMs()));
                         lastPos = t;
                         Console.WriteLine($"PEER t={t:F1} ride {(riding ? hn : "off")} (HorseInfo + the riding flag)");
                         break;
@@ -693,7 +713,7 @@ static partial class P
                 }
                 if (bot is not null)
                 {
-                    uint actual = Ms();
+                    uint actual = SenderMs();
                     Console.WriteLine(FormattableString.Invariant($"BOT-T4-STATION role=joiner station={step.F[0]} planned_host_ms={plannedHostMs} actual_host_ms={actual} schedule_lag_ms={ScheduledAgeMs(plannedHostMs, actual)}"));
                 }
             }
@@ -780,7 +800,7 @@ static partial class P
                 lastPos = t;
                 BodyState2? block = due ? s2 : null;
                 if (due) { lastSent = s2; lastSentT = t; }
-                await Emit(PositionCodec.BuildPosition(x, y, z, yaw, riding, false, block, Ms()));
+                await Emit(PositionCodec.BuildPosition(x, y, z, yaw, riding, false, block, SenderMs()));
             }
             if (t - lastPing > 2) { lastPing = t; var ping = new byte[11]; ping[0] = Protocol.Ping; BinaryPrimitives.WriteUInt16LittleEndian(ping.AsSpan(1), 8); await Emit(ping); }
             await Task.Delay(5, hard);

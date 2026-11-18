@@ -114,3 +114,31 @@ Beide Varianten mit neuem `KCDMP_RIG_RUN` und frisch gestartetem Relay für `--n
 3. Pro Abschlusszeile 120 Frames, 3.600 erledigte Echtzeit- und 6.000 geordnet erledigte Bulk-Aufträge zählen. Die Echtzeitspur soll unter gleichzeitiger Last Vorrang haben. Ihre Wartezeit p95 bleibt unter 34 ms.
 4. Neu verbinden und mit dem Relay-Testplan für 150 ms plus Jitter wiederholen. Beide Henrys sollen während der Messung weiterlaufen und zuverlässig eintreffende Aktionen zeigen.
 5. Beide LogPack-Bundles sammeln. `proc_awaits_per_frame_max`, `http_calls_rt` und `owner_violations` prüfen. Pipe-Busy, In-Process-Fallbacks und Agent-Hop mit den Stichprobenzahlen festhalten.
+
+## s2-4 · Gemeinsame Zeitleiste für Bewegung und Schlag
+
+Beide Henrys in einem Wegwerfstand auf einer freien, ebenen Fläche verbinden. `mp_rp_timeline` steht standardmäßig auf `on`. `timeline` fordert den Sender im Terminal auf, mit gezogener Waffe mindestens zwei Meter zu gehen und anschließend einen normalen Schlag auszuführen. Der Empfänger bleibt in Sichtweite. `--sender host` wechselt die Richtung. Der Test ordnet die gesendete Aktion über Relay-ID, ursprünglichen Sender-Zeitstempel, Sequenz und Host-Zeit derselben Empfängerfigur zu.
+
+```powershell
+$env:KCDMP_TEST_TIMELINE = '1'
+$env:KCDMP_RIG_RUN = 'timeline-normal'
+python tools/rig/pair.py relay --netz normal
+python tools/rig/scenarios.py timeline --test-timeline --netz normal
+```
+
+Für den Bot-Lauf nur Relay und geladenen Host starten. Der T4 Bot-Joiner kalibriert seine Uhr mit dem Relay und sendet drei Bewegungs- und Schlagfolgen. `--attack-row` kann eine andere passende Schlagzeile wählen. Jede Wertermittlung braucht die von der Empfänger-DLL bestätigte Installation der Aktion sowie den Host-Zeitstempel der tatsächlich angewendeten Pose.
+
+```powershell
+$env:KCDMP_TEST_BOT = '1'
+python tools/rig/scenarios.py timeline --test-timeline --netz normal --bot
+```
+
+Beide Varianten mit neuem `KCDMP_RIG_RUN` und einem frisch gestarteten Relay für `--netz schlecht` wiederholen. `timeline.json` enthält die erfassten Schläge, die zugehörigen nativen Pose-Zeitstempel sowie p95 der absoluten Zeitdifferenzen. Grün liegt unter 20 ms, gelb unter 50 ms, rot ab 50 ms. Fehlende Uhr- oder Installationsbelege bleiben grau. Der Test erwartet grün, vollständige Abdeckung der angeforderten Schläge und `owner_violations=0`. Der Puffer bleibt bei 60–120 ms, Extrapolation bei höchstens 200 ms. Verspätete Proben erscheinen als `rp_late_samples`. Die sichtbare Animationsphase bleibt im Spiel zu prüfen.
+
+### Zwei-PC-Checkliste
+
+1. Auf beiden PCs denselben Build laden und verbinden. Beide Partnerfiguren stehen auf ebener Fläche in Sichtweite.
+2. Der Joiner geht mit gezogener Waffe und schlägt unmittelbar danach. Den Vorgang mehrmals wiederholen und den Übergang auf dem Host beobachten.
+3. Der Host wiederholt die Folge als Sender. Bei wechselnder Netzqualität auf weiches Halten und sichtbare Sprünge achten.
+4. Den Lauf mit 150 ms plus Jitter wiederholen. Beide LogPack-Bundles sammeln. Pro `installed`-Schlag Figuren-ID, Host-Zeit und die zugehörige Pose prüfen.
+5. `rp_action_pos_skew_ms_p95`, Stichproben, Puffer und Extrapolation ablesen. Fehlende Proben festhalten und auf beiden Seiten `owner_violations=0` prüfen.

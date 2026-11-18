@@ -66,6 +66,8 @@ int t3_native_stats_tests(int* passed);
 int rp_measure_tests(int* passed);
 int holder_contract_tests(int* passed);
 int edge_lanes_tests(int* passed);
+int rp_timeline_tests(int* passed);
+int rp_timeline_action_tests(int* passed);
 int edge_console_tests(int* passed);
 int p4_rules_review_tests(int* passed); // independent P4 boundary review
 int p4_flow_tests(int* passed); // actual p4.cpp with engine/clock test doubles
@@ -473,6 +475,8 @@ int main() {
     { int pp = 0; const int pf = rp_measure_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = holder_contract_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = edge_lanes_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = rp_timeline_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = rp_timeline_action_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = edge_console_tests(&pp); g_pass += pp; g_fail += pf; }
     {
         int pp = 0;

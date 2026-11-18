@@ -39,6 +39,7 @@
 #include "main_thread.h"
 #include "mannequin_read.h"
 #include "npc_drive.h"
+#include "rp_timeline_actions.h"
 #include "combat_write.h"
 #include "pipe_server.h"
 #include "respawn.h"
@@ -183,6 +184,7 @@ DWORD WINAPI plugin_main(LPVOID) {
         // WO-118: the native per-frame puppet write. Anchors fail closed
         // (WO118-NATIVE native_write=DISARMED): Lua then writes as before.
         kcdmp::npcdrive::install();
+        kcdmp::main_thread::post_repeating("rp_timeline_actions::tick", &kcdmp::timelineactions::tick);
         // WO-121: movement and combat on the writer's bodies, the committed-
         // action capture, and the combat-hit chokepoint. Each piece fails
         // closed on its own (WO121-MOTION / WO121-HITS lines).

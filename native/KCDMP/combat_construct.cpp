@@ -62,6 +62,7 @@
 #include "log.h"
 #include "motion.h"
 #include "npc_drive.h"
+#include "rp_timeline_actions.h"
 #include "wo167_rules.h"
 #include "wo202.h"
 #include "wo202_rules.h"
@@ -826,7 +827,8 @@ static std::optional<holders::Permit> begin_death_pose(uint32_t eid) {
     return std::optional<holders::Permit>(std::move(permit));
 }
 
-SwingResult ghost_swing(uint32_t entityId, const char* fragSpec) {
+SwingResult ghost_swing(uint32_t entityId, const char* fragSpec, uint64_t timelineToken, bool* watching) {
+    if (watching) *watching = false;
     if (!fragSpec || !fragSpec[0] || std::strlen(fragSpec) > 191) {
         logf("SWING: rejected -- missing/oversized fragment spec");
         return SwingResult::BadSpec;
@@ -986,7 +988,8 @@ SwingResult ghost_swing(uint32_t entityId, const char* fragSpec) {
     read_u32(anim, 0x58, &refc);
     // WO-167 C3: our reference goes to the swing watch (dropped there once the action was installed, or never was); with the watch
     // off it is dropped here as before. refc includes it, so the controller's view is refc-1.
-    const bool watched = swing_watch_take(entityId, anim);
+    const bool watched = swing_watch_take(entityId, anim, timelineToken);
+    if (watching) *watching = watched;
     swing_keep_last(entityId, anim);   // WO-202 IV.1: one reference of ours until the next swing (or kLastSwingKeepS)
     if (!watched) call_release(anim);
     logf("SWING: entity=%u queued fragment %d status=%u ref(controller)=%u%s spec=\"%s\"",
@@ -1110,7 +1113,7 @@ bool stop_action(void* action) {
 // own virtual. The last result per body is what the agent asks before it counts the swing as shown. Main thread only. Any fault
 // switches the watch off for the session (every held reference dropped, the site logged; the agent says it on screen once).
 namespace {
-struct SwingWatch { uint32_t eid = 0; void* anim = nullptr; double t0 = 0; bool seen = false; };
+struct SwingWatch { uint32_t eid = 0; void* anim = nullptr; double t0 = 0; bool seen = false; uint64_t timelineToken = 0; };
 struct SwingLast { wo167rules::Seen seen = wo167rules::Seen::None; double at = 0; float waitS = 0; };
 std::vector<SwingWatch> g_watches;                       // main thread
 std::unordered_map<uint32_t, SwingLast> g_swingSeen;      // main thread
@@ -1139,11 +1142,15 @@ void w_switch_off(const char* site) {
     g_watchFaultSite = site;
     c_wFaults.fetch_add(1);
     logf("WO167-SHOWN switched OFF for the session -- a fault at %s (every queued swing counts as shown again, as in 0.48.2)", site);
-    for (auto& w : g_watches) if (w.anim) w_release(w.anim);   // a release that faults again leaks one action: never a crash
+    for (auto& w : g_watches) {
+        if (w.timelineToken) timelineactions::observed(w.timelineToken, false);
+        if (w.anim) w_release(w.anim);   // a release that faults again leaks one action: never a crash
+    }
     g_watches.clear();
 }
 
 void w_resolve(SwingWatch& w, wo167rules::Seen s, double now) {
+    if (w.timelineToken) timelineactions::observed(std::exchange(w.timelineToken, 0), s == wo167rules::Seen::Installed);
     if (!w_release(w.anim)) { w_switch_off("wo167::watch_release"); return; }
     w.anim = nullptr;
     (s == wo167rules::Seen::Installed ? c_wInstalled : c_wNever).fetch_add(1);
@@ -1152,8 +1159,8 @@ void w_resolve(SwingWatch& w, wo167rules::Seen s, double now) {
 }
 } // namespace
 
-bool swing_watch_take(uint32_t eid, void* anim) {
-    if (!g_watchOn.load(std::memory_order_relaxed) || g_watchFaulted.load(std::memory_order_relaxed) || !anim) return false;
+bool swing_watch_take(uint32_t eid, void* anim, uint64_t timelineToken) {
+    if ((!timelineToken && !g_watchOn.load(std::memory_order_relaxed)) || g_watchFaulted.load(std::memory_order_relaxed) || !anim) return false;
     const double now = w_now();
     if (g_watches.size() >= wo167rules::kMaxWatches) {   // the oldest first: it had its chance
         SwingWatch& old = g_watches.front();
@@ -1164,7 +1171,7 @@ bool swing_watch_take(uint32_t eid, void* anim) {
         g_watches.erase(g_watches.begin());
         c_wEvicted.fetch_add(1);
     }
-    g_watches.push_back(SwingWatch{ eid, anim, now, false });
+    g_watches.push_back(SwingWatch{ eid, anim, now, false, timelineToken });
     SwingLast& l = g_swingSeen[eid];
     l.seen = wo167rules::Seen::Pending; l.at = now; l.waitS = 0;
     c_wTaken.fetch_add(1);
