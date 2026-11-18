@@ -27,3 +27,9 @@ Für den zweiten Lauf ein frisches Relay mit dem Profil `schlecht` starten und `
 | `dmg_double` | T3-Zähler beider Seiten, muss null bleiben. Grün braucht eine belegte Blockierung im aktuellen Messfenster und null ungeklärte Schadensfälle. |
 
 Das Rig verbindet gesendete Aktionen mit Agent-Quittung und der nativen `installed`-Meldung für dieselbe Figur und denselben Lauf. Ein Queue-Eintrag reicht dafür nicht aus. Die Bildprüfung bleibt grau, bis ein Beobachter auf der Empfängerseite die Pose sieht. Für die Schadensabnahme im Spiel zusätzlich die tatsächliche Lebens- und Ausdaueränderung pro Treffer prüfen. Der untere native Trefferpfad liefert derzeit keine Bestätigung pro angewendetem Treffer, daher reicht `dmg_double=0` allein dafür nicht aus. Reale Messwerte für diese Lane und der Spielnachweis stehen aus. [Nativer Damage-Guard](../native/KCDMP/hits.cpp)
+
+## N2 · Griffe und Konter
+
+**Grau · Engine-Einstieg für Spielerpaare unbestätigt.** `codex/lane2-nahkampf-grabs` baut auf N1 auf und dokumentiert den Befund. WO-197 fand `StartSyncGuard`, die Engine wies den Aufruf auf zwei Puppets jedoch in allen Versuchen ab. Die dort beobachteten einzelnen Reaktionszeilen betrafen NPC-/Figurenpaare. Der Einstieg aus WO-209 war für die Kombination aus NPC-Kopie und lokalem Spieler gebaut. Auf dem Prüfstand trat für diese Kombination kein Clinch auf. WO-210 dokumentiert, dass die Abnahme einer Paaraktion auf beiden Bildschirmen offen blieb. [WO-197](WO-197-findings.md) · [WO-209](WO-209-findings.md) · [WO-210](WO-210-findings.md)
+
+`melee_grab_shown` ist ungemessen. Der Abnahmebeleg wäre ein echter Griff mit beobachtetem Einstieg, Bewegung und sauberem Ende für beide Spieler, in beiden Rollenrichtungen. Der dokumentierte Hinweis zu Griffen mit den Leuten des Hosts gilt weiter. [KNOWN-ISSUES](KNOWN-ISSUES.md#fights)
