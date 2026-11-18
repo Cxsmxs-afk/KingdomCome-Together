@@ -4812,7 +4812,7 @@ public partial class GameBridge(ClientConfig config)
                 await ReadExactAsync(stream, payload, ct);
                 ct.ThrowIfCancellationRequested();
                 long arrival   = Stopwatch.GetTimestamp();
-                RecordRelayRead(header, payload);
+                byte[] wirePayload = payload;
                 int wireBytes  = payloadLen + 3;
                 if (!PresentationReadFrame(presentationSession, ref type, ref payload, arrival, out var presentation, ct)) continue;
                 long p6ReadTick = Environment.TickCount64;
@@ -4824,6 +4824,7 @@ public partial class GameBridge(ClientConfig config)
                 long p6Deadline = p6Frame ? p6ReadTick + Protocol.MeasuredMissileApplyBudgetMs : 0;
                 long markerPeer = P5PeerAtRead(type, payload);
                 P6NoteVisualAtRead(type, payload);
+                if (_sessionRecorder is not null) RecordRelayRead(header, wirePayload);
                 if (type == Protocol.NpcStateQDown)   // WO-213 D.3: the relay's compact NPC state, back to the 0x27 payload everything below reads
                 {
                     if (Wo213Expand(payload) is not { } full) { Wo213NoteIn(type, payload, arrival, wireBytes); continue; }
