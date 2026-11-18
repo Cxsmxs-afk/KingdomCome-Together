@@ -142,9 +142,12 @@ public class Wo203W164FitTests
         for (int i = 0; i < conv.Length; i++) Assert.Equal(conv[i], Protocol.ConvKindName((byte)(i + 1)));
         Assert.Equal("unknown-15", Protocol.ConvKindName(15));
         Assert.Equal((byte)13, Protocol.ConvTimer);
-        string[] w203 = { "defence-swing", "defence-outcome", "guard-state", "engage-early", "npc-worn", "npc-pose", "join-progress", "focus-edge", "travel-route" };
+        string[] w203 = { "defence-swing", "defence-outcome", "guard-state", "engage-early", "npc-worn", "npc-pose", "join-progress", "focus-edge", "travel-route",
+            "digest-checkpoint", "epoch", "figure-hand", "tp-snapshot-request", "tp-snapshot-response" };
         for (int i = 0; i < w203.Length; i++) Assert.Equal(w203[i], Protocol.W203KindName((byte)(i + 1)));
-        Assert.Equal("unknown-13", Protocol.W203KindName(13));   // WO-206: 10 the digest checkpoint, 11 the epochs; WO-214: 12 the figure's hand
+        Assert.Equal((byte)13, Protocol.W203TpSnapshotRequest);
+        Assert.Equal((byte)14, Protocol.W203TpSnapshotResponse);
+        Assert.Equal("unknown-15", Protocol.W203KindName(15));
         Assert.Equal(10, Protocol.Version);   // no bump: new types on the join channel
     }
 }
