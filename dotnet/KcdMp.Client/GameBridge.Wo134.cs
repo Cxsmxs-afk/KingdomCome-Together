@@ -73,7 +73,7 @@ public partial class GameBridge
     private void Wo134OnConnect(CancellationToken ct)
     {
         _w134Connected = true;
-        if (!_w134LedgerLinkHeld || !_w211Holding || _w206.World != _w134LedgerLinkWorld) Wo134ResetLedgerGeneration();
+        if (!_w134LedgerLinkHeld || !LinkHeld || _w206.World != _w134LedgerLinkWorld) Wo134ResetLedgerGeneration();
         _w134Worn.Clear();
         _ = Wo134LoopAsync(ct);
     }
@@ -81,7 +81,7 @@ public partial class GameBridge
     private async Task Wo134OnDisconnectAsync()
     {
         _w134Connected = false;
-        if (_w211Holding)
+        if (LinkHeld)
         {
             _w134LedgerLinkWorld = _w206.World;
             _w134LedgerLinkHeld = true;
@@ -106,7 +106,7 @@ public partial class GameBridge
                 bool shared = joiner ? JoinerSharedEffective : _sharedWorld;
                 int peers = LivePartners().Count;   // WO-144
                 await _transport.ExecuteNowAsync($"if KCD2MP_W134Tick then KCD2MP_W134Tick({B(joiner)}, {B(host)}, {B(shared)}, {peers}) end");
-                if (_w134LedgerLinkHeld && !_w211Holding && HostAuthorityOwned && _w206.World == _w134LedgerLinkWorld)
+                if (_w134LedgerLinkHeld && !LinkHeld && HostAuthorityOwned && _w206.World == _w134LedgerLinkWorld)
                 {
                     await _transport.ExecuteNowAsync("if KCD2MP_W134LedgerLinkHold then KCD2MP_W134LedgerLinkHold(false) end");
                     _w134LedgerLinkHeld = false;
@@ -560,14 +560,14 @@ public partial class GameBridge
         await Wo134SendLedgerWorkAsync(work);
     }
 
-    private bool Wo134LedgerCurrent(LedgerWork work) => _w134Connected && W137Joiner && HostAuthorityOwned && !_ownLoadExpected && !_loadGraceOwn && _w206.World == work.World
+    private bool Wo134LedgerCurrent(LedgerWork work) => _w134Connected && W137Joiner && HostAuthorityOwned && !OwnLoadExpected && !LoadGraceOwn && _w206.World == work.World
         && _joinedTag == work.Tag && work.Generation == Interlocked.Read(ref _w134LedgerGeneration);
 
     private async Task Wo134SendLedgerWorkAsync(LedgerWork work)
     {
         try
         {
-            if (_where != GameWhere.World || Wo136Holding || _w211Holding || _w134LedgerLinkHeld) return;
+            if (_where != GameWhere.World || Wo136Holding || LinkHeld || _w134LedgerLinkHeld) return;
             if (!Wo134LedgerCurrent(work))
             {
                 lock (_w134Gate) if (ReferenceEquals(_w134LedgerPending, work)) _w134LedgerPending = null;
@@ -591,7 +591,7 @@ public partial class GameBridge
             }
             while (work.Next < work.Calls.Count)
             {
-                if (_where != GameWhere.World || Wo136Holding || _w211Holding || _w134LedgerLinkHeld) return;
+                if (_where != GameWhere.World || Wo136Holding || LinkHeld || _w134LedgerLinkHeld) return;
                 if (!Wo134LedgerCurrent(work)) return;
                 // Stable epoch/serial/part makes a transport retry idempotent even
                 // when the game accepted the previous HTTP request before its reply was lost.

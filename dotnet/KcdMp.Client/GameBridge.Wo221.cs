@@ -278,6 +278,7 @@ public partial class GameBridge
                 int eq = (arg ?? "").IndexOf('=');
                 if (eq <= 0 || arg![(eq + 1)..] is not ("on" or "off") || !W221Switch.Names.Contains(arg[..eq])) { Console.WriteLine($"MP-W221 cfg refused: '{arg}'"); return; }
                 _w221On[arg[..eq]] = arg[(eq + 1)..] == "on";
+                if (arg[..eq] == "load_sequence") _ = LoadSequenceSyncNativeAsync();
                 Console.WriteLine($"MP-W221 cfg {arg}");
                 _ = Wo221PushNativeAsync();
                 _ = Wo221TellModAsync();

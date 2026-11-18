@@ -112,7 +112,7 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
 using FrameFn = void (*)(uint8_t type, const uint8_t* body, uint16_t len);
 void set_frame_callback(FrameFn fn);   // 0xA0 / 0xA1 go out through it
 
-void on_pipe_closed();   // any thread: sender off, gate off, hold off
+void on_pipe_closed(bool releaseLegacyHold = true);   // any thread: sender off, gate off, hold off
 
 // WO-151 3.8: the host's world held for a whole join -- the engine's own PauseGame from the
 // ScriptBind source (2: idle on this build, never declined by the levers), at most maxS seconds

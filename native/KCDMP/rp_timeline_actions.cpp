@@ -7,6 +7,7 @@
 #include "engine.h"
 #include "hits.h"
 #include "log.h"
+#include "load_sequence.h"
 #include "motion.h"
 #include "npc_drive.h"
 #include "p4.h"
@@ -82,7 +83,7 @@ rpcombat::Counts g_combat;
 rpmeasure::detail::Histogram g_actionLag, g_koLag;
 
 Scope scope_now() {
-    return {wo216::lifecycle_observation_stamp(), pipe::observation_connection(), p4::life_edge_tick()};
+    return {wo216::lifecycle_observation_stamp(), pipe::observation_connection(), p4::life_edge_tick(), loadsequence::stamp()};
 }
 
 uint64_t elapsed(uint64_t start, uint64_t now) { return start <= now ? now - start : 0; }
@@ -130,6 +131,7 @@ void forget_pending(uint32_t eid, Body& body, const char* reason, bool keepWake 
 Scope synchronize() {
     const auto scope = scope_now();
     if (!(g_scope == scope)) {
+        if (loadsequence::old_generation(g_scope.load, scope.load)) loadsequence::note_stale(g_pending);
         reset();
         g_scope = scope;
     }
@@ -376,8 +378,8 @@ Receipt submit_combat(const uint8_t* bytes, size_t size, Scope received, uint64_
 
 void tick() {
     const Scope scope = synchronize();
+    if (!scope.connection || !loadsequence::allows(scope.load, loadsequence::Access::Live)) return;
     wo131::rp_knockout_tick();
-    if (!scope.connection) return;
     const uint64_t now = GetTickCount64();
     for (auto it = g_observing.begin(); it != g_observing.end();) {
         const auto& watched = it->second;

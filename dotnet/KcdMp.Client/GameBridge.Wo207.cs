@@ -152,6 +152,8 @@ public partial class GameBridge
         {
             await foreach (var f in lane.ReadAllAsync(ct))
             {
+                if (!LoadSequenceFrameCurrent(f) || (LoadSequenceEnabled && Wo136Defer(f))) continue;
+                using var loadLife = LoadSequenceLink(f, ct);
                 if (Wo140DropSeparate(f.Type)) continue;   // WO-140: a joiner in its own world
                 Interlocked.Increment(ref _w207ConvLaneFrames);
                 long wait = (Stopwatch.GetTimestamp() - f.Arrival) * 1000 / Stopwatch.Frequency;
@@ -162,7 +164,7 @@ public partial class GameBridge
                 bool cam = W213On("link_sched") && LinkKinds.Of(f.Type, f.Payload) == "conv:" + Protocol.ConvCam;
                 CombatPipe.Priority.Value = cam;
                 Wo207Trace.Kind.Value = !cam && W207("conv_pipe_first") ? Wo207Trace.ConvKind : 0;
-                try { await Wo123OnFrameAsync(f.Type, f.Payload, ct); }
+                try { await Wo123OnFrameAsync(f.Type, f.Payload, loadLife?.Token ?? ct); }
                 catch (Exception ex) { Console.WriteLine($"MP-W207 conv lane: a frame failed: {ex.GetType().Name}: {ex.Message}"); }
             }
         }
@@ -182,6 +184,8 @@ public partial class GameBridge
         {
             await foreach (var f in lane.ReadAllAsync(ct))
             {
+                if (!LoadSequenceFrameCurrent(f) || (LoadSequenceEnabled && Wo136Defer(f))) continue;
+                using var loadLife = LoadSequenceLink(f, ct);
                 if (Wo140DropSeparate(f.Type)) continue;   // WO-140: a joiner in its own world
                 Volatile.Write(ref _w218ActAtMs, W147StampMs(f.Arrival));   // WO-218: the lane's age (act_lag_ms)
                 Interlocked.Increment(ref _w207ActLaneFrames);
@@ -189,14 +193,14 @@ public partial class GameBridge
                 if (wait > Interlocked.Read(ref _w207ActLaneMaxWaitMs)) Interlocked.Exchange(ref _w207ActLaneMaxWaitMs, wait);
                 if (W218On("pipe_batch") && _combat.BatchActive)   // WO-218 A.1: every waiting frame at once, coalesced, the bodies together
                 {
-                    try { await Wo218ActivityBatchAsync(f, lane, ct); }
+                    try { await Wo218ActivityBatchAsync(f, lane, loadLife?.Token ?? ct); }
                     catch (Exception ex) { Console.WriteLine($"MP-W218 activity lane: a batch failed: {ex.GetType().Name}: {ex.Message}"); }
                     if (lane.CanCount && lane.Count == 0) Volatile.Write(ref _w218ActAtMs, 0);
                     continue;
                 }
                 Wo207Trace.Kind.Value = f.Type;
                 long t0 = Stopwatch.GetTimestamp();
-                try { await Wo123OnFrameAsync(f.Type, f.Payload, ct); }
+                try { await Wo123OnFrameAsync(f.Type, f.Payload, loadLife?.Token ?? ct); }
                 catch (Exception ex) { Console.WriteLine($"MP-W207 activity lane: a frame failed: {ex.GetType().Name}: {ex.Message}"); }
                 Wo207Trace.Frame(f.Type, wait, (Stopwatch.GetTimestamp() - t0) * 1000 / Stopwatch.Frequency);
                 Wo207Trace.Kind.Value = 0;

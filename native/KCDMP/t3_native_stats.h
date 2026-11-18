@@ -4,6 +4,7 @@
 #include "edge_lanes.h"
 #include "holders.h"
 #include "hits.h"
+#include "load_sequence.h"
 #include "p4.h"
 #include "wo216.h"
 #include "respawn_actions.h"
@@ -70,5 +71,14 @@ inline size_t combat_stats(uint8_t* out, size_t cap) {
                                damage.blocked, damage.doubleApplied, combat.ko_up_lag_ms_p95, combat.ko_up_n,
                                damage.unconfirmed};
     return write_combat(out, cap, counts);
+}
+
+inline size_t load_stats(uint8_t* out, size_t cap) {
+    const auto load = loadsequence::snapshot();
+    const uint64_t counts[] = {load.world_gen, load.load_phase,
+                              load.phase_ms[0], load.phase_ms[1], load.phase_ms[2], load.phase_ms[3],
+                              load.phase_ms[4], load.phase_ms[5], load.phase_ms[6],
+                              load.stale_gen_dropped, load.observations};
+    return write_load(out, cap, counts);
 }
 } // namespace kcdmp::t3native

@@ -3987,6 +3987,9 @@ def run(name, args):
     if name in ('rpfight', 'rpdown', 'rpbow'):
         import scen_s2_combat
         return scen_s2_combat.run(sys.modules[__name__], name, args)
+    if name in ('reload', 'weatherload'):
+        import scen_s3_load
+        return scen_s3_load.run(sys.modules[__name__], name, args)
     r = Run(name, include_joiner=name != 'botjoiner')
     plan = {
         'join': [('join', s_join(r))],

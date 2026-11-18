@@ -107,6 +107,17 @@ int t3_native_stats_tests(int* passed) {
     for (size_t i = 0; i < kcdmp::t3native::kCombatFields; ++i)
         check(combat[2 + 9*i] == i && kcdmp::p4rules::u64(combat.data() + 3 + 9*i) == combatCounts[i],
             "combat page preserves the exact native playback, damage and confirmation values");
+    std::array<uint8_t, 102> load;
+    load.fill(0xDC);
+    const auto untouchedLoad = load;
+    const uint64_t loadCounts[] = {23, 5, 11, 22, 333, 444, 555, 666, 0, 3, 9};
+    check(kcdmp::t3native::write_load(load.data(), 100, loadCounts) == 0 && load == untouchedLoad,
+        "load short reply is untouched");
+    check(kcdmp::t3native::write_load(load.data(), load.size(), loadCounts) == 101 &&
+        load[0] == 1 && load[1] == 11 && load[101] == 0xDC, "load is a separate 101-byte page");
+    for (size_t i = 0; i < kcdmp::t3native::kLoadFields; ++i)
+        check(load[2 + 9*i] == i && kcdmp::p4rules::u64(load.data() + 3 + 9*i) == loadCounts[i],
+            "load page preserves generation, seven phase durations, stale drops and observation coverage");
     p6 = base;
     check(kcdmp::t3native::append_rp_measure(p6.data(), 272, 424, measure) == 0 && p6 == base,
         "short replies cannot contain partial measurement coverage");

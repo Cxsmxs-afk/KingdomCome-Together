@@ -43,6 +43,11 @@ public static class T3NativeCounters
         "rp_actions_in", "rp_actions_played", "rp_actions_pending", "rp_action_lag_ms_p95", "rp_action_confirmed_n",
         "dmg_double_blocked", "dmg_double", "rp_ko_up_lag_ms_p95", "rp_ko_up_n", "dmg_double_unconfirmed"
     ];
+    private static readonly string[] LoadKeys = [
+        "load_native_gen", "load_phase_native", "load_native_phase_ms_menu", "load_native_phase_ms_offer",
+        "load_native_phase_ms_load", "load_native_phase_ms_reconstruct", "load_native_phase_ms_settle",
+        "load_native_phase_ms_play", "load_native_phase_ms_exit", "stale_gen_native_dropped", "load_native_observations"
+    ];
 
     private static bool TryReadFields(ReadOnlySpan<byte> payload, string[] keys, Span<bool> seen, out Dictionary<string, long> values)
     {
@@ -93,6 +98,10 @@ public static class T3NativeCounters
     /// <summary>Playback counts and their confirmed observation counts share one Op250 page.</summary>
     public static bool TryReadCombat(ReadOnlySpan<byte> payload, out Dictionary<string, long> values) =>
         TryReadPage(payload, CombatKeys, out values);
+
+    /// <summary>Measures the typed phase and frame guard as observed by the DLL.</summary>
+    public static bool TryReadLoad(ReadOnlySpan<byte> payload, out Dictionary<string, long> values) =>
+        TryReadPage(payload, LoadKeys, out values) && values["load_phase_native"] <= 7;
 
     private static bool TryReadPage(ReadOnlySpan<byte> payload, string[] keys, out Dictionary<string, long> values)
     {

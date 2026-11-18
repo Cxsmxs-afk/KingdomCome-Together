@@ -23,6 +23,7 @@
 #include "p6_render_rules.h"
 #include "rp_measure.h"
 #include "rp_timeline_actions.h"
+#include "load_sequence.h"
 #include "respawn_actions.h"
 #include "npc_drive.h"
 #include "motion.h"
@@ -60,6 +61,9 @@
 #include "wo206.h"
 #include "wo218_rules.h"
 #include "wo221.h"
+#include "wo200.h"
+#include "wo197.h"
+#include "wo173.h"
 #include "log.h"
 
 #include <windows.h>
@@ -463,7 +467,7 @@ bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) 
     if (!decode(outer, request)) return reject(Status::Invalid);
     const uint8_t nested = request.frame.type;
     const bool lifecycle = nested == kWo163 && !request.frame.body.empty() &&
-                           (request.frame.body[0] == wo216::kOpLifecycle ||
+                           (request.frame.body[0] == wo216::kOpLifecycle || request.frame.body[0] == loadsequence::kOp ||
                             request.frame.body[0] == pipecontrol::kEdgeCapabilities);
     const bool latest = nested == kSetPartner || nested == kReadBodyState || nested == kReadLocalState;
     const bool presentation = nested == kTimedAction || nested == kTimedPose || nested == kTimelineConfig ||
@@ -581,10 +585,82 @@ void edge_probe_work(const edgelanes::Request& request, bool rt) {
     edge_probe_maybe_finish();
 }
 
+using LoadAccess = loadsequence::Access;
+constexpr uint8_t kLoadRefused = 20;
+thread_local uint64_t t_loadStamp = 0;
+thread_local LoadAccess t_loadAccess = LoadAccess::Read;
+
+LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
+    const uint8_t op = n ? body[0] : 0;
+    switch (type) {
+        case kApplyDamage: case kApplyDeath: case kSetFactionHostile: case kGhostSwing:
+        case kAvatarEvent: case kAttributedDamage: case kApplyPvpHit: case kNpcHold:
+        case kNpcSamples: case kLeashSample: case kSetPartner:
+        case edgelanes::kRawPose: case edgelanes::kTimedPose: case edgelanes::kTimedAction:
+        case edgelanes::kRemoteRelocation: case edgelanes::kCombatEvent: case edgelanes::kCombatRow:
+            return LoadAccess::Live;
+        case kJoinPlace: case kGhostIsolate: case kMirrorGrave:
+            return LoadAccess::Setup;
+        case kNpcBind:
+            return op ? LoadAccess::Setup : LoadAccess::Control;
+        case kSetSession: case kSetRespawn: case kJoinGuard: case kMotionConfig:
+        case kHitsConfig: case kNpcConfig: case edgelanes::kTimelineConfig:
+            return LoadAccess::Control;
+        case kWo131:
+            if (op == wo131::kOpCopyGuard) return n > 1 && body[1] >= wo131::kGuardKnockout ? LoadAccess::Live : LoadAccess::Setup;
+            return op == wo131::kOpFollowHp || op == wo131::kOpPlayerCrouch ? LoadAccess::Live : LoadAccess::Control;
+        case kWo132:
+            return op == wo132::kOpEngage || op == wo132::kOpAvatarSwing || op == wo132::kOpHostThreat ||
+                   op == wo132::kOpPlayerFight || op == wo132::kOpHandOver ? LoadAccess::Live : LoadAccess::Control;
+        case kWo137:
+            return op == wo137::kOpApply || op == wo137::kOpSetValue ? LoadAccess::Live : LoadAccess::Control;
+        case kWo138:
+            return LoadAccess::Control;
+        case kWo139:
+            return op == wo139::kOpPursue ? LoadAccess::Live : LoadAccess::Control;
+        case kWo140:
+            if (op == wo140::kOpCalendarFollow) {
+                // Mode 2 arms the validated calendar follower before the
+                // save command. Mode 0 clears it; neither applies a clock.
+                if (n > 1 && (body[1] == 0 || body[1] == 2)) return LoadAccess::Control;
+                if (n > 1 && body[1] == 3) return LoadAccess::Read;
+                return LoadAccess::Setup;
+            }
+            return op == wo140::kOpPull ? LoadAccess::Live : LoadAccess::Control;
+        case kWo141:
+            return op == wo141::kOpApply || op == wo141::kOpShow || op == wo141::kOpSweep ? LoadAccess::Live : LoadAccess::Control;
+        case kWo143:
+            // Hands, gaits, one-shot, looks and minigame hold. Controls and
+            // stream reset use their existing, separately acknowledged ops.
+            return op == 2 || op == 3 || op == 4 || op == 8 || op == 9 ? LoadAccess::Live : LoadAccess::Control;
+        case kWo147:
+            return LoadAccess::Control;
+        case kWo151:
+            return op == wo151::kOpCopyFight ? LoadAccess::Live : LoadAccess::Control;
+        case kWo163:
+            return op == wo163::kOpReplay || op == wo163::kOpSkirmishPair ||
+                   op == wo173::kOpRealHit || op == wo197::kOpPair || op == wo197::kOpSyncGuard ||
+                   op == wo197::kOpEnsureGuard || op == wo187::kOpOpponent || op == wo187::kOpGuardHold ||
+                   op == wo200::kOpReplay || op == wo216::kOpRouteIn ? LoadAccess::Live : LoadAccess::Control;
+        default:
+            return LoadAccess::Read;
+    }
+}
+
+bool load_allows(uint8_t type, const uint8_t* body, size_t n, uint64_t stamp, LoadAccess access) {
+    if (!loadsequence::allows(stamp, access)) return false;
+    // Off-main lifecycle control cannot be smuggled through Bulk/batches.
+    if (type == kWo163 && n && body[0] == loadsequence::kOp) return false;
+    // The old WO-151 join hold remains the actuator's direct caller only in
+    // compatibility mode. The native sequence now owns the verified lease.
+    return type != kWo151 || !n || body[0] != wo151::kOpJoinHold ||
+           loadsequence::gate(loadsequence::stamp()) == loadsequence::Gate::Legacy;
+}
+
 struct PendingBatch {
     uint16_t id = 0;
     uint64_t gen = 0;
-    uint64_t calendarEpoch = 0;
+    uint64_t calendarEpoch = 0, loadStamp = 0;
     p6render::Stamp renderStamp;
     std::vector<uint8_t> raw;
     std::vector<wo218rules::Sub> subs;
@@ -677,11 +753,13 @@ void rp_note_ranged(const uint8_t* body, size_t len, const p6render::Stamp& stam
 }
 
 // One generic request, here on the main thread: the reply frame's body into rb (the exact bytes the single path sends, seq 0).
-size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, size_t cap, bool* faulted, uint64_t calendarEpoch,const p6render::Stamp& renderStamp) {
+size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, size_t cap, bool* faulted, uint64_t calendarEpoch,const p6render::Stamp& renderStamp, uint64_t loadStamp) {
     *faulted = false;
     const uint8_t op = len ? body[0] : 0;
     if (cap < 4) return 0;
     if (!wo218rules::batchable(type)) { ++g_w218.notBatchable; return wo218rules::failure(rb, op, wo218rules::kReasonNotBatchable); }
+    if (!load_allows(type, body, len, loadStamp, load_access(type, body, len)))
+        return wo218rules::failure(rb, op, kLoadRefused);
     if (type == kWo163 && len >= 1) {   // WO-203B's own ops (no engine call, their own lock), as the single path tries them first
         size_t on = 0;
         uint8_t oreason = kcdmp::wo163::kRFailed;
@@ -744,7 +822,7 @@ void w218_drain() {
             const wo218rules::Sub& sub = b->subs[b->next];
             bool faulted = false;
             const double s0 = w218_now_us();
-            const size_t n = w218_run_sub(sub.type, b->raw.data() + sub.off, sub.len, rb, sizeof rb, &faulted, b->calendarEpoch,b->renderStamp);
+            const size_t n = w218_run_sub(sub.type, b->raw.data() + sub.off, sub.len, rb, sizeof rb, &faulted, b->calendarEpoch,b->renderStamp,b->loadStamp);
             w221_note_sub(sub.type, sub.len ? b->raw[sub.off] : 0, w218_now_us() - s0);   // WO-221 F.1
             b->reply.add(wo218rules::reply_type(sub.type), rb, n);
             ++b->next;
@@ -780,7 +858,7 @@ void w218_post_drain() {
 }
 
 // The pipe thread: a batch read -- parsed, queued for the main thread; a malformed one answered at once (ok 0, no requests).
-void w218_on_batch(HANDLE h, const BYTE* body, uint16_t len,const p6render::Stamp& renderStamp) {
+void w218_on_batch(HANDLE h, const BYTE* body, uint16_t len,const p6render::Stamp& renderStamp, uint64_t loadStamp) {
     auto b = std::make_shared<PendingBatch>();
     b->raw.assign(body, body + len);
     if (!wo218rules::parse_batch(b->raw.data(), b->raw.size(), &b->id, &b->subs)) {
@@ -794,6 +872,7 @@ void w218_on_batch(HANDLE h, const BYTE* body, uint16_t len,const p6render::Stam
     b->gen = g_connGen.load();
     b->calendarEpoch = kcdmp::wo140::calendar_connection_epoch();
     b->renderStamp=renderStamp;
+    b->loadStamp=loadStamp;
     b->reply.begin(b->id, static_cast<uint8_t>(b->subs.size()));
     g_w218BatchesIn.fetch_add(1);
     {
@@ -1165,7 +1244,14 @@ bool ingest(ReaderContext& input, const uint8_t* bytes, size_t n) {
             const BYTE caps[] = {1, f.sequence, pipecontrol::kEdgeCapabilities, 0, edgelanes::kVersion};
             return send_frame(input.handle, kWo163Reply, caps, sizeof caps, input.generation);
         }
-        // Only this opcode is pure lifecycle state. Do not route any other
+        if (f.body[0] == loadsequence::kOp) {
+            BYTE out[4 + loadsequence::kAckBytes]{0, f.sequence, loadsequence::kOp, 0};
+            const bool ok = loadsequence::control(f.body.data(), f.body.size(), input.generation + 1, out + 4);
+            out[0] = ok ? 1 : 0;
+            out[3] = ok ? 0 : 5;
+            return send_frame(input.handle, kWo163Reply, out, sizeof out, input.generation);
+        }
+        // The P1 latch is pure lifecycle state. Do not route any other
         // off-main op ahead of the normal FIFO, even if the registry allows it.
         BYTE out[4 + 512]{}; size_t used = 0; uint8_t reason = wo163::kRFailed;
         crash::note_pipe(f.type, f.body[0], static_cast<uint16_t>(f.body.size()));
@@ -1173,6 +1259,7 @@ bool ingest(ReaderContext& input, const uint8_t* bytes, size_t n) {
         out[0] = reason == wo163::kROk ? 1 : 0; out[1] = f.sequence; out[2] = wo216::kOpLifecycle; out[3] = reason;
         return send_frame(input.handle, kWo163Reply, out, static_cast<uint16_t>(4 + used), input.generation);
     },[](pipecontrol::Frame& f){
+        f.loadStamp = loadsequence::stamp();
         f.readerTick=GetTickCount64();f.readerGeneration=wo216::lifecycle_generation();f.readerLife=p4::life_edge_tick();f.readerGameplay=wo216::lifecycle_gameplay();
         if (f.type == kNpcSamples || f.type == pipecontrol::kEdge) {
             f.readerQpc = edge_qpc();
@@ -1244,6 +1331,7 @@ template <typename T>
 bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& outValue, bool* faultedOut = nullptr) {
     if (t_edgeReply) {
         bool faulted = true;
+        if (!loadsequence::allows(t_loadStamp, t_loadAccess)) return false;
         try { faulted = !fault::guarded(g_sitePipeTask, [&] { work(outValue); }); }
         catch (...) { logf("PIPE: async %s raised a C++ exception on Main", what); }
         if (faultedOut) *faultedOut = faulted;
@@ -1256,10 +1344,12 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
     // second on a host alone, and the host alone climbed ~50-85 MB/s with it. The guarantee is the same: nothing here references the
     // caller's frame (work is copied, state is shared), so a wait given up on can never dangle, and a task the frame runs late still lands.
     std::function<void(T&)> task = work;
-    main_thread::post_when(&w218_single_ready, [state, task, generation] {
+    const auto loadStamp = t_loadStamp;
+    const auto loadAccess = t_loadAccess;
+    main_thread::post_when(&w218_single_ready, [state, task, generation, loadStamp, loadAccess] {
         {
             std::lock_guard<std::mutex> lock(state->mutex);
-            if (state->cancelled || generation != g_connGen.load()) {
+            if (state->cancelled || generation != g_connGen.load() || !loadsequence::allows(loadStamp, loadAccess)) {
                 state->done = true; state->cv.notify_all(); return;
             }
             state->started = true;
@@ -1307,7 +1397,20 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
         const uint8_t seq = incoming.sequence;
         crash::note_pipe(type, len ? body[0] : 0, len);
         const p6render::Stamp renderStamp{incoming.readerGeneration,incoming.readerLife,incoming.readerTick,incoming.readerGameplay};
-        if (type == wo218rules::kBatch) { w218_on_batch(h, body, len,renderStamp); return; }
+        if (type == wo218rules::kBatch) { w218_on_batch(h, body, len, renderStamp, incoming.loadStamp); return; }
+        t_loadStamp = incoming.loadStamp;
+        t_loadAccess = load_access(type, body, len);
+        if (!load_allows(type, body, len, incoming.loadStamp, t_loadAccess)) {
+            if (wo218rules::batchable(type)) {
+                const BYTE reply[]{0, seq, body[0], kLoadRefused};
+                send_frame(h, wo218rules::reply_type(type), reply, sizeof reply, generation);
+            } else if (type == kAttributedDamage || type == kLeashSample || type == kJoinPlace) {
+                const BYTE reply[]{0, seq};
+                const uint8_t replyType = type == kAttributedDamage ? kAttributedReply : type == kLeashSample ? kLeashReply : kJoinPlaceReply;
+                send_frame(h, replyType, reply, sizeof reply, generation);
+            } else send_result(h, false, seq, kLoadRefused);
+            return;
+        }
 
         switch (type) {
             case kPing:
@@ -1689,20 +1792,20 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
             // (engine reads) is marshalled onto the main thread.
             case kNpcSamples: {
                 const uint8_t r = npcdrive::on_samples(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}});
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp});
                 if (r != npcdrive::kOk) logf("PIPE: NpcSamples refused (%s, %u bytes)", npcdrive::reason_name(r), len);
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
             case edgelanes::kRawPose: {
                 const uint8_t r = t_edgeReply ? npcdrive::on_raw_pose(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}}) : npcdrive::kBadRequest;
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp}) : npcdrive::kBadRequest;
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
             case edgelanes::kTimedPose: {
                 const uint8_t r = t_edgeReply ? npcdrive::on_timed_pose(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}}) : npcdrive::kBadRequest;
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp}) : npcdrive::kBadRequest;
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
@@ -1714,13 +1817,13 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
             }
             case edgelanes::kTimedAction: {
                 const auto r = t_edgeReply ? timelineactions::submit(body, len,
-                    {incoming.readerObservation, generation + 1, incoming.readerLife}, incoming.readerTick) : timelineactions::Invalid;
+                    {incoming.readerObservation, generation + 1, incoming.readerLife, incoming.loadStamp}, incoming.readerTick) : timelineactions::Invalid;
                 send_result(h, r == timelineactions::Accepted, seq, static_cast<uint8_t>(r));
                 break;
             }
             case edgelanes::kCombatRow:
             case edgelanes::kCombatEvent: {
-                const timelineactions::Scope scope{incoming.readerObservation, generation + 1, incoming.readerLife};
+                const timelineactions::Scope scope{incoming.readerObservation, generation + 1, incoming.readerLife, incoming.loadStamp};
                 const auto result = !t_edgeReply ? timelineactions::Invalid :
                     (type == edgelanes::kCombatRow ? timelineactions::register_combat(body, len, scope) :
                                                    timelineactions::submit_combat(body, len, scope, incoming.readerTick));
@@ -1729,7 +1832,7 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
             }
             case edgelanes::kRemoteRelocation: {
                 const uint8_t r = t_edgeReply ? npcdrive::authorize_remote_relocation(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}}) : npcdrive::kBadRequest;
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp}) : npcdrive::kBadRequest;
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
@@ -1746,7 +1849,7 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 break;
             }
             case kNpcHold: {
-                const uint8_t r = npcdrive::on_hold(body, len);
+                const uint8_t r = npcdrive::on_hold(body, len, incoming.loadStamp);
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
@@ -2287,6 +2390,11 @@ void edge_dispatch(const edgelanes::Request& request, bool rt) {
     const HANDLE handle = g_pipe.load();
     if (handle == INVALID_HANDLE_VALUE) return;
     const uint8_t type = request.frame.type;
+    const auto& body = request.frame.body;
+    if (!load_allows(type, body.data(), body.size(), request.frame.loadStamp, load_access(type, body.data(), body.size()))) {
+        edge_finish(handle, request.connection, request.id, edgelanes::Status::Invalid);
+        return;
+    }
     if (type != edgelanes::kRawPose && type != edgelanes::kTimedPose && type != edgelanes::kProbe)
         edge_observe(rt ? g_edgeRt : g_edgeBulk, request.frame.readerQpc);
     EdgeReplyCapture capture;
@@ -2338,6 +2446,8 @@ void serve(HANDLE h) {
     }
 
     t_reader = nullptr;
+    const bool legacyLoad = loadsequence::gate(loadsequence::stamp()) == loadsequence::Gate::Legacy;
+    loadsequence::disconnected(input.generation + 1);
     g_connected = false;
     p6::connection(false);
     w218_on_disconnect();   // WO-218 A.1: a waiting batch's reply never reaches the next connection
@@ -2355,7 +2465,7 @@ void serve(HANDLE h) {
     main_thread::post([] { kcdmp::wo201::on_pipe_closed(); });   // WO-201: its session parts stand down
     main_thread::post([] { kcdmp::wo206::on_pipe_closed(); });   // WO-206: the digest sweep disarms, the probe stops
     kcdmp::wo137::on_disconnect();   // WO-137: no agent -- no quest frames, no HUD proxy
-    kcdmp::wo138::on_pipe_closed();  // WO-138: no agent -- the native sender, the pause gate and the hold go off
+    kcdmp::wo138::on_pipe_closed(legacyLoad);  // WO-138: no agent -- the native sender, the pause gate and the hold go off
     kcdmp::wo166::on_pipe_closed();  // WO-166 C3: no agent -- the striking windows end (restored at the next tick)
     kcdmp::weather::on_pipe_closed();  // WO-151: no agent -- the weather gate opens
     kcdmp::wo139::on_pipe_closed();

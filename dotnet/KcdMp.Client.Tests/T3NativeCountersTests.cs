@@ -227,4 +227,24 @@ public class T3NativeCountersTests
         page[2 + 9 * 9] = 8;
         Assert.False(T3NativeCounters.TryReadCombat(page, out _));
     }
+
+    [Fact]
+    public void Load_page_keeps_generation_phase_time_and_drop_coverage_together()
+    {
+        byte[] page = Payload(11);
+        Assert.Equal(101, page.Length);
+        Assert.True(T3NativeCounters.TryReadLoad(page, out var values));
+        Assert.Equal(0L, values["load_native_gen"]);
+        Assert.Equal(1L, values["load_phase_native"]);
+        string[] phases = ["menu", "offer", "load", "reconstruct", "settle", "play", "exit"];
+        for (int i = 0; i < phases.Length; i++) Assert.Equal((long)i + 2, values["load_native_phase_ms_" + phases[i]]);
+        Assert.Equal(9L, values["stale_gen_native_dropped"]);
+        Assert.Equal(10L, values["load_native_observations"]);
+        Assert.False(T3NativeCounters.TryReadLoad(Payload(10), out _));
+        Assert.False(T3NativeCounters.TryReadLoad(Payload(55), out _));
+        BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(12), 7);
+        Assert.True(T3NativeCounters.TryReadLoad(page, out _)); // Disabled has an explicit native ID.
+        BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(12), 8);
+        Assert.False(T3NativeCounters.TryReadLoad(page, out _)); // Query is a command.
+    }
 }

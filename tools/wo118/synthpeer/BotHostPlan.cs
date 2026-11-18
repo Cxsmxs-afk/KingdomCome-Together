@@ -70,24 +70,34 @@ sealed record BotHostPlan(IReadOnlyList<string[]> Setup, IReadOnlyList<BotHostPl
 }
 
 sealed record BotHostOptions(string Save, string Host, int Port, string Name, double Duration,
-    float[] Position, long WorldTimeMs, BotHostPlan Plan, string WireVersion)
+    float[] Position, long WorldTimeMs, BotHostPlan Plan, string WireVersion, string? LoadWeather)
 {
     public const string Flag = "--test-bot";
     public const string EnvironmentName = "KCDMP_TEST_BOT";
+    public const string LoadFlag = "--test-load-sequence";
+    public const string LoadEnvironmentName = "KCDMP_TEST_LOAD_SEQUENCE";
+    public const string LoadWeatherOption = "--weather-during-load";
 
     public static BotHostOptions Parse(string[] args)
     {
         var values = new Dictionary<string, string>(StringComparer.Ordinal);
-        bool flag = false;
+        bool flag = false, loadFlag = false;
         for (int i = 0; i < args.Length; i++)
         {
             var key = args[i];
             if (key == Flag && !flag) { flag = true; continue; }
-            if (key is not ("--join-host125" or "--host" or "--port" or "--duration" or "--name" or "--host-pos" or "--world-time" or "--bot-plan" or "--wire-version")
+            if (key == LoadFlag && !loadFlag) { loadFlag = true; continue; }
+            if (key is not ("--join-host125" or "--host" or "--port" or "--duration" or "--name" or "--host-pos" or "--world-time" or "--bot-plan" or "--wire-version" or LoadWeatherOption)
                 || i + 1 == args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal)
                 || !values.TryAdd(key, args[++i]))
                 throw new FormatException("Ungültige Bot-Host-Argumente.");
         }
+        string? loadWeather = values.GetValueOrDefault(LoadWeatherOption);
+        if (loadFlag != (loadWeather is not null) || loadFlag && Environment.GetEnvironmentVariable(LoadEnvironmentName) != "1")
+            throw new FormatException("Der Wettertest braucht KCDMP_TEST_LOAD_SEQUENCE=1, --test-load-sequence und --weather-during-load.");
+        if (loadWeather is not null && (loadWeather.Length is < 1 or > Protocol.MaxWeatherNameLen ||
+            loadWeather.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '_')))
+            throw new FormatException("Das Wetterprofil braucht 1 bis 48 ASCII-Buchstaben, Ziffern oder Unterstriche.");
         string host = values.GetValueOrDefault("--host", "127.0.0.1");
         if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase)) host = IPAddress.Loopback.ToString();
         if (!IPAddress.TryParse(host, out var address) || !IPAddress.IsLoopback(address))
@@ -126,7 +136,7 @@ sealed record BotHostOptions(string Save, string Host, int Port, string Name, do
         var plan = values.TryGetValue("--bot-plan", out var planFile)
             ? BotHostPlan.Parse(ReadPlan(planFile))
             : BotHostPlan.Parse(["at 0 walk 1.4 0 4 0 100", "at 4 walk 0 1.4 4 0 100"]);
-        return new(save, host, port, name, duration, position, worldTime, plan, wireVersion);
+        return new(save, host, port, name, duration, position, worldTime, plan, wireVersion, loadWeather);
     }
 
     private static IEnumerable<string> ReadPlan(string path)

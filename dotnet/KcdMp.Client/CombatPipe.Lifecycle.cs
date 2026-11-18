@@ -7,7 +7,7 @@ namespace KcdMp.Client;
 
 public sealed partial class CombatPipe
 {
-    private sealed record LifecycleWait(NamedPipeClientStream Pipe, TaskCompletionSource<Wo216LifecycleReply?> Reply);
+    private sealed record LifecycleWait(byte Op, NamedPipeClientStream Pipe, TaskCompletionSource<byte[]?> Reply);
     private readonly ConcurrentDictionary<uint, LifecycleWait> _lifecycleWaits = new();
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private readonly object _connectionState = new();
@@ -20,6 +20,12 @@ public sealed partial class CombatPipe
     public async Task<Wo216LifecycleReply?> Wo216LifecycleAsync(byte phase, ulong generation, CancellationToken ct = default)
     {
         if (phase > Protocol.Wo216LifecycleQuery) throw new ArgumentOutOfRangeException(nameof(phase));
+        byte[]? body = await SendControlAsync(Protocol.Wo216OpLifecycle, id => Wo216LifecycleCodec.BuildArgs(phase, generation, id), ct);
+        return body is not null && Wo216LifecycleCodec.TryReadReply(body, out var reply) ? reply : null;
+    }
+
+    private async Task<byte[]?> SendControlAsync(byte op, Func<uint, byte[]> buildArgs, CancellationToken ct)
+    {
         using var scope = ProcessorFrameScope.Link(ct);
         ct = scope.Token;
         ct.ThrowIfCancellationRequested();
@@ -33,11 +39,10 @@ public sealed partial class CombatPipe
             if (!await EnsureConnectedAsync(deadline.Token)) return null;
             var connection = _pipe;
             if (connection?.IsConnected != true) return null;
-            waiting = new(connection, new(TaskCreationOptions.RunContinuationsAsynchronously));
+            waiting = new(op, connection, new(TaskCreationOptions.RunContinuationsAsynchronously));
             do { requestId = unchecked((uint)Interlocked.Increment(ref _lifecycleNextId)); }
             while (requestId == 0 || !_lifecycleWaits.TryAdd(requestId, waiting));
-            byte[] args = Wo216LifecycleCodec.BuildArgs(phase, generation, requestId);
-            byte[] payload = [Protocol.Wo216OpLifecycle, .. args];
+            byte[] payload = [op, .. buildArgs(requestId)];
             await _writeLock.WaitAsync(deadline.Token);
             try
             {
@@ -73,15 +78,21 @@ public sealed partial class CombatPipe
         }
     }
 
-    // Every op168 reply stays out of the normal shared reply channel, including
+    // Every lifecycle reply stays out of the normal shared reply channel, including
     // expired IDs and malformed ACKs. Otherwise a late control ACK can masquerade
     // as a later unrelated Wo163 response.
     private bool TryLifecycleReply(NamedPipeClientStream? connection, byte type, byte[] body)
     {
-        if (type != Wo163Reply || body.Length < 3 || body[2] != Protocol.Wo216OpLifecycle) return false;
-        if (Wo216LifecycleCodec.TryReadReply(body, out var reply)
-            && _lifecycleWaits.TryGetValue(reply.RequestId, out var waiting)
-            && ReferenceEquals(waiting.Pipe, connection)) waiting.Reply.TrySetResult(reply);
+        if (type != Wo163Reply || body.Length < 3) return false;
+        byte op = body[2];
+        uint requestId;
+        if (op == Protocol.Wo216OpLifecycle)
+            requestId = Wo216LifecycleCodec.TryReadReply(body, out var reply) ? reply.RequestId : 0;
+        else if (op == LoadSequenceOp)
+            requestId = LoadSequenceNativeReply.TryRead(body, out var load) ? load.RequestId : 0;
+        else return false;
+        if (requestId != 0 && _lifecycleWaits.TryGetValue(requestId, out var waiting) && waiting.Op == op &&
+            ReferenceEquals(waiting.Pipe, connection)) waiting.Reply.TrySetResult(body);
         return true;
     }
 

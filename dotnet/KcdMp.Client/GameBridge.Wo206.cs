@@ -45,7 +45,9 @@ public partial class GameBridge
             return true;
         }
         if (W206Host) return true;   // a host never takes another machine's epochs
+        if (LoadSequenceEnabled && _hostModeKnown && src != _hostModeFrom) return true;
         bool changed = _w206.LearnWorld(world, join);
+        LoadSequenceObserveHostWorld(world);
         if (changed) { T3TpInvalidate(); _ = ResetHostCalendarAsync("host-world-epoch"); }
         Wo206SyncPublic();
         if (changed) Console.WriteLine($"MP-W206 the host's world epoch is {world} now ({why}; join epoch {join}) -- what was read before this is the old world's");

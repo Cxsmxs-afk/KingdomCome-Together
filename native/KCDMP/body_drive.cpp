@@ -19,6 +19,7 @@
 // The bench only (never set in play): KCDMP_TEST_W221_DRIVE_OFF=<lod,hostwalk,arrive,lead,nomove> leaves single conditions out (the
 // probe's own behaviour is all five off), KCDMP_TEST_W221_DRIVE_ONLY=<name> drives that one copy, KCDMP_TEST_W221_DRIVE_LOG=<name>
 // logs ten lines a second for it.
+#include "load_sequence.h"
 #include "body_drive.h"
 
 #ifndef NOMINMAX
@@ -197,12 +198,14 @@ bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float
     using holders::Holder;
     const Holder current = holders::of(d.eid);
     const bool taking = walking || face != nullptr;
+    const uint64_t loadStamp = loadsequence::stamp();
+    if (taking && !loadsequence::allowed(loadStamp, loadStamp, loadsequence::Access::Live)) return false;
     if (taking && (current == Holder::None || current == Holder::Writer || current == Holder::Figure || current == Holder::Driver) &&
         !holders::handover(d.eid, d.name.c_str(), Holder::Driver, now)) return false;
     const auto claim = taking ? holders::Claim::Held : holders::Claim::Release;
     auto permit = holders::may_place(d.eid, Holder::Driver,
         d.remote ? holders::kRemoteControllerSetter : "bodydrive::RequestMovement", claim);
-    if (!permit) return false;
+    if (!permit || (taking && !loadsequence::allows(loadStamp, loadsequence::Access::Live))) return false;
     bool ok = false;
     if (attempted) *attempted = true;
     if (taking) d.active = true;   // a fault can follow a partial request merge

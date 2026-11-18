@@ -71,6 +71,7 @@ public static class VerdictRules
     private const string W136 = "MP-WO136-STATS";
     private const string StepPair = "MP-RP-STEP";
     private const string OwnerViolation = "WO221-OWNER-VIOLATION";
+    private static readonly string[] LoadPhases = ["Menu", "Offer", "Load", "Reconstruct", "Settle", "Play", "Exit"];
     // The agent's TeeTextWriter supplies the wall clock and optional shared-clock metadata.
     private const string AgentPrefix = @"^(?:\d\d:\d\d:\d\d(?:\.\d+)? (?:m=\d+ off=(?:[+-]?\d+|\?) )?)?";
     private static readonly Regex AgentPrefixOnly = new(AgentPrefix + @"\z", RegexOptions.Compiled);
@@ -188,6 +189,7 @@ public static class VerdictRules
         rows.AddRange(Counters.Select(rule => Evaluate(rule, samples)));
         rows.AddRange(PresentationCounters.Select(rule => EvaluatePresentation(rule, samples)));
         rows.Add(ActionPlayback(samples));
+        rows.AddRange(LoadSequence(samples));
         rows.Add(BotPlan(input));
 
         // Traffic observable on this machine is required for green. Optional
@@ -380,6 +382,60 @@ public static class VerdictRules
         string measurement = string.Create(CultureInfo.InvariantCulture, $"{played}/{received} ({percent:0.00} %)");
         var status = percent >= CombatPlaybackGreenPercent ? VerdictStatus.Green : VerdictStatus.Yellow;
         return new(id, status, measurement, $"{source.Marker}, {source.Origin}, bestätigte Engine-Wiedergabe");
+    }
+
+    private static IEnumerable<VerdictRow> LoadSequence(IReadOnlyList<Sample> samples)
+    {
+        var reports = samples.Where(sample => sample.Marker == T3 && sample.Fields.GetValueOrDefault("section") == "load").ToList();
+        var agent = reports.LastOrDefault(sample => sample.Origin == "Agent");
+        var latest = agent ?? reports.LastOrDefault();
+        var phase = latest?.Number("load_phase");
+        var generation = latest?.Number("load_gen");
+        bool validAgentPhase = phase < LoadPhases.Length && generation.HasValue;
+        bool validNativePhase = latest?.Number("load_phase_native") < LoadPhases.Length
+            && latest?.Number("load_native_gen") > 0 && latest?.Number("load_native_observations") > 0;
+        if (validAgentPhase)
+        {
+            bool sameNativePlay = validNativePhase && phase == 5 && generation > 0 &&
+                latest!.Number("load_native_gen") == generation && latest.Number("load_phase_native") == phase;
+            yield return new("load_phase", sameNativePlay ? VerdictStatus.Green : VerdictStatus.Grey, LoadPhases[(int)phase.GetValueOrDefault()],
+                sameNativePlay ? $"Agent und DLL melden Play für Generation {generation}" :
+                $"Generation {generation}, gemeinsames Play von Agent und DLL unbelegt");
+        }
+        else
+            yield return Missing("load_phase", "Kein gültiger Agent-Ladephasenbericht");
+
+        foreach (string name in LoadPhases)
+        {
+            string suffix = name.ToLowerInvariant();
+            string key = "load_phase_ms_" + suffix;
+            var managedMs = latest?.Number(key);
+            var nativeMs = latest?.Number("load_native_phase_ms_" + suffix);
+            var durations = new List<string>(capacity: 2);
+            if (managedMs > 0 && validAgentPhase) durations.Add("Agent " + Format(managedMs.Value, " ms"));
+            if (nativeMs > 0 && validNativePhase)
+                durations.Add("DLL " + Format(nativeMs.Value, " ms"));
+            yield return durations.Count == 0
+                ? Missing(key, "Keine verstrichene Zeit gemessen")
+                : new(key, VerdictStatus.Grey, string.Join(", ", durations),
+                    "Agent-Laufzeit kumuliert, DLL für gemeldete Generation, ohne Grenzwert");
+        }
+
+        yield return LoadRejected(reports, "stale_gen_dropped", "load_gen", "Agent");
+        yield return LoadRejected(reports, "stale_gen_native_dropped", "load_native_gen", "DLL", "load_native_observations");
+    }
+
+    private static VerdictRow LoadRejected(IEnumerable<Sample> reports, string id, string generation, string source,
+        string? coverage = null)
+    {
+        var counts = reports.Where(sample => sample.Number(generation) > 0 &&
+                (coverage is null || sample.Number(coverage) > 0))
+            .Select(sample => sample.Number(id)).Where(value => value.HasValue).ToList();
+        if (counts.Count == 0) return Missing(id, $"Kein gültiger Zähler vom {source}");
+
+        long maximum = counts.Max().GetValueOrDefault();
+        return new(id, maximum > 0 ? VerdictStatus.Green : VerdictStatus.Grey, Format(maximum, ""),
+            maximum > 0 ? $"{source} hat veraltete Frames verworfen" : $"Kein veralteter Frame beim {source} beobachtet");
     }
 
     private static bool HasOwnerCounters(Sample sample) => sample.Number("owner_handovers").HasValue

@@ -193,6 +193,7 @@ public partial class GameBridge
         if (type == Protocol.Disconnect) { T3TpInvalidate(); return false; }
         if (type != Protocol.W203Down || payload.Length < 1 + Protocol.JoinHeaderLen || !LootMsg.TryDecode(payload.AsSpan(1 + Protocol.JoinHeaderLen), out var m) ||
             m.Kind is not (Protocol.W203TpSnapshotRequest or Protocol.W203TpSnapshotResponse)) return false;
+        if (!LoadSequenceWritable) return true;
         byte peer = payload[0];
         if (m.Kind == Protocol.W203TpSnapshotResponse)
         {

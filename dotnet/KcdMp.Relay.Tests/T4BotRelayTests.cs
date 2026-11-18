@@ -174,6 +174,44 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
     }
 
     [Fact]
+    public async Task Host_sends_weather_during_verified_load_before_joiner_ready()
+    {
+        await WaitForAsync(() => Clients.ReadyClientCount == 0, "Previous relay peers did not disconnect");
+        using var fixture = new BotFixture();
+        byte[] save = BotFixture.Save();
+        string savePath = fixture.Write("world.whs", save);
+        string plan = fixture.Write("host-plan.txt", "at 0 pos 1 2 3\n");
+        await using var bot = T4BotTools.StartLoadSequence("SynthPeer", true, "--test-bot", "--join-host125", savePath,
+            "--bot-plan", plan, "--world-time", "28800", "--host", "127.0.0.1", "--port", Port,
+            "--name", "t4-weather-host", "--duration", "20", "--test-load-sequence", "--weather-during-load", "Cloudy");
+        await WaitForAsync(() => Clients.DamageAuthority?.Name == "t4-weather-host", "Weather bot did not acquire relay authority", bot);
+        await using var joiner = await Peer.ConnectAsync(relay.TcpPort, "t4-weather-joiner");
+        const uint join = 127;
+        await LoadHostedWorldAsync(joiner, fixture, save, join, beforeReady: async host =>
+        {
+            bool waiting = false;
+            long since = Stopwatch.GetTimestamp();
+            while (true)
+            {
+                TimeSpan left = Wait - Stopwatch.GetElapsedTime(since);
+                Assert.True(left > TimeSpan.Zero, "Host did not send load weather before Ready");
+                var (type, payload) = await joiner.ReadPacketAsync(left);
+                if (type == Protocol.JoinStatusDown)
+                {
+                    var (source, id, body) = ReadJoin(payload);
+                    if (source == host && id == join && JoinStatusCodec.TryDecode(body, out byte state, out _, out _))
+                        waiting |= state == Protocol.JoinStateWaitingReady;
+                }
+                if (type != Protocol.WeatherDown) continue;
+                Assert.True(waiting, "Weather arrived before the verified WaitingReady status");
+                byte[] expected = [host, 6, .. "Cloudy"u8, 0, 0];
+                Assert.Equal(expected, payload);
+                return;
+            }
+        });
+    }
+
+    [Fact]
     public async Task Host_rejects_pickups_from_a_reused_peer_id_until_that_connection_completes_its_own_join()
     {
         await WaitForAsync(() => Clients.ReadyClientCount == 0, "Previous relay peers did not disconnect");
@@ -249,7 +287,7 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
     }
 
     private static async Task<byte> LoadHostedWorldAsync(Peer joiner, BotFixture fixture, byte[] expectedSave, uint joinId,
-        bool refusePreOfferPickups = false)
+        bool refusePreOfferPickups = false, Func<byte, Task>? beforeReady = null)
     {
         await joiner.SendRawAsync(WorldReceiver.BuildRequest(joinId));
         byte[] body;
@@ -299,6 +337,7 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
         Assert.True(verified.Ok, verified.Why);
         Assert.Equal(expectedSave, await File.ReadAllBytesAsync(receiver.FinalPath));
         await joiner.SendRawAsync(receiver.BuildDone());
+        if (beforeReady is not null) await beforeReady(hostId);
         await joiner.SendRawAsync(WorldReceiver.BuildReady(joinId, offer.Value.WorldSavedSeq));
         await WaitForReadyAsync(joiner, hostId, joinId);
         return hostId;

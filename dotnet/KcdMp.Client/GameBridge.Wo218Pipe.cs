@@ -128,6 +128,7 @@ public partial class GameBridge
         var units = new List<Wo218Rules.ActUnit>();
         foreach (var f in frames)
         {
+            if (!LoadSequenceFrameCurrent(f) || (LoadSequenceEnabled && Wo136Defer(f))) continue;
             if (Wo140DropSeparate(f.Type)) continue;
             if (SplitJoinDown(f.Payload, out byte src, out _, out var body))
             {

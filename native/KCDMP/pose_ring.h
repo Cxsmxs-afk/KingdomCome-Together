@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #pragma once
+#include "load_sequence_rules.h"
 // Phase 3: one ring of poses. The DLL writes a sample per body per frame.
 // The agent reads the bytes. A pose does not wait in the Lua console.
 //
@@ -146,8 +147,10 @@ constexpr size_t kEnvelope = 9, kClockBytes = 16, kGhostFixed = 18, kNpcTail = 2
 constexpr size_t kBodyName = 63, kMaxEnvelope = kEnvelope + 2 + kBodyName + kNpcTail;
 
 struct Scope {
-    uint64_t observation = 0, connection = 0;
-    bool operator==(Scope other) const { return observation == other.observation && connection == other.connection; }
+    uint64_t observation = 0, connection = 0, loadStamp = 0;
+    bool operator==(Scope other) const {
+        return observation == other.observation && connection == other.connection && loadStamp == other.loadStamp;
+    }
 };
 
 struct Pose {
@@ -262,8 +265,16 @@ class Ring {
 public:
     explicit Ring(size_t capacity) : capacity_(capacity) {}
 
+    size_t retire(Scope current) {
+        if (scope_ == current) return 0;
+        const size_t stale = loadsequence::old_generation(scope_.loadStamp, current.loadStamp) ? pending_.size() : 0;
+        pending_.clear();
+        scope_ = current;
+        return stale;
+    }
+
     Put publish(Pose pose, Scope scope, bool senderClock = true) {
-        if (!(scope_ == scope)) { pending_.clear(); scope_ = scope; }
+        retire(scope);
         auto key = body_key(pose.body);
         const auto it = pending_.find(key);
         if (it != pending_.end()) {

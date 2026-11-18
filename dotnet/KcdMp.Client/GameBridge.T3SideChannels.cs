@@ -16,8 +16,8 @@ public partial class GameBridge
     private const byte T3Clock = 0, T3Weather = 1, T3WeatherProfile = T3Weather;
     private readonly T3SideChannelQueue<T3SideValue> _t3SideChannels = new();
     private readonly AsyncLocal<T3SideChannelQueue<T3SideValue>.Lease?> _t3SideAmbient = new();
-    private bool T3SideWorldWritable => _where == GameWhere.World && !_ownLoadExpected && !_loadGraceOwn &&
-        !_w211Holding && (_isDamageAuthority || (_joinedWorld && _jj is null));
+    private bool T3SideWorldWritable => _where == GameWhere.World && !OwnLoadExpected && !LoadGraceOwn &&
+        !LinkHeld && LoadSequenceWritable && (_isDamageAuthority || (_joinedWorld && _jj is null));
     private T3SideChannelQueue<T3SideValue>.Lease T3SideLease() => _t3SideAmbient.Value ?? _t3SideChannels.Capture(_w206.World);
     private sealed class T3SideContext : IDisposable
     {
@@ -53,6 +53,7 @@ public partial class GameBridge
         {
             if (!config.WeatherSyncEnabled) return true;
             _t3SideChannels.Put(T3Weather, new(message.Source, message.Rain, message.Profile, message.Blend), lease);
+            if (!LoadSequenceWritable && message.Profile is { } profile) LoadSequenceWeather(profile, "deferred");
         }
         T3Increment("deferred_sidechannel");
         return true;
@@ -95,6 +96,7 @@ public partial class GameBridge
         if (!T3SideReady)
         {
             _t3SideChannels.Put(T3WeatherProfile, new(0, Profile: profile, Blend: blendSec), lease);
+            LoadSequenceWeather(profile, "deferred");
             T3Increment("deferred_sidechannel"); return;
         }
         if (profile == _lastAppliedWeatherProfile) return;
@@ -105,6 +107,7 @@ public partial class GameBridge
             $"if KCD2MP_ApplyWeather then KCD2MP_ApplyWeather(\"{profile}\",{blendSec}) end"), linked.Token);
         T3SideGuard(lease, true);
         _lastAppliedWeatherProfile = profile;
+        LoadSequenceWeather(profile, "applied");
         Console.WriteLine($"[weather] applied profile '{profile}' blend={blendSec}");
     }
 }

@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Reflection;
 using System.Text;
 using KcdMp.Wire;
 using Xunit;
@@ -10,6 +11,39 @@ namespace KcdMp.Client.Tests;
 
 public class T3SideChannelsTests
 {
+    [Fact]
+    public void Weather_received_after_the_verified_offer_survives_load_edges_of_the_same_generation()
+    {
+        const BindingFlags instance = BindingFlags.Instance | BindingFlags.NonPublic;
+        var bridge = new GameBridge(new ClientConfig { WeatherSyncEnabled = true });
+        object Get(string name) => typeof(GameBridge).GetField(name, instance)!.GetValue(bridge)!;
+        void Set(string name, object value) => typeof(GameBridge).GetField(name, instance)!.SetValue(bridge, value);
+        object? Call(string name, params object[] args) => typeof(GameBridge).GetMethod(name, instance)!.Invoke(bridge, args);
+        Set("_loadSequenceRuntime", true);
+        Set("_hostModeKnown", true);
+        Set("_hostModeFrom", (byte)0);
+        Set("_transport", new ReplayGameTransport([]));
+        ((Wo206Epochs)Get("_w206")).LearnWorld(7, 1);
+        var seq = (WorldLoadSequence)Get("_worldLoad");
+        Call("LoadSequenceBeginOffer", 11u, 7u);
+        var payload = new byte[] { 0, 5, (byte)'c', (byte)'l', (byte)'e', (byte)'a', (byte)'r', 0, 0 };
+        var type = typeof(GameBridge).GetNestedType("InFrame", BindingFlags.NonPublic)!;
+        var frame = Activator.CreateInstance(type, [(int)Protocol.WeatherDown, payload, 1L, 7u])!;
+        Assert.True((bool)Call("T3TryDeferSideChannel", frame)!);
+        var queue = Get("_t3SideChannels");
+        int Pending() => (int)queue.GetType().GetProperty("Count")!.GetValue(queue)!;
+        Assert.Equal(1, Pending());
+
+        ulong offered = seq.Current.Generation;
+        Call("LoadSequenceBeginLoad", false);
+        Call("LoadSequenceBeginLoad", false);
+        Assert.Equal(offered, seq.Current.Generation);
+        Assert.Equal(1, Pending());
+        Call("LoadSequenceBeginLoad", true);
+        Assert.Equal(offered + 1, seq.Current.Generation);
+        Assert.Equal(0, Pending());
+    }
+
     [Fact]
     public void Load_keeps_only_latest_weather_and_applies_after_gameplay_plus_five_seconds()
     {

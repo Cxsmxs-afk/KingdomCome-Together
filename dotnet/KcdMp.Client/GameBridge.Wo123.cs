@@ -602,6 +602,7 @@ public partial class GameBridge
             // ---- 4. the joiner loads (the next WO) and says ready
             j.Phase = "waiting-ready";
             await TrySendStatusAsync(j, Protocol.JoinStateWaitingReady, "none");
+            _ = LoadWeatherSendAsync(j);
             _ = ExecLuaAsync($"if KCD2MP_JoinProgress then KCD2MP_JoinProgress(\"{j.JoinId:x8}\", 100, \"loading\") end");
             while (true)
             {
@@ -874,6 +875,7 @@ public partial class GameBridge
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, reason)); } catch { }
             return;
         }
+        if (LoadSequenceEnabled && JoinerSharedEffective) LoadSequenceBeginOffer(joinId, rx.HostWorldEpoch);
         await WriteJoinAsync(rx.BuildDone());
         _joinReceivedId = joinId;
         _joinReceivedSeq = rx.Offer.WorldSavedSeq;

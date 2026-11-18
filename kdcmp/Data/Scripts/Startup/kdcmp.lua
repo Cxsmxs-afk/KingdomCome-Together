@@ -7543,6 +7543,8 @@ KCD2MP.w136 = {
 
 function KCD2MP_W136Held()
     local w = KCD2MP.w136
+    local load = w.loadSequence
+    if load and load.enabled then return load.phase ~= 5 or load.flags ~= 0 end
     if not w.hold then return false end
     if os.clock() > w.holdUntil then
         w.stats.expired = w.stats.expired + 1
@@ -7554,8 +7556,9 @@ end
 
 -- on = true|false; ttlS = how long a hold may last unlifted (default 240 s:
 -- the field's join took 112 s from the command to "Gameplay started").
-function KCD2MP_W136Hold(on, ttlS, why)
+function KCD2MP_W136Hold(on, ttlS, why, sequenced)
     local w = KCD2MP.w136
+    if w.loadSequence and w.loadSequence.enabled and not sequenced then return KCD2MP_W136Held() end
     local now = os.clock()
     if on and not w.hold and KCD2MP_T3InputReset then KCD2MP_T3InputReset("load-hold") end
     if on and not w.hold and KCD2MP_T3CorpseWorldReset then KCD2MP_T3CorpseWorldReset("load-hold") end
@@ -7588,6 +7591,35 @@ function KCD2MP_W136Hold(on, ttlS, why)
     if tostring(why) == "gameplay+settle" and KCD2MP_W174Clean then pcall(KCD2MP_W174Clean, "load") end   -- WO-174: once after every load
     if tostring(why) == "gameplay+settle" and KCD2MP_W174AfterLoad then pcall(KCD2MP_W174AfterLoad, "settle") end
     if tostring(why) == "gameplay+settle" and KCD2MP_W175AfterLoad then pcall(KCD2MP_W175AfterLoad, "settle") end   -- WO-175
+    return true
+end
+
+-- The adopted Agent publishes the current phase with a monotonically ordered
+-- receipt. A scope change retires any Lua samples held for the previous world.
+function KCD2MP_LoadSequence(session, revision, generation, phase, flags)
+    session, generation = tostring(session or ""), tostring(generation or "")
+    revision, phase, flags = tonumber(revision), tonumber(phase), tonumber(flags)
+    if #session ~= 32 or not string.match(session, "^%x+$") or #generation > 20 or not string.match(generation, "^%d+$")
+        or not revision or revision < 1 or not phase or phase < 0 or phase > 7 or not flags or flags < 0 or flags > 7 then return false end
+    local w = KCD2MP.w136
+    local prior = w.loadSequence
+    if prior and prior.session == session and revision <= prior.revision then return false end
+    if prior and prior.session ~= session then
+        local retired = w.loadSequenceRetired or {}
+        for _, retiredSession in ipairs(retired) do if retiredSession == session then return false end end
+        retired[#retired + 1] = prior.session
+        if #retired > 32 then table.remove(retired, 1) end
+        w.loadSequenceRetired = retired
+    end
+    local fresh = not prior or prior.session ~= session or prior.generation ~= generation
+    w.loadSequence = { enabled = phase ~= 7, session = session, revision = revision, generation = generation, phase = phase, flags = flags }
+    if fresh then w.queue, w.queueN = {}, 0 end
+    if phase == 7 then return true end
+    if phase ~= 5 then
+        KCD2MP_W136Hold(true, 240, "load-sequence", true)
+    elseif flags == 0 then
+        KCD2MP_W136Hold(false, 0, "gameplay+settle", true)
+    end
     return true
 end
 
@@ -35920,34 +35952,40 @@ do
     -- A.1 (the joiner): the hold. on: the world's clock stands, the player's own movement is held (the "actionmap" hold: the player and
     -- movement maps off, so the co-op menu and the console still work), the line says how long is left; off: all of it given back.
     -- The agent calls it again every second while the hold runs (idempotent: a load or another path that resumed the clock is undone).
-    function KCD2MP_W211LinkHold(on, left, text)
+    function KCD2MP_W211LinkHold(on, left, text, uiOnly)
         local w = KCD2MP.w211
-        KCD2MP_T3InputLink(on, left)
         if on then
+            if not w.holding then w.linkUiOnly = uiOnly == true end
+            if not w.linkUiOnly then KCD2MP_T3InputLink(true, left) end
             if not w.holding then
                 w.holding = true
                 w.holds = w.holds + 1
                 w.ratioWas, w.ratioSet = nil, false
-                pcall(function() w.ratioWas = Calendar.GetWorldTimeRatio() end)
-                w.t3InputLease = (w.t3InputLease or 0) + 1
-                local okH, how = KCD2MP_JoinHold(true, "actionmap", "link", w.t3InputLease)
-                w.holdUsed = okH and true or false
-                mp_log(string.format("WO211-LINK hold on: clock ratio was %s, movement %s (%s)", tostring(w.ratioWas), okH and "held" or "NOT held", tostring(how)))
+                if w.linkUiOnly then
+                    mp_log("WO211-LINK hold on: the native load sequence holds the world")
+                else
+                    pcall(function() w.ratioWas = Calendar.GetWorldTimeRatio() end)
+                    w.t3InputLease = (w.t3InputLease or 0) + 1
+                    local okH, how = KCD2MP_JoinHold(true, "actionmap", "link", w.t3InputLease)
+                    w.holdUsed = okH and true or false
+                    mp_log(string.format("WO211-LINK hold on: clock ratio was %s, movement %s (%s)", tostring(w.ratioWas), okH and "held" or "NOT held", tostring(how)))
+                end
                 pcall(KCD2MP_ShowNativeToast, "Connection to your host lost -- reconnecting...")
             end
-            pcall(function() Calendar.SetWorldTimeRatio(0); w.ratioSet = true end)
+            if not w.linkUiOnly then pcall(function() Calendar.SetWorldTimeRatio(0); w.ratioSet = true end) end
             w.holdLeft, w.holdText = tonumber(left) or 0, tostring(text or "")
             if w.holdText ~= "" then pcall(KCD2MP_ShowInteractionMsg, w.holdText) end
             return true
         end
+        if not w.linkUiOnly then KCD2MP_T3InputLink(false, left) end
         if not w.holding then return false end
-        w.holding = false
+        w.holding, w.linkUiOnly = false, nil
         if w.ratioSet and w.ratioWas ~= nil then pcall(function() Calendar.SetWorldTimeRatio(w.ratioWas) end) end
         w.ratioSet = false
         if w.holdUsed then pcall(KCD2MP_JoinHold, false, "actionmap", "link", w.t3InputLease) end
         w.holdUsed = false
         pcall(KCD2MP_ShowInteractionMsg, "")
-        mp_log("WO211-LINK hold off: the clock and the player's movement given back")
+        mp_log("WO211-LINK hold off")
         return true
     end
 
@@ -36940,6 +36978,7 @@ do
         shop_keeper = "mp_shop_keeper", own_horse = "mp_own_horse", talk_force = "mp_talk_force",
         corpse_look = "mp_corpse_look", horse_drop = "mp_horse_drop", saddlebags = "mp_saddlebags", route_quiet = "mp_route_quiet", cart_seat = "mp_cart_seat", cart_wheels = "mp_cart_wheels",
         ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller", rp_combat = "mp_rp_combat",
+        load_sequence = "mp_load_sequence",
     }
     W221.HELP = {
         combat_action_end = "A: (both) no combat animation of ours outlives its body's combat part (the joiner's fight crash)",
@@ -36958,6 +36997,7 @@ do
         ragdoll_once = "A: (joiner) a fresh corpse is laid down by one ragdoll at a time, after the game's own death action had its time, never when it already lies",
         rp_controller = "Move the partner's figure through the game's movement request when the body supports it",
         rp_combat = "Play the partner's timed combat through native requests",
+        load_sequence = "Apply the world only for its current load generation",
     }
     function KCD2MP_W221On(name)
         local v = W221.on[tostring(name)]
@@ -38888,6 +38928,20 @@ function KCD2MP_EdgeLanes(arg)
 end
 System.AddCCommand("mp_lanes", 'KCD2MP_EdgeLanes(%line)',
     "DLL lane test: mp_lanes --test-lanes <nonce> <frames 1..600>")
+
+-- The real Host Agent additionally requires KCDMP_TEST_LOAD_SEQUENCE=1.
+function KCD2MP_TestWeatherLoad(arg)
+    local text = tostring(arg or ""):match("^%s*(.-)%s*$")
+    local profile = text:match("^%-%-test%-load%-sequence%s+([A-Za-z0-9_]+)$")
+    if not profile or #profile > 48 then
+        mp_log("mp_test_weatherload: expected --test-load-sequence <profile>")
+        return false
+    end
+    KCD2MP_EmitEvent("test_load_weather", "--test-load-sequence " .. profile)
+    return true
+end
+System.AddCCommand("mp_test_weatherload", 'KCD2MP_TestWeatherLoad(%line)',
+    "Test weather while the joiner loads: mp_test_weatherload --test-load-sequence <profile>")
 
 -- ===== P1: optional host decision authority, native load lifecycle owns activation =================
 do

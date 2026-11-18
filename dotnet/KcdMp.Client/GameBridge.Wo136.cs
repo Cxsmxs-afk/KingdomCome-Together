@@ -44,7 +44,7 @@ public partial class GameBridge
     private DateTime _w136LuaToldUtc = DateTime.MinValue;
 
     /// <summary>A world is loading (or the menu: no world), or it loaded less than the settle ago.</summary>
-    private bool Wo136Holding =>
+    private bool Wo136Holding => LoadSequenceEnabled ? !LoadSequenceWritable :
         _where is GameWhere.Loading or GameWhere.Menu || DateTime.UtcNow < _w136SettleUntilUtc;
 
     /// <summary>The frames the hold keeps back: every one that moves, spawns, poses, hits or kills an NPC or an avatar.</summary>
@@ -54,7 +54,7 @@ public partial class GameBridge
     /// <summary>The processor: true = this frame waits for the world (the newest per NPC / per peer is kept).</summary>
     private bool Wo136Defer(in InFrame frame)
     {
-        if (!Wo136HeldType(frame.Type) || !Wo136Holding) return false;
+        if (!(LoadSequenceEnabled ? frame.LoadScoped : Wo136HeldType(frame.Type)) || !Wo136Holding) return false;
         lock (_w136Gate)
         {
             if (!_w136WasHolding) { _w136WasHolding = true; _w136HoldSinceUtc = DateTime.UtcNow; _w136Holds++; }
@@ -115,13 +115,15 @@ public partial class GameBridge
         {
             if (ct.IsCancellationRequested || !ReferenceEquals(_frameWriter, writer)) break;
             ProcessorFrameScope.ThrowIfAbandoned();
+            if (!LoadSequenceFrameCurrent(f)) { stale++; continue; }
             // WO-144: a peer who left while the world loaded is not brought back by its held frame.
             if (f.Type == Protocol.Ghost && f.Payload.Length > 0 && Wo144DropFromRemoved(f.Payload[0])) continue;
             // WO-206 E: a frame held across a load of the host's world is that old world's -- never fed or replayed into the new one
             if (Wo206Rules.WorldCategory(f.Type, f.Payload) is Wo206Cat cat && !Wo206Admit(cat, f.Stamp, $"held frame 0x{f.Type:X2}")) { stale++; continue; }
             long now = Stopwatch.GetTimestamp();
-            FeedNativeAtRead(f.Type, f.Payload, now, replay: true);
-            if (Wo207Queue(writer, new InFrame(f.Type, f.Payload, now, f.Stamp), f.Type)) n++;
+            if (LoadSequenceWritable) FeedNativeAtRead(f.Type, f.Payload, now, replay: true, presentation: f.Presentation);
+            var resumed = LoadSequenceEnabled ? f with { Arrival = now } : new InFrame(f.Type, f.Payload, now, f.Stamp);
+            if (Wo207Queue(writer, resumed, f.Type)) n++;
         }
         Interlocked.Add(ref _w136Replayed, n);
         Console.WriteLine(FormattableString.Invariant(
@@ -132,9 +134,10 @@ public partial class GameBridge
     private void Wo136OnLoadSeen(string what)
     {
         P1OnLoadSeen(what);
-        T3SideChannelsInvalidate("load-" + what);
+        if (!LoadSequenceEnabled) T3SideChannelsInvalidate("load-" + what);
         _ = Wo134InvalidateLedgerAsync("load-" + what);
         Wo147ForgetGuardsOnLoad(what);   // WO-147: a load re-creates the copies -- their guards are gone with the old ones
+        if (LoadSequenceEnabled) { _npcLua.Clear(); return; }
         _w136SettleUntilUtc = DateTime.MinValue;
         _w136LuaReleased = false;
         _ = ExecLuaAsync($"if KCD2MP_W136Hold then KCD2MP_W136Hold(true, 240, \"agent-{what}\") end");
@@ -144,6 +147,7 @@ public partial class GameBridge
     private void Wo136OnGameplayStarted()
     {
         P1OnGameplayStarted();
+        if (LoadSequenceEnabled) return;
         _w136SettleUntilUtc = DateTime.UtcNow + W136Settle;
         _w136LuaReleased = false;
         Console.WriteLine(FormattableString.Invariant($"MP-W136 Gameplay started: NPCs wait {W136Settle.TotalSeconds:F0} s more (settle), then the held frames are replayed"));
@@ -157,7 +161,7 @@ public partial class GameBridge
     /// <summary>The mod's hold follows the agent's (idempotent; re-told every 5 s while in the world).</summary>
     private async Task Wo136TellModAsync(bool force = false)
     {
-        if (Wo136Holding) return;
+        if (LoadSequenceEnabled || Wo136Holding) return;
         var now = DateTime.UtcNow;
         if (!force && _w136LuaReleased && now - _w136LuaToldUtc < TimeSpan.FromSeconds(5)) return;
         _w136LuaToldUtc = now;

@@ -291,7 +291,9 @@ public class VerdictTests
     [InlineData("MP-RP-COMBAT-ACTION eid=0x42 token=21 result=confirmed")]
     [InlineData("MP-RP-KO eid=0x42 token=22 down=1 result=confirmed")]
     [InlineData("MP-RP-DAMAGE escaped_cause attacker=0x42 victim=0x43 missile=0 application=unconfirmed n=1")]
-    public void Collection_keeps_scoped_engine_readback(string line) => Assert.True(NoiseRules.IsProtected(line));
+    [InlineData("MP-LOAD-SEQUENCE role=joiner gen=23 world=8 phase=Reconstruct link_hold=0")]
+    [InlineData("MP-LOAD-STALE role=host gen=23 stale_gen=22 world=8 stale_world=7 type=0x11 n=1")]
+    public void Collection_keeps_gameplay_and_load_evidence(string line) => Assert.True(NoiseRules.IsProtected(line));
 
     [Theory]
     [InlineData("rp_actions_in=0 rp_actions_played=0 rp_actions_pending=0", VerdictStatus.Grey, "–")]
@@ -352,6 +354,64 @@ public class VerdictTests
         var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "rp_ko_up_lag_ms_p95");
         Assert.Equal(VerdictStatus.Grey, row.Status);
         Assert.Equal(measurement, row.Measurement);
+    }
+
+    [Theory]
+    [InlineData(5, 23, 5, 23, 9, "Play", VerdictStatus.Green)]
+    [InlineData(5, 23, 5, 22, 9, "Play", VerdictStatus.Grey)]
+    [InlineData(5, 23, 5, 23, 0, "Play", VerdictStatus.Grey)]
+    [InlineData(5, 0, 5, 0, 9, "Play", VerdictStatus.Grey)]
+    [InlineData(3, 23, 3, 23, 9, "Reconstruct", VerdictStatus.Grey)]
+    [InlineData(8, 23, 5, 23, 9, "–", VerdictStatus.Grey)]
+    public void Load_play_requires_matching_agent_and_native_observations_in_one_generation(int phase, int generation,
+        int nativePhase, int nativeGeneration, int observations, string measurement, VerdictStatus status)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [$"MP-T3-STATS origin=agent role=joiner section=load load_phase={phase} load_gen={generation} " +
+            $"load_phase_native={nativePhase} load_native_gen={nativeGeneration} load_native_observations={observations}"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "load_phase");
+        Assert.Equal(status, row.Status);
+        Assert.Equal(measurement, row.Measurement);
+    }
+
+    [Fact]
+    public void Load_keeps_separate_duration_bases_and_does_not_join_a_stale_mirror_to_current_agent_phase()
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [
+            "MP-T3-STATS origin=agent role=host section=load load_gen=23 load_phase=5 load_phase_ms_load=391 " +
+            "load_native_gen=23 load_phase_native=5 load_native_observations=6 load_native_phase_ms_load=175",
+            "MP-T3-STATS origin=agent role=host section=load load_gen=24 load_phase=5 load_phase_ms_load=542"];
+        input.Logs["kcdmp-native.log"] = [
+            "MP-T3-STATS origin=dll source=agent role=host section=load load_gen=23 load_phase=5 load_native_gen=23 " +
+            "load_phase_native=5 load_native_observations=6 load_native_phase_ms_load=175"];
+        var rows = VerdictRules.Evaluate(input).Rows;
+        Assert.Equal(VerdictStatus.Grey, Assert.Single(rows, row => row.Id == "load_phase").Status);
+        Assert.Equal("Agent 542 ms", Assert.Single(rows, row => row.Id == "load_phase_ms_load").Measurement);
+        input.Logs["agent.log"] = [input.Logs["agent.log"][0]];
+        rows = VerdictRules.Evaluate(input).Rows;
+        Assert.Equal("Agent 391 ms, DLL 175 ms", Assert.Single(rows, row => row.Id == "load_phase_ms_load").Measurement);
+        Assert.Equal("–", Assert.Single(rows, row => row.Id == "load_phase_ms_exit").Measurement);
+    }
+
+    [Theory]
+    [InlineData("load_gen=4 load_native_gen=4 load_native_observations=5 stale_gen_dropped=0 stale_gen_native_dropped=0", "0", "0",
+        VerdictStatus.Grey, VerdictStatus.Grey)]
+    [InlineData("load_gen=4 load_native_gen=4 load_native_observations=5 stale_gen_dropped=3 stale_gen_native_dropped=2", "3", "2",
+        VerdictStatus.Green, VerdictStatus.Green)]
+    [InlineData("load_gen=4 load_native_gen=4 load_native_observations=0 stale_gen_dropped=3 stale_gen_native_dropped=2", "3", "–",
+        VerdictStatus.Green, VerdictStatus.Grey)]
+    [InlineData("stale_gen_dropped=3 stale_gen_native_dropped=2", "–", "–", VerdictStatus.Grey, VerdictStatus.Grey)]
+    public void Old_generation_rejections_are_independent_and_zero_is_unexercised(string fields, string agent, string native,
+        VerdictStatus agentStatus, VerdictStatus nativeStatus)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = ["MP-T3-STATS origin=agent role=host section=load " + fields];
+        var rows = VerdictRules.Evaluate(input).Rows;
+        var agentRow = Assert.Single(rows, row => row.Id == "stale_gen_dropped");
+        Assert.Equal((agent, agentStatus), (agentRow.Measurement, agentRow.Status));
+        var nativeRow = Assert.Single(rows, row => row.Id == "stale_gen_native_dropped");
+        Assert.Equal((native, nativeStatus), (nativeRow.Measurement, nativeRow.Status));
     }
 
     [Fact]

@@ -1,6 +1,7 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+#include "load_sequence.h"
 #include "wo143.h"
 #include "talk_hold.h"
 #include "wo208.h"
@@ -789,6 +790,20 @@ bool change_pending(uint32_t eid) {
 }
 struct Deferred { std::string name, frag, tags; uint64_t alignW = 0; uint8_t flags = 0; bool stop = false; double at = 0; };
 std::unordered_map<uint32_t, Deferred> g_deferred;
+
+void synchronize_load(uint64_t stamp) {
+    static uint64_t previous = 0;
+    if (previous == stamp) return;
+    if (loadsequence::old_generation(previous, stamp)) loadsequence::note_stale(g_deferred.size());
+    previous = stamp;
+    g_deferred.clear();
+    for (auto& shot : g_flight) {
+        if (shot.heldByUs) npcdrive::set_activity_hold(shot.eid, false);
+        if (shot.ranged.token) timelineactions::observed(shot.ranged.token, false);
+    }
+    g_flight.clear();
+}
+
 std::atomic<uint32_t> c_deferred{0}, c_deferReplaced{0}, c_deferStarted{0}, c_deferExpired{0};
 constexpr double kDeferMaxS = 3.0;
 void deferred_tick(double now) {
@@ -1290,6 +1305,9 @@ void install() {
 }
 
 void tick() {
+    const uint64_t loadStamp = loadsequence::stamp();
+    synchronize_load(loadStamp);
+    if (!loadsequence::allows(loadStamp, loadsequence::Access::Live)) return;
     static unsigned n = 0;
     if ((++n % 15) == 0) research_watch();
     const double now = now_s();
@@ -1329,6 +1347,9 @@ bool rp_ranged_available(uint32_t eid, const uint8_t itemClass[16]) {
 }
 
 bool rp_ranged(uint32_t eid, uint8_t weapon, uint8_t phase, const uint8_t itemClass[16], uint64_t token) {
+    const uint64_t loadStamp = loadsequence::stamp();
+    synchronize_load(loadStamp);
+    if (!loadsequence::allows(loadStamp, loadsequence::Access::Live)) return false;
     const char* fragment = rpbodyactions::ranged_fragment(weapon, phase);
     if (!token || !fragment || !rp_ranged_available(eid, itemClass)) return false;
     void* e = engine::entity_by_id(eid);
@@ -1349,6 +1370,7 @@ void on_pipe_closed() {
 }
 
 uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
+    synchronize_load(loadsequence::stamp());
     *outLen = 0;
     if (!len) return kRBadRequest;
     auto name_at = [&](size_t off, std::string* nm, size_t* next) -> bool {

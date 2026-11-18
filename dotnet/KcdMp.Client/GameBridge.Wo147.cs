@@ -75,12 +75,14 @@ public partial class GameBridge
         {
             await foreach (var f in lane.ReadAllAsync(ct))
             {
+                if (!LoadSequenceFrameCurrent(f) || (LoadSequenceEnabled && Wo136Defer(f))) continue;
+                using var loadLife = LoadSequenceLink(f, ct);
                 if (Wo140DropSeparate(f.Type)) continue;
                 if (f.Type == Protocol.LeashDown && f.Payload.Length > 1 + Protocol.JoinHeaderLen && f.Payload[1 + Protocol.JoinHeaderLen] == Protocol.LeashKindPull &&
                     (f.Stamp == 0 || f.Stamp != _w206.World || f.TeleportGeneration != P1Lifecycle.Current.Generation ||
                     f.TeleportLifeRevision != Interlocked.Read(ref _t3InputLifeRevision))) continue;   // WO-140: a joiner in its own world
                 Interlocked.Increment(ref _w147LeashLaneFrames);
-                try { await Wo123OnFrameAsync(f.Type, f.Payload, ct, f.Stamp); }
+                try { await Wo123OnFrameAsync(f.Type, f.Payload, loadLife?.Token ?? ct, f.Stamp); }
                 catch (Exception ex) { Console.WriteLine($"MP-LEASH lane: a frame failed: {ex.GetType().Name}: {ex.Message}"); }
             }
         }

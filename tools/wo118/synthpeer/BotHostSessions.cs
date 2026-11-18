@@ -62,6 +62,11 @@ sealed class BotHostSessions
         }
     }
 
+    public bool IsPending(Join join)
+    {
+        lock (gate) return pending == join && peers.GetValueOrDefault(join.Peer.Id) == join.Peer;
+    }
+
     public Join? ReadyFor(Peer? peer)
     {
         lock (gate) return ready is not null && ready.Peer == peer ? ready : null;

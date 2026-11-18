@@ -376,6 +376,7 @@ public sealed class LogTailGameTransport : IGameTransport
     public event Action? GameplayStarted;
     /// <summary>The real engine postload-reconstruction timeout line, never a synthetic settle deadline.</summary>
     public event Action? PostLoadReconstructionTimeout;
+    public event Action? LoadReconstructionStarted;
 
     /// <summary>
     /// WO-123: the engine printed "[CryAction] LoadGame: '...'" -- a save load
@@ -1099,6 +1100,11 @@ public sealed class LogTailGameTransport : IGameTransport
         int tagIdx = line.IndexOf(Tag);
         if (tagIdx < 0)
         {
+            if (LoadReconstructionStarted is not null &&
+                line.IndexOf("Sending concept notification 'EntityModuleOnPostLoadGame'", StringComparison.Ordinal) >= 0 &&
+                line.IndexOf("[KCD2-MP", StringComparison.Ordinal) < 0)
+                try { LoadReconstructionStarted.Invoke(); }
+                catch (Exception ex) { Console.WriteLine($"[load] reconstruction observer threw: {ex.GetType().Name}"); }
             if (line.IndexOf("[KCD2-MP", StringComparison.Ordinal) < 0 &&
                 line.IndexOf("Loading screen timeouted while still in post load reconstruction", StringComparison.Ordinal) >= 0)
                 try { PostLoadReconstructionTimeout?.Invoke(); }

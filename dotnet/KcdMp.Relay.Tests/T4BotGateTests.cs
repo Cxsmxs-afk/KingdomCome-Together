@@ -95,6 +95,21 @@ public sealed class T4BotGateTests
         Assert.True(result.ExitCode == 0, result.Output);
     }
 
+    [Theory]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    public async Task Load_weather_requires_its_environment_and_both_options(bool environment, bool flag, bool profile)
+    {
+        var args = new List<string> { "--test-bot" };
+        if (flag) args.Add("--test-load-sequence");
+        if (profile) args.AddRange(["--weather-during-load", "Cloudy"]);
+        await using var bot = T4BotTools.StartLoadSequence("SynthPeer", environment, args.ToArray());
+        var result = await bot.WaitAsync();
+        Assert.Equal(2, result.ExitCode);
+        Assert.Contains("KCDMP_TEST_LOAD_SEQUENCE", result.Output);
+    }
+
     private static IEnumerable<string> TextUnder(string folder)
     {
         foreach (string file in Directory.EnumerateFiles(folder))
@@ -126,6 +141,12 @@ internal sealed class T4BotTools : IAsyncDisposable
     }
 
     public static T4BotTools Start(string tool, bool enabled, params string[] args)
+        => Start(tool, enabled, false, args);
+
+    public static T4BotTools StartLoadSequence(string tool, bool loadSequence, params string[] args)
+        => Start(tool, true, loadSequence, args);
+
+    private static T4BotTools Start(string tool, bool enabled, bool loadSequence, string[] args)
     {
         string folder = tool == "AvatarPeer" ? "tools/wo121/avatarpeer" : "tools/wo118/synthpeer";
         string configuration = new DirectoryInfo(AppContext.BaseDirectory).Parent!.Name;
@@ -139,7 +160,9 @@ internal sealed class T4BotTools : IAsyncDisposable
             RedirectStandardError = true
         };
         info.Environment.Remove(EnvironmentFlag);
+        info.Environment.Remove("KCDMP_TEST_LOAD_SEQUENCE");
         if (enabled) info.Environment[EnvironmentFlag] = "1";
+        if (loadSequence) info.Environment["KCDMP_TEST_LOAD_SEQUENCE"] = "1";
         info.ArgumentList.Add(dll);
         foreach (string arg in args) info.ArgumentList.Add(arg);
         return new(Process.Start(info) ?? throw new InvalidOperationException($"Cannot start {tool}"));
