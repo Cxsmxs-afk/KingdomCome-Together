@@ -31,6 +31,13 @@ if (args.Contains("--w175coop"))
 if (args.Contains("--w175"))
     return Wo175SaveHealth.RunCli(args, Console.Out);
 
+if (!TestRecordingOptions.TryRead(args, Environment.GetEnvironmentVariable("KCDMP_TEST_RECORD"),
+    out var recording, out args))
+{
+    Console.Error.WriteLine("Use KCDMP_TEST_RECORD=1 with --test-record or --test-record=<file.kcdrec>.");
+    return 2;
+}
+
 // Settings live in kcdmp-client.json next to the executable; it is created with
 // defaults on first run. Everything can still be overridden on the command line:
 //   named:      --host <ip> --port <n> --name <s> --game-api <url> [--no-voice]
@@ -306,8 +313,16 @@ AppDomain.CurrentDomain.ProcessExit += (_, _) => { cts.Cancel(); Thread.Sleep(50
 // WO-206 Part C: applied.jsonl beside the exe -- one session per file, so it starts empty (nothing else is touched)
 Wo206Applied.StartSession();
 var bridge = new GameBridge(config);
+using var recorder = recording?.Open();
+if (recording is not null && recorder is null) return 2;
+bridge.RecordSession(recorder);
 // WO-179 0.3: an agent that exits gives the joiner's host-only save lock back first (the mod's lease covers a kill)
 AppDomain.CurrentDomain.ProcessExit += (_, _) => bridge.ReleaseSaveLockOnExit("agent-exit");
 await bridge.RunAsync(cts.Token);
 bridge.ReleaseSaveLockOnExit("agent-stop");
+if (recorder is not null)
+{
+    recorder.Dispose();
+    Console.WriteLine(recorder.Failed ? "MP-T2-RECORD incomplete" : "MP-T2-RECORD complete");
+}
 return 0;

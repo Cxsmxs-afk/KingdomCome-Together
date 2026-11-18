@@ -1135,6 +1135,7 @@ public partial class GameBridge(ClientConfig config)
         var http = new HttpGameTransport(config.GameApiBase) { RetryBatches = config.BatchRetryEnabled };   // WO-153 3
         await http.StartAsync(ct);
         _transport = http;
+        UpdateRecordingTransport();
 
         // WO-50: created once for the process's whole lifetime (not per relay
         // connection) so a reconnect doesn't tear down and re-open the
@@ -1312,7 +1313,10 @@ public partial class GameBridge(ClientConfig config)
             // Chosen after the game is up, because the log-tail probe needs the
             // mod running to answer.
             if (ReferenceEquals(_transport, http))
+            {
                 _transport = await SelectTransportAsync(http, ct);
+                UpdateRecordingTransport();
+            }
 
             try
             {
@@ -1374,7 +1378,7 @@ public partial class GameBridge(ClientConfig config)
         bool menuSaid = false;
         while (!ct.IsCancellationRequested)
         {
-            if (await _transport.IsGameReadyAsync(ct))
+            if (await GameCalls.IsGameReadyAsync(ct))
             {
                 // WO-124: GameTime > 0 is also what a failed load leaves behind at
                 // the main menu (observed). Ask whether the player entity exists.
@@ -1940,6 +1944,12 @@ public partial class GameBridge(ClientConfig config)
 
         if (_transport is LogTailGameTransport tailForPause)
         {
+            if (_sessionRecorder is not null)
+            {
+                tailForPause.LoadStarted += RecordLoadStarted;
+                tailForPause.GameplayStarted += RecordGameplayStarted;
+                tailForPause.MainMenuShown += RecordMainMenuShown;
+            }
             tailForPause.PauseStateChanged += OnLocalPauseDetected;
             tailForPause.SkipTimeStateChanged += OnLocalSkipTime;
             tailForPause.StoryBeatDetected += OnLocalStoryBeat;
@@ -2008,7 +2018,7 @@ public partial class GameBridge(ClientConfig config)
             while (link.IsOpen)   // WO-127: TcpClient.Connected, or the Steam connection's state
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var state = await _transport.ReadPlayerStateAsync(cts.Token);
+                var state = await GameCalls.ReadPlayerStateAsync(cts.Token);
                 sw.Stop();
                 totalReadMs += sw.ElapsedMilliseconds;
                 tickCount++;
@@ -2409,6 +2419,12 @@ public partial class GameBridge(ClientConfig config)
 
             if (_transport is LogTailGameTransport tailForPause2)
             {
+                if (_sessionRecorder is not null)
+                {
+                    tailForPause2.LoadStarted -= RecordLoadStarted;
+                    tailForPause2.GameplayStarted -= RecordGameplayStarted;
+                    tailForPause2.MainMenuShown -= RecordMainMenuShown;
+                }
                 tailForPause2.PauseStateChanged -= OnLocalPauseDetected;
                 tailForPause2.SkipTimeStateChanged -= OnLocalSkipTime;
                 tailForPause2.StoryBeatDetected -= OnLocalStoryBeat;   // WO-90
@@ -3959,7 +3975,7 @@ public partial class GameBridge(ClientConfig config)
         // the lethal apply below can trip the observer.
         try
         {
-            await _transport.ExecuteNowAsync(
+            await GameCalls.ExecuteNowAsync(
                 $"if KCD2MP_NpcRemoteDeath then KCD2MP_NpcRemoteDeath(\"{npcName}\", \"{via.Replace('"', '\'')}\") end", ct);
         }
         catch (Exception ex) { Console.WriteLine($"[npcdeath] Lua remote-death mark failed for '{npcName}': {ex.Message}"); }
@@ -4052,6 +4068,7 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private Task OnLocalDownedAsync(bool on, byte kind)
     {
+        if (_sessionRecorder is not null) RecordGameEvent(on ? "local_down" : "local_up", kind.ToString(CultureInfo.InvariantCulture));
         long previousLife = Interlocked.Read(ref _t3InputLifeRevision);
         T3NoteInputLifeEdge(on);
         if (previousLife != Interlocked.Read(ref _t3InputLifeRevision)) { T3TpInvalidate(); P6Invalidate(); }
@@ -4795,6 +4812,7 @@ public partial class GameBridge(ClientConfig config)
                 await ReadExactAsync(stream, payload, ct);
                 ct.ThrowIfCancellationRequested();
                 long arrival   = Stopwatch.GetTimestamp();
+                RecordRelayRead(header, payload);
                 int wireBytes  = payloadLen + 3;
                 if (!PresentationReadFrame(presentationSession, ref type, ref payload, arrival, out var presentation, ct)) continue;
                 long p6ReadTick = Environment.TickCount64;
@@ -6021,6 +6039,8 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private void OnGameEvent(string name, string arg)
     {
+        if (_sessionRecorder is not null && TestRecordingOptions.AllowsGameEvent(name))
+            RecordGameEvent(name, arg);
         // WO-38: the world-clock reading is consumed regardless of the
         // interaction layer's state -- it feeds the time-skip sync, which has
         // no dependency on sessions being up.
@@ -8170,7 +8190,12 @@ public partial class GameBridge(ClientConfig config)
         long t0 = Stopwatch.GetTimestamp();
         await _tcpWriteLock.WaitAsync(ct);
         long t1 = Stopwatch.GetTimestamp();
-        try { ProcessorFrameScope.ThrowIfAbandoned(); await stream.WriteAsync(packet, ct); }
+        try
+        {
+            ProcessorFrameScope.ThrowIfAbandoned();
+            await stream.WriteAsync(packet, ct);
+            if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
+        }
         finally
         {
             _tcpWriteLock.Release();

@@ -85,7 +85,7 @@ public partial class GameBridge
         if (_where == GameWhere.Menu) return;
         if (LuaCommandBudget.EncodedLength(lua) + LuaCommandBudget.WrapperEncodedChars > LuaCommandBudget.MaxEncodedCommandChars)
             throw new InvalidDataException("loot Lua command exceeds the encoded console budget");
-        await _transport.ExecuteNowAsync(lua, link.Token);
+        await GameCalls.ExecuteNowAsync(lua, link.Token);
         T3LootGuard(link.Token);
     }
 

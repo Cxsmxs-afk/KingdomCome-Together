@@ -263,6 +263,7 @@ public partial class GameBridge
         else if (link.Steam is not null) Console.WriteLine("MP-LINK steam-config left at Steam's own (the twin: steam_cfg off)");
         if (W213Switch.TwinOff("link_sched")) { Console.WriteLine("MP-LINK scheduler OFF (the twin: link_sched) -- every frame written in order as before"); return; }
         ILinkPath path = link.Steam is { } s2 ? new SteamLinkPath(s2) : new StreamLinkPath(stream);
+        if (_sessionRecorder is { } recorder) path = new RecordingRelayPath(path, recorder);
         var sched = new LinkScheduler(new LinkSchedOptions { Budget = !W213Switch.TwinOff("link_budget") });
         // D.4: this player's own position is the top band; everything else this agent sends is its own few bodies
         if (!W213Switch.TwinOff("figure_band")) sched.BandOf = p => p.Kind == "pos" ? 0 : null;
