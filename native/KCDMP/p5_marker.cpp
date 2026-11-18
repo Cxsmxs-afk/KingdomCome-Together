@@ -135,6 +135,7 @@ void set_event(EventFn fn){g_event=fn;}
 bool suspended(){return g_preparing;}
 void set_suspended(bool on){g_preparing=on;}
 uint64_t physical_world(){return g_physical;}
+bool loaded_scope(uint32_t* world){if(world)*world=g_world;return g_scopeKnown&&!g_preparing;}
 void counts(uint64_t out[3]){if(out){out[0]=g_added;out[1]=g_fallbacks;out[2]=0;}}
 bool render_add(void* entity,Ref* out,int type,unsigned picture,const char* label,bool death){
     if(!out||g_preparing||!g_scopeKnown||!gameplay()||!g_backend.ready||!g_backend.ready())return false;

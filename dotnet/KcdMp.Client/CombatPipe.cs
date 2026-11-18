@@ -2249,6 +2249,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
                     var   soul    = new Guid(body.AsSpan(0, 16));
                     float stamina = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(16));
                     float health  = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(20));
+                    if (body.Length > 27)
+                    {
+                        // A malformed new receipt must never become an untyped legacy damage send.
+                        if (MeasuredMissileEvidence.TryDecode(body, out var evidence) && OnMeasuredMissile is { } measured)
+                        { try { await measured(soul, stamina, health, evidence); } catch (Exception ex) { Console.WriteLine($"P6 measured hit refused: {ex.Message}"); } }
+                        continue;
+                    }
                     // WO-86: trailing died byte; absent from a pre-WO-86 DLL.
                     bool  died    = body.Length >= 25 && body[24] != 0;
                     bool  byPlayer = body.Length >= 26 && body[25] != 0;   // WO-121

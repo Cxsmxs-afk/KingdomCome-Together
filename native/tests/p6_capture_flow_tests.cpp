@@ -1,0 +1,56 @@
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+#include "wo201.h"
+#include "p6_capture.h"
+#include "p6_rules.h"
+#include <array>
+#include <cstdio>
+#include <cstring>
+namespace {
+uint64_t clockMs=1000,gen=1,life=11;
+bool playable=true,hasActor=true,hasSoul=true,changeDuringHand=false;
+uint8_t phase=0,known=3,left=0x11,right=0;
+int actorObject=0,soulObject=0,passedCount=0,failedCount=0;
+#define C6(c,label) do{if(c)++passedCount;else{++failedCount;std::printf("FAIL P6 capture %d: %s\n",__LINE__,label);}}while(false)
+uint64_t now(){return clockMs;}uint64_t generation(){return gen;}uint64_t epoch(){return life;}bool gameplay(){return playable;}
+void* actor(uint32_t* eid){*eid=hasActor?44:0;return hasActor?&actorObject:nullptr;}
+void* soul(){return hasSoul?&soulObject:nullptr;}
+uint8_t readPhase(void*){return phase;}
+uint8_t hands(uint32_t,uint8_t* l,uint8_t* r){std::memset(l,0,16);std::memset(r,0,16);l[0]=left;r[0]=right;if(changeDuringHand)++life;return known;}
+struct Reply {uint8_t code=255;size_t size=0;std::array<uint8_t,512> b{};};
+Reply poll(bool on=true,uint64_t expected=0){uint8_t b[11]={86,2,uint8_t(on?1:0)};kcdmp::p6rules::put64(b+3,expected?expected:gen);Reply r;r.code=kcdmp::wo201ranged::handle(b,sizeof b,r.b.data(),r.b.size(),&r.size);return r;}
+void step(uint8_t p,uint64_t ms=50){phase=p;clockMs+=ms;kcdmp::wo201ranged::tick();}
+void reset(){clockMs=1000;gen=1;life=11;playable=hasActor=hasSoul=true;changeDuringHand=false;phase=0;known=3;left=0x11;right=0;kcdmp::wo201ranged::set_test_backend({now,generation,epoch,gameplay,actor,soul,readPhase,hands});kcdmp::wo201ranged::reset_for_tests();C6(poll().code==0,"current gameplay enables native v2 capture");}
+}
+namespace kcdmp::wo201ranged {void test_trace(const char*,...){} }
+int p6_capture_flow_tests(int* passed){
+    using namespace kcdmp::wo201ranged;using namespace kcdmp::p6rules;
+    passedCount=failedCount=0;
+    reset();step(1);step(2);step(3);left=0x22;step(4);
+    auto r=poll();C6(r.code==0&&r.size==18+4*48&&r.b[1]==4,"actual tick and poll emits1,2,3,4 in one typed batch");
+    C6(r.b[18]==1&&r.b[66]==2&&r.b[114]==3&&r.b[162]==4,"actual phase FIFO");
+    C6(r.b[18+16]==0x11&&r.b[114+16]==0x11&&r.b[162+16]==0x22,"queued Bow Fire is never relabeled after hand changes to Crossbow");
+    C6(r.b[19]==1&&r.b[20]==3&&u64(r.b.data()+2)==gen,"strict native source and known mask are carried");
+    reset();step(3);left=0x22;step(3);r=poll();C6(r.b[1]==1&&r.b[18+16]==0x11,"same firing clip plus later hand change cannot invent a second shot or relabel the first");
+    reset();known=0;left=right=0;step(3);known=3;left=0x44;r=poll();
+    C6(r.b[18+1]==0&&r.b[18+2]==0&&r.b[18+16]==0,"unreadable capture stays unknown despite fresh hand before poll");
+    uint64_t counts[6]{};t3_counts(counts);C6(counts[2]==1,"unknown hand diagnostic counts actual captured phase");
+    reset();step(1,600);step(2,600);step(3,600);r=poll();C6(r.b[1]==3,"long but stable gameplay frames do not restart an endless5second settle");
+    reset();hasActor=false;step(1);t3_counts(counts);C6(counts[0]==1&&poll().b[1]==0,"missing actor is distinct from a proved none phase");
+    hasActor=true;phase=255;clockMs+=50;tick();t3_counts(counts);C6(counts[1]==1,"unreadable phase has separate diagnostic and no idle fabrication");
+    reset();step(1);++life;r=poll();C6(r.b[1]==0,"life change drops old queued phase before drain");t3_counts(counts);C6(counts[5]==1,"life drop is visible in cached lifecycle counter");
+    reset();step(3);clockMs+=2001;r=poll();C6(r.b[1]==0,"old capture is expired rather than restamped at poll");t3_counts(counts);C6(counts[4]==1,"expiry counter counts discarded row");
+    reset();const auto firstEpoch=u64(poll().b.data()+10);for(unsigned i=0;i<33;++i)step(uint8_t(i%2+1));r=poll();t3_counts(counts);
+    C6(r.b[1]==0&&u64(r.b.data()+10)!=firstEpoch&&counts[3]==1,"overflow drops an unsafe sequence and changes only visual stream epoch");
+    step(3);r=poll();C6(r.b[1]==1&&r.b[18]==3,"next real phase resynchronizes after overflow");C6(life==11,"visual overflow does not mutate contact or player lifecycle epoch");
+    reset();for(unsigned i=0;i<25;++i)step(uint8_t(i%2+1));auto a=poll(),b=poll(),c=poll();
+    C6(a.size==498&&a.b[1]==10&&b.size==498&&b.b[1]==10&&c.b[1]==5,"Queue32 drains whole48byte rows in <=512byte pages");
+    C6(u32(a.b.data()+18+4)==1&&u32(b.b.data()+18+4)==11&&u32(c.b.data()+18+4)==21,"paged sequence stays ordered without duplicates");
+    reset();step(1);const auto beforeOff=u64(poll().b.data()+10);step(3);r=poll(false);C6(r.b[1]==0&&u64(r.b.data()+10)!=beforeOff,"visual disable clears queue and resets only its stream");
+    C6(life==11,"visual disable leaves independent contact lifecycle unchanged");
+    reset();step(1);C6(poll(false,gen+1).code!=0,"stale generation disable changes no capture config");step(2);r=poll();C6(r.b[1]==2,"valid capture still runs after refused stale disable");
+    reset();changeDuringHand=true;step(3);r=poll();C6(r.b[1]==0,"life change during engine hand read cannot publish stale capture");
+    reset();step(3);playable=false;r=poll();C6(r.code!=0,"no gameplay proof cannot drain old capture");
+    on_pipe_closed();playable=true;tick();r=poll();C6(r.b[1]==0,"pipe close invalidates prior presentation queue");
+    if(passed)*passed=passedCount;
+    return failedCount;
+}

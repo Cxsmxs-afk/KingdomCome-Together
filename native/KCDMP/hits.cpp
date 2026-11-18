@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // WO-121 Phases 5 and 6 -- see hits.h.
 #include "hits.h"
+#include "p6_missile.h"
 #include "wo208.h"
 #include "wo208_rules.h"
 #include "wo166.h"
@@ -126,7 +127,7 @@ void* avatar_soul(uint32_t eid) {
 
 // ---- the hook's queue (any thread -> main thread) -----------------------------------
 struct PvpHit { uint32_t victimEid; float st, hp; uint8_t flags, material; };
-struct PlayerHitMark { uint32_t victimEid; double at; };
+struct PlayerHitMark { uint32_t victimEid; double at; bool invalidate=false; };
 std::mutex g_qMutex;
 std::vector<PvpHit> g_pvp;
 std::vector<PlayerHitMark> g_marks;
@@ -216,6 +217,7 @@ void* hit_common(bool missile, HitFn orig, void* self, void* out, const uint8_t*
     (missile ? c_missile : c_melee).fetch_add(1, std::memory_order_relaxed);
     uint64_t aw = 0, vw = 0; uint32_t aeid = 0, veid = 0; uint8_t mat = 0;
     if (!g_pvpHook.load(std::memory_order_relaxed) || !read_hit(data, &aw, &aeid, &vw, &veid, &mat)) return orig(self, out, data);
+    const bool measuredMissile=p6::contact(missile,aeid,veid,self,aw!=0&&aw==g_playerWuid.load(std::memory_order_relaxed)); // always run original cause producer
     // WO-165: our own replay of a blow (wo165.cpp) -- on the thread that opened the window, this attacker on this victim. Exempt from
     // the discard (WO-162 Q1.3 #9: a replay from an engaged copy would be put back) and from every other branch: the record the engine
     // built is copied (the probe's reads: block +0x54/+0x55, perfect +0x56, broken +0x57, zone mismatch +0x61), the victim is watched
@@ -240,15 +242,15 @@ void* hit_common(bool missile, HitFn orig, void* self, void* out, const uint8_t*
     }
     // WO-170 F1: a blow of a partner's figure. The figure only ever does what its partner does: a blow that no relayed swing of his
     // matches is the figure's own (its brain, an animation's collision) and is measured and put back like the avatar's own hits above --
-    // never skipped (the engine's call wants a cause back). Melee only: the partner's arrows are not relayed swings (counted, passed).
-    if (g_figureGuard.load(std::memory_order_relaxed) && aeid && avatar_soul(aeid) && veid != aeid) {
+    // never skipped (the engine's call wants a cause back). P6: remote-figure missiles have no relayed shooting authority;
+    // use the existing measured put-back watch, never the melee ledger or a synthetic cause.
+    if (p6rules::figure_guard(missile,g_figureGuard.load(std::memory_order_relaxed)) && aeid && avatar_soul(aeid) && veid != aeid) {
         c_figSeen.fetch_add(1, std::memory_order_relaxed);
-        if (missile) {
-            c_figMissile.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            wo170rules::Verdict verdict;
-            { std::lock_guard<std::mutex> lock(g_qMutex); verdict = g_ledger.take(aeid, now_s()); }
-            if (verdict == wo170rules::Verdict::Relayed) {
+        {
+            if(missile)c_figMissile.fetch_add(1,std::memory_order_relaxed);
+            bool ledgerMatch=false;
+            if(!missile){std::lock_guard<std::mutex> lock(g_qMutex);ledgerMatch=g_ledger.take(aeid,now_s())==wo170rules::Verdict::Relayed;}
+            if (p6rules::figure_relayed(missile,ledgerMatch)) {
                 const uint32_t n = c_figRelayed.fetch_add(1, std::memory_order_relaxed);
                 if (n < 20 || (n % 50) == 0) logf("WO170-FIGUREHIT relayed by=0x%X victim=0x%X -- matches a swing the partner sent: applied [n=%u]", aeid, veid, n + 1);
             } else {
@@ -266,7 +268,7 @@ void* hit_common(bool missile, HitFn orig, void* self, void* out, const uint8_t*
                 void* res = orig(self, out, data);
                 {
                     std::lock_guard<std::mutex> lock(g_qMutex);
-                    g_newWatches.push_back({vs, veid, hp0, st0, static_cast<uint8_t>(0), mat, static_cast<uint8_t>(kWatchFigure), aeid});
+                    g_newWatches.push_back({vs, veid, hp0, st0, static_cast<uint8_t>(missile?0x02:0), mat, static_cast<uint8_t>(kWatchFigure), aeid});
                 }
                 g_figureWatchesOpen.fetch_add(1, std::memory_order_relaxed);
                 return res;
@@ -356,7 +358,7 @@ void* hit_common(bool missile, HitFn orig, void* self, void* out, const uint8_t*
     if (aw != 0 && aw == g_playerWuid.load(std::memory_order_relaxed) && veid) {
         {
             std::lock_guard<std::mutex> lock(g_qMutex);
-            if (g_marks.size() < 128) g_marks.push_back({veid, 0});
+            if (g_marks.size() < 128) g_marks.push_back({veid, 0, measuredMissile});
         }
         // WO-176 (B1a): the engine's own verdict on the host's real blow (the record it built: block +0x54, second +0x55, perfect +0x56,
         // broken +0x57) -- the baseline the joiner's real hits are compared with. Read only, never changes the blow.
@@ -532,6 +534,7 @@ uint8_t on_config(const uint8_t* body, size_t len) {
     return 0;
 }
 
+bool avatar_known(uint32_t eid){return avatar_soul(eid)!=nullptr;}
 void note_avatar(uint32_t eid, void* soul, bool on) {
     if (!on) { std::lock_guard<std::mutex> lock(g_qMutex); g_ledger.forget(eid); }   // WO-170: a released body's swings are not licences
     if (on) {
@@ -831,6 +834,7 @@ void mark_player_hit(uint32_t victimEid) {
 }
 
 void tick() {
+    p6::tick(); // contact measurements precede the legacy health sampler
     // The player's WUID for the hook (a load changes the entity, not the id,
     // but it is cheap to keep fresh).
     static double s_lastWuid = 0;
@@ -986,9 +990,12 @@ void tick() {
         if (void* soul = soul_of_actor(actor_by_eid(m.victimEid))) {
             // The pipe's LocalHit looks its soul up by guid (the RTTR Soul);
             // remember both the actor's soul and its C_Soul primary.
-            g_hitSouls[soul] = now;
-            if (void* c = buffs::as_c_soul(soul)) g_hitSouls[c] = now;
-            c_marks.fetch_add(1);
+            if(m.invalidate){
+                g_hitSouls.erase(soul);if(void* c=buffs::as_c_soul(soul))g_hitSouls.erase(c);
+            }else{
+                g_hitSouls[soul]=now;if(void* c=buffs::as_c_soul(soul))g_hitSouls[c]=now;
+                c_marks.fetch_add(1);
+            }
         }
         if (kcdmp::wo136::host_target()) kcdmp::wo139::host_struck(m.victimEid);   // WO-154 3.1: a pursuit's lock goes first
         kcdmp::wo136::note_threat(m.victimEid, 0, 2, "host-hit");   // WO-136: the host's real hit, its threat
@@ -1014,7 +1021,7 @@ int status_text(char* out, int n) {
         "hit_slot=%s attribution=%s ff=%d attrib_cfg=%d melee=%u missile=%u avatar_hits=%u restored=%u ff_sent=%u player_marks=%u "
         "attributed=%u history=%u skirmish=%u pvp_in=%u hit_faults=%u npc_watch=%s npc_avatar_hits=%u npc_hits_sent=%u "
         "discard_hits=%u discarded=%u discard_eids=%d skirmish_kept_host=%u skirmish_remove=%u skirmish_relation=%s relation_asked=%u "
-        "scene_kept=%u blows_kept_out=%u figure_guard=%s fig_seen=%u fig_relayed=%u fig_dropped=%u fig_put_back=%u fig_fatal=%u fig_cancelled=%u fig_unread=%u fig_missile_passed=%u",
+        "scene_kept=%u blows_kept_out=%u figure_guard=%s fig_seen=%u fig_relayed=%u fig_dropped=%u fig_put_back=%u fig_fatal=%u fig_cancelled=%u fig_unread=%u fig_missile_guarded=%u",
         g_hookArmed ? "armed" : "off", g_attribArmed ? "armed" : "off", g_ff.load() ? 1 : 0, g_attribution.load() ? 1 : 0,
         c_melee.load(), c_missile.load(), c_avatarHits.load(), c_restored.load(), c_ffQueued.load(), c_marks.load(),
         c_attrib.load(), c_attribHistory.load(), c_skirmish.load(), c_pvpIn.load(), c_faults.load(),

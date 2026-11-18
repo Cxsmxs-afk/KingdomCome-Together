@@ -56,6 +56,7 @@ void* speak_fn();   // WO-203 I.3c: C_ActorSpeakMan::Speak as the engine runs it
 } // namespace kcdmp::wo201speech
 
 namespace kcdmp::wo201ranged {
+void t3_counts(uint64_t out[6]); // O(1) cached diagnostics, no engine reads
 void install();
 void tick();
 void on_pipe_closed();

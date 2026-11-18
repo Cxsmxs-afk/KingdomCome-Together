@@ -500,6 +500,47 @@ do
     check("o: no Lua errors", #ERRS == 0, ERRS[1])
 end
 
+-- P6: call the real obsolete API, including old requests arriving after the figure/world changed.
+do
+    ERRS = {}; clearLog()
+    local savedSpawn, savedXSpawn, savedGhosts = System.SpawnEntity, XGenAIModule.SpawnEntity, KCD2MP.ghosts
+    local savedInv, savedActor, savedHuman = player.inventory, player.actor, player.human
+    local trace = { arrow = 0, bolt = 0, spawn = 0, inventory = 0, damage = 0, shooting = 0, reads = 0 }
+    System.SpawnEntity = function(t)
+        trace.spawn = trace.spawn + 1
+        if t.Class == "Arrow" then trace.arrow = trace.arrow + 1 elseif t.Class == "Bolt" then trace.bolt = trace.bolt + 1 end
+        return {}
+    end
+    XGenAIModule.SpawnEntity = function() trace.spawn = trace.spawn + 1 end
+    local inventory = setmetatable({}, { __index = function() return function() trace.inventory = trace.inventory + 1 end end })
+    local actor = setmetatable({}, { __index = function() return function() trace.damage = trace.damage + 1 end end })
+    local human = setmetatable({}, { __index = function() return function() trace.shooting = trace.shooting + 1 end end })
+    player.inventory, player.actor, player.human = inventory, actor, human
+    local function figure()
+        return { inventory = inventory, actor = actor, human = human, GetPos = function() trace.reads = trace.reads + 1; return { x = 1, y = 2, z = 3 } end }
+    end
+    KCD2MP.ghosts = { ["1"] = { entity = figure() } }
+    for _, kind in ipairs({ "bow", "crossbow", "unknown" }) do
+        check("p6: obsolete " .. kind .. " shot is explicitly refused", KCD2MP_W201Shot("1", kind) == false)
+    end
+    local delayed = function() return KCD2MP_W201Shot("1", "bow", "old-generation") end
+    KCD2MP.ghosts = {} -- an old request can arrive with no remaining figure
+    check("p6: delayed call after figure removal is refused", delayed() == false)
+    KCD2MP.ghosts["1"] = { entity = figure() } -- the same id now names another life/body
+    check("p6: delayed call never attaches to the replacement figure", delayed() == false)
+    local poison = setmetatable({}, { __tostring = function() error("legacy shot must not inspect old arguments") end })
+    check("p6: malformed or absent old arguments remain harmless", KCD2MP_W201Shot(poison, poison) == false and KCD2MP_W201Shot() == false)
+    for _ = 1, 200 do KCD2MP_W201Shot("1", "crossbow") end
+    NOW = NOW + 120; KCD2MP_W201Shot("1", "bow")
+    check("p6: obsolete calls never spawn an Arrow, Bolt or other entity", trace.arrow == 0 and trace.bolt == 0 and trace.spawn == 0)
+    check("p6: obsolete calls never write inventory, damage or shooting", trace.inventory == 0 and trace.damage == 0 and trace.shooting == 0)
+    check("p6: obsolete calls never read the current figure position", trace.reads == 0)
+    check("p6: legacy diagnostic stays bounded once per script load", logCount("WO201-RANGED legacy-shot refused") == 1)
+    check("p6: no Lua errors", #ERRS == 0, ERRS[1])
+    System.SpawnEntity, XGenAIModule.SpawnEntity, KCD2MP.ghosts = savedSpawn, savedXSpawn, savedGhosts
+    player.inventory, player.actor, player.human = savedInv, savedActor, savedHuman
+end
+
 -- Summary, in the shared driver's contract (Test-NpcSmoothSynthetic.ps1 reads the global OUT).
 local pass, fail = 0, 0
 for _, r in ipairs(RESULTS) do if r:sub(1, 4) == "PASS" then pass = pass + 1 else fail = fail + 1 end end

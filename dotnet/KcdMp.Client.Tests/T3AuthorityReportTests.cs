@@ -19,12 +19,12 @@ public class T3AuthorityReportTests
         Assert.Equal(0x2B, header[0]);
         var body = new byte[header[1] | header[2] << 8]; await stream.ReadExactlyAsync(body, ct); return body;
     }
-    private static async Task Reply(Stream stream, byte seq, byte op, CancellationToken ct, bool truncated = false, bool worldStats = false, int statsFields = 24)
+    private static async Task Reply(Stream stream, byte seq, byte op, CancellationToken ct, bool truncated = false, bool worldStats = false, int statsFields = 30)
     {
         byte[] payload = op == Protocol.Wo216OpBrains ? Encoding.ASCII.GetBytes(truncated ? "B decision_blocked=999 npc_hidden=999" : Snapshot) : [];
         if (worldStats)
         {
-            int count = truncated ? 23 : statsFields;
+            int count = truncated ? 29 : statsFields;
             payload = new byte[2 + count * 9]; payload[0] = 1; payload[1] = (byte)count;
             for (int i = 0; i < count; i++) { payload[2 + i * 9] = (byte)i; BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(3 + i * 9), (ulong)(10 + i)); }
         }
@@ -34,9 +34,10 @@ public class T3AuthorityReportTests
     }
 
     [Theory]
-    [InlineData(true, 1, false, 24)]
+    [InlineData(true, 1, false, 30)]
+    [InlineData(false, 2, false, 30)]
+    [InlineData(false, 2, true, 30)]
     [InlineData(false, 2, false, 24)]
-    [InlineData(false, 2, true, 24)]
     [InlineData(false, 2, false, 19)]
     public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role, bool truncated, int statsFields)
     {
@@ -56,6 +57,7 @@ public class T3AuthorityReportTests
         counters["decision_blocked"] = 9; counters["npc_hidden"] = 8;
         counters["tp_total"] = 7;
         counters["corpses_visible"] = 6; counters["markers_off_session"] = 0;
+        counters["ranged_native_unknown_hand"] = 42;
         Task report = (Task)typeof(GameBridge).GetMethod("T3PublishStatsAsync", Private)!.Invoke(b, [stop.Token])!;
         Assert.Equal(new byte[] { Protocol.Wo216OpBrains }, await Read(server, stop.Token));
         await Reply(server, 1, Protocol.Wo216OpBrains, stop.Token, truncated);
@@ -63,7 +65,9 @@ public class T3AuthorityReportTests
         await Reply(server, 2, Protocol.T3OpStats, stop.Token, truncated, worldStats: true, statsFields: statsFields);
         var mirror = await Read(server, stop.Token);
         Assert.Equal(Protocol.T3OpStats, mirror[0]); Assert.Equal(role, mirror[1]);
+        Assert.InRange(mirror.Length, 4, 4096); // actual complete generic body, including op and role
         string fields = Encoding.ASCII.GetString(mirror, 2, mirror.Length - 2);
+        Assert.InRange(fields.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length, 1, 128);
         Assert.True(T3AuthorityCounters.TryRead(fields, out var actual));
         Assert.Equal(truncated ? 9 : 44, actual["decision_blocked"]);
         Assert.Equal(truncated ? 8 : 60, actual["npc_hidden"]);
@@ -73,13 +77,17 @@ public class T3AuthorityReportTests
         Assert.Equal(truncated ? 1 : 0, counters["authority_stats_unreadable"]);
         Assert.Equal(truncated ? 1 : 0, counters["world_stats_unreadable"]);
         bool corpseUnavailable = truncated || statsFields < 24;
+        bool rangedUnavailable = truncated || statsFields < 30;
         Assert.Equal(corpseUnavailable ? 1 : 0, counters["corpse_stats_unreadable"]);
+        Assert.Equal(rangedUnavailable ? 1 : 0, counters["ranged_stats_unreadable"]);
         Assert.Contains("tp_total=" + (truncated ? 7 : 10), fields);
         Assert.Contains("falldeath_after_tp=" + (truncated ? 0 : 24), fields);
         Assert.Contains("corpses_visible=" + (corpseUnavailable ? 6 : 29), fields);
         Assert.Contains("grave_markers_added=" + (corpseUnavailable ? 0 : 31), fields);
         Assert.Contains("grave_marker_fallbacks=" + (corpseUnavailable ? 0 : 32), fields);
         Assert.Contains("markers_off_session=" + (corpseUnavailable ? 0 : 33), fields);
+        Assert.Contains("ranged_native_unknown_hand=" + (rangedUnavailable ? 42 : 36), fields);
+        foreach (string key in new[] { "ranged_out", "ranged_in", "ranged_kind_unknown", "ranged_bow_played", "ranged_hits_verdict" }) Assert.Contains(key + "=0", fields);
         foreach (string key in new[] { "lua_corpse_visible", "lua_corpse_hidden_blocked", "lua_corpse_unknown_kept" }) Assert.Contains(key + "=0", fields);
         await Reply(server, 3, Protocol.T3OpStats, stop.Token);
         await report.WaitAsync(stop.Token);

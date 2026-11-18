@@ -63,4 +63,19 @@ public class T3NativeCountersTests
         byte[] next = Payload(25); next[2 + 24 * 9] = 250;
         Assert.True(T3NativeCounters.TryRead(next, out values)); Assert.Equal(24, values.Count);
     }
+
+    [Fact]
+    public void Ranged_diagnostics_are_an_atomic_extension_of_the_actual_P4_and_P5_prefix()
+    {
+        byte[] bytes = Payload(30); Assert.Equal(272, bytes.Length);
+        Assert.True(T3NativeCounters.TryRead(bytes, out var values)); Assert.Equal(30, values.Count);
+        Assert.Equal(24, values["ranged_native_missing_actor"]); Assert.Equal(25, values["ranged_native_unreadable_phase"]);
+        Assert.Equal(26, values["ranged_native_unknown_hand"]); Assert.Equal(27, values["ranged_native_queue_overflow"]);
+        Assert.Equal(28, values["ranged_native_expired_rows"]); Assert.Equal(29, values["ranged_native_lifecycle_dropped"]);
+        for (int n = 25; n < 30; n++) Assert.False(T3NativeCounters.TryRead(Payload(n), out _));
+        byte[] missingP5 = [1, 25, .. bytes.AsSpan(2, 19 * 9).ToArray(), .. bytes.AsSpan(2 + 24 * 9).ToArray()];
+        Assert.False(T3NativeCounters.TryRead(missingP5, out _));
+        byte[] future = Payload(31); future[2 + 30 * 9] = 250;
+        Assert.True(T3NativeCounters.TryRead(future, out values)); Assert.Equal(30, values.Count);
+    }
 }

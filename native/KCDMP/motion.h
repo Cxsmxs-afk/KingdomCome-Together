@@ -136,6 +136,7 @@ uint8_t drop_fight_holds(uint32_t eid, const char* why);
 // WO-190 0.4: [figures: frames, glide, in-place, class changes][copies: the same] since the DLL loaded (any thread).
 void loco_counters(uint32_t out[8]);
 bool fight_held(uint32_t eid);                   // WO-190: a copy held in combat mode for a fight (engaged, or WO-187's guard hold), fresh
+void* local_actor(uint32_t* eid); // verified GetPlayerActor + existing EID read, roundtrip checked; main only
 void* actor_of(uint32_t eid);                    // the C_Actor of an entity id (main thread), null when none
 void set_ko_hold(uint32_t eid, bool on);
 // WO-201 follow-up B9: a standing copy's stale TurnAngle is cleared before its AI-movement action picks idle / turn (mp_copy_no_idle_turn, bit 16)

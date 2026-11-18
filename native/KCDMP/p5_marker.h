@@ -11,6 +11,7 @@ bool suspended();
 void set_suspended(bool on);
 void physical_world_changed();
 uint64_t physical_world();
+bool loaded_scope(uint32_t* world); // cached real loaded-world receipt, main-thread only
 void counts(uint64_t out[3]);
 struct Fact { uint8_t kind=0; uint64_t id=0, revision=0; float xyz[3]{}; };
 using EventFn = void(*)(const uint8_t*,size_t);

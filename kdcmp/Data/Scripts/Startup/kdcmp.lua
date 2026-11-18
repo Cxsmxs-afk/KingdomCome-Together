@@ -25523,24 +25523,17 @@ function KCD2MP_W166SetTalkResumeFirst(arg)
     return true
 end
 
--- A shot on the partner's figure. The class is the game's if it has one; a miss only logs.
-function KCD2MP_W201Shot(id, kind)
-    kind = tostring(kind or "unknown")
-    mp_log(string.format("WO201-RANGED shot weapon=%s figure=%s", kind, tostring(id)))
-    local g = KCD2MP.ghosts and KCD2MP.ghosts[tostring(id)]
-    local e = g and g.entity
-    if not (e and e.GetPos) then return false end
-    local pos
-    pcall(function() pos = e:GetPos() end)
-    if not pos then return false end
-    local class = kind == "bow" and "Arrow" or "Bolt"
-    local spawned = false
-    pcall(function()
-        local ent = System.SpawnEntity({ Name = "kcdmp_shot_" .. tostring(id), Class = class, Pos = pos })
-        spawned = ent ~= nil
-    end)
-    if spawned then mp_log(string.format("WO201-RANGED shot spawned class=%s figure=%s", class, tostring(id))) end
-    return true
+-- Keep already submitted calls from older agents harmless, including after a load or figure replacement.
+-- A ranged animation never creates a projectile: only the existing host hit verdict decides real damage.
+do
+    local reported = false
+    function KCD2MP_W201Shot(id, kind)
+        if not reported then
+            reported = true
+            mp_log("WO201-RANGED legacy-shot refused reason=animation-only -- real hits use the host verdict")
+        end
+        return false
+    end
 end
 
 -- ---- W1: the host's live weather ----------------------------------------------------------------------------------

@@ -9,7 +9,7 @@ public static class T3NativeCounters
 {
     public const byte Version = 1;
     public const int MaxFields = 56;
-    public const int CoreFields = 19, CorpseFields = 5;
+    public const int CoreFields = 19, CorpseFields = 5, RangedFields = 6;
     // IDs are append-only. Distances are rounded UP to whole metres; detailed
     // teleport logs preserve the actual coordinates and fractional distances.
     public static readonly string[] Keys = [
@@ -17,7 +17,9 @@ public static class T3NativeCounters
         "wake_dist_m_max", "wake_drop_m_max", "tp_blocked_combat", "tp_refused_stale", "tp_refused_drop",
         "death_cause_hit", "death_cause_fall", "death_cause_bleed", "death_cause_other", "falldeath_after_tp",
         "tp_by_source_leash_settle", "tp_by_source_video_landing", "tp_by_source_video_rollback", "tp_by_source_scene_nudge",
-        "corpses_visible", "corpse_hidden_blocked", "grave_markers_added", "grave_marker_fallbacks", "markers_off_session"
+        "corpses_visible", "corpse_hidden_blocked", "grave_markers_added", "grave_marker_fallbacks", "markers_off_session",
+        "ranged_native_missing_actor", "ranged_native_unreadable_phase", "ranged_native_unknown_hand",
+        "ranged_native_queue_overflow", "ranged_native_expired_rows", "ranged_native_lifecycle_dropped"
     ];
 
     public static bool TryRead(ReadOnlySpan<byte> payload, out Dictionary<string, long> values)
@@ -39,8 +41,11 @@ public static class T3NativeCounters
         for (int i = 0; i < CoreFields; i++) if (!seen[i]) return false;
         int corpse = 0;
         for (int i = CoreFields; i < CoreFields + CorpseFields; i++) if (seen[i]) corpse++;
-        // P4-only DLLs remain readable; a partially received P5 group never
-        // overwrites a previous complete measurement.
-        return corpse == 0 || corpse == CorpseFields;
+        int ranged = 0;
+        for (int i = CoreFields + CorpseFields; i < CoreFields + CorpseFields + RangedFields; i++) if (seen[i]) ranged++;
+        // Older P4/P5 DLLs remain readable. Each added group is atomic; the
+        // P6 group cannot pretend that an absent P5 prefix was present.
+        return (corpse == 0 || corpse == CorpseFields) && (ranged == 0 || ranged == RangedFields) &&
+            (ranged == 0 || corpse == CorpseFields);
     }
 }

@@ -1072,6 +1072,7 @@ bool on(uint32_t bit) { return (g_bits.load(std::memory_order_relaxed) & ~twin_o
 bool configured() { return g_configured.load(std::memory_order_relaxed); }
 bool authority_active() { return lifecycle_active(GetTickCount64()); }
 bool authority_enabled() { return g_authorityEnabled.load(std::memory_order_acquire); }
+uint8_t lifecycle_role(){return g_role.load(std::memory_order_acquire);}
 uint64_t lifecycle_generation() { return g_authorityGeneration.load(std::memory_order_acquire); }
 bool lifecycle_gameplay() { return g_authorityPhase.load(std::memory_order_acquire) == uint8_t(wo216authority::Phase::Gameplay); }
 bool decisions_blocked() { return authority_active() && g_decisionGate.load(); }

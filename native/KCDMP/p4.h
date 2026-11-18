@@ -14,6 +14,7 @@ void tick();
 void note_life_edge(const char* why); // main-thread actual down/up edges fence stale challenges
 void invalidate(); // off-main safe: invalidate protection; no engine call
 uint64_t generation();
+uint64_t life_edge_tick(); // cached actual local life edge; no engine read
 bool gameplay();
 bool ready_context(Context c);
 void arm_recovery(void* soul); // after full heal/readback, before wake events

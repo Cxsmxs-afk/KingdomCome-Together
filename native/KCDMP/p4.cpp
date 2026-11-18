@@ -71,6 +71,7 @@ struct Register { Register() { wo203::reg_op(251, snapshot_op); } } g_register;
 uint64_t generation() { return wo216::lifecycle_generation(); }
 bool gameplay() { return wo216::lifecycle_gameplay(); }
 bool ready_context(Context c) { return p4rules::fresh(c, now_ms(), generation(), gameplay(), g_lifeEdge.load()); }
+uint64_t life_edge_tick(){return g_lifeEdge.load();}
 void note_life_edge(const char* why) { g_lifeEdge.store(now_ms()); logf("T3-LIFE-EDGE source=%s tick=%llu", why, static_cast<unsigned long long>(g_lifeEdge.load())); }
 void invalidate() { g_until.store(0, std::memory_order_release); g_reset.fetch_add(1); g_lifeEdge.store(now_ms()); }
 bool recovery_policy() {

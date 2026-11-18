@@ -17,7 +17,7 @@ namespace kcdmp::pipecontrol {
 constexpr uint8_t kGeneric = 0x2B, kBatch = 0x2D, kSamples = 0x10;
 constexpr size_t kNormalPayload = 1024, kLargePayload = 4096;
 constexpr size_t kDeferredFrames = 128, kDeferredBytes = 64 * 1024;
-struct Frame { uint8_t type = 0, sequence = 0; std::vector<uint8_t> body; };
+struct Frame { uint8_t type = 0, sequence = 0; std::vector<uint8_t> body; uint64_t readerTick=0,readerGeneration=0,readerLife=0;bool readerGameplay=false; };
 inline bool header_payload_allowed(uint8_t type, size_t n) {
     return n <= kNormalPayload || ((type == kBatch || type == kSamples || type == kGeneric) && n <= kLargePayload);
 }
@@ -33,7 +33,7 @@ inline bool lifecycle(const Frame& f) { return f.type == kGeneric && !f.body.emp
 // Only complete standalone lifecycle frames bypass the deferred normal FIFO.
 class Reader {
     uint8_t head_[3]{}; size_t header_ = 0, wanted_ = 0;
-    std::vector<uint8_t> body_;
+    std::vector<uint8_t> body_;Frame reading_;
     std::deque<Frame> deferred_;
     size_t bytes_ = 0; uint8_t sequence_ = 0; bool failed_ = false;
 public:
@@ -43,11 +43,12 @@ public:
     size_t queued() const { return deferred_.size(); }
     size_t queued_bytes() const { return bytes_; }
     size_t partial_bytes() const { return header_ + body_.size(); }
-    template<class Control>
-    bool feed(const uint8_t* data, size_t n, Control&& control) {
+    template<class Control,class Stamp>
+    bool feed(const uint8_t* data, size_t n, Control&& control,Stamp&& stamp) {
         if (failed_ || (!data && n)) return false;
         size_t at = 0;
         while (at < n) {
+            if(header_==0){reading_=Frame{};reading_.type=data[at];stamp(reading_);} // first byte, never freshen a partial frame
             while (header_ < 3 && at < n) head_[header_++] = data[at++];
             if (header_ < 3) break;
             if (body_.empty()) {
@@ -59,7 +60,7 @@ public:
             if (take) body_.insert(body_.end(), data + at, data + at + take);
             at += take;
             if (body_.size() != wanted_) break;
-            Frame f; f.type = head_[0]; f.body = std::move(body_);
+            Frame f=std::move(reading_); f.type = head_[0]; f.body = std::move(body_);
             if (!complete_payload_allowed(f)) { failed_ = true; return false; }
             // Assigned exactly once in wire-read order, not when normal work is
             // eventually dispatched. Batches never consume the single sequence.
@@ -75,6 +76,8 @@ public:
         }
         return true;
     }
+    template<class Control>
+    bool feed(const uint8_t* data,size_t n,Control&& control){return feed(data,n,std::forward<Control>(control),[](Frame&){});}
     bool pop(Frame* out) {
         if (!out || deferred_.empty()) return false;
         *out = std::move(deferred_.front()); deferred_.pop_front(); bytes_ -= 3 + out->body.size(); return true;

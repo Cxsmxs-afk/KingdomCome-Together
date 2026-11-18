@@ -16,6 +16,14 @@ public partial class GameBridge
     private readonly ConcurrentDictionary<string, long> _t3Counters = new(StringComparer.Ordinal);
     private long _t3StatsNextMs;
     private int _t3SideDrainBusy, _t3StatsBusy;
+    private static readonly string[] T3RangedKeys = [
+        "ranged_out", "ranged_in", "ranged_kind_unknown", "ranged_bow_played", "ranged_hits_verdict",
+        "ranged_peer_tx", "ranged_capture_kind_unknown", "ranged_poll_started", "ranged_poll_busy", "ranged_poll_refused", "ranged_poll_timeouts",
+        "ranged_malformed", "ranged_stale", "ranged_duplicate", "ranged_stream_reset", "ranged_phase_unrenderable", "ranged_animation_refused",
+        "ranged_missile_requests", "ranged_missile_measured_accept", "ranged_missile_host_verdict_queued", "ranged_missile_local_host",
+        "ranged_missile_refused", "ranged_missile_duplicate", "ranged_missile_conflict", "ranged_missile_uncertain", "ranged_missile_ack_timeout",
+        "ranged_stats_unreadable"
+    ];
     private void T3Increment(string name, long amount = 1) => _t3Counters.AddOrUpdate(name, amount, (_, n) => n + amount);
     private void T3Max(string name, long value) => _t3Counters.AddOrUpdate(name, value, (_, n) => Math.Max(n, value));
 
@@ -138,6 +146,7 @@ public partial class GameBridge
             _t3Counters.TryAdd("authority_stats_unreadable", 0);
             _t3Counters.TryAdd("world_stats_unreadable", 0);
             _t3Counters.TryAdd("corpse_stats_unreadable", 0);
+            _t3Counters.TryAdd("ranged_stats_unreadable", 0);
             byte role = W137Host ? (byte)1 : W137Joiner || _jj is not null ? (byte)2 : (byte)0;
             if (role != 0)
             {
@@ -159,11 +168,12 @@ public partial class GameBridge
                     {
                         foreach (var field in values) _t3Counters[field.Key] = field.Value;
                         if (!values.ContainsKey("markers_off_session")) T3Increment("corpse_stats_unreadable");
+                        if (!values.ContainsKey("ranged_native_missing_actor")) T3Increment("ranged_stats_unreadable");
                     }
-                    else { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); }
+                    else { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); T3Increment("ranged_stats_unreadable"); }
                 }, 2000, ct);
                 if (worldStats.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
-                { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); }
+                { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); T3Increment("ranged_stats_unreadable"); }
             }
             ct.ThrowIfCancellationRequested();
             T3EmitStats(role, ct);
@@ -175,7 +185,7 @@ public partial class GameBridge
 
     private void T3EmitStats(byte role, CancellationToken ct)
     {
-        foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(T3LootCounters.CorpseKeys).Concat(new[] {
+        foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(T3LootCounters.CorpseKeys).Concat(T3RangedKeys).Concat(new[] {
             "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable", "corpse_lua_stats_unreadable" }))
             _t3Counters.TryAdd(key, 0);
         foreach (string key in new[] { "proc_stalls", "proc_stall_max_ms", "proc_frames_abandoned", "deferred_sidechannel", "proc_frame_faults", "proc_tick_faults", "engine_teleport_lines", "input_owner_sync_failed", "tp_snapshot_timeouts", "tp_snapshot_refused" })

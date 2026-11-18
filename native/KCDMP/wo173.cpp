@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // WO-173: the joiner's real hits on the host (wo173.h).
 #include "wo173.h"
+#include "p6_missile.h"
 #include "wo173_rules.h"
 
 #include <windows.h>
@@ -613,6 +614,9 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
     *outLen = 0;
     switch (op) {
         case kOpRealHit: {
+            // Explicit measured_missile_accept exception: never a melee replay,
+            // hold, no_raw_blows fallback, or legacy retry after uncertain IO.
+            if(len>=9&&(body[8]&0x80)!=0)return p6::measured_apply(body,len,out,cap,outLen);
             bool held = false;
             const uint8_t r = do_real_hit(body, len, out, cap, outLen, true, &held, -1.0);
             if (r != wo163::kROk || !held) return r;

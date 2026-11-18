@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Text;
 using KcdMp.Client;
 using KcdMp.Wire;
 using Xunit;
@@ -78,7 +79,14 @@ public class Wo203W164FitTests
         yield return (Protocol.W164VoteOptions, "vote options (retired, 6 x 80)", $"v1|{uint.MaxValue}|" + string.Join("|", Enumerable.Range(0, 6).Select(i => N(80, 'o'))));
         yield return (Protocol.W164VoteCast, "vote cast (retired)", $"v1|{uint.MaxValue}|6|" + N(80, 'v'));
         yield return (Protocol.W164VoteClose, "vote close (retired)", $"v1|{uint.MaxValue}|" + N(80, 'c'));
-        yield return (Protocol.W164RangedStep, "ranged step", "v1|5");
+        yield return (Protocol.W164RangedStep, "ranged step v2 (maximum receipt fields)",
+            new RangedStepV2(uint.MaxValue, ulong.MaxValue, ulong.MaxValue, uint.MaxValue, 6,
+                RangedWeaponKind.Crossbow, Guid.Parse("ffffffff-ffff-ffff-ffff-ffffffffffff"), Protocol.RangedCaptureMaxAgeMs, 1).Encode());
+        // P6: the longest accepted name and full-width receipt. Also exercise a longer round-trip float spelling than the numeric maximum.
+        var missileKey = new MeasuredMissileKey(uint.MaxValue, ulong.MaxValue, ulong.MaxValue, ulong.MaxValue);
+        yield return (Protocol.W164MeasuredMissile, "measured missile (maximum values)", new MeasuredMissileRequest(missileKey, npc48, 999.9f, 999.9f).Encode());
+        yield return (Protocol.W164MeasuredMissile, "measured missile (long round-trip floats)", new MeasuredMissileRequest(missileKey, npc48, 0.00012345679f, 0.00012345679f).Encode());
+        yield return (Protocol.W164RealHit, "measured missile result (maximum receipt)", new MeasuredMissileResult(missileKey, MeasuredMissileStatus.Accepted, 1, 999.9f, 999.9f).Encode());
         // WO-202: the key share
         yield return (Protocol.W164KeyShare, "key", Wo202Rules.KeyText("4a6fa310-067a-404d-9813-bd1761d1c70d")!);
         yield return (Protocol.W164KeyShare, "chest", Wo202Rules.ChestText($"{N(80, 'k')} -99999.99 -99999.99 -99999.99")!);
@@ -102,6 +110,24 @@ public class Wo203W164FitTests
             Assert.True(len >= row.Min && len <= row.Max, $"{Protocol.W164KindName(kind)} ({what}) is {len} bytes, the row takes {row.Min}..{row.Max}");
             Assert.True(Protocol.IsUpLenOk(Protocol.W164Up, len), what);            // the relay's gate
             Assert.True(Protocol.IsJoinDown(Protocol.W164Down, len + 1), what);     // the receiving agent's gate
+            Assert.True(Encoding.UTF8.GetByteCount(text) <= Protocol.W164WireTextMax, what);
+            Assert.True(LootMsg.TryDecode(pkt.AsSpan(3 + Protocol.JoinHeaderLen), out var encoded), what);
+            Assert.Equal(kind, encoded.Kind); Assert.Equal(uint.MaxValue, encoded.Tok); Assert.Equal(text, encoded.Text);
+            if (kind == Protocol.W164RangedStep)
+            {
+                Assert.True(RangedStepV2.TryDecode(encoded.Text, out var ranged), what);
+                Assert.Equal(uint.MaxValue, ranged.World); Assert.Equal(ulong.MaxValue, ranged.Generation); Assert.Equal(ulong.MaxValue, ranged.Epoch);
+                Assert.Equal(uint.MaxValue, ranged.Sequence); Assert.Equal(RangedWeaponKind.Crossbow, ranged.Kind);
+                Assert.Equal(text, ranged.Encode());
+            }
+            if (kind == Protocol.W164MeasuredMissile)
+            {
+                Assert.True(MeasuredMissileRequest.TryDecode(encoded.Text, out var missile), what);
+                Assert.Equal(new MeasuredMissileKey(uint.MaxValue, ulong.MaxValue, ulong.MaxValue, ulong.MaxValue), missile.Key);
+                Assert.Equal(48, missile.Npc.Length); Assert.Equal(text, missile.Encode());
+            }
+            if (kind == Protocol.W164RealHit && text.StartsWith("m1|", StringComparison.Ordinal))
+            { Assert.True(MeasuredMissileResult.TryDecode(encoded.Text, out var result), what); Assert.Equal(text, result.Encode()); }
             kindsSeen.Add(kind);
         }
         // every kind the protocol names has a case here (append a case with a new kind)

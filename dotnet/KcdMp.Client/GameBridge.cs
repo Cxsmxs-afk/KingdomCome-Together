@@ -1821,6 +1821,12 @@ public partial class GameBridge(ClientConfig config)
             _ = Task.Run(() => onLocalHitCore(soul, stamina, health, died, byPlayer, judge));
             return Task.CompletedTask;
         };
+        _combat.OnMeasuredMissile = (soul, stamina, health, evidence) =>
+        {
+            P6QueueMeasuredHit(soul, stamina, health, evidence,
+                () => onLocalHitCore(soul, stamina, health, evidence.Died, true, false));
+            return Task.CompletedTask;
+        };
         // Connect now rather than lazily, so the DLL has somewhere to push hits
         // before the first inbound packet ever arrives.
         _ = _combat.EnsureConnectedAsync(cts.Token);
@@ -4048,7 +4054,7 @@ public partial class GameBridge(ClientConfig config)
     {
         long previousLife = Interlocked.Read(ref _t3InputLifeRevision);
         T3NoteInputLifeEdge(on);
-        if (previousLife != Interlocked.Read(ref _t3InputLifeRevision)) T3TpInvalidate();
+        if (previousLife != Interlocked.Read(ref _t3InputLifeRevision)) { T3TpInvalidate(); P6Invalidate(); }
         _localDownedKind = kind;
         if (on) Wo166NoteLocalDown(_lastX, _lastY, _lastZ);   // WO-166 R1: where this player went down
         if (on) _w132LocalGate.Down(DateTime.UtcNow); else _w132LocalGate.Up(DateTime.UtcNow);   // WO-132
@@ -4687,6 +4693,14 @@ public partial class GameBridge(ClientConfig config)
         public long TeleportLifeRevision { get; init; }
         public ulong TeleportGeneration { get; init; }
         public long MarkerPeerSerial { get; init; }
+        public ulong P6Generation { get; init; }
+        public long P6Serial { get; init; }
+        public long P6Life { get; init; }
+        public long P6PeerSerial { get; init; }
+        public long P6Deadline { get; init; }
+        public long P6VisualSerial { get; init; }
+        public bool P6Ready { get; init; }
+        public long P6ModeSerial { get; init; }
     }
 
     /// <summary>
@@ -4707,6 +4721,7 @@ public partial class GameBridge(ClientConfig config)
         // EOF must revoke its frame/side-channel leases before any teardown I/O.
         var receiveLife = CancellationTokenSource.CreateLinkedTokenSource(ct);
         ct = receiveLife.Token;
+        P6BeginReceive(stream, ct);
         var tpConnection = T3TpBeginReceive(stream, ct);
         var frames = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
         _frameWriter = frames.Writer;   // WO-136: the load hold replays held frames through here
@@ -4730,6 +4745,7 @@ public partial class GameBridge(ClientConfig config)
         void StopReceive()
         {
             if (Interlocked.Exchange(ref stopped, 1) != 0) return;
+            P6EndReceive(stream, ct);
             T3TpEndReceive(tpConnection);
             // CancelAsync marks the token immediately; callbacks and disposal
             // never hold the reader behind a slow transport's cancellation hook.
@@ -4770,7 +4786,15 @@ public partial class GameBridge(ClientConfig config)
                 await ReadExactAsync(stream, payload, ct);
                 ct.ThrowIfCancellationRequested();
                 long arrival   = Stopwatch.GetTimestamp();
+                long p6ReadTick = Environment.TickCount64;
+                var p6State = type == Protocol.W164Down ? P1Lifecycle.Current : default;
+                long p6Serial = type == Protocol.W164Down ? Interlocked.Read(ref _p1Serial) : 0, p6Life = type == Protocol.W164Down ? Interlocked.Read(ref _t3InputLifeRevision) : 0;
+                long p6ModeSerial = type == Protocol.W164Down ? Interlocked.Read(ref _p6VisualModeSerial) : 0;
+                bool p6Ready = p6State is { Confirmed: true, GameplaySent: true } && !_p1Loading && P5LoadedWorld != 0 && !_leaveInProgress;
+                bool p6Frame = P6Frame(type, payload);
+                long p6Deadline = p6Frame ? p6ReadTick + Protocol.MeasuredMissileApplyBudgetMs : 0;
                 long markerPeer = P5PeerAtRead(type, payload);
+                P6NoteVisualAtRead(type, payload);
                 int wireBytes  = payloadLen + 3;
                 if (type == Protocol.NpcStateQDown)   // WO-213 D.3: the relay's compact NPC state, back to the 0x27 payload everything below reads
                 {
@@ -4792,6 +4816,16 @@ public partial class GameBridge(ClientConfig config)
                 if (W202("ping_network") && Wo202TakeAtRead(type, payload)) continue;   // WO-202 III.2: the network's answers, never behind the queue
                 if (Wo206TakeAtRead(type, payload)) continue;   // WO-206 E: an epoch is known from the frame it arrives in, never behind the queue
                 uint stamp = Wo206StampAtRead(payload);         // WO-206 E: the world epoch this frame was sent under
+                if (p6Frame)
+                {
+                    Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp)
+                    {
+                        P6Generation = p6State.Generation, P6Serial = p6Serial, P6Life = p6Life,
+                        P6PeerSerial = P6PeerAtRead(type, payload), P6Deadline = p6Deadline,
+                        P6VisualSerial = Interlocked.Read(ref _p6VisualSerial), P6Ready = p6Ready, P6ModeSerial = p6ModeSerial
+                    }, type);
+                    continue;
+                }
                 if (T3TpTakeAtRead(type, payload, stamp)) continue;
                 if (T3LootType(type))
                 {
@@ -4928,6 +4962,7 @@ public partial class GameBridge(ClientConfig config)
         Wo207Trace.Kind.Value = frame.Type;
         try
         {
+            if (await P6TryProcessFrameAsync(frame, ct)) return;
             if (T3TryDeferSideChannel(frame)) return;
             ProcessorFrameScope.ThrowIfAbandoned();
             Wo147NoteProcessing(frame.Arrival);   // the backlog fix: how far behind the reader this processor is
