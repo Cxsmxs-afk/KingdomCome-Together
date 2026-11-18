@@ -11,6 +11,7 @@ namespace KcdMp.Client;
 public partial class GameBridge
 {
     private const int PresentationCombatRowsPerBody = 192;  // native rp_timeline_actions.cpp
+    private const string PresentationMeleeUnavailableReason = "legacy-visual-damage-gate-unverified";
     private readonly record struct PresentationCombatScope(RemoteRelocationScope Actor, long Revision);
 
     private sealed class PresentationCombatRows(PresentationCombatScope scope)
@@ -78,26 +79,33 @@ public partial class GameBridge
         if (!current) return PresentationCombatAdmission.Suppressed;
         var admission = recovery && (reply.Outcome is EdgeOutcome.Busy or EdgeOutcome.Unavailable) ? PresentationCombatAdmission.Fallback :
             melee ? PresentationMeleeAdmission(reply) : CombatPipe.GetPresentationCombatAdmission(reply);
+        bool meleeUnavailable = melee && PresentationMeleeProviderUnavailable(reply);
         string status = admission switch
         {
             PresentationCombatAdmission.Accepted => "accepted",
             PresentationCombatAdmission.Fallback => "unavailable",
+            _ when meleeUnavailable => "unavailable",
             _ when reply.Outcome == EdgeOutcome.Ambiguous => "ambiguous",
             _ => "refused"
         };
-        Console.WriteLine(FormattableString.Invariant($"MP-RP-TIMELINE-IN peer={peer} kind={kind} phase=1 seq={seq} source_ms={sourceMs} event_host_ms={hostMs} result={status}"));
+        string reason = meleeUnavailable ? $" reason={PresentationMeleeUnavailableReason}" : "";
+        Console.WriteLine(FormattableString.Invariant($"MP-RP-TIMELINE-IN peer={peer} kind={kind} phase=1 seq={seq} source_ms={sourceMs} event_host_ms={hostMs} result={status}{reason}"));
         return admission;
     }
 
-    // A typed DLL can temporarily be unable to play an action. Only a DLL that does not implement the request uses legacy playback.
+    private static bool PresentationMeleeProviderUnavailable(EdgePipeReply reply) =>
+        reply is { Outcome: EdgeOutcome.Completed, Payload: [0, 0, 1] };
+
+    // Native Unavailable does not identify which owner or timeline switch is off.
+    // A timed or direct legacy swing has no equivalent to the typed visual damage gate.
     internal static PresentationCombatAdmission PresentationMeleeAdmission(EdgePipeReply reply) =>
-        reply is { Outcome: EdgeOutcome.Completed, Payload: [0, 0, 1] }
+        PresentationMeleeProviderUnavailable(reply)
             ? PresentationCombatAdmission.Suppressed
             : CombatPipe.GetPresentationCombatAdmission(reply);
 
     internal static byte PresentationMeleeKind(ActionKind action, string table, byte flags, int actionType = -1) => (action, table) switch
     {
-        (ActionKind.Attack, "combat_action_attack") when (flags & AttackEvent.FlagCombo) == 0 => (byte)ActionKind.Attack,
+        (ActionKind.Attack, "combat_action_attack") => (byte)ActionKind.Attack,
         (ActionKind.BlockImpulse, "combat_action_block") when (flags & Wo187Rules.NativeFlagPerfect) == 0 => (byte)ActionKind.BlockImpulse,
         (ActionKind.BlockImpulse, "combat_action_perfect_block")
             when (flags & Wo187Rules.NativeFlagPerfect) != 0 && !ActionRowCatalog.IsMasterStrike(actionType) => 0x83,
@@ -162,6 +170,8 @@ public partial class GameBridge
             if (!Current()) return PresentationCombatAdmission.Suppressed;
             if (receipt.Outcome == EdgeOutcome.Unsupported)
                 Interlocked.Exchange(ref _presentationCombatUnsupportedConnection, scope.Actor.Pipe);
+            if (PresentationMeleeProviderUnavailable(receipt))
+                ReportRow($"result=unavailable reason={PresentationMeleeUnavailableReason}");
             var status = PresentationMeleeAdmission(receipt);
             entry.Registered = status == PresentationCombatAdmission.Accepted;
             return status;

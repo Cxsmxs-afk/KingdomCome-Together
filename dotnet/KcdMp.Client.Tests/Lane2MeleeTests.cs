@@ -11,6 +11,7 @@ public sealed class Lane2MeleeTests
 {
     [Theory]
     [InlineData(ActionKind.Attack, "combat_action_attack", 0, 1, -1)]
+    [InlineData(ActionKind.Attack, "combat_action_attack", AttackEvent.FlagCombo, 1, -1)]
     [InlineData(ActionKind.BlockImpulse, "combat_action_block", 0, 6, 6)]
     [InlineData(ActionKind.BlockImpulse, "combat_action_perfect_block", Wo187Rules.NativeFlagPerfect, 0x83, 14)]
     [InlineData(ActionKind.Dodge, "combat_action_dodge", 0, 7, -1)]
@@ -21,7 +22,6 @@ public sealed class Lane2MeleeTests
 
     [Theory]
     [InlineData(ActionKind.Attack, "combat_action_block", 0)]
-    [InlineData(ActionKind.Attack, "combat_action_attack", AttackEvent.FlagCombo)]
     [InlineData(ActionKind.BlockImpulse, "combat_action_attack", 0)]
     [InlineData(ActionKind.BlockImpulse, "combat_action_block", Wo187Rules.NativeFlagPerfect)]
     [InlineData(ActionKind.BlockImpulse, "combat_action_perfect_block", 0)]
@@ -32,9 +32,19 @@ public sealed class Lane2MeleeTests
         Assert.Equal((byte)0, GameBridge.PresentationMeleeKind(action, table, flags));
 
     [Fact]
-    public void A_paired_attack_is_never_mapped_as_an_ordinary_swing() =>
-        Assert.NotEqual((byte)ActionKind.Attack,
-            GameBridge.PresentationMeleeKind(ActionKind.Attack, "combat_action_sync_attack", AttackEvent.FlagCombo));
+    public Task A_combo_flagged_attack_row_registers_and_schedules_an_ordinary_swing() =>
+        new EdgePipeTests().Presentation_combat_registers_a_row_once_then_sends_only_its_numeric_key(
+            ActionKind.Attack, "combat_action_attack", AttackEvent.FlagCombo, (byte)ActionKind.Attack);
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(AttackEvent.FlagCombo)]
+    public async Task A_paired_attack_has_no_native_kind_and_stays_out_of_legacy_playback(byte flags)
+    {
+        const string table = "combat_action_sync_attack";
+        Assert.Equal((byte)0, GameBridge.PresentationMeleeKind(ActionKind.Attack, table, flags));
+        Assert.True(await Schedule(typedPresentation: false, ActionKind.Attack, table, flags));
+    }
 
     [Fact]
     public async Task A_wrong_table_is_consumed_when_the_legacy_path_is_enabled()
@@ -67,13 +77,20 @@ public sealed class Lane2MeleeTests
     }
 
     [Fact]
-    public void Only_an_unsupported_typed_request_allows_legacy_melee_playback()
+    public void An_unsupported_request_can_use_legacy_playback_but_uncertain_receipts_cannot()
     {
         Assert.Equal(PresentationCombatAdmission.Accepted, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Completed, [1, 0, 0])));
-        Assert.Equal(PresentationCombatAdmission.Suppressed, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Completed, [0, 0, 1])));
         Assert.Equal(PresentationCombatAdmission.Suppressed, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Unavailable, [])));
         Assert.Equal(PresentationCombatAdmission.Suppressed, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Ambiguous, [])));
         Assert.Equal(PresentationCombatAdmission.Fallback, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Unsupported, [])));
+    }
+
+    [Fact]
+    public void A_native_unavailable_receipt_preserves_the_typed_melee_damage_gate()
+    {
+        EdgePipeReply receipt = new(EdgeOutcome.Completed, [0, 0, 1]);
+        Assert.Equal(PresentationCombatAdmission.Fallback, CombatPipe.GetPresentationCombatAdmission(receipt));
+        Assert.Equal(PresentationCombatAdmission.Suppressed, GameBridge.PresentationMeleeAdmission(receipt));
     }
 
     private static Task<bool> Schedule(bool typedPresentation, ActionKind kind, string table, byte flags, int actionType = -1,
