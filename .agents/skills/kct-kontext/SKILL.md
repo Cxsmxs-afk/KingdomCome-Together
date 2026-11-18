@@ -5,7 +5,7 @@ description: "Projektkarte für „Kingdom Come: Together“ (KCD2-Koop-Mod). Zu
 
 # kct-kontext — Was das Projekt ist, wie es gebaut ist, wo was liegt
 
-Stand: geprüft am H0-Commit `6c8a63e` (`codex/self-check`, auf `a62ba9ba`) beim Anlegen der Repo-Skills, Version `0.65.2` (`VERSION`), Protokoll `Protocol.Version = 10` (`dotnet/KcdMp.Protocol/Protocol.cs:800`). Zeilenangaben gelten für diesen Tip. **Vor jeder Nutzung am aktuellen Tip nachprüfen.** Warum: Die Kette ist gestapelt, Zeilen wandern.
+Stand: geprüft auf `codex/self-check` seit `6f66913` mit den zusätzlichen Frame-Test-Korrekturen aus Draft #49, Version `0.65.2` (`VERSION`), Protokoll `Protocol.Version = 10` (`dotnet/KcdMp.Protocol/Protocol.cs:800`). **Vor jeder Nutzung am aktuellen Tip nachprüfen.** Warum: Die Kette ist gestapelt, Zeilen wandern.
 
 ## So nutzt du diese Karte
 1. Thema in der Tabelle „Thema → lesen“ suchen und **alle** genannten Dateien gründlich lesen, inklusive Aufrufer und Tests. Warum: passgenauer Code entsteht nur aus dem echten Kontext. Die Karte zeigt, wo du anfangen musst, sie ersetzt das Lesen nicht.
@@ -76,7 +76,7 @@ Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op 
 4. **Fehlende Start-Saves:** Der Build war grün, aber `start saves installed: none`.
 5. **Rollen-Lock:** Der Launcher leitet beim Start die Rolle aus dem Relay ab (`Home.razor.cs:536–537`). Das gestartete Menü graut die jeweils andere Rolle aus (`kdcmp.lua:30422–30423`). Der Direct-Test schreibt diese Rolle nicht.
 6. **Tests prüften Teile, nicht den Ablauf:** `HostCalendarTests` (Parse), `T3SideChannelsTests` (Decode/Queue), `T4BotRelayTests` (Relay). Keiner fuhr Host↔Joiner durch den echten Reader im Menü.
-7. **Zeitabhängige Tests:** H0 hat `HostAuthorityTests.Abandoned_native_probe_cannot_later_configure_a_role` und das Gegenstück für die Konfiguration mit kontrolliertem Deadline-Ablauf stabilisiert (`docs/H0-SELBSTKONTROLLE.md`). Bei Fehlern in `EdgePipeTests.Busy_progress_keeps_its_id_pending_while_other_requests_complete_out_of_order` oder `HttpFrameCancellationTests.Recovery_started_in_an_abandoned_frame_probes_health_without_resending_its_rows` den Ablauf reproduzieren und die Assertions erhalten.
+7. **Zeitabhängige Tests:** Die Testuhr `dotnet/KcdMp.Client.Tests/ManualFrameTime.cs` steuert die Frist für zwei HostAuthority-Tests, den abgeschlossenen Processor-Frame sowie die Prüfungen auf späte HTTP-Schreibversuche und Wiederaufnahme nach einem Timeout. Die Tests lösen die Frist an einem belegten Wartepunkt aus. Der Test für regulären Abschluss lässt den Frame mit kontrollierter Uhr fertiglaufen. Bei weiteren Timing-Fehlern den Ablauf reproduzieren und die Assertions erhalten. [Nachweis](../../../docs/H0-SELBSTKONTROLLE.md)
 
 ## Git-Regeln
 Gestapelte Draft-PRs, nichts direkt auf `main`, kein Force-Push, Rebase, Amend oder Reset, kein Merge ohne Lasses OK. Vor weiteren Änderungen den aktuellen Tip der PR-Kette prüfen.

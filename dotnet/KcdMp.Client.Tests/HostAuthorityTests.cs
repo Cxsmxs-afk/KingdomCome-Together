@@ -153,28 +153,4 @@ public class HostAuthorityTests
     }
 
     private static readonly TimeSpan TestWatchdog = TimeSpan.FromSeconds(5);
-
-    // Only expire after the processor has reached the native wait under test.
-    private sealed class ManualFrameTime : TimeProvider
-    {
-        private DeadlineTimer? _timer;
-
-        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
-        {
-            _timer = new DeadlineTimer(callback, state);
-            return _timer;
-        }
-
-        public void Expire() => _timer?.Fire();
-
-        private sealed class DeadlineTimer(TimerCallback callback, object? state) : ITimer
-        {
-            private TimerCallback? _callback = callback;
-
-            public void Fire() => Interlocked.Exchange(ref _callback, null)?.Invoke(state);
-            public bool Change(TimeSpan dueTime, TimeSpan period) => throw new NotSupportedException();
-            public void Dispose() => Interlocked.Exchange(ref _callback, null);
-            public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
-        }
-    }
 }

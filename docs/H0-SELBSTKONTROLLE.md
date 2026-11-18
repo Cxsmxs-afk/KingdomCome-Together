@@ -8,6 +8,8 @@ Skyrim Together baut spielbare Windows-Pakete für mehrere Spielversionen und pr
 
 Am 18.11.2026 um 20:46:58 Uhr (Berlin) meldete der Push-Build `Abandoned_native_probe_cannot_later_configure_a_role` als fehlgeschlagen. Der 50-ms-Timeout konnte auslösen, bevor der ThreadPool die native Anfrage begonnen und der Test seine Prüfaufgabe gesetzt hatte. Eine kontrollierte Verzögerung des Workers reproduziert den Nullzugriff im alten Test. Die beiden Tests warten jetzt auf die laufende native Anfrage, lösen den Timeout aus und geben anschließend deren Antwort frei. Sie prüfen weiter die abgebrochene Aufgabe und das Ausbleiben später Autoritätsänderungen. [Fehlgeschlagener Build](https://github.com/Cxsmxs-afk/KingdomCome-Together/actions/runs/44383139015/job/135080492732) · [ProcessorFrameScope](../dotnet/KcdMp.Client/ProcessorFrameScope.cs#L72) · [HostAuthorityTests](../dotnet/KcdMp.Client.Tests/HostAuthorityTests.cs#L89)
 
+Der nächste Windows-Lauf zeigte drei weitere Tests mit einer Annahme über den Start des Workers. Ein kontrolliert verzögerter Start reproduzierte `TimedOut` beim regulären Abschluss, das ausbleibende Signal des späten HTTP-Schreibversuchs und die fehlende HTTP-Wiederaufnahme. Der Abschlusstest wartet jetzt mit kontrollierter Uhr auf den Worker. Die beiden HTTP-Tests lösen die Frist erst am belegten Wartepunkt aus. Der Wiederaufnahmetest prüft zusätzlich, dass der erste erfolgreiche Request eine harmlose Probe ist. [Fehlgeschlagener Build](https://github.com/Cxsmxs-afk/KingdomCome-Together/actions/runs/44413076859/job/135186087657) · [Testuhr](../dotnet/KcdMp.Client.Tests/ManualFrameTime.cs) · [HTTP-Tests](../dotnet/KcdMp.Client.Tests/HttpFrameCancellationTests.cs#L150)
+
 ## Pflichtprüfungen
 
 | Paket | Nachweis |
@@ -28,7 +30,7 @@ Der Netzsimulator prüft im CI-Modus zuerst die Skill-Namen, Beschreibungen und 
 
 ## Löschliste
 
-Die HostAuthority-Tests verwenden keine 50-ms-Wartezeit mehr als Nachweis, dass der Worker begonnen hat. Die bisherigen Aufrufe der vier .NET-Suiten, die nur den Exitcode prüften, sind durch die Auswertung ihrer TRX-Ergebnisse ersetzt. Der Paketcheck steht in `tools/Verify-DropIn.ps1` und wird vom Workflow aufgerufen.
+Die Annahmen über den Worker-Start innerhalb der realen Frist sind in den betroffenen Tests durch Wartepunkte und eine kontrollierte Testuhr ersetzt. Die bisherigen Aufrufe der vier .NET-Suiten, die nur den Exitcode prüften, sind durch die Auswertung ihrer TRX-Ergebnisse ersetzt. Der Paketcheck steht in `tools/Verify-DropIn.ps1` und wird vom Workflow aufgerufen.
 
 ## Zwei Instanzen und Ampel
 
