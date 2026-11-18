@@ -283,9 +283,10 @@ public class T3LootFastlaneIntegrationTests
         using var stop = new CancellationTokenSource(); using var wire = new WireStream(); Task receive = Receive(b, wire, stop.Token);
         try
         {
-            var first = Answer(1); var old = Answer(2);
-            wire.Feed(first); await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
-            wire.Feed(old); await Wait(() => wire.ReadBytes >= first.Length + old.Length);
+            wire.Feed(Answer(1)); await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            long waiting = Wo207Trace.WaitingTotal;
+            // The reader counts the queued frame after capturing its generation.
+            wire.Feed(Answer(2)); await Wait(() => Wo207Trace.WaitingTotal == waiting + 1);
             await lifecycle.PendingAsync(true, true, default); Assert.Equal(2ul, lifecycle.Current.Generation);
             wire.Feed(Answer(3)); release.TrySetResult();
             await Wait(() => game.Loot.Any(s => s.Contains("W134ItemResult(\"3\"")));
