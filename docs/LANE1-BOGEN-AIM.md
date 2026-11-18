@@ -1,0 +1,13 @@
+# B2 Bogenspannen und Zielen
+
+**Status grau.** Am Lane-Basisstand `5fc9133e` werden Spannen und Zielen bereits als typisierte P6-Phasen übertragen. Auf dem Empfänger bleiben Phase 1 und 2 unrenderable. Armbrust-Nachladen in Phase 4 braucht einen eigenen Nachweis für den jeweiligen Mechanismus. Die passende `Fire`-Anforderung ist vorhanden. Auf dem nativen Timeline-Pfad setzt sie die exakte, live gelesene Klasse in einer Hand voraus. Die passende Engine-Rückmeldung bestätigt den Abschluss des Auftrags. Für die sichtbare Schusspose fehlt der Spielnachweis. [P6-Befund](T3-P6-BOW.md#transport-und-darstellung) · [Agent-Empfang](../dotnet/KcdMp.Client/GameBridge.Wo201Ranged.cs) · [Native Handprüfung](../native/KCDMP/wo143.cpp#L1335) · [Engine-Rückmeldung](../native/KCDMP/wo143.cpp#L896)
+
+Die Spielaufzeichnung belegt den Schießablauf beim lokalen Henry. Der frühere Einstieg am Partneravatar brach ohne Waffe in der Hand ab. Für das Zielen am Partneravatar fehlen bestätigte Fragment- und Tagdaten. Ein neuer Native-Baustein braucht einen Build- und Laufzeiteinstieg, den H4 übernehmen kann. Der native Build führt seine Quelldateien einzeln auf. [Engine-Aufzeichnung](WO-119-action-fidelity.md#32-ranged) · [Source-Liste](../native/KCDMP/CMakeLists.txt#L4)
+
+## Übergabe an H4
+
+- **Probe.** Am Partneravatar die tatsächliche Handklasse, die installierte Animationsschicht samt Fragment und Tags und die sichtbare Pose beim Spannen, gehaltenen Zielen und Loslassen erfassen. Die Beobachtung zur jeweiligen P6-Phase und Sequenz zuordnen. Für die Scope-, Fragment- und Tagprüfung stehen bereits lesende Helfer bereit. [Mannequin-Lesezugriffe](../native/KCDMP/wo187.h#L76)
+- **Gegenprobe.** Dieselbe Folge mit fehlender oder falscher Handklasse sowie mit dem benötigten Tag entfernt wiederholen. Die Zielpose soll ausbleiben und die fehlende Voraussetzung im Log erkennbar sein. Nach Abbruch, Waffenwechsel oder Figurenwechsel darf kein alter Zielzustand fortleben. Den Nachweis für Armbrust-Nachladen separat führen.
+- **Zähler.** `ranged_charge_shown`, `ranged_aim_shown` und `ranged_fire_shown` erst über die bestehende T3-Increment-API erhöhen, wenn pro Phase ein validierter Posenbeleg für den Empfänger vorliegt. Request-ID, Timeline-Annahme und Engine-Abschluss geben jeweils einen eigenen technischen Zwischenstand wieder. [Vorhandene Agent-Zähler](../dotnet/KcdMp.Client/GameBridge.Wo201Ranged.cs)
+
+Die vorhandenen P6- und T2-Regressionsprüfungen gelten weiter. Die Zwei-PC-Abnahme liegt im Hauptchat. [P6-Gegenprobe für Aiming](../dotnet/KcdMp.Client.Tests/P6RangedBridgeTests.cs#L258) · [Mapping-Test](../dotnet/KcdMp.Client.Tests/Wo201SpeechTests.cs#L34) · [T2-Fall `bow-shot`](TEST-REPLAY.md)
