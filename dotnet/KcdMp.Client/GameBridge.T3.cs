@@ -116,6 +116,41 @@ public partial class GameBridge
         long now = Environment.TickCount64;
         if (now < Interlocked.Read(ref _t3StatsNextMs)) return;
         Interlocked.Exchange(ref _t3StatsNextMs, now + 60000);
+        _ = T3PublishStatsAsync(ct); // neither status I/O nor mirroring can hold replay
+    }
+
+    private async Task T3PublishStatsAsync(CancellationToken ct)
+    {
+        if (Interlocked.CompareExchange(ref _t3StatsBusy, 1, 0) != 0) return;
+        try
+        {
+            foreach (string key in T3AuthorityCounters.NativeKeys) _t3Counters.TryAdd(key, 0);
+            _t3Counters.TryAdd("postload_timeouts", 0);
+            _t3Counters.TryAdd("authority_stats_unreadable", 0);
+            byte role = W137Host ? (byte)1 : W137Joiner || _jj is not null ? (byte)2 : (byte)0;
+            if (role != 0)
+            {
+                var result = await ProcessorFrameScope.RunAsync(async token =>
+                {
+                    var native = await _combat.Wo163Async(Protocol.Wo216OpBrains, [], token);
+                    ProcessorFrameScope.ThrowIfAbandoned();
+                    if (native is { Ok: true } b && T3AuthorityCounters.TryRead(Encoding.ASCII.GetString(b.Payload), out var values))
+                        foreach (var field in values) _t3Counters[field.Key] = field.Value;
+                    else T3Increment("authority_stats_unreadable");
+                }, 2000, ct);
+                if (result.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
+                    T3Increment("authority_stats_unreadable");
+            }
+            ct.ThrowIfCancellationRequested();
+            T3EmitStats(role, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception ex) { Console.WriteLine($"MP-T3-STATS report unavailable: {ex.GetType().Name}"); }
+        finally { Interlocked.Exchange(ref _t3StatsBusy, 0); }
+    }
+
+    private void T3EmitStats(byte role, CancellationToken ct)
+    {
         foreach (string key in new[] { "proc_stalls", "proc_stall_max_ms", "proc_frames_abandoned", "deferred_sidechannel", "proc_frame_faults", "proc_tick_faults" })
             _t3Counters.TryAdd(key, 0);
         _t3Counters["w136_held"] = Interlocked.Read(ref _w136Held);
@@ -124,14 +159,12 @@ public partial class GameBridge
         _t3Counters["proc_outbound_abandoned"] = _w213Writer?.Scheduler.CancelledDropped ?? 0;
         string fields = string.Join(' ', _t3Counters.OrderBy(p => p.Key, StringComparer.Ordinal)
             .Select(p => p.Key + "=" + p.Value.ToString(CultureInfo.InvariantCulture)));
-        byte role = W137Host ? (byte)1 : W137Joiner || _jj is not null ? (byte)2 : (byte)0;
         Console.WriteLine($"MP-T3-STATS origin=agent role={(role == 1 ? "host" : role == 2 ? "joiner" : "off")} {fields}");
         if (role != 0) _ = T3SendNativeStatsAsync(role, fields, ct);
     }
 
     private async Task T3SendNativeStatsAsync(byte role, string fields, CancellationToken ct)
     {
-        if (Interlocked.CompareExchange(ref _t3StatsBusy, 1, 0) != 0) return;
         try
         {
             using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -142,6 +175,6 @@ public partial class GameBridge
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         { Console.WriteLine($"MP-T3-STATS native mirror unavailable: {ex.GetType().Name}"); }
-        finally { Interlocked.Exchange(ref _t3StatsBusy, 0); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
     }
 }

@@ -553,7 +553,7 @@ void* hooked_fn_invoke(void* self, void* ret, void* out) {
     // Paket F3: data-port reads can invoke a Function without C_Node::Execute.
     // Keep those time decisions on the host as well; the empty variant is the
     // engine's existing no-invocation result used by the time-set gate below.
-    if (wo200::host_graph_only()) {
+    if (wo200::host_graph_only() && !applying_state(self)) {
         const char* s = nullptr; char m[128] = "";
         const bool method = rd(self, kOffFnMethodName, &s) && s && copy_cstr(s, m, sizeof m) &&
                             wo200rules::method_kind(m) == wo200rules::Method::HostTime;

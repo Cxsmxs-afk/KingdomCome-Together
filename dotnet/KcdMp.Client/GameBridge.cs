@@ -1947,6 +1947,7 @@ public partial class GameBridge(ClientConfig config)
             tailForPause.SceneStage += Wo167OnSceneStage;            // WO-167 T4: a conversation's scene
             tailForPause.ModInitDetected += OnModInitDetected;       // WO-98 Phase 7
             tailForPause.GameplayStarted += Wo122OnGameplayStarted;  // WO-122
+            tailForPause.PostLoadReconstructionTimeout += P1OnPostLoadTimeout;
             tailForPause.AutoSaveRefused += Wo122OnAutoSaveRefused;  // WO-122
             tailForPause.GameplayStarted += Wo123OnGameplayStarted;  // WO-123: a host load ends a join
             tailForPause.LoadStarted += Wo123OnLoadStarted;          // WO-123: joins defer through a load
@@ -2413,6 +2414,7 @@ public partial class GameBridge(ClientConfig config)
                 tailForPause2.CutsceneEdge -= OnLocalCutsceneEdge;      // WO-98 Phase 5
                 tailForPause2.ModInitDetected -= OnModInitDetected;     // WO-98 Phase 7
                 tailForPause2.GameplayStarted -= Wo122OnGameplayStarted; // WO-122
+                tailForPause2.PostLoadReconstructionTimeout -= P1OnPostLoadTimeout;
                 tailForPause2.AutoSaveRefused -= Wo122OnAutoSaveRefused; // WO-122
                 tailForPause2.GameplayStarted -= Wo123OnGameplayStarted; // WO-123
                 tailForPause2.LoadStarted -= Wo123OnLoadStarted;         // WO-123
@@ -6274,6 +6276,9 @@ public partial class GameBridge(ClientConfig config)
                 return;
             case "t3_proc_timeout":
                 T3ProcessorTimeout(arg);
+                return;
+            case "p1_host_authority":
+                P1OnAuthorityConfig(arg);
                 return;
             case "w134_open":        // WO-134: world items
             case "w134_take":

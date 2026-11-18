@@ -13,7 +13,7 @@ public partial class GameBridge
     private long _hostAuthorityGeneration;
     private volatile string _hostAuthorityFailureReason = "";
     // Stays set throughout the load and holds. NPC decisions are not a quest-mirror feature toggle.
-    private bool HostAuthorityOwned => _hostAuthorityPrepared && !_isDamageAuthority;
+    private bool HostAuthorityOwned => _hostAuthorityEnabled && _hostAuthorityPrepared && !_isDamageAuthority;
 
     private void HostAuthorityGuard(long generation, CancellationToken ct, Func<bool>? owner = null)
     {
@@ -22,14 +22,17 @@ public partial class GameBridge
             throw new OperationCanceledException("authority owner was superseded", ct);
     }
 
-    private async Task<bool> PushHostAuthorityRoleAsync(byte role, CancellationToken ct = default)
+    private async Task<bool> PushHostAuthorityRoleAsync(byte role, CancellationToken ct = default, ulong? expectedLifecycleGeneration = null)
     {
         using var scope = ProcessorFrameScope.Link(ct);
         long generation = Interlocked.Read(ref _hostAuthorityGeneration);
         HostAuthorityGuard(generation, scope.Token);
-        var body = new byte[5];
+        ulong lifecycleGeneration = expectedLifecycleGeneration ?? await P1Lifecycle.KnownGenerationAsync(scope.Token);
+        HostAuthorityGuard(generation, scope.Token);
+        var body = new byte[13];
         BitConverter.GetBytes(W216Switch.NativeBits(W216On)).CopyTo(body, 0);
         body[4] = role;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(5), lifecycleGeneration);
         var r = await _combat.Wo163Async(Protocol.Wo216OpConfig, body, scope.Token);
         HostAuthorityGuard(generation, scope.Token);
         if (r is not { Ok: true }) return false;
@@ -43,7 +46,7 @@ public partial class GameBridge
         _hostAuthorityFailureReason = "";
         try
         {
-            await _transport.ExecuteNowAsync("if KCD2MP_HostAuthority then KCD2MP_HostAuthority(true,false) end", ct);
+            await P1TellLuaAsync("pending", ct);
             guard();
             var probe = await HostAuthorityReadiness.ProbeAndConfigureAsync(async () =>
             {
@@ -63,8 +66,6 @@ public partial class GameBridge
             bool configured = await Wo200PushConfigCoreAsync(ct);
             guard();
             if (!configured) { _hostAuthorityFailureReason = HostAuthorityFailure.NotConfirmed; return false; }
-            await _transport.ExecuteNowAsync("if KCD2MP_HostAuthority then KCD2MP_HostAuthority(true,true) end", ct);
-            guard();
             return true;
         }
         catch (OperationCanceledException) { throw; }
@@ -82,12 +83,26 @@ public partial class GameBridge
         using var scope = ProcessorFrameScope.Link(ct);
         long generation = Interlocked.Read(ref _hostAuthorityGeneration);
         void Guard() => HostAuthorityGuard(generation, scope.Token, () => ReferenceEquals(_jj, join) && !join.Abandoned.Task.IsCompleted);
+        Guard();
+        if (!await P1PrepareJoinAsync(join, scope.Token)) return false;
+        Guard();
         await _hostAuthorityGate.WaitAsync(scope.Token);
         try
         {
             Guard();
             if (generation != Interlocked.Read(ref _hostAuthorityGeneration) || _isDamageAuthority ||
                 !ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted) return false;
+            if (!_hostAuthorityEnabled)
+            {
+                _hostAuthorityFailureReason = "";
+                _hostAuthorityPrepared = false;
+                if (!await PushHostAuthorityRoleAsync(0, scope.Token)) return false;
+                Guard();
+                await Wo200PushConfigCoreAsync(scope.Token);
+                Guard();
+                Console.WriteLine($"MP-P1 join 0x{join.JoinId:x8}: authority off; legacy role remains off until loaded/settled");
+                return true;
+            }
             bool armed = await ArmHostAuthorityAsync(Guard, scope.Token);
             Guard();
             if (!armed)
@@ -99,7 +114,7 @@ public partial class GameBridge
                 Console.WriteLine("MP-AUTHORITY join refused: native brain/scheduler and story gates are unavailable or the join was cancelled");
                 return false;
             }
-            Console.WriteLine($"MP-AUTHORITY join 0x{join.JoinId:x8}: decision_gate=armed story_gate=armed before load/Ready");
+            Console.WriteLine($"MP-AUTHORITY join 0x{join.JoinId:x8}: hooks ready; decisions/story remain pending until real Gameplay + 5 s");
             return true;
         }
         finally { _hostAuthorityGate.Release(); }
@@ -111,6 +126,8 @@ public partial class GameBridge
         ProcessorFrameScope.ThrowIfAbandoned(); scope.Token.ThrowIfCancellationRequested();
         long generation = Interlocked.Increment(ref _hostAuthorityGeneration);
         _hostAuthorityPrepared = false;
+        await P1ResetLifecycleAsync(why, scope.Token);
+        HostAuthorityGuard(generation, scope.Token);
         await _hostAuthorityGate.WaitAsync(scope.Token);
         try
         {
@@ -122,7 +139,7 @@ public partial class GameBridge
             HostAuthorityGuard(generation, scope.Token);
             await Wo200PushConfigCoreAsync(scope.Token);
             HostAuthorityGuard(generation, scope.Token);
-            await _transport.ExecuteNowAsync("if KCD2MP_HostAuthority then KCD2MP_HostAuthority(false,false) end", scope.Token);
+            await P1TellLuaAsync("disabled", scope.Token);
             HostAuthorityGuard(generation, scope.Token);
         }
         catch (OperationCanceledException) { throw; }
@@ -136,11 +153,15 @@ public partial class GameBridge
         using var scope = ProcessorFrameScope.Link(ct);
         long generation = Interlocked.Read(ref _hostAuthorityGeneration);
         void Guard() => HostAuthorityGuard(generation, scope.Token, () => calendarGeneration == Interlocked.Read(ref _hostCalendarGeneration));
+        Guard();
+        if (_hostAuthorityEnabled && !await P1EnsureOnPendingAsync(scope.Token)) return false;
+        Guard();
         await _hostAuthorityGate.WaitAsync(scope.Token);
         try
         {
             Guard();
             if (generation != Interlocked.Read(ref _hostAuthorityGeneration) || calendarGeneration != Interlocked.Read(ref _hostCalendarGeneration)) return false;
+            if (!_hostAuthorityEnabled) return true; // calendar ownership is independent of the optional decision gate
             _hostAuthorityPrepared = true;   // confirmed host world: retain suppression intent during a transient pipe failure
             bool armed = await ArmHostAuthorityAsync(Guard, scope.Token);
             Guard();

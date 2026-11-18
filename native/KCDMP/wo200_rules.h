@@ -75,6 +75,13 @@ inline Method method_kind(const char* methodName) {
     return Method::Other;
 }
 
+// Time decisions remain host-only even while story/AI authority is pending or
+// explicitly disabled. Only an actual State being applied is exempt, not every
+// Function invoked under a mirror depth.
+inline bool host_clock_guard(uint8_t role, bool hostWorld, bool applyingState) {
+    return role == kRoleJoiner && hostWorld && !applyingState;
+}
+
 // C_Node::GetName/GetParent produce a dotted path (wo137::path_of). Time
 // libraries are sometimes modules rather than reflection methods. Match whole
 // components, never e.g. ResetIsNight or WhatTimeIsItLater.

@@ -374,14 +374,14 @@ do
 end
 
 -- Paket C/F2: the new role intent exists before the host save is loaded.
--- It blocks the old suspend/resume cycle even when native readiness failed,
+-- The mod command path blocks its suspend/resume cycle even when readiness failed,
 -- and a locally-dead copy cannot announce FATAL through the Lua observer.
 do
     resetNpcSync()
     local logMark, cmdMark = #LOG, #CMDS
     check("(h) missing native hook refuses host authority readiness", KCD2MP_HostAuthority(true, false) == false)
-    System.ExecuteCommand("wh_ai_PauseNPC copy_before_load")
-    System.ExecuteCommand("wh_ai_ResumeNPC copy_before_load")
+    KCD2MP_ModBrainCommand("wh_ai_PauseNPC copy_before_load")
+    KCD2MP_ModBrainCommand("wh_ai_ResumeNPC copy_before_load")
     check("(h) no suspend/resume fallback before native readiness", #CMDS == cmdMark)
     check("(h) readiness failure is explicit", countLog("decision_gate=unavailable", logMark) > 0)
     check("(h) native readiness is recorded separately", KCD2MP_HostAuthority(true, true) == true and KCD2MP.hostAuthority.armed)
@@ -432,6 +432,73 @@ do
     KCD2MP.w137.joiner, KCD2MP.w137.active = false, false
     KCD2MP.wo102.authorityHost = false
     noErrs("(i)")
+end
+
+-- P1: pending never runs the legacy suspend path, off restores it only after native confirmation.
+do
+    check("(p1) authority defaults on", KCD2MP.p1AuthorityEnabled == true)
+    check("(p1) bad switch is refused", KCD2MP_P1SetHostAuthority("maybe") == false and KCD2MP.p1AuthorityEnabled)
+    check("(p1) off is emitted to the agent", KCD2MP_P1SetHostAuthority("off") == true and not KCD2MP.p1AuthorityEnabled)
+    local mark = #CMDS
+    KCD2MP_HostAuthority(true, false, "pending", "10")
+    local oldJoiner, oldActive = KCD2MP.w137.joiner, KCD2MP.w137.active
+    local oldBrains = KCD2MP_W216On("no_brains")
+    KCD2MP.w137.joiner, KCD2MP.w137.active = true, true
+    KCD2MP_W216Cfg("no_brains=on")
+    W216_RELEASE = true
+    System.ExecuteCommand("wh_ai_PauseNPC retail_load"); System.ExecuteCommand("wh_ai_ResumeNPC retail_load")
+    W216_RELEASE = false
+    check("(p1) pending permits retail pause and resume despite legacy release policy", #CMDS == mark + 2
+        and KCD2MP_W216JoinerBrainsOff() and KCD2MP.hostAuthority.phase == "pending")
+    mark = #CMDS
+    KCD2MP_ModBrainCommand("  wh_ai_PauseNPC load_copy"); KCD2MP_ModBrainCommand("wh_ai_ResumeNPC load_copy")
+    check("(p1) pending blocks the mod's exact pause and resume verbs", #CMDS == mark)
+    KCD2MP_W176Pause("p1_conditional", true, "pending"); KCD2MP_W176Pause("p1_conditional", false, "pending")
+    check("(p1) pending blocks the conditional mod verb callsite", #CMDS == mark)
+    KCD2MP.w167.talk.fresh.p1_router = NOW
+    check("(p1) pending blocks the variable w164 console router", KCD2MP_W167FreshResume("p1_router") == true and #CMDS == mark)
+    KCD2MP_ModBrainCommand("wh_ai_ResumeNPCDiagnostic exact_verb")
+    KCD2MP_ModBrainCommand("sys_budget unrelated")
+    check("(p1) the mod helper forwards unrelated and similarly named verbs", #CMDS == mark + 2
+        and CMDS[#CMDS - 1] == "wh_ai_ResumeNPCDiagnostic exact_verb" and CMDS[#CMDS] == "sys_budget unrelated")
+    mark = #CMDS
+    check("(p1) a late active from older load is rejected", KCD2MP_HostAuthority(true, true, "active", "9") == false
+        and KCD2MP.hostAuthority.phase == "pending" and not KCD2MP.hostAuthority.armed)
+    check("(p1) current active confirms native gate", KCD2MP_HostAuthority(true, true, "active", "10") == true and KCD2MP.hostAuthority.armed)
+    System.ExecuteCommand("wh_ai_PauseNPC retail_active"); System.ExecuteCommand("wh_ai_ResumeNPC retail_active")
+    KCD2MP_ModBrainCommand("wh_ai_PauseNPC mod_active"); KCD2MP_ModBrainCommand("wh_ai_ResumeNPC mod_active")
+    check("(p1) active blocks retail and mod pause and resume", #CMDS == mark)
+    KCD2MP.w137.joiner, KCD2MP.w137.active = oldJoiner, oldActive
+    KCD2MP_W216Cfg("no_brains=" .. (oldBrains and "on" or "off"))
+    check("(p1) delayed pending of same load cannot downgrade active", KCD2MP_HostAuthority(true, false, "pending", "10") == false and KCD2MP.hostAuthority.armed)
+    check("(p1) confirmed legacy restores local command path", KCD2MP_HostAuthority(false, false, "legacy", "11") == true)
+    KCD2MP_ModBrainCommand("wh_ai_PauseNPC legacy_copy"); KCD2MP_ModBrainCommand("wh_ai_ResumeNPC legacy_copy")
+    check("(p1) classic mod pause and resume both reach engine", #CMDS == mark + 2)
+    System.ExecuteCommand("wh_ai_PauseNPC retail_legacy"); System.ExecuteCommand("wh_ai_ResumeNPC retail_legacy")
+    check("(p1) legacy also permits retail pause and resume", #CMDS == mark + 4)
+    mark = #CMDS
+    check("(p1) delayed pending of same off load cannot disable legacy", KCD2MP_HostAuthority(true, false, "pending", "11") == false and KCD2MP.hostAuthority.phase == "legacy")
+    local owned = mkEntity("p1_owned_pause", 0, 0, 0); owned.soul = { GetId = function() return "p1-owned-soul" end }; ENTS.p1_owned_pause = owned
+    local reused = mkEntity("p1_reused_pause", 0, 0, 0); reused.soul = { GetId = function() return "p1-new-soul" end }; ENTS.p1_reused_pause = reused
+    KCD2MP._npcPaused.p1_owned_pause, KCD2MP._npcPaused.p1_reused_pause = NOW, NOW
+    KCD2MP._npcPauseExec.p1_owned_pause, KCD2MP._npcPauseExec.p1_reused_pause = "ok", "ok"
+    KCD2MP._npcPauseEntity.p1_owned_pause = { id = tostring(owned.id), soul = "p1-owned-soul" }
+    KCD2MP._npcPauseEntity.p1_reused_pause = { id = tostring(reused.id), soul = "p1-old-soul" }
+    check("(p1) old cleanup generation is refused", KCD2MP_P1ReleaseLegacy("10") == false and #CMDS == mark)
+    check("(p1) exact owned legacy pause is released", KCD2MP_P1ReleaseLegacy("11") == true and #CMDS == mark + 1
+        and CMDS[#CMDS] == "wh_ai_ResumeNPC p1_owned_pause")
+    check("(p1) reused body is never resumed from old name", KCD2MP._npcPaused.p1_reused_pause ~= nil)
+    KCD2MP_HostAuthority(true, false, "pending", "12")
+    KCD2MP_ModBrainCommand("wh_ai_PauseNPC next_load_copy")
+    check("(p1) next load blocks mod legacy again", #CMDS == mark + 1 and KCD2MP.hostAuthority.phase == "pending")
+    check("(p1) load discards old Lua pause markers without resuming new copies", next(KCD2MP._npcPaused) == nil and next(KCD2MP._npcPauseEntity) == nil)
+    check("(p1) unversioned delayed active cannot override load", KCD2MP_HostAuthority(true, true) == false and not KCD2MP.hostAuthority.armed)
+    KCD2MP_HostAuthority(true, false, "pending", "18446744073709551610")
+    check("(p1) uint64 generations are compared without Lua number rounding", KCD2MP_HostAuthority(true, true, "active", "18446744073709551609") == false
+        and KCD2MP.hostAuthority.generation == "18446744073709551610")
+    KCD2MP_HostAuthority(false, false, "disabled", "18446744073709551611")
+    KCD2MP_P1SetHostAuthority("on")
+    noErrs("(p1)")
 end
 
 OUT = table.concat(RESULTS, "\n")

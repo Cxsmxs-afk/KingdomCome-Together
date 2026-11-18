@@ -8,9 +8,12 @@
 //    end -- at the AI update's entry, on that update's own thread (wo215.cpp: the same entry hook that makes the route's requests), and
 //    hands every change to the agent (op 162), which sends it on the state lane (NpcRoute 0x84 -> 0x85, kind npc-route). The joiner's
 //    copy makes that request once per change (op 163 brings the lines in); the position stream only corrects.
-// B  no_brains. Paket C stops C_NPCManager::UpdateIntellects at entry on the
-//    joined world. No suspend/resume masks are changed. The census controls
-//    visibility; host movement/animation requests keep their lower engine update.
+// B  no_brains. P1 keeps role 2 pending through Load and Gameplay+5000 ms;
+//    only then does the entry gate stop UpdateIntellects. No inner reconstruction
+//    sub-entry has been verified. The census hides only initialized living nearby
+//    bodies with >=30% nearby bindings, for at most 10 s per unbound episode.
+//    Explicit disabled authority restores PR14's per-body PauseNPC fallback;
+//    host movement/animation requests retain their lower engine update.
 //
 // Pipe ops in the WO-163 family (0x2B -> 0xAC), registered through wo203.h (numbers 160..169 are WO-216's):
 //   160 Config [bits:4] -> [effective bits:4]          wo216_rules.h kBit* (KCDMP_TEST_W216_OFF names a twin's bits off)
@@ -22,7 +25,10 @@
 //   166 OutfitRead [max:1] -> [count:1]{[nameLen:1][name][n:1] n x [class:16]}   D, the host: the bodies whose worn items changed (their
 //        whole worn set, armour and weapons, as the soul's EquipmentManager holds it; each streamed body read every ~4 s, round-robin)
 //   167 OutfitOf [nameLen:1][name] -> [found:1][n:1] n x [class:16]               D, the joiner: what this copy wears now
-//   op 160 takes a role byte after the bits: 0 none, 1 the host, 2 a joiner in the host's world (B runs only then)
+//   168 Lifecycle [phase:1][generation:8 LE][requestId:4 LE] -> [phase,enabled,active,gen:8,ageMs:4,id:4] (19 B), off main
+//       phase 0 disabled, 1 load/pending, 2 gameplay, 3 query. Role 2 alone never activates the entry gate.
+//   op 160 optionally adds [role:1][lifecycleGeneration:8 LE] after bits (13 B after opcode); stale tagged config changes nothing.
+//   The old role-only format never rearms disabled legacy. Role values: 0 none, 1 the host, 2 a joiner in the host's world (B runs only then)
 #include <cstddef>
 #include <cstdint>
 #include "wo216_rules.h"
@@ -30,10 +36,12 @@
 namespace kcdmp::wo216 {
 
 constexpr uint8_t kOpConfig = 160, kOpStatus = 161, kOpRouteRead = 162, kOpRouteIn = 163, kOpBrains = 164, kOpExempt = 165,
-                  kOpOutfitRead = 166, kOpOutfitOf = 167;
+                  kOpOutfitRead = 166, kOpOutfitOf = 167, kOpLifecycle = 168;
 
 bool on(uint32_t bit);       // the agent's word, less the bench twin's
 bool configured();           // the agent told this DLL its word (a joiner or a host in a session)
+bool authority_active();    // P1: role 2 after explicit Gameplay + native 5 s; never the calendar latch
+bool authority_enabled();   // switch state, independent of hook readiness
 bool decisions_blocked();    // Paket C: no local decision batch; direct host body actions still advance
 
 int status(char* out, int n);

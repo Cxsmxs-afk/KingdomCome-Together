@@ -8,6 +8,7 @@
 #include "wo202_rules.h"
 #include "wo200_rules.h"
 #include "wo221.h"
+#include "wo216.h"
 
 #include <windows.h>
 #include <atomic>
@@ -213,9 +214,11 @@ std::atomic<uint8_t> g_tapBits{0}, g_gateBits{0}, g_logBits{1}, g_valueBits{0};
 std::atomic<bool> g_tapOn{false}, g_gateOn{false};
 std::atomic<const void*> g_playerFull{nullptr};
 
+bool story_authority() { return g_role.load() == kRoleJoiner && g_joined.load() && wo216::authority_active(); }
+
 void recompute() {
     const bool role = g_role.load() != kRoleUnknown;
-    const bool receiveOnly = g_role.load() == kRoleJoiner && g_joined.load();
+    const bool receiveOnly = host_graph_only();
     g_tapOn = A.tap && role && (g_tapBits.load() != 0 || receiveOnly);
     g_gateOn = A.gate && role && (g_gateBits.load() != 0 || receiveOnly);
 }
@@ -490,7 +493,7 @@ void read_handler(const void* node, bool wantClass, HandlerRead* h) {
 // ---------------------------------------------------------------------------
 void hooked_out_trigger(void* port) {
     // The engine's own pulse always runs unguarded (a fault deep in the graph is the game's, never ours to swallow).
-    if (!g_tapOn.load(std::memory_order_relaxed) && !g_researchDrop.load(std::memory_order_relaxed)) {
+    if (!g_tapOn.load(std::memory_order_relaxed) && !host_graph_only() && !g_researchDrop.load(std::memory_order_relaxed)) {
         if (wo202::on(wo202rules::kBitQuestFail)) {   // WO-202 II.4: the pulse's port is the source of what it changes (the owner, below, only when asked)
             const void* ps = t_srcPort; const void* ns = t_srcNode;
             t_srcPort = port; t_srcNode = nullptr;
@@ -503,7 +506,7 @@ void hooked_out_trigger(void* port) {
     c_tapCalls.fetch_add(1, std::memory_order_relaxed);
     void* owner = port_owner(port);
     if (!owner) { g_origOut(port); return; }
-    if (host_graph_only()) {
+    if (host_graph_only() && !wo137::applying_state(owner)) {
         char method[128] = "";
         const bool function = classify_node(owner) == Kind::Function && wo137::function_method(owner, method, sizeof method) &&
                               method_kind(method) == Method::HostTime;
@@ -523,7 +526,7 @@ void hooked_out_trigger(void* port) {
         call_release(owner);
         return;
     }
-    if (g_npcTrigAny.load(std::memory_order_relaxed) && g_role.load() == kRoleJoiner && g_joined.load()) {   // WO-207 D.2
+    if (g_npcTrigAny.load(std::memory_order_relaxed) && story_authority()) {   // WO-207 D.2
         AcquireSRWLockShared(&g_npcTrigLock);
         const bool npcTrig = g_npcTrig.count(owner) != 0;
         ReleaseSRWLockShared(&g_npcTrigLock);
@@ -568,7 +571,7 @@ void hooked_out_trigger(void* port) {
     }
     uint32_t markId = 0;
     const bool marked = (k == Kind::Waiter || k == Kind::SceneStarter) && (g_tapBits.load() & 4) && cur == 0 && marked_closure(owner, &markId);
-    const Tap act = tap(g_role.load(), k, g_joined.load(), (g_tapBits.load() & 2) != 0, (g_tapBits.load() & 1) != 0, marked, cur != 0);
+    const Tap act = tap(g_role.load(), k, story_authority(), (g_tapBits.load() & 2) != 0, (g_tapBits.load() & 1) != 0, marked, cur != 0);
     switch (act) {
         case Tap::QuietDrop: {
             c_quiet.fetch_add(1, std::memory_order_relaxed);
@@ -767,7 +770,7 @@ int horse_status(char* out, int n) {
 const bool kHorseReg = wo221::add_status("horse_gate", &horse_status);
 
 bool gate(void* node, void* /*ctx*/) {
-    if (!g_gateOn.load(std::memory_order_relaxed) || t_inGate) return false;
+    if ((!g_gateOn.load(std::memory_order_relaxed) && !host_graph_only()) || t_inGate) return false;
     c_gateCalls.fetch_add(1, std::memory_order_relaxed);
     const void* vt = nullptr;
     if (!rd(node, 0, &vt) || !vt) return false;
@@ -780,7 +783,7 @@ bool gate(void* node, void* /*ctx*/) {
     if (methodRead) m = method_kind(mname);
     if (host_graph_only()) {
         ++t_inGate;
-        const bool timePath = !wo137::applying_state(node) && (m == Method::HostTime || wo137::host_time_scope(node));
+        const bool timePath = host_clock_guard(g_role.load(), g_joined.load(), wo137::applying_state(node)) && (m == Method::HostTime || wo137::host_time_scope(node));
         --t_inGate;
         if (timePath) {
             c_verdict[static_cast<int>(Verdict::HostWorld)].fetch_add(1, std::memory_order_relaxed);
@@ -793,7 +796,7 @@ bool gate(void* node, void* /*ctx*/) {
     const uint8_t role = g_role.load();
     const uint8_t gb = g_gateBits.load();
     Cfg c;
-    c.joined = g_joined.load();
+    c.joined = story_authority();
     c.puppets = (gb & 1) != 0 || (role == kRoleJoiner && c.joined);
     c.hostClosure = (gb & 2) != 0;
     c.route = (gb & 4) != 0;
@@ -1059,11 +1062,11 @@ void describe_source(const void* node, const void* port, char* cls, size_t ncls,
     port_name(port, pname, npname);
     if (owner && !node) call_release(owner);
 }
-bool copy_neutral_always() { return g_role.load() == kRoleJoiner && g_joined.load() && (g_valueBits.load() & 1) != 0; }
+bool copy_neutral_always() { return story_authority() && (g_valueBits.load() & 1) != 0; }
 bool host_authority_ready() {
     return A.tap && A.gate && A.ports && g_triggerClasses == 3 && wo137::punish_gate_armed() && wo137::host_time_scope_ready();
 }
-bool host_graph_only() { return g_role.load() == kRoleJoiner && g_joined.load(); }
+bool host_graph_only() { return host_clock_guard(g_role.load(), g_joined.load(), false); }
 void set_mirror_talker(bool on) { t_mirrorTalker = on; }
 
 void install() {
@@ -1203,6 +1206,7 @@ void install() {
 }
 
 void tick() {
+    recompute(); // lifecycle can become active without another optional-feature configuration
     static uint64_t last = 0;
     const uint64_t t = now_ms();
     if (t - last < 1000) return;

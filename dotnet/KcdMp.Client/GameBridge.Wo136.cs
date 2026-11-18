@@ -131,6 +131,7 @@ public partial class GameBridge
     /// <summary>"Loading saved game" / "[CryAction] LoadGame": the mod's hold, best effort (the join's own load call already set it).</summary>
     private void Wo136OnLoadSeen(string what)
     {
+        P1OnLoadSeen(what);
         T3SideChannelsInvalidate("load-" + what);
         _ = Wo134InvalidateLedgerAsync("load-" + what);
         Wo147ForgetGuardsOnLoad(what);   // WO-147: a load re-creates the copies -- their guards are gone with the old ones
@@ -142,6 +143,7 @@ public partial class GameBridge
     /// <summary>"Gameplay started": the settle starts; the hold ends W136Settle later.</summary>
     private void Wo136OnGameplayStarted()
     {
+        P1OnGameplayStarted();
         _w136SettleUntilUtc = DateTime.UtcNow + W136Settle;
         _w136LuaReleased = false;
         Console.WriteLine(FormattableString.Invariant($"MP-W136 Gameplay started: NPCs wait {W136Settle.TotalSeconds:F0} s more (settle), then the held frames are replayed"));
