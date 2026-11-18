@@ -500,10 +500,10 @@ def start_agent(cid, role, port, twin=False):
     rig.say('agent', cid, 'pid', rec['pid'], role, 'TWIN (the 0.62.7 tail fix off)' if twin else '')
 
 
-def collect(tag, *, write_verdict=False):
+def collect(tag, *, write_verdict=False, copies=('A', 'B'), bot_log=None):
     """Both copies' files into <run>\\bundles\\<tag>-<id>\\ (the launcher's bundle layout), then LogPack's bundle."""
     out = {}
-    for cid in ('A', 'B'):
+    for cid in copies:
         p = plan(cid)
         d = os.path.join(rig.run_dir(), 'bundles', '%s-%s' % (tag, cid))
         if os.path.isdir(d): shutil.rmtree(d)
@@ -514,6 +514,8 @@ def collect(tag, *, write_verdict=False):
         put(os.path.join(p['root'], 'kcdmp-native.mirror.log'), 'kcdmp-native.mirror.log')
         put(os.path.join(p['dll_dir'], 'kcdmp-native-%s.log' % cid), 'kcdmp-native.log')
         put(os.path.join(p['agent_dir'], 'agent.log'), 'agent.log')
+        if bot_log is not None:
+            put(bot_log, 'bot-t4.log')
         # WO-210: the probe's rotated piece too (E.1's overlap); WO-215 G: the whole session's file and its rotated piece
         for f in ('kcdmp-anim.jsonl', 'kcdmp-anim.1.jsonl', 'kcdmp-anim-session.jsonl', 'kcdmp-anim-session.1.jsonl', 'digest.jsonl', 'applied.jsonl'):
             put(os.path.join(p['root'], f), f)

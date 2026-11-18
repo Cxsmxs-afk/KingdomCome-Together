@@ -254,6 +254,35 @@ static class P
 
     static async Task<int> Main(string[] a)
     {
+        if (a.Contains(BotHostOptions.Flag))
+        {
+            if (Environment.GetEnvironmentVariable(BotHostOptions.EnvironmentName) != "1")
+            {
+                Console.Error.WriteLine("Bot-Host benötigt KCDMP_TEST_BOT=1 und --test-bot.");
+                return 2;
+            }
+            try
+            {
+                var bot = BotHostOptions.Parse(a);
+                return await Host125.RunAsync(a, bot.WireVersion, bot);
+            }
+            catch (FormatException ex)
+            {
+                Console.Error.WriteLine(ex.Message);
+                return 2;
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or OperationCanceledException or ArgumentException or SocketException)
+            {
+                Console.Error.WriteLine($"Bot-Host abgebrochen ({ex.GetType().Name}).");
+                return 1;
+            }
+        }
+        if (a.Any(arg => arg is "--bot-plan" or "--world-time" or "--wire-version"))
+        {
+            Console.Error.WriteLine("Bot-Host-Optionen benötigen --test-bot.");
+            return 2;
+        }
+
         string host = Arg(a, "--host", "127.0.0.1"); int port = int.Parse(Arg(a, "--port", "7778"));
         string name = Arg(a, "--name", "synth-host"); double duration = double.Parse(Arg(a, "--duration", "60"), CultureInfo.InvariantCulture);
         int emitMs = int.Parse(Arg(a, "--emit-ms", "100"));

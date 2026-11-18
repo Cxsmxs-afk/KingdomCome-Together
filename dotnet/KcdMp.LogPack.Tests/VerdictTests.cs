@@ -92,4 +92,20 @@ public class VerdictTests
         }
         finally { if (Directory.Exists(folder)) Directory.Delete(folder, true); }
     }
+
+    [Theory]
+    [InlineData("", VerdictStatus.Grey)]
+    [InlineData("BOT-T4 role=joiner complete=1 poses=12", VerdictStatus.Grey)]
+    [InlineData("BOT-T4 role=joiner complete=0 reason=relay_role", VerdictStatus.Red)]
+    [InlineData("SYNTH125 t=0.16s BOT-T4 role=host refused=relay_role", VerdictStatus.Red)]
+    [InlineData("BOT-T4 role=joiner ready=1\nBOT-T4 role=host complete=1", VerdictStatus.Red)]
+    [InlineData("BOT-T4 role=joiner ready=1\nBOT-T4 role=joiner complete=1 poses=12", VerdictStatus.Green)]
+    [InlineData("SYNTH125 t=0.00s BOT-T4 role=host started=1\nSYNTH125 t=4.24s BOT-T4 role=host complete=1 played=2", VerdictStatus.Green)]
+    public void A_scripted_peer_verdict_requires_a_start_and_its_own_completion(string log, VerdictStatus expected)
+    {
+        var input = new Briefing.Input();
+        input.Logs["bot-t4.log"] = log.Split('\n');
+        var route = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "bot_plan_complete");
+        Assert.Equal(expected, route.Status);
+    }
 }

@@ -87,7 +87,7 @@ using System.Text;
 using KcdMp.Client;
 using KcdMp.Wire;
 
-static class P
+static partial class P
 {
     static string Arg(string[] a, string k, string d) { int i = Array.IndexOf(a, k); return i >= 0 && i + 1 < a.Length ? a[i + 1] : d; }
     static float F(string s) => float.Parse(s, CultureInfo.InvariantCulture);
@@ -105,12 +105,45 @@ static class P
 
     static async Task<int> Main(string[] a)
     {
+        if (!a.Any(BotOptions.Contains)) return await RunAsync(a, null);
+        if (!a.Contains("--test-bot") || Environment.GetEnvironmentVariable(BotEnv) != "1")
+        {
+            Console.Error.WriteLine("T4 requires --test-bot and KCDMP_TEST_BOT=1.");
+            return 2;
+        }
+        try
+        {
+            if (a.Length == 2 && a.Contains("--self-test")) return BotSelfTest();
+            return await RunAsync(a, ParseBotOptions(a));
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException or FormatException or InvalidOperationException or UnauthorizedAccessException)
+        {
+            // Private save and installation paths stay out of bot diagnostics.
+            string reason = ex switch
+            {
+                BotRoleException => "relay_role",
+                IOException or UnauthorizedAccessException => "io-or-join",
+                _ => ex.GetType().Name
+            };
+            Console.Error.WriteLine($"BOT-T4 role=joiner complete=0 reason={reason}");
+            return 1;
+        }
+    }
+
+    private static async Task<int> RunAsync(string[] a, BotOptionsParsed? bot)
+    {
         string host = Arg(a, "--host", "127.0.0.1"); int port = int.Parse(Arg(a, "--port", "7778"));
-        string name = Arg(a, "--name", "wo121-peer");
+        string name = bot?.Name ?? Arg(a, "--name", "wo121-peer");
+        using var botTimeout = bot is null ? null : new CancellationTokenSource(bot.Duration);
+        var hard = botTimeout?.Token ?? CancellationToken.None;
         SkewMs = long.Parse(Arg(a, "--skew-ms", "0"), CultureInfo.InvariantCulture);
-        string release = File.ReadAllText(FindUp("VERSION")).Trim();
+        string release = bot?.WireVersion ?? File.ReadAllText(FindUp("VERSION")).Trim();
         var steps = new List<Step>(); double endT = 60;
-        foreach (var raw in File.ReadAllLines(Arg(a, "--scenario", "scenario.txt")))
+        BotPlan? plan = bot is null ? null : bot.Scenario is string scenario
+            ? ReadBotPlan(File.ReadLines(scenario)) : DefaultBotPlan(bot.Origin ?? (0, 0, 0));
+        Guid bow = bot is not null && plan!.Steps.Any(step => step.F[0] is "ranged" or "bow_equip")
+            ? FindBotBow(bot) : Guid.Empty;
+        foreach (var raw in bot is null ? File.ReadLines(Arg(a, "--scenario", "scenario.txt")) : Array.Empty<string>())
         {
             var t = raw.Trim(); if (t.Length == 0 || t.StartsWith('#')) continue;
             var f = t.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -121,24 +154,59 @@ static class P
         steps.Sort((x, y) => x.T.CompareTo(y.T));
 
         using var tcp = new TcpClient { NoDelay = true };
-        await tcp.ConnectAsync(host, port);
+        if (bot is null) await tcp.ConnectAsync(host, port);
+        else await tcp.ConnectAsync(bot.Address, bot.Port, hard);
         var st = tcp.GetStream();
-        var nb = Encoding.UTF8.GetBytes(name); var rb = Encoding.UTF8.GetBytes(release);
-        int hl = 2 + nb.Length + rb.Length; var hs = new byte[3 + hl];
-        hs[0] = Protocol.Handshake; BinaryPrimitives.WriteUInt16LittleEndian(hs.AsSpan(1), (ushort)hl);
-        hs[3] = Protocol.Version; hs[4] = (byte)nb.Length; nb.CopyTo(hs, 5); rb.CopyTo(hs, 5 + nb.Length);
-        await st.WriteAsync(hs);
-        var (ty, pl) = await ReadPacket(st, CancellationToken.None);
-        if (ty != Protocol.Ack) { Console.WriteLine($"PEER refused: 0x{ty:X2} {Encoding.UTF8.GetString(pl)}"); return 1; }
+        byte[] hs;
+        if (bot is not null) hs = RelayConnector.BuildHandshake(name, release);
+        else
+        {
+            var nb = Encoding.UTF8.GetBytes(name); var rb = Encoding.UTF8.GetBytes(release);
+            int hl = 2 + nb.Length + rb.Length; hs = new byte[3 + hl];
+            hs[0] = Protocol.Handshake; BinaryPrimitives.WriteUInt16LittleEndian(hs.AsSpan(1), (ushort)hl);
+            hs[3] = Protocol.Version; hs[4] = (byte)nb.Length; nb.CopyTo(hs, 5); rb.CopyTo(hs, 5 + nb.Length);
+        }
+        await st.WriteAsync(hs, hard);
+        var (ty, pl) = await ReadPacket(st, hard);
+        if (ty != Protocol.Ack || pl.Length == 0) { Console.WriteLine($"PEER refused: 0x{ty:X2} {Encoding.UTF8.GetString(pl)}"); return 1; }
         byte myId = pl[0];
+        BotContext? botContext = null;
+        if (bot is not null)
+        {
+            bool needsOrigin = bot.Scenario is null && !bot.Origin.HasValue;
+            botContext = await PrepareBotAsync(st, myId, needsOrigin, hard);
+            if (needsOrigin) plan = DefaultBotPlan(botContext.Origin!.Value);
+            steps = plan!.Steps.ToList();
+            endT = plan.End;
+            Console.WriteLine($"BOT-T4 role=joiner ready=1 world={botContext.World}");
+        }
+        int botPoses = 0, botActions = 0, botRanged = 0;
+        ulong botRangedEpoch = 1;
+        uint rangedSequence = 0;
+        async Task Emit(byte[] packet)
+        {
+            await Send(st, packet, hard);
+            if (bot is null) return;
+            switch (packet[0])
+            {
+                case Protocol.Position: botPoses++; break;
+                case Protocol.ActionUp:
+                case Protocol.PlayerHitV8Up:
+                case Protocol.PlayerStateUp:
+                case Protocol.PlayerDeathUp:
+                case Protocol.PlayerRespawnedUp:
+                case Protocol.AppearanceUp: botActions++; break;
+                case Protocol.W164Up: botRanged++; break;
+            }
+        }
         Console.WriteLine($"PEER connected id={myId} release={release} protocol=v{Protocol.Version} steps={steps.Count}");
 
-        byte? joiner = null;
+        byte? joiner = botContext?.Host;
         var leashIn = new System.Collections.Concurrent.ConcurrentQueue<(byte Src, LeashCommand C)>();   // WO-114
         var sleepIn = new System.Collections.Concurrent.ConcurrentQueue<(byte Src, LootMsg M)>();        // WO-140
         string sleepAuto = "none";
         uint sleepN = 0;
-        using var cts = new CancellationTokenSource();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(hard);
         var inbox = new ActionInbox();
         string recPath = Arg(a, "--record", "");
         string questRecPath = Arg(a, "--quest-rec", "");   // WO-137
@@ -154,9 +222,22 @@ static class P
                 while (!cts.IsCancellationRequested)
                 {
                     var (t2, b2) = await ReadPacket(st, cts.Token);
+                    if (botContext is not null)
+                    {
+                        if ((t2 == Protocol.CombatRole && b2.Length == 1 && b2[0] != 0) ||
+                            (t2 == Protocol.Disconnect && b2.Length >= 1 && b2[0] == botContext.Host))
+                            throw new IOException("T4 host left.");
+                        if (Wo206Rules.TryReadEpochFrame(t2, b2, out byte source, out uint world, out uint epoch, out string why) &&
+                            source == botContext.Host && why != Wo206Rules.Ack)
+                        {
+                            if (world != botContext.World) throw new IOException("T4 host changed world.");
+                            await Send(st, BotEpochAck(world, epoch), cts.Token);
+                            continue;
+                        }
+                    }
                     if (rec is not null && (t2 == Protocol.NpcStateDown || t2 == Protocol.ActionDown || t2 == Protocol.NpcDamageDown || t2 == Protocol.PauseDown || t2 == Protocol.ActivityHostDown || t2 == Protocol.ActivityExtraDown))   // WO-138: + the pause announcement; WO-141: + activities; WO-143: + hands, gaits, one-shots, looks
                         lock (rec) rec.WriteLine($"{recClock.ElapsedMilliseconds} {t2:X2} {Convert.ToHexString(b2)}");
-                    if (t2 == Protocol.AppearanceDown && b2.Length >= 2 && b2[0] != myId) hostAppearance = b2.AsSpan(1).ToArray();   // [src][count][classes]
+                    if (bot is null && t2 == Protocol.AppearanceDown && b2.Length >= 2 && b2[0] != myId) hostAppearance = b2.AsSpan(1).ToArray();   // [src][count][classes]
                     if (t2 == Protocol.Name && b2.Length >= 2 && b2[0] != myId) { joiner ??= b2[0]; }
                     else if (t2 == Protocol.Ghost && b2.Length >= 1 && b2[0] != myId)
                     {
@@ -216,23 +297,28 @@ static class P
                              && LootMsg.TryDecode(b2.AsSpan(1 + Protocol.JoinHeaderLen), out var svm))   // WO-140
                     {
                         Console.WriteLine($"PEER t={recClock.Elapsed.TotalSeconds:F1} got SleepVote {Protocol.SleepVoteName(svm.Kind)} tok=0x{svm.Tok:X8} from={b2[0]}: {svm.Text}");
-                        sleepIn.Enqueue((b2[0], svm));
+                        if (bot is null) sleepIn.Enqueue((b2[0], svm));
                     }
                     else if (t2 == Protocol.CarryDown && b2.Length > 1 + Protocol.JoinHeaderLen
                              && LootMsg.TryDecode(b2.AsSpan(1 + Protocol.JoinHeaderLen), out var crm))   // WO-148
                         Console.WriteLine($"PEER t={recClock.Elapsed.TotalSeconds:F1} got Carry {Protocol.CarryKindName(crm.Kind)} tok={crm.Tok} from={b2[0]}: {crm.Text}");
-                    else if (t2 == Protocol.LeashDown && b2.Length > 1 + Protocol.JoinHeaderLen
+                    // A T4 route is scripted. The legacy live peer may obey a host pull.
+                    else if (bot is null && t2 == Protocol.LeashDown && b2.Length > 1 + Protocol.JoinHeaderLen
                              && LeashCommand.TryDecode(b2.AsSpan(1 + Protocol.JoinHeaderLen), out var lc))
                         leashIn.Enqueue((b2[0], lc));   // WO-114: handled on the main loop
                 }
             }
-            catch { }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
+            catch when (bot is null) { }
         });
 
         var outbox = new ActionOutbox();
         uint lootTok = 0;   // WO-134
         var sw = Stopwatch.StartNew();
-        float x = 0, y = 0, z = 0, yaw = 0, speed = 0, head = 0, moveDir = 0, zRate = 0; double moveUntil = -1;
+        uint botStartMs = bot is null ? 0 : Ms();
+        float x = 0, y = 0, z = 0, yaw = 0, speed = 0, head = 0, moveDir = 0, zRate = 0;
+        double moveUntil = -1, curveStart = -1, moveStart = -1;
+        float curveFrom = 0, curveTo = 0;
         double jumpT0 = -1, jumpDur = 0.8; float jumpH = 0.5f, zBase = 0;
         var s2 = new BodyState2(0, 0, BodyState2Bits.None, WireZone.Undefined, WireGuardStance.None, WireZone.Undefined, 0, 0, 0);
         BodyState2? lastSent = null; double lastSentT = -9, lastPos = -9, lastPing = 0; int si = 0; bool placed = false, frozen = false;
@@ -261,6 +347,8 @@ static class P
         if (control is not null) File.WriteAllText(control, "");
         while (sw.Elapsed.TotalSeconds < endT)
         {
+            hard.ThrowIfCancellationRequested();
+            if (bot is not null && reader.IsCompleted) await reader;
             double t = sw.Elapsed.TotalSeconds, dt = t - lastT; lastT = t;
             // Live control: every line appended to the control file runs now.
             if (control is not null && t - lastPoll > 0.05)
@@ -286,15 +374,30 @@ static class P
             }
             while (si < steps.Count && steps[si].T <= t)
             {
-                var f = steps[si++].F;
+                var step = steps[si++];
+                var f = step.F;
+                uint plannedHostMs = bot is null ? 0 : PlannedHostMs(botStartMs, step.T);
                 switch (f[0])
                 {
                     case "freeze": frozen = true; break;      // stop sending (photo-mode shots: the native writer keeps rendering)
                     case "unfreeze": frozen = false; break;
                     case "stand": frozen = false; x = F(f[1]); y = F(f[2]); z = zBase = F(f[3]); yaw = F(f[4]); speed = 0; moveUntil = -1; placed = true; break;
-                    case "move": speed = F(f[1]); head = F(f[2]); yaw = head; moveDir = 0; moveUntil = t + F(f[3]);
-                        zRate = f.Length > 4 ? (F(f[4]) - z) / F(f[3]) : 0; break;   // WO-129: [zEnd] keeps a slope walk on the ground
-                    case "strafe": speed = F(f[1]); moveDir = F(f[2]); head = yaw + moveDir; moveUntil = t + F(f[3]); break;
+                    case "move":
+                    case "curve" when bot is not null:
+                        speed = F(f[1]); head = F(f[2]); yaw = head; moveDir = 0;
+                        moveStart = bot is null ? t : step.T;
+                        moveUntil = moveStart + F(f[3]);
+                        curveStart = f[0] == "curve" ? moveStart : -1;
+                        curveFrom = head;
+                        curveTo = curveStart >= 0 ? F(f[4]) : head;
+                        zRate = f[0] == "move" && f.Length > 4 ? (F(f[4]) - z) / F(f[3]) : 0;
+                        break;
+                    case "strafe":
+                        speed = F(f[1]); moveDir = F(f[2]); head = yaw + moveDir;
+                        moveStart = bot is null ? t : step.T;
+                        moveUntil = moveStart + F(f[3]); curveStart = -1;
+                        if (bot is not null) zRate = 0;
+                        break;
                     case "state":
                         foreach (var kv in f[1..])
                         {
@@ -317,23 +420,23 @@ static class P
                         if (f.Length > 1) jumpH = F(f[1]);
                         if (f.Length > 2) jumpDur = double.Parse(f[2], CultureInfo.InvariantCulture);
                         jumpT0 = t; zBase = z;
-                        await Send(st, outbox.Build(ActionKind.Jump, ActionPhase.Commit, BitConverter.GetBytes(Ms())));
+                        await Emit(outbox.Build(ActionKind.Jump, ActionPhase.Commit, BitConverter.GetBytes(Ms())));
                         Console.WriteLine($"PEER t={t:F1} jump h={jumpH} dur={jumpDur}");
                         break;
                     case "attack":
                     {
                         var ev = new AttackEvent(Ms(), 1, f.Length > 2 ? Zone(f[2]) : WireZone.UpperRight, 1, 0, Guid.Parse(f[1]));
-                        await Send(st, outbox.Build(ActionKind.Attack, ActionPhase.Commit, ev.ToBytes()));
+                        await Emit(outbox.Build(ActionKind.Attack, ActionPhase.Commit, ev.ToBytes()));
                         Console.WriteLine($"PEER t={t:F1} attack {ev}");
                         break;
                     }
                     case "block_impulse":
-                        await Send(st, outbox.Build(ActionKind.BlockImpulse, ActionPhase.Commit,
+                        await Emit(outbox.Build(ActionKind.BlockImpulse, ActionPhase.Commit,
                             new RowEvent(Ms(), (byte)(f.Length > 2 && f[2] == "perfect" ? RowEvent.FlagPerfect : 0), Guid.Parse(f[1]), "").ToBytes()));
                         Console.WriteLine($"PEER t={t:F1} block_impulse {f[1]}");
                         break;
                     case "dodge":
-                        await Send(st, outbox.Build(ActionKind.Dodge, ActionPhase.Commit, new RowEvent(Ms(), 0, Guid.Parse(f[1]), "").ToBytes()));
+                        await Emit(outbox.Build(ActionKind.Dodge, ActionPhase.Commit, new RowEvent(Ms(), 0, Guid.Parse(f[1]), "").ToBytes()));
                         Console.WriteLine($"PEER t={t:F1} dodge {f[1]}");
                         break;
                     case "draw":
@@ -342,12 +445,12 @@ static class P
                         // The 0x2C combat event (v2: [event][sid:2]) -- the avatar's weapon draw/sheathe.
                         var ce = new byte[3 + 3]; ce[0] = Protocol.CombatEventUp; BinaryPrimitives.WriteUInt16LittleEndian(ce.AsSpan(1), 3);
                         ce[3] = f[0] == "draw" ? Protocol.CombatEventWeaponDrawn : Protocol.CombatEventWeaponSheathed;
-                        await Send(st, ce);
+                        await Emit(ce);
                         Console.WriteLine($"PEER t={t:F1} {f[0]}");
                         break;
                     }
                     case "ff":
-                        await Send(st, outbox.Build(ActionKind.SessionSetting, ActionPhase.Commit, [SessionSettingKey.FriendlyFire, f[1] == "on" ? (byte)1 : (byte)0]));
+                        await Emit(outbox.Build(ActionKind.SessionSetting, ActionPhase.Commit, [SessionSettingKey.FriendlyFire, f[1] == "on" ? (byte)1 : (byte)0]));
                         Console.WriteLine($"PEER t={t:F1} ff {f[1]} (as host)");
                         break;
                     case "npchit":   // npchit <npcName> <hp> <st>: this peer's attributed hit on a world NPC (0x30, WO-121 Phase 5)
@@ -361,7 +464,7 @@ static class P
                         BinaryPrimitives.WriteSingleLittleEndian(pk.AsSpan(o), F(f[3]));
                         BinaryPrimitives.WriteSingleLittleEndian(pk.AsSpan(o + 4), F(f[2]));
                         pk[o + 8] = (byte)(Protocol.DamageFlagSuppressHitReaction | Protocol.NpcDamageFlagAttributed);
-                        await Send(st, pk);
+                        await Emit(pk);
                         Console.WriteLine($"PEER t={t:F1} npchit {f[1]} hp={f[2]} st={f[3]} attributed");
                         break;
                     }
@@ -369,7 +472,7 @@ static class P
                         if (joiner is byte j)
                         {
                             byte fl = (byte)(f.Length > 3 && f[3] == "unarmed" ? PlayerHitV8.FlagUnarmed : 0);
-                            await Send(st, new PlayerHitV8(j, F(f[2]), F(f[1]), fl, 0).BuildUp());
+                            await Emit(new PlayerHitV8(j, F(f[2]), F(f[1]), fl, 0).BuildUp());
                             Console.WriteLine($"PEER t={t:F1} hit ghost {j} hp={f[1]} st={f[2]} flags={fl}");
                         }
                         else Console.WriteLine($"PEER t={t:F1} hit: no joiner seen yet");
@@ -382,25 +485,37 @@ static class P
                         break;
                     case "death":   // WO-131
                     {
+                        if (bot is not null) { outbox.BumpIncarnation(); botRangedEpoch++; }
                         var dp = new byte[3]; dp[0] = Protocol.PlayerDeathUp;
-                        await Send(st, dp);
+                        await Emit(dp);
                         Console.WriteLine($"PEER t={t:F1} death sent");
                         break;
                     }
                     case "respawned":   // WO-131: respawned <x> <y> <z>
                     {
+                        if (bot is not null) { outbox.BumpIncarnation(); botRangedEpoch++; }
                         x = F(f[1]); y = F(f[2]); z = zBase = F(f[3]); speed = 0; moveUntil = -1; placed = true; frozen = false;
                         var rp = new byte[3 + Protocol.PlayerRespawnedUpPayloadLen]; rp[0] = Protocol.PlayerRespawnedUp;
                         BinaryPrimitives.WriteUInt16LittleEndian(rp.AsSpan(1), (ushort)Protocol.PlayerRespawnedUpPayloadLen);
                         BinaryPrimitives.WriteSingleLittleEndian(rp.AsSpan(3), x); BinaryPrimitives.WriteSingleLittleEndian(rp.AsSpan(7), y);
                         BinaryPrimitives.WriteSingleLittleEndian(rp.AsSpan(11), z); rp[15] = 1;
-                        await Send(st, rp);
-                        await Send(st, PositionCodec.BuildPosition(x, y, z, yaw, false, false, null, Ms()));
+                        await Emit(rp);
+                        await Emit(PositionCodec.BuildPosition(x, y, z, yaw, false, false, null, Ms()));
                         lastPos = t;
                         vitalsHp = 100; vitalsSt = 100; lastVitals = -9; vitalsFlags = 0;
                         Console.WriteLine(FormattableString.Invariant($"PEER t={t:F1} respawned at ({x:F1}, {y:F1}, {z:F1})"));
                         break;
                     }
+                    case "ranged" when botContext is not null:
+                    {
+                        uint delay = (uint)ScheduledAgeMs(plannedHostMs, Ms());
+                        if (delay > Protocol.RangedCaptureMaxAgeMs) throw new IOException("T4 ranged station missed its deadline.");
+                        await Emit(BuildBotRanged(botContext.Host, botContext.World, botRangedEpoch, ++rangedSequence, BotRangedPhase(f[1]), bow, delay));
+                        break;
+                    }
+                    case "bow_equip" when botContext is not null:
+                        f = ["appearance", bow.ToString("D")];
+                        goto case "appearance";
                     case "appearance":   // WO-131: appearance mirror | <guid,...>
                     {
                         byte[]? classes = null;
@@ -414,7 +529,7 @@ static class P
                         if (classes is null) { Console.WriteLine($"PEER t={t:F1} appearance: nothing to mirror yet"); break; }
                         var ap = new byte[3 + classes.Length]; ap[0] = Protocol.AppearanceUp;
                         BinaryPrimitives.WriteUInt16LittleEndian(ap.AsSpan(1), (ushort)classes.Length); classes.CopyTo(ap, 3);
-                        await Send(st, ap);
+                        await Emit(ap);
                         Console.WriteLine($"PEER t={t:F1} appearance sent ({classes[0]} item classes)");
                         break;
                     }
@@ -425,7 +540,7 @@ static class P
                         BinaryPrimitives.WriteUInt16LittleEndian(tp.AsSpan(1), (ushort)Protocol.TimeSkipUpPayloadLen);
                         tp[3] = ph; tp[4] = byte.Parse(f[2], CultureInfo.InvariantCulture);
                         BinaryPrimitives.WriteUInt32LittleEndian(tp.AsSpan(5), uint.Parse(f[3], CultureInfo.InvariantCulture));
-                        await Send(st, tp);
+                        await Emit(tp);
                         Console.WriteLine($"PEER t={t:F1} timeskip sent {f[1]} kind={f[2]} t={f[3]}");
                         break;
                     }
@@ -435,7 +550,7 @@ static class P
                         var body = StoryBeat.BuildUpPayload(sk, string.Join(' ', f.Skip(2)));
                         var sp = new byte[3 + body.Length]; sp[0] = Protocol.StoryBeatUp;
                         BinaryPrimitives.WriteUInt16LittleEndian(sp.AsSpan(1), (ushort)body.Length); body.CopyTo(sp, 3);
-                        await Send(st, sp);
+                        await Emit(sp);
                         Console.WriteLine($"PEER t={t:F1} story sent {f[1]} ({body.Length} bytes)");
                         break;
                     }
@@ -451,7 +566,7 @@ static class P
                         BinaryPrimitives.WriteSingleLittleEndian(dp.AsSpan(29), F(f[4]));
                         BinaryPrimitives.WriteSingleLittleEndian(dp.AsSpan(33), F(f[5]));
                         BinaryPrimitives.WriteSingleLittleEndian(dp.AsSpan(37), F(f[6]));
-                        await Send(st, dp);
+                        await Emit(dp);
                         Console.WriteLine($"PEER t={t:F1} itemdrop sent drop={did} class={f[1]} x{f[2]}");
                         break;
                     }
@@ -460,7 +575,7 @@ static class P
                         var cp = new byte[3 + Protocol.ItemClaimUpPayloadLen]; cp[0] = Protocol.ItemClaimUp;
                         BinaryPrimitives.WriteUInt16LittleEndian(cp.AsSpan(1), (ushort)Protocol.ItemClaimUpPayloadLen);
                         BinaryPrimitives.WriteUInt32LittleEndian(cp.AsSpan(3), uint.Parse(f[1], CultureInfo.InvariantCulture));
-                        await Send(st, cp);
+                        await Emit(cp);
                         Console.WriteLine($"PEER t={t:F1} itemclaim sent drop={f[1]}");
                         break;
                     }
@@ -469,7 +584,7 @@ static class P
                         lootTok++;
                         byte k = f[1] switch { "open" => Protocol.LootAskBodyOpen, "take" => Protocol.LootAskBodyTake, "put" => Protocol.LootAskBodyPut, _ => Protocol.LootAskItemTake };
                         string text = f[1] == "item" && f.Length == 6 ? string.Join(' ', f.Skip(2)) + " 0" : string.Join(' ', f.Skip(2));
-                        await Send(st, new LootMsg(k, lootTok, text).BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost));
+                        await Emit(new LootMsg(k, lootTok, text).BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost));
                         Console.WriteLine($"PEER t={t:F1} loot {Protocol.LootAskName(k)} tok={lootTok}: {text}");
                         break;
                     }
@@ -477,7 +592,7 @@ static class P
                     {
                         lootTok++;
                         string text = $"{f[1]} {f[2]}";
-                        await Send(st, new LootMsg(Protocol.LootAskTakedown, lootTok, text).BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost));
+                        await Emit(new LootMsg(Protocol.LootAskTakedown, lootTok, text).BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost));
                         Console.WriteLine($"PEER t={t:F1} takedown tok={lootTok}: {text}");
                         break;
                     }
@@ -489,8 +604,8 @@ static class P
                         var hip = new byte[3 + 1 + hnb.Length]; hip[0] = Protocol.HorseInfoUp;
                         BinaryPrimitives.WriteUInt16LittleEndian(hip.AsSpan(1), (ushort)(1 + hnb.Length));
                         hip[3] = (byte)hnb.Length; hnb.CopyTo(hip, 4);
-                        await Send(st, hip);
-                        await Send(st, PositionCodec.BuildPosition(x, y, z, yaw, riding, false, null, Ms()));
+                        await Emit(hip);
+                        await Emit(PositionCodec.BuildPosition(x, y, z, yaw, riding, false, null, Ms()));
                         lastPos = t;
                         Console.WriteLine($"PEER t={t:F1} ride {(riding ? hn : "off")} (HorseInfo + the riding flag)");
                         break;
@@ -501,7 +616,7 @@ static class P
                         byte k = f[1] switch { "request" => Protocol.QuestAskRequest, "talk" => Protocol.QuestAskTalk, "resync" => Protocol.QuestAskResync, _ => (byte)0 };
                         if (k == 0) { Console.WriteLine($"PEER t={t:F1} quest: unknown verb {f[1]}"); break; }
                         string text = string.Join(' ', f.Skip(2));
-                        await Send(st, new LootMsg(k, lootTok, text).BuildUp(Protocol.QuestAskUp, Protocol.JoinTargetHost));
+                        await Emit(new LootMsg(k, lootTok, text).BuildUp(Protocol.QuestAskUp, Protocol.JoinTargetHost));
                         Console.WriteLine($"PEER t={t:F1} quest {Protocol.QuestAskName(k)} tok={lootTok}: {text}");
                         break;
                     }
@@ -514,7 +629,7 @@ static class P
                         else if (f[1] == "begin" && f.Length > 4) { sk = Protocol.SleepBegin; stok = Convert.ToUInt32(f[2], 16); stext = Wo140Text.Begin("sleep", myId, float.Parse(f[3], CultureInfo.InvariantCulture), f[4] == "1"); }
                         else if (f[1] == "cancel" && f.Length > 3) { sk = Protocol.SleepCancel; stok = Convert.ToUInt32(f[2], 16); stext = Wo140Text.Cancel(f[3], myId); }
                         else { Console.WriteLine($"PEER t={t:F1} sleep: bad verb"); break; }
-                        await Send(st, new LootMsg(sk, stok, stext).BuildUp(Protocol.SleepVoteUp, Protocol.JoinTargetHost));
+                        await Emit(new LootMsg(sk, stok, stext).BuildUp(Protocol.SleepVoteUp, Protocol.JoinTargetHost));
                         Console.WriteLine($"PEER t={t:F1} sleep {Protocol.SleepVoteName(sk)} tok=0x{stok:X8}: {stext}");
                         break;
                     }
@@ -527,7 +642,7 @@ static class P
                         string text;
                         if (k == Protocol.CrimeAskOutcome) { ctok = uint.Parse(f[2], CultureInfo.InvariantCulture); text = string.Join(' ', f.Skip(3)); }
                         else { ctok = ++lootTok; text = string.Join(' ', f.Skip(2)); }
-                        await Send(st, new LootMsg(k, ctok, text).BuildUp(Protocol.CrimeAskUp, Protocol.JoinTargetHost));
+                        await Emit(new LootMsg(k, ctok, text).BuildUp(Protocol.CrimeAskUp, Protocol.JoinTargetHost));
                         Console.WriteLine($"PEER t={t:F1} crime {Protocol.CrimeAskName(k)} tok={ctok}: {text}");
                         break;
                     }
@@ -545,7 +660,7 @@ static class P
                                 act = act with { Stance = byte.Parse(f[5], CultureInfo.InvariantCulture), StanceObj = ulong.Parse(f[6], NumberStyles.HexNumber, CultureInfo.InvariantCulture) };
                         }
                         act = act.Normalised();
-                        await Send(st, ActivityCodec.BuildUp(Protocol.ActivityPeerUp, Protocol.JoinTargetHost, Protocol.ActivityKindPlayer, [new ActivityRow(myId, "", act)]));
+                        await Emit(ActivityCodec.BuildUp(Protocol.ActivityPeerUp, Protocol.JoinTargetHost, Protocol.ActivityKindPlayer, [new ActivityRow(myId, "", act)]));
                         Console.WriteLine($"PEER t={t:F1} activity {act}");
                         break;
                     }
@@ -561,7 +676,7 @@ static class P
                         if (grab) { carryTok++; carryBody = f[3]; carryWhat = f[2]; lastCarry = t; text = CarryText.Grab(myId, f[2], f[3], cx, cy, cz); }
                         else { text = CarryText.Put(myId, f[2], carryWhat ?? "dead", f[3], cx, cy, cz); carryBody = null; }
                         byte kind = grab ? Protocol.CarryGrab : Protocol.CarryPut;
-                        await Send(st, new LootMsg(kind, carryTok, text).BuildUp(Protocol.CarryUp, Protocol.JoinTargetHost));
+                        await Emit(new LootMsg(kind, carryTok, text).BuildUp(Protocol.CarryUp, Protocol.JoinTargetHost));
                         Console.WriteLine($"PEER t={t:F1} carry {Protocol.CarryKindName(kind)} tok={carryTok}: {text}");
                         break;
                     }
@@ -576,13 +691,18 @@ static class P
                         Console.WriteLine($"PEER t={t:F1} leash on={leashOn} flags={Protocol.LeashFlagsText(leashFlags)} obey={leashObey}");
                         break;
                 }
+                if (bot is not null)
+                {
+                    uint actual = Ms();
+                    Console.WriteLine(FormattableString.Invariant($"BOT-T4-STATION role=joiner station={step.F[0]} planned_host_ms={plannedHostMs} actual_host_ms={actual} schedule_lag_ms={ScheduledAgeMs(plannedHostMs, actual)}"));
+                }
             }
             // WO-140: the host's sleep votes; with `sleep auto` every Ask is answered here.
             while (sleepIn.TryDequeue(out var svq))
             {
                 if (svq.M.Kind != Protocol.SleepAsk || sleepAuto is not ("yes" or "no" or "busy")) continue;
                 if (!Wo140Text.TryAsk(svq.M.Text, out var sKind, out byte sAsker, out _)) continue;
-                await Send(st, new LootMsg(Protocol.SleepAnswer, svq.M.Tok, Wo140Text.Answer(sleepAuto, sAsker)).BuildUp(Protocol.SleepVoteUp, Protocol.JoinTargetHost));
+                await Emit(new LootMsg(Protocol.SleepAnswer, svq.M.Tok, Wo140Text.Answer(sleepAuto, sAsker)).BuildUp(Protocol.SleepVoteUp, Protocol.JoinTargetHost));
                 Console.WriteLine($"PEER t={t:F1} sleep answer tok=0x{svq.M.Tok:X8}: {sleepAuto} (auto, to {sAsker}'s {sKind})");
             }
             // WO-114: the host's leash messages; a pull moves the avatar beside the host.
@@ -600,7 +720,7 @@ static class P
                 {
                     x = lcmd.HostX + 3; y = lcmd.HostY; z = zBase = lcmd.HostZ; speed = 0; moveUntil = -1; placed = true; frozen = false;
                     leashResult = Protocol.LeashResultPlaced; leashTo = 3; leashRes = 0;
-                    await Send(st, PositionCodec.BuildPosition(x, y, z, yaw, false, false, null, Ms()));
+                    await Emit(PositionCodec.BuildPosition(x, y, z, yaw, false, false, null, Ms()));
                     lastPos = t;
                 }
                 Console.WriteLine($"PEER t={t:F1} MP-LEASH pulled from={leashFrom} to={leashTo} residual=0.00 result={Protocol.LeashResultName(leashResult)} (synthetic joiner)");
@@ -609,12 +729,12 @@ static class P
             if (carryBody is not null && carryHeld && t - lastCarry >= Protocol.CarryHeldEveryMs / 1000.0)   // WO-148: still carrying
             {
                 lastCarry = t;
-                await Send(st, new LootMsg(Protocol.CarryHeld, carryTok, CarryText.Held(myId, carryWhat ?? "dead", carryBody, x, y, z)).BuildUp(Protocol.CarryUp, Protocol.JoinTargetHost));
+                await Emit(new LootMsg(Protocol.CarryHeld, carryTok, CarryText.Held(myId, carryWhat ?? "dead", carryBody, x, y, z)).BuildUp(Protocol.CarryUp, Protocol.JoinTargetHost));
             }
             if (leashOn && t - lastLeash >= 1.0)
             {
                 lastLeash = t;
-                await Send(st, new LeashState(leashFlags, leashSeq, leashResult, leashFrom, leashTo, leashRes).Build());
+                await Emit(new LeashState(leashFlags, leashSeq, leashResult, leashFrom, leashTo, leashRes).Build());
             }
             if (vitalsHp >= 0 && t - lastVitals >= 2.0)
             {
@@ -623,15 +743,21 @@ static class P
                 BinaryPrimitives.WriteUInt16LittleEndian(vp.AsSpan(1), (ushort)Protocol.PlayerStateUpPayloadLen);
                 BinaryPrimitives.WriteSingleLittleEndian(vp.AsSpan(3), vitalsHp); BinaryPrimitives.WriteSingleLittleEndian(vp.AsSpan(7), vitalsSt);
                 vp[11] = vitalsFlags;
-                await Send(st, vp);
+                await Emit(vp);
             }
-            if (!placed || frozen) { await Task.Delay(5); continue; }
+            if (!placed || frozen) { await Task.Delay(5, hard); continue; }
             bool moving = moveUntil > t && speed > 0;
-            if (moving)
+            double active = bot is null ? (moving ? dt : 0) : Math.Max(0, Math.Min(moveUntil, t) - Math.Max(moveStart, t - dt));
+            if (active > 0)
             {
-                if (jumpT0 < 0) { z += zRate * (float)dt; zBase = z; }
-                x += (float)(-Math.Sin(head) * speed * dt);
-                y += (float)(Math.Cos(head) * speed * dt);
+                if (curveStart >= 0)
+                {
+                    double u = Math.Clamp((t - curveStart) / (moveUntil - curveStart), 0, 1);
+                    yaw = head = curveFrom + (curveTo - curveFrom) * (float)u;
+                }
+                if (jumpT0 < 0) { z += zRate * (float)active; zBase = z; }
+                x += (float)(-Math.Sin(head) * speed * active);
+                y += (float)(Math.Cos(head) * speed * active);
             }
             float zNow = zBase;
             if (jumpT0 >= 0)
@@ -654,18 +780,30 @@ static class P
                 lastPos = t;
                 BodyState2? block = due ? s2 : null;
                 if (due) { lastSent = s2; lastSentT = t; }
-                await Send(st, PositionCodec.BuildPosition(x, y, z, yaw, riding, false, block, Ms()));
+                await Emit(PositionCodec.BuildPosition(x, y, z, yaw, riding, false, block, Ms()));
             }
-            if (t - lastPing > 2) { lastPing = t; var ping = new byte[11]; ping[0] = Protocol.Ping; BinaryPrimitives.WriteUInt16LittleEndian(ping.AsSpan(1), 8); await Send(st, ping); }
-            await Task.Delay(5);
+            if (t - lastPing > 2) { lastPing = t; var ping = new byte[11]; ping[0] = Protocol.Ping; BinaryPrimitives.WriteUInt16LittleEndian(ping.AsSpan(1), 8); await Emit(ping); }
+            await Task.Delay(5, hard);
         }
-        Console.WriteLine("PEER done");
         cts.Cancel();
+        if (bot is not null)
+        {
+            await reader;
+            hard.ThrowIfCancellationRequested();
+            if (si != steps.Count || botPoses == 0) throw new IOException("T4 playback did not reach every station.");
+            Console.WriteLine($"BOT-T4 role=joiner complete=1 poses={botPoses} actions={botActions} ranged={botRanged}");
+        }
+        else Console.WriteLine("PEER done");
         return 0;
     }
 
     static readonly SemaphoreSlim WriteLock = new(1, 1);
-    static async Task Send(NetworkStream s, byte[] p) { await WriteLock.WaitAsync(); try { await s.WriteAsync(p); } finally { WriteLock.Release(); } }
+    static async Task Send(NetworkStream stream, byte[] packet, CancellationToken token = default)
+    {
+        await WriteLock.WaitAsync(token);
+        try { await stream.WriteAsync(packet, token); }
+        finally { WriteLock.Release(); }
+    }
 
     static async Task<(byte, byte[])> ReadPacket(NetworkStream s, CancellationToken ct)
     {
