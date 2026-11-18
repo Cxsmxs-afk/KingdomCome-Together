@@ -22,7 +22,7 @@
       2. dotnet\KcdMp.Client.Tests, the Wo203W164Fit tests: every W164 kind's builder at its worst
          case fits the row, and LootMsg.BuildUp refuses a text over its row before it is sent.
 
-    A filter that matches no test fails the gate (a renamed class must not turn it green).
+    Each filter must run its full baseline count without any skipped tests.
     Prints one RESULT line; exit 0 = PASS, 1 = a test failed or did not run.
     Run by tools\Build-Installer.ps1 just before the relay round-trip gate.
 
@@ -34,11 +34,13 @@ param(
     [string] $Configuration = 'Release'
 )
 
+$ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-if (-not $root) { $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
+. (Join-Path $PSScriptRoot 'Required-TestResults.ps1')
 
 # The .NET 8 SDK is user-scope on the build machine; the machine-wide dotnet may be another version.
-$sdk = Join-Path $env:USERPROFILE '.dotnet-sdk8'
+$profileDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+$sdk = Join-Path $profileDir '.dotnet-sdk8'
 if (Test-Path (Join-Path $sdk 'dotnet.exe')) {
     $env:DOTNET_ROOT = $sdk
     $env:PATH = "$sdk;$env:PATH"
@@ -46,33 +48,15 @@ if (Test-Path (Join-Path $sdk 'dotnet.exe')) {
     Write-Host "  note: $sdk not found and DOTNET_ROOT unset -- using the dotnet on PATH"
 }
 
-# One dotnet test run, its output shown without the build's warnings; returns (ok, passed, failed, total).
-function Invoke-GateTests([string] $project, [string] $filter) {
-    Write-Host "`n=== $filter ($project) ===`n"
-    $lines = New-Object System.Collections.Generic.List[string]
-    & dotnet test (Join-Path $root $project) -c $Configuration --nologo -v q --filter $filter |
-        ForEach-Object {
-            $lines.Add([string]$_)
-            if ($_ -notmatch ': warning [A-Za-z]+[0-9]+:') { Write-Host $_ }
-        }
-    $code = $LASTEXITCODE
-    $passed = 0; $failed = 0; $total = 0
-    foreach ($l in $lines) {
-        if ($l -match 'Failed:\s+(\d+),\s+Passed:\s+(\d+),\s+Skipped:\s+\d+,\s+Total:\s+(\d+)') {
-            $failed += [int]$Matches[1]; $passed += [int]$Matches[2]; $total += [int]$Matches[3]
-        }
-    }
-    $ok = ($code -eq 0) -and ($failed -eq 0) -and ($total -gt 0)
-    if ($total -eq 0) { Write-Host "  FAIL  no test matched '$filter' -- the gate did not run" -ForegroundColor Red }
-    return @($ok, $passed, $failed, $total)
+try {
+    Invoke-KcdManagedTests (Join-Path $root 'dotnet/KcdMp.Relay.Tests/KcdMp.Relay.Tests.csproj') relay-table 119 `
+        -Filter 'FullyQualifiedName~KcdMp.Relay.Tests.RelayTableGateTests.' -Configuration $Configuration
+    Invoke-KcdManagedTests (Join-Path $root 'dotnet/KcdMp.Client.Tests/KcdMp.Client.Tests.csproj') w164-fit 3 `
+        -Filter 'FullyQualifiedName~KcdMp.Client.Tests.Wo203W164FitTests.' -Configuration $Configuration
+    Write-Host 'RESULT: PASS relay-table and w164-fit' -ForegroundColor Green
 }
-
-$relay = Invoke-GateTests 'dotnet\KcdMp.Relay.Tests\KcdMp.Relay.Tests.csproj' 'FullyQualifiedName~RelayTableGate'
-$fit   = Invoke-GateTests 'dotnet\KcdMp.Client.Tests\KcdMp.Client.Tests.csproj' 'FullyQualifiedName~Wo203W164Fit'
-
-$pass = $relay[0] -and $fit[0]
-$verdict = if ($pass) { 'PASS' } else { 'FAIL' }
-$line = "RESULT: $verdict relay-table passed=$($relay[1]) failed=$($relay[2]) total=$($relay[3]); w164-fit passed=$($fit[1]) failed=$($fit[2]) total=$($fit[3])"
-Write-Host ""
-Write-Host $line -ForegroundColor $(if ($pass) { 'Green' } else { 'Red' })
-if ($pass) { exit 0 } else { exit 1 }
+catch {
+    Write-Host "RESULT: FAIL $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+exit 0

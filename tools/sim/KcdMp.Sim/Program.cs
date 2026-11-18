@@ -22,6 +22,8 @@ public static class Program
 
     public static async Task<int> Main(string[] args)
     {
+        if (args is ["--check-join-abort"]) return await JoinAbortRegression.RunAsync();
+
         string outDir = "tools/sim/out";
         string label = "this-tree";
         string timeline = "legacy";

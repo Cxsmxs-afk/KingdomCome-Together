@@ -1,0 +1,76 @@
+---
+name: kct-log-analyse
+description: "Log-Bundles von Lasses Spieltests für „Kingdom Come: Together“ auswerten (.tzst-Bundles, agent*.log, app*.log, relay*.log, kcd.log, kcdmp-native*.log, MP-*-Zeilen). Laden, wenn Logs oder ein Testbericht vorliegen, wenn eine Ursache aus einem Live-Test belegt werden soll oder wenn Behauptung, Code und Log „Fleck für Fleck“ gegeneinander geprüft werden. Nicht zum Schreiben von Fixes (dafür kct-fix-workflow)."
+---
+
+# kct-log-analyse — Lasses Logs lesen und belegen
+
+Ziel: Jede Aussage über den Spieltest stützt sich auf **Logzeile + Datei:Zeile im Code**, und die Zeiten stehen in Europe/Berlin. Warum: Nur so lassen sich Fixes und der nächste Zwei-PC-Test darauf aufbauen.
+
+## 1. Bundle öffnen
+- Ein Bundle ist `<name>.tzst` oder `<name>-partNofM.tzst` (tar + zstd, jede Datei ein eigener Frame, `dotnet/KcdMp.LogPack/Packer.cs`). Entpacken mit `tar --zstd -xf <part>` (so steht es in `MANIFEST.txt`). Vertrauenswürdige Teile aus demselben Bundle zusammen in einen Arbeitsordner entpacken. `MANIFEST.txt`, `BRIEFING.md` und `ERGEBNIS.txt` stehen in Teil 1.
+- Ein Ordner pro PC/Start. Oft bekommst du Ordner mit Hash-Namen, z. B. `837e8bcb157e/`. Warum: Ohne die Zuordnung PC → Rolle sind alle weiteren Schlüsse wertlos.
+- Lies zuerst `MANIFEST.txt`: Dateien, Größen, sha256, Zusammenfassungen. Identische Dateien sind nur einmal gespeichert. Die Manifestnotiz `same content as` verweist auf den gespeicherten Eintrag (`dotnet/KcdMp.LogPack/Packer.cs:142`, `:241`). Zusammengefasste Läufe stehen als Zeile `[kct-pack] …` mit Anzahl. `MP-MARK`-, `FAULT`- und `STATS`-/Summary-Zeilen bleiben immer vollständig, ebenso alles bis 5 Minuten um eine `mark_odd`-Markierung (`dotnet/KcdMp.LogPack/Collapser.cs:30`). Warum: Eine scheinbar fehlende Zeile kann zusammengefasst sein.
+- Danach `BRIEFING.md` und `ERGEBNIS.txt` (die T1-Ampel aus `dotnet/KcdMp.LogPack/VerdictRules.cs`). GRAU heißt „keine Messung“, nicht „ok“. Warum: Ein „Gesamt GRÜN“ mit fast nur GRAU beweist nichts (Beispiel 18.11.: GRÜN, Rolle „unbekannt“).
+- Werkzeug: `dotnet run --project dotnet/KcdMp.LogPack.Tool -- brief <ordner>` gibt das Briefing auf stdout aus. `dotnet run --project dotnet/KcdMp.LogPack.Tool -- anim-compare <host> <joiner> --no-write` vergleicht vorhandene Animationsproben ohne Änderungen an den Bundles. Ohne `--no-write` versucht das Werkzeug, den Abschnitt in beide bestehenden `BRIEFING.md` zu schreiben (`dotnet/KcdMp.LogPack.Tool/Program.cs:11–42`).
+
+## 2. Dateien und Zeitformat
+| Datei | Quelle | Zeitformat |
+|---|---|---|
+| `agent.log`, `agent.prev*.log` | Agent `KcdMp.Client` | `HH:mm:ss.fff m=<mono-ms> off=<±ms\|?> <text>`: Ortszeit des PCs, `off` = Relay-Uhr minus PC-Uhr, in ms (`dotnet/KcdMp.Client/TeeTextWriter.cs:68–71`, `docs/WO-98-log-format.md`) |
+| `app<JJJJMMTT>[_NNN].log` | Launcher (Serilog) | `2026-11-18 22:10:19.406 +01:00 [INF] …` |
+| `relay<JJJJMMTT>[_NNN].log` | Relay `KcdMp.Server` | wie `app`, mit Offset |
+| `kcd.log`, `history/launch-*/kcd.log`, `logbackups/*.log` | Spiel + Lua `mp_log` | Kopf `Log Started at JJJJ-MM-TT HH:MM:SS`. `mp_log` hängt `t=<s>.<ms>` aus `os.clock()` an (`kdcmp/Data/Scripts/Startup/kdcmp.lua:200–210`). Siehe `SessionRule.LaunchTime` in `dotnet/KcdMp.LogPack/Packer.cs:22–30` und `docs/WO-98-log-format.md`. |
+| `kcdmp-native.mirror[.N].log` | DLL | `[HH:MM:SS.mmm] t<thread> L<launch-id> …` (`native/KCDMP/log.h:116–119`) |
+| `settings.json` | Launcher-Einstellungen | `GamePath`, `HostAllowSteam`, `StartSavePath`, `MenuTakeover` … |
+| `crashes/crash-*/agent-statements.txt`, `anim/kcdmp-anim.jsonl` | Absturzberichte, Animations-Probe | – |
+- Zeiten ohne Offset sind Ortszeit des jeweiligen PCs (bei Lasse Europe/Berlin). Konvertiere Zeitstempel mit Offset anhand ihres Datums nach Europe/Berlin und nenne die Zeitzone im Bericht. Kennzeichne unbekannte Zeitzonen ohne Offset. Für den Abgleich zweier Agenten mit bekannter Uhrkorrektur gilt `Hostzeit = Joinerzeit + off_joiner - off_host` (`docs/WO-98-log-format.md`). Bei `off=?` bleibt der exakte Uhrabgleich offen.
+- `m=` ist eine monotone Uhr pro Prozess und eignet sich für Abstände innerhalb eines Logs, nicht zwischen PCs.
+
+## 3. PC und Rolle zuordnen (immer zuerst)
+1. Build: `MP-BUILD version=… build=…` (`dotnet/KcdMp.Client/Program.cs:95`) und `KCDMP.dll attached … build=` (`native/KCDMP/dllmain.cpp:87`). Prüfe die Build-ID beider PCs. Bei verschiedenen Builds den Unterschied als eigenen Befund festhalten und Codebelege je Build ermitteln.
+2. PC: Windows-Benutzer/`GamePath` (`settings.json`, Pfade im Log), Steam-Name im Relay-Log (z. B. MORTIS = Lasse, Sayl = Freund am 18.11.). Die Relay-ID identifiziert den Client in der Sitzung. Prüfe die Rolle über `MP-HOST-CLAIM` und `MP-AUTHORITY-OWNER` (`dotnet/KcdMp.Server/Features/ClientHandling/ClientSession.cs:1132`, `dotnet/KcdMp.Server/Features/ClientHandling/ClientHandler.cs:368`).
+3. Rolle **pro Sitzung**, nicht pro PC: `MP-W159 menu driver on (host|joiner)` (`Home.Wo159.cs:147`), `MP-LAUNCH connect gate closed (host: …|joiner: …)` (`Home.Wo154.cs:271`), `MP-W200-STATS role=1` Host, `role=2` Joiner, `role=0` ohne Rolle (`dotnet/KcdMp.Client/Wo200.cs:45`, `dotnet/KcdMp.Client/GameBridge.Wo200.cs:97`), `MP-LINK kinds who=host|joiner` (`dotnet/KcdMp.Client/GameBridge.Wo213.cs:61`). Die Launcher-Zeilen belegen die Auswahl. Relay und Agent belegen die wirksame Autorität. Warum: Am 18.11. hat Lasses PC um 22:33 gehostet und vorher gejoint.
+4. Zeitachse bauen: pro Sitzung Start, Join-ID (`0x…`), Abbruch und Ende, beide PCs nebeneinander.
+
+## 4. Wichtige Zeilen (Bedeutung → Codeort)
+| Zeile | Bedeutung | Code |
+|---|---|---|
+| `setup: Ready! Host and Join unlocked` | Setup fertig | `Home.Wo150.cs:97` |
+| `MP-W159 start saves installed: none\|soldier, adviser, scout` | Start-Saves vorhanden? | `Home.Wo159.cs:87` |
+| `MP-JOIN host: join 0x… world=playlineN/… verify=ok` | Host hat den Save für das Angebot verifiziert. Den weiteren Versand separat prüfen. | `dotnet/KcdMp.Client/GameBridge.Wo123.cs:525` |
+| `MP-JOIN host: join 0x…: native calendar unreadable -- offer not sent` | Host-Uhr nicht lesbar | `GameBridge.Wo123.cs:520` |
+| `MP-CALENDAR join 0x…: no current host calendar -- load not issued` | Joiner hat keinen Uhr-Snapshot | `GameBridge.HostCalendar.cs:159` |
+| `MP-JOIN joiner: join 0x… ABORTED (<grund>)` | Abbruch dieser Join-ID. Verbleib wird am Zeilenende geloggt, die gesonderte Zeile `ABORTED after the load` bezeichnet den Abbruch nach dem Ladepfad. | `dotnet/KcdMp.Client/GameBridge.Wo124.cs:1152`, `:1163` |
+| `… kept playlineN/mpworld….whs -- no join=in or player cancel yet` | Der Slot wurde in diesem Schritt beibehalten. Ein dauerhaftes Leck anhand der folgenden Abbrüche und fehlenden Freigabe belegen. | `GameBridge.Wo124.cs:867` |
+| `All five save slots are full…` | Alle Join-Plätze voll | `Wo175Coop.cs:33` |
+| `MP-JOIN host: … aborted while loading`, `resume … phase_at_end=` | Host-Sicht des Abbruchs | `GameBridge.Wo123.cs:640`, `:709` |
+| `MP-W200-STATS … clock_out= clock_in=` | Erfolgreiche Kalender-Sendezyklen des Hosts bzw. akzeptierte und **gecachte** Samples des Joiners. Anwendung im Spiel separat prüfen. | `dotnet/KcdMp.Client/GameBridge.Wo200Values.cs:168`, `dotnet/KcdMp.Client/GameBridge.HostCalendar.cs:44–46`, `:65` |
+| `MP-LINK kinds who=… in=<kind>:<B/s>/<msg/s>` | Eingangsraten nach Nachrichtentyp. `w164:18` ist der Typname für die Host-Uhr, der vollständige Eintrag enthält danach B/s und msg/s. | `dotnet/KcdMp.Protocol/ProtocolWo213.cs:113–118`, `:254–258`, `dotnet/KcdMp.Protocol/ProtocolWo200.cs:41` |
+| `MP-T3-STATS origin=agent role=…` | Prozessorwerte ohne `section`, weitere Werte mit `section=load`, `section=events` oder `section=recovery` | `dotnet/KcdMp.Client/GameBridge.T3.cs:280–284`, `dotnet/KcdMp.Client/GameBridge.WorldRecoveryStats.cs:94` |
+| `MP-W207-Q lag_ms= waiting= …` | Rückstand der Verarbeitungs-Queue mit Partner etwa jede Sekunde, `MP-W207-QK` mit Details alle 10 s. | `dotnet/KcdMp.Client/GameBridge.Wo207.cs:27–38` |
+| `FRAME window_s=60 … frame_ms_worst= ours_us_max= ours_us_p95=` | Frame-Kosten der Mod (DLL, immer an) | `native/KCDMP/frame_meter.h:74–81`, `native/KCDMP/main_thread.cpp:75–86` |
+| `[version] ghost N is on release …` | Release des Partners | `GameBridge.cs:5241` |
+Such die Zeile mit `rg -n "<fester Textteil>"` im zum Log gehörigen Build. Fehlt ihr Codebeleg, kennzeichne die Zuordnung als unbelegt. Logtext kann aus einem älteren Build stammen.
+
+## 5. „Fleck für Fleck“-Audit
+Für jedes Feature (z. B. Bogen: Hand → Zielen → Schuss → Pfeil → Treffer; Join: Rolle → Uhr → Welt → Laden → In-Welt) eine Zeile:
+```
+Schritt | Behauptung (Bericht/PR) | Code (Datei:Zeile) | Log Host (Zeit) | Log Joiner (Zeit) | Urteil
+```
+- Urteil ist nur eines von: **belegt**, **widerlegt**, **unbelegt** (fehlt Log/Code), **nicht getestet**. Warum: Grüne Tests oder eine Behauptung allein sind kein Beweis.
+- „Paket gesendet“ ≠ „empfangen“ ≠ „verarbeitet“. Prüfe alle drei getrennt (Beispiel 18.11.: `clock_out` steigt, der Typ `w164:18` erscheint in `in=`, `clock_in=0`). Warum: Genau dazwischen lag der Fehler.
+- Fehlt eine Logzeile, wo der Code eine schreiben müsste: Der Pfad lief nicht, **oder** er ist still. Nenne beide Möglichkeiten und lies den Code.
+- Zähle Wiederholungen (gleiche Folge bei mehreren Join-IDs). Warum: Ein Einzelfall und ein systematischer Fehler brauchen verschiedene Fixes.
+- Vergleich mit dem letzten funktionierenden Build, falls Logs davon da sind (z. B. 17.11. `pre-update latch armed`). Warum: Daraus ergibt sich die Regression.
+
+## 6. Ergebnisformat
+```
+Sitzung(en): Datum, Zeitraum Europe/Berlin, Build-ID beider PCs
+Rollen: PC → Steam-Name → Rolle je Sitzung
+Befunde (je: Symptom, Logzeilen mit Zeit, Codeort, Ursache belegt/unbelegt)
+Fleck-für-Fleck-Tabelle
+Warum CI das nicht fing (welcher Test fehlt)
+Nächster Schritt: Paket/Fix + Logzeile, die den Erfolg im nächsten Test beweist
+```
+Keine Secrets, Tokens oder rohen Steam-IDs aus den Logs zitieren. Warum: Die Logs gehen in Chats und Prompts.

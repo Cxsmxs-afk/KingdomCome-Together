@@ -38,11 +38,27 @@ public class ProcessorFrameScopeTests
     public async Task Normal_completion_keeps_queued_work_valid_until_the_session_ends()
     {
         using var session = new CancellationTokenSource();
+        var clock = new ManualFrameTime();
         ProcessorFrameScope.Lease? captured = null;
-        var result = await ProcessorFrameScope.RunAsync(_ => { captured = ProcessorFrameScope.Capture(); return Task.CompletedTask; }, 50, session.Token);
-        Assert.Equal(ProcessorFrameScope.Outcome.Completed, result.Status);
-        Assert.NotNull(captured); Assert.False(captured.IsAbandoned); captured.ThrowIfAbandoned();
-        session.Cancel(); Assert.True(captured.IsAbandoned);
+        var frame = ProcessorFrameScope.RunAsync(_ =>
+        {
+            captured = ProcessorFrameScope.Capture();
+            return Task.CompletedTask;
+        }, 50, session.Token, clock);
+        try
+        {
+            var result = await frame.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(ProcessorFrameScope.Outcome.Completed, result.Status);
+            Assert.NotNull(captured);
+            Assert.False(captured.IsAbandoned);
+            captured.ThrowIfAbandoned();
+            session.Cancel();
+            Assert.True(captured.IsAbandoned);
+        }
+        finally
+        {
+            clock.Expire();
+        }
     }
 
     [Fact]

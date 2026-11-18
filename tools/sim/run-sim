@@ -12,6 +12,7 @@ export SIM_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 extra=()
 if [ "$#" -ge 3 ]; then extra=("${@:3}"); fi
 if [ "$label" = ci ]; then
+    python3 -B tools/Test-Skills.py
     native_tmp="$(mktemp -d)"
     trap 'rm -rf -- "$native_tmp"' EXIT
     cat > "$native_tmp/main.cpp" <<'EOF'
@@ -63,15 +64,15 @@ EOF
         exit 1
     fi
     printf '%s\n' "$native_result"
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_rpcombat.py'
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_load_sequence.py'
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_s3_events.py'
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_s3_recovery.py'
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_solo_*.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_rpcombat.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_load_sequence.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_s3_events.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_s3_recovery.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_solo_*.py'
     pwsh -NoLogo -NoProfile -NonInteractive -File tools/rig/Test-Solo-Abend.ps1
     python3 tools/Test-NoInputTooling.py tools/rig/Solo-Abend.ps1 tools/rig/scen_solo_abend.py
     python3 tools/Test-NoScreenshots.py tools/rig/Solo-Abend.ps1 tools/rig/scen_solo_abend.py
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_guided_*.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_guided_*.py'
     pwsh -NoLogo -NoProfile -NonInteractive -File tools/Test-TestlaufSynthetic.ps1
     guided_sources=(kdcmp/Data/Scripts/Startup/kdcmp.lua
         dotnet/KcdMp.Client/GuidedRun.cs dotnet/KcdMp.Client/GameBridge.GuidedRun.cs

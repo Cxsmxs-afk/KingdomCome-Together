@@ -19,6 +19,7 @@ public class HttpFrameCancellationTests
     }
 
     private static TaskCompletionSource Signal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private static readonly TimeSpan FrameTestWatchdog = TimeSpan.FromSeconds(3);
     private static HttpGameTransport Transport(Game game) => new("http://localhost:1403", 5000, game);
     private static string Toast(string text) => $"if KCD2MP_ShowNativeToast then KCD2MP_ShowNativeToast(\"{text}\") end";
 
@@ -151,11 +152,14 @@ public class HttpFrameCancellationTests
     {
         var game = new Game((_, _) => Task.CompletedTask);
         await using var transport = Transport(game);
+        var entered = Signal();
         var release = Signal();
         var done = Signal();
+        var clock = new ManualFrameTime();
         var failures = new ConcurrentQueue<Exception>();
-        var result = await ProcessorFrameScope.RunAsync(async _ =>
+        var frame = ProcessorFrameScope.RunAsync(async _ =>
         {
+            entered.SetResult();
             await release.Task; // deliberately ignores cancellation like an old semaphore or callback
             foreach (Func<Task> write in new Func<Task>[]
             {
@@ -171,14 +175,24 @@ public class HttpFrameCancellationTests
                 catch (Exception ex) { failures.Enqueue(ex); }
             }
             done.SetResult();
-        }, 50);
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-        release.SetResult();
-        await done.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        await transport.FlushAsync();
-        Assert.Empty(failures);
-        Assert.Empty(game.Calls);
-        Assert.Equal(0, transport.Queued);
+        }, 50, CancellationToken.None, clock);
+        try
+        {
+            await entered.Task.WaitAsync(FrameTestWatchdog);
+            clock.Expire();
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(FrameTestWatchdog)).Status);
+            release.SetResult();
+            await done.Task.WaitAsync(FrameTestWatchdog);
+            await transport.FlushAsync();
+            Assert.Empty(failures);
+            Assert.Empty(game.Calls);
+            Assert.Equal(0, transport.Queued);
+        }
+        finally
+        {
+            clock.Expire();
+            release.TrySetResult();
+        }
     }
 
     [Fact]
@@ -230,29 +244,74 @@ public class HttpFrameCancellationTests
     public async Task Recovery_started_in_an_abandoned_frame_probes_health_without_resending_its_rows()
     {
         int calls = 0;
-        var game = new Game((_, _) => Interlocked.Increment(ref calls) <= 2
-            ? Task.FromException(new TaskCanceledException("game did not answer")) : Task.CompletedTask);
+        var probeEntered = Signal();
+        var game = new Game((_, _) =>
+        {
+            int call = Interlocked.Increment(ref calls);
+            if (call <= 2) return Task.FromException(new TaskCanceledException("game did not answer"));
+            if (call == 3) probeEntered.SetResult();
+            return Task.CompletedTask;
+        });
         await using var transport = Transport(game);
         transport.RecoveryIntervalMs = 200;
+        var holdEntered = Signal();
+        using var releaseHold = new ManualResetEventSlim();
         var release = Signal();
-        var result = await ProcessorFrameScope.RunAsync(async _ =>
+        var frameEnded = Signal();
+        var clock = new ManualFrameTime();
+        transport.NowMs = () =>
         {
-            await transport.ExecuteAsync(Toast("abandoned"));
+            // EnterHold sets Held before reading the clock and launching recovery.
+            if (transport.Held && holdEntered.TrySetResult() && !releaseHold.Wait(FrameTestWatchdog))
+                throw new TimeoutException("The test did not release the transport hold");
+            return Environment.TickCount64;
+        };
+        var frame = ProcessorFrameScope.RunAsync(async _ =>
+        {
+            try
+            {
+                await transport.ExecuteAsync(Toast("abandoned"));
+                await transport.FlushAsync();
+                await transport.FlushAsync();
+                await release.Task;
+            }
+            finally { frameEnded.SetResult(); }
+        }, 100, CancellationToken.None, clock);
+        bool verified = false;
+        try
+        {
+            await holdEntered.Task.WaitAsync(FrameTestWatchdog);
+            Assert.True(transport.Held);
+            clock.Expire();
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(FrameTestWatchdog)).Status);
+            releaseHold.Set();
+            release.SetResult();
+            await probeEntered.Task.WaitAsync(FrameTestWatchdog);
+            using var deadline = new CancellationTokenSource(FrameTestWatchdog);
+            while (transport.Held) await Task.Delay(5, deadline.Token);
+            string[] requests = game.Calls.ToArray();
+            Assert.True(requests.Length >= 3);
+            Assert.Contains("local _ = 1", requests[2]);
+            Assert.All(requests.Skip(2), request => Assert.DoesNotContain("abandoned", request));
+            await transport.ExecuteAsync(Toast("independent"));
             await transport.FlushAsync();
-            await transport.FlushAsync();
-            await release.Task;
-        }, 100);
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-        release.SetResult();
-        using var deadline = new CancellationTokenSource(3000);
-        while (transport.Held) await Task.Delay(5, deadline.Token);
-        string[] requests = game.Calls.ToArray();
-        Assert.True(requests.Length >= 3);
-        Assert.All(requests.Skip(2), request => Assert.DoesNotContain("abandoned", request));
-        await transport.ExecuteAsync(Toast("independent"));
-        await transport.FlushAsync();
-        Assert.Contains(game.Calls, c => c.Contains("independent"));
-        Assert.Equal(1, transport.AbandonedStatements);
+            Assert.Contains(game.Calls, c => c.Contains("independent"));
+            Assert.Equal(1, transport.AbandonedStatements);
+            verified = true;
+        }
+        finally
+        {
+            clock.Expire();
+            releaseHold.Set();
+            release.TrySetResult();
+            // A frame already in EnterHold must finish launching recovery before transport disposal.
+            if (holdEntered.Task.IsCompleted)
+            {
+                var finished = await Task.WhenAny(frameEnded.Task, Task.Delay(FrameTestWatchdog));
+                if (verified && finished != frameEnded.Task)
+                    throw new TimeoutException("The abandoned recovery frame did not finish after its hold was released");
+            }
+        }
     }
 
     [Fact]
