@@ -39155,6 +39155,27 @@ end
 System.AddCCommand("mp_test_weatherload", 'KCD2MP_TestWeatherLoad(%line)',
     "Test weather while the joiner loads: mp_test_weatherload --test-load-sequence <profile>")
 
+-- ===== T5: guided test run console ===============================================================
+do
+    local actions = { start = true, status = true, weiter = true, wiederholen = true, abbruch = true }
+    local usage = "mp_testlauf --test-guided-run <start|status|weiter [ja|nein]|wiederholen|abbruch>"
+
+    function KCD2MP_GuidedRunCommand(arg)
+        local text = type(arg) == "string" and arg:match("^[ \t]*(.-)[ \t]*$") or ""
+        local action, answer = text:match("^%-%-test%-guided%-run[ \t]+([a-z]+)[ \t]*([a-z]*)$")
+        if not actions[action] or (answer ~= "" and (action ~= "weiter" or (answer ~= "ja" and answer ~= "nein"))) then
+            mp_log("Geführter Testlauf. " .. usage .. ". Den Agenten mit KCDMP_TEST_GUIDED_RUN=1 starten.")
+            return false
+        end
+        local request = "--test-guided-run " .. action
+        if answer ~= "" then request = request .. " " .. answer end
+        KCD2MP_EmitEvent("guided_run", request)
+        return true
+    end
+
+    System.AddCCommand("mp_testlauf", 'KCD2MP_GuidedRunCommand(%line)', "Geführter Testlauf. " .. usage)
+end
+
 -- ===== P1: optional host decision authority, native load lifecycle owns activation =================
 do
     if KCD2MP.p1AuthorityEnabled == nil then KCD2MP.p1AuthorityEnabled = true end

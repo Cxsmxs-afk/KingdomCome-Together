@@ -59,7 +59,10 @@ if (-not $KdcmpLua) { $KdcmpLua = Join-Path $toolsDir '..\kdcmp\Data\Scripts\Sta
 if (-not $Scenario) { $Scenario = Join-Path $toolsDir 'Test-NpcSmoothSynthetic.lua' }
 
 # --- locate (or restore) MoonSharp -------------------------------------------
-$pkgRoot = Join-Path $env:USERPROFILE '.nuget\packages\moonsharp'
+$userProfile = if ($env:USERPROFILE) { $env:USERPROFILE }
+               else { [Environment]::GetFolderPath('UserProfile') }
+$pkgRoot = if ($env:NUGET_PACKAGES) { Join-Path $env:NUGET_PACKAGES 'moonsharp' }
+           else { Join-Path $userProfile '.nuget/packages/moonsharp' }
 function Find-MoonSharpDll {
     if (-not (Test-Path $pkgRoot)) { return $null }
     $cands = Get-ChildItem $pkgRoot -Directory | ForEach-Object {
@@ -73,10 +76,10 @@ if (-not $dll) {
     Write-Host "MoonSharp not in the NuGet cache; restoring $MoonSharpVersion once..." -ForegroundColor Yellow
     $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
     if (-not $dotnet) {
-        $alt = Join-Path $env:USERPROFILE '.dotnet-sdk8\dotnet.exe'
+        $alt = Join-Path $userProfile '.dotnet-sdk8\dotnet.exe'
         if (Test-Path $alt) { $dotnet = $alt } else { throw "dotnet SDK not found; cannot restore MoonSharp" }
     } else { $dotnet = $dotnet.Source }
-    $tmp = Join-Path $env:TEMP ("wo77-moonsharp-" + [guid]::NewGuid().ToString('N'))
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("wo77-moonsharp-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force $tmp | Out-Null
     @"
 <Project Sdk="Microsoft.NET.Sdk">

@@ -3978,6 +3978,9 @@ def smoke_plan(record):
 
 
 def run(name, args):
+    if name == 'testlauf':
+        import scen_guided_run
+        return scen_guided_run.run(sys.modules[__name__], args)
     if name == 'abend':
         import scen_solo_abend
         return scen_solo_abend.run(sys.modules[__name__], args)

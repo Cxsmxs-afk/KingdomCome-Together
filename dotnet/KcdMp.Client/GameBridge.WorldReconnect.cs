@@ -297,6 +297,9 @@ public partial class GameBridge
         WorldRecoveryReconnectSample(scope.HostWorld, scope.Generation, elapsed, sameWorld: success, success: success, timeout: !success, reloaded: false);
     }
 
-    private static void WorldReconnectLog(string role, long serial, WorldSyncScope scope, string result, long elapsed, bool reload = false) =>
+    private void WorldReconnectLog(string role, long serial, WorldSyncScope scope, string result, long elapsed, bool reload = false)
+    {
         Console.WriteLine(FormattableString.Invariant($"MP-WORLD-RECONNECT role={role} attempt={serial} world={scope.HostWorld} gen={scope.Generation} result={result} reconnect_ms={elapsed} reload={(reload ? 1 : 0)}"));
+        GuidedRunObserveReconnect(role, serial, scope, result, elapsed, reload);
+    }
 }

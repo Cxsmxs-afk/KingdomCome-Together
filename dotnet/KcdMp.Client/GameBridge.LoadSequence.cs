@@ -47,6 +47,7 @@ public partial class GameBridge
             (after.Generation, after.Phase, after.HostWorld, after.LinkHeld, after.OwnIntent);
         if (changed && LoadSequenceEnabled)
         {
+            if (after.Phase == WorldLoadPhase.Load) GuidedRunObserveLoad(after);
             Console.WriteLine(FormattableString.Invariant($"MP-LOAD-SEQUENCE role={LoadSequenceRole} gen={after.Generation} world={after.HostWorld} phase={after.Phase} link_hold={(after.LinkHeld ? 1 : 0)}"));
             _ = LoadSequenceSyncNativeAsync();
         }
