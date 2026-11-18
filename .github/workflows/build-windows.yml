@@ -7,7 +7,13 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/t3-p1-intellect-gate
+      - 'codex/**'
+      - 'cursor/**'
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -23,13 +29,8 @@ jobs:
       - name: Inno Setup 6
         run: choco install innosetup --no-progress -y
 
-      - name: Relay unit tests
-        run: dotnet test dotnet/KcdMp.Relay.Tests -c Release --logger "trx;LogFileName=relay.trx" --results-directory test-results
-
-      - name: Client unit tests
-        run: dotnet test dotnet/KcdMp.Client.Tests -c Release --logger "trx;LogFileName=client.trx" --results-directory test-results
-
-      - name: Build installer, DLL, pak and programs
+      # Build-Installer runs the full managed, synthetic and native test gates.
+      - name: Test and build installer, DLL, pak and programs
         shell: pwsh
         run: >
           powershell -ExecutionPolicy Bypass -File tools\Build-Installer.ps1
@@ -68,13 +69,6 @@ jobs:
             release/KingdomComeTogether-DropIn.zip
             release/BUILD-*.log
             release/RELEASE-CANDIDATE-*.txt
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: unit-test-results
-          if-no-files-found: warn
-          path: test-results/*.trx
 
   sim:
     runs-on: ubuntu-latest
