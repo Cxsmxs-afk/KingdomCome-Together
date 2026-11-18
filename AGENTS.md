@@ -38,3 +38,14 @@ Kingdom Come: Together is an unofficial co-op mod for Kingdom Come: Deliverance 
 | Master | `dotnet/KcdMp.MasterServer` | Optional directory of relays. Not the game world. |
 | Native DLL | `native/KCDMP` | In-process hooks, the named pipe, body driving. |
 | Launcher | `KCDMP_launcher` | Starts the game, the agent and the relay. |
+
+## Definition of Done — Selbstkontrolle
+
+1. **Vor dem Code** die Ursache mit `Datei:Zeile` und einer Logzeile mit Zeitstempel belegen. Bei unklarer Ursache zuerst ein Diagnose-Log ergänzen und die Beobachtung wiederholen.
+2. **Erst rot, dann grün.** Für jeden Bug zuerst einen Test schreiben und ausführen, der den Fehler auf dem unveränderten Produktionspfad reproduziert. Nach der Korrektur denselben Test erneut ausführen und beide Ergebnisse berichten. Für einen Empfangsfehler zählt der echte Reader-Pfad bis zu seiner Auswirkung.
+3. **Vor jedem Push** lokal vollständig bauen und die kompletten Client-, Relay-, LogPack-, Setup- und nativen Tests sowie den Netzwerksimulator ausführen. Bei fehlgeschlagenen oder übersprungenen Tests anhalten. Tests weder deaktivieren noch ihre Assertions abschwächen.
+4. **Vor dem Bericht** den eigenen Diff auf stille Rückgaben, Race- und Timeout-Pfade, Aufräumen von Slots, Dateien und Zuständen bei Abbruch, beide Rollen, die Fälle mit zwei und drei bis vier Spielern sowie verbliebene alte Pfade prüfen. Gefundene Schwächen beheben und die betroffenen Prüfungen erneut ausführen.
+5. **Verworfene Pakete und Zustände** mit ihrem konkreten Ablehnungsgrund protokollieren. Wiederholungen desselben Grundes drosseln.
+6. **Für den Zwei-PC-Test** je Paket die Logzeile und den erwarteten Wert angeben, die den Erfolg im echten Spiel belegen. Den Stand der Spielprüfung ausdrücklich nennen.
+7. **Im Bericht** Branch, PR, Commit-SHA, CI-Link, Artefakt-Link, Ursache mit `Datei:Zeile`, die Läufe rot und grün, Ergebnis des Selbst-Reviews und offene Risiken angeben. „Fertig“ setzt alle Prüfpunkte voraus. Andernfalls „teilweise“ mit Begründung angeben.
+8. **Git-Grenzen** einhalten. Kein Force-Push, kein direkter Push auf `main`, kein Rebase, Amend oder Reset. Ein Merge braucht Lasses Freigabe.

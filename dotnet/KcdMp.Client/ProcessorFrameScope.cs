@@ -69,7 +69,11 @@ public static class ProcessorFrameScope
     }
     public static TokenLink Link(CancellationToken caller = default) => new(caller, CurrentToken, Ambient.Value?.ParentToken ?? CancellationToken.None);
 
-    public static async Task<Result> RunAsync(Func<CancellationToken, Task> handler, int timeoutMs, CancellationToken parent = default)
+    public static Task<Result> RunAsync(Func<CancellationToken, Task> handler, int timeoutMs, CancellationToken parent = default)
+        => RunAsync(handler, timeoutMs, parent, TimeProvider.System);
+
+    internal static async Task<Result> RunAsync(Func<CancellationToken, Task> handler, int timeoutMs,
+        CancellationToken parent, TimeProvider timeProvider)
     {
         ArgumentNullException.ThrowIfNull(handler);
         if (timeoutMs < 1) throw new ArgumentOutOfRangeException(nameof(timeoutMs));
@@ -86,7 +90,7 @@ public static class ProcessorFrameScope
         // Leave a small part of the configured upper budget for cancellation and
         // accounting. ElapsedMs is always the actual stopwatch value, never clamped.
         int reserveMs = Math.Min(50, Math.Max(1, timeoutMs / 20));
-        var timeout = Task.Delay(Math.Max(1, timeoutMs - reserveMs), deadline.Token);
+        var timeout = Task.Delay(TimeSpan.FromMilliseconds(Math.Max(1, timeoutMs - reserveMs)), timeProvider, deadline.Token);
         if (await Task.WhenAny(work, timeout) != work)
         {
             lease.Abandon();

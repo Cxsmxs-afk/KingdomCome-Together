@@ -169,6 +169,7 @@ $payload = Join-Path $root "release\KCDMP"
 if ($LASTEXITCODE -ne 0) { throw "Build-And-Install-Mod.ps1 failed (is the game running?)" }
 
 if (-not $SkipPublish) {
+    . (Join-Path $PSScriptRoot 'Required-TestResults.ps1')
     # WO-101: the relay round-trip gate. 0.23.1 shipped a Position packet
     # shape the relay silently dropped; 111 unit tests passed because none of
     # them opened a socket to the relay. This hosts the real relay in-process
@@ -189,27 +190,25 @@ if (-not $SkipPublish) {
     if ($LASTEXITCODE -ne 0) { throw "the relay message table gate FAILED -- a message type has no relay rule, a rule does not cross the real relay, or a W164 text does not fit its row (tools\Test-RelayTable.ps1). Not shipping." }
 
     Write-Host "Relay round-trip gate (dotnet\KcdMp.Relay.Tests) ..."
-    & dotnet test (Join-Path $root "dotnet\KcdMp.Relay.Tests\KcdMp.Relay.Tests.csproj") -c Release --nologo -v q
-    if ($LASTEXITCODE -ne 0) { throw "relay round-trip gate FAILED -- a packet does not cross the real relay. Not shipping." }
+    # Minimum counts from the accepted T5 Windows build (44383488125). Raise the
+    # floors when adding tests. Explain any reduction in the package report.
+    Invoke-KcdManagedTests (Join-Path $root "dotnet\KcdMp.Relay.Tests\KcdMp.Relay.Tests.csproj") Relay 288
 
     # WO-102 Phase 7: the agent's unit tests (codecs, cadence stats, the
     # request/resync payloads) and the mod's synthetic authority suite run
     # here too. KcdMp.Client.Tests is NOT in KcdMp.sln, so a plain solution
     # build never compiles it -- it has to be named. A failure does not ship.
     Write-Host "Agent unit tests (dotnet\KcdMp.Client.Tests) ..."
-    & dotnet test (Join-Path $root "dotnet\KcdMp.Client.Tests\KcdMp.Client.Tests.csproj") -c Release --nologo -v q
-    if ($LASTEXITCODE -ne 0) { throw "agent unit tests FAILED. Not shipping." }
+    Invoke-KcdManagedTests (Join-Path $root "dotnet\KcdMp.Client.Tests\KcdMp.Client.Tests.csproj") Client 2705
 
     # WO-150: the first-run setup code Setup and the launcher share (manifest
     # reading, link checks, the checklist, redaction, the fake-tool runs).
     Write-Host "Setup unit tests (dotnet\KcdMp.Setup.Tests) ..."
-    & dotnet test (Join-Path $root "dotnet\KcdMp.Setup.Tests\KcdMp.Setup.Tests.csproj") -c Release --nologo -v q
-    if ($LASTEXITCODE -ne 0) { throw "setup unit tests FAILED. Not shipping." }
+    Invoke-KcdManagedTests (Join-Path $root "dotnet\KcdMp.Setup.Tests\KcdMp.Setup.Tests.csproj") Setup 110
 
     # WO-171 L: the tester's log bundle (collapsed noise, zstd, parts that fit a Discord upload).
     Write-Host "Log bundle tests (dotnet\KcdMp.LogPack.Tests) ..."
-    & dotnet test (Join-Path $root "dotnet\KcdMp.LogPack.Tests\KcdMp.LogPack.Tests.csproj") -c Release --nologo -v q
-    if ($LASTEXITCODE -ne 0) { throw "log bundle tests FAILED. Not shipping." }
+    Invoke-KcdManagedTests (Join-Path $root "dotnet\KcdMp.LogPack.Tests\KcdMp.LogPack.Tests.csproj") LogPack 285
 
     # WO-110 R10 (docs/WO-109-audit.md): EVERY synthetic suite gates the
     # release, not four of them. Before this, WO-108's own suite, WO-86,
@@ -218,7 +217,7 @@ if (-not $SkipPublish) {
     # The list is a glob so a new Test-*Synthetic.ps1 is gated the moment it
     # is added; nothing has to remember to register it.
     $suites = Get-ChildItem (Join-Path $PSScriptRoot "Test-*Synthetic.ps1") | Sort-Object Name
-    if ($suites.Count -lt 14) { throw "release gate: expected at least 14 Test-*Synthetic.ps1 suites, found $($suites.Count) -- the tools folder is incomplete" }
+    if ($suites.Count -lt 85) { throw "release gate: expected at least 85 Test-*Synthetic.ps1 suites, found $($suites.Count)" }
     foreach ($suite in $suites) {
         Write-Host "Synthetic suite $($suite.Name) ..."
         & powershell -ExecutionPolicy Bypass -File $suite.FullName
@@ -265,8 +264,11 @@ if (-not $SkipPublish) {
     $nativeTests = Join-Path $root "native\build\tests\KCDMP_NativeTests.exe"
     if (-not (Test-Path $nativeTests)) { throw "native tests missing: $nativeTests (Build-Native.ps1 should have built them)" }
     Write-Host "Native unit tests (native\tests) ..."
-    & $nativeTests
-    if ($LASTEXITCODE -ne 0) { throw "native unit tests FAILED. Not shipping." }
+    $nativeOutput = @(& $nativeTests)
+    $nativeExit = $LASTEXITCODE
+    $nativeOutput | Write-Host
+    if ($nativeExit -ne 0) { throw "native unit tests FAILED. Not shipping." }
+    Assert-KcdNativeResults $nativeOutput 12488
 
     # WO-157: sign the payload before anything runs it or hashes it (the smoke below runs the signed
     # files; the install manifest further down describes the signed bytes).

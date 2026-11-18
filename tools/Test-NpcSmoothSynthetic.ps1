@@ -126,13 +126,18 @@ try {
 
 $out = $lua.Globals.Get('OUT')
 if ($out.Type -ne [MoonSharp.Interpreter.DataType]::String) { Write-Host "scenario produced no OUT" -ForegroundColor Red; exit 2 }
-$pass = 0; $fail = 0
+$pass = 0; $fail = 0; $skipped = 0
 foreach ($line in ($out.String -split "`n")) {
     if ($line -like 'PASS*') { $pass++; Write-Host "  $line" -ForegroundColor Green }
     elseif ($line -like 'FAIL*') { $fail++; Write-Host "  $line" -ForegroundColor Red }
+    elseif ($line -match '^SKIP(?:PED)?(?:\s|:|$)') { $skipped++; Write-Host "  $line" -ForegroundColor Red }
     else { Write-Host "  $line" -ForegroundColor DarkGray }
 }
 Write-Host ""
 Write-Host ("RESULT: {0} passed, {1} failed" -f $pass, $fail) -ForegroundColor ($(if ($fail -eq 0) { 'Green' } else { 'Red' }))
+if ($pass -eq 0 -or $skipped -gt 0) {
+    Write-Host "Required synthetic suite: $pass passed, $skipped skipped" -ForegroundColor Red
+    exit 1
+}
 if ($fail -gt 0) { exit 1 }
 exit 0

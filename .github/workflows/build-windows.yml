@@ -44,21 +44,12 @@ jobs:
 
       - name: Verify drop-in contents
         shell: pwsh
-        run: |
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $PWD 'release/KingdomComeTogether-DropIn.zip'))
-          try {
-            $entries = @{}
-            foreach ($entry in $zip.Entries) { $entries[$entry.FullName.Replace('\', '/')] = $entry }
-            foreach ($path in @('INSTALL.txt', 'KingdomComeTogether/KCDMP_launcher.exe', 'Mods/kdcmp/Data/kdcmp.pak', 'KingdomComeTogether/install-verify.txt')) {
-              if (-not $entries.ContainsKey($path) -or $entries[$path].Length -eq 0) { throw "Missing or empty drop-in entry: $path" }
-            }
-            $reader = [System.IO.StreamReader]::new($entries['KingdomComeTogether/install-verify.txt'].Open())
-            try { if ($reader.ReadLine() -notmatch '^PASS(?:\s|$)') { throw 'Drop-in install verification is not PASS' } }
-            finally { $reader.Dispose() }
-            Write-Output 'Drop-in contents PASS: instructions, launcher, pak and install-verify'
-          }
-          finally { $zip.Dispose() }
+        # H21 removes the exact missing-saves expectation when the approved saves are packaged.
+        run: >
+          ./tools/Verify-DropIn.ps1
+          -ZipPath release/KingdomComeTogether-DropIn.zip
+          -Agent release/KCDMP/KcdMpClient.exe
+          -ExpectMissingStartSaves
 
       - uses: actions/upload-artifact@v4
         with:
@@ -84,6 +75,16 @@ jobs:
         run: |
           chmod +x tools/sim/run-sim
           SIM_COMMIT="${GITHUB_SHA::7}" tools/sim/run-sim ci tools/sim/out --timeline both
+
+      - name: End-to-End-Join
+        shell: pwsh
+        # H20 enables the required tests once the real reader integration fixture lands.
+        run: ./tools/Test-JoinReadiness.ps1 -Check EndToEnd -ExpectKnownFailure
+
+      - name: Join aborts preserve personal saves
+        shell: pwsh
+        # H19 removes the exact five-retained-slots expectation when pre-load cleanup is fixed.
+        run: ./tools/Test-JoinReadiness.ps1 -Check Abort -ExpectKnownFailure
 
       - uses: actions/upload-artifact@v4
         with:

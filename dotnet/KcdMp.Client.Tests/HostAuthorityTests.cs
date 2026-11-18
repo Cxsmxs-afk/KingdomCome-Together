@@ -89,37 +89,92 @@ public class HostAuthorityTests
     [Fact]
     public async Task Abandoned_native_probe_cannot_later_configure_a_role()
     {
+        const string armed = "B decision_gate=armed story_gate=armed";
         var native = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Task<HostAuthorityReadiness.Preparation>? pending = null;
+        var entered = new TaskCompletionSource<Task<HostAuthorityReadiness.Preparation>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var clock = new ManualFrameTime();
         int roleCalls = 0;
-        var result = await ProcessorFrameScope.RunAsync(async token =>
+        var frame = ProcessorFrameScope.RunAsync(async token =>
         {
-            pending = HostAuthorityReadiness.ProbeAndConfigureAsync(() => native.Task,
+            var preparation = HostAuthorityReadiness.ProbeAndConfigureAsync(() => native.Task,
                 () => { roleCalls++; return Task.FromResult(true); }, token);
-            await pending;
-        }, 50);
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-        native.SetResult("B decision_gate=armed story_gate=armed");
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await pending!);
-        Assert.Equal(0, roleCalls);
+            entered.SetResult(preparation);
+            await preparation;
+        }, 50, CancellationToken.None, clock);
+        try
+        {
+            var pending = await entered.Task.WaitAsync(TestWatchdog);
+            Assert.False(pending.IsCompleted);
+            clock.Expire();
+            var result = await frame.WaitAsync(TestWatchdog);
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
+            native.SetResult(armed);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await pending);
+            Assert.Equal(0, roleCalls);
+        }
+        finally
+        {
+            clock.Expire();
+            native.TrySetResult(armed);
+        }
     }
 
     [Fact]
     public async Task Abandoned_native_configuration_cannot_report_late_success()
     {
         var native = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Task<HostAuthorityReadiness.Preparation>? pending = null;
+        var entered = new TaskCompletionSource<Task<HostAuthorityReadiness.Preparation>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var clock = new ManualFrameTime();
         int confirmed = 0;
-        var result = await ProcessorFrameScope.RunAsync(async token =>
+        var frame = ProcessorFrameScope.RunAsync(async token =>
         {
-            pending = HostAuthorityReadiness.ProbeAndConfigureAsync(
+            var preparation = HostAuthorityReadiness.ProbeAndConfigureAsync(
                 () => Task.FromResult<string?>("B decision_gate=armed story_gate=armed"), () => native.Task, token);
-            await pending;
+            entered.SetResult(preparation);
+            await preparation;
             confirmed++;
-        }, 50);
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-        native.SetResult(true);
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await pending!);
-        Assert.Equal(0, confirmed);
+        }, 50, CancellationToken.None, clock);
+        try
+        {
+            var pending = await entered.Task.WaitAsync(TestWatchdog);
+            Assert.False(pending.IsCompleted);
+            clock.Expire();
+            var result = await frame.WaitAsync(TestWatchdog);
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
+            native.SetResult(true);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await pending);
+            Assert.Equal(0, confirmed);
+        }
+        finally
+        {
+            clock.Expire();
+            native.TrySetResult(true);
+        }
+    }
+
+    private static readonly TimeSpan TestWatchdog = TimeSpan.FromSeconds(5);
+
+    // Only expire after the processor has reached the native wait under test.
+    private sealed class ManualFrameTime : TimeProvider
+    {
+        private DeadlineTimer? _timer;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            _timer = new DeadlineTimer(callback, state);
+            return _timer;
+        }
+
+        public void Expire() => _timer?.Fire();
+
+        private sealed class DeadlineTimer(TimerCallback callback, object? state) : ITimer
+        {
+            private TimerCallback? _callback = callback;
+
+            public void Fire() => Interlocked.Exchange(ref _callback, null)?.Invoke(state);
+            public bool Change(TimeSpan dueTime, TimeSpan period) => throw new NotSupportedException();
+            public void Dispose() => Interlocked.Exchange(ref _callback, null);
+            public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+        }
     }
 }
