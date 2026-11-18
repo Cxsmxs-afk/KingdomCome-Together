@@ -93,6 +93,35 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual({'rp_e2e_n': 27, 'rp_e2e_ms_p95': 171, 'owner_violations': 1}, measure.last_stats(rows, 'host'))
         self.assertEqual({}, measure.last_stats(['MP-T3-STATS origin=agent role=host tp_total=1'], 'host'))
 
+    def test_sender_ids_come_from_real_and_bot_connection_logs(self):
+        agent = ['16:51:44.267 Connected! Assigned id=6 (protocol v6)',
+                 '16:52:10.341 Connected! Assigned id=255 (protocol v6)',
+                 '16:52:13.149 Connected! Assigned id=255 (protocol v6)',
+                 '16:52:17.652 Connected! Assigned id=256 (protocol v6)']
+        bot = ['PEER connected id=8 release=dev protocol=v6 steps=4',
+               'BOT-T4 role=joiner ready=1', 'BOT-T4 role=joiner complete=1 poses=1200 actions=0 ranged=0']
+        self.assertEqual([6, 255, 255], measure.peer_ids(agent, measure.ASSIGNED_PEER))
+        self.assertEqual([8], measure.peer_ids(bot, measure.BOT_PEER))
+        self.assertEqual([], measure.peer_ids(bot, measure.ASSIGNED_PEER))
+
+    def test_figure_evidence_requires_positive_same_pc_samples_for_the_sender(self):
+        def row(peer, generation, count, clock='same_pc_qpc', final=0):
+            return (f'MP-RP-MEASURE figure=kcd2mp_{peer} gen={generation} clock={clock} '
+                    f'proof=writer final={final} rp_e2e_ms_p95=170 rp_e2e_n={count}')
+
+        unrelated = [row(2, 3, 209), row(8, 3, 0), row(8, 3, 350, 'unknown')]
+        self.assertIsNone(measure.figure_stats(unrelated, 8))
+        fresh = unrelated + [row(8, 3, 40), row(8, 3, 1180, final=1)]
+        self.assertEqual({'figure': 'kcd2mp_8', 'world_generation': 3, 'rp_e2e_ms_p95': 170, 'rp_e2e_n': 1180},
+                         measure.figure_stats(fresh, 8))
+        self.assertIsNone(measure.figure_stats(fresh + [row(8, 3, 4)], 8))
+        self.assertIsNone(measure.figure_stats(fresh + [row(8, 4, 1330)], 8))
+
+    def test_receiver_requires_finite_in_world_position(self):
+        self.assertTrue(measure.finite_position((0, 0, -1)))
+        for position in (None, (), (1, 2), (1, 2, math.nan), (1, 2, math.inf)):
+            self.assertFalse(measure.finite_position(position))
+
 
 if __name__ == '__main__':
     unittest.main()

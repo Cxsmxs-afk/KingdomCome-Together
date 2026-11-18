@@ -17,7 +17,14 @@ namespace kcdmp::pipecontrol {
 constexpr uint8_t kGeneric = 0x2B, kBatch = 0x2D, kSamples = 0x10;
 constexpr size_t kNormalPayload = 1024, kLargePayload = 4096;
 constexpr size_t kDeferredFrames = 128, kDeferredBytes = 64 * 1024;
-struct Frame { uint8_t type = 0, sequence = 0; std::vector<uint8_t> body; uint64_t readerTick=0,readerGeneration=0,readerLife=0;bool readerGameplay=false; int64_t readerQpc=0; };
+struct Frame {
+    uint8_t type = 0, sequence = 0;
+    std::vector<uint8_t> body;
+    uint64_t readerTick = 0, readerGeneration = 0, readerLife = 0;
+    bool readerGameplay = false;
+    int64_t readerQpc = 0;
+    uint64_t readerObservation = 0;
+};
 inline bool header_payload_allowed(uint8_t type, size_t n) {
     return n <= kNormalPayload || ((type == kBatch || type == kSamples || type == kGeneric) && n <= kLargePayload);
 }

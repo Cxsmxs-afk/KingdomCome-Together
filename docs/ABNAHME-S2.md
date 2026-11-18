@@ -2,7 +2,7 @@
 
 ## s2-1 · Vergleichsmessung auf einem PC
 
-`rpmeasure` nutzt den Pfad, der im Build für den zweiten Henry bereits aktiv ist. Das Rig schaltet für den Empfänger den gemeinsamen Rechner-Takt mit `mp_rp_measure_clock on` frei und wartet auf die Bestätigung von Agent und DLL. Der Standard ist `off`. Nach Abschluss und Log-Sammlung schaltet das Rig auf `off` zurück. Der Spieltest mit zwei PCs steht aus.
+`rpmeasure` nutzt den Pfad, der im Build für den zweiten Henry bereits aktiv ist. Vor dem Start der Route liest das Rig die Position des lokalen Spielers am Empfänger. Drei endliche Koordinaten belegen, dass die Figur in der Welt erreichbar ist. Danach schaltet das Rig den gemeinsamen Rechner-Takt mit `mp_rp_measure_clock on` frei und wartet auf die Bestätigung von Agent und DLL. Der Standard ist `off`. Nach Abschluss und Log-Sammlung schaltet das Rig auf `off` zurück. Der Spieltest mit zwei PCs steht aus.
 
 ### Route und Start
 
@@ -34,7 +34,7 @@ python tools/rig/scenarios.py rpmeasure --test-rpmeasure --route $Route --netz n
 
 Für den Schlecht-Netz-Lauf die Instanzen und das Relay mit `pair.py down` beenden und mit neuem `KCDMP_RIG_RUN` wieder starten. In beiden Befehlen `--netz schlecht` setzen. Das Relay lädt den Testplan für beide Richtungen des Joiners mit 150 ms Zusatzlatenz und 0–35 ms Jitter. Das Szenario prüft im aktuellen Relay-Log, dass die Regel aktiviert wurde und Frames verzögert hat. Eine Änderung des Netzprofils braucht einen frischen Relay-Start.
 
-Das Ergebnisverzeichnis enthält `rpmeasure.json` mit der ersten frischen 60-s-Statistik nach der Route. Die gebündelte T1-Wertung umfasst den Spielstart. Mit zwei Instanzen liegt auch `ERGEBNIS-PAAR.md` beim Szenario. Fortschritt in `rp_e2e_n` belegt eine Messung. Ein `owner_violations`-Messwert über null ist ein Fehler. Fehlende Zyklen, Aktionen oder Besitzerbelege bleiben grau. Die Latenz-Ampel für p95 ist unter 150 ms grün, unter 300 ms gelb und ab 300 ms rot.
+Das Ergebnisverzeichnis enthält `rpmeasure.json` mit der ersten frischen 60-s-Statistik nach der Route und der Messzeile des empfangenen Henry. Die Relay-ID des Senders stammt aus dem Agent-Log oder aus dem laufenden Bot. `rp_e2e_n` muss im frischen Messfenster für genau diese Figur steigen. Ein Verbindungswechsel während des Laufs oder ein `owner_violations`-Messwert über null ist ein Fehler. Die gebündelte T1-Wertung umfasst den Spielstart. Mit zwei Instanzen liegt auch `ERGEBNIS-PAAR.md` beim Szenario. Fehlende Zyklen, Aktionen oder Besitzerbelege bleiben grau. Die Latenz-Ampel für p95 ist unter 150 ms grün, unter 300 ms gelb und ab 300 ms rot.
 
 ### Messgrenzen
 
@@ -46,7 +46,7 @@ Das Ergebnisverzeichnis enthält `rpmeasure.json` mit der ersten frischen 60-s-S
 | `rp_action_lag_ms_p95` | Von der Pipe-Ankunft bis zum angenommenen nativen Swing- oder Ranged-Request. Sichtbare Animationsphasen brauchen eine Spielmessung. |
 | `rp_step_ratio`, `owner_violations` | Der Schrittvergleich braucht zwei beobachtete Skelette mit vergleichbarer Geschwindigkeit. Der Besitzer-Zähler erhält seine prüfbare Abdeckung in s2-2. |
 
-Beim Einschalten beginnt ein frisches Messfenster. Die DLL schreibt pro beobachteter Figur eine Messzeile, der 60-s-Bericht enthält die Zusammenfassung der Rolle. Die Simulation misst separat auf beiden Seiten bis zum Positionspaket am Relay-Client. Die Schwelle von 150 ms prüft dabei den Nachweis von guter und verschlechterter Testleitung.
+Beim Einschalten beginnt ein frisches Messfenster. Bei einem bereits geladenen Host, dessen Agent erst später startet, beginnt die Erfassung mit der ersten erfolgreich auf die bestätigte Partnerfigur angewendeten Pose. Ein Lade-, Rollen- oder Pipe-Wechsel beendet die Freigabe. Für einen neuen Lauf muss das Rig sie erneut aktivieren. Die DLL schreibt pro beobachteter Figur eine Messzeile, der 60-s-Bericht enthält die Zusammenfassung der Rolle. Die Simulation misst separat auf beiden Seiten bis zum Positionspaket am Relay-Client. Die Schwelle von 150 ms prüft dabei den Nachweis von guter und verschlechterter Testleitung.
 
 ### Zwei-PC-Checkliste
 

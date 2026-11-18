@@ -892,6 +892,7 @@ bool ingest(ReaderContext& input, const uint8_t* bytes, size_t n) {
         if (f.type == kNpcSamples) {
             LARGE_INTEGER tick{};
             if (QueryPerformanceCounter(&tick)) f.readerQpc = tick.QuadPart;
+            f.readerObservation = wo216::lifecycle_observation_stamp();
         }
     });
     g_seq = input.reader.next_sequence();
@@ -1395,8 +1396,8 @@ void serve(HANDLE h) {
             // holds, config and status never wait for a frame; only a bind
             // (engine reads) is marshalled onto the main thread.
             case kNpcSamples: {
-                const uint8_t r = npcdrive::on_samples(body, len, incoming.readerQpc,
-                                                       incoming.readerGameplay ? incoming.readerGeneration : 0);
+                const uint8_t r = npcdrive::on_samples(body, len,
+                    {incoming.readerQpc, {incoming.readerObservation, input.generation + 1}});
                 if (r != npcdrive::kOk) logf("PIPE: NpcSamples refused (%s, %u bytes)", npcdrive::reason_name(r), len);
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
@@ -1925,7 +1926,6 @@ void serve(HANDLE h) {
     logf("PIPE: agent disconnected");
     // WO-118: no agent, no stream -- every native binding is dropped.
     npcdrive::on_pipe_closed();
-    main_thread::post([] { rpmeasure::on_pipe_closed(); });
     main_thread::post([] { kcdmp::wo132::on_pipe_closed(); });   // WO-132: engaged copies let go (main-thread state)
     main_thread::post([] { kcdmp::motion::on_pipe_closed(); });  // WO-154 2: the avatars' identities go with the session
     main_thread::post([] { kcdmp::wo201::on_pipe_closed(); });   // WO-201: its session parts stand down
@@ -2055,5 +2055,6 @@ void stop() {
 }
 
 bool connected() { return g_connected; }
+uint64_t observation_connection() { return g_connected ? g_connGen.load() + 1 : 0; }
 
 } // namespace kcdmp::pipe

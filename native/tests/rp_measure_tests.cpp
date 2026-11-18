@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #include "../KCDMP/rp_measure_rules.h"
+#include "../KCDMP/pipe_control_reader.h"
 
 #include <cstdio>
 
@@ -19,10 +20,53 @@ int rp_measure_tests(int* passed) {
     check(!clock_config(true, 2, clock) && clock, "unknown configuration leaves state untouched");
     check(!clock_config(false, 0, clock) && clock, "unauthorized off leaves state untouched");
     check(clock_config(true, 0, clock) && !clock, "explicit authorized off applied");
-    check(sample_in_window({100, 9}, 9, 100), "current gameplay receipt at window start is eligible");
-    check(!sample_in_window({99, 9}, 9, 100), "queued receipt preceding a reset is outside the window");
-    check(!sample_in_window({100, 8}, 9, 100) && !sample_in_window({100, 0}, 0, 100) &&
-        !sample_in_window({0, 9}, 9, 0), "missing, inactive and prior-generation receipts are ineligible");
+    const ReceiverScope boot{2, 1};
+    const ReceiverScope gameplay{5, 1};
+    const ReceiverScope nextLoad{6, 1};
+    const ReceiverScope nextGameplay{9, 1};
+    const ReceiverScope reconnected{9, 2};
+    check(sample_in_window({100, boot}, boot, 100), "first byte from the armed boot scope at window start is eligible");
+    check(!sample_in_window({99, boot}, boot, 100), "queued receipt preceding a reset is outside the window");
+    check(!sample_in_window({100, boot}, gameplay, 100) && !sample_in_window({100, gameplay}, nextLoad, 100) &&
+        !sample_in_window({100, nextGameplay}, reconnected, 100), "phase, generation and pipe edges discard queued receipts");
+    check(!sample_in_window({0, boot}, boot, 0) && !sample_in_window({100, {0, 0}}, {0, 0}, 100),
+        "missing timestamp or transport scope is ineligible");
+
+    Window window;
+    check(window.synchronize(boot) && !window.shared_clock() && !window.can_report() && !window.observe_pose(false, true),
+        "ordinary inactive phase cannot be opted in by a writer alone");
+    window.configure(true);
+    check(window.shared_clock() && !window.can_report() && !window.observe_pose(true, false),
+        "same-PC command promises a clock and waits for a writer with a fresh source");
+    check(window.observe_pose(false, true) && window.can_report() && window.observe_pose(true, false)
+        && !window.observe_pose(false, false) && !window.synchronize(boot),
+        "live writer-source proof allows the loaded-host window and applies to the observed body");
+    check(window.synchronize(gameplay) && window.can_report() && !window.shared_clock() && window.observe_pose(false, false),
+        "a real gameplay transition disables the test assertion and leaves ordinary coverage");
+    window.configure(true);
+    check(window.synchronize(nextLoad) && !window.shared_clock() && !window.can_report() && !window.observe_pose(true, true),
+        "the next load hard-disables the test window including previously known actors");
+    window.configure(true);
+    check(window.synchronize(nextGameplay) && !window.shared_clock(), "a new Gameplay phase demands a separate explicit assertion");
+    window.configure(true);
+    check(window.synchronize({nextGameplay.lifecycle, 0}) && !window.shared_clock() && !window.can_report() &&
+        window.synchronize(reconnected) && !window.shared_clock(),
+        "pipe disconnect clears the assertion and reconnect cannot reuse it");
+
+    namespace reader = kcdmp::pipecontrol;
+    reader::Reader staged;
+    reader::Frame deferred;
+    const uint8_t sampleFrame[] = {reader::kSamples, 1, 0, 0};
+    const auto noControl = [](const reader::Frame&) { return true; };
+    check(staged.feed(sampleFrame, 1, noControl, [&](reader::Frame& f) {
+            f.readerQpc = 99;
+            f.readerObservation = boot.lifecycle;
+        }) && staged.feed(sampleFrame + 1, sizeof(sampleFrame) - 1, noControl, [&](reader::Frame& f) {
+            f.readerQpc = 101;
+            f.readerObservation = gameplay.lifecycle;
+        }) && staged.pop(&deferred) && deferred.readerQpc == 99 &&
+        !sample_in_window({deferred.readerQpc, {deferred.readerObservation, 1}}, boot, 100),
+        "actual pipe decoder keeps the first-byte cutoff across delayed completion");
 
     uint8_t peer = 17;
     check(partner_id("kcd2mp_0", peer) && peer == 0, "peer zero is a canonical figure");
@@ -71,6 +115,8 @@ int rp_measure_tests(int* passed) {
     check(ledger.peer_counts(1)[12] == 2 && ledger.peer_counts(2)[15] == 1, "first binding retains existing pipeline samples");
     check(ledger.peer_of(100, peer) && peer == 1 && ledger.peer_of(200, peer) && peer == 2,
         "applied entity identities resolve to the measured peer");
+    check(ledger.has_body(1) && ledger.has_body(1, 100) && !ledger.has_body(1, 200) && !ledger.has_body(3),
+        "only the verified bound figure is eligible for loaded-host follow-up");
 
     ledger.pose(1, 101, 100, 120, true, 0.0, false);
     check(!ledger.peer_of(100, peer) && ledger.peer_of(101, peer) && peer == 1 && ledger.peer_counts(1)[11] == 1

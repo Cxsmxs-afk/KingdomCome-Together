@@ -373,5 +373,6 @@ void stop();
 
 /// Whether an agent is currently connected.
 bool connected();
+uint64_t observation_connection(); // zero disconnected, otherwise stable for the current pipe
 
 } // namespace kcdmp::pipe

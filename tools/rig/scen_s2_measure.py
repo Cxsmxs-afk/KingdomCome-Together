@@ -21,6 +21,9 @@ FAULT_FIRED = re.compile(r'RELAY-FAULT rpmeasure-netz-schlecht fired kind=lag ro
 FAULT_MODE = re.compile(r'RELAY-FAULTS loaded plan=')
 FAULT_DELAY = re.compile(r'RELAY-FAULTS .*\bplan=netz-schlecht\.json\b.*\bdelayed=([1-9]\d*)/')
 STATS = re.compile(r'\bMP-T3-STATS origin=agent role=(host|joiner) (.+)$')
+FIGURE = re.compile(r'\bMP-RP-MEASURE figure=kcd2mp_(\d+) gen=(\d+) clock=same_pc_qpc (.+)$')
+ASSIGNED_PEER = re.compile(r'\bConnected! Assigned id=(\d+) \(protocol')
+BOT_PEER = re.compile(r'^PEER connected id=(\d+) release=')
 COUNTER = re.compile(r'\b((?:rp_[a-z0-9_]+)|owner_violations)=(\d+)(?= |$)')
 
 
@@ -116,15 +119,20 @@ def route_commands(route, tag, drive):
     yield ' '.join(LUA_TICK.split())
 
 
-def game_route(sender, route, tag, drive, say):
+def finite_position(position):
+    return position is not None and len(position) == 3 and all(map(math.isfinite, position))
+
+
+def game_route(sender, route, tag, drive, say, arm_window):
     if sender.port is None:
         raise RuntimeError('source game console is unavailable')
     original = sender.pos()
-    if original is None or math.dist(original, route.points[0][1:]) > 3:
+    if not finite_position(original) or math.dist(original, route.points[0][1:]) > 3:
         raise RuntimeError('source player must be within 3 m of the first waypoint')
     try:
         for command in route_commands(route, tag, drive):
             if not sender.lua(command): raise RuntimeError('route preparation was not acknowledged')
+        arm_window()
         off = sender.size(sender.klog)
         start = 'local r=RPMeasureRoute; if r and not r.start then r.start=System.GetCurrTime(); r.player=player; r.i=1; r.near=0; r.stairs=0; RPMeasureTick(r) end'
         if not sender.lua(start): raise RuntimeError('route start was not acknowledged')
@@ -170,6 +178,26 @@ def last_stats(lines, role):
     return {}
 
 
+def peer_ids(lines, pattern):
+    return [int(match[1]) for line in lines if (match := pattern.search(line)) and int(match[1]) <= 255]
+
+
+def figure_stats(lines, peer):
+    generation = None
+    latest = {}
+    for line in lines:
+        match = FIGURE.search(line)
+        if match and int(match[1]) == peer:
+            values = {key: int(value) for key, value in COUNTER.findall(match[3])}
+            count = values.get('rp_e2e_n', 0)
+            if generation is not None and (int(match[2]) != generation or count < latest.get('rp_e2e_n', 0)):
+                return None
+            generation, latest = int(match[2]), values
+    if not latest.get('rp_e2e_n', 0):
+        return None
+    return {'figure': f'kcd2mp_{peer}', 'world_generation': generation, **latest}
+
+
 def paired_steps(source_rows, receiver_rows):
     import scoreboard
 
@@ -192,20 +220,19 @@ def paired_steps(source_rows, receiver_rows):
     return ((len(ratios), round(statistics.median(ratios))) if ratios else (0, None))
 
 
-def natural_route(S, sender, receiver, route, tag):
+def natural_route(S, sender, receiver, route, tag, arm_window):
     import scoreboard
 
     name_tag = 'RPMEASURE-SOURCE'
     name = sender.ask('System.LogAlways("[' + name_tag + '] " .. tostring(player:GetName()))', name_tag)
-    ids = [match[1] for line in sender.lines(sender.alog, 0)
-           if (match := re.search(r'Connected! Assigned id=(\d+) \(protocol', line))]
     agent_offsets = {copy.id: copy.size(copy.alog) for copy in (sender, receiver)}
+    ids = peer_ids(sender.lines(sender.alog, 0), ASSIGNED_PEER)
     offsets = {}
     try:
         for copy in (sender, receiver):
             if all(copy.lua(chunk) for chunk in S.bones_chunks()) and copy.lua('W206Bones_Start(10,50,"root,lfoot,rfoot")'):
                 offsets[copy.id] = copy.size(copy.klog)
-        journey = game_route(sender, route, tag, False, S.rig.say)
+        journey = game_route(sender, route, tag, False, S.rig.say, arm_window)
         ends = {copy.id: copy.size(copy.klog) for copy in (sender, receiver)}
     finally:
         for copy in (sender, receiver): copy.lua_nowait('if W206Bones_Stop then W206Bones_Stop() end')
@@ -218,7 +245,7 @@ def natural_route(S, sender, receiver, route, tag):
             return journey, (0, None)
     source, _ = scoreboard.bone_rows(sender.klog, offsets[sender.id], ends[sender.id])
     display, _ = scoreboard.bone_rows(receiver.klog, offsets[receiver.id], ends[receiver.id])
-    return journey, paired_steps(source.get(name, []), display.get('kcd2mp_' + ids[-1], []))
+    return journey, paired_steps(source.get(name, []), display.get(f'kcd2mp_{ids[-1]}', []))
 
 
 def clock(copy, turn):
@@ -239,9 +266,28 @@ def measure(S, run, args, route):
         raise RuntimeError('the Bot-Joiner replaces the second game, which must be stopped')
     relay = state.get('relay')
     network_evidence(relay, S.pair.POOR_NETWORK, args.netz, S.procs.matches, S.Copy.lines)
-    # Scope this explicit shared-clock assertion to the same-PC rig.
-    try:
+    source = None
+    armed = False
+    figure_offsets = {}
+    link_offsets = {}
+
+    def arm_window():
+        nonlocal armed, source
+        if not finite_position(receiver.pos()):
+            raise RuntimeError('receiver must return a finite position for an in-world local player')
+        for copy in (receiver,) if args.bot else (sender, receiver):
+            link_offsets[copy.id] = copy.size(copy.alog)
+        if not args.bot:
+            ids = peer_ids(sender.lines(sender.alog, 0), ASSIGNED_PEER)
+            if not ids: raise RuntimeError('source Agent has no assigned Relay ID')
+            source = ids[-1]
+        # Clock-on resets the DLL ledger, so this route's counter starts at zero.
+        armed = True
         clock(receiver, 'on')
+        native_log = os.path.join(receiver.p['dll_dir'], f'kcdmp-native-{receiver.id}.log')
+        figure_offsets.update((path, receiver.size(path)) for path in (native_log, receiver.nlog))
+
+    try:
         bot_log = None
         rp_step = None
         if args.bot:
@@ -249,13 +295,18 @@ def measure(S, run, args, route):
             plan.write_text(bot_plan(route), encoding='utf-8')
             bot_log = Path(run.dir, 'bot-t4.log')
             command = S.bot_joiner_command(run, '--scenario', str(plan.resolve()), '--duration', '240')
+            arm_window()
             with bot_log.open('w', encoding='utf-8') as stream:
                 result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT)
-            if result.returncode or 'BOT-T4 role=joiner complete=1' not in bot_log.read_text(encoding='utf-8', errors='replace'):
+            bot_lines = bot_log.read_text(encoding='utf-8', errors='replace').splitlines()
+            if result.returncode or not any(line.startswith('BOT-T4 role=joiner complete=1 ') for line in bot_lines):
                 raise RuntimeError(f'the T4 route did not complete (exit {result.returncode})')
+            ids = peer_ids(bot_lines, BOT_PEER)
+            if len(ids) != 1: raise RuntimeError('the T4 route must have one assigned Relay ID')
+            source = ids[0]
             journey = {'bot_log': str(bot_log)}
         elif args.spieler:
-            journey, (n, ratio) = natural_route(S, sender, receiver, route, str(time.time_ns()))
+            journey, (n, ratio) = natural_route(S, sender, receiver, route, str(time.time_ns()), arm_window)
             if n:
                 step_log = Path(run.dir, 'rp-step.log')
                 step_log.write_text(f'MP-RP-STEP rp_step_n={n} rp_step_ratio={ratio}\n', encoding='utf-8')
@@ -263,18 +314,25 @@ def measure(S, run, args, route):
             journey['step_n'] = n
             journey['step_ratio_permille'] = ratio
         else:
-            journey = game_route(sender, route, str(time.time_ns()), True, S.rig.say)
+            journey = game_route(sender, route, str(time.time_ns()), True, S.rig.say, arm_window)
 
         # Include a report made after the route, even when a heartbeat landed
         # during it. The bundle's T1 verdict still covers the whole game launch.
         offset = receiver.size(receiver.alog)
         pulse = receiver.wait('a', offset, r'MP-T3-STATS origin=agent role=' + role + r' .*\brp_e2e_n=\d+', 90)
         latest = last_stats(receiver.lines(receiver.alog, offset), role) if pulse else {}
+        figure = None
+        for path, before in figure_offsets.items():
+            figure = figure_stats(receiver.lines(path, before), source)
+            if figure: break
+        stable_link = all(copy.size(copy.alog) >= link_offsets[copy.id] and
+                          not peer_ids(copy.lines(copy.alog, link_offsets[copy.id]), ASSIGNED_PEER)
+                          for copy in ((receiver,) if args.bot else (sender, receiver)))
         network = network_evidence(relay, S.pair.POOR_NETWORK, args.netz, S.procs.matches, S.Copy.lines, require_delay=True)
         bundles = S.pair.collect('rpmeasure-%d' % time.time_ns(), write_verdict=True, copies=copies, bot_log=bot_log, rp_step=rp_step)
         packed = {cid: os.path.abspath(folder + '.packed') for cid, folder in bundles.items()}
-        detail = {'sender': args.sender, 'receiver': role, 'duration_s': DURATION, 'network': network,
-                  'route': journey, 'metrics': latest, 'bundles': packed}
+        detail = {'sender': args.sender, 'sender_peer': source, 'receiver': role, 'duration_s': DURATION, 'network': network,
+                  'route': journey, 'metrics': latest, 'figure': figure, 'stable_link': stable_link, 'bundles': packed}
         if not args.bot:
             tool = Path(S.HERE, '..', 'verdict', 'pair.py').resolve()
             result = subprocess.run([sys.executable, '-X', 'utf8', str(tool), packed[run.a.id], packed[run.b.id]], cwd=run.dir)
@@ -282,12 +340,14 @@ def measure(S, run, args, route):
             detail['pair_report'] = os.path.join(run.dir, 'ERGEBNIS-PAAR.md')
         Path(run.dir, 'rpmeasure.json').write_text(json.dumps(detail, indent=2), encoding='utf-8')
         if latest.get('owner_violations', 0) > 0: return False, 'owner-violations', detail
+        if not stable_link: return False, 'replaced-route-participant', detail
         if not latest.get('rp_e2e_n', 0): return False, 'no-new-rp-e2e-samples', detail
+        if not figure: return False, 'no-new-matching-figure-samples', detail
         return True, 'ok', detail
     finally:
         failed = sys.exc_info()[0] is not None
         try:
-            clock(receiver, 'off')
+            if armed: clock(receiver, 'off')
         except (OSError, RuntimeError) as error:
             if not failed: raise
             S.rig.say('rpmeasure cleanup:', str(error))

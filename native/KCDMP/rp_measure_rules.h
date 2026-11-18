@@ -25,15 +25,56 @@ inline bool clock_config(bool environment, unsigned value, bool& enabled) {
     return true;
 }
 
-struct SampleScope {
-    int64_t firstByteQpc = 0;
-    uint64_t generation = 0; // Zero when the reader was outside Gameplay.
+struct ReceiverScope {
+    uint64_t lifecycle = 0; // Revision from the native lifecycle, with Gameplay in the low bit.
+    uint64_t connection = 0; // Zero means disconnected.
+
+    bool gameplay() const { return (lifecycle & 1) != 0; }
+    bool connected() const { return lifecycle != 0 && connection != 0; }
+    bool operator==(ReceiverScope other) const {
+        return lifecycle == other.lifecycle && connection == other.connection;
+    }
 };
 
-inline bool sample_in_window(SampleScope sample, uint64_t generation, int64_t startQpc) {
-    return generation != 0 && sample.generation == generation &&
+struct SampleScope {
+    int64_t firstByteQpc = 0;
+    ReceiverScope receiver{};
+};
+
+inline bool sample_in_window(SampleScope sample, ReceiverScope receiver, int64_t startQpc) {
+    return receiver.connected() && sample.receiver == receiver &&
            sample.firstByteQpc > 0 && sample.firstByteQpc >= startQpc;
 }
+
+// Test-only measurement can start on a loaded host whose Agent missed the
+// Gameplay log line. The clock assertion by itself leaves the window pending.
+class Window {
+    ReceiverScope receiver_;
+    bool sharedClock_ = false;
+    bool writerProven_ = false;
+
+public:
+    bool synchronize(ReceiverScope receiver) {
+        if (receiver == receiver_) return false;
+        receiver_ = receiver;
+        configure(false);
+        return true;
+    }
+
+    void configure(bool sharedClock) {
+        sharedClock_ = receiver_.connected() && sharedClock;
+        writerProven_ = false;
+    }
+
+    bool shared_clock() const { return sharedClock_; }
+    bool gameplay() const { return receiver_.connected() && receiver_.gameplay(); }
+    bool can_report() const { return gameplay() || (sharedClock_ && writerProven_); }
+
+    bool observe_pose(bool knownBody, bool validWriterSource) {
+        if (sharedClock_ && validWriterSource) writerProven_ = true;
+        return gameplay() || (sharedClock_ && writerProven_ && (knownBody || validWriterSource));
+    }
+};
 
 inline bool partner_id(std::string_view name, uint8_t& peer) {
     constexpr std::string_view prefix = "kcd2mp_";
@@ -239,6 +280,11 @@ public:
             }
         }
         return false;
+    }
+
+    bool has_body(uint8_t peer, uint32_t eid = 0) const {
+        const auto& body = peers_[peer];
+        return body && body->eid != 0 && (eid == 0 || body->eid == eid);
     }
 
     void forget(uint32_t eid) {

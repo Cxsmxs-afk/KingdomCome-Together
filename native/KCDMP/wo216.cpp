@@ -78,6 +78,7 @@ wo216authority::State g_authority; // only pure control state under this mutex, 
 std::atomic<uint64_t> g_activeFromMs{0}, g_authorityGeneration{0};
 std::atomic<bool> g_authorityEnabled{true}, g_legacyArmed{false};
 std::atomic<uint8_t> g_authorityPhase{static_cast<uint8_t>(wo216authority::Phase::Load)};
+std::atomic<uint64_t> g_observationStamp{2};
 std::atomic<uint32_t> c_blockedDuringLoad{0}, c_gateArmedAtS{0};
 std::atomic<uint32_t> c_npcNear{0}, c_npcBound{0}, c_npcHidden{0}, c_hideFailsafe{1}, c_unhidden10s{0};
 
@@ -88,6 +89,11 @@ void publish_authority() {
     g_legacyArmed.store(g_authority.legacyArmed, std::memory_order_release);
     g_authorityGeneration.store(g_authority.generation, std::memory_order_release);
     g_activeFromMs.store(g_authority.active_from(), std::memory_order_release);
+    // Diagnostic readers can detect even a phase or role round trip between
+    // game ticks, without changing any P1 authority checks.
+    const uint64_t next = (g_observationStamp.load(std::memory_order_relaxed) & ~uint64_t{1}) + 2;
+    const bool gameplay = g_authority.generation != 0 && g_authority.phase == wo216authority::Phase::Gameplay;
+    g_observationStamp.store(next | static_cast<uint64_t>(gameplay), std::memory_order_release);
 }
 bool lifecycle_active(uint64_t now, uint64_t* observedFrom = nullptr) {
     const uint64_t from = g_activeFromMs.load(std::memory_order_acquire);
@@ -1075,6 +1081,7 @@ bool authority_enabled() { return g_authorityEnabled.load(std::memory_order_acqu
 uint8_t lifecycle_role(){return g_role.load(std::memory_order_acquire);}
 uint64_t lifecycle_generation() { return g_authorityGeneration.load(std::memory_order_acquire); }
 bool lifecycle_gameplay() { return g_authorityPhase.load(std::memory_order_acquire) == uint8_t(wo216authority::Phase::Gameplay); }
+uint64_t lifecycle_observation_stamp() { return g_observationStamp.load(std::memory_order_acquire); }
 bool decisions_blocked() { return authority_active() && g_decisionGate.load(); }
 uint64_t p5_corpses_visible() { return g_p5World.load() == lifecycle_generation() ? g_p5Visible.load() : 0; }
 uint64_t p5_corpse_hidden_blocked() { return g_p5Blocked.load(); }

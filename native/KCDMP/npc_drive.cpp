@@ -275,6 +275,7 @@ struct RingSample {
     float x, y, z, rot;
     double at;
     uint32_t senderMs;
+    uint8_t sourceId;
     rpmeasure::SampleScope reader;
 };
 struct Stream {
@@ -601,7 +602,7 @@ void push_sample(const InSample& in, double now) {
     s.lastArrival = nowPkt;
     s.lastMoved = moved;
     const double at = sender_stamp(in.src, in.senderMs, nowPkt);
-    RingSample r{ in.x, in.y, in.z, in.rot, at, in.senderMs, in.reader };
+    RingSample r{ in.x, in.y, in.z, in.rot, at, in.senderMs, in.src, in.reader };
     if (s.n > 0) {
         const RingSample& lastS = s.ring[s.n - 1];
         const float dx = in.x - lastS.x, dy = in.y - lastS.y;
@@ -880,6 +881,7 @@ void disarm(const char* why) {
     for (auto it = g_bound.begin(); it != g_bound.end();) {
         motion::body_released(it->second.key.c_str(), it->second.eid);
         wo215::route_release(it->second.eid, "writer disarmed");
+        rpmeasure::forget(it->second.eid);
         notify_drop(kFault, it->second.name);
         it = g_bound.erase(it);
     }
@@ -1014,7 +1016,7 @@ bool armed() { return g_armed.load(); }
 void set_drop_callback(DropFn fn) { g_dropFn.store(fn); }
 
 // ---- pipe thread --------------------------------------------------------------
-uint8_t on_samples(const uint8_t* body, size_t len, int64_t readerQpc, uint64_t readerGeneration) {
+uint8_t on_samples(const uint8_t* body, size_t len, rpmeasure::SampleScope reader) {
     if (len < 1) return kBadRequest;
     const int count = body[0];
     size_t o = 1;
@@ -1034,7 +1036,7 @@ uint8_t on_samples(const uint8_t* body, size_t len, int64_t readerQpc, uint64_t 
         std::memcpy(&s.seq, body + o, 2); o += 2;
         std::memcpy(&s.senderMs, body + o, 4); o += 4;
         std::memcpy(&s.arrivalQpc, body + o, 8); o += 8;
-        s.reader = {readerQpc, readerGeneration};
+        s.reader = reader;
         if (s.flags & 0x80) {   // WO-121: the agent's pipe-only "state block follows" bit
             if (o + sizeof(motion::State2) > len) return kBadRequest;
             std::memcpy(&s.st2, body + o, sizeof(motion::State2)); o += sizeof(motion::State2);
@@ -1206,11 +1208,13 @@ uint8_t bind_main(const BindRequest& req) {
     }
     Puppet& p = g_bound[key];
     const bool rebind = p.eid != 0;
+    const uint64_t wuid = nativeWuid ? nativeWuid : req.wuid;
+    if (rebind && (p.eid != req.eid || p.ent != e || p.wuid != wuid)) rpmeasure::forget(p.eid);
     // WO-214 B: how long the stream this bind is for had been silent (a bind for a stream the host no longer sends drops at once)
     double streamAge = -1;
     { auto si = g_streams.find(key); if (si != g_streams.end() && si->second.lastSampleAt > 0) streamAge = now - si->second.lastSampleAt; }
     p = Puppet{};
-    p.key = key; p.name = req.name; p.eid = req.eid; p.ent = e; p.wuid = nativeWuid ? nativeWuid : req.wuid;
+    p.key = key; p.name = req.name; p.eid = req.eid; p.ent = e; p.wuid = wuid;
     p.beast = beast;
     p.human = npcscan::body_kind(e) == 0;   // WO-215 A
     p.noPhys = noPhys;
@@ -1715,7 +1719,8 @@ void tick() {
         }
         // A catch-up or pace limiter that left the body short of this
         // horizontal pose cannot confirm presentation of its source stamp.
-        const bool reached = reachedSample && pose[0] == streamX && pose[1] == streamY;
+        const bool reached = reachedSample && reachedSample->sourceId == measuredPeer &&
+                             pose[0] == streamX && pose[1] == streamY;
         const auto reachedScope = reached ? reachedSample->reader : rpmeasure::SampleScope{};
         const uint32_t reachedSender = reached ? reachedSample->senderMs : 0;
         double correctionCm = 0.0;

@@ -11,7 +11,6 @@ constexpr uint8_t kClockControl = 3;
 // Main thread only. This diagnostics state cannot drive a body.
 bool configure_clock(uint8_t value);
 bool shared_clock();
-void on_pipe_closed();
 void forget(uint32_t eid);
 void note_hop(uint8_t peer, SampleScope source, int64_t agentArrivalQpc, double milliseconds);
 void note_pose(uint8_t peer, uint32_t eid, SampleScope source, uint32_t senderMs, uint32_t appliedMs,
