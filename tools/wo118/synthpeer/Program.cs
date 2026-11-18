@@ -277,7 +277,7 @@ static class P
                 return 1;
             }
         }
-        if (a.Any(arg => arg is "--bot-plan" or "--world-time" or "--wire-version" or BotHostOptions.LoadFlag or BotHostOptions.LoadWeatherOption or BotHostOptions.BaselineFlag))
+        if (a.Any(arg => arg is "--bot-plan" or "--world-time" or "--wire-version" or BotHostOptions.LoadFlag or BotHostOptions.LoadWeatherOption or BotHostOptions.BaselineFlag or BotHostOptions.RecoveryFlag))
         {
             Console.Error.WriteLine("Bot-Host-Optionen benötigen --test-bot.");
             return 2;

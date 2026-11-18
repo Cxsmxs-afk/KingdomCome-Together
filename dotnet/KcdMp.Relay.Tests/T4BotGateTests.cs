@@ -158,7 +158,11 @@ internal sealed class T4BotTools : IAsyncDisposable
     public static T4BotTools StartBaselineEvents(string tool, bool enabled, params string[] args)
         => Start(tool, true, false, args, baselineEvents: enabled);
 
-    private static T4BotTools Start(string tool, bool enabled, bool loadSequence, string[] args, bool baselineEvents = false)
+    public static T4BotTools StartWorldRecovery(string tool, bool enabled, params string[] args)
+        => Start(tool, true, false, args, worldRecovery: enabled);
+
+    private static T4BotTools Start(string tool, bool enabled, bool loadSequence, string[] args,
+        bool baselineEvents = false, bool worldRecovery = false)
     {
         string folder = tool == "AvatarPeer" ? "tools/wo121/avatarpeer" : "tools/wo118/synthpeer";
         string configuration = new DirectoryInfo(AppContext.BaseDirectory).Parent!.Name;
@@ -174,9 +178,11 @@ internal sealed class T4BotTools : IAsyncDisposable
         info.Environment.Remove(EnvironmentFlag);
         info.Environment.Remove("KCDMP_TEST_LOAD_SEQUENCE");
         info.Environment.Remove("KCDMP_TEST_BASELINE_EVENTS");
+        info.Environment.Remove("KCDMP_TEST_WORLD_RECOVERY");
         if (enabled) info.Environment[EnvironmentFlag] = "1";
         if (loadSequence) info.Environment["KCDMP_TEST_LOAD_SEQUENCE"] = "1";
         if (baselineEvents) info.Environment["KCDMP_TEST_BASELINE_EVENTS"] = "1";
+        if (worldRecovery) info.Environment["KCDMP_TEST_WORLD_RECOVERY"] = "1";
         info.ArgumentList.Add(dll);
         foreach (string arg in args) info.ArgumentList.Add(arg);
         return new(Process.Start(info) ?? throw new InvalidOperationException($"Cannot start {tool}"));

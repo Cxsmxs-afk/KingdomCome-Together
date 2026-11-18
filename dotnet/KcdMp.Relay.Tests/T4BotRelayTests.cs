@@ -302,6 +302,61 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
         Assert.Equal(initial with { Amt = 1 }, await ItemList());
     }
 
+    [Fact]
+    public async Task Recovery_bot_host_announces_an_immutable_identity_to_the_replacement_connection()
+    {
+        await WaitForAsync(() => Clients.ReadyClientCount == 0, "Previous relay peers did not disconnect");
+        using var fixture = new BotFixture();
+        string save = fixture.Write("world.whs", BotFixture.Save());
+        await using var bot = T4BotTools.StartWorldRecovery("SynthPeer", true, "--test-bot", "--test-world-recovery",
+            "--join-host125", save, "--world-time", "28800", "--port", Port, "--name", "t4-recovery-host", "--duration", "22");
+        await WaitForAsync(() => Clients.DamageAuthority?.Name == "t4-recovery-host", "Bot-Host did not acquire relay authority", bot);
+
+        async Task<(byte Source, uint Seed, uint Key, string Epoch)> Identity(Peer peer)
+        {
+            uint seed = 0, key = 0;
+            byte? authority = null;
+            string? epoch = null;
+            long since = Stopwatch.GetTimestamp();
+            while (seed == 0 || key == 0 || epoch is null)
+            {
+                var remaining = Wait - Stopwatch.GetElapsedTime(since);
+                Assert.True(remaining > TimeSpan.Zero, "The synthetic authority did not announce its complete recovery identity");
+                var (type, payload) = await peer.ReadPacketAsync(remaining);
+                if (type is not (Protocol.W203Down or Protocol.JoinStatusDown) || payload.Length < 2 || payload[1] != peer.Id) continue;
+                var (from, value, body) = ReadJoin(payload);
+                if (type == Protocol.W203Down)
+                {
+                    if (LootMsg.TryDecode(body, out var msg) && msg.Kind == Protocol.W203Epoch &&
+                        msg.Text.StartsWith("v1|1|1|tick|r1|", StringComparison.Ordinal))
+                    {
+                        Assert.True(authority is null || authority == from);
+                        authority = from;
+                        epoch = msg.Text;
+                    }
+                    continue;
+                }
+                if (!JoinStatusCodec.TryDecode(body, out byte state, out _, out ushort flags)) continue;
+                if (state == Protocol.JoinStateSession && (flags & Protocol.SessionSeedKnown) != 0) seed = value;
+                else if (state == Protocol.JoinStateHostKey) key = value;
+                else continue;
+                Assert.True(authority is null || authority == from);
+                authority = from;
+            }
+            string[] parts = epoch.Split('|');
+            Assert.True(Guid.TryParseExact(parts[5], "N", out var nonce) && nonce != Guid.Empty);
+            Assert.Equal("1", parts[6]);
+            return (authority!.Value, seed, key, epoch);
+        }
+
+        (byte Source, uint Seed, uint Key, string Epoch) first;
+        await using (var peer = await Peer.ConnectAsync(relay.TcpPort, "t4-recovery-joiner"))
+            first = await Identity(peer);
+        await WaitForAsync(() => Clients.ReadyClientCount == 1, "Relay did not retire the cut Joiner connection");
+        await using var replacement = await Peer.ConnectAsync(relay.TcpPort, "t4-recovery-joiner");
+        Assert.Equal(first, await Identity(replacement));
+    }
+
     private static byte[] Pickup(Guid item, uint token) => new LootMsg(Protocol.LootAskItemTake, token, $"{item:D} 1 2 3 0")
         .BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost);
 

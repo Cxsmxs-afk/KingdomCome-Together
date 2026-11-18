@@ -96,12 +96,17 @@ public partial class GameBridge
     /// <summary>The reconnect loop's gap (GameBridge.RunLoopAsync): growing while a hold runs, the agent's own 3 s otherwise.</summary>
     private int Wo211ReconnectDelayMs()
     {
+        if (WorldReconnectPending(Interlocked.Read(ref _w211HoldSerial)) is { } recovery)
+        {
+            int delay = Wo211Rules.ReconnectDelayMs(Interlocked.Increment(ref _w211HoldAttempt) - 1, holding: true);
+            return (int)Math.Clamp(recovery.Remaining(Environment.TickCount64), 1, Math.Min(3000, delay));
+        }
         bool held = LinkHeld;
         return Wo211Rules.ReconnectDelayMs(held ? _w211HoldAttempt++ : 0, held);
     }
 
     /// <summary>The joiner, at the session's teardown (Wo124OnDisconnectAsync): a lost link starts a hold instead of the leave. True = held.</summary>
-    private async Task<bool> Wo211TryHoldAsync(string why)
+    private async Task<bool> Wo211TryHoldAsync(string why, bool sameRelay = false)
     {
         if (!Wo211Rules.HoldOnLoss(W211("link_hold"), _joinedWorld, _jj is not null, _leaveInProgress, _gameQuitting)) return false;
         if (LinkHeld) return true;
@@ -115,8 +120,10 @@ public partial class GameBridge
         _w211HoldSinceUtc = DateTime.UtcNow;
         _w211HoldEpoch = _w206.World;
         _w211HoldAttempt = 0;
+        WorldReconnectBegin(serial, _worldLoad.Current, sameRelay);
+        int window = WorldReconnectPending(serial) is null ? Wo211Rules.HoldWindowS : WorldReconnectAttempt.WindowMs / 1000;
         Interlocked.Increment(ref _w211Holds);
-        Console.WriteLine($"WO211-LINK hold: the link to the host dropped ({why}) -- this game stays in the host's world, still, for up to {Wo211Rules.HoldWindowS} s "
+        Console.WriteLine($"WO211-LINK hold: the link to the host dropped ({why}) -- this game stays in the host's world, still, for up to {window} s "
             + $"while the agent reconnects (the host's world epoch {_w211HoldEpoch}); the leave comes only after that or on the player's word");
         bool typedPause = false;
         if (LoadSequenceEnabled)
@@ -127,7 +134,7 @@ public partial class GameBridge
         {
             try { _w211EngineHeld = await _combat.Wo151JoinHoldAsync(true, (ushort)(Wo211Rules.HoldWindowS + 20)) == true; } catch { }
         }
-        await Wo211TellLinkUiAsync(serial, on: true, Wo211Rules.HoldWindowS, typedPause);
+        await Wo211TellLinkUiAsync(serial, on: true, window, typedPause);
         _ = Wo211HoldLoopAsync(serial, typedPause);
         return true;
     }
@@ -155,11 +162,17 @@ public partial class GameBridge
             await Task.Delay(1000);
             if (serial != Interlocked.Read(ref _w211HoldSerial)) return;
             if (!LinkHeld) break;
-            int left = Wo211Rules.HoldWindowS - (int)(DateTime.UtcNow - _w211HoldSinceUtc).TotalSeconds;
+            var recovery = WorldReconnectPending(serial);
+            long now = Environment.TickCount64;
+            int window = recovery is null ? Wo211Rules.HoldWindowS : WorldReconnectAttempt.WindowMs / 1000;
+            int left = recovery is null ? window - (int)(DateTime.UtcNow - _w211HoldSinceUtc).TotalSeconds :
+                (int)((recovery.Remaining(now) + 999) / 1000);
             if (_w211LeaveNow || left <= 0)
             {
-                string reason = _w211LeaveNow ? "the player chose to leave" : $"the link did not come back in {Wo211Rules.HoldWindowS} s";
-                if (!await Wo211EndHoldAsync(serial, _w211HoldEpoch, resumed: false, reason, leaving: true)) return;
+                if (recovery is not null && !WorldReconnectTimeout(serial, _w211LeaveNow)) continue;
+                string reason = _w211LeaveNow ? "the player chose to leave" : $"the link did not come back in {window} s";
+                if (!await Wo211EndHoldAsync(serial, _w211HoldEpoch, resumed: false, reason, leaving: true,
+                    expectedGeneration: recovery?.Scope.Generation ?? 0)) return;
                 Interlocked.Increment(ref _w211HoldLeaves);
                 await LeaveSharedWorldAsync("relay-lost", _w211LeaveNow ? "You left your partner's world." : "Lost the connection to your host.");
                 return;
@@ -173,13 +186,14 @@ public partial class GameBridge
         await Wo211TellLinkUiAsync(serial, on: false);
     }
 
-    private async Task<bool> Wo211EndHoldAsync(long serial, uint world, bool resumed, string why, bool leaving = false)
+    private async Task<bool> Wo211EndHoldAsync(long serial, uint world, bool resumed, string why, bool leaving = false,
+        ulong expectedGeneration = 0, Func<bool>? reconnectProof = null, bool notify = true)
     {
         if (serial != Interlocked.Read(ref _w211HoldSerial) || !LinkHeld) return false;
         double s = (DateTime.UtcNow - _w211HoldSinceUtc).TotalSeconds;
         if (LoadSequenceEnabled)
         {
-            if (!LoadSequenceTryResumeLink(world, resumed)) return false;
+            if (!LoadSequenceTryResumeLink(world, resumed, expectedGeneration, reconnectProof)) return false;
             if (leaving) LoadSequenceOnExit();
             if (resumed) _hostCalendarResumeEpoch = world;
             try { await LoadSequenceSyncNativeAsync(); } catch { }
@@ -192,7 +206,7 @@ public partial class GameBridge
         }
         await Wo211TellLinkUiAsync(serial, on: false);
         Console.WriteLine(FormattableString.Invariant($"WO211-LINK hold ends after {s:F1} s: {why}"));
-        if (resumed) _ = ExecLuaAsync("KCD2MP_ShowNativeToast(\"Reconnected to your host.\")");
+        if (resumed && notify) _ = ExecLuaAsync("KCD2MP_ShowNativeToast(\"Reconnected to your host.\")");
         return true;
     }
 
@@ -201,6 +215,7 @@ public partial class GameBridge
     private void Wo211OnEpochHeard(uint world)
     {
         if (!LinkHeld) return;
+        if (WorldRecoveryEnabled) { WorldReconnectTryResolve(); return; }
         long serial = Interlocked.Read(ref _w211HoldSerial);
         if (world == 0) return; // an unknown world cannot authorize a reload
         if (Wo211Rules.ResumeInPlace(_w211HoldEpoch, world) && !T3HostWorldChanged)
@@ -222,14 +237,19 @@ public partial class GameBridge
         _ = Task.Run(async () =>
         {
             if (!await Wo211EndHoldAsync(serial, world, resumed: false, $"the link is back but the host's world changed meanwhile (epoch {_w211HoldEpoch} -> {world}): the in-world rejoin of a host reload")) return;
-            Interlocked.Increment(ref _w211ResumedRejoin);
-            Wo125OnHostReloading();
-            if (_peerSeedKnown && _peerTag is not null && _peerTag == _joinedTag && !_rejoinPending)
-            {
-                T3ArmInWorldRejoin("relay-reconnected-host-world-changed");
-                Console.WriteLine($"MP-HENRY joiner: the host reloaded world {_peerTag} while the link was down -- rejoining from inside the world");
-            }
+            Wo211ContinueWithNewWorld();
         });
+    }
+
+    private void Wo211ContinueWithNewWorld()
+    {
+        Interlocked.Increment(ref _w211ResumedRejoin);
+        Wo125OnHostReloading();
+        if (_peerSeedKnown && _peerTag is not null && _peerTag == _joinedTag && !_rejoinPending)
+        {
+            T3ArmInWorldRejoin("relay-reconnected-host-world-changed");
+            Console.WriteLine($"MP-HENRY joiner: the host reloaded world {_peerTag} while the link was down -- rejoining from inside the world");
+        }
     }
 
     // ---------------------------------------------------------------- A.2.3: home with the drop moment's Henry

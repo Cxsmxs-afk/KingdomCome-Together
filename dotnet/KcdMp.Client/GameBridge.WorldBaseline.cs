@@ -91,6 +91,7 @@ public partial class GameBridge
         foreach (var chunk in items)
             if (chunk.Section == WorldBaselineSection.Loot && chunk.Payload.Length == 0) return true;
         var parts = new SortedDictionary<int, List<Wo134Rules.Entry>>();
+        var texts = new SortedDictionary<int, string>();
         int total = 0;
         (WorldSyncScope Scope, uint Snapshot) key = default;
         foreach (var chunk in items.Where(i => i.Section == WorldBaselineSection.Loot))
@@ -102,17 +103,28 @@ public partial class GameBridge
                 Wo134Rules.ParseLedgerPart(row.Text) is not { } part || !parts.TryAdd(part.Part, part.Rows) ||
                 (total != 0 && total != part.N)) return false;
             total = part.N;
+            texts.Add(part.Part, row.Text);
             key = (chunk.Scope, chunk.SnapshotId);
         }
         if (parts.Count == 0 || parts.Count != total || key.Scope.HostWorld != _w206.World ||
             key.Scope.Generation != _worldLoad.Current.Generation || !LoadSequenceWritable) return false;
         lock (_w134Gate)
         {
-            if (_w134BaselineLedger == key) return true;
+            if (_w134BaselineLedger is { } previous)
+            {
+                // Chest reconciliation is relative to the loaded inventory.
+                // Reuse the original epoch/serial only for those exact deltas.
+                if (previous.Scope != key.Scope || (previous != key && !WorldRecoveryEnabled) ||
+                    _w134BaselineLedgerParts is not { } alreadyStaged ||
+                    !alreadyStaged.SequenceEqual(texts.Values, StringComparer.Ordinal)) return false;
+                _w134BaselineLedger = key;
+                return true;
+            }
             if (_w134ApplyTag is null || _w134BaselineLedgerWork is not null) return false;
             var ledger = new Wo134Rules.Ledger();
             foreach (var part in parts.Values) ledger.Entries.AddRange(part);
             _w134BaselineLedger = key;
+            _w134BaselineLedgerParts = texts.Values.ToArray();
             _w134RxLedger = ledger;
             _w134RxStamp = key.Scope.HostWorld;
         }

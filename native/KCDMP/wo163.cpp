@@ -26,6 +26,8 @@
 #include "wo194.h"
 #include "wo195.h"
 #include "t3_stats_rules.h"
+#include "t3_recovery_stats_rules.h"
+#include "pipe_server.h"
 #include "t3_native_stats.h"
 #include "rp_measure.h"
 #include "p4.h"
@@ -44,6 +46,34 @@ std::atomic<uint32_t> c_asked{0}, c_answeredHostile{0}, c_answeredNot{0}, c_unan
 std::atomic<uint64_t> g_t3ToldAtMs[3]{};
 std::atomic<uint64_t> g_t3LoadToldAtMs[3]{};
 std::atomic<uint64_t> g_t3WorldSyncToldAtMs[3]{};
+
+t3recovery::Mirror g_recoveryMirror; // Main-thread diagnostics only.
+
+uint8_t mirror_recovery(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
+    t3recovery::Report report;
+    if (!out || cap < t3recovery::kAckBytes || !t3recovery::decode(body, len, report)) return kRBadRequest;
+    const auto before = loadsequence::stamp();
+    const auto load = loadsequence::snapshot();
+    const t3recovery::Receiver receiver{load.world_gen, pipe::observation_connection(), wo216::lifecycle_role(),
+                                        load.load_phase == static_cast<uint8_t>(loadsequence::Phase::Play)};
+    // Play can retain a link hold during a timeout. This diagnostic can still
+    // confirm that attempt without reopening the native writer or any setter.
+    if (before != loadsequence::stamp() || !g_recoveryMirror.accept(receiver, report)) return kRFailed;
+    std::string fields = "recovery_world=" + std::to_string(report.world) + " recovery_gen=" +
+        std::to_string(report.generation) + " recovery_run=" + std::to_string(report.run);
+    fields.reserve(1600);
+    for (size_t i = 0; i < t3recovery::kFields; ++i) {
+        fields += ' ';
+        fields += t3recovery::kNames[i];
+        fields += '=';
+        fields += std::to_string(report.fields[i]);
+    }
+    logf("MP-T3-STATS origin=dll source=agent role=%s section=recovery %s",
+         receiver.role == 1 ? "host" : "joiner", fields.c_str());
+    std::memcpy(out, body + 1, t3recovery::kAckBytes);
+    *outLen = t3recovery::kAckBytes;
+    return kROk;
+}
 
 uint32_t player_eid() {
     void* e = engine::entity_by_id(0x7777);
@@ -94,6 +124,7 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
     c_byOp[body[0]].fetch_add(1, std::memory_order_relaxed);
     tell_ops();
     switch (body[0]) {
+        case t3recovery::kOp: return mirror_recovery(body, len, out, cap, outLen);
         case t3stats::kOp: {
             if (len == 1) { *outLen = t3native::stats(out, cap); return *outLen ? kROk : kRFailed; }
             if (len == 2 && body[1] == t3stats::kTimelineCommand) {

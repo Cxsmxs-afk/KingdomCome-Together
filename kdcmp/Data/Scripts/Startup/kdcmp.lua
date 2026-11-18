@@ -37159,7 +37159,7 @@ do
         shop_keeper = "mp_shop_keeper", own_horse = "mp_own_horse", talk_force = "mp_talk_force",
         corpse_look = "mp_corpse_look", horse_drop = "mp_horse_drop", saddlebags = "mp_saddlebags", route_quiet = "mp_route_quiet", cart_seat = "mp_cart_seat", cart_wheels = "mp_cart_wheels",
         ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller", rp_combat = "mp_rp_combat",
-        load_sequence = "mp_load_sequence", baseline_events = "mp_baseline_events",
+        load_sequence = "mp_load_sequence", baseline_events = "mp_baseline_events", world_recovery = "mp_world_recovery",
     }
     W221.HELP = {
         combat_action_end = "A: (both) no combat animation of ours outlives its body's combat part (the joiner's fight crash)",
@@ -37180,6 +37180,7 @@ do
         rp_combat = "Play the partner's timed combat through native requests",
         load_sequence = "Apply the world only for its current load generation",
         baseline_events = "Install the world baseline and confirm each ordered event",
+        world_recovery = "Check the world by area and repair that area or reconnect",
     }
     function KCD2MP_W221On(name)
         local v = W221.on[tostring(name)]
@@ -39129,6 +39130,16 @@ function KCD2MP_EdgeLanes(arg)
 end
 System.AddCCommand("mp_lanes", 'KCD2MP_EdgeLanes(%line)',
     "DLL lane test: mp_lanes --test-lanes <nonce> <frames 1..600>")
+
+-- The Agent accepts this test event only after its explicit startup opt-in.
+function KCD2MP_TestWorldRecovery(arg)
+    local section = tostring(arg or ""):match("^%s*([a-z]+)%s*$")
+    if not section then return false end
+    KCD2MP_EmitEvent("test_world_recovery", section)
+    return true
+end
+System.AddCCommand("mp_test_world_recovery", 'KCD2MP_TestWorldRecovery(%line)',
+    "Test a single world area: mp_test_world_recovery <body|npc|corpse|loot|clock|weather>")
 
 -- The real Host Agent additionally requires KCDMP_TEST_LOAD_SEQUENCE=1.
 function KCD2MP_TestWeatherLoad(arg)

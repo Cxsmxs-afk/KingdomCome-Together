@@ -11,7 +11,8 @@ public partial class ClientSession
     private const int WorldCacheMaxBytes = 4 * 1024 * 1024;
     private readonly object _worldSyncGate = new();
     private readonly CancellationTokenSource _worldSyncStop = new();
-    private readonly Dictionary<(WorldBaselineSection Section, string Key), byte[]> _worldImage = new();
+    private sealed record WorldImageRow(byte[] Payload, long ReceivedAt, long ArrivalOrder);
+    private readonly Dictionary<(WorldBaselineSection Section, string Key), WorldImageRow> _worldImage = new();
     private readonly List<(WorldEventChannel Channel, byte Type, byte[] Body)> _worldBeforeOpen = [];
     private volatile bool _linkWorldSync;
     private Task? _worldSyncTick;
@@ -25,7 +26,7 @@ public partial class ClientSession
     private byte[][] _worldBaseline = [];
     private int _worldBaselineNext;
     private WorldEventSendWindow? _worldEvents;
-    private long _worldSent, _worldAcked, _worldRetx, _worldDropped;
+    private long _worldSent, _worldAcked, _worldRetx, _worldDropped, _worldImageArrival;
 
     internal void ObserveWorldSyncEpoch(byte authority, uint world)
     {
@@ -37,6 +38,7 @@ public partial class ClientSession
             _worldImageEpoch = world;
             _worldImage.Clear();
             _worldImageBytes = _worldLedgerParts = 0;
+            _worldImageArrival = 0;
             ClearWorldBeforeOpenLocked();
             _worldSyncFull = false;
             RetireWorldSyncLocked();
@@ -59,6 +61,7 @@ public partial class ClientSession
         _worldEvents = null;
         _worldSent = _worldAcked = _worldRetx = _worldDropped = 0;
         _worldStatusAt = 0;
+        ClearWorldRecoveryLocked();
     }
 
     // All inputs to this method have already passed the ordinary Relay
@@ -69,8 +72,10 @@ public partial class ClientSession
         lock (_worldSyncGate)
         {
             if (_worldImageEpoch == 0) return false;
+            if (type == Protocol.Disconnect && body.Length == 1)
+                ForgetWorldBodyLocked(body[0]);
             if (WorldSyncCatalog.TryBaseline(type, body, _worldImageAuthority, out var section, out string key))
-                RememberWorldRow(section, key, type, body);
+                RememberWorldRow(section, key, type, body, WorldObservationTime(packet));
             if (WorldSyncCatalog.EventChannel(type, body) is not { } channel) return false;
             if (_worldEvents is null)
             {
@@ -95,7 +100,17 @@ public partial class ClientSession
         }
     }
 
-    private void RememberWorldRow(WorldBaselineSection section, string key, byte type, ReadOnlySpan<byte> body)
+    private void ForgetWorldBodyLocked(byte source)
+    {
+        foreach (var slot in _worldImage.Where(row => row.Key.Section == WorldBaselineSection.Body &&
+            row.Value.Payload[1] == source).Select(row => row.Key).ToArray())
+        {
+            _worldImageBytes -= _worldImage[slot].Payload.Length;
+            _worldImage.Remove(slot);
+        }
+    }
+
+    private void RememberWorldRow(WorldBaselineSection section, string key, byte type, ReadOnlySpan<byte> body, long observedAt)
     {
         if (section == WorldBaselineSection.Loot && LootMsg.TryDecode(body[(1 + Protocol.JoinHeaderLen)..], out var msg) &&
             WorldSyncCatalog.TryLedgerPart(msg.Text, out int part, out int count))
@@ -104,7 +119,7 @@ public partial class ClientSession
             {
                 foreach (var old in _worldImage.Keys.Where(k => k.Section == WorldBaselineSection.Loot).ToArray())
                 {
-                    _worldImageBytes -= _worldImage[old].Length;
+                    _worldImageBytes -= _worldImage[old].Payload.Length;
                     _worldImage.Remove(old);
                 }
             }
@@ -112,16 +127,25 @@ public partial class ClientSession
         }
         var slot = (section, key);
         _worldImage.TryGetValue(slot, out var previous);
-        int nextBytes = _worldImageBytes - (previous?.Length ?? 0) + 1 + body.Length;
+        int nextBytes = _worldImageBytes - (previous?.Payload.Length ?? 0) + 1 + body.Length;
         if (nextBytes > WorldCacheMaxBytes || (previous is null && _worldImage.Count >= WorldCacheMaxRows))
         { _worldSyncFull = true; return; }
-        _worldImage[slot] = [type, .. body];
+        _worldImage[slot] = new([type, .. body], observedAt, ++_worldImageArrival);
         _worldImageBytes = nextBytes;
     }
 
     private bool HandleWorldSync(byte[] body)
     {
         if (!_linkWorldSync || !WorldSyncWire.TryReadSync(body, out var command)) return false;
+        bool handled = HandleWorldSyncControl(command, out bool baselineAcked);
+        if (baselineAcked && _linkWorldRecovery && _conn.RecoveryJoinerReady is { } ready &&
+            !_clientHandler.IsDamageAuthority(this)) ready();
+        return handled;
+    }
+
+    private bool HandleWorldSyncControl(WorldSyncCommand command, out bool baselineAcked)
+    {
+        baselineAcked = false;
         lock (_worldSyncGate)
         {
             if (command.Operation == WorldSyncOperation.Open)
@@ -172,6 +196,7 @@ public partial class ClientSession
                 if (!_worldBaselineApplied)
                 {
                     _worldBaselineApplied = true;
+                    baselineAcked = true;
                     _logger.Information("MP-WORLD-BASELINE relay world={World} gen={Gen} snapshot={Snapshot} target={Target} result=acked",
                         command.Scope.HostWorld, command.Scope.Generation, command.SnapshotId, Id);
                 }
@@ -189,10 +214,11 @@ public partial class ClientSession
         foreach (var section in Enum.GetValues<WorldBaselineSection>())
         {
             var rows = _worldImage.Where(p => p.Key.Section == section).OrderBy(p => p.Key.Key, StringComparer.Ordinal)
-                .Select(p => p.Value).ToArray();
+                .Select(p => p.Value.Payload).ToArray();
             if (section == WorldBaselineSection.Loot && rows.Length != _worldLedgerParts)
                 rows = [];
             if (rows.Length == 0) rows = [[]];
+            AnchorWorldRecoveryLocked(section, rows);
             for (ushort index = 0; index < rows.Length; index++)
                 packets.Add(WorldSyncWire.BuildBaseline(new(_worldSyncScope, _worldSnapshot, 1, section,
                     index, checked((ushort)rows.Length), rows[index])));
@@ -247,9 +273,11 @@ public partial class ClientSession
                                 send.IsRetry ? "retry" : "sent");
                         }
                     }
-                    if (Environment.TickCount64 >= _worldStatusAt)
+                    long now = Environment.TickCount64;
+                    SendWorldRecoveryLocked(now);
+                    if (now >= _worldStatusAt)
                     {
-                        _worldStatusAt = Environment.TickCount64 + 2000;
+                        _worldStatusAt = now + 2000;
                         EnqueueWire(WorldSyncStatusPacket());
                     }
                 }

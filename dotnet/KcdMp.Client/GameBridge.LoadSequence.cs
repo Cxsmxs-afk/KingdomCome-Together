@@ -127,8 +127,9 @@ public partial class GameBridge
 
     private bool LoadSequenceTryHoldLink() => LoadSequenceChange(s => _worldLoad.TryHoldLink(s.Generation));
 
-    private bool LoadSequenceTryResumeLink(uint world, bool resumed) => LoadSequenceChange(s =>
+    private bool LoadSequenceTryResumeLink(uint world, bool resumed, ulong expectedGeneration = 0, Func<bool>? proof = null) => LoadSequenceChange(s =>
     {
+        if ((expectedGeneration != 0 && s.Generation != expectedGeneration) || (proof is not null && !proof())) return false;
         if (resumed) return _worldLoad.TryReconnect(s.Generation, world);
         if (!s.LinkHeld) return false;
         if (world != 0 && world != s.HostWorld && T3HostWorldChanged)

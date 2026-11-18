@@ -178,11 +178,13 @@ def launch_bot(command, logfile):
                                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
 
 
-def bot_host(S, run, args):
+def bot_host(S, run, args, *, fixture_flag='--test-baseline-events'):
     tool = Path(S.HERE, '..', 'bothost', 'bot-joiner').resolve()
-    command = [sys.executable, '-X', 'utf8', str(tool), '--test-bot', '--test-baseline-events', '--role', 'host',
+    command = [sys.executable, '-X', 'utf8', str(tool), '--test-bot', fixture_flag, '--role', 'host',
                '--port', str(S.pair.RELAY_PORT), '--save', str(args.bot_save.resolve()), '--world-time', str(args.world_time),
-               '--plan', str(args.bot_plan.resolve()), '--duration', str(args.timeout + 300)]
+               '--duration', str(args.timeout + 300)]
+    if args.bot_plan:
+        command += ['--plan', str(args.bot_plan.resolve())]
     if args.wire_version:
         command += ['--wire-version', args.wire_version]
     logfile = Path(run.dir, 'bot-t4.log')

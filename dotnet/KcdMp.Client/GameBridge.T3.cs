@@ -280,6 +280,7 @@ public partial class GameBridge
             Console.WriteLine($"MP-T3-STATS origin=agent role={roleName} section=load {loadFields}");
         if (worldSyncFields is not null)
             Console.WriteLine($"MP-T3-STATS origin=agent role={roleName} section=events {worldSyncFields}");
+        T3WorldRecoveryReport(roleName, ct);
         Console.WriteLine($"MP-T3-STATS origin=agent role={roleName} {fields}");
         if (role != 0) _ = T3SendNativeStatsAsync(role, fields, loadSnapshot is null ? null : loadFields, worldSyncFields, ct);
     }

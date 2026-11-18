@@ -2412,7 +2412,11 @@ public partial class GameBridge(ClientConfig config)
             Wo213StopWriter();                                     // WO-213 C
             // WO-211 A.1: a joiner in the host's world whose link dropped (not the agent stopping) holds there while it reconnects --
             // decided before the per-WO teardowns below, which read it (the save lock stays, the leave does not run, the host stays shown)
-            if (!appCt.IsCancellationRequested) { try { await Wo211TryHoldAsync("relay-lost"); } catch (Exception ex) { Console.WriteLine($"WO211-LINK hold failed: {ex.Message}"); } }
+            if (!appCt.IsCancellationRequested)
+            {
+                WorldReconnectHostLost(appCt);
+                try { await Wo211TryHoldAsync("relay-lost"); } catch (Exception ex) { Console.WriteLine($"WO211-LINK hold failed: {ex.Message}"); }
+            }
             _stats = new SessionCounters();
             _peerCutscene.Clear();
             cts.Cancel();
@@ -4656,6 +4660,11 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private async Task ApplyCombatRoleAsync(bool isAuthority, CancellationToken ct)
     {
+        if (isAuthority && WorldRecoveryEnabled && _joinedWorld)
+        {
+            Console.WriteLine("MP-WORLD-RECONNECT role=joiner result=authority-deferred reason=shared-world");
+            return;
+        }
         // WO-118: the FIRST role of a connection is always pushed. A fresh agent
         // starts at _isDamageAuthority == false, so a first "not the authority"
         // used to be a no-op here -- and the game's Lua kept whatever an earlier
@@ -4682,6 +4691,7 @@ public partial class GameBridge(ClientConfig config)
         ProcessorFrameScope.ThrowIfAbandoned();
         ct.ThrowIfCancellationRequested();
         _combatRoleApplyComplete = true; // An abandoned first apply must be retried by an identical Role frame.
+        WorldReconnectHostRoleConfirmed();
     }
 
     private async Task SendAppearanceAsync(Stream stream, Guid[] itemClasses, CancellationToken ct)
@@ -4853,6 +4863,7 @@ public partial class GameBridge(ClientConfig config)
                     payload = kept;
                 }
                 if (W202("ping_network") && Wo202TakeAtRead(type, payload)) continue;   // WO-202 III.2: the network's answers, never behind the queue
+                WorldReconnectObserveAtRead(presentationSession, type, payload);
                 if (Wo206TakeAtRead(type, payload)) continue;   // WO-206 E: an epoch is known from the frame it arrives in, never behind the queue
                 uint stamp = Wo206StampAtRead(payload);         // WO-206 E: the world epoch this frame was sent under
                 var inFrame = new InFrame(type, payload, arrival, stamp)
@@ -6256,6 +6267,12 @@ public partial class GameBridge(ClientConfig config)
         if (name == "edge_mode" || name == "edge_probe" || name == "edge_lanes")
         {
             EdgeOnGameEvent(name, arg);
+            return;
+        }
+
+        if (name == "test_world_recovery")
+        {
+            WorldRecoveryTestEvent(arg);
             return;
         }
 

@@ -100,12 +100,14 @@ public partial class ClientSession
         (ushort)((W213Switch.TwinOff("link_sched") ? 0 : Protocol.LinkCapLatestWins)
                | (W213Switch.TwinOff("link_sched") || W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
                | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc)
-               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapWorldSync);
+               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapWorldSync
+               | (W213Switch.TwinOff("world_recovery") ? 0 : Protocol.LinkCapWorldRecovery));
 
     private void OnLinkHello(byte[] hello)
     {
         Protocol.TryParseLinkHello(hello, out byte version, out ushort caps, out _, out _);
         ushort both = (ushort)(caps & RelayLinkCaps);
+        if ((both & Protocol.LinkCapWorldSync) == 0) both &= unchecked((ushort)~Protocol.LinkCapWorldRecovery);
         var path = _conn.Path;
         byte transport = _conn.Steam is not null ? Protocol.LinkTransportSteam : path is { Transport: "shaped" } ? Protocol.LinkTransportShaped : Protocol.LinkTransportTcp;
         int rate = _conn.Steam?.RealTimeStatus()?.SendRateBytesPerSec ?? (path?.Status() is { Known: true } st ? st.RateBytesPerS : 0);
@@ -115,6 +117,7 @@ public partial class ClientSession
         _linkPresentationTime = (both & Protocol.LinkCapPresentationTime) != 0;
         _linkPresentationCombat = _linkPresentationTime && (both & Protocol.LinkCapPresentationCombat) != 0;
         _linkWorldSync = (both & Protocol.LinkCapWorldSync) != 0;
+        _linkWorldRecovery = (both & Protocol.LinkCapWorldRecovery) != 0;
         if (_linkWorldSync) _worldSyncTick ??= RunWorldSyncAsync();
         if (!_linkPresentationTime)
         {
@@ -541,6 +544,14 @@ public partial class ClientSession
                     var control = new byte[payloadLen];
                     await ReadExactAsync(control);
                     if (!HandleWorldSync(control)) _clientHandler.CountDrop((byte)type, "invalid-world-sync");
+                    continue;
+                }
+
+                if (type == Protocol.WorldRepairUp)
+                {
+                    var request = new byte[payloadLen];
+                    await ReadExactAsync(request);
+                    if (!HandleWorldRepair(request)) _clientHandler.CountDrop((byte)type, "invalid-world-repair");
                     continue;
                 }
 

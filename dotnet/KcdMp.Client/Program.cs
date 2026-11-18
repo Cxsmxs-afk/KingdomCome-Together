@@ -38,6 +38,13 @@ if (!TestRecordingOptions.TryRead(args, Environment.GetEnvironmentVariable("KCDM
     return 2;
 }
 
+if (!WorldRecoveryTestOptions.TryRead(args, Environment.GetEnvironmentVariable(WorldRecoveryTestOptions.EnvironmentName),
+    out bool testWorldRecovery, out args))
+{
+    Console.Error.WriteLine("Use KCDMP_TEST_WORLD_RECOVERY=1 with --test-world-recovery.");
+    return 2;
+}
+
 // Settings live in kcdmp-client.json next to the executable; it is created with
 // defaults on first run. Everything can still be overridden on the command line:
 //   named:      --host <ip> --port <n> --name <s> --game-api <url> [--no-voice]
@@ -312,7 +319,7 @@ AppDomain.CurrentDomain.ProcessExit += (_, _) => { cts.Cancel(); Thread.Sleep(50
 
 // WO-206 Part C: applied.jsonl beside the exe -- one session per file, so it starts empty (nothing else is touched)
 Wo206Applied.StartSession();
-var bridge = new GameBridge(config);
+var bridge = new GameBridge(config) { WorldRecoveryTestEnabled = testWorldRecovery };
 using var recorder = recording?.Open();
 if (recording is not null && recorder is null) return 2;
 bridge.RecordSession(recorder);

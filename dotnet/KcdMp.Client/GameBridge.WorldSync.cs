@@ -18,6 +18,7 @@ public partial class GameBridge
         public readonly Channel<(int Type, byte[] Body)> Inbox = Channel.CreateBounded<(int, byte[])>(new BoundedChannelOptions(8192)
             { SingleReader = true, SingleWriter = true });
         public readonly Dictionary<WorldBaselineSection, WorldBaselineChunk?[]> Sections = new();
+        public readonly WorldRecoveryReceiver Recovery = new();
         public WorldEventReceiveWindow? Events;
         public Task? Work;
         public uint Snapshot;
@@ -120,10 +121,13 @@ public partial class GameBridge
 
     private bool WorldSyncAtRead(int type, byte[] body, Stream stream)
     {
-        if (type is not (Protocol.WorldBaselineDown or Protocol.WorldEventDown or Protocol.WorldSyncStatusDown)) return false;
+        bool recovery = type is Protocol.WorldDigestDown or Protocol.WorldRepairDown;
+        if (!recovery && type is not (Protocol.WorldBaselineDown or Protocol.WorldEventDown or Protocol.WorldSyncStatusDown))
+            return false;
+        if (recovery && !WorldRecoveryWireEffective) return true;
         var active = Volatile.Read(ref _worldReceiver);
         if (active is null || !ReferenceEquals(active.Stream, stream) || !WorldSyncCurrent(active) || active.Failed) return true;
-        if (active.Inbox.Writer.TryWrite((type, body))) return true;
+        if (active.Inbox.Writer.TryWrite((type, body)) || recovery) return true;
         active.Failed = true;
         WorldSyncEventDropped(active);
         Console.WriteLine($"MP-WORLD-EVENT-FAULT role={LoadSequenceRole} world={active.Scope.HostWorld} gen={active.Scope.Generation} snapshot={active.Snapshot} kind=receiver-overflow");
@@ -153,7 +157,12 @@ public partial class GameBridge
             await foreach (var (type, body) in receiver.Inbox.Reader.ReadAllAsync(ct))
             {
                 if (!WorldSyncCurrent(receiver) || receiver.Failed) return;
-                if (type == Protocol.WorldSyncStatusDown)
+                if (type is Protocol.WorldDigestDown or Protocol.WorldRepairDown)
+                {
+                    if (WorldRecoveryWireEffective && receiver.Installed)
+                        await ReceiveWorldRecoveryAsync(receiver, type, body, ct);
+                }
+                else if (type == Protocol.WorldSyncStatusDown)
                 {
                     if (WorldSyncStatusWire.TryRead(body, out var status) && status.Scope == receiver.Scope &&
                         status.Recipient == _myGhostId && WorldSyncSnapshot(receiver, status.SnapshotId))
@@ -223,6 +232,7 @@ public partial class GameBridge
             if (WorldSyncCurrent(receiver)) WorldSyncRejectBaseline(receiver, "application-unconfirmed");
             return;
         }
+        if (WorldRecoveryWireEffective) receiver.Recovery.Install(complete);
         receiver.Installed = true;
         receiver.Installing = false;
         WorldSyncBaselineApplied(receiver, chunk.Version, (long)Stopwatch.GetElapsedTime(receiver.BaselineAt).TotalMilliseconds);
@@ -243,7 +253,7 @@ public partial class GameBridge
             LootGeneration = P1Lifecycle.Current.Generation, MarkerPeerSerial = P5PeerAtRead(type, payload)
         };
 
-    private async Task<bool> InstallWorldBaselineAsync(WorldSyncReceiver receiver, WorldBaselineChunk[] all, CancellationToken ct)
+    private async Task<bool> InstallWorldBaselineAsync(WorldSyncReceiver receiver, WorldBaselineChunk[] all, CancellationToken ct, bool recovery = false)
     {
         byte authority = _isDamageAuthority ? _myGhostId : _hostModeFrom;
         foreach (var chunk in all)
@@ -255,15 +265,18 @@ public partial class GameBridge
         _worldBaselineApplying.Value = true;
         try
         {
-            if (!await RetryBaselineStateAsync(receiver, () => StageWorldBaselineAsync(all, ct), ct)) return false;
+            if (all.Any(chunk => chunk.Section == WorldBaselineSection.Loot) &&
+                !await RetryBaselineStateAsync(receiver, () => StageWorldBaselineAsync(all, ct), ct)) return false;
             foreach (var chunk in all)
             {
                 if (chunk.Payload.Length == 0) continue;
                 if (!WorldSyncCurrent(receiver) || !LoadSequenceWritable) return false;
                 byte type = chunk.Payload[0];
                 byte[] payload = chunk.Payload[1..];
-                if (!await RetryBaselineStateAsync(receiver, () =>
-                    ApplyWorldBaselineAsync(chunk, WorldSyncFrame(receiver.Scope, type, payload, ct), ct), ct)) return false;
+                var frame = WorldSyncFrame(receiver.Scope, type, payload, ct);
+                if (!await RetryBaselineStateAsync(receiver, () => recovery
+                    ? ApplyWorldRecoveryRowAsync(chunk, frame, ct)
+                    : ApplyWorldBaselineAsync(chunk, frame, ct), ct)) return false;
             }
         }
         finally { _worldBaselineApplying.Value = false; }

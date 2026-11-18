@@ -56,9 +56,10 @@ public static class Program
         var queued = QueueLoad.RunAll();
         var feel = Feel.RunAll();
         var life = SessionLife.RunAll();
+        var recovery = WorldRecovery.Run();
         var join = await JoinDiscovery.RunAsync();
         var ingress = Report.RemoteIngress(results, loadOnly);
-        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + ingress.Markdown + Report.Load(load) + Report.Queue(queued) + Report.Feel(feel) + Report.Life(life) + join.Report);
+        await File.WriteAllTextAsync(mdPath, Report.Markdown(label, commit, results) + ingress.Markdown + Report.Load(load) + Report.Queue(queued) + Report.Feel(feel) + Report.Life(life) + join.Report + WorldRecovery.Markdown(recovery));
         int gated = results.Count(r => r.Gate);
         int failed = results.Count(r => r.Gate && !r.Pass);
         // Phase 3: a flooded console freezes the figure for seconds. The ring's
@@ -67,10 +68,12 @@ public static class Program
         bool consoleTrails = queued.Where(r => r.Timeline == "console").All(r => r.WireBytes > 2000);
         bool feelOk = feel.All(r => r.Pass);
         bool lifeOk = life.All(r => r.Pass);
+        bool recoveryOk = recovery.All(r => r.Pass);
         Console.WriteLine($"sim {label}: {gated - failed}/{gated} gated runs passed. timeline={timeline}. queue ringFlat={ringFlat} consoleTrails={consoleTrails} feel={feelOk} life={lifeOk}. {mdPath}");
+        Console.WriteLine($"world recovery rules: {(recoveryOk ? "PASS" : "FAIL")}");
         Console.WriteLine($"join-save lifecycle: {(join.Pass ? "PASS" : "FAIL")}");
         Console.WriteLine($"remote figure relay ingress: {(loadOnly ? "not measured" : ingress.Pass ? "PASS" : "FAIL")}");
-        return failed == 0 && ringFlat && consoleTrails && feelOk && lifeOk && join.Pass && ingress.Pass ? 0 : 1;
+        return failed == 0 && ringFlat && consoleTrails && feelOk && lifeOk && recoveryOk && join.Pass && ingress.Pass ? 0 : 1;
     }
 
     static async Task<RunResult> RunOne(int players, Profile profile, string label, string commit)

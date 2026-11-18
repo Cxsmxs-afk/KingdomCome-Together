@@ -527,6 +527,38 @@ public class Wo206FaultTests
         Assert.Matches(@" cut=1 ", f.SummaryLine(false));
     }
 
+    [Fact]
+    public async Task Wo206Fault_recovery_step_cuts_only_the_joiner_with_an_accepted_baseline()
+    {
+        string plan = Plan("{ \"name\": \"recovery\", \"kind\": \"cut\", \"role\": \"joiner\", \"at\": \"step:recovery-joiner-ready\" }");
+        await using var relay = await FaultRelay.StartAsync(plan);
+        var (host, joiner) = await PairAsync(relay);
+        await using var _h = host;
+        await using var _j = joiner;
+        await using var other = await Peer.ConnectAsync(relay.TcpPort, "s3-3-other-joiner");
+        await joiner.SendRawAsync(Protocol.BuildLinkHelloUp(Protocol.LinkCapWorldSync | Protocol.LinkCapWorldRecovery));
+        await joiner.ReadUntilAsync(Protocol.LinkHelloDown, Wait);
+        var scope = new WorldSyncScope(147, 9);
+        await host.SendRawAsync(new LootMsg(Protocol.W203Epoch, 0, "v1|147|1|test").BuildUp(Protocol.W203Up, joiner.Id));
+        await joiner.ReadUntilAsync(Protocol.W203Down, Wait);
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.Open, scope, 0)));
+        Assert.True(WorldSyncStatusWire.TryRead(await joiner.ReadUntilAsync(Protocol.WorldSyncStatusDown, Wait), out var status));
+        byte[] ack = WorldSyncWire.BuildSync(new(WorldSyncOperation.BaselineApplied, scope, status.SnapshotId));
+        await joiner.SendRawAsync(ack); // this ACK names an image that has not been sent
+        await joiner.SendRawAsync(new byte[] { Protocol.Ping, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        await joiner.ReadUntilAsync(Protocol.Pong, Wait);
+        Assert.Equal(0, relay.Faults!.StepCount("recovery-joiner-ready"));
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.Ready, scope, 0)));
+        for (int i = 0; i < 6; i++) await joiner.ReadUntilAsync(Protocol.WorldBaselineDown, Wait);
+        await joiner.SendRawAsync(ack);
+        Assert.Equal(joiner.Id, (await host.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+        Assert.Equal(1, relay.Faults.StepCount("recovery-joiner-ready"));
+        Assert.Equal(1, relay.Rule("recovery").CutCount);
+        Assert.Contains(relay.Faults.RecentLines(), line => line.Contains("step:recovery-joiner-ready via=baseline-applied") && line.Contains("targets=1"));
+        await other.SendRawAsync(new byte[] { Protocol.Ping, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        await other.ReadUntilAsync(Protocol.Pong, Wait);
+    }
+
     // WO-207 C.4: "#2" = the step's second time (the rejoin after a host reload is the session's second join): the first join passes,
     // the second is cut
     private static readonly string CutSecondPlan = Plan("{ \"name\": \"cut2\", \"kind\": \"cut\", \"role\": \"joiner\", \"at\": \"step:world-sent#2\" }");

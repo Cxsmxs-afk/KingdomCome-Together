@@ -38,6 +38,8 @@ def local_relay(value):
 
 
 def command_line(args, forwarded, parser):
+    if args.test_world_recovery and (args.legacy or args.role != 'host' or os.environ.get('KCDMP_TEST_WORLD_RECOVERY') != '1'):
+        parser.error('Recovery mode requires --role host and KCDMP_TEST_WORLD_RECOVERY=1.')
     if args.test_baseline_events and (args.legacy or os.environ.get('KCDMP_TEST_BASELINE_EVENTS') != '1'):
         parser.error('The baseline test requires KCDMP_TEST_BASELINE_EVENTS=1 and a native T4 role.')
     if args.dialog_votes and (not args.test_baseline_events or args.role != 'joiner'):
@@ -87,6 +89,8 @@ def command_line(args, forwarded, parser):
         if not math.isfinite(args.world_time) or args.world_time < 0:
             parser.error('--world-time must be finite and non-negative.')
         program_args = ['--join-host125', str(args.save.resolve()), '--world-time', str(args.world_time), *common]
+        if args.test_world_recovery:
+            program_args.append('--test-world-recovery')
         if args.plan:
             program_args += ['--bot-plan', str(args.plan.resolve())]
         if args.origin is not None:
@@ -122,6 +126,7 @@ def main(argv=None):
         argv, forwarded = argv[:separator], argv[separator + 1:]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--test-bot', action='store_true', help='Enable the test mode explicitly.')
+    parser.add_argument('--test-world-recovery', action='store_true', help='Keep a stable T4 Host identity for a scoped recovery test.')
     parser.add_argument('--role', choices=('joiner', 'host'), default='joiner')
     parser.add_argument('--host', type=local_relay, help='Loopback address of the local relay.')
     parser.add_argument('--port', type=int)
