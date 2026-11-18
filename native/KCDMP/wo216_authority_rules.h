@@ -84,18 +84,18 @@ struct PauseLease {
     void forget() { owned = false; }
 };
 struct Stats {
-    uint64_t gateArmedAtS = 0, decisions = 0, duringLoad = 0, near = 0, bound = 0, hidden = 0, failsafe = 0, expired = 0;
+    uint64_t gateArmedAtS = 0, decisions = 0, duringLoad = 0, nearCount = 0, bound = 0, hidden = 0, failsafe = 0, expired = 0;
 };
 inline int stats_prefix(char* out, size_t cap, const Stats& s) {
     return std::snprintf(out, cap, "gate_armed_at_s=%llu decision_blocked=%llu decision_blocked_during_load=%llu npc_near=%llu npc_bound=%llu npc_hidden=%llu hide_failsafe_on=%llu unhidden_unbound_10s=%llu ",
         static_cast<unsigned long long>(s.gateArmedAtS), static_cast<unsigned long long>(s.decisions), static_cast<unsigned long long>(s.duringLoad),
-        static_cast<unsigned long long>(s.near), static_cast<unsigned long long>(s.bound), static_cast<unsigned long long>(s.hidden),
+        static_cast<unsigned long long>(s.nearCount), static_cast<unsigned long long>(s.bound), static_cast<unsigned long long>(s.hidden),
         static_cast<unsigned long long>(s.failsafe), static_cast<unsigned long long>(s.expired));
 }
 // Only a complete census can authorize hiding. Integer comparison keeps the
 // exact 30 percent boundary and avoids division by zero / partial-pass ratios.
-inline bool coverage(unsigned near, unsigned nearBound, bool havePlayer = true) {
-    return havePlayer && near && nearBound && uint64_t(nearBound) * 10 >= uint64_t(near) * 3;
+inline bool coverage(unsigned nearCount, unsigned nearBound, bool havePlayer = true) {
+    return havePlayer && nearCount && nearBound && uint64_t(nearBound) * 10 >= uint64_t(nearCount) * 3;
 }
 struct HideLease {
     bool hidden = false, expired = false;
@@ -108,7 +108,7 @@ struct HideLease {
     }
     void applied(bool hide, uint64_t now) { if (hide && !hidden) hiddenAtMs = now; hidden = hide; }
 };
-inline bool hide_eligible(bool ready, bool lifeKnown, bool dead, bool near, bool fighting, bool exempt, bool streamable) {
-    return ready && lifeKnown && !dead && near && !fighting && !exempt && streamable;
+inline bool hide_eligible(bool ready, bool lifeKnown, bool dead, bool inNearRange, bool fighting, bool exempt, bool streamable) {
+    return ready && lifeKnown && !dead && inNearRange && !fighting && !exempt && streamable;
 }
 } // namespace kcdmp::wo216authority

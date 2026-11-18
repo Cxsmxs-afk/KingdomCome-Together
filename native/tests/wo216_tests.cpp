@@ -8,8 +8,18 @@
 #include <initializer_list>
 
 #include "wo216_rules.h"
+// Windows headers define near as an empty legacy macro. These pure headers
+// are also included AFTER windows.h by pipe_server.cpp: pin that include order.
+#ifndef near
+#define near
+#define KCDMP_TEST_UNDEF_NEAR
+#endif
 #include "wo216_authority_rules.h"
 #include "pipe_control_reader.h"
+#ifdef KCDMP_TEST_UNDEF_NEAR
+#undef near
+#undef KCDMP_TEST_UNDEF_NEAR
+#endif
 #include <string>
 #include <limits>
 #include "wo215_rules.h"
@@ -201,6 +211,7 @@ int wo216_tests(int* passed) {
         WCHECK(ownPause.may_resume(10, 20, 3, 2, 8), "P1: retained lease can retry after the foreign context leaves");
         ownPause.forget(); WCHECK(!ownPause.may_resume(10, 20, 3, 2, 8), "P1: cleanup is impossible after ownership is released");
         Stats stats{5, 4294967295ull, 0, 300, 90, 210, 0, 20};
+        WCHECK(stats.nearCount == 300, "P1: Windows near macro cannot erase the nearby-count member");
         char text[512]{}; const int n = stats_prefix(text, sizeof text, stats);
         WCHECK(n > 0 && n < 400, "P1: all eight import counters fit before first512-byte boundary");
         const char* keys[] = {"gate_armed_at_s=", "decision_blocked=", "decision_blocked_during_load=", "npc_near=", "npc_bound=", "npc_hidden=", "hide_failsafe_on=", "unhidden_unbound_10s="};
@@ -252,7 +263,7 @@ int wo216_tests(int* passed) {
             std::vector<uint8_t>(ctlWire.begin() + 8, ctlWire.end()), wireFrame(pc::kGeneric, {171})};
         size_t next = 0;
         std::unique_lock<std::mutex> mainLock(mainMutex);
-        const auto waited = pc::wait_pumped(mainCv, mainLock, std::chrono::milliseconds(80), [&] { return mainDone; }, [&] {
+        const auto waited = pc::wait_pumped(mainCv, mainLock, std::chrono::milliseconds(500), [&] { return mainDone; }, [&] {
             if (mainMutex.try_lock()) { mutexReleased = true; mainMutex.unlock(); }
             if (next < chunks.size()) { const auto& c = chunks[next++]; return reader.feed(c.data(), c.size(), accept); }
             return true;

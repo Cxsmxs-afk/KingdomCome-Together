@@ -342,7 +342,7 @@ bool ours(const char* name) {
 struct BBody {
     std::string name;
     wo216authority::HideLease visibility;
-    bool wantHide = false, bound = false, near = false, ready = false, lifeKnown = false, dead = false, exemptNow = false;
+    bool wantHide = false, bound = false, inNearRange = false, ready = false, lifeKnown = false, dead = false, exemptNow = false;
     double pauseAt = -1e9;
     wo216authority::PauseLease pause;
     void* pauseEntity = nullptr;
@@ -520,12 +520,12 @@ bool census_visit(void* e, void* ctx) {
     b.name = nm; b.kind = kind; b.wuid = w; b.brainState = st;
     b.bound = npcdrive::is_bound_eid(eid);
     b.exemptNow = exempt(b.name, c->now);
-    b.near = false;
+    b.inNearRange = false;
     if (c->havePlayer) {
         float q[3];
         if (engine::entity_world_pos(e, q)) {
             const float dx = q[0] - c->player[0], dy = q[1] - c->player[1], dz = q[2] - c->player[2];
-            b.near = dx * dx + dy * dy + dz * dz <= 150.0f * 150.0f;
+            b.inNearRange = dx * dx + dy * dy + dz * dz <= 150.0f * 150.0f;
         }
     }
     b.dead = false;
@@ -537,7 +537,7 @@ bool census_visit(void* e, void* ctx) {
     b.ready = brain && (b.spawnAt < 0 || c->now - b.spawnAt >= 5.0);
     if (b.ready && b.lifeKnown && !b.dead) {
         if (b.bound) ++c->bound;
-        if (b.near) { ++c->nearN; if (b.bound) ++c->nearBound; }
+        if (b.inNearRange) { ++c->nearN; if (b.bound) ++c->nearBound; }
     }
     b.fightPlayer = fighting_player(eid);
     if (!b.fightPlayer) b.keptFight = false;
@@ -551,7 +551,7 @@ bool census_visit(void* e, void* ctx) {
             if (g_act && b.ready && b.lifeKnown) b_queue_pause(eid, b, c->now);
         } else {
             ++c->running;
-            if (b.near) ++c->nearRunning;
+            if (b.inNearRange) ++c->nearRunning;
             if (c->names.size() < 600) { if (!c->names.empty()) c->names += ","; c->names += b.name + (b.bound ? "(bound)" : "(unbound)"); }
             if (c->fresh && c->fresh->count(eid)) { ++c->freshRunning; if (c->freshNames.size() < 300) { if (!c->freshNames.empty()) c->freshNames += ","; c->freshNames += b.name; } }
             if (g_act && b.ready && b.lifeKnown) b_queue_pause(eid, b, c->now);
@@ -568,7 +568,7 @@ void b_visibility(CensusCtx& c) {
     const uint64_t ms = GetTickCount64();
     for (uint32_t eid : c.seen) {
         BBody& b = g_bodies[eid];
-        const bool eligible = g_act && wo216authority::hide_eligible(b.ready, b.lifeKnown, b.dead, b.near,
+        const bool eligible = g_act && wo216authority::hide_eligible(b.ready, b.lifeKnown, b.dead, b.inNearRange,
             b.fightPlayer, b.exemptNow, wo216rules::streamable_name(b.name.size()));
         const bool wasExpired = b.visibility.expired;
         b.wantHide = b.visibility.desired(b.bound, eligible, covered, ms);
