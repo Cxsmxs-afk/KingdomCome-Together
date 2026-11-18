@@ -23,7 +23,8 @@ the tick is live (the launcher's VerifyInjectionAsync); then the agent starts wi
     python tools/rig/pair.py collect <tag>               both bundles (LogPack) into the run folder
     python tools/rig/pair.py down                        agents, relay, both games (recorded processes only)
 """
-import glob, json, os, re, shutil, subprocess, sys, time
+import glob, json, os, re, shutil, subprocess, sys, tempfile, time
+from mmap import mmap, ACCESS_READ
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -36,6 +37,168 @@ POOR_NETWORK = os.path.join(HERE, 'netz-schlecht.json')
 SETTLE_S = 10.0          # the launcher's ConnectGateRule.SettleS
 VERIFY_S = 8.0           # the launcher's VerifyInjectionAsync window
 INJECTOR = os.path.join(rig.REPO, 'native', 'build', 'KCDMP_LauncherInjector', 'KCDMP_LauncherInjector.exe')
+SOLO = os.environ.get('KCDMP_RIG_SOLO') == '1'
+SOLO_LOCK = os.path.join(rig.RIG, 'solo-abend.owner')
+SOLO_HOST_SAVE = 'save440'
+SOLO_JOINER_SAVE = 'autosave026'
+if SOLO:
+    INJECTOR = os.environ.get('KCDMP_RIG_INJECTOR') or INJECTOR
+    mirror.MOD_TEMPLATE = os.environ.get('KCDMP_RIG_MOD_TEMPLATE') or mirror.MOD_TEMPLATE
+
+
+def safe_tag(value):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}', value):
+        raise RuntimeError('invalid rig run or collection name')
+    return value
+
+
+def solo_run():
+    return safe_tag(os.environ.get('KCDMP_RIG_RUN', ''))
+
+
+if SOLO:
+    rig.HASHES = os.path.join(rig.RUNS, solo_run(), 'real-saves-before.sha256')
+
+
+def solo_owner():
+    try:
+        with open(SOLO_LOCK, encoding='utf-8') as f: return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def solo_guard():
+    owner = solo_owner()
+    if SOLO:
+        if owner != solo_run() or state().get('solo_run') != owner:
+            raise RuntimeError('this Solo-Abend run does not own the rig')
+    elif owner is not None:
+        raise RuntimeError('the configured rig belongs to a Solo-Abend run')
+
+
+def distinct_roots(paths):
+    roots = [os.path.normcase(os.path.realpath(p)) for p in paths]
+    for i, a in enumerate(roots):
+        for b in roots[i+1:]:
+            try: common = os.path.commonpath((a, b))
+            except ValueError: continue
+            if common in (a, b): return False
+    return True
+
+
+def contained_path(root, path):
+    a, b = (os.path.normcase(os.path.realpath(p)) for p in (root, path))
+    try: return a != b and os.path.commonpath((a, b)) == a
+    except ValueError: return False
+
+
+def solo_user_folder(cid, value):
+    if not value or user_folder_refusal(cid, value): return False
+    path = value if os.path.isabs(value) else os.path.join(mirror.SAVED_GAMES, value)
+    actual = os.path.normcase(os.path.realpath(path))
+    return any(actual == os.path.normcase(os.path.realpath(os.path.join(mirror.SAVED_GAMES, name)))
+               for name in mirror.user_folders(cid))
+
+
+def solo_save(cid):
+    key = 'KCDMP_RIG_SOLO_HOST_SAVE' if cid == 'A' else 'KCDMP_RIG_SOLO_JOINER_SAVE'
+    path = os.environ.get(key, '')
+    if not os.path.isabs(path) or not path.lower().endswith('.whs') or not os.path.isfile(path):
+        raise RuntimeError(key + ' must name an existing absolute .whs file')
+    return os.path.realpath(path)
+
+
+def loopback_supported(executable):
+    """The supported bench build handles both listeners, including via an apphost DLL."""
+    needles = tuple(value.encode('utf-16-le') for value in (
+        'Tcp:LoopbackOnly', 'TCP listener bound to {Address}:{Port}.', 'HTTP loopback ready on {Url}.'))
+    companion = os.path.splitext(executable)[0] + '.dll'
+    def includes(path, markers):
+        if not os.path.isfile(path) or not os.path.getsize(path): return False
+        with open(path, 'rb') as stream, mmap(stream.fileno(), 0, access=ACCESS_READ) as data:
+            return all(data.find(marker) >= 0 for marker in markers)
+    return includes(executable, needles) or (includes(executable, (os.path.basename(companion).encode('ascii') + b'\0',))
+        and includes(companion, needles))
+
+
+def solo_check():
+    if not SOLO:
+        raise RuntimeError('solo-check also requires KCDMP_RIG_SOLO=1')
+    run = solo_run()
+    if not distinct_roots((mirror.INSTALL, mirror.ROOT_A, mirror.ROOT_B, rig.RIG)):
+        raise RuntimeError('the game install, two mirror roots and rig directory must be distinct and non-nested')
+    real = os.path.join(mirror.SAVED_GAMES, mirror.USER_FOLDER_REAL)
+    folders = [os.path.join(mirror.SAVED_GAMES, name) for cid in ('A', 'B') for name in mirror.user_folders(cid)]
+    if not distinct_roots((real, *folders)):
+        raise RuntimeError('the mirror user folders resolve into each other or the real user folder')
+    for folder in folders:
+        for relative in ('profiles', os.path.join('profiles', 'default'), 'saves'):
+            if not contained_path(folder, os.path.join(folder, relative)):
+                raise RuntimeError('a copy profile or saves path leaves its own user folder')
+    for path in (os.path.join(mirror.INSTALL, rig.EXE_REL), os.path.join(mirror.INSTALL, 'system.cfg'),
+                 os.path.join(mirror.BUILD, 'agent', 'KcdMpClient.exe'),
+                 os.path.join(mirror.BUILD, 'relay', 'KcdMpServer.exe'),
+                 os.path.join(mirror.BUILD, 'logpack', 'KcdMp.LogPack.Tool.exe'),
+                 mirror.MOD_PAK, INJECTOR, solo_save('A'), solo_save('B')):
+        if not os.path.isfile(path): raise RuntimeError('required rig file missing: ' + path)
+    if not os.path.isdir(mirror.MOD_TEMPLATE):
+        raise RuntimeError('mod template missing: ' + mirror.MOD_TEMPLATE)
+    if not loopback_supported(os.path.join(mirror.BUILD, 'relay', 'KcdMpServer.exe')):
+        raise RuntimeError('the staged relay build does not support verified loopback-only TCP and HTTP')
+    if not os.path.isdir(rig.SAVES_A):
+        raise RuntimeError('real saves folder missing: ' + rig.SAVES_A)
+    if not glob.glob(os.path.join(mirror.BUILD, 'dll', 'KCDMP_w2[0-9]*.dll')):
+        raise RuntimeError('the build has no rig DLL')
+    for cid in ('A', 'B'):
+        p = plan(cid)
+        root = p['root']
+        mod = os.path.join(root, 'Mods', 'kdcmp')
+        if not contained_path(root, mod) or not distinct_roots((mirror.INSTALL, mod)):
+            raise RuntimeError('the copy mod resolves into the real game install')
+        if not all(contained_path(p['dir'], p[k]) for k in ('agent_dir', 'dll_dir', 'data_dir', 'backup_dir', 'bundle_dir')):
+            raise RuntimeError('a copy deployment path leaves its own rig directory')
+    if not distinct_roots((plan('A')['dir'], plan('B')['dir'])):
+        raise RuntimeError('the per-copy rig directories alias each other')
+    os.makedirs(rig.RIG, exist_ok=True)
+    try:
+        with open(SOLO_LOCK, 'x', encoding='utf-8') as f: f.write(run)
+    except FileExistsError:
+        raise RuntimeError('the configured rig already has a Solo-Abend owner') from None
+    try:
+        try:
+            with open(rig.STATE, encoding='utf-8') as f: old = json.load(f)
+        except FileNotFoundError:
+            old = {}
+        if not isinstance(old, dict) or old.get('solo_run') or any(procs.matches(old.get(k)) for k in ('a', 'b', 'agent_a', 'agent_b', 'relay')):
+            raise RuntimeError('the rig has an existing run or running processes')
+        capture_solo_save_hashes()
+        rig.save_state({'solo_run': run})
+    except BaseException:
+        os.remove(SOLO_LOCK)
+        raise
+    rig.say('solo-abend owner', run)
+    return 0
+
+
+def capture_solo_save_hashes():
+    rig.run_dir()
+    with open(rig.HASHES, 'x', encoding='utf-8') as f:
+        for directory, folders, files in os.walk(rig.SAVES_A):
+            folders.sort()
+            for name in sorted(files):
+                path = os.path.join(directory, name)
+                f.write('%s  %d  %s\n' % (procs.sha(path), os.path.getsize(path), os.path.relpath(path, rig.SAVES_A)))
+    if not rig.saves_ok('solo-preflight'):
+        raise RuntimeError('the real saves changed while recording their initial hash list')
+
+
+def record_start(st, key, rec):
+    st[key] = rec
+    try:
+        rig.save_state(st)
+    except BaseException:
+        procs.stop(rec)
+        raise
 
 
 def plan(cid):
@@ -51,7 +214,8 @@ def plan(cid):
         'agent_dir': os.path.join(base, 'agent'),
         'dll_dir': os.path.join(base, 'dll'),
         # WO-214 F: KCDMP_RIG_JOIN_DATA=<tag> gives the joiner copy a Henry store of its own (a world never joined there: a first join)
-        'data_dir': os.path.join(base, 'data-' + JOIN_DATA if JOIN_DATA and cid == JOIN_CID else 'data'),
+        'data_dir': os.path.join(base, 'solo-' + solo_run() if SOLO else
+                                 'data-' + JOIN_DATA if JOIN_DATA and cid == JOIN_CID else 'data'),
         'backup_dir': os.path.join(base, 'backups'),
         'bundle_dir': os.path.join(base, 'bundle'),
         'dice_port': 5900 + 10 * n + 1,      # the maintainer's launcher/agent keep 5901/5902
@@ -74,10 +238,15 @@ def test_env():
 
 def prepare():
     """Fresh per-copy agent and DLL folders from the rig's build (release\\w206rig\\run\\agent, dll\\KCDMP_w206_*.dll)."""
-    ddir = os.path.join(mirror.BUILD, 'dll') if os.environ.get('KCDMP_RIG_BUILD') else os.path.join(rig.RIG, 'dll')
+    if SOLO and solo_owner() is None: solo_check()
+    solo_guard()
+    if SOLO and any(procs.matches(state().get(k)) for k in ('a', 'b', 'agent_a', 'agent_b', 'relay')):
+        raise RuntimeError('stop the current copies before preparing this run again')
+    ddir = os.path.join(mirror.BUILD, 'dll') if SOLO or os.environ.get('KCDMP_RIG_BUILD') else os.path.join(rig.RIG, 'dll')
     dlls = sorted(glob.glob(os.path.join(ddir, 'KCDMP_w2[0-9]*.dll')), key=os.path.getmtime)
     if not dlls: raise SystemExit('no DLL in the rig (run deploy.ps1)')
-    src_agent = os.environ.get('KCDMP_RIG_AGENT_SRC', os.path.join(mirror.BUILD, 'agent'))
+    src_agent = os.path.join(mirror.BUILD, 'agent')
+    if not SOLO: src_agent = os.environ.get('KCDMP_RIG_AGENT_SRC', src_agent)
     for cid in ('A', 'B'):
         p = plan(cid)
         for d in ('agent_dir', 'dll_dir'):
@@ -94,7 +263,27 @@ def prepare():
         mirror.create(cid)
         keys_pak(cid)
         mirror.seed_profile(cid)
-    seed_saves()
+    if SOLO: seed_solo_saves()
+    else: seed_saves()
+
+
+def seed_solo_saves():
+    for cid, playline, name in (('A', 'playline4', SOLO_HOST_SAVE), ('B', 'playline2', SOLO_JOINER_SAVE)):
+        src = solo_save(cid)
+        for folder in mirror.user_folders(cid):
+            own = os.path.join(mirror.SAVED_GAMES, folder)
+            dst = os.path.join(own, 'saves', playline, name + '.whs')
+            if not contained_path(own, dst) or not distinct_roots((rig.SAVES_A, dst)) or os.path.realpath(dst) == src:
+                raise RuntimeError('fixture destination aliases the real saves or the source')
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            fd, pending = tempfile.mkstemp(prefix='.solo-save-', dir=os.path.dirname(dst))
+            try:
+                os.close(fd)
+                shutil.copy2(src, pending)
+                os.replace(pending, dst)  # replace a directory entry without writing its previous inode
+            finally:
+                if os.path.exists(pending): os.remove(pending)
+            rig.say('solo fixture', cid, dst)
 
 
 def keys_pak(cid):
@@ -118,7 +307,7 @@ def keys_pak(cid):
 # player's saves folder (read only), into each copy's own user folder.
 # KCDMP_RIG_HOST=B swaps the roles: copy B (started second, the window in front -- the game caps an unfocused window's frame
 # rate) hosts and copy A joins. The seeds follow the role: the host's world into the host copy, the joiner's own Henry into the other.
-HOST_CID = 'B' if os.environ.get('KCDMP_RIG_HOST') == 'B' else 'A'
+HOST_CID = 'B' if not SOLO and os.environ.get('KCDMP_RIG_HOST') == 'B' else 'A'
 JOIN_CID = 'A' if HOST_CID == 'B' else 'B'
 SEED = {HOST_CID: [('playline4', 'save440.whs')], JOIN_CID: [('OLD/playline1', 'autosave026.whs')]}
 SEED_TO = {HOST_CID: 'playline4', JOIN_CID: 'playline3'}
@@ -126,7 +315,7 @@ SEED_TO = {HOST_CID: 'playline4', JOIN_CID: 'playline3'}
 # KCDMP_RIG_JOIN_SAVE=<dir>/<file> (under the real saves, read only; another playthrough than the host's world) is seeded into the
 # joiner's playline2 and pinned as his first-join Henry (mp_join_henry playline2/<file>); with KCDMP_RIG_JOIN_DATA=<tag> (a Henry store
 # of the copy's own) the host's world is a first join there, so that Henry is the one brought.
-JOIN_SAVE = os.environ.get('KCDMP_RIG_JOIN_SAVE', '').strip().replace('\\', '/')
+JOIN_SAVE = '' if SOLO else os.environ.get('KCDMP_RIG_JOIN_SAVE', '').strip().replace('\\', '/')
 JOIN_DATA = re.sub(r'[^A-Za-z0-9_-]', '', os.environ.get('KCDMP_RIG_JOIN_DATA', ''))
 if JOIN_SAVE:
     SEED[JOIN_CID] = [tuple(JOIN_SAVE.rsplit('/', 1))]
@@ -173,20 +362,31 @@ def seed_saves():
     rig.say('saves seeded: host', HOST_CID, SEED[HOST_CID], 'joiner', JOIN_CID, SEED[JOIN_CID], ('+ ' + os.path.basename(extra)) if extra else '')
 
 
-def relay(plan_file=None, *, profile=None):
+def relay(plan_file=None, *, profile=None, loopback=False):
+    solo_guard()
+    loopback = loopback or SOLO
     st = state()
     if profile == 'schlecht':
         plan_file = POOR_NETWORK
     active = st.get('relay')
     if procs.matches(active):
-        if profile is not None and active.get('fault_plan', '') != (plan_file or ''):
+        if loopback and (not active.get('loopback') or not active.get('loopback_ready')):
+            rig.say('both listeners of the existing loopback relay were not confirmed')
+            return 2
+        if (loopback or profile is not None) and active.get('fault_plan', '') != (os.path.abspath(plan_file) if plan_file else ''):
             rig.say('running relay has another network profile; stop it before starting the requested profile')
             return 2
         rig.say('relay already up')
         return 0
     exe = os.path.join(mirror.BUILD, 'relay', 'KcdMpServer.exe')
+    if loopback and not loopback_supported(exe):
+        raise RuntimeError('the staged relay build does not support verified loopback-only TCP and HTTP')
     argv = [exe, '--port', str(RELAY_PORT), '--urls', 'http://127.0.0.1:%d' % RELAY_HTTP]
+    if loopback:
+        argv += ['--Tcp:BindAddress', '127.0.0.1', '--Tcp:LoopbackOnly', 'true', '--Steam:Enabled', 'false', '--MasterServer:Url=']
     env = rig.clean_env(test_env())
+    if loopback:
+        env = {k: v for k, v in env.items() if not k.upper().startswith('KESTREL__ENDPOINTS__')}
     if plan_file:
         env['KCDMP_TEST_RELAY_FAULTS'] = '1'
         argv += ['--test-faults', os.path.abspath(plan_file)]
@@ -194,9 +394,25 @@ def relay(plan_file=None, *, profile=None):
     offset = os.path.getsize(log) if os.path.isfile(log) else 0
     rec = procs.start(argv, os.path.dirname(exe), env, 'relay', log_path=log)
     rec.update(fault_plan=os.path.abspath(plan_file) if plan_file else '', relay_log=log, relay_log_offset=offset)
-    st['relay'] = rec; rig.save_state(st)
+    rec['loopback'] = loopback
+    record_start(st, 'relay', rec)
     rig.note('start', what='relay', **rec, argv=argv)
     rig.say('relay pid', rec['pid'], 'port', RELAY_PORT, 'faults' if plan_file else '')
+    if loopback:
+        until = time.monotonic() + 15
+        while time.monotonic() < until and procs.matches(rec):
+            with open(log, 'rb') as f:
+                f.seek(offset)
+                ready = f.read()
+                if (('TCP listener bound to 127.0.0.1:%d.' % RELAY_PORT).encode('ascii') in ready and
+                    ('HTTP loopback ready on http://127.0.0.1:%d.' % RELAY_HTTP).encode('ascii') in ready):
+                    if not procs.matches(rec): break
+                    rec['loopback_ready'] = True
+                    record_start(st, 'relay', rec)
+                    return 0
+            time.sleep(0.2)
+        rig.say('both loopback relay listeners were not confirmed')
+        return 1
     time.sleep(2)
     return 0
 
@@ -220,9 +436,10 @@ def wait_line(watch_path, since, rx, secs, rec=None, watch=None):
     return None, None
 
 
-def up(cid):
+def up(cid, *, manual_confirm=False):
     """A copy to its main menu. Copy B only after the A.3 checks (the real saves' hash list, the mirror root, copy A at its
     menu, free VRAM over B's pool + 2 GB) -- and with a device-removed watch on both logs while it starts."""
+    solo_guard()
     p = plan(cid)
     st = state()
     key = cid.lower()
@@ -244,14 +461,17 @@ def up(cid):
         if k.startswith('KCDMP_TEST_'): genv[k] = v
     genv.update(test_env())   # WO-213
     rec = procs.start(argv, p['root'], rig.clean_env(genv), cid)
-    st[key] = rec; st[key + '_since'] = t0; rig.save_state(st)
+    st[key + '_since'] = t0
+    record_start(st, key, rec)
     rig.note('start', copy=cid, **rec, argv=argv, instance=cid)
     rig.say('copy', cid, 'pid', rec['pid'])
     # WO-207 0.1: a second copy stops at the game's own Yes/No start box (A.4: -multi_inst only allows it); the rig answers it
     # (tools/rig/dialogs.py: the box among this copy's own windows, by class and owner, its Yes button by control id). 30 s: none -> on.
     box = None
-    if cid == 'B':
+    if cid == 'B' and not (manual_confirm or SOLO):
         box = dialogs.answer_in_background(rec, 30.0, log=lambda m: (rig.say('copy B', m)), matches=procs.matches)
+    elif cid == 'B':
+        rig.say('Bitte im zweiten Fenster „Ja“ klicken.')
     # a second instance writes kcd(1).log (A.4); the first writes kcd.log
     log = os.path.join(p['root'], 'kcd.log' if cid == 'A' else 'kcd(1).log')
     line, _ = wait_line(log, t0, r"^PlayVideoOnly 'main_menu|^User folder is", 420, rec)
@@ -268,7 +488,12 @@ def up(cid):
         box['thread'].join(timeout=35)
         rig.note('instance-box', copy=cid, **{k: v for k, v in (box.get('result') or {'found': None}).items()})
     if w.device_lost:
-        rig.note('device-lost', copy=cid, lines=w.device_lost[:5]); rig.say('DEVICE-REMOVED: stopping both'); down(); return 1
+        rig.note('device-lost', copy=cid, lines=w.device_lost[:5]); rig.say('DEVICE-REMOVED detected')
+        if not SOLO: down()
+        return 1
+    if SOLO and (not w.http_port or not solo_user_folder(cid, w.user_folder)):
+        rig.say('copy', cid, 'did not confirm its own user folder and engine API port')
+        return 1
     rig.note('menu', copy=cid, ok=w.menu, user_folder=w.user_folder, http_port=w.http_port)
     rig.say('copy', cid, 'menu' if w.menu else 'NOT at its menu', 'port', w.http_port, 'user folder', w.user_folder)
     return 0 if w.menu else 1
@@ -308,7 +533,11 @@ def user_folder_refusal(cid, override=None):
 
 def port_of(cid):
     st = state()
+    if SOLO and not procs.matches(st.get(cid.lower())):
+        raise RuntimeError('the current run has no live copy ' + cid)
     w = procs.LogWatch(rig.klog(plan(cid)['root']), since=st.get(cid.lower() + '_since')); w.poll()
+    if SOLO and (not w.http_port or not solo_user_folder(cid, w.user_folder)):
+        raise RuntimeError('no engine-confirmed port and user folder for copy ' + cid)
     return w.http_port
 
 
@@ -362,6 +591,9 @@ def host(cid, playline, save, agent_delay=None, twin=False, at_load=None, hitch_
     """The launcher's host: the save loads from the menu; 'Gameplay started'; 10 s (ConnectGateRule.SettleS); inject, verify,
     the agent with --hosting. at_load=S: the 0.62.7 field order instead -- CONNECT pressed by hand S seconds after the load
     command, while the save still loads (inject, verify, the agent), before 'Gameplay started'."""
+    solo_guard()
+    if SOLO and (cid != 'A' or playline != '4' or save != SOLO_HOST_SAVE):
+        raise RuntimeError('Solo-Abend host uses copy A, playline 4 and ' + SOLO_HOST_SAVE)
     p = plan(cid)
     st = state()
     key = cid.lower()
@@ -404,6 +636,8 @@ def host(cid, playline, save, agent_delay=None, twin=False, at_load=None, hitch_
 
 
 def join(cid):
+    solo_guard()
+    if SOLO and cid != 'B': raise RuntimeError('Solo-Abend joiner uses copy B')
     p = plan(cid)
     st = state()
     return join_from_menu(cid, p, st, cid.lower(), port_of(cid))
@@ -445,7 +679,7 @@ def join_from_menu(cid, p, st, key, port, *, wait_host=host_ready):
     rig.note('joiner-gate-open', copy=cid)
     if not inject_verify(cid, p, st, key): return 1
     start_agent(cid, 'joiner', port)
-    pre = os.environ.get('KCDMP_RIG_PRE_JOIN_LUA')   # a twin's switch on both copies before the join starts (B2: mp_rejoin_recover off)
+    pre = None if SOLO else os.environ.get('KCDMP_RIG_PRE_JOIN_LUA')   # a twin's switch on both copies before join
     if pre:
         time.sleep(3)   # the joiner's agent reads the mod's events from now
         for c in ('A', 'B'):
@@ -453,10 +687,10 @@ def join_from_menu(cid, p, st, key, port, *, wait_host=host_ready):
             rig.note('pre-join-lua', copy=c, lua=pre)
         rig.say('pre-join Lua on both copies:', pre)
         time.sleep(2)
-    if JOIN_SAVE:   # WO-214 F: the pinned Henry, the console's answer (the launcher's answer only knows bring / fresh)
+    if JOIN_SAVE or SOLO:   # WO-214 F: the pinned Henry, the console's answer (the launcher's answer only knows bring / fresh)
         # sent once the agent asks (the first try, 3 s after the agent's start, never reached it: the agent asked "Bring / Start fresh"
         # and waited, the host idled beside a joiner that never asked for the world -- and died of out-of-memory), then confirmed
-        pin = 'playline2/' + JOIN_SAVE.rsplit('/', 1)[1]
+        pin = 'playline2/' + (SOLO_JOINER_SAVE + '.whs' if SOLO else JOIN_SAVE.rsplit('/', 1)[1])
         alog = os.path.join(p['agent_dir'], 'agent.log')
         def seen(rx):
             try:
@@ -490,6 +724,7 @@ def join_from_menu(cid, p, st, key, port, *, wait_host=host_ready):
 
 def start_agent(cid, role, port, twin=False):
     """twin: A.6's mutation twin -- the 0.62.7 field fix (keep the log tail of a loaded mod whose emitter has not ticked) off."""
+    solo_guard()
     p = plan(cid)
     st = state()
     exe = os.path.join(p['agent_dir'], 'KcdMpClient.exe')
@@ -511,21 +746,31 @@ def start_agent(cid, role, port, twin=False):
         argv.append('--test-world-recovery')
     env['DOTNET_ROOT'] = os.environ.get('DOTNET_ROOT', os.path.expandvars(r'%USERPROFILE%\.dotnet-sdk8'))
     rec = procs.start(argv, p['agent_dir'], env, 'agent-' + cid)
-    st['agent_' + cid.lower()] = rec; rig.save_state(st)
+    record_start(st, 'agent_' + cid.lower(), rec)
     rig.note('start', what='agent', copy=cid, **rec, argv=argv, twin=twin)
     rig.say('agent', cid, 'pid', rec['pid'], role, 'TWIN (the 0.62.7 tail fix off)' if twin else '')
 
 
 def collect(tag, *, write_verdict=False, copies=('A', 'B'), bot_log=None, rp_step=None):
     """Both copies' files into <run>\\bundles\\<tag>-<id>\\ (the launcher's bundle layout), then LogPack's bundle."""
+    solo_guard()
+    tag = safe_tag(tag)
+    st = state()
     out = {}
     for cid in copies:
+        if SOLO and not st.get(cid.lower()):
+            rig.say('bundle', cid, 'no copy launched by this run')
+            continue
         p = plan(cid)
         d = os.path.join(rig.run_dir(), 'bundles', '%s-%s' % (tag, cid))
         if os.path.isdir(d): shutil.rmtree(d)
         os.makedirs(d)
         def put(src, name):
-            if src and os.path.exists(src): shutil.copy2(src, os.path.join(d, name))
+            if not src or not os.path.isfile(src): return
+            since = st.get(cid.lower() + '_since')
+            if SOLO and since is not None and name != 'relay.log' and os.path.getmtime(src) < since - 1:
+                return
+            shutil.copy2(src, os.path.join(d, name))
         put(rig.klog(p['root']), 'kcd.log')
         put(os.path.join(p['root'], 'kcdmp-native.mirror.log'), 'kcdmp-native.mirror.log')
         put(os.path.join(p['dll_dir'], 'kcdmp-native-%s.log' % cid), 'kcdmp-native.log')
@@ -559,7 +804,29 @@ def collect(tag, *, write_verdict=False, copies=('A', 'B'), bot_log=None, rp_ste
 def down(tag='run'):
     """Agents, relay, both games (recorded processes only); then the copies' new autosaves out of the throwaway playline, the
     real saves against the hash list, and the mirror root's links. A change in the real saves stops the WO (exit 3)."""
+    if SOLO and solo_owner() != solo_run():
+        rig.say('no rig processes owned by this Solo-Abend run')
+        return 0
+    solo_guard()
+    tag = safe_tag(tag)
     st = state()
+    if SOLO:
+        keys = ('agent_b', 'agent_a', 'relay', 'b', 'a')
+        for key in keys:
+            result = procs.stop(st.get(key))
+            rig.note('stop', what=key, result=result)
+            rig.say(key, result)
+        if any(procs.matches(st.get(key)) for key in keys):
+            rig.say('an owned process is still running; rig ownership retained')
+            return 3
+        try:
+            ok = rig.saves_ok('after-' + tag)
+            bad = mirror.verify('A') + mirror.verify('B')
+            rig.say('mirror roots:', 'PASS' if not bad else 'FAIL %s' % bad[:3])
+            return 0 if ok and not bad else 3
+        finally:
+            rig.save_state({})
+            os.remove(SOLO_LOCK)
     for k in ('agent_b', 'agent_a', 'relay'):
         r = procs.stop(st.get(k))
         rig.note('stop', what=k, result=r)
@@ -577,17 +844,24 @@ def down(tag='run'):
 if __name__ == '__main__':
     v = sys.argv[1] if len(sys.argv) > 1 else ''
     a = sys.argv[2:]
-    if v == 'prepare': prepare()
+    if v == 'solo-check' and a == ['--test-solo-abend']: sys.exit(solo_check())
+    elif v == 'prepare': prepare()
     elif v == 'relay':
+        loopback = '--loopback' in a
+        a = [arg for arg in a if arg != '--loopback']
         if any(arg.split('=', 1)[0] == '--test-world-recovery' for arg in a):
+            if loopback and not SOLO: sys.exit('--loopback with recovery requires Solo-Abend ownership')
             import scen_s3_recovery
             sys.exit(scen_s3_recovery.relay_run(sys.modules[__name__], a))
         if a in (['--netz', 'normal'], ['--netz', 'schlecht']):
-            sys.exit(relay(profile=a[1]))
+            sys.exit(relay(profile=a[1], loopback=loopback))
         if len(a) > 1 or (a and a[0].startswith('--')):
             sys.exit('usage: pair.py relay [plan.json | --netz normal | --netz schlecht]')
-        sys.exit(relay(a[0] if a else None))
-    elif v == 'up': sys.exit(up(a[0]))
+        sys.exit(relay(a[0] if a else None, loopback=loopback))
+    elif v == 'up':
+        if len(a) not in (1, 2) or a[0] not in ('A', 'B') or (len(a) == 2 and a[1] != '--manual-confirm'):
+            sys.exit('usage: pair.py up <A|B> [--manual-confirm]')
+        sys.exit(up(a[0], manual_confirm=len(a) == 2))
     elif v == 'guard':   # WO-207 0.2's dry run: would this copy (or this user folder) be started? Nothing is started.
         uf = a[a.index('--user-folder') + 1] if '--user-folder' in a else None
         why = user_folder_refusal(a[0].upper(), uf)
@@ -604,6 +878,11 @@ if __name__ == '__main__':
         sys.exit(host(a[0], a[1], a[2], delay, twin, at_load, hitch_s, freeze))
     elif v == 'join': sys.exit(join(a[0]))
     elif v == 'agent': start_agent(a[0], a[1], int(a[2]))
-    elif v == 'collect': collect(a[0] if a else 'run')
-    elif v == 'down': sys.exit(down(a[0] if a else 'run'))
+    elif v == 'collect':
+        argv = [arg for arg in a if arg != '--write-verdict']
+        if len(argv) > 1: sys.exit('usage: pair.py collect [tag] [--write-verdict]')
+        collect(argv[0] if argv else 'run', write_verdict='--write-verdict' in a)
+    elif v == 'down':
+        if len(a) > 1: sys.exit('usage: pair.py down [tag]')
+        sys.exit(down(a[0] if a else 'run'))
     else: sys.exit(__doc__)
