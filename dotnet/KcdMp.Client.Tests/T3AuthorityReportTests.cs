@@ -20,7 +20,7 @@ public class T3AuthorityReportTests
         var body = new byte[header[1] | header[2] << 8]; await stream.ReadExactlyAsync(body, ct); return body;
     }
     private static async Task Reply(Stream stream, byte seq, byte op, CancellationToken ct, bool truncated = false,
-        bool worldStats = false, int statsFields = 30, bool timeline = false, bool refused = false)
+        bool worldStats = false, int statsFields = 30, bool timeline = false, bool controller = false, bool refused = false)
     {
         byte[] payload = op == Protocol.Wo216OpBrains ? Encoding.ASCII.GetBytes(truncated ? "B decision_blocked=999 npc_hidden=999" : Snapshot) : [];
         if (worldStats)
@@ -29,9 +29,9 @@ public class T3AuthorityReportTests
             payload = new byte[2 + count * 9]; payload[0] = 1; payload[1] = (byte)count;
             for (int i = 0; i < count; i++) { payload[2 + i * 9] = (byte)i; BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(3 + i * 9), (ulong)(10 + i)); }
         }
-        if (timeline)
+        if (timeline || controller)
         {
-            ulong[] values = [86, 42, 2, 18, 360, 4];
+            ulong[] values = timeline ? [86, 42, 2, 18, 360, 4] : [1500, 1499, 1, 2, 3, 4, 5, 6, 7, 8, 0, 199, 1, 301508];
             payload = new byte[2 + values.Length * 9]; payload[0] = 1; payload[1] = (byte)values.Length;
             for (int i = 0; i < values.Length; i++)
             {
@@ -59,7 +59,10 @@ public class T3AuthorityReportTests
     [InlineData(true, 1, false, 55)]
     [InlineData(false, 2, false, 55)]
     [InlineData(false, 2, false, 56)]
-    public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role, bool truncated, int statsFields)
+    [InlineData(true, 1, false, 55, true)]
+    [InlineData(false, 2, false, 55, true)]
+    public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role,
+        bool truncated, int statsFields, bool controllerSupported = false)
     {
         string name = "t3r-" + Guid.NewGuid().ToString("N")[..16];
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -89,6 +92,12 @@ public class T3AuthorityReportTests
         {
             Assert.Equal(new byte[] { Protocol.T3OpStats, Protocol.T3TimelineStatsCommand }, await Read(server, stop.Token));
             await Reply(server, 3, Protocol.T3OpStats, stop.Token, timeline: timelineSupported, refused: !timelineSupported);
+            mirrorSequence++;
+        }
+        if (timelineSupported)
+        {
+            Assert.Equal(new byte[] { Protocol.T3OpStats, Protocol.T3ControllerStatsCommand }, await Read(server, stop.Token));
+            await Reply(server, 4, Protocol.T3OpStats, stop.Token, controller: controllerSupported, refused: !controllerSupported);
             mirrorSequence++;
         }
         var mirror = await Read(server, stop.Token);
@@ -146,6 +155,19 @@ public class T3AuthorityReportTests
             Assert.Contains("rp_timeline_skew_n=4", fields);
         }
         else Assert.DoesNotContain("rp_timeline_skew_n=", fields);
+        if (controllerSupported)
+        {
+            Assert.Contains("rp_ctrl_frames=1500", fields);
+            Assert.Contains("rp_req_ok=1499", fields);
+            Assert.Contains("rp_req_fail=1", fields);
+            Assert.Contains("rp_fallback_by_ragdoll=4", fields);
+            Assert.Contains("rp_hard_tp_by_travel=8", fields);
+            Assert.Contains("rp_hard_tp_unsafe=0", fields);
+            Assert.Contains("rp_pulls_per_min=199", fields);
+            Assert.Contains("rp_pull_n=1", fields);
+            Assert.Contains("rp_pull_observed_ms=301508", fields);
+        }
+        else Assert.DoesNotContain("rp_pull_observed_ms=", fields);
         await Reply(server, mirrorSequence, Protocol.T3OpStats, stop.Token);
         await report.WaitAsync(stop.Token);
         var gate = (SemaphoreSlim)typeof(CombatPipe).GetField("_gate", Private)!.GetValue(pipe)!;

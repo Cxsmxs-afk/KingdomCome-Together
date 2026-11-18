@@ -8,5 +8,6 @@ target_include_directories(KCDMP_NativeTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_sources(KCDMP_NativeTests PRIVATE rp_measure_tests.cpp holder_contract_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE edge_lanes_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE rp_timeline_tests.cpp rp_timeline_action_tests.cpp)
+target_sources(KCDMP_NativeTests PRIVATE rp_controller_tests.cpp motion_remote_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE edge_console_tests.cpp)
 target_compile_definitions(KCDMP_NativeTests PRIVATE KCDMP_P4_TEST KCDMP_P5_TEST KCDMP_P6_TEST KCDMP_P6_CAPTURE_TEST)

@@ -622,6 +622,45 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
         await ArrivesAsync(peer, Protocol.Pong, Protocol.PingPayloadLen);
     }
 
+    [Fact]
+    public async Task The_relay_authenticates_WO167_host_travel_edges_and_preserves_each_valid_direction()
+    {
+        var (host, joiner) = await HostAndJoinerAsync();
+        await using var _h = host; await using var _j = joiner;
+        await using var other = await Peer.ConnectAsync(_relay.TcpPort, "travel-listener");
+        var start = new LootMsg(Protocol.W164Travel, 0, W164Text.TravelStart(7, "@Road"));
+        var end = new LootMsg(Protocol.W164Travel, 0, W164Text.TravelEnd(7, 1200, 1300, 40, false));
+        var refusal = new LootMsg(Protocol.W164Travel, 0, W164Text.TravelRefused(7, "off"));
+        var request = new LootMsg(Protocol.W164Travel, 0, W164Text.TravelRequest(7, "@Road"));
+        string notHost = $"{Hex(Protocol.W164Up)}/k{Protocol.W164Travel}:not-the-host";
+        string fromHost = $"{Hex(Protocol.W164Up)}/k{Protocol.W164Travel}:from-the-host";
+        long priorNonHost = Drops(notHost), priorHostRequest = Drops(fromHost);
+
+        async Task Cross(Peer sender, Peer receiver, LootMsg message, byte target)
+        {
+            await sender.SendRawAsync(message.BuildUp(Protocol.W164Up, target));
+            byte[] down = await receiver.ReadUntilAsync(Protocol.W164Down, Wait);
+            Assert.Equal(sender.Id, down[0]);
+            Assert.True(LootMsg.TryDecode(down.AsSpan(1 + Protocol.JoinHeaderLen), out var original));
+            Assert.Equal(message, original);
+        }
+
+        await joiner.SendRawAsync(start.BuildUp(Protocol.W164Up, other.Id));
+        await joiner.SendRawAsync(end.BuildUp(Protocol.W164Up, other.Id));
+        await joiner.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await ArrivesAsync(joiner, Protocol.Pong, Protocol.PingPayloadLen);
+        Assert.Equal(priorNonHost + 2, Drops(notHost));
+        await host.SendRawAsync(request.BuildUp(Protocol.W164Up, other.Id));
+        await host.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await ArrivesAsync(host, Protocol.Pong, Protocol.PingPayloadLen);
+        Assert.Equal(priorHostRequest + 1, Drops(fromHost));
+
+        await Cross(joiner, host, request, Protocol.JoinTargetHost);
+        await Cross(host, other, start, other.Id);
+        await Cross(host, other, end, other.Id);
+        await Cross(host, other, refusal, other.Id);
+    }
+
     private static byte[] TimedPosition(long sourceMs, bool hostClaim)
     {
         var body = new byte[Protocol.PositionPayloadLen + Protocol.SenderMsLen];

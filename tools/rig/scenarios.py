@@ -3981,6 +3981,9 @@ def run(name, args):
     if name == 'timeline':
         import scen_s2_timeline
         return scen_s2_timeline.run(sys.modules[__name__], args)
+    if name in ('rpwalk', 'rpstance'):
+        import scen_s2_walk
+        return scen_s2_walk.run(sys.modules[__name__], name, args)
     r = Run(name, include_joiner=name != 'botjoiner')
     plan = {
         'join': [('join', s_join(r))],

@@ -28,6 +28,7 @@ add_library(KCDMP SHARED
     respawn_actions.cpp
     rp_measure.cpp
     rp_timeline.cpp
+    rp_controller.cpp
     rp_timeline_actions.cpp
     p5_marker.cpp
     p6_missile.cpp

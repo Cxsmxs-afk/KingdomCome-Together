@@ -53,7 +53,7 @@ public sealed partial class CombatPipe
     private readonly record struct EdgeStateKey(byte Type, uint PeerOrKey, string? Body = null, bool State2 = false);
 
     private sealed class EdgeWork(NamedPipeClientStream pipe, byte lane, byte type, byte want, uint key, byte[] payload,
-        CancellationToken cancellation, EdgeStateKey? stateKey, long arrival)
+        CancellationToken cancellation, EdgeStateKey? stateKey, long arrival, Func<bool>? beforeWrite)
     {
         public readonly NamedPipeClientStream Pipe = pipe;
         public readonly byte Lane = lane, Type = type, Want = want;
@@ -62,6 +62,7 @@ public sealed partial class CombatPipe
         public readonly CancellationToken Cancellation = cancellation;
         public readonly EdgeStateKey? StateKey = stateKey;
         public readonly long Arrival = arrival;
+        public readonly Func<bool>? BeforeWrite = beforeWrite;
         public readonly TaskCompletionSource<EdgePipeReply> Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public uint Id;
         public LinkedListNode<EdgeWork>? QueueNode;
@@ -92,7 +93,7 @@ public sealed partial class CombatPipe
     }
 
     public async Task<EdgePipeReply> EdgeRequestAsync(byte type, byte[] payload, byte expectedReplyType, EdgeLane lane,
-        CancellationToken ct = default, long? connectionRevision = null)
+        CancellationToken ct = default, long? connectionRevision = null, Func<bool>? beforeWrite = null)
     {
         using var scope = ProcessorFrameScope.Link(ct);
         ct = scope.Token;
@@ -102,7 +103,7 @@ public sealed partial class CombatPipe
             (type is >= Wo131 and <= Wo163 && payload.Length == 0))
             return EmptyEdge(EdgeOutcome.Invalid);
         if (!EdgeActive) return EmptyEdge(EdgeOutcome.Unavailable);
-        return await QueueEdgeAsync(type, payload.ToArray(), expectedReplyType, (byte)lane, 0, ct, connectionRevision);
+        return await QueueEdgeAsync(type, payload.ToArray(), expectedReplyType, (byte)lane, 0, ct, connectionRevision, beforeWrite: beforeWrite);
     }
 
     /// <summary>Submit the unchanged relay pose payload. True routes this update exclusively through the native edge.</summary>
@@ -177,7 +178,8 @@ public sealed partial class CombatPipe
     private static EdgePipeReply EmptyEdge(EdgeOutcome outcome) => new(outcome, []);
 
     private async Task<EdgePipeReply> QueueEdgeAsync(byte type, byte[] payload, byte want, byte lane, uint key,
-        CancellationToken ct, long? connectionRevision = null, EdgeStateKey? stateKey = null, long arrival = 0)
+        CancellationToken ct, long? connectionRevision = null, EdgeStateKey? stateKey = null, long arrival = 0,
+        Func<bool>? beforeWrite = null)
     {
         EdgeWork request;
         lock (_edgeLock)
@@ -192,7 +194,7 @@ public sealed partial class CombatPipe
             }
             if (_edgePending.Count >= EdgeMaxPending) return EmptyEdge(EdgeOutcome.Unavailable);
 
-            request = new(pipe, lane, type, want, key, payload, ct, stateKey, arrival);
+            request = new(pipe, lane, type, want, key, payload, ct, stateKey, arrival, beforeWrite);
             do { request.Id = unchecked(++_edgeNextId); }
             while (request.Id == 0 || _edgePending.ContainsKey(request.Id));
             _edgePending.Add(request.Id, request);
@@ -256,10 +258,11 @@ public sealed partial class CombatPipe
                 await _writeLock.WaitAsync(deadline.Token);
                 try
                 {
+                    bool valid = work.BeforeWrite?.Invoke() != false;
                     lock (_edgeLock)
                     {
                         if (!_edgePending.ContainsKey(work.Id)) continue;
-                        if (!EdgeTransportOn || !ReferenceEquals(_pipe, work.Pipe) || work.Cancellation.IsCancellationRequested)
+                        if (!valid || !EdgeTransportOn || !ReferenceEquals(_pipe, work.Pipe) || work.Cancellation.IsCancellationRequested)
                         {
                             FinishEdge(work, EmptyEdge(EdgeOutcome.Unavailable));
                             continue;

@@ -179,4 +179,28 @@ public class T3NativeCountersTests
         BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(3 + 5 * 9), ulong.MaxValue);
         Assert.False(T3NativeCounters.TryReadTimeline(page, out _));
     }
+
+    [Fact]
+    public void Controller_stats_keep_provenance_and_pull_evidence_together()
+    {
+        byte[] page = Payload(14);
+        Assert.Equal(128, page.Length);
+        Assert.True(T3NativeCounters.TryReadController(page, out var values));
+        Assert.Equal(0, values["rp_ctrl_frames"]);
+        Assert.Equal(2, values["rp_req_fail"]);
+        Assert.Equal(3, values["rp_fallback_by_jump"]);
+        Assert.Equal(6, values["rp_fallback_by_air"]);
+        Assert.Equal(7, values["rp_hard_tp_by_join"]);
+        Assert.Equal(9, values["rp_hard_tp_by_travel"]);
+        Assert.Equal(10, values["rp_hard_tp_unsafe"]);
+        Assert.Equal(11, values["rp_pulls_per_min"]);
+        Assert.Equal(12, values["rp_pull_n"]);
+        Assert.Equal(13, values["rp_pull_observed_ms"]);
+        Assert.False(T3NativeCounters.TryReadController(Payload(13), out _));
+        Assert.False(T3NativeCounters.TryReadController(Payload(55), out _));
+        Assert.False(T3NativeCounters.TryReadController(Payload(6), out _));
+        Assert.False(T3NativeCounters.TryReadTimeline(page, out _));
+        page[2 + 13 * 9] = 12;
+        Assert.False(T3NativeCounters.TryReadController(page, out _));
+    }
 }

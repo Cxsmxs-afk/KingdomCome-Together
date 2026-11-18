@@ -49,6 +49,20 @@ struct In {
 
 // The writer asks before it writes a bound body it holds (main thread, the frame hook).
 Out frame(const In& in);
+enum class Remote : uint8_t { Writer, Driven, Draining };
+struct RemoteIn {
+    uint32_t eid = 0;
+    uint8_t peer = 0;
+    void* ent = nullptr;
+    const char* name = nullptr;
+    float pose[4]{}; // pose selected on the shared host timeline
+    float vx = 0, vy = 0, pace = 0;
+    bool crouch = false;
+    double now = 0;
+};
+// Dedicated ground-only partner lane (Main). Observed is the real body
+// position produced by the engine before this frame's request.
+Remote remote_frame(const RemoteIn& in, float observed[3]);
 // False while the previous controller request could still move the body.
 bool release(uint32_t eid, const char* why);
 // This body's gait, start and stop are the engine's own this frame (the gait inputs and the owner's walk family stay off it).

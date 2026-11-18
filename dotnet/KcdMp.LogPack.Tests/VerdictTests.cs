@@ -225,20 +225,70 @@ public class VerdictTests
     }
 
     [Theory]
-    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1245", "1.245")]
-    [InlineData("MP-RP-STEP rp_step_n=0 rp_step_ratio=1245", "–")]
-    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1.245", "–")]
-    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1245\nMP-RP-STEP rp_step_n=3 rp_step_ratio=1300", "–")]
-    public void Step_ratio_uses_a_scoped_record_from_the_two_game_probe(string record, string expected)
+    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=899", "0.899", VerdictStatus.Yellow)]
+    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=900", "0.900", VerdictStatus.Green)]
+    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1100", "1.100", VerdictStatus.Green)]
+    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1101", "1.101", VerdictStatus.Yellow)]
+    [InlineData("MP-RP-STEP rp_step_n=0 rp_step_ratio=1245", "–", VerdictStatus.Grey)]
+    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1.245", "–", VerdictStatus.Grey)]
+    [InlineData("MP-RP-STEP rp_step_n=2 rp_step_ratio=1245\nMP-RP-STEP rp_step_n=3 rp_step_ratio=1300", "–", VerdictStatus.Grey)]
+    public void Step_ratio_uses_a_scoped_record_from_the_two_game_probe(string record, string expected, VerdictStatus status)
     {
         var input = new Briefing.Input();
         input.Logs["agent.log"] = ["MP-T3-STATS origin=agent role=joiner rp_step_n=0 rp_step_ratio=0"];
         input.Logs["rp-step.log"] = record.Split('\n');
         var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "rp_step_ratio");
         Assert.Equal(expected, row.Measurement);
-        Assert.Equal(VerdictStatus.Grey, row.Status);
+        Assert.Equal(status, row.Status);
         if (expected != "–") Assert.Contains("rp-step.log, n=2", row.Evidence);
     }
+
+    [Fact]
+    public void A_paired_skeleton_record_takes_precedence_over_raw_frame_estimates()
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = ["MP-T3-STATS origin=agent role=joiner rp_step_n=1000 rp_step_ratio=1500"];
+        input.Logs["rp-step.log"] = ["MP-RP-STEP rp_step_n=2 rp_step_ratio=995"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "rp_step_ratio");
+        Assert.Equal(VerdictStatus.Green, row.Status);
+        Assert.Equal("0.995", row.Measurement);
+        Assert.Contains("gepaarte Skelettmessung", row.Evidence);
+    }
+
+    [Theory]
+    [InlineData("rp_pulls_per_min=0 rp_pull_n=0 rp_pull_observed_ms=0", VerdictStatus.Grey, "–")]
+    [InlineData("rp_pulls_per_min=0 rp_pull_observed_ms=300000", VerdictStatus.Grey, "–")]
+    [InlineData("rp_pulls_per_min=0 rp_pull_n=1 rp_pull_observed_ms=300000", VerdictStatus.Grey, "–")]
+    [InlineData("rp_pulls_per_min=0 rp_pull_n=0 rp_pull_observed_ms=60000", VerdictStatus.Green, "0.000 / min")]
+    [InlineData("rp_pulls_per_min=199 rp_pull_n=1 rp_pull_observed_ms=300001", VerdictStatus.Green, "0.199 / min")]
+    [InlineData("rp_pulls_per_min=200 rp_pull_n=1 rp_pull_observed_ms=300000", VerdictStatus.Yellow, "0.200 / min")]
+    public void Pull_rate_needs_matching_raw_count_and_observation_time(string counters, VerdictStatus expected, string measurement)
+    {
+        var input = new Briefing.Input();
+        input.Logs["kcdmp-native.log"] = [$"MP-T3-STATS origin=dll source=agent role=host {counters}"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "rp_pulls_per_min");
+        Assert.Equal(expected, row.Status);
+        Assert.Equal(measurement, row.Measurement);
+    }
+
+    [Theory]
+    [InlineData(0, 0, VerdictStatus.Grey)]
+    [InlineData(0, 15, VerdictStatus.Green)]
+    [InlineData(1, 0, VerdictStatus.Red)]
+    public void Hard_teleports_outside_approved_reasons_are_red_with_or_without_driving_coverage(int unsafePlacements, int frames, VerdictStatus expected)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [
+            $"MP-T3-STATS origin=agent role=joiner rp_hard_tp_by_join=1 rp_hard_tp_by_respawn=1 rp_hard_tp_by_travel=1 rp_hard_tp_unsafe={unsafePlacements} rp_ctrl_frames={frames}"];
+        var rows = VerdictRules.Evaluate(input).Rows;
+        Assert.Equal(expected, Assert.Single(rows, row => row.Id == "rp_hard_tp_unsafe").Status);
+        Assert.Equal(VerdictStatus.Grey, Assert.Single(rows, row => row.Id == "rp_hard_tp_by_respawn").Status);
+    }
+
+    [Theory]
+    [InlineData("MP-RP-CTRL figure=kcd2mp_1 eid=0x42 ctrl_frames=480")]
+    [InlineData("MP-RP-CTRL-STANCE body=kcd2mp_1 eid=0x42 owner=driver crouch=1 result=confirmed")]
+    public void Collection_keeps_scoped_controller_and_stance_readback(string line) => Assert.True(NoiseRules.IsProtected(line));
 
     [Fact]
     public void The_pairing_role_comes_from_the_current_agent_and_conflicting_roles_are_unknown()

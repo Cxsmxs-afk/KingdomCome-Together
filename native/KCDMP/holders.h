@@ -17,6 +17,7 @@ namespace kcdmp::holders {
 
 const char* name(Holder h);
 constexpr char kStreamSetter[] = "npc-drive-stream";
+constexpr char kRemoteControllerSetter[] = "bodydrive::remote-controller";
 
 struct Claims {
     bool fall = false;       // dead, unconscious or carried (the stream's bits), or lying for its host NPC's knockdown: the engine's ragdoll / the carrier

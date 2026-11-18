@@ -100,6 +100,7 @@ if r.drive then
   if dx~=0 or dy~=0 then player:SetWorldAngles({x=0,y=0,z=math.atan2(-dx,dy)}) end
   player:SetWorldPos({x=x,y=y,z=z})
 end
+if r.observe then r.observe(r,t,x,y,z) end
 if t>=r.stair1 and t<=r.stair2 then
   local q=player:GetWorldPos(); r.stairs=r.stairs+1
   if (q.x-x)^2+(q.y-y)^2<=4 and math.abs(q.z-z)<=0.6 then r.near=r.near+1 end

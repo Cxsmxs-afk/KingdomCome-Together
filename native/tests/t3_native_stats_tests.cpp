@@ -85,6 +85,17 @@ int t3_native_stats_tests(int* passed) {
         check(timeline[2 + 9*i] == i, "timeline field has its own page ID");
         check(kcdmp::p4rules::u64(timeline.data() + 3 + 9*i) == timelineCounts[i], "timeline values and matching observation counts retain precise encoding");
     }
+    std::array<uint8_t, 132> controller;
+    controller.fill(0xDA);
+    const auto untouchedController = controller;
+    const uint64_t controllerCounts[] = {1500, 1499, 1, 2, 3, 4, 5, 6, 7, 8, 0, 199, 1, 301508};
+    check(kcdmp::t3native::write_controller(controller.data(), 127, controllerCounts) == 0 && controller == untouchedController,
+        "controller short reply is untouched");
+    check(kcdmp::t3native::write_controller(controller.data(), controller.size(), controllerCounts) == 128 &&
+        controller[0] == 1 && controller[1] == 14 && controller[128] == 0xDA, "controller is a separate 128-byte page");
+    for (size_t i = 0; i < kcdmp::t3native::kControllerFields; ++i)
+        check(controller[2 + 9*i] == i && kcdmp::p4rules::u64(controller.data() + 3 + 9*i) == controllerCounts[i],
+            "controller page preserves every exact outcome, reason, or observation field");
     p6 = base;
     check(kcdmp::t3native::append_rp_measure(p6.data(), 272, 424, measure) == 0 && p6 == base,
         "short replies cannot contain partial measurement coverage");

@@ -172,6 +172,7 @@ public partial class GameBridge
             byte role = W137Host ? (byte)1 : W137Joiner || _jj is not null ? (byte)2 : (byte)0;
             Dictionary<string, long>? nativeSnapshot = null;
             IReadOnlyDictionary<string, long>? timelineSnapshot = null;
+            IReadOnlyDictionary<string, long>? controllerSnapshot = null;
             if (role != 0)
             {
                 var result = await ProcessorFrameScope.RunAsync(async token =>
@@ -209,31 +210,35 @@ public partial class GameBridge
                 // A DLL that implements the previous edge snapshot may also
                 // support the independent timeline page. Refusal leaves it absent.
                 if (nativeSnapshot?.ContainsKey("edge_rt_n") == true)
-                    timelineSnapshot = await T3ReadTimelineStatsAsync(ct);
+                    timelineSnapshot = await T3ReadNativePageAsync(Protocol.T3TimelineStatsCommand, T3NativeCounters.TryReadTimeline, ct);
+                if (timelineSnapshot is not null)
+                    controllerSnapshot = await T3ReadNativePageAsync(Protocol.T3ControllerStatsCommand, T3NativeCounters.TryReadController, ct);
             }
             ct.ThrowIfCancellationRequested();
-            T3EmitStats(role, ct, nativeSnapshot, timelineSnapshot);
+            T3EmitStats(role, ct, nativeSnapshot, timelineSnapshot, controllerSnapshot);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex) { Console.WriteLine($"MP-T3-STATS report unavailable: {ex.GetType().Name}"); }
         finally { Interlocked.Exchange(ref _t3StatsBusy, 0); }
     }
 
-    private async Task<IReadOnlyDictionary<string, long>?> T3ReadTimelineStatsAsync(CancellationToken ct)
+    private delegate bool ReadT3Page(ReadOnlySpan<byte> payload, out Dictionary<string, long> counters);
+
+    private async Task<IReadOnlyDictionary<string, long>?> T3ReadNativePageAsync(byte command, ReadT3Page read, CancellationToken ct)
     {
         Dictionary<string, long>? snapshot = null;
         var result = await ProcessorFrameScope.RunAsync(async token =>
         {
-            var reply = await _combat.Wo163Async(Protocol.T3OpStats, [Protocol.T3TimelineStatsCommand], token);
+            var reply = await _combat.Wo163Async(Protocol.T3OpStats, [command], token);
             ProcessorFrameScope.ThrowIfAbandoned();
-            if (reply is { Ok: true } b && T3NativeCounters.TryReadTimeline(b.Payload, out var values))
+            if (reply is { Ok: true } b && read(b.Payload, out var values))
                 snapshot = values;
         }, 2000, ct);
         return result.Status == ProcessorFrameScope.Outcome.Completed ? snapshot : null;
     }
 
     private void T3EmitStats(byte role, CancellationToken ct, IReadOnlyDictionary<string, long>? nativeSnapshot,
-        IReadOnlyDictionary<string, long>? timelineSnapshot)
+        IReadOnlyDictionary<string, long>? timelineSnapshot, IReadOnlyDictionary<string, long>? controllerSnapshot)
     {
         foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(T3LootCounters.CorpseKeys).Concat(T3RangedKeys).Concat(new[] {
             "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable", "corpse_lua_stats_unreadable" }))
@@ -255,6 +260,7 @@ public partial class GameBridge
                 .Where(nativeSnapshot.ContainsKey)
                 .Select(key => KeyValuePair.Create(key, nativeSnapshot[key])));
         if (timelineSnapshot is not null) counters = counters.Concat(timelineSnapshot);
+        if (controllerSnapshot is not null) counters = counters.Concat(controllerSnapshot);
         string fields = string.Join(' ', counters.OrderBy(p => p.Key, StringComparer.Ordinal)
             .Select(p => p.Key + "=" + p.Value.ToString(CultureInfo.InvariantCulture)));
         Console.WriteLine($"MP-T3-STATS origin=agent role={(role == 1 ? "host" : role == 2 ? "joiner" : "off")} {fields}");

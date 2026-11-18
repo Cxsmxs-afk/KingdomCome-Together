@@ -142,3 +142,35 @@ Beide Varianten mit neuem `KCDMP_RIG_RUN` und einem frisch gestarteten Relay fü
 3. Der Host wiederholt die Folge als Sender. Bei wechselnder Netzqualität auf weiches Halten und sichtbare Sprünge achten.
 4. Den Lauf mit 150 ms plus Jitter wiederholen. Beide LogPack-Bundles sammeln. Pro `installed`-Schlag Figuren-ID, Host-Zeit und die zugehörige Pose prüfen.
 5. `rp_action_pos_skew_ms_p95`, Stichproben, Puffer und Extrapolation ablesen. Fehlende Proben festhalten und auf beiden Seiten `owner_violations=0` prüfen.
+
+## s2-5 · Engine-Controller für den zweiten Henry
+
+`mp_rp_controller` steht standardmäßig auf `on`. `rpwalk` verwendet eine 60-s-Strecke mit Treppe, Hang und drei Gangarten. `$Route` zeigt auf eine lokale JSON-Datei mit `points` und `stairs` wie bei `rpmeasure`. `slope` enthält Start und Ende eines eigenen Hangabschnitts mit wenigstens 0,5 m Höhenänderung auf 2 m horizontaler Strecke. `gaits` enthält `walk`, `run` und `sprint` mit je zwei Wegpunktzeiten. Die Gangabschnitte dauern mindestens vier Sekunden und liegen in dieser Reihenfolge. Die geplanten Geschwindigkeiten liegen bei 0,5 bis unter 2,4 m/s, 2,4 bis unter 4,0 m/s und 4,0 bis 6,0 m/s. Die Strecke vor dem Lauf im Spiel abgehen. Der echte Sender folgt der Strecke ab dem Rig-Signal, während das Werkzeug seine Position und Geschwindigkeit liest.
+
+`rpstance` benötigt einen stehenden, mit einer Nahkampfwaffe ausgerüsteten Sender und freie Sicht. Das Rig lässt die Spielfigur über den bekannten Konsolenpfad ducken und aufstehen. Danach zieht der Sender die Waffe über den Spielaufruf. Am Empfänger zählen der bestätigte Haltungswechsel des Controllers und das Auslesen der gezogenen Waffe in der Hand der gleichen Körper-ID. `--sender host` wechselt in beiden Szenarien die Richtung.
+
+```powershell
+$env:KCDMP_TEST_RP_CONTROLLER = '1'
+$env:KCDMP_RIG_RUN = 'rp-controller-normal'
+python tools/rig/pair.py relay --netz normal
+python tools/rig/scenarios.py rpwalk --test-rp-controller --netz normal --route $Route
+python tools/rig/scenarios.py rpstance --test-rp-controller --netz normal
+```
+
+Für die T4-Varianten nur Relay und geladenen Host nahe der Strecke starten. `$Waffenklasse` ist die lokale GUID einer ausrüstbaren Nahkampfwaffe. Der Bot sendet die Wegpunkte und Ganggeschwindigkeiten beziehungsweise die Ausrüstung, beide Haltungen und den Ziehbefehl. Die Messungen der Partnerfigur kommen von der echten Empfängerinstanz.
+
+```powershell
+$env:KCDMP_TEST_BOT = '1'
+python tools/rig/scenarios.py rpwalk --test-rp-controller --netz normal --bot --route $Route
+python tools/rig/scenarios.py rpstance --test-rp-controller --netz normal --bot --weapon-class $Waffenklasse
+```
+
+Beide Szenarien und Varianten mit einem neuen `KCDMP_RIG_RUN` und einem frisch gestarteten Relay für `--netz schlecht` wiederholen. `rpwalk.json` und `rpstance.json` nennen Körper und Messzeitraum sowie die Zählerdifferenzen. Im Bundle liegt die T1-Ampel. Das Schrittverhältnis ist von 0,9 bis 1,1 grün. Ein Pull-Wert unter 0,2 pro beobachteter Körperminute ist grün. Das Verhältnis bleibt grau, wenn die Fußzyklen bei vergleichbarer Geschwindigkeit fehlen. Das gilt für den Bot ohne Sender-Skelett. Bestätigte harte Teleports außerhalb von Join, Respawn und Reise sind rot. `owner_violations` bleibt null. Die Sichtprüfung von Füßen und Bewegung steht aus.
+
+### Zwei-PC-Checkliste
+
+1. Mit demselben Build verbinden und eine Strecke mit Treppe und Hang wählen. Zuschauer und aktive Figur bleiben in Sichtweite.
+2. Die Strecke gehen, laufen und sprinten. Am Empfänger Füße und Bodenkontakt auf Treppe und Hang prüfen. Auf Sprünge und Pulls achten.
+3. Stehen, ducken, geduckt bewegen, aufstehen und eine Nahkampfwaffe ziehen. Am Empfänger Haltung und Waffe am selben Henry prüfen.
+4. Rollen tauschen und mit 150 ms zusätzlicher Relay-Latenz plus Jitter wiederholen. Bewegungsunterbrechungen und Wechsel auf den Writer im Log festhalten.
+5. Beide Bundles sammeln. Engine-Requests, Schrittverhältnis, Pulls und Teleport-Gründe prüfen. `owner_violations` bleibt null, harte Teleports haben einen erlaubten Grund.

@@ -15,7 +15,7 @@ static partial class P
     private static readonly HashSet<string> BotVerbs = new(StringComparer.Ordinal)
     {
         "stand", "move", "curve", "strafe", "state", "attack", "block_impulse", "hit",
-        "vitals", "death", "respawned", "ranged", "appearance", "bow_equip", "activity", "ride"
+        "vitals", "death", "respawned", "ranged", "appearance", "bow_equip", "activity", "ride", "draw", "sheathe"
     };
     private static readonly string[] BotOptions = ["--test-bot", "--self-test", "--origin", "--bow-class", "--tables-pak", "--duration", "--wire-version"];
     private static readonly string[] BotValueOptions =
@@ -166,7 +166,7 @@ static partial class P
                 if (Finite(f[1]) is >= 0 and <= 100 && Finite(f[2]) is >= 0 and <= 100 &&
                     (f.Length == 3 || (f[0] == "hit" ? f[3] == "unarmed" : f[3] is "downed" or "knockeddown"))) return;
                 break;
-            case "death" or "bow_equip" when Count(1, 1): return;
+            case "death" or "bow_equip" or "draw" or "sheathe" when Count(1, 1): return;
             case "ranged" when Count(2, 2): _ = BotRangedPhase(f[1]); return;
             case "appearance" when Count(2, 2):
                 if (f[1].Split(',').All(s => Guid.TryParseExact(s, "D", out Guid id) && id != Guid.Empty)) return;
@@ -374,7 +374,9 @@ static partial class P
             var handoverPlan = ReadBotPlan(["at 0 stand 0 0 0 0", "at 2 activity stance 3 0123456789abcdef",
                 "at 3 activity none", "at 4 ride horse[rig]", "at 5 ride off", "end 6"]);
             if (handoverPlan.Steps.Count != 5) throw new InvalidOperationException("T4 owner handover plan self-test failed.");
-            foreach (string invalid in new[] { "activity stance 3 0000000000000000", "activity stance 256 0123456789abcdef", "activity bad", "ride", "ride -", "ride " + new string('á', 128) })
+            var stancePlan = ReadBotPlan(["at 0 stand 0 0 0 0", "at 2 state crouch=1", "at 3 state crouch=0", "at 4 draw", "at 5 sheathe", "end 6"]);
+            if (stancePlan.Steps.Count != 5) throw new InvalidOperationException("T4 controller stance plan self-test failed.");
+            foreach (string invalid in new[] { "activity stance 3 0000000000000000", "activity stance 256 0123456789abcdef", "activity bad", "ride", "ride -", "ride " + new string('á', 128), "draw extra", "sheathe extra" })
             {
                 try
                 {

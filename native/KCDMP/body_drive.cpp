@@ -42,6 +42,7 @@
 #include "motion.h"
 #include "npc_drive.h"
 #include "respawn_actions.h"
+#include "rp_controller.h"
 #include "wo203.h"
 #include "wo208.h"
 #include "wo208_rules.h"
@@ -132,6 +133,7 @@ struct Drv {
     uint32_t frames = 0, moved = 0, within50 = 0, over200 = 0, snaps = 0, walkFrames = 0, walkWithin50 = 0;
     double errSum = 0, errMax = 0, jumpMaxCm = 0, jumpSumCm = 0, spdSum = 0, wantSum = 0, hostSum = 0;
     uint32_t totalSnaps = 0;
+    bool remote = false;
 };
 std::unordered_map<uint32_t, Drv> g_drv;
 std::atomic<uint32_t> c_frames{0}, c_snaps{0}, c_arrives{0}, c_ends{0}, c_lodFrames{0}, c_noMove{0}, c_restFrames{0}, c_standFrames{0}, c_famEnds{0}, c_famFrames{0}, c_lost{0}, c_lostFrames{0}, c_snapRests{0};
@@ -165,14 +167,19 @@ void* controller_of(void* actor) {
 
 // One request to the body's controller. walking: a move target `to` at `mps` (class `cls`), `endM` to the path's end; standing: no
 // move target, no speed. Returns false when the body has no controller of the checked kind.
-bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float cls, float endM, double now) {
+bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float cls, float endM, double now,
+          const float* face = nullptr, bool* attempted = nullptr) {
     void* ctl = controller_of(actor);
     if (!ctl) return false;
     alignas(16) uint8_t req[kReqSize];
     std::memset(req, 0, sizeof req);
     const float one = 1.0f;
     std::memcpy(req + kReqDefaultOne, &one, 4);
-    uint64_t flags = kHasSpeed | kHasPseudo | kRemBody;
+    uint64_t flags = kHasSpeed | kHasPseudo;
+    if (face) {
+        flags |= kHasBody;
+        std::memcpy(req + kReqBodyTarget, face, 12);
+    } else flags |= kRemBody;
     if (walking) {
         flags |= kHasMove;
         std::memcpy(req + kReqMoveTarget, to, 12);
@@ -189,15 +196,18 @@ bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float
     // the outgoing driver's last operation, so it never claims a new owner.
     using holders::Holder;
     const Holder current = holders::of(d.eid);
-    if (walking && (current == Holder::None || current == Holder::Writer || current == Holder::Figure || current == Holder::Driver) &&
+    const bool taking = walking || face != nullptr;
+    if (taking && (current == Holder::None || current == Holder::Writer || current == Holder::Figure || current == Holder::Driver) &&
         !holders::handover(d.eid, d.name.c_str(), Holder::Driver, now)) return false;
-    const auto claim = walking ? holders::Claim::Held : holders::Claim::Release;
-    auto permit = holders::may_place(d.eid, Holder::Driver, "bodydrive::RequestMovement", claim);
+    const auto claim = taking ? holders::Claim::Held : holders::Claim::Release;
+    auto permit = holders::may_place(d.eid, Holder::Driver,
+        d.remote ? holders::kRemoteControllerSetter : "bodydrive::RequestMovement", claim);
     if (!permit) return false;
     bool ok = false;
-    if (walking) d.active = true;   // a fault can follow a partial request merge
+    if (attempted) *attempted = true;
+    if (taking) d.active = true;   // a fault can follow a partial request merge
     if (!call_request(g_fnRequest, ctl, req, &ok)) {
-        if (walking) permit.wrote();   // the controller may have merged part of the request before the fault
+        if (taking) permit.wrote();   // the controller may have merged part of the request before the fault
         g_armed = false; g_why = "RequestMovement faulted";
         logf("WO221-DRIVE RequestMovement FAULTED on %s: new requests disabled; an existing request must end before writing", d.name.c_str());
         return false;
@@ -205,7 +215,7 @@ bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float
     permit.wrote();
     // Even a declined movement request may have changed controller fields.
     // Keep its claim until we have sent the matching stop successfully.
-    d.active = walking || !ok;
+    d.active = taking || !ok;
     d.walking = walking;
     return ok;
 }
@@ -311,6 +321,53 @@ const bool kReg = wo203::reg_install("body_drive", &install) && wo203::reg_tick(
 } // namespace
 
 bool armed() { return g_armed.load(std::memory_order_relaxed); }
+
+Remote remote_frame(const RemoteIn& in, float observed[3]) {
+    const auto writer = [&] { return release(in.eid, "remote controller handover") ? Remote::Writer : Remote::Draining; };
+    if (!g_armed.load(std::memory_order_relaxed) || !wo221::on(wo221::kBitRemoteController) || !in.ent ||
+        !in.name || !rpctrl::finite_position(in.pose) || !std::isfinite(in.pose[3]) ||
+        !std::isfinite(in.vx) || !std::isfinite(in.vy) || !std::isfinite(in.pace)) return writer();
+    void* actor = motion::actor_of(in.eid);
+    if (!actor || !engine::entity_world_pos(in.ent, observed) || !rpctrl::finite_position(observed)) return writer();
+    uint8_t lod = 0;
+    if (g_lodKnown && (!rd(actor, kActorLodByte, &lod) || (lod & kActorLodBit))) return writer();
+
+    Drv& d = g_drv[in.eid];
+    if (d.eid != in.eid || d.ent != in.ent || !d.remote) {
+        if (!end_request(d, "remote controller identity")) return Remote::Draining;
+        d = Drv{};
+        d.eid = in.eid; d.ent = in.ent; d.name = in.name; d.remote = true;
+    }
+    const double dt = d.lastAt > 0.0 ? in.now - d.lastAt : 0.0;
+    const float moved = d.havePrev ? rpctrl::distance(d.prev, observed) : 0.f;
+    if (d.active && d.havePrev && dt >= 0.001 && dt <= 0.250)
+        rpctrl::observed(in.eid, in.peer, static_cast<uint64_t>(std::round(dt * 1000.0)),
+                         rpctrl::pull(moved, d.wantPrev, dt));
+    if (in.now < d.restUntil) return writer();
+    if (d.active && d.havePrev && dt >= 0.001 && dt <= 0.250 && d.wantPrev >= 0.5f &&
+        moved / static_cast<float>(dt) < 0.10f) {
+        if (!d.noMoveSince) d.noMoveSince = in.now;
+        else if (in.now - d.noMoveSince >= 0.65) {
+            d.restUntil = in.now + 1.0;
+            return writer();
+        }
+    } else d.noMoveSince = 0;
+    const auto plan = rpctrl::movement(observed, in.pose, in.vx, in.vy,
+                                      (std::clamp)(in.pace, 0.f, 6.5f), in.crouch, d.wantPrev, dt);
+    bool attempted = false;
+    const bool accepted = send(d, actor, plan.walking, plan.move, plan.speed, plan.gait, plan.endM, in.now,
+                               plan.face, &attempted);
+    if (attempted) rpctrl::request(in.eid, in.peer, accepted, static_cast<unsigned>(plan.gait));
+    if (!accepted) {
+        d.restUntil = in.now + 1.0;
+        return writer();
+    }
+    d.lastAt = g_lastFrameAt = in.now;
+    std::memcpy(d.prev, observed, sizeof d.prev);
+    d.havePrev = true;
+    d.wantPrev = plan.speed;
+    return Remote::Driven;
+}
 
 Out frame(const In& in) {
     if (!g_armed.load(std::memory_order_relaxed) || !wo221::on(wo221::kBitDrive) || !in.name || !in.ent) return Out::Writer;

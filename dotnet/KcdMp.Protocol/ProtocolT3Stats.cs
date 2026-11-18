@@ -33,6 +33,12 @@ public static class T3NativeCounters
     private static readonly string[] TimelineKeys = [
         "rp_buffer_ms", "rp_extrap_ms_max", "rp_late_samples", "rp_action_pos_skew_ms_p95", "rp_timeline_pose_n", "rp_timeline_skew_n"
     ];
+    private static readonly string[] ControllerKeys = [
+        "rp_ctrl_frames", "rp_req_ok", "rp_req_fail",
+        "rp_fallback_by_jump", "rp_fallback_by_mount", "rp_fallback_by_ragdoll", "rp_fallback_by_air",
+        "rp_hard_tp_by_join", "rp_hard_tp_by_respawn", "rp_hard_tp_by_travel", "rp_hard_tp_unsafe",
+        "rp_pulls_per_min", "rp_pull_n", "rp_pull_observed_ms"
+    ];
 
     private static bool TryReadFields(ReadOnlySpan<byte> payload, string[] keys, Span<bool> seen, out Dictionary<string, long> values)
     {
@@ -73,10 +79,17 @@ public static class T3NativeCounters
     }
 
     /// <summary>Op250 with the timeline subcommand returns a separate bounded page.</summary>
-    public static bool TryReadTimeline(ReadOnlySpan<byte> payload, out Dictionary<string, long> values)
+    public static bool TryReadTimeline(ReadOnlySpan<byte> payload, out Dictionary<string, long> values) =>
+        TryReadPage(payload, TimelineKeys, out values);
+
+    /// <summary>Controller samples and elapsed observation time share their own Op250 page.</summary>
+    public static bool TryReadController(ReadOnlySpan<byte> payload, out Dictionary<string, long> values) =>
+        TryReadPage(payload, ControllerKeys, out values);
+
+    private static bool TryReadPage(ReadOnlySpan<byte> payload, string[] keys, out Dictionary<string, long> values)
     {
         Span<bool> seen = stackalloc bool[256];
-        return TryReadFields(payload, TimelineKeys, seen, out values) &&
-            payload[1] == TimelineKeys.Length && values.Count == TimelineKeys.Length;
+        return TryReadFields(payload, keys, seen, out values) &&
+            payload[1] == keys.Length && values.Count == keys.Length;
     }
 }

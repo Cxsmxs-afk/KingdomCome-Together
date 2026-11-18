@@ -11,4 +11,5 @@ public static partial class Protocol
     public const byte T3OpStats = 250;
     public const byte T3PresentationClockCommand = 3;
     public const byte T3TimelineStatsCommand = 4;
+    public const byte T3ControllerStatsCommand = 5;
 }
