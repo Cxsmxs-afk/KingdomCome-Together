@@ -45,6 +45,7 @@ uint8_t on_config(const uint8_t* body, size_t len);
 
 // Avatars, from motion.cpp (main thread): the soul the hook restores.
 void note_avatar(uint32_t eid, void* soul, bool on);
+bool avatar_known(uint32_t eid); // cached registered avatar identity
 
 struct AttribResult { bool ok = false; uint8_t steps = 0; uint8_t reason = 0; uint64_t attackerWuid = 0, victimWuid = 0; };
 // 0x19, main thread: [guid:16][st:4f][hp:4f][flags:1][attackerEid:4][nameLen:1][name]

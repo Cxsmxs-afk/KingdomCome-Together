@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // WO-131 -- see wo131.h.
 #include "wo131.h"
+#include "p6_missile.h"
 #include "fault_guard.h"
 
 #include <windows.h>
@@ -206,10 +207,12 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
         if (std::isfinite(wantSt) && wantSt >= 0.0f) {   // WO-200 II.1: the host's stamina of its NPC (never set from anything local)
             float st = -1;
             if (rttr::soul_state(soul, "stamina", &st) && std::fabs(st - wantSt) >= 1.0f) {
+                p6::remote_follow_eid(eid);
                 if (rttr::soul_set_state(soul, "stamina", wantSt)) c_followStamina.fetch_add(1);
             }
         }
         if (std::fabs(target - before) < 0.5f) { put_f(out, before); put_f(out + 4, before); *outLen = 8; return kROk; }
+        p6::remote_follow_eid(eid); // includes a host follow that raises health
         if (target < before) { rttr::note_remote_damage(a, before - target); c_followCredit.fetch_add(1); }
         if (!rttr::soul_set_state(soul, "health", target)) { c_fail.fetch_add(1); return kRFailed; }
         rttr::soul_state(soul, "health", &after);
@@ -241,6 +244,7 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
         void* cs = buffs::as_c_soul(soul) ? buffs::as_c_soul(soul) : soul;
         float before = -1, after = -1;
         rttr::soul_state(cs, "health", &before);
+        p6::remote_follow_eid(eid);
         if (!rttr::soul_set_state(cs, "health", want)) { c_fail.fetch_add(1); return kRFailed; }
         rttr::soul_state(cs, "health", &after);
         c_restore.fetch_add(1);

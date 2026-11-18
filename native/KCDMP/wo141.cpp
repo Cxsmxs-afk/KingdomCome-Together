@@ -478,6 +478,28 @@ bool read_hand_class(void* state, unsigned slot, KH::ClassId* out) {
     return true;
 }
 
+bool read_hand_strict(void* state,unsigned slot,KH::ClassId* out){
+    *out={};void* b=nullptr;void* e=nullptr;void* el=nullptr;
+    if(!rd(state,kStateElemsB,&b)||!rd(state,kStateElemsE,&e)||!b||e<b)return false;
+    const size_t bytes=static_cast<size_t>(static_cast<char*>(e)-static_cast<char*>(b));
+    if(bytes%16||bytes/16>256||bytes/16<=slot||!rd(b,slot*16,&el))return false;
+    if(!el)return true; // actual empty slot
+    if(!is_a(el,g_vftHand)&&!is_a(el,g_vftHandReq))return false;
+    uint64_t w=0;
+    if(!rd64(el,kHandWuid,&w)||!wuid_valid(w))return false;
+    void* item=actions::item_by_wuid(w);
+    return item&&actions::item_class_id(item,out->b)&&!out->empty();
+}
+uint8_t strict_hands(uint32_t eid,KH::Hands* out){
+    *out={};void* ctx=ctx_of_eid(eid);
+    if(!ctx||!g_vftHand||!g_vftHandReq)return 0;
+    void* st=static_cast<char*>(ctx)+kCtxCurrent;
+    uint8_t known=0;
+    if(read_hand_strict(st,KH::kSlotLeft,&out->left))known|=1;else out->left={};
+    if(read_hand_strict(st,KH::kSlotRight,&out->right))known|=2;else out->right={};
+    return known;
+}
+
 bool read_hands(uint32_t eid, KH::Hands* out) {
     *out = KH::Hands{};
     void* ctx = ctx_of_eid(eid);
@@ -1441,6 +1463,7 @@ int unstance_index(const char* name) { return unstance_id(name); }
 
 bool hands_armed() { return g_handsArmed; }
 bool read_body_hands(uint32_t eid, KH::Hands* out) { return read_hands(eid, out); }
+uint8_t read_body_hands_strict(uint32_t eid,KH::Hands* out){return out?strict_hands(eid,out):0;}
 std::string hand_classes_text(const KH::Hands& h) { return hands_text(h); }
 std::string class_id_text(const KH::ClassId& c) { return class_text(c); }
 bool apply_on() { return g_applyOn.load(); }

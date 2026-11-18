@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/t3-p5-corpses-marker
+      - codex/t3-p6-bow
 
 jobs:
   build:

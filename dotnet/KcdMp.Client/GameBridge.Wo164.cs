@@ -409,7 +409,10 @@ public partial class GameBridge
                 await Wo202OnKeyShareAsync(src, m.Text);
                 return;
             case Protocol.W164RangedStep:   // WO-201 B11: the partner's crossbow / bow step, on his figure here
-                await Wo201OnRangedStepAsync(src, m.Text);
+                T3Increment("ranged_stale"); // P6 requires the actual reader world/life/peer receipt
+                return;
+            case Protocol.W164MeasuredMissile:
+                T3Increment("ranged_stale");
                 return;
             case Protocol.W164Clock:   // native calendar samples, also cached before the join's load
                 if (W137Host) { Interlocked.Increment(ref _w164Malformed); return; }

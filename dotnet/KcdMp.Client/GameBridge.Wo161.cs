@@ -116,6 +116,7 @@ public partial class GameBridge
                 await WriteJoinAsync(msg.BuildUp(ghost));
                 Wo165NoteVerdictSent(hid, verdict);   // WO-165: the joiner's engine outcome is logged against it
                 _w161Stats.Out();
+                if (missile) { T3Increment("ranged_missile_host_verdict_queued"); T3Increment("ranged_hits_verdict"); }
                 how = "verdict";
             }
             catch (Exception ex)

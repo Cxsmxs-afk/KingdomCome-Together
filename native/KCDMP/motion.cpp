@@ -1997,6 +1997,13 @@ uint8_t drop_fight_holds(uint32_t eid, const char* why) {
     return held;
 }
 
+void* local_actor(uint32_t* eid) {
+    if(eid)*eid=0;
+    void* actor=player_actor();uint32_t id=0;
+    if(!actor||!rd(actor,kActorEntityId,&id)||!id||actor_by_eid(id)!=actor||!engine::entity_by_id(id))return nullptr;
+    if(eid)*eid=id;
+    return actor;
+}
 void* actor_of(uint32_t eid) { return actor_by_eid(eid); }
 
 void loco_counters(uint32_t out[8]) {

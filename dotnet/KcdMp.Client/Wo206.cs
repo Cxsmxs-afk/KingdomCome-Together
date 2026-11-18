@@ -125,6 +125,7 @@ public static class Wo206Rules
         }
         if (p.Length < 7) return null;
         byte kind = p[6];
+        if (type == Protocol.W164Down && kind is Protocol.W164RangedStep or Protocol.W164MeasuredMissile) return Wo206Cat.Npc;
         if (type == Protocol.QuestHostDown && kind is Protocol.QuestHostChange or Protocol.QuestHostCheckpoint or Protocol.QuestHostResult) return Wo206Cat.Quest;
         if (type == Protocol.QuestAskDown && kind == Protocol.QuestAskRequest) return Wo206Cat.Quest;
         // Build is available at the menu before a host-world epoch is known.

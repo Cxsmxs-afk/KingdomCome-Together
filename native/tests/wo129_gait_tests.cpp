@@ -58,6 +58,10 @@ int pose_ring_tests(int* passed);          // pose_ring_tests.cpp (phase 3: the 
 int wo216_tests(int* passed);
 int p5_corpse_tests(int* passed);
 int p5_marker_tests(int* passed);
+int p6_rules_tests(int* passed);
+int p6_missile_flow_tests(int* passed);
+int p6_capture_flow_tests(int* passed);
+int p6_render_fence_tests(int* passed);
 int t3_native_stats_tests(int* passed);
 int p4_rules_review_tests(int* passed); // independent P4 boundary review
 int p4_flow_tests(int* passed); // actual p4.cpp with engine/clock test doubles
@@ -457,6 +461,10 @@ int main() {
     }
     { int pp = 0; const int pf = p5_corpse_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = p5_marker_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = p6_rules_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = p6_missile_flow_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = p6_capture_flow_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = p6_render_fence_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = t3_native_stats_tests(&pp); g_pass += pp; g_fail += pf; }
     {
         int pp = 0;

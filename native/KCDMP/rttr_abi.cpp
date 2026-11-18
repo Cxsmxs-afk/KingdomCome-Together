@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #include "rttr_abi.h"
+#include "p6_missile.h"
 #include "fault_guard.h"
 #include "pe_exports.h"
 #include "log.h"
@@ -1826,6 +1827,7 @@ const Carry* find_carry(const unsigned char guid[16]) {
 } // namespace
 
 void note_remote_damage(const unsigned char guid[16], float health_delta) {
+    p6::remote_follow(guid);
     if (Tracked* t = find_tracked(guid)) t->credit += health_delta;
 }
 

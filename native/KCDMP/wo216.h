@@ -43,6 +43,7 @@ bool configured();           // the agent told this DLL its word (a joiner or a 
 bool authority_active();    // P1: role 2 after explicit Gameplay + native 5 s; never the calendar latch
 bool authority_enabled();   // switch state, independent of hook readiness
 uint64_t lifecycle_generation();
+uint8_t lifecycle_role(); // cached session role, independent of authority gate
 bool lifecycle_gameplay(); // explicit local Gameplay proof, also while authority switch is off
 bool decisions_blocked();    // Paket C: no local decision batch; direct host body actions still advance
 

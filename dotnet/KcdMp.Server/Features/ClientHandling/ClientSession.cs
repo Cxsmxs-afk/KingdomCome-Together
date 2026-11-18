@@ -948,7 +948,18 @@ public class ClientSession
                 {
                     var body = new byte[payloadLen];
                     await ReadExactAsync(body);
-                    var dest = _broadcastService.RouteJoin(this, jw.Down, jw.From, body, out string why);
+                    var routeFrom = jw.From;
+                    if (type == Protocol.W164Up && body.Length > Protocol.JoinHeaderLen && LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var p6))
+                    {
+                        bool invalid = false;
+                        if (p6.Kind == Protocol.W164RangedStep) invalid = !RangedStepV2.TryDecode(p6.Text, out _);
+                        else if (p6.Kind == Protocol.W164MeasuredMissile)
+                        { routeFrom = Protocol.JoinFrom.Joiner; invalid = !MeasuredMissileRequest.TryDecode(p6.Text, out _); }
+                        else if (p6.Kind == Protocol.W164RealHit && p6.Text.StartsWith("m1|", StringComparison.Ordinal))
+                        { routeFrom = Protocol.JoinFrom.Host; invalid = !MeasuredMissileResult.TryDecode(p6.Text, out _); }
+                        if (invalid) { _clientHandler.CountDrop((byte)type, "p6-malformed", p6.Kind); continue; }
+                    }
+                    var dest = _broadcastService.RouteJoin(this, jw.Down, routeFrom, body, out string why);
                     if (dest is null)
                     {
                         _clientHandler.CountDrop((byte)type, why, Protocol.DropKeyHasKind(type) ? Protocol.JoinBodyKind(body) : -1);

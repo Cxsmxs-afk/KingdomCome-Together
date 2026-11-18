@@ -18,6 +18,8 @@
 #include "concept_read.h"
 #include "respawn.h"
 #include "p5_marker.h"
+#include "p6_missile.h"
+#include "p6_render_rules.h"
 #include "respawn_actions.h"
 #include "npc_drive.h"
 #include "motion.h"
@@ -239,6 +241,7 @@ bool             g_write_lock_ready = false;
 
 void send_local_hit(const unsigned char guid[16], void* soul, float health_delta, float stamina_delta, bool died) {
     const uint64_t generation = g_connGen.load();
+    if(p6::filter_sample(soul,guid,&health_delta,&stamina_delta))return; // one known missile contact has one typed route
     // WO-147: the sampler hands over the soul it measured (the old per-hit soul-list walk is gone), and a
     // stamina drop is kept only for the player's own blow (an NPC's swings and blocks cost it stamina too).
     const bool byPlayer = soul && hits::hit_by_player(soul, 1.5);
@@ -301,6 +304,7 @@ struct PendingBatch {
     uint16_t id = 0;
     uint64_t gen = 0;
     uint64_t calendarEpoch = 0;
+    p6render::Stamp renderStamp;
     std::vector<uint8_t> raw;
     std::vector<wo218rules::Sub> subs;
     size_t next = 0;
@@ -381,7 +385,7 @@ void w218_note_single(double usedUs) {
 }
 
 // One generic request, here on the main thread: the reply frame's body into rb (the exact bytes the single path sends, seq 0).
-size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, size_t cap, bool* faulted, uint64_t calendarEpoch) {
+size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, size_t cap, bool* faulted, uint64_t calendarEpoch,const p6render::Stamp& renderStamp) {
     *faulted = false;
     const uint8_t op = len ? body[0] : 0;
     if (cap < 4) return 0;
@@ -407,7 +411,9 @@ size_t w218_run_sub(uint8_t type, const uint8_t* body, size_t len, uint8_t* rb, 
             case kWo139: reason = kcdmp::wo139::handle(body, len, rb + 4, pcap < 300 ? pcap : 300, &n); break;
             case kWo140: reason = kcdmp::wo140::handle(body, len, rb + 4, pcap < 340 ? pcap : 340, &n, calendarEpoch); break;
             case kWo141: reason = kcdmp::wo141::handle(body, len, rb + 4, pcap < 420 ? pcap : 420, &n); break;
-            case kWo143: reason = kcdmp::wo143::handle(body, len, rb + 4, pcap < 420 ? pcap : 420, &n); break;
+            case kWo143:
+                if(!p6render::invoke(body,len,renderStamp,GetTickCount64(),wo216::lifecycle_generation(),p4::life_edge_tick(),wo216::lifecycle_gameplay(),[&]{reason=kcdmp::wo143::handle(body,len,rb+4,pcap<420?pcap:420,&n);})){reason=wo143::kRFailed;n=0;}
+                break;
             case kWo147: reason = kcdmp::wo147::handle(body, len, rb + 4, pcap < 200 ? pcap : 200, &n); break;
             case kWo151: reason = kcdmp::wo151::handle(body, len, rb + 4, pcap < 200 ? pcap : 200, &n); break;
             case kWo163: reason = kcdmp::wo163::handle(body, len, rb + 4, pcap < 512 ? pcap : 512, &n); break;
@@ -445,7 +451,7 @@ void w218_drain() {
             const wo218rules::Sub& sub = b->subs[b->next];
             bool faulted = false;
             const double s0 = w218_now_us();
-            const size_t n = w218_run_sub(sub.type, b->raw.data() + sub.off, sub.len, rb, sizeof rb, &faulted, b->calendarEpoch);
+            const size_t n = w218_run_sub(sub.type, b->raw.data() + sub.off, sub.len, rb, sizeof rb, &faulted, b->calendarEpoch,b->renderStamp);
             w221_note_sub(sub.type, sub.len ? b->raw[sub.off] : 0, w218_now_us() - s0);   // WO-221 F.1
             b->reply.add(wo218rules::reply_type(sub.type), rb, n);
             ++b->next;
@@ -481,7 +487,7 @@ void w218_post_drain() {
 }
 
 // The pipe thread: a batch read -- parsed, queued for the main thread; a malformed one answered at once (ok 0, no requests).
-void w218_on_batch(HANDLE h, const BYTE* body, uint16_t len) {
+void w218_on_batch(HANDLE h, const BYTE* body, uint16_t len,const p6render::Stamp& renderStamp) {
     auto b = std::make_shared<PendingBatch>();
     b->raw.assign(body, body + len);
     if (!wo218rules::parse_batch(b->raw.data(), b->raw.size(), &b->id, &b->subs)) {
@@ -494,6 +500,7 @@ void w218_on_batch(HANDLE h, const BYTE* body, uint16_t len) {
     }
     b->gen = g_connGen.load();
     b->calendarEpoch = kcdmp::wo140::calendar_connection_epoch();
+    b->renderStamp=renderStamp;
     b->reply.begin(b->id, static_cast<uint8_t>(b->subs.size()));
     g_w218BatchesIn.fetch_add(1);
     {
@@ -867,6 +874,8 @@ bool ingest(ReaderContext& input, const uint8_t* bytes, size_t n) {
         if (!wo203::handle_off_main(wo216::kOpLifecycle, f.body.data(), f.body.size(), out + 4, 512, &used, &reason) || used > 512) return false;
         out[0] = reason == wo163::kROk ? 1 : 0; out[1] = f.sequence; out[2] = wo216::kOpLifecycle; out[3] = reason;
         return send_frame(input.handle, kWo163Reply, out, static_cast<uint16_t>(4 + used), input.generation);
+    },[](pipecontrol::Frame& f){
+        f.readerTick=GetTickCount64();f.readerGeneration=wo216::lifecycle_generation();f.readerLife=p4::life_edge_tick();f.readerGameplay=wo216::lifecycle_gameplay();
     });
     g_seq = input.reader.next_sequence();
     if (!ok) { input.failed = true; logf("PIPE: control reader rejected malformed/over-limit input, deferred overflow or failed ACK -- disconnecting"); }
@@ -982,6 +991,7 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
 void serve(HANDLE h) {
     tx_connected(h);
     g_connected = true;
+    p6::connection(true);
     logf("PIPE: agent connected");
 
     ReaderContext input(h, g_connGen.load());
@@ -995,7 +1005,8 @@ void serve(HANDLE h) {
         BYTE empty = 0; const BYTE* body = len ? incoming.body.data() : &empty;
         const uint8_t seq = incoming.sequence;
         crash::note_pipe(type, len ? body[0] : 0, len);
-        if (type == wo218rules::kBatch) { w218_on_batch(h, body, len); continue; }
+        const p6render::Stamp renderStamp{incoming.readerGeneration,incoming.readerLife,incoming.readerTick,incoming.readerGameplay};
+        if (type == wo218rules::kBatch) { w218_on_batch(h, body, len,renderStamp); continue; }
 
         switch (type) {
             case kPing:
@@ -1740,9 +1751,9 @@ void serve(HANDLE h) {
                 R r{};
                 bool faulted = false;
                 const bool ran = run_sync_bounded<R>(
-                    [copy](R& out) {
+                    [copy,renderStamp](R& out) {
                         out.op = copy.empty() ? 0 : copy[0];
-                        out.reason = kcdmp::wo143::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                        if(!p6render::invoke(copy.data(),copy.size(),renderStamp,GetTickCount64(),wo216::lifecycle_generation(),p4::life_edge_tick(),wo216::lifecycle_gameplay(),[&]{out.reason=kcdmp::wo143::handle(copy.data(),copy.size(),out.buf,sizeof(out.buf),&out.n);})){out.reason=wo143::kRFailed;out.n=0;}
                     }, "Wo143", r, &faulted);
                 if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo143::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
                 BYTE rb[4 + 420]{};
@@ -1885,6 +1896,7 @@ void serve(HANDLE h) {
 
     t_reader = nullptr;
     g_connected = false;
+    p6::connection(false);
     w218_on_disconnect();   // WO-218 A.1: a waiting batch's reply never reaches the next connection
     tx_disconnected(h);
     logf("PIPE: agent disconnected");
@@ -1976,6 +1988,7 @@ bool start() {
     // P5 replaces legacy 0x93 with one typed B0 route.
     p5::set_event([](const uint8_t* b,size_t n){if(n==43)send_unsolicited(0xB0,b,43,"DeathMarker");});
     respawn::set_events(ev);
+    p6::set_event([](const uint8_t* b,size_t n){if(n==61)send_unsolicited(kLocalHit,b,61,"MeasuredMissileContact");});
 
     // WO-121: committed actions and friendly-fire hits become unsolicited frames.
     kcdmp::motion::set_action_callback(&send_local_action);

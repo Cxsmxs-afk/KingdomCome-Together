@@ -40,6 +40,8 @@ int unstance_index(const char* name);
 bool hands_armed();
 bool apply_on();                                   // WO-141's apply is on (mp_activities, a session)
 bool read_body_hands(uint32_t eid, wo143rules::Hands* out);
+// P6: each known bit means proven empty or actual resolved Item Class; unknown is never an empty-hand proof.
+uint8_t read_body_hands_strict(uint32_t eid, wo143rules::Hands* out);
 std::string hand_classes_text(const wo143rules::Hands& h);
 std::string class_id_text(const wo143rules::ClassId& c);
 void set_hands(const std::string& name, const wo143rules::Hands& h);

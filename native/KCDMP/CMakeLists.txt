@@ -26,6 +26,7 @@ add_library(KCDMP SHARED
     respawn.cpp
     respawn_actions.cpp
     p5_marker.cpp
+    p6_missile.cpp
     punishment.cpp
     npc_drive.cpp
     npc_trace.cpp

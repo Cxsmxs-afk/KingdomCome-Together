@@ -21,6 +21,7 @@ public partial class GameBridge
         {
             case "w201_cfg":
                 if (!Wo201Rules.TryParseCfg(arg, out string cfg, out bool on)) { Console.WriteLine($"MP-W201 cfg refused: '{arg}'"); return; }
+                if (cfg == "figure_ranged" && W201(cfg) != on) P6VisualModeChanged();
                 _w201On[cfg] = on;
                 Console.WriteLine($"MP-W201 cfg {cfg}={(on ? "on" : "off")}");
                 Wo201OnCfg(cfg, on);
@@ -65,6 +66,7 @@ public partial class GameBridge
     private void Wo201OnDisconnect()
     {
         _w201Connected = false;
+        P6Invalidate();
         Wo201ScenesReset();
         Wo201ValuesReset();
         Wo201CombatReset();

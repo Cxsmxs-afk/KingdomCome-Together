@@ -184,9 +184,12 @@ public sealed class LinkScheduler
 {
     // Optional producer authority. Shared by all pieces of one original packet,
     // so a revoked multi-body packet is counted once, including after selection.
-    private sealed class Delivery(Func<bool> valid)
+    private sealed class Delivery(Func<bool> valid, Action? afterWrite, Func<byte[]>? prepare)
     {
         private int _counted;
+        private int _written;
+        public void Written() { if (Interlocked.Exchange(ref _written, 1) == 0) afterWrite?.Invoke(); }
+        public Func<byte[]>? Prepare => prepare;
         public bool Allowed(LinkScheduler owner)
         {
             if (valid()) return true;
@@ -232,9 +235,10 @@ public sealed class LinkScheduler
     public int DirtySlots { get { lock (_lock) return _slots.Values.Count(s => s.Dirty); } }
 
     /// <summary>One whole frame (header included), from any thread.</summary>
-    public void Enqueue(byte[] frame, Func<bool>? stillValid = null)
+    public void Enqueue(byte[] frame, Func<bool>? stillValid = null, Action? afterWrite = null, Func<byte[]>? prepare = null)
     {
-        var delivery = stillValid is null ? null : new Delivery(stillValid);
+        if ((afterWrite is not null || prepare is not null) && frame.Length > 0 && LinkState.IsStateType(frame[0])) throw new ArgumentException("Physical receipts require a complete event frame", nameof(frame));
+        var delivery = stillValid is null && afterWrite is null && prepare is null ? null : new Delivery(stillValid ?? (() => true), afterWrite, prepare);
         if (!Allowed(delivery)) return; // a revoked replacement must not displace a live state
         long now = Stopwatch.GetTimestamp();
         lock (_lock)
@@ -273,9 +277,15 @@ public sealed class LinkScheduler
         TryTake(budgetBytes, pendingBytes, out frame, out isState, out _, eventsHeld);
 
     /// <summary>The producer check travels with a selected frame, including merged state pieces, to its physical writer.</summary>
-    public bool TryTake(int budgetBytes, int pendingBytes, out byte[] frame, out bool isState, out Func<bool>? stillValid, bool eventsHeld = false)
+    public bool TryTake(int budgetBytes, int pendingBytes, out byte[] frame, out bool isState, out Func<bool>? stillValid, bool eventsHeld = false) =>
+        TryTake(budgetBytes, pendingBytes, out frame, out isState, out stillValid, out _, eventsHeld);
+
+    public bool TryTake(int budgetBytes, int pendingBytes, out byte[] frame, out bool isState, out Func<bool>? stillValid, out Action? afterWrite, bool eventsHeld = false)
+        => TryTake(budgetBytes, pendingBytes, out frame, out isState, out stillValid, out afterWrite, out _, eventsHeld);
+
+    public bool TryTake(int budgetBytes, int pendingBytes, out byte[] frame, out bool isState, out Func<bool>? stillValid, out Action? afterWrite, out Func<byte[]>? prepare, bool eventsHeld = false)
     {
-        stillValid = null;
+        stillValid = null; afterWrite = null; prepare = null;
         long now = Stopwatch.GetTimestamp();
         frame = []; isState = false;
         lock (_lock)
@@ -308,6 +318,8 @@ public sealed class LinkScheduler
                 if (_eventAgeAtSendMs.Count < 20_000) _eventAgeAtSendMs.Add((now - e.Ts) / TicksPerMs);
                 frame = e.F;
                 stillValid = e.Delivery is null ? null : () => Allowed(e.Delivery);
+                afterWrite = e.Delivery is null ? null : e.Delivery.Written;
+                prepare = e.Delivery?.Prepare;
                 return true;
             }
             if (_slots.Count == 0) return false;
@@ -427,10 +439,10 @@ public sealed class LinkWriter
     public ILinkPath Path => _path;
 
     /// <summary>One frame in (any thread); the writer wakes.</summary>
-    public void Enqueue(byte[] frame, Func<bool>? stillValid = null)
+    public void Enqueue(byte[] frame, Func<bool>? stillValid = null, Action? afterWrite = null, Func<byte[]>? prepare = null)
     {
         if (Failed is { } f) throw new IOException("the link's writer stopped: " + f.Message, f);
-        _sched.Enqueue(frame, stillValid);
+        _sched.Enqueue(frame, stillValid, afterWrite, prepare);
         if (_signal.CurrentCount == 0) _signal.Release();
     }
 
@@ -467,14 +479,22 @@ public sealed class LinkWriter
             // B with C: a state lane of its own -- the events wait here while their lane holds enough, so the pump is never stuck in an
             // event's send and the state goes beside a burst (the world's transfer) at its lane's share instead of after it
             bool eventsHeld = _path.StateOwnLane && st.Known && st.EventPendingBytes > _sched.Options.EventPendingCapBytes;
-            if (!_sched.TryTake(budget, st.Known ? st.PendingBytes : -1, out var frame, out bool isState, out var stillValid, eventsHeld)) return;
+            if (!_sched.TryTake(budget, st.Known ? st.PendingBytes : -1, out var frame, out bool isState, out var stillValid, out var afterWrite, out var prepare, eventsHeld)) return;
             if (stillValid is not null && !stillValid()) continue;
             if (Transform is { } t) frame = t(frame);   // D.3: the link's own encoding (the relay's compact NPC states)
             if (stillValid is not null && !stillValid()) continue;
             if (budget != int.MaxValue && (isState || !_path.StateOwnLane)) _tokens -= frame.Length;   // a lane of its own: events spend their lane's share
             onFrame?.Invoke(frame, isState);
             if (stillValid is not null && !stillValid()) continue;
+            if (prepare is not null)
+            {
+                var refreshed = prepare();
+                if (refreshed.Length != frame.Length || refreshed[0] != frame[0]) throw new InvalidOperationException("Event refresh changed the selected frame's type or budget");
+                frame = refreshed;
+            }
+            if (stillValid is not null && !stillValid()) continue;
             await _path.SendAsync(frame, isState && _sched.Options.Unreliable, ct);
+            afterWrite?.Invoke(); // complete physical send, never queue acceptance / pre-send observer
             Written++; WrittenBytes += frame.Length;
         }
     }

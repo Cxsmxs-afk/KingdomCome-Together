@@ -32,5 +32,20 @@ int t3_native_stats_tests(int* passed) {
     b = before; const uint64_t large[] = {UINT64_MAX, 0, 0, 0, 0};
     check(kcdmp::t3native::append_corpses(b.data(), n, b.size(), large) == 218 &&
         kcdmp::p4rules::u64(b.data() + 174) == uint64_t(INT64_MAX), "native metric saturates at signed agent counter limit");
+    std::array<uint8_t, 512> p6{};
+    size_t used = kcdmp::p4rules::stats(p6.data(), p6.size(), core);
+    used = kcdmp::t3native::append_corpses(p6.data(), used, p6.size(), extra);
+    const auto prefix = p6;
+    const uint64_t ranged[] = {201, 202, 203, 204, 205, 206};
+    check(kcdmp::t3native::append_ranged(p6.data(), used, p6.size(), ranged) == 272 && p6[1] == 30, "P6 stays at272 bytes in the existing reply budget");
+    check(std::memcmp(p6.data() + 2, prefix.data() + 2, 216) == 0, "P4 and P5 field identities and values remain byte-identical");
+    for (size_t i = 0; i < 6; ++i) {
+        check(p6[218 + 9*i] == 24 + i, "P6 appended field identity");
+        check(kcdmp::p4rules::u64(p6.data() + 219 + 9*i) == ranged[i], "P6 exact native little-endian value");
+    }
+    p6 = prefix;
+    check(kcdmp::t3native::append_ranged(p6.data(), used, 271, ranged) == 0 && p6 == prefix, "no partial P6 group on short capacity");
+    p6[2 + 9*23] = 22; const auto badPrefix = p6;
+    check(kcdmp::t3native::append_ranged(p6.data(), used, p6.size(), ranged) == 0 && p6 == badPrefix, "invalid P5 prefix never gets ranged diagnostics attached");
     *passed += good; return bad;
 }
