@@ -4689,6 +4689,7 @@ public partial class GameBridge(ClientConfig config)
     /// at that moment (Wo206StampAtRead); 0 = none.</summary>
     private readonly record struct InFrame(int Type, byte[] Payload, long Arrival, uint Stamp)
     {
+        public PresentationFrame Presentation { get; init; }
         public ulong LootGeneration { get; init; }
         public long TeleportLifeRevision { get; init; }
         public ulong TeleportGeneration { get; init; }
@@ -4723,6 +4724,10 @@ public partial class GameBridge(ClientConfig config)
         ct = receiveLife.Token;
         P6BeginReceive(stream, ct);
         var tpConnection = T3TpBeginReceive(stream, ct);
+        var presentationSession = new PresentationSession(stream);
+        Volatile.Write(ref _presentationSession, presentationSession);
+        PresentationResetNative(ct);
+        _ = PresentationClockLoopAsync(presentationSession, ct);
         var frames = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
         _frameWriter = frames.Writer;   // WO-136: the load hold replays held frames through here
         T3StartIndependentTick(frames.Writer, ct);
@@ -4747,6 +4752,8 @@ public partial class GameBridge(ClientConfig config)
             if (Interlocked.Exchange(ref stopped, 1) != 0) return;
             P6EndReceive(stream, ct);
             T3TpEndReceive(tpConnection);
+            if (ReferenceEquals(Interlocked.CompareExchange(ref _presentationSession, null, presentationSession), presentationSession))
+                PresentationResetNative();
             // CancelAsync marks the token immediately; callbacks and disposal
             // never hold the reader behind a slow transport's cancellation hook.
             _ = receiveLife.CancelAsync().ContinueWith(t => { _ = t.Exception; receiveLife.Dispose(); },
@@ -4786,6 +4793,8 @@ public partial class GameBridge(ClientConfig config)
                 await ReadExactAsync(stream, payload, ct);
                 ct.ThrowIfCancellationRequested();
                 long arrival   = Stopwatch.GetTimestamp();
+                int wireBytes  = payloadLen + 3;
+                if (!PresentationReadFrame(presentationSession, ref type, ref payload, arrival, out var presentation, ct)) continue;
                 long p6ReadTick = Environment.TickCount64;
                 var p6State = type == Protocol.W164Down ? P1Lifecycle.Current : default;
                 long p6Serial = type == Protocol.W164Down ? Interlocked.Read(ref _p1Serial) : 0, p6Life = type == Protocol.W164Down ? Interlocked.Read(ref _t3InputLifeRevision) : 0;
@@ -4795,7 +4804,6 @@ public partial class GameBridge(ClientConfig config)
                 long p6Deadline = p6Frame ? p6ReadTick + Protocol.MeasuredMissileApplyBudgetMs : 0;
                 long markerPeer = P5PeerAtRead(type, payload);
                 P6NoteVisualAtRead(type, payload);
-                int wireBytes  = payloadLen + 3;
                 if (type == Protocol.NpcStateQDown)   // WO-213 D.3: the relay's compact NPC state, back to the 0x27 payload everything below reads
                 {
                     if (Wo213Expand(payload) is not { } full) { Wo213NoteIn(type, payload, arrival, wireBytes); continue; }
@@ -4837,9 +4845,9 @@ public partial class GameBridge(ClientConfig config)
                 if (type == Protocol.ConvDown && W207("conv_lane")) { convLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }   // WO-207 A.1
                 if ((type == Protocol.ActivityHostDown || type == Protocol.ActivityExtraDown) && W207("queue_decouple"))   // WO-207 B.3
                 { actLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
-                FeedNativeAtRead(type, payload, arrival);
-                if (W202("net_game_queue") && Wo202Coalesce(frames.Writer, type, payload, arrival, stamp)) continue;   // WO-202 III.1: a waiting state is replaced
-                Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp) { MarkerPeerSerial = markerPeer }, type);   // WO-207 B.1
+                FeedNativeAtRead(type, payload, arrival, presentation: presentation);
+                if (W202("net_game_queue") && Wo202Coalesce(frames.Writer, type, payload, arrival, stamp, presentation)) continue;   // WO-202 III.1: a waiting state is replaced
+                Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp) { MarkerPeerSerial = markerPeer, Presentation = presentation }, type);   // WO-207 B.1
             }
         }
         catch (OperationCanceledException) { }
@@ -4854,7 +4862,7 @@ public partial class GameBridge(ClientConfig config)
     /// decode and name rules as the processor's handlers (which drop what this
     /// drops, and count it); anything malformed is simply not fed.
     /// </summary>
-    private void FeedNativeAtRead(int type, byte[] payload, long arrival, bool replay = false)
+    private void FeedNativeAtRead(int type, byte[] payload, long arrival, bool replay = false, PresentationFrame presentation = default)
     {
         // WO-136: while a world loads nothing is bound or written natively either (the replay feeds it later).
         if (!replay && Wo136HeldType(type) && Wo136Holding) return;
@@ -4893,7 +4901,9 @@ public partial class GameBridge(ClientConfig config)
             // WO-121: the v8 state block rides the same sample, so the DLL's
             // per-frame gait / crouch / combat hold for this avatar sees it in
             // the frame the position does.
-            if (!EdgeForwardPose(type, payload, arrival))
+            bool timeForwarded = _nativeWriteOn && PresentationReady(presentation, out long connection) &&
+                _combat.PostPresentationPose((byte)type, payload, arrival, presentation.SampleMs, presentation.HostAtArrivalMs, connection);
+            if (!timeForwarded && !EdgeForwardPose(type, payload, arrival))
                 _nativeFeed.Enqueue(new NativeNpcSample(gs.GhostId, "kcd2mp_" + gs.GhostId, gs.X, gs.Y, gs.Z, gs.RotZ,
                     gs.IsRiding ? (byte)0x10 : (byte)0, gSeq, gs.SenderMs, arrival, gs.State2));
             Wo154FeedRiddenHorse(gs, gSeq, arrival);   // WO-154 5: the ridden horse rides the rider's stream
@@ -5095,7 +5105,7 @@ public partial class GameBridge(ClientConfig config)
                     {
                         OnNpcRequestIn(a);
                     }
-                    else if (await DispatchWo121ActionAsync(a, ct))
+                    else if (await DispatchWo121ActionAsync(a, ct, frame.Presentation))
                     {
                         // WO-121: attack / jump / block / dodge rows, NPC rows, the host lever.
                     }
@@ -6192,6 +6202,12 @@ public partial class GameBridge(ClientConfig config)
         if (name == "edge_mode" || name == "edge_probe" || name == "edge_lanes")
         {
             EdgeOnGameEvent(name, arg);
+            return;
+        }
+
+        if (name == "rp_timeline_cfg")
+        {
+            PresentationSetMode(arg);
             return;
         }
 
@@ -7529,6 +7545,7 @@ public partial class GameBridge(ClientConfig config)
             var st = await _combat.NpcStatusAsync(ct);
             if (st is not { } s) return;
             _ = EdgeProbeConsoleAsync(ct);
+            _ = PresentationConfigureAsync(ct);
             await ExecLuaAsync(FormattableString.Invariant(
                 $"if KCD2MP_NpcNativeAlive then KCD2MP_NpcNativeAlive({(s.Armed ? 1 : 0)}, {(s.NativeOn ? 1 : 0)}, {s.Bound}, {s.Writing}, 1) end"));
             if ((++_nativeHeartbeats % 10) == 0)
@@ -7717,7 +7734,7 @@ public partial class GameBridge(ClientConfig config)
     /// bd26225, Position since the WO-118 follow-up): 1 ms QPC time, not the
     /// 15.6 ms Environment.TickCount64 steps that showed up as pace noise.
     /// </summary>
-    private static uint SenderMsNow() => unchecked((uint)(Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency));
+    private static uint SenderMsNow() => unchecked((uint)PresentationClock.NowMs());
 
     /// <summary>
     /// WO-102 Phase 1: the native sample for this tick, or null when the log

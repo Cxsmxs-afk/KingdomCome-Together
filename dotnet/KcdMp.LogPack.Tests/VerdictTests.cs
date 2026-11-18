@@ -109,6 +109,51 @@ public class VerdictTests
         Assert.Contains("inproc_fallbacks\tGRAU\t3\tMP-T3-STATS, DLL-Spiegel, ohne Grenzwert", report);
     }
 
+    [Theory]
+    [InlineData(0, 0, VerdictStatus.Grey)]
+    [InlineData(140, 0, VerdictStatus.Grey)]
+    [InlineData(0, 10, VerdictStatus.Green)]
+    [InlineData(19, 10, VerdictStatus.Green)]
+    [InlineData(20, 10, VerdictStatus.Yellow)]
+    [InlineData(49, 10, VerdictStatus.Yellow)]
+    [InlineData(50, 10, VerdictStatus.Red)]
+    public void Timeline_skew_needs_a_paired_observation_and_checks_the_exact_boundaries(int skew, int paired, VerdictStatus expected)
+    {
+        var input = new Briefing.Input();
+        input.Logs["kcdmp-native.log"] = [
+            $"MP-T3-STATS origin=dll source=agent role=host rp_action_pos_skew_ms_p95={skew} rp_timeline_skew_n={paired} rp_action_n=30 rp_timeline_pose_n=50"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "rp_action_pos_skew_ms_p95");
+        Assert.Equal(expected, row.Status);
+    }
+
+    [Theory]
+    [InlineData("rp_buffer_ms", 59, VerdictStatus.Red)]
+    [InlineData("rp_buffer_ms", 60, VerdictStatus.Green)]
+    [InlineData("rp_buffer_ms", 120, VerdictStatus.Green)]
+    [InlineData("rp_buffer_ms", 121, VerdictStatus.Red)]
+    [InlineData("rp_extrap_ms_max", 200, VerdictStatus.Green)]
+    [InlineData("rp_extrap_ms_max", 201, VerdictStatus.Red)]
+    public void Timeline_buffer_and_extrapolation_report_observed_bounds(string metric, int value, VerdictStatus expected)
+    {
+        var input = new Briefing.Input();
+        input.Logs["kcdmp-native.log"] = [
+            $"MP-T3-STATS origin=dll source=agent role=joiner {metric}={value} rp_timeline_pose_n=450"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == metric);
+        Assert.Equal(expected, row.Status);
+    }
+
+    [Fact]
+    public void Buffer_outside_lower_bound_remains_visible_after_later_measured_valid_buffer()
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [
+            "12:00:00.000 MP-T3-STATS origin=agent role=joiner rp_buffer_ms=59 rp_timeline_pose_n=10 rp_late_samples=2",
+            "12:01:00.000 MP-T3-STATS origin=agent role=joiner rp_buffer_ms=90 rp_timeline_pose_n=100 rp_late_samples=8"];
+        var report = VerdictRules.Evaluate(input).ToText();
+        Assert.Contains("rp_buffer_ms\tROT\t59 ms\tMP-T3-STATS, Agent, n=10", report);
+        Assert.Contains("rp_late_samples\tGRAU\t8\tMP-T3-STATS, Agent, n=100", report);
+    }
+
     [Fact]
     public void Owner_handovers_and_denials_from_a_qualified_mirror_have_no_failure_threshold()
     {

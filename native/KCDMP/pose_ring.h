@@ -10,6 +10,7 @@
 // mid-copy, or is odd, is a torn write and is skipped.
 
 #include <atomic>
+#include "rp_timeline_rules.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -141,7 +142,7 @@ inline void leave_torn(View v) {
 namespace receive {
 
 constexpr uint8_t kGhost = 0x02, kNpcStateDown = 0x27;
-constexpr size_t kEnvelope = 9, kGhostFixed = 18, kNpcTail = 27, kStateBytes = 12;
+constexpr size_t kEnvelope = 9, kClockBytes = 16, kGhostFixed = 18, kNpcTail = 27, kStateBytes = 12;
 constexpr size_t kBodyName = 63, kMaxEnvelope = kEnvelope + 2 + kBodyName + kNpcTail;
 
 struct Scope {
@@ -156,12 +157,14 @@ struct Pose {
     uint16_t sequence = 0;
     uint32_t senderMs = 0;
     int64_t arrivalQpc = 0, firstByteQpc = 0, stateQpc = 0;
+    uint64_t hostMs = 0, hostAtArrivalMs = 0, stateHostMs = 0;
     std::array<uint8_t, kStateBytes> state{};
     bool ghost() const { return kind == kGhost; }
 };
 
 inline uint16_t u16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8)); }
 inline uint32_t u32(const uint8_t* p) { return static_cast<uint32_t>(u16(p)) | (static_cast<uint32_t>(u16(p + 2)) << 16); }
+inline uint64_t u64(const uint8_t* p) { return static_cast<uint64_t>(u32(p)) | (static_cast<uint64_t>(u32(p + 4)) << 32); }
 inline float f32(const uint8_t* p) {
     const uint32_t bits = u32(p);
     float value;
@@ -174,15 +177,22 @@ inline bool name_byte(uint8_t c) {
 
 // Matches PositionCodec.TryDecodeGhost's four versions and flag AND length
 // checks. The base transform remains usable if a sender's optional flag is short.
-inline bool decode(const uint8_t* bytes, size_t size, Pose& pose) {
+inline bool decode(const uint8_t* bytes, size_t size, Pose& pose, bool timed = false) {
     pose = {};
-    if (!bytes || size <= kEnvelope || size > kMaxEnvelope) return false;
-    const uint64_t arrival = static_cast<uint64_t>(u32(bytes + 1)) | (static_cast<uint64_t>(u32(bytes + 5)) << 32);
+    const size_t clock = timed ? kClockBytes : 0;
+    const size_t envelope = kEnvelope + clock;
+    if (!bytes || size <= envelope || size > kMaxEnvelope + clock) return false;
+    const uint64_t arrival = u64(bytes + 1);
     if (!arrival || arrival > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) return false;
     pose.kind = bytes[0];
     pose.arrivalQpc = static_cast<int64_t>(arrival);
-    const uint8_t* payload = bytes + kEnvelope;
-    const size_t length = size - kEnvelope;
+    if (timed) {
+        pose.hostMs = u64(bytes + 9);
+        pose.hostAtArrivalMs = u64(bytes + 17);
+        if (!rptimeline::known_stamp(pose.hostMs, pose.hostAtArrivalMs)) return false;
+    }
+    const uint8_t* payload = bytes + envelope;
+    const size_t length = size - envelope;
     const uint8_t* transform;
     if (pose.ghost()) {
         if (length != kGhostFixed && length != kGhostFixed + 4 && length != kGhostFixed + kStateBytes &&
@@ -196,6 +206,7 @@ inline bool decode(const uint8_t* bytes, size_t size, Pose& pose) {
         if ((ghostFlags & 0x10) && length >= tail + kStateBytes) {
             std::memcpy(pose.state.data(), payload + tail, kStateBytes);
             pose.stateQpc = pose.arrivalQpc;
+            pose.stateHostMs = pose.hostMs;
             tail += kStateBytes;
         }
         if ((ghostFlags & 0x08) && length == tail + 4) pose.senderMs = u32(payload + tail);
@@ -225,6 +236,7 @@ inline std::string body_key(const char* name) {
 inline bool newer(const Pose& candidate, const Pose& existing, bool senderClock) {
     if (candidate.arrivalQpc < existing.arrivalQpc) return false;
     if (candidate.kind != existing.kind || candidate.source != existing.source) return true;
+    if (candidate.hostMs && existing.hostMs) return candidate.hostMs > existing.hostMs;
     if (!candidate.ghost()) {
         const auto delta = static_cast<uint16_t>(candidate.sequence - existing.sequence);
         if (!delta || delta > 32768) return false;
@@ -257,9 +269,11 @@ public:
         if (it != pending_.end()) {
             const Pose& old = it->second.pose;
             if (!newer(pose, old, senderClock)) return Put::Superseded;
-            if (!pose.stateQpc && old.stateQpc && pose.kind == old.kind && pose.source == old.source) {
+            if (!pose.stateQpc && old.stateQpc && pose.kind == old.kind && pose.source == old.source &&
+                (pose.hostMs == 0) == (old.hostMs == 0)) {
                 pose.state = old.state;
                 pose.stateQpc = old.stateQpc;
+                pose.stateHostMs = old.stateHostMs;
             }
             it->second = {pose, ++next_};
         } else {
@@ -267,6 +281,13 @@ public:
             pending_.emplace(std::move(key), Entry{pose, ++next_});
         }
         return Put::Accepted;
+    }
+
+    void clear_timed() {
+        for (auto it = pending_.begin(); it != pending_.end();) {
+            if (it->second.pose.hostMs) it = pending_.erase(it);
+            else ++it;
+        }
     }
 
     std::vector<Pose> drain(Scope current) {

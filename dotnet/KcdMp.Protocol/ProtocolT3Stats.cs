@@ -30,11 +30,14 @@ public static class T3NativeCounters
         "edge_rt_age_ms_p95", "edge_rt_age_ms_max", "edge_bulk_age_ms_p95", "pipe_busy_replies", "edge_rt_n", "edge_bulk_n"
     ];
 
-    public static bool TryRead(ReadOnlySpan<byte> payload, out Dictionary<string, long> values)
+    private static readonly string[] TimelineKeys = [
+        "rp_buffer_ms", "rp_extrap_ms_max", "rp_late_samples", "rp_action_pos_skew_ms_p95", "rp_timeline_pose_n", "rp_timeline_skew_n"
+    ];
+
+    private static bool TryReadFields(ReadOnlySpan<byte> payload, string[] keys, Span<bool> seen, out Dictionary<string, long> values)
     {
         values = new(StringComparer.Ordinal);
         if (payload.Length < 2 || payload[0] != Version || payload[1] > MaxFields || payload.Length != 2 + payload[1] * 9) return false;
-        Span<bool> seen = stackalloc bool[256];
         seen.Clear();
         for (int at = 2; at < payload.Length; at += 9)
         {
@@ -42,10 +45,17 @@ public static class T3NativeCounters
             if (seen[field]) return false;
             seen[field] = true;
             ulong value = BinaryPrimitives.ReadUInt64LittleEndian(payload[(at + 1)..]);
-            if (field >= Keys.Length) continue; // bounded forward-compatible extension
+            if (field >= keys.Length) continue; // bounded forward-compatible extension
             if (value > long.MaxValue) return false;
-            values.Add(Keys[field], (long)value);
+            values.Add(keys[field], (long)value);
         }
+        return true;
+    }
+
+    public static bool TryRead(ReadOnlySpan<byte> payload, out Dictionary<string, long> values)
+    {
+        Span<bool> seen = stackalloc bool[256];
+        if (!TryReadFields(payload, Keys, seen, out values)) return false;
         for (int i = 0; i < CoreFields; i++) if (!seen[i]) return false;
         int corpse = 0;
         for (int i = CoreFields; i < CoreFields + CorpseFields; i++) if (seen[i]) corpse++;
@@ -60,5 +70,13 @@ public static class T3NativeCounters
             (presentation == 0 || ranged == RangedFields) && (owners == 0 || owners == OwnerFields) &&
             (owners == 0 || presentation == PresentationFields) && (edge == 0 || edge == EdgeFields) &&
             (edge == 0 || owners == OwnerFields);
+    }
+
+    /// <summary>Op250 with the timeline subcommand returns a separate bounded page.</summary>
+    public static bool TryReadTimeline(ReadOnlySpan<byte> payload, out Dictionary<string, long> values)
+    {
+        Span<bool> seen = stackalloc bool[256];
+        return TryReadFields(payload, TimelineKeys, seen, out values) &&
+            payload[1] == TimelineKeys.Length && values.Count == TimelineKeys.Length;
     }
 }

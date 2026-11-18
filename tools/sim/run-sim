@@ -19,19 +19,27 @@ if [ "$label" = ci ]; then
 
 int holder_contract_tests(int* passed);
 int edge_lanes_tests(int* passed);
+int rp_timeline_tests(int* passed);
+int rp_timeline_action_tests(int* passed);
+
+bool run_tests(const char* name, int (*suite)(int*)) {
+    int passed = 0;
+    const int failed = suite(&passed);
+    std::printf("%s: %d passed, %d failed\n", name, passed, failed);
+    return passed > 0 && failed == 0;
+}
 
 int main() {
-    int passed = 0;
-    const int ownerFailed = holder_contract_tests(&passed);
-    std::printf("body owner contract: %d passed, %d failed\n", passed, ownerFailed);
-    int edgePassed = 0;
-    const int edgeFailed = edge_lanes_tests(&edgePassed);
-    std::printf("modeled DLL lanes: %d passed, %d failed\n", edgePassed, edgeFailed);
-    return passed > 0 && edgePassed > 0 && ownerFailed == 0 && edgeFailed == 0 ? 0 : 1;
+    bool passed = run_tests("body owner contract", &holder_contract_tests);
+    passed &= run_tests("modeled DLL lanes", &edge_lanes_tests);
+    passed &= run_tests("modeled presentation clock", &rp_timeline_tests);
+    passed &= run_tests("presentation action order", &rp_timeline_action_tests);
+    return passed ? 0 : 1;
 }
 EOF
     "${CXX:-c++}" -std=c++17 -I native/KCDMP "$native_tmp/main.cpp" \
-        native/tests/holder_contract_tests.cpp native/tests/edge_lanes_tests.cpp -o "$native_tmp/native-contracts"
+        native/tests/holder_contract_tests.cpp native/tests/edge_lanes_tests.cpp \
+        native/tests/rp_timeline_tests.cpp native/tests/rp_timeline_action_tests.cpp -o "$native_tmp/native-contracts"
     native_result="$("$native_tmp/native-contracts")"
     printf '%s\n' "$native_result"
 fi

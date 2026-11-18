@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using KcdMp.Client;
 using KcdMp.Wire;
 
@@ -14,7 +15,7 @@ static partial class P
     private static readonly HashSet<string> BotVerbs = new(StringComparer.Ordinal)
     {
         "stand", "move", "curve", "strafe", "state", "attack", "block_impulse", "hit",
-        "vitals", "death", "respawned", "ranged", "appearance", "bow_equip"
+        "vitals", "death", "respawned", "ranged", "appearance", "bow_equip", "activity", "ride"
     };
     private static readonly string[] BotOptions = ["--test-bot", "--self-test", "--origin", "--bow-class", "--tables-pak", "--duration", "--wire-version"];
     private static readonly string[] BotValueOptions =
@@ -169,6 +170,14 @@ static partial class P
             case "ranged" when Count(2, 2): _ = BotRangedPhase(f[1]); return;
             case "appearance" when Count(2, 2):
                 if (f[1].Split(',').All(s => Guid.TryParseExact(s, "D", out Guid id) && id != Guid.Empty)) return;
+                break;
+            case "activity":
+                if (Count(2, 2) && f[1] == "none") return;
+                if (Count(4, 4) && f[1] == "stance" && byte.TryParse(f[2], NumberStyles.None, CultureInfo.InvariantCulture, out byte stance) &&
+                    stance is >= 1 and <= 7 && f[3].Length == 16 && ulong.TryParse(f[3], NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out ulong obj) && obj != 0) return;
+                break;
+            case "ride" when Count(2, 2):
+                if (Encoding.UTF8.GetByteCount(f[1]) <= byte.MaxValue && f[1] != "-") return;
                 break;
         }
         throw new FormatException("Invalid parameters for a T4 scenario step.");
@@ -362,6 +371,18 @@ static partial class P
                 throw new InvalidOperationException("T4 plans must not depend on the host's appearance.");
             }
             catch (FormatException) { }
+            var handoverPlan = ReadBotPlan(["at 0 stand 0 0 0 0", "at 2 activity stance 3 0123456789abcdef",
+                "at 3 activity none", "at 4 ride horse[rig]", "at 5 ride off", "end 6"]);
+            if (handoverPlan.Steps.Count != 5) throw new InvalidOperationException("T4 owner handover plan self-test failed.");
+            foreach (string invalid in new[] { "activity stance 3 0000000000000000", "activity stance 256 0123456789abcdef", "activity bad", "ride", "ride -", "ride " + new string('á', 128) })
+            {
+                try
+                {
+                    _ = ReadBotPlan(["at 0 stand 0 0 0 0", "at 1 " + invalid, "end 2"]);
+                    throw new InvalidOperationException("T4 accepted an invalid owner handover step.");
+                }
+                catch (FormatException) { }
+            }
             string localVersion = BuildId.Split(ReleaseVersionInfo.Wire).Version;
             string testWire = BuildId.Wire(localVersion, "t4-fixture-0000000000");
             if (ParseBotOptions(["--test-bot"]).WireVersion != ReleaseVersionInfo.Wire ||

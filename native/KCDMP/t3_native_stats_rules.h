@@ -8,6 +8,7 @@ namespace kcdmp::t3native {
 constexpr size_t kCoreFields = 19, kCorpseFields = 5, kRangedFields = 6;
 constexpr size_t kRpMeasureFields = 17, kOwnerFields = 2;
 constexpr size_t kEdgeFields = 6;
+constexpr size_t kTimelineFields = 6, kTimelineBytes = 2 + 9 * kTimelineFields;
 constexpr size_t kRpOwnerViolationsIndex = 10, kRpOwnerChecksIndex = 16;
 constexpr size_t kCoreBytes = 2 + 9 * kCoreFields, kP5Bytes = 2 + 9 * (kCoreFields + kCorpseFields);
 constexpr size_t kP6Bytes = kP5Bytes + 9 * kRangedFields;
@@ -41,5 +42,13 @@ inline size_t append_owners(uint8_t* out, size_t used, size_t cap, const uint64_
 }
 inline size_t append_edge(uint8_t* out, size_t used, size_t cap, const uint64_t* values) {
     return append_group(out, used, cap, kCoreFields + kCorpseFields + kRangedFields + kRpMeasureFields + kOwnerFields, values, kEdgeFields);
+}
+// Op250 with the timeline subcommand has an independent version/count
+// page, so the established 497-byte stats reply retains all existing IDs.
+inline size_t write_timeline(uint8_t* out, size_t cap, const uint64_t* values) {
+    if (!out || !values || cap < kTimelineBytes) return 0;
+    out[0] = 1;
+    out[1] = 0;
+    return append_group(out, 2, cap, 0, values, kTimelineFields);
 }
 } // namespace kcdmp::t3native

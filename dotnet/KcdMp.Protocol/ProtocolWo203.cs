@@ -148,6 +148,7 @@ public static partial class Protocol
         (ItemClaimUp,       "item-claim",        ItemClaimUpPayloadLen, ItemClaimUpPayloadLen),
         (StoryBeatUp,       "story-beat",        2, 2 + MaxStoryBeatTextLen),                   // and the len byte agrees
         (ClockSyncUp,       "clock-sync",        ClockSyncUpPayloadLen, ClockSyncUpPayloadLen),
+        (PresentationClockUp, "presentation-clock", PresentationClock.QueryLength, PresentationClock.ConfirmLength),
         (ActionUp,          "action",            ActionUpHeaderLen, ActionUpHeaderLen + ActionPayloadMaxLen),   // and the len byte agrees
         (PlayerRespawnedUp, "player-respawned",  PlayerRespawnedUpPayloadLen, PlayerRespawnedUpPayloadLen),
         (DeathMarkerUp,     "death-marker",       DeathMarkerUpLen, DeathMarkerUpLen),
@@ -177,6 +178,7 @@ public static partial class Protocol
         NpcDamageDown, ItemDropDown, ItemClaimDown, ServerFull, StoryBeatDown, ClockSyncDown, ActionDown, ReleaseVersionMismatch,
         PlayerRespawnedDown, GraveAddDown, GraveRemoveDown, DeathMarkerDown, PlayerHitV8Down, WorldSavedDown, Ack,
         LinkHelloDown, NpcStateQDown,   // WO-213
+        PresentationClockDown, PresentationPoseDown, PresentationActionDown,
     };
 
     // One lookup per type byte, built on first use (not in a field initializer: JoinWire lives in another part of this partial
@@ -219,6 +221,7 @@ public static partial class Protocol
         {
             Position => IsPositionPayloadLen(len),
             CombatEventUp => len is CombatEventUpPayloadLen or CombatEventUpPayloadLenV2,
+            PresentationClockUp => len is PresentationClock.QueryLength or PresentationClock.ConfirmLength,
             _ => true,
         };
     }

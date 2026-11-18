@@ -38833,6 +38833,18 @@ end
 System.AddCCommand("mp_edge", 'KCD2MP_SetEdgeMode(%line)',
     "Lua edge transport: mp_edge auto|inproc|http (default auto)")
 
+function KCD2MP_SetPresentationMode(arg)
+    local mode = tostring(arg or ""):match("^%s*(.-)%s*$")
+    if mode ~= "on" and mode ~= "off" then
+        mp_log("mp_rp_timeline: expected on|off")
+        return false
+    end
+    KCD2MP_EmitEvent("rp_timeline_cfg", mode)
+    return true
+end
+System.AddCCommand("mp_rp_timeline", 'KCD2MP_SetPresentationMode(%line)',
+    "Remote presentation on the host clock: mp_rp_timeline on|off (default on)")
+
 -- Both the agent and the DLL additionally require KCDMP_TEST_LANES=1.
 function KCD2MP_EdgeLanes(arg)
     local text = tostring(arg or ""):match("^%s*(.-)%s*$")

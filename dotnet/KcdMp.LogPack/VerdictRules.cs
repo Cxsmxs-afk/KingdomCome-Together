@@ -61,6 +61,8 @@ public static class VerdictRules
     public const long PresentationYellowBelowMs = 300;
     public const long PresentationAgentHopReviewAboveMs = 20;
     public const long EdgeRealtimeGreenBelowMs = 34;
+    public const long TimelineBufferMinMs = 60, TimelineBufferMaxMs = 120, TimelineExtrapolationMaxMs = 200;
+    public const long TimelineSkewGreenBelowMs = 20, TimelineSkewYellowBelowMs = 50;
 
     private const string T3 = "MP-T3-STATS";
     private const string W136 = "MP-WO136-STATS";
@@ -142,7 +144,11 @@ public static class VerdictRules
         new("edge_rt_age_ms_max", "edge_rt_n", " ms"),
         new("edge_bulk_age_ms_p95", "edge_bulk_n", " ms"),
         new("pipe_busy_replies", "edge_rt_n", AlternateCoverage: "edge_bulk_n", ReportNonZeroWithoutCoverage: true),
-        new("inproc_fallbacks", "edge_proc_n", ReportNonZeroWithoutCoverage: true)
+        new("inproc_fallbacks", "edge_proc_n", ReportNonZeroWithoutCoverage: true),
+        new("rp_buffer_ms", "rp_timeline_pose_n", " ms"),
+        new("rp_extrap_ms_max", "rp_timeline_pose_n", " ms"),
+        new("rp_late_samples", "rp_timeline_pose_n", ReportNonZeroWithoutCoverage: true),
+        new("rp_action_pos_skew_ms_p95", "rp_timeline_skew_n", " ms")
     ];
 
     private sealed record Sample(string Marker, string Role, string Origin, Dictionary<string, string> Fields)
@@ -292,6 +298,23 @@ public static class VerdictRules
             case "edge_rt_age_ms_p95":
                 var realtime = value < EdgeRealtimeGreenBelowMs ? VerdictStatus.Green : VerdictStatus.Red;
                 return new(rule.Id, realtime, measurement, evidence + ", DLL-Empfang bis Verarbeitung im Hauptthread");
+            case "rp_buffer_ms":
+                // Either endpoint is a violation, including in an older measured window.
+                var (outside, invalidBuffer, outsideCount) = observations.FirstOrDefault(x =>
+                    x.Value < TimelineBufferMinMs || x.Value > TimelineBufferMaxMs);
+                if (invalidBuffer is long buffer)
+                {
+                    return new(rule.Id, VerdictStatus.Red, Format(buffer, rule.Unit),
+                        $"{outside!.Marker}, {outside.Origin}, n={Format(outsideCount.GetValueOrDefault(), "")}, Puffer außerhalb 60–120 ms");
+                }
+                return new(rule.Id, VerdictStatus.Green, measurement, evidence + ", Puffer 60–120 ms");
+            case "rp_extrap_ms_max":
+                var extrapolation = value <= TimelineExtrapolationMaxMs ? VerdictStatus.Green : VerdictStatus.Red;
+                return new(rule.Id, extrapolation, measurement, evidence + ", Extrapolation bis 200 ms");
+            case "rp_action_pos_skew_ms_p95":
+                var skew = value < TimelineSkewGreenBelowMs ? VerdictStatus.Green :
+                    value < TimelineSkewYellowBelowMs ? VerdictStatus.Yellow : VerdictStatus.Red;
+                return new(rule.Id, skew, measurement, evidence + ", Host-Zeit der ausgelösten Aktion und der dargestellten Pose");
             case "owner_violations":
                 // The native guard can assert before the next periodic count.
                 if (source.Marker == OwnerViolation) return new(rule.Id, VerdictStatus.Red, "≥1", evidence);

@@ -73,6 +73,18 @@ int t3_native_stats_tests(int* passed) {
         check(p6[443 + 9*i] == 49 + i, "edge field identity is append-only");
         check(kcdmp::p4rules::u64(p6.data() + 444 + 9*i) == edges[i], "edge age, busy replies and sample counts retain their exact values");
     }
+    std::array<uint8_t, 64> timeline;
+    timeline.fill(0xAD);
+    const auto untouchedTimeline = timeline;
+    const uint64_t timelineCounts[] = {90, 200, 15, 19, 1234, 20};
+    check(kcdmp::t3native::write_timeline(timeline.data(), 55, timelineCounts) == 0 && timeline == untouchedTimeline,
+        "timeline short reply is untouched");
+    check(kcdmp::t3native::write_timeline(timeline.data(), timeline.size(), timelineCounts) == 56 &&
+        timeline[0] == 1 && timeline[1] == 6 && timeline[56] == 0xAD, "timeline is a separate 56-byte versioned page");
+    for (size_t i = 0; i < kcdmp::t3native::kTimelineFields; ++i) {
+        check(timeline[2 + 9*i] == i, "timeline field has its own page ID");
+        check(kcdmp::p4rules::u64(timeline.data() + 3 + 9*i) == timelineCounts[i], "timeline values and matching observation counts retain precise encoding");
+    }
     p6 = base;
     check(kcdmp::t3native::append_rp_measure(p6.data(), 272, 424, measure) == 0 && p6 == base,
         "short replies cannot contain partial measurement coverage");

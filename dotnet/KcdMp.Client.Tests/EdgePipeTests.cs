@@ -235,6 +235,26 @@ public sealed class EdgePipeTests
     }
 
     [Fact]
+    public async Task Timed_realtime_pose_carries_both_host_times_and_original_body_only_on_its_current_connection()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        byte[] pose = NpcCompact.BuildDown(8, "Npc_17", new(2, 3, 4, 5, 90, 0, 8, 13));
+        long revision = conn.Pipe.EdgeConnectionRevision;
+        const ulong captured = 1UL << 40, arrived = captured + 37;
+        Assert.False(conn.Pipe.PostPresentationPose(Protocol.NpcStateDown, pose, 54321, captured, arrived, revision + 1));
+        Assert.False(conn.Pipe.PostPresentationPose(Protocol.NpcStateDown, pose, 54321, 0, arrived, revision));
+        Assert.True(conn.Pipe.PostPresentationPose(Protocol.NpcStateDown, pose, 54321, captured, arrived, revision));
+        var wire = await conn.Read(Request);
+        Assert.Equal(new byte[] { 1, 0x3C, 0, 0, 0, 0, Protocol.NpcStateDown }, wire[4..11]);
+        Assert.Equal(54321, BinaryPrimitives.ReadInt64LittleEndian(wire.AsSpan(11)));
+        Assert.Equal(captured, BinaryPrimitives.ReadUInt64LittleEndian(wire.AsSpan(19)));
+        Assert.Equal(arrived, BinaryPrimitives.ReadUInt64LittleEndian(wire.AsSpan(27)));
+        Assert.Equal(pose, wire[35..]);
+        await conn.Respond(Id(wire), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+    }
+
+    [Fact]
     public async Task A_full_send_queue_retains_latest_raw_pose_and_its_stance_without_replacing_reliable_work()
     {
         await using var conn = new Connection();

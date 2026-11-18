@@ -10,4 +10,5 @@ public static partial class Protocol
     // The test-only clock command is [op][3][on:0|1].
     public const byte T3OpStats = 250;
     public const byte T3PresentationClockCommand = 3;
+    public const byte T3TimelineStatsCommand = 4;
 }

@@ -3978,6 +3978,9 @@ def run(name, args):
     if name == 'lanes':
         import scen_s2_lanes
         return scen_s2_lanes.run(sys.modules[__name__], args)
+    if name == 'timeline':
+        import scen_s2_timeline
+        return scen_s2_timeline.run(sys.modules[__name__], args)
     r = Run(name, include_joiner=name != 'botjoiner')
     plan = {
         'join': [('join', s_join(r))],

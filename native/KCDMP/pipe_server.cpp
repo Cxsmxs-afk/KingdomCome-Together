@@ -21,6 +21,7 @@
 #include "p6_missile.h"
 #include "p6_render_rules.h"
 #include "rp_measure.h"
+#include "rp_timeline_actions.h"
 #include "respawn_actions.h"
 #include "npc_drive.h"
 #include "motion.h"
@@ -463,9 +464,10 @@ bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) 
                            (request.frame.body[0] == wo216::kOpLifecycle ||
                             request.frame.body[0] == pipecontrol::kEdgeCapabilities);
     const bool latest = nested == kSetPartner || nested == kReadBodyState || nested == kReadLocalState;
-    if (lifecycle || (nested > kPinLabel && nested != kRawPose && nested != kProbe) ||
+    const bool timeline = nested == kTimedAction || nested == kTimedPose || nested == kTimelineConfig;
+    if (lifecycle || (nested > kPinLabel && nested != kRawPose && nested != kProbe && !timeline) ||
         (request.lane == Lane::Latest && !latest) ||
-        (nested == kRawPose && request.lane != Lane::Realtime) || (nested == kProbe && request.lane != Lane::Bulk))
+        ((nested == kRawPose || timeline) && request.lane != Lane::Realtime) || (nested == kProbe && request.lane != Lane::Bulk))
         return reject(Status::Unsupported);
     if (nested != kRawPose && !pipecontrol::complete_payload_allowed(request.frame))
         return reject(Status::Invalid);
@@ -1685,6 +1687,24 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
+            case edgelanes::kTimedPose: {
+                const uint8_t r = t_edgeReply ? npcdrive::on_timed_pose(body, len,
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}}) : npcdrive::kBadRequest;
+                send_result(h, r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case edgelanes::kTimelineConfig: {
+                const uint8_t r = t_edgeReply && len == 1 && body[0] <= 1 ? npcdrive::configure_timeline(body[0]) : npcdrive::kBadRequest;
+                if (r == npcdrive::kOk) timelineactions::configure(body[0] != 0);
+                send_result(h, r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case edgelanes::kTimedAction: {
+                const auto r = t_edgeReply ? timelineactions::submit(body, len,
+                    {incoming.readerObservation, generation + 1, incoming.readerLife}, incoming.readerTick) : timelineactions::Invalid;
+                send_result(h, r == timelineactions::Accepted, seq, static_cast<uint8_t>(r));
+                break;
+            }
             case edgelanes::kProbe: {
                 BYTE out[10]{};
                 if (t_edgeReply && len == 9 && body[0] == 1) {
@@ -2239,7 +2259,7 @@ void edge_dispatch(const edgelanes::Request& request, bool rt) {
     const HANDLE handle = g_pipe.load();
     if (handle == INVALID_HANDLE_VALUE) return;
     const uint8_t type = request.frame.type;
-    if (type != edgelanes::kRawPose && type != edgelanes::kProbe)
+    if (type != edgelanes::kRawPose && type != edgelanes::kTimedPose && type != edgelanes::kProbe)
         edge_observe(rt ? g_edgeRt : g_edgeBulk, request.frame.readerQpc);
     EdgeReplyCapture capture;
     capture.type = direct_reply_type(type);

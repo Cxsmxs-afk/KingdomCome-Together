@@ -347,7 +347,7 @@ public partial class GameBridge
     /// Dispatches one inbound WO-121 action. True when this file owned the kind
     /// (whatever it then did); false leaves it to the older handlers.
     /// </summary>
-    private async Task<bool> DispatchWo121ActionAsync(InboundAction a, CancellationToken ct)
+    private async Task<bool> DispatchWo121ActionAsync(InboundAction a, CancellationToken ct, PresentationFrame presentation)
     {
         switch (a.Kind)
         {
@@ -407,7 +407,7 @@ public partial class GameBridge
                 if (!AttackEvent.TryFromBytes(a.Payload, out var ae)) { Console.WriteLine($"MP-ACTION section=inbound ghost={a.SourceGhostId} kind=Attack dispatch=dropped-malformed len={a.Payload.Length}"); return true; }
                 _peerV8AttackAt[a.SourceGhostId] = DateTime.UtcNow;
                 Wo173OnAvatarAttack(a.SourceGhostId, ae.Row, catalog, ct);   // WO-173 C1: the row his next hit belongs to; his figure strikes for its window
-                await PlayAvatarRowAsync(a, ae.Row, catalog, ae.ToString(), ct);
+                await PlayAvatarRowAsync(a, ae.Row, catalog, ae.ToString(), ct, presentation);
                 Wo136OnAvatarAttack(a.SourceGhostId);   // WO-136 Phase 4: the avatar fights what it swings at; the swing threatens it
                 return true;
             }
@@ -415,7 +415,7 @@ public partial class GameBridge
             case ActionKind.Dodge:
             {
                 if (!RowEvent.TryFromBytes(a.Payload, out var re)) return true;
-                await PlayAvatarRowAsync(a, re.Row, catalog, $"row={re.Row} flags={re.Flags}", ct);
+                await PlayAvatarRowAsync(a, re.Row, catalog, $"row={re.Row} flags={re.Flags}", ct, presentation);
                 return true;
             }
             case ActionKind.Jump:
@@ -491,7 +491,8 @@ public partial class GameBridge
     }
 
     /// <summary>The avatar plays the sender's committed row (attack / block / perfect block / dodge).</summary>
-    private async Task PlayAvatarRowAsync(InboundAction a, Guid rowGuid, ActionRowCatalog? catalog, string detail, CancellationToken ct)
+    private async Task PlayAvatarRowAsync(InboundAction a, Guid rowGuid, ActionRowCatalog? catalog, string detail, CancellationToken ct,
+        PresentationFrame presentation)
     {
         if (!_avatarCombat)
         {
@@ -522,6 +523,8 @@ public partial class GameBridge
         // WO-200 II.6: a clinch entered by rows whose "leave" never came (the field dropped two as stale) ends before this swing
         if (_ghostEntityIds.TryGetValue(gid, out uint fe200) && row.Table != "combat_action_sync_attack" && _w200ClinchRows.TryRemove(fe200, out var cr200))
             await Wo200EndClinchAsync(fe200, cr200.Opp, "next-swing", ct);
+        if (row.Table != "combat_action_sync_attack" && _ghostEntityIds.TryGetValue(gid, out uint presentationEid) &&
+            await TrySchedulePresentationRowAsync(a, presentationEid, row.Spec, presentation, ct)) return;
         _ = _combat.NpcHoldAsync("kcd2mp_" + gid, 900, ct);
         if (row.Table == "combat_action_sync_attack" && _ghostEntityIds.TryGetValue(gid, out uint fe197))
             await Wo197VictimHalfAsync("kcd2mp_" + gid, fe197, row, catalog, ct);   // WO-197 B2: his paired move's victim half first

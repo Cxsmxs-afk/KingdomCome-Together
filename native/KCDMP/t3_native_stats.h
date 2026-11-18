@@ -7,6 +7,7 @@
 #include "wo216.h"
 #include "respawn_actions.h"
 #include "rp_measure.h"
+#include "rp_timeline.h"
 #include "wo201.h"
 
 namespace kcdmp::t3native {
@@ -38,5 +39,12 @@ inline size_t stats(uint8_t* out, size_t cap) {
     const uint64_t edge_counts[] = {lanes.rt_age_ms_p95, lanes.rt_age_ms_max, lanes.bulk_age_ms_p95,
                                     lanes.pipe_busy_replies, lanes.rt_n, lanes.bulk_n};
     return append_edge(out, owned, cap, edge_counts);
+}
+
+inline size_t timeline_stats(uint8_t* out, size_t cap) {
+    const auto timeline = rptimeline::snapshot();
+    const uint64_t counts[] = {timeline.buffer_ms, timeline.extrap_ms_max, timeline.late_samples,
+                               timeline.action_pos_skew_ms_p95, timeline.pose_n, timeline.action_n};
+    return write_timeline(out, cap, counts);
 }
 } // namespace kcdmp::t3native

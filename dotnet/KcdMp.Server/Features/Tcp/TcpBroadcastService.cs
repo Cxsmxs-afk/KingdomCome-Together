@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
 using KcdMp.Server.Features.ClientHandling;
+using KcdMp.Wire;
 
 namespace KcdMp.Server.Features.Tcp;
 
@@ -29,16 +30,34 @@ public class TcpBroadcastService
     /// </summary>
     public void Broadcast(ClientSession source, float x, float y, float z, float rotZ, byte flags, byte[] tail)
     {
+        var stamp = PresentationTimeWire.TryPositionStamp(flags, tail, out uint ticks) ? HostStamp(source, ticks) : null;
         foreach (var target in Others(source))
-            target.EnqueueGhost(source.Id, x, y, z, rotZ, flags, tail);
+            target.EnqueueGhost(source.Id, x, y, z, rotZ, flags, tail, stamp);
 
         if (_echo)
         {
             // Place echo ghost 1 m to the right of the player's facing direction
             float sideX = (float)Math.Cos(rotZ);
             float sideY = -(float)Math.Sin(rotZ);
-            source.EnqueueGhost(0, x + sideX, y + sideY, z, rotZ, flags, tail);
+            source.EnqueueGhost(0, x + sideX, y + sideY, z, rotZ, flags, tail, stamp);
         }
+    }
+
+    private PresentationStamp? HostStamp(ClientSession source, uint ticks)
+    {
+        if (ticks == 0) return null;
+        long now = PresentationClock.NowMs();
+        if (!source.TryPresentationClock(now, out var sender) ||
+            !PresentationClock.TryShift(now, -sender.ClientToRelayMs, out long senderNow) ||
+            !PresentationClock.TryUnwrap(ticks, senderNow, out long sourceTime)) return null;
+        var (host, epoch) = _clientHandler.PresentationAnchor();
+        if (host is null || !host.TryPresentationClock(now, out var hostClock)) return null;
+        long relayToHost = -hostClock.ClientToRelayMs;
+        // A packet captured by the host is already on the authoritative clock.
+        if (ReferenceEquals(host, source)) return new(epoch, (ulong)sourceTime, relayToHost);
+        if (!PresentationClock.TryShift(sourceTime, sender.ClientToRelayMs, out long relayTime) ||
+            !PresentationClock.TryShift(relayTime, relayToHost, out long hostTime)) return null;
+        return new(epoch, (ulong)hostTime, relayToHost);
     }
 
     /// <summary>
@@ -132,8 +151,9 @@ public class TcpBroadcastService
     /// </summary>
     public void BroadcastNpcState(ClientSession source, byte[] body)
     {
+        var stamp = HostStamp(source, System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(^Protocol.SenderMsLen)));
         foreach (var target in Others(source))
-            target.EnqueueNpcState(source.Id, body);
+            target.EnqueueNpcState(source.Id, body, stamp);
     }
 
     /// <summary>
@@ -181,8 +201,9 @@ public class TcpBroadcastService
     /// </summary>
     public void BroadcastAction(ClientSession source, byte[] body)
     {
+        var stamp = PresentationTimeWire.TryActionStamp(body, out uint ticks) ? HostStamp(source, ticks) : null;
         foreach (var target in Others(source))
-            target.EnqueueAction(source.Id, body);
+            target.EnqueueAction(source.Id, body, stamp);
     }
 
     /// <summary>
