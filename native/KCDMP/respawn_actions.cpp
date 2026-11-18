@@ -724,9 +724,9 @@ bool marker_create(const p5::Binding& b,const p5::Spec& spec,SharedPtr* out){
 bool marker_add(const p5::Binding& b,const p5::Spec& spec,const SharedPtr& mark){
     SharedPtr arg=mark;if(!sp_addref(arg))return false;
     const bool ok=marker_void(marker_sites::add,b.map,kMapAdd,&arg);
-    if(ok){char small[10]{},large[10]{};const int slot=wo171rules::slot_of_code(spec.picture);
-        if(slot>=0&&g_picArmed&&!g_picOff.load()&&wo171rules::picture_name(spec.picture,small,sizeof small)){
-            std::snprintf(large,sizeof large,"%sM",small);if(!slot_set(slot,large)){g_picOff=true;c_picFaults.fetch_add(1);}
+    if(ok){char smallIcon[10]{},largeIcon[10]{};const int slot=wo171rules::slot_of_code(spec.picture);
+        if(slot>=0&&g_picArmed&&!g_picOff.load()&&wo171rules::picture_name(spec.picture,smallIcon,sizeof smallIcon)){
+            std::snprintf(largeIcon,sizeof largeIcon,"%sM",smallIcon);if(!slot_set(slot,largeIcon)){g_picOff=true;c_picFaults.fetch_add(1);}
         }}
     return ok;
 }
