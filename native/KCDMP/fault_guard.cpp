@@ -95,7 +95,7 @@ void on_fault(Site& s) noexcept {
                       s.kind == Kind::Read ? " [read site: counted, never switched off]" : "");
         emit(line);
     }
-    if (s.kind == Kind::Call && n >= kSwitchOffAfter && g_switchOff.load(std::memory_order_relaxed) &&
+    if (s.kind == Kind::Call && s.policy == Policy::Ordinary && n >= kSwitchOffAfter && g_switchOff.load(std::memory_order_relaxed) &&
         !s.off.exchange(true, std::memory_order_relaxed)) {
         char line[300];
         std::snprintf(line, sizeof line,

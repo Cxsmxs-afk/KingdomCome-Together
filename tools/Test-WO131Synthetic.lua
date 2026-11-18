@@ -436,6 +436,127 @@ do -- (n) WO-158 S2: Mutt, the player's own dog, is never paused; any other dog 
     check("n: no Lua errors", #ERRS == 0, ERRS[1])
 end
 
+
+do -- P5: actual parking/reassert/release and late combat-failure methods
+    reset(); NOW = 5000; KCD2MP_T3CorpseWorldReset("test")
+    local byId, trace, events = {}, {}, {}
+    System.GetEntity = function(id) return byId[id] end
+    local originalRemove, originalEmit = System.RemoveEntity, KCD2MP_EmitEvent
+    System.RemoveEntity = function(id) trace[#trace + 1] = "remove:" .. tostring(id); byId[id] = nil; originalRemove(id) end
+    KCD2MP_EmitEvent = function(kind, arg) events[#events + 1] = { kind, arg }; return originalEmit(kind, arg) end
+    local function body(name)
+        local e = mkEntity(name, 5, 0, 0)
+        ENTS[name], byId[e.id] = e, e
+        local hide = e.Hide
+        e.Hide = function(self, v) trace[#trace + 1] = "hide:" .. tostring(v); hide(self, v) end
+        return e
+    end
+    local function attempts(kind)
+        local n = 0; for _, t in ipairs(trace) do if t:find(kind, 1, true) == 1 then n = n + 1 end end; return n
+    end
+    local e = body("p5_parked"); SPHERE = {e}
+    KCD2MP_W131Tick(true, true)
+    check("p5 live body really parks before the transition", e.hidden and KCD2MP.w131.parked.p5_parked ~= nil)
+    e.dead, trace, CMDS = true, {}, {}; NOW = NOW + 11; KCD2MP.w131.reassert = true
+    KCD2MP_W131Tick(true, true)
+    check("p5 actual death overrides parked repause/reassert with no Hide1", not e.hidden and attempts("hide:1") == 0 and cmdCount("wh_ai_PauseNPC p5_parked") == 0)
+    check("p5 actual death retires the parking record", KCD2MP.w131.parked.p5_parked == nil)
+    if W217.E then W217.E.listed.p5_parked = NOW - 61 end
+    trace, CMDS = {}, {}; KCD2MP_W131ParkReleased("p5_parked", "silence")
+    check("p5 stream release after corpse-list TTL keeps actual corpse", not e.hidden and attempts("hide:1") == 0 and attempts("remove:") == 0 and #CMDS == 0)
+    trace = {}; KCD2MP_W215Ghost("p5_parked"); KCD2MP_W215Dormant("p5_parked")
+    check("p5 late Ghost and Dormant cannot hide or mark the corpse", attempts("hide:1") == 0 and not W215.ghosts.p5_parked and not W215.dormantUntil.p5_parked)
+
+    local stand = body("p5_stand"); stand.kcdmpStandIn = "exact-owned-token"; stand.dead = true
+    KCD2MP.w131.standins.p5_stand = { token = stand.kcdmpStandIn, id = stand.id, cls = "NPC", at = NOW }
+    trace = {}; KCD2MP_W131RemoveStandIn("p5_stand", "stream-stopped")
+    check("p5 confirmed dead owned stand-in is never removed", byId[stand.id] == stand and attempts("remove:") == 0)
+    local other = body("p5_stand")
+    System.GetEntitiesByClass = function() return { stand, other } end
+    KCD2MP.w131.standinSweepAt = -1e9; trace = {}; KCD2MP_W131StandInSweep()
+    check("p5 returning world NPC retires binding but keeps physical stand-in corpse", KCD2MP.w131.standins.p5_stand == nil and byId[stand.id] == stand and attempts("remove:") == 0)
+    check("p5 returning alive same-name NPC never inherits corpse fact", KCD2MP_T3CorpseProbe("p5_stand", other) == "alive")
+
+    local pending = body("p5_pending"); pending.kcdmpStandIn = "pending-token"
+    local si = { token = pending.kcdmpStandIn, id = pending.id, at = NOW, cls = "NPC" }
+    KCD2MP.w131.standins.p5_pending = si
+    KCD2MP_W137DeadStandInSpawned("p5_pending", pending, si)
+    trace = {}; KCD2MP_W131ParkReleased("p5_pending", "silence")
+    check("p5 alive-pending stand-in remains hidden and retained", pending.hidden and byId[pending.id] == pending and attempts("remove:") == 0 and attempts("hide:0") == 0)
+    check("p5 alive-pending is not an observed corpse", KCD2MP_T3CorpseProbe("p5_pending", pending) == "alive-pending")
+    pending.dead = true; KCD2MP_W131ParkReleased("p5_pending", "death-applied")
+    check("p5 successful actual death shows the pending body without a new death writer", not pending.hidden and attempts("remove:") == 0)
+
+    local retiring = body("p5_replaced_pending"); retiring.kcdmpStandIn = "retire-pending"
+    local retiringEntry = { token = retiring.kcdmpStandIn, id = retiring.id, at = NOW, cls = "NPC", deadPending = true }
+    KCD2MP.w131.standins.p5_replaced_pending = retiringEntry; retiring.hidden = true
+    local returned = body("p5_replaced_pending")
+    System.GetEntitiesByClass = function() return { retiring, returned } end
+    KCD2MP.w131.standinSweepAt = -1e9; trace = {}; KCD2MP_W131StandInSweep()
+    check("p5 verified alive pending duplicate retires without ever being shown", byId[retiring.id] == nil and attempts("hide:0") == 0)
+    local unresolved = body("p5_replaced_unknown"); unresolved.kcdmpStandIn = "retire-unknown"; unresolved.actor.IsDead = function() return nil end
+    local unresolvedEntry = { token = unresolved.kcdmpStandIn, id = unresolved.id, at = NOW, cls = "NPC" }
+    KCD2MP.w131.standins.p5_replaced_unknown = unresolvedEntry
+    local newer = body("p5_replaced_unknown")
+    System.GetEntitiesByClass = function() return { unresolved, newer } end
+    KCD2MP.w131.standinSweepAt = -1e9; trace = {}; KCD2MP_W131StandInSweep()
+    check("p5 unknown duplicate retains its exact retry owner instead of orphaning a hidden entity", KCD2MP.w131.standins.p5_replaced_unknown == unresolvedEntry and attempts("remove:") == 0)
+    unresolved.dead = true; unresolved.actor.IsDead = function() return unresolved.dead end
+    KCD2MP.w131.standinSweepAt = -1e9; trace = {}; KCD2MP_W131StandInSweep()
+    check("p5 later confirmed duplicate corpse retires binding and keeps actual body", KCD2MP.w131.standins.p5_replaced_unknown == nil and byId[unresolved.id] == unresolved and attempts("remove:") == 0)
+
+    local unknown = body("p5_unknown"); unknown.actor.IsDead = function() return nil end
+    local beforeUnknown = KCD2MP.t3Corpses.stats.lua_corpse_unknown_kept
+    trace, CMDS = {}, {}; SPHERE = {unknown}; KCD2MP_W131Tick(true, true); KCD2MP_W215Dormant("p5_unknown")
+    check("p5 unknown life read neither parks nor removes", attempts("hide:1") == 0 and attempts("remove:") == 0 and #CMDS == 0)
+    check("p5 unknown-kept counts destructive attempts only", KCD2MP.t3Corpses.stats.lua_corpse_unknown_kept >= beforeUnknown + 2)
+    local stable = KCD2MP.t3Corpses.stats.lua_corpse_unknown_kept
+    NOW = NOW + 1; KCD2MP_T3CorpseStatsTick()
+    check("p5 stats poll does not inflate unknown-kept", KCD2MP.t3Corpses.stats.lua_corpse_unknown_kept == stable)
+
+    local beforeError = #ERRS
+    unknown.actor.IsDead = function() error("p5-expected-life-read-failure") end
+    trace, CMDS = {}, {}; KCD2MP_W215Ghost("p5_unknown")
+    check("p5 throwing life read is unknown and has no destructive call", attempts("hide:1") == 0 and attempts("remove:") == 0 and #CMDS == 0)
+    check("p5 fixture observed the caught engine error", #ERRS == beforeError + 1 and tostring(ERRS[#ERRS]):find("p5-expected-life-read-failure", 1, true) ~= nil)
+    if #ERRS == beforeError + 1 and tostring(ERRS[#ERRS]):find("p5-expected-life-read-failure", 1, true) then table.remove(ERRS) end
+
+    local old = body("p5_reuse"); old.dead = true; KCD2MP_T3CorpseProbe("p5_reuse", old)
+    local replacement = body("p5_reuse"); byId[replacement.id] = nil; replacement.id = old.id; byId[old.id] = replacement
+    check("p5 same name and reused ID with a new table is a living replacement", KCD2MP_T3CorpseProbe("p5_reuse", replacement) == "alive")
+    local soul = body("p5_soul"); soul.dead = true; local sid = "one"; soul.soul.GetId = function() return sid end
+    KCD2MP_T3CorpseProbe("p5_soul", soul); sid = "two"; soul.dead = false
+    check("p5 changed soul token retires the old death", KCD2MP_T3CorpseProbe("p5_soul", soul) == "alive")
+    local tagged = body("p5_token"); tagged.dead = true; tagged.kcdmpStandIn = "old-life"
+    KCD2MP_T3CorpseProbe("p5_token", tagged); tagged.kcdmpStandIn = "new-life"; tagged.actor.IsDead = function() return nil end
+    check("p5 changed stand-in token cannot inherit a death through an unknown read", KCD2MP_T3CorpseProbe("p5_token", tagged) == "unknown" and KCD2MP.t3Corpses.rows[tagged] == nil)
+    e.dead = false; check("p5 same instance actually alive again retires its corpse", KCD2MP_T3CorpseProbe("p5_parked", e) == "alive")
+
+    KCD2MP_T3CorpseWorldReset("gauge"); local c = body("p5_visible"); c.dead = true
+    ENTS.p5_alias = c; KCD2MP_T3CorpseProbe("p5_visible", c); KCD2MP_T3CorpseProbe("p5_alias", c)
+    local d = body("p5_visible"); d.dead = true; KCD2MP_T3CorpseProbe("p5_visible", d)
+    local uncertain = body("p5_no_visibility"); uncertain.dead = true; uncertain.IsHidden = function() return nil end
+    KCD2MP_T3CorpseProbe("p5_no_visibility", uncertain)
+    local scans = 0; System.GetEntitiesInSphere = function() scans = scans + 1; return SPHERE end
+    System.GetEntitiesByClass = function() scans = scans + 1; return {} end
+    events = {}; KCD2MP.t3Corpses.reportedAt = NOW; NOW = NOW + 61; KCD2MP_T3CorpseStatsTick()
+    local stats = nil; for _, event in ipairs(events) do if event[1] == "t3_corpse_stats" then stats = event[2] end end
+    check("p5 exact three unsigned integer fields are emitted after60s", stats and stats:match("^lua_corpse_visible=%d+ lua_corpse_hidden_blocked=%d+ lua_corpse_unknown_kept=%d+$") ~= nil)
+    check("p5 gauge dedupes one body aliases and counts two genuine same-name bodies", stats and stats:match("lua_corpse_visible=2 ") ~= nil, stats)
+    check("p5 gauge never enumerates the world", scans == 0)
+    local world = KCD2MP.t3Corpses.world
+    KCD2MP_W134LootLifeReset()
+    check("p5 Henry-life reset does not retire NPC corpse world", KCD2MP.t3Corpses.world == world)
+    KCD2MP_W136Hold(true, 240, "test-load")
+    check("p5 genuine load retires old corpse identities", KCD2MP.t3Corpses.world > world and next(KCD2MP.t3Corpses.rows) == nil)
+    local version = KCD2MP.t3Corpses.world; KCD2MP_W136Hold(true, 240, "keepalive")
+    check("p5 repeated load keepalive is idempotent for corpse reset", KCD2MP.t3Corpses.world == version)
+    local fatal = 0; for _, event in ipairs(events) do if event[1] == "npc_death" then fatal = fatal + 1 end end
+    check("p5 all visibility and retirement operations create no FATAL/death event", fatal == 0)
+    check("p5 no Lua errors", #ERRS == 0, ERRS[1])
+    System.RemoveEntity, KCD2MP_EmitEvent = originalRemove, originalEmit
+end
+
 local pass, fail = 0, 0
 for _, r in ipairs(RESULTS) do if r:sub(1, 4) == "PASS" then pass = pass + 1 else fail = fail + 1 end end
 OUT = table.concat(RESULTS, "\n") .. string.format("\n%d passed, %d failed", pass, fail)

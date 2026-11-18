@@ -48,4 +48,19 @@ public class T3NativeCountersTests
         Assert.False(T3NativeCounters.TryRead(bytes, out _));
         Assert.False(T3NativeCounters.TryRead([.. Payload(), 0], out _));
     }
+
+    [Fact]
+    public void Complete_corpse_group_is_atomic_and_does_not_change_the_P4_prefix()
+    {
+        Assert.True(T3NativeCounters.TryRead(Payload(24), out var values));
+        Assert.Equal(24, values.Count);
+        Assert.Equal(19, values["corpses_visible"]); Assert.Equal(20, values["corpse_hidden_blocked"]);
+        Assert.Equal(21, values["grave_markers_added"]); Assert.Equal(22, values["grave_marker_fallbacks"]);
+        Assert.Equal(23, values["markers_off_session"]);
+        for (int n = 20; n < 24; n++) Assert.False(T3NativeCounters.TryRead(Payload(n), out _));
+        Assert.True(T3NativeCounters.TryRead(Payload(19), out var old));
+        Assert.Equal(19, old.Count); Assert.False(old.ContainsKey("corpses_visible"));
+        byte[] next = Payload(25); next[2 + 24 * 9] = 250;
+        Assert.True(T3NativeCounters.TryRead(next, out values)); Assert.Equal(24, values.Count);
+    }
 }

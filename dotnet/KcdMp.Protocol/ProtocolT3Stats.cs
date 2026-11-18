@@ -9,13 +9,15 @@ public static class T3NativeCounters
 {
     public const byte Version = 1;
     public const int MaxFields = 56;
+    public const int CoreFields = 19, CorpseFields = 5;
     // IDs are append-only. Distances are rounded UP to whole metres; detailed
     // teleport logs preserve the actual coordinates and fractional distances.
     public static readonly string[] Keys = [
         "tp_total", "tp_by_source_leash", "tp_by_source_respawn", "tp_by_source_unstuck", "tp_by_source_join",
         "wake_dist_m_max", "wake_drop_m_max", "tp_blocked_combat", "tp_refused_stale", "tp_refused_drop",
         "death_cause_hit", "death_cause_fall", "death_cause_bleed", "death_cause_other", "falldeath_after_tp",
-        "tp_by_source_leash_settle", "tp_by_source_video_landing", "tp_by_source_video_rollback", "tp_by_source_scene_nudge"
+        "tp_by_source_leash_settle", "tp_by_source_video_landing", "tp_by_source_video_rollback", "tp_by_source_scene_nudge",
+        "corpses_visible", "corpse_hidden_blocked", "grave_markers_added", "grave_marker_fallbacks", "markers_off_session"
     ];
 
     public static bool TryRead(ReadOnlySpan<byte> payload, out Dictionary<string, long> values)
@@ -34,6 +36,11 @@ public static class T3NativeCounters
             if (value > long.MaxValue) return false;
             values.Add(Keys[field], (long)value);
         }
-        return values.Count == Keys.Length;
+        for (int i = 0; i < CoreFields; i++) if (!seen[i]) return false;
+        int corpse = 0;
+        for (int i = CoreFields; i < CoreFields + CorpseFields; i++) if (seen[i]) corpse++;
+        // P4-only DLLs remain readable; a partially received P5 group never
+        // overwrites a previous complete measurement.
+        return corpse == 0 || corpse == CorpseFields;
     }
 }

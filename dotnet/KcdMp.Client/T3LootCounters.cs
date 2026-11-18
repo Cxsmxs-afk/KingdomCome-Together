@@ -7,10 +7,11 @@ internal static class T3LootCounters
 {
     internal static readonly string[] LootKeys = ["pickup_asks", "pickup_optimistic", "pickup_rollbacks", "pickup_unknown_kept", "ask_timeouts", "ask_latency_ms_p95", "take_busy_refusals"];
     internal static readonly string[] InputKeys = ["input_held_max_s", "input_releases"];
+    internal static readonly string[] CorpseKeys = ["lua_corpse_visible", "lua_corpse_hidden_blocked", "lua_corpse_unknown_kept"];
     internal static bool TryRead(string kind, string? text, out Dictionary<string, long> values)
     {
         values = new(StringComparer.Ordinal);
-        string[] keys = kind == "t3_loot_stats" ? LootKeys : kind == "t3_input_stats" ? InputKeys : [];
+        string[] keys = kind == "t3_loot_stats" ? LootKeys : kind == "t3_input_stats" ? InputKeys : kind == "t3_corpse_stats" ? CorpseKeys : [];
         if (keys.Length == 0 || text is null || text.Length > 1024) return false;
         foreach (string field in text.Split(' ', StringSplitOptions.RemoveEmptyEntries))
         {

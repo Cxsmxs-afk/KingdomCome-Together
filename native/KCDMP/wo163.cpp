@@ -26,6 +26,7 @@
 #include "wo194.h"
 #include "wo195.h"
 #include "t3_stats_rules.h"
+#include "t3_native_stats.h"
 #include "p4.h"
 
 #include <windows.h>
@@ -91,7 +92,7 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
     tell_ops();
     switch (body[0]) {
         case t3stats::kOp: {
-            if (len == 1) { *outLen = p4::stats(out, cap); return *outLen ? kROk : kRFailed; }
+            if (len == 1) { *outLen = t3native::stats(out, cap); return *outLen ? kROk : kRFailed; }
             if (!t3stats::valid(body + 1, len - 1)) return kRBadRequest;
             const uint8_t role = body[1];
             const uint64_t now = GetTickCount64();

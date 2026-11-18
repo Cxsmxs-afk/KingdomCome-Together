@@ -6332,7 +6332,153 @@ function KCD2MP_W131Guardable(e)
     return true, name
 end
 
+-- ===== P5/T3: observed corpse identities, never a new death writer =================
+do
+    local C = { world = 1, rows = {}, order = {}, cursor = 1, reportedAt = os.clock(),
+        stats = { lua_corpse_hidden_blocked = 0, lua_corpse_unknown_kept = 0 } }
+    KCD2MP.t3Corpses = C
+    local schedule
+    local function value(obj, method)
+        if not obj or type(obj[method]) ~= "function" then return nil end
+        local ok, v = pcall(obj[method], obj)
+        if not ok then return nil end
+        if v == true or v == 1 then return true end
+        if v == false or v == 0 then return false end
+        return nil
+    end
+    local function current(name, e)
+        if not e or e.id == nil then return false end
+        local live, ok = nil, false
+        if System and type(System.GetEntity) == "function" then ok, live = pcall(System.GetEntity, e.id) end
+        if not ok or live == nil then
+            if not System or type(System.GetEntityByName) ~= "function" then return false end
+            ok, live = pcall(System.GetEntityByName, name)
+        end
+        return ok and live == e
+    end
+    local function identity(name, e)
+        if not current(name, e) then return nil end
+        local soul, known = nil, true
+        if e.soul and type(e.soul.GetId) == "function" then
+            local ok, id = pcall(e.soul.GetId, e.soul)
+            known = ok and id ~= nil
+            if known then soul = tostring(id) end
+        end
+        if not known then return nil end
+        return { entity = e, id = tostring(e.id), soulRef = e.soul, soul = soul, token = e.kcdmpStandIn, world = C.world }
+    end
+    local function same(a, b)
+        return a and b and a.entity == b.entity and a.id == b.id and a.soulRef == b.soulRef
+            and a.soul == b.soul and a.token == b.token and a.world == b.world
+    end
+    local function retire(e)
+        local row = C.rows[e]
+        if row then row.visible = false; C.rows[e] = nil end
+    end
+    function KCD2MP_T3CorpseWorldReset(reason)
+        C.world, C.rows, C.order, C.cursor = C.world + 1, {}, {}, 1
+        C.nextAt = nil
+        if schedule then schedule() end
+        return true
+    end
+    function KCD2MP_T3CorpseProbe(name, e)
+        name = tostring(name or "")
+        if not e then pcall(function() e = System.GetEntityByName(name) end) end
+        if not e then return "missing", nil, nil end
+        local id = identity(name, e)
+        local row = C.rows[e]
+        if not id then if row then row.visible = false end; return "unknown", e, row end
+        if row and not same(row.identity, id) then retire(e); row = nil end
+        local dead = value(e.actor, "IsDead")
+        if dead == false then
+            retire(e)
+            local si = KCD2MP.w131 and KCD2MP.w131.standins and KCD2MP.w131.standins[name]
+            if si and si.deadPending and si.token ~= nil and si.token == e.kcdmpStandIn and si.id == e.id then
+                return "alive-pending", e, nil
+            end
+            return "alive", e, nil
+        end
+        if dead == nil then if row then row.visible = false end; return "unknown", e, row end
+        if not row then
+            if #C.order >= 512 then
+                local kept = {}
+                for _, old in ipairs(C.order) do if C.rows[old.entity] == old then kept[#kept + 1] = old end end
+                C.order, C.cursor = kept, 1
+            end
+            if #C.order < 512 then
+                row = { entity = e, name = name, identity = id, world = C.world }
+                C.rows[e] = row; C.order[#C.order + 1] = row
+            end
+        end
+        if row then row.confirmed = true; row.visible = value(e, "IsHidden") == false; row.checkedAt = os.clock() end
+        return "dead", e, row
+    end
+    local function show(name, e, row)
+        if not e or not current(name, e) then return end
+        if KCD2MP_W136Held and KCD2MP_W136Held() then return end
+        if value(e, "IsHidden") ~= false and type(e.Hide) == "function" then pcall(e.Hide, e, 0) end
+        if row then row.visible = value(e.actor, "IsDead") == true and value(e, "IsHidden") == false; row.checkedAt = os.clock() end
+    end
+    function KCD2MP_T3CorpseKeep(name, e, reason, action)
+        local state, body, row = KCD2MP_T3CorpseProbe(name, e)
+        if state == "dead" or state == "unknown" then
+            local key = state == "dead" and "lua_corpse_hidden_blocked" or "lua_corpse_unknown_kept"
+            C.stats[key] = math.min(1000000000, C.stats[key] + 1)
+            if state == "dead" then
+                if KCD2MP._npcPaused and KCD2MP._npcPaused[name] and KCD2MP_W137DeadTick then
+                    pcall(KCD2MP_W137DeadTick, name, KCD2MP.npcPuppets[name], body, true)
+                end
+                if KCD2MP.w131 then KCD2MP.w131.parked[name] = nil; KCD2MP.w131.pausedAnimals[name] = nil end
+                show(name, body, row)
+            elseif row and row.confirmed and same(row.identity, identity(name, body)) then show(name, body, row) end
+            return true
+        end
+        -- An authoritative death apply is still pending: keep its existing hidden
+        -- body until the ordinary verified-alive timeout, never expose it as dead.
+        return state == "alive-pending" and action == "remove" and reason ~= "dead-never-died" and reason ~= "world-npc-returned"
+    end
+    function KCD2MP_T3CorpseStatsTick()
+        local now = os.clock()
+        if C.nextAt and now < C.nextAt then return true end
+        C.nextAt = now + 0.25
+        local n = #C.order
+        for _ = 1, math.min(8, n) do
+            if C.cursor > n then C.cursor = 1 end
+            local row = C.order[C.cursor]; C.cursor = C.cursor + 1
+            if C.rows[row.entity] == row then
+                if not current(row.name, row.entity) then retire(row.entity)
+                else
+                    local state, e, fresh = KCD2MP_T3CorpseProbe(row.name, row.entity)
+                    if state == "dead" then show(row.name, e, fresh) end
+                end
+            end
+        end
+        local now = os.clock()
+        if now - C.reportedAt >= 60 then
+            C.reportedAt = now
+            local count = 0
+            for _, row in pairs(C.rows) do
+                if row.world == C.world and row.visible and now - (row.checkedAt or -1e9) <= 20 then count = count + 1 end
+            end
+            KCD2MP_EmitEvent("t3_corpse_stats", string.format("lua_corpse_visible=%d lua_corpse_hidden_blocked=%d lua_corpse_unknown_kept=%d",
+                count, C.stats.lua_corpse_hidden_blocked, C.stats.lua_corpse_unknown_kept))
+        end
+        return true
+    end
+    schedule = function()
+        local epoch = C.world
+        local function timer()
+            if KCD2MP.t3Corpses ~= C or C.world ~= epoch then return end
+            pcall(KCD2MP_T3CorpseStatsTick)
+            Script.SetTimer(250, timer)
+        end
+        Script.SetTimer(250, timer)
+    end
+    schedule()
+end
+
 local function w131_park(name, e, why)
+    if KCD2MP_T3CorpseKeep(name, e, why, "hide") then return false end
     local w = KCD2MP.w131
     local ok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. tostring(name))
     pcall(function() e:Hide(1) end)
@@ -6360,6 +6506,7 @@ end
 -- nothing there resumes it later.
 function KCD2MP_W131ParkReleased(name, why)
     if not KCD2MP_W131IsActive() then return false end
+    if KCD2MP_T3CorpseKeep(name, nil, why, "remove") then return true end
     if KCD2MP_W148Holds and KCD2MP_W148Holds(name) then return true end   -- WO-148: a carried body stays shown
     if KCD2MP_W217CorpseHolds and KCD2MP_W217CorpseHolds(name) then return true end   -- WO-217 E.1: a corpse the host lists stays
     -- WO-151 Phase 2: a ridden horse is the rider's -- never paused or hidden (the field: the host's horse
@@ -6443,6 +6590,7 @@ local function w131_sweep()
         local ok, name = KCD2MP_W131Guardable(e)
         if ok and KCD2MP_W139StopHeld and KCD2MP_W139StopHeld(name) then ok = false end   -- WO-139: a guard stopping this player
         if ok and KCD2MP_W148Holds and KCD2MP_W148Holds(name) then ok = false end   -- WO-148: a carried body is never parked
+        if ok and KCD2MP_T3CorpseKeep(name, e, "sweep", "hide") then ok = false end
         if ok and not KCD2MP.npcPuppets[name] then
             local parked = w.parked[name]
             if not parked then
@@ -6554,6 +6702,7 @@ end
 -- Liveness backstop from the 8 ms draw loop: the agent went away without a
 -- disconnect call (a crash) -> give everything back once the tick is stale.
 function KCD2MP_W131Backstop()
+    KCD2MP_T3CorpseStatsTick()
     local w = KCD2MP.w131
     if w.active and not KCD2MP_W131IsActive() then KCD2MP_W131UnparkAll("agent-silent") end
 end
@@ -6669,6 +6818,10 @@ function KCD2MP_W131RemoveStandIn(name, why)
     local w = KCD2MP.w131
     local entry = w.standins[name]
     if not entry then return false end
+    local body = nil
+    if entry.id and System.GetEntity then pcall(function() body = System.GetEntity(entry.id) end) end
+    if not body then body = w131_body(name) end
+    if KCD2MP_T3CorpseKeep(name, body, why, "remove") then return false end
     w.standins[name] = nil
     w.parked[name] = nil
     -- WO-200 II.5: by identity, never by name. The field (0.61.0): the rejoin's load left this table behind (Lua outlives a load), and
@@ -6692,6 +6845,7 @@ end
 -- nothing is removed by name. Each streamed NPC then resolves to the new world's body of its name; a missing one gets exactly one stand-in.
 --   WO200-STANDIN forget n=<n> why=<w>
 function KCD2MP_W131ForgetStandIns(why)
+    if KCD2MP_T3CorpseWorldReset then KCD2MP_T3CorpseWorldReset(why) end
     local w = KCD2MP.w131
     local n = 0
     for name in pairs(w.standins or {}) do
@@ -6735,14 +6889,21 @@ function KCD2MP_W131StandInSweep()
             pcall(function() own = entry.id and System.GetEntity(entry.id) end)
             local ok = false
             pcall(function() ok = own ~= nil and own.kcdmpStandIn == entry.token end)
-            if ok then pcall(function() System.RemoveEntity(own.id) end) end
-            w.standins[name] = nil
-            w.parked[name] = nil
-            local p = KCD2MP.npcPuppets[name]
-            if p and p.idHex then p.idHex = "?" end
-            retired = retired + 1
-            KCD2MP.w131.standinRetired = (KCD2MP.w131.standinRetired or 0) + 1
-            mp_log(string.format("WO200-STANDIN retired npc=%s removed_own=%s -- its world NPC is back: the stream binds that body", name, tostring(ok)))
+            local retire = true
+            if ok then
+                local state = KCD2MP_T3CorpseProbe(name, own)
+                if not KCD2MP_T3CorpseKeep(name, own, "world-npc-returned", "remove") then pcall(function() System.RemoveEntity(own.id) end)
+                elseif state == "unknown" then retire = false end -- keep an exact owner for a later verified retry
+            end
+            if retire then
+                w.standins[name] = nil
+                w.parked[name] = nil
+                local p = KCD2MP.npcPuppets[name]
+                if p and p.idHex then p.idHex = "?" end
+                retired = retired + 1
+                KCD2MP.w131.standinRetired = (KCD2MP.w131.standinRetired or 0) + 1
+                mp_log(string.format("WO200-STANDIN retired npc=%s removed_own=%s -- its world NPC is back: the stream binds that body", name, tostring(ok)))
+            end
         end
     end
     return retired
@@ -7273,6 +7434,7 @@ function KCD2MP_W136Hold(on, ttlS, why)
     local w = KCD2MP.w136
     local now = os.clock()
     if on and not w.hold and KCD2MP_T3InputReset then KCD2MP_T3InputReset("load-hold") end
+    if on and not w.hold and KCD2MP_T3CorpseWorldReset then KCD2MP_T3CorpseWorldReset("load-hold") end
     if on then
         if not w.hold and KCD2MP_W134LedgerReset then KCD2MP_W134LedgerReset("load") end
         local ttl = tonumber(ttlS) or 240
@@ -26625,6 +26787,7 @@ function KCD2MP_W172CopyDied(name, via)
     local W = KCD2MP.w172
     if not W.deadWins or type(name) ~= "string" or not string.find(name, "^[%w_]+$") then return false end
     W.stats.deadMarks = W.stats.deadMarks + 1
+    KCD2MP_T3CorpseProbe(name, nil) -- an observation, never a new Kill/FATAL path
     KCD2MP_EmitEvent("w172_dead", name)
     local w137 = KCD2MP.w137
     if w137 and w137.talking and w137.talking[name] and KCD2MP_W137TalkEndNow then pcall(KCD2MP_W137TalkEndNow, name, "dead") end
@@ -26637,6 +26800,7 @@ function KCD2MP_W172CopyAlive(name)
     local W = KCD2MP.w172
     if type(name) ~= "string" or not string.find(name, "^[%w_]+$") then return false end
     W.stats.alive = W.stats.alive + 1
+    KCD2MP_T3CorpseProbe(name, nil) -- only an actual current alive read retires a fact
     KCD2MP_EmitEvent("w172_alive", name)
     return true
 end
@@ -36028,6 +36192,7 @@ do
         if not KCD2MP_W215On("dormant") then return false end
         name = tostring(name or "")
         if name == "" then return false end
+        if KCD2MP_T3CorpseKeep(name, nil, "KCD2MP_W215Ghost", "hide") then return false end
         local now = os.clock()
         local g = W215.ghosts[name]
         if g then g.at = now; g.n = g.n + 1; return true end
@@ -36055,6 +36220,7 @@ do
         if not KCD2MP_W215On("dormant") then return false end
         name = tostring(name or "")
         if name == "" then return false end
+        if KCD2MP_T3CorpseKeep(name, nil, "KCD2MP_W215Dormant", "hide") then return false end
         local p = KCD2MP.npcPuppets[name]
         if p then
             pcall(KCD2MP_NpcNativeSync, name, p, nil, false, "dormant")
@@ -38042,6 +38208,7 @@ do
             KCD2MP_EmitEvent("w217_corpse", name .. " alive")
             return false
         end
+        KCD2MP_T3CorpseProbe(name, e)
         -- WO-137's created-dead stand-in: dead here now -- shown (its own tick would, for a streamed one)
         local si = KCD2MP.w131 and KCD2MP.w131.standins and KCD2MP.w131.standins[name]
         if si and si.deadPending then si.deadPending = nil end

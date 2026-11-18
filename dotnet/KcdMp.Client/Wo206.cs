@@ -116,6 +116,7 @@ public static class Wo206Rules
     /// payload as read ([sourceGhostId] first); join-channel kinds are the LootMsg kind at payload[6].</summary>
     public static Wo206Cat? WorldCategory(int type, byte[] p)
     {
+        if (type is Protocol.DeathMarkerDown or Protocol.GraveAddDown or Protocol.GraveRemoveDown) return Wo206Cat.Death;
         if (type == Protocol.NpcStateDown) return Wo206Cat.Npc;
         if (type == Protocol.NpcDamageDown)
         {

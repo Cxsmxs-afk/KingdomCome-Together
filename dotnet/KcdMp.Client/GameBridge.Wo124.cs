@@ -683,12 +683,11 @@ public partial class GameBridge
             j.GameplayStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
             j.LoadFailed = new(TaskCreationOptions.RunContinuationsAsynchronously);
             j.LoadCmdUtc = DateTime.UtcNow;
-            if (!await P1BeforeModLoadAsync("join-command"))
+            if (!await P5LoadGameAsync(j.Playline, j.Name, "join-command"))
             {
-                await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "authority-pending-unconfirmed", "The load safety gate could not be confirmed.");
+                await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "authority-pending-unconfirmed", _p5LoadRefusal.Length > 0 ? _p5LoadRefusal : "The load safety gate could not be confirmed.");
                 return;
             }
-            await ExecLuaAsync($"if KCD2MP_Wo124LoadGame then KCD2MP_Wo124LoadGame({j.Playline}, \"{j.Name}\", \"join\") end");
             // The engine prints "Loading saved game '...'" at once; from the menu it
             // then loads the level and reads the FILE only ~40 s later (the second
             // "Loading saved game" + "[CryAction] LoadGame"), so the file must stay
@@ -871,6 +870,7 @@ public partial class GameBridge
         }
         await CleanupRetainedJoinWorldsAsync(completed, "join=in");
         T3AfterJoinedWorldCleanup();
+        if (_wo122Stream is Stream markerStream) _ = P5AnnounceMarkersAsync(markerStream, _wo122Ct);
         try { await ExecLuaAsync("if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"Co-op: you are in your host's world.\") end"); }
         catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: joined notification failed: {ex.Message}"); }
         _ = Task.Delay(10000).ContinueWith(_ => { if (_joinUiState == "in") SetJoinUi("idle", ""); });
@@ -1086,14 +1086,12 @@ public partial class GameBridge
         }
         if (!await Wo177WaitQuietAsync("leave")) { _leaveInProgress = false; SetJoinUi("left", full + " " + Wo177Rules.GaveUpText); return; }   // WO-177 A5
         await Task.Delay(4000);
-        _ownLoadExpected = true;
-        _w207LeaveTarget = src.Base;   // WO-207 C.4: what the mod's last-loaded save reads once this leave is in
-        if (!await P1BeforeModLoadAsync("leave-command"))
+        if (!await P5LoadGameAsync(src.Playline, src.Base, "leave-command"))
         {
-            SetJoinUi("failed", "The load safety gate could not be confirmed.");
+            _leaveInProgress = false;
+            SetJoinUi("failed", _p5LoadRefusal.Length > 0 ? _p5LoadRefusal : "The load safety gate could not be confirmed.");
             return;
         }
-        await ExecLuaAsync($"if KCD2MP_Wo124LoadGame then KCD2MP_Wo124LoadGame({src.Playline}, \"{src.Base}\", \"leave\") end");
     }
 
     /// <summary>The host left the relay (0x06) while this game was in its world or joining.</summary>

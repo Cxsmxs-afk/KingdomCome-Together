@@ -1830,7 +1830,8 @@ public partial class GameBridge(ClientConfig config)
         // connection like OnLocalHit.
         _combat.OnLocalDowned = OnLocalDownedAsync;
         _combat.OnLocalRespawned = (x, y, z, reason) => { Wo139OnLocalRespawned(reason); _ = Wo166OnLocalRespawnedAsync(reason); return SendPlayerRespawnedAsync(stream, x, y, z, reason, cts.Token); };   // WO-166 R1   // WO-139: an execution clears the joiner's record
-        _combat.OnLocalGrave = (add, id, x, y, z) => SendGraveAsync(stream, add, id, x, y, z, cts.Token);
+        _combat.OnLocalGrave = (add, id, x, y, z) => { Console.WriteLine($"P5-MARKER legacy notice 0x{id:X16} skipped: no world/generation receipt; use the matching drop-in DLL"); return Task.CompletedTask; };
+        _combat.OnDeathMarker = marker => { P5QueueLocalMarker(marker, stream, cts.Token); return Task.CompletedTask; };
         // WO-118: the native writer's own drops and the trace's completion go
         // to Lua (the drop makes Lua write that puppet again at once).
         _combat.OnNpcDropped = OnNativeNpcDroppedAsync;
@@ -2461,6 +2462,8 @@ public partial class GameBridge(ClientConfig config)
             // (vanilla death), and every peer's mirror gravestone goes.
             _combat.OnLocalRespawned = null;
             _combat.OnLocalGrave = null;
+            _combat.OnDeathMarker = null;
+            await P5ClearPeerAsync(255);
             try { await _combat.SetSessionAsync(false); } catch { }
             try { await _combat.MirrorGraveAsync(2, 0xFF, 0, 0, 0, 0); } catch { }
             _sessionWeatherProfile = null;
@@ -4073,29 +4076,6 @@ public partial class GameBridge(ClientConfig config)
         catch (Exception ex) { Console.WriteLine($"[respawn] 0x3E send failed: {ex.Message}"); }
     }
 
-    /// <summary>Puts one GraveAddUp (0x40) or GraveRemoveUp (0x42) on the wire.</summary>
-    private async Task SendGraveAsync(Stream stream, bool add, ulong id, float x, float y, float z, CancellationToken ct)
-    {
-        try
-        {
-            int len = add ? Protocol.GraveAddUpPayloadLen : Protocol.GraveRemoveUpPayloadLen;
-            var packet = new byte[3 + len];
-            packet[0] = add ? Protocol.GraveAddUp : Protocol.GraveRemoveUp;
-            BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(1), (ushort)len);
-            BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(3), id);
-            if (add)
-            {
-                BinaryPrimitives.WriteSingleLittleEndian(packet.AsSpan(11), x);
-                BinaryPrimitives.WriteSingleLittleEndian(packet.AsSpan(15), y);
-                BinaryPrimitives.WriteSingleLittleEndian(packet.AsSpan(19), z);
-            }
-            await WritePacketAsync(stream, packet, ct);
-            Console.WriteLine(FormattableString.Invariant(
-                $"[grave] sent 0x{packet[0]:X2} grave 0x{id:X16}{(add ? $" at ({x:F1}, {y:F1}, {z:F1})" : " removed")}"));
-        }
-        catch (Exception ex) { Console.WriteLine($"[grave] send failed: {ex.Message}"); }
-    }
-
     /// <summary>
     /// SetSession(on) to the DLL, and optionally re-announce every grave the
     /// DLL says we still own. Both idempotent; cheap enough for a 5 s cadence.
@@ -4115,11 +4095,10 @@ public partial class GameBridge(ClientConfig config)
                 _respawnSessionWarned = false;
                 Console.WriteLine("[respawn] the DLL took SetSession -- death guard eligible");
             }
-            if (!announceGraves || !ok) return;
-            var graves = await _combat.ListGravesAsync(ct);
-            if (graves is null) return;
-            foreach (var (id, x, y, z) in graves)
-                await SendGraveAsync(stream, add: true, id, x, y, z, ct);
+            if (!ok) return;
+            if (_p5RebindAfterLoad) await P5AfterGameplayAsync(ct);
+            bool needsScope = _p5ScopeGeneration != P1Lifecycle.Current.Generation || _p5ScopeWorld != P5LoadedWorld;
+            if (announceGraves || needsScope) await P5AnnounceMarkersAsync(stream, ct);
         }
         catch (Exception ex) { Console.WriteLine($"[respawn] heartbeat failed: {ex.Message}"); }
     }
@@ -4707,6 +4686,7 @@ public partial class GameBridge(ClientConfig config)
         public ulong LootGeneration { get; init; }
         public long TeleportLifeRevision { get; init; }
         public ulong TeleportGeneration { get; init; }
+        public long MarkerPeerSerial { get; init; }
     }
 
     /// <summary>
@@ -4790,6 +4770,7 @@ public partial class GameBridge(ClientConfig config)
                 await ReadExactAsync(stream, payload, ct);
                 ct.ThrowIfCancellationRequested();
                 long arrival   = Stopwatch.GetTimestamp();
+                long markerPeer = P5PeerAtRead(type, payload);
                 int wireBytes  = payloadLen + 3;
                 if (type == Protocol.NpcStateQDown)   // WO-213 D.3: the relay's compact NPC state, back to the 0x27 payload everything below reads
                 {
@@ -4824,7 +4805,7 @@ public partial class GameBridge(ClientConfig config)
                 { actLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
                 FeedNativeAtRead(type, payload, arrival);
                 if (W202("net_game_queue") && Wo202Coalesce(frames.Writer, type, payload, arrival, stamp)) continue;   // WO-202 III.1: a waiting state is replaced
-                Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp), type);   // WO-207 B.1
+                Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp) { MarkerPeerSerial = markerPeer }, type);   // WO-207 B.1
             }
         }
         catch (OperationCanceledException) { }
@@ -5132,6 +5113,7 @@ public partial class GameBridge(ClientConfig config)
                 byte ghostId = payload[0];
                 string gname = Encoding.UTF8.GetString(payload, 1, payloadLen - 1);
                 _ghostNames[ghostId] = gname;
+                if (_wo122Stream is Stream markerStream) _ = P5AnnounceMarkersAsync(markerStream, ct);
                 Wo144OnPeerConnected(ghostId, gname);   // WO-144: the relay's connection set, the only source of partners
                 Wo211OnPeerBack(ghostId);               // WO-211 A.1.5: a held figure of this ghost carries on
                 Wo206OnPeerConnected(ghostId);          // WO-206 E: it hears the host's epochs at once
@@ -5199,7 +5181,7 @@ public partial class GameBridge(ClientConfig config)
                 await ApplyPeerPauseAsync(ghostId, paused: false, ct);
                 // WO-113: a gone peer's mirror gravestones go with them;
                 // the owner re-announces on its next connect.
-                try { await _combat.MirrorGraveAsync(2, ghostId, 0, 0, 0, 0, ct); } catch { }
+                try { await P5ClearPeerAsync(ghostId, ct); await _combat.MirrorGraveAsync(2, ghostId, 0, 0, 0, 0, ct); } catch { }
                 // WO-211 A.1.5: a partner in this world keeps its figure, marked reconnecting, for the hold's window (Wo211HostFigureTick)
                 if (!Wo211HoldFigure(ghostId, w211InWorld)) { try { await ExecLuaAsync($"KCD2MP_RemoveGhost(\"{ghostId}\")"); } catch { } }
                 await Wo123OnPeerGoneAsync(ghostId);   // WO-123: a joiner gone mid-join resumes the host
@@ -5382,23 +5364,18 @@ public partial class GameBridge(ClientConfig config)
                 _ = Wo132OnPeerUpAsync(sourceId, "respawned");   // WO-132 (was WO-131 1g's StopFight)
                 _ = Wo166OnPeerRespawnedAsync(sourceId, payload[13]);   // WO-166 R1: the respawn amnesty (host)
             }
+            else if (type == Protocol.DeathMarkerDown && payloadLen == Protocol.DeathMarkerDownLen)
+            {
+                if (DeathMarkerCodec.TryRead(payload.AsSpan(1), out var fact)) await P5ReceiveMarkerAsync(payload[0], fact, frame.Stamp, frame.MarkerPeerSerial, ct);
+            }
             else if (type == Protocol.GraveAddDown && payloadLen == Protocol.GraveAddDownPayloadLen)
             {
-                // WO-113: [ghostId:1][graveId:8][x:4f][y:4f][z:4f] -> a mirror
-                // gravestone + marker in our world (never lootable, never saved).
-                byte sourceId = payload[0];
-                ulong gid = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(1));
-                float gx = ReadFloat(payload, 9), gy = ReadFloat(payload, 13), gz = ReadFloat(payload, 17);
-                bool ok = await _combat.MirrorGraveAsync(1, sourceId, gid, gx, gy, gz, ct);
-                Console.WriteLine(FormattableString.Invariant(
-                    $"[grave] peer {sourceId} grave 0x{gid:X16} at ({gx:F1}, {gy:F1}, {gz:F1}) -> mirror {(ok ? "shown" : "not shown (DLL refused/absent)")}"));
+                await P5ReceiveLegacyMarkerAsync(payload[0], true, BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(1)),
+                    ReadFloat(payload, 9), ReadFloat(payload, 13), ReadFloat(payload, 17), frame.Stamp, frame.MarkerPeerSerial, ct);
             }
             else if (type == Protocol.GraveRemoveDown && payloadLen == Protocol.GraveRemoveDownPayloadLen)
             {
-                byte sourceId = payload[0];
-                ulong gid = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(1));
-                bool ok = await _combat.MirrorGraveAsync(0, sourceId, gid, 0, 0, 0, ct);
-                Console.WriteLine($"[grave] peer {sourceId} grave 0x{gid:X16} removed -> mirror {(ok ? "removed" : "not present")}");
+                await P5ReceiveLegacyMarkerAsync(payload[0], false, BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(1)), 0, 0, 0, frame.Stamp, frame.MarkerPeerSerial, ct);
             }
             else if (type == Protocol.PlayerDeathDown && payloadLen == Protocol.PlayerDeathDownPayloadLen)
             {
@@ -6299,6 +6276,7 @@ public partial class GameBridge(ClientConfig config)
                 return;
             case "t3_loot_stats":
             case "t3_input_stats":
+            case "t3_corpse_stats":
                 T3LuaStats(name, arg);
                 return;
             case "p1_host_authority":
