@@ -500,7 +500,7 @@ def start_agent(cid, role, port, twin=False):
     rig.say('agent', cid, 'pid', rec['pid'], role, 'TWIN (the 0.62.7 tail fix off)' if twin else '')
 
 
-def collect(tag):
+def collect(tag, *, write_verdict=False):
     """Both copies' files into <run>\\bundles\\<tag>-<id>\\ (the launcher's bundle layout), then LogPack's bundle."""
     out = {}
     for cid in ('A', 'B'):
@@ -522,8 +522,15 @@ def collect(tag):
         tool = os.path.join(mirror.BUILD, 'logpack', 'KcdMp.LogPack.Tool.exe')
         packed = os.path.join(d + '.packed')
         if os.path.exists(tool):
-            r = subprocess.run([tool, d, packed, '--no-verify'], capture_output=True, text=True)
+            args = [tool, d, packed, '--no-verify']
+            if write_verdict:
+                args.append('--write-verdict')
+            r = subprocess.run(args, capture_output=True, text=True)
             rig.note('pack', copy=cid, out=r.stdout[-400:])
+            if write_verdict and (r.returncode or not os.path.isfile(os.path.join(packed, 'ERGEBNIS.txt'))):
+                raise RuntimeError('LogPack did not write the result for copy %s' % cid)
+        elif write_verdict:
+            raise RuntimeError('the bench LogPack tool was not built')
         out[cid] = d
         rig.say('bundle', cid, d)
     return out

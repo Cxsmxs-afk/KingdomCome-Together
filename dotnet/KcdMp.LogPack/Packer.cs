@@ -66,6 +66,8 @@ public sealed class PackResult
     public string Manifest = "";
     /// <summary>WO-202: BRIEFING.md, the bundle's first file (Briefing.cs).</summary>
     public string Briefing = "";
+    /// <summary>T1: ERGEBNIS.txt, in the first part beside BRIEFING.md.</summary>
+    public string Verdict = "";
     /// <summary>WO-206 D: the animation detectors' results, when the bundle holds the probe's file.</summary>
     public AnimAnalysis? Anim;
 }
@@ -83,6 +85,8 @@ public static class Packer
     {
         opt ??= new PackOptions();
         Directory.CreateDirectory(outDir);
+        // Repacking an extracted bundle regenerates the verdict from the supplied logs.
+        sources = sources.Where(s => !s.EntryName.Equals(VerdictReport.EntryName, StringComparison.OrdinalIgnoreCase)).ToList();
         sources = ArrangeAnim(sources);
         sources = ArrangeAnimSession(sources);
         var res = new PackResult();
@@ -102,9 +106,22 @@ public static class Packer
                     if (s.EntryName.StartsWith("agent", StringComparison.OrdinalIgnoreCase)) MarkList.Collect(s.EntryName, lines, res.Marks);
                 }
         res.OddMarks = windows.Count;
-        // WO-202: the briefing, read off the sources before anything is collapsed (never fatal)
-        try { var inp = Briefing.Read(sources); res.Anim = inp.Anim; res.Briefing = Briefing.Build(inp); }
-        catch (Exception ex) { res.Briefing = "# Kingdom Come: Together -- briefing\n\nThe briefing could not be written: " + ex.GetType().Name + ": " + ex.Message + "\n"; }
+        // Evaluate before collapse and use the same result in both reports.
+        VerdictReport? verdict = null;
+        try
+        {
+            var inp = Briefing.Read(sources);
+            res.Anim = inp.Anim;
+            verdict = VerdictRules.Evaluate(inp);
+            res.Briefing = Briefing.Build(inp, verdict);
+        }
+        catch (Exception ex)
+        {
+            verdict ??= VerdictRules.Evaluate(new Briefing.Input());
+            res.Briefing = "# Kingdom Come: Together -- briefing\n\n" + verdict.ToMarkdown()
+                + "The briefing could not be written: " + ex.GetType().Name + ": " + ex.Message + "\n";
+        }
+        res.Verdict = verdict.ToText();
         // WO-206 D: the animation report beside the probe's file (never fatal)
         if (res.Anim is { } an)
             try { sources = sources.Append(new SourceFile(AnimStream.ReportEntry, Bytes: Encoding.UTF8.GetBytes(AnimReport.Html(an)))).ToList(); }
@@ -160,6 +177,7 @@ public static class Packer
         res.Manifest = BuildManifest(res, n, baseName, opt);
         byte[] manFrame = comp.Wrap(Tar.Entry("MANIFEST.txt", Encoding.UTF8.GetBytes(res.Manifest), DateTime.UtcNow)).ToArray();
         byte[] briefFrame = comp.Wrap(Tar.Entry("BRIEFING.md", Encoding.UTF8.GetBytes(res.Briefing), DateTime.UtcNow)).ToArray();
+        byte[] verdictFrame = comp.Wrap(Tar.Entry(VerdictReport.EntryName, Encoding.UTF8.GetBytes(res.Verdict), DateTime.UtcNow)).ToArray();
 
         for (int p = 0; p < n; p++)
         {
@@ -167,7 +185,12 @@ public static class Packer
             string path = System.IO.Path.Combine(outDir, name);
             using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
             {
-                if (p == 0) { fs.Write(briefFrame); fs.Write(manFrame); }   // WO-202: the briefing first
+                if (p == 0)
+                {
+                    fs.Write(briefFrame);  // WO-202: the briefing first
+                    fs.Write(manFrame);
+                    fs.Write(verdictFrame);
+                }
                 foreach (var f in bins[p].OrderBy(f => f.Name, StringComparer.Ordinal)) fs.Write(f.Frame);
                 fs.Write(comp.Wrap(Tar.End()));
             }

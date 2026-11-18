@@ -6,7 +6,7 @@ using System.Text;
 using KcdMp.LogPack;
 using ZstdSharp;
 
-// usage: KcdMp.LogPack.Tool <folder holding a bundle's files> <out folder> [--earlier] [--max-part-bytes N] [--no-verify]
+// usage: KcdMp.LogPack.Tool <folder holding a bundle's files> <out folder> [--earlier] [--max-part-bytes N] [--no-verify] [--write-verdict]
 // The folder is a bundle as the launcher collects it (kcd.log, agent.log, history/..., leash/...). Prints sizes and checks the promises.
 if (args.Length >= 2 && args[0] == "brief")
 {
@@ -71,6 +71,8 @@ foreach (var f in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories
 Directory.CreateDirectory(outDir);
 var sw = Stopwatch.StartNew();
 var res = Packer.Pack(files, outDir, "bundle", opt, s => Console.WriteLine("  " + s));
+if (args.Contains("--write-verdict"))
+    File.WriteAllText(Path.Combine(outDir, "ERGEBNIS.txt"), res.Verdict);
 sw.Stop();
 Console.WriteLine($"files {files.Count}, original {before:N0} bytes -> {res.Parts.Count} part(s), {res.PartBytes:N0} bytes, {sw.Elapsed.TotalSeconds:F1} s, marks {res.OddMarks}");
 foreach (var p in res.Parts) Console.WriteLine($"  {Path.GetFileName(p)} {new FileInfo(p).Length:N0}");
