@@ -295,22 +295,27 @@ public sealed class P6RangedBridgeTests
         var ack = Message(await r.Link.Next()); Assert.True(MeasuredMissileResult.TryDecode(ack.Text, out var result)); Assert.Equal(MeasuredMissileStatus.Expired, result.Status);
         writer.Release(); Assert.Equal(0, Count(r.Bridge, "ranged_missile_measured_accept")); Assert.True(Count(r.Bridge, "proc_stalls") > 0);
     }
-    [Fact]
-    public async Task Figure_ranged_off_keeps_actual_joiner_measured_hits_with_no_dependency_on_a_poll_epoch()
+    [Theory]
+    [InlineData(false)] [InlineData(true)]
+    public async Task Figure_ranged_off_keeps_actual_joiner_measured_hits_with_no_dependency_on_a_poll_epoch_and_never_adds_floor_damage(bool atFloor)
     {
         await using var r = await Rig.Create(false); Get<ConcurrentDictionary<string, bool>>(r.Bridge, "_w201On")["figure_ranged"] = false; Set(r.Bridge, "_w131Connected", true);
         r.Receive();
         int legacy = 0; r.Pipe.OnLocalHit = (_, _, _, _, _, _) => { legacy++; return Task.CompletedTask; };
         r.Pipe.OnMeasuredMissile = (soul, st, hp, evidence) => { Call(r.Bridge, "P6QueueMeasuredHit", soul, st, hp, evidence, (Func<Task>)(() => throw new Exception("joiner must not replicate a host local hit"))); return Task.CompletedTask; };
         var connect = r.Pipe.EnsureConnectedAsync(); await r.Accept; Assert.True(await connect);
-        byte[] evidence = new byte[61]; Soul.TryWriteBytes(evidence); BinaryPrimitives.WriteSingleLittleEndian(evidence.AsSpan(16), 3); BinaryPrimitives.WriteSingleLittleEndian(evidence.AsSpan(20), 12);
+        float measuredHealth = atFloor ? 4 : 12;
+        byte[] evidence = new byte[61]; Soul.TryWriteBytes(evidence); BinaryPrimitives.WriteSingleLittleEndian(evidence.AsSpan(16), 3); BinaryPrimitives.WriteSingleLittleEndian(evidence.AsSpan(20), measuredHealth);
         evidence[25] = 1; evidence[27] = 1; evidence[28] = 7; BinaryPrimitives.WriteUInt64LittleEndian(evidence.AsSpan(29), 123); BinaryPrimitives.WriteUInt64LittleEndian(evidence.AsSpan(37), r.Generation);
         BinaryPrimitives.WriteUInt64LittleEndian(evidence.AsSpan(45), 9999); BinaryPrimitives.WriteUInt64LittleEndian(evidence.AsSpan(53), (ulong)Environment.TickCount64);
         await r.Server.WriteAsync(Wire(0x90, evidence)); // native LocalHit
         var gate = await Read(r.Server); Assert.Equal(0x21, gate.Type); Assert.Equal(1, gate.Body[0]);
-        byte[] check = new byte[13]; check[0] = 1; BinaryPrimitives.WriteSingleLittleEndian(check.AsSpan(8), 50); await Reply(r.Server, 0x98, 0, 1, check);
+        byte[] check = new byte[13]; check[0] = 1; BinaryPrimitives.WriteSingleLittleEndian(check.AsSpan(8), atFloor ? 1 : 50); check[12] = atFloor ? (byte)1 : (byte)0;
+        await Reply(r.Server, 0x98, 0, 1, check);
         var request = Message(await r.Link.Next()); Assert.Equal(Protocol.W164MeasuredMissile, request.Kind); Assert.True(MeasuredMissileRequest.TryDecode(request.Text, out var hit));
-        Assert.Equal(123ul, hit.Key.ContactId); Assert.Equal(9999ul, hit.Key.Epoch); Assert.Equal(12, hit.Health); Assert.Equal(0, legacy); Assert.Equal(0, Count(r.Bridge, "ranged_poll_started"));
+        Assert.Equal(123ul, hit.Key.ContactId); Assert.Equal(9999ul, hit.Key.Epoch); Assert.Equal(measuredHealth, hit.Health); Assert.Equal(3, hit.Stamina);
+        if (atFloor) Assert.NotEqual(5, hit.Health); // the legacy gate's +1 is not a measured missile value and is never sent
+        Assert.Equal(0, legacy); Assert.Equal(0, Count(r.Bridge, "ranged_poll_started"));
         r.Link.Feed(Down(Protocol.W164RealHit, new MeasuredMissileResult(hit.Key, MeasuredMissileStatus.Accepted, 1, hit.Health, hit.Stamina).Encode(), 0));
         await Until(() => Get<ConcurrentDictionary<MeasuredMissileKey, TaskCompletionSource<MeasuredMissileResult>>>(r.Bridge, "_p6AwaitingMissile").IsEmpty);
         await r.Server.WriteAsync(Wire(0x90, evidence)); await Until(() => Count(r.Bridge, "ranged_missile_duplicate") == 1);

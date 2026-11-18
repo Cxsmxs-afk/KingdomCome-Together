@@ -9,7 +9,7 @@ Auftrag: [T3-AUFTRAG.md](T3-AUFTRAG.md). Alle Änderungen bleiben auf gestapelte
 | P3 | codex/t3-p3-pickup-freeze | P1, ad16c5f | [PR #21](https://github.com/Cxsmxs-afk/KingdomCome-Together/pull/21), Head bfd9500b, CI 44223046972 grün, Drop-in 14392880463 install-verify PASS |
 | P4 | codex/t3-p4-respawn-wake | P3, bfd9500b | [PR #22](https://github.com/Cxsmxs-afk/KingdomCome-Together/pull/22), Head 0cacd7a, CI 44230437849 grün, Drop-in 14395043289 install-verify PASS; vollständiger Vanilla-Schadensschutz offen |
 | P5 | codex/t3-p5-corpses-marker | P4, 0cacd7a | [PR #23](https://github.com/Cxsmxs-afk/KingdomCome-Together/pull/23), Head 329e440, CI 44238201571 grün, Drop-in 14399380513 install-verify PASS; unkontrollierte Engine-Purge-/Map-Lebensdauer offen |
-| P6 | codex/t3-p6-bow | P5, 329e440 | Implementierung |
+| P6 | codex/t3-p6-bow | P5, 329e440 | [PR #24](https://github.com/Cxsmxs-afk/KingdomCome-Together/pull/24), Windows-CI läuft; reale Hand-/Renderdaten und tödliche Imm-Floor-Missiles offen |
 | P2 | codex/t3-p2-frame-budget | P6 | nur nach Messung der Bedingung |
 
 ## Testmaterial

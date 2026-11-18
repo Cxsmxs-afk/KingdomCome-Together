@@ -84,7 +84,7 @@ public partial class GameBridge
         if (!Current() || name is null || name.StartsWith("kcd2mp_", StringComparison.Ordinal) || !W164Text.IsNpcName(name)) { T3Increment("ranged_missile_refused"); return; }
         // Existing location/host-body guard remains. Never replace a measured amount with the imm-floor estimate.
         var gate = await Wo131GateOutboundAsync(work.Soul, name, work.Health, false);
-        if (!Current() || !gate.Send || gate.Health != work.Health) { T3Increment("ranged_missile_refused"); return; }
+        if (!Current() || !gate.Send) { T3Increment("ranged_missile_refused"); return; }
         var request = new MeasuredMissileRequest(new(context.World, work.Evidence.Generation, work.Evidence.Epoch, work.Evidence.ContactId), name, work.Health, work.Stamina);
         var completion = new TaskCompletionSource<MeasuredMissileResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (_p6AwaitingMissile.Count >= 128 || !_p6AwaitingMissile.TryAdd(request.Key, completion)) { T3Increment("ranged_missile_duplicate"); return; }
