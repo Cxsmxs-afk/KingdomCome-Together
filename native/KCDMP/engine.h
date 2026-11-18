@@ -18,6 +18,7 @@
 // Main thread only.
 
 #include <cstdint>
+#include <cstddef>
 
 namespace kcdmp::holders { enum class Holder : uint8_t; }
 
@@ -30,6 +31,8 @@ void* game_iface();
 void* genv();
 void* entity_system();
 void* console();
+// The console slot lifted from the live script binding by WO-216. Zero if unverified.
+size_t console_execute_slot(const char** why);
 
 // IEntity helpers (null / false when unavailable).
 void*       entity_by_id(uint32_t id);

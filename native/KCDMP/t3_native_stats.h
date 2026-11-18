@@ -1,6 +1,7 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "t3_native_stats_rules.h"
+#include "edge_lanes.h"
 #include "holders.h"
 #include "p4.h"
 #include "wo216.h"
@@ -31,6 +32,11 @@ inline size_t stats(uint8_t* out, size_t cap) {
     const size_t measured = append_rp_measure(out, prior, cap, measure.data());
     if (!measured || cap < kOwnerBytes) return measured;
     const uint64_t owner_counts[] = {owners.handovers, owners.denied_sets};
-    return append_owners(out, measured, cap, owner_counts);
+    const size_t owned = append_owners(out, measured, cap, owner_counts);
+    if (!owned || cap < kEdgeBytes) return owned;
+    const auto lanes = edge::snapshot();
+    const uint64_t edge_counts[] = {lanes.rt_age_ms_p95, lanes.rt_age_ms_max, lanes.bulk_age_ms_p95,
+                                    lanes.pipe_busy_replies, lanes.rt_n, lanes.bulk_n};
+    return append_edge(out, owned, cap, edge_counts);
 }
 } // namespace kcdmp::t3native

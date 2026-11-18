@@ -2,7 +2,7 @@
 # Headless smoothness run against the tree you are in.
 #   tools/sim/run-sim
 #   tools/sim/run-sim pr3 tools/sim/out
-# Needs the .NET 8 SDK and a C++17 compiler for the CI owner gate. No game, no root.
+# Needs the .NET 8 SDK and a C++17 compiler for the native CI gates. No game, no root.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 label="${1:-this-tree}"
@@ -12,26 +12,31 @@ export SIM_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 extra=()
 if [ "$#" -ge 3 ]; then extra=("${@:3}"); fi
 if [ "$label" = ci ]; then
-    owner_tmp="$(mktemp -d)"
-    trap 'rm -rf -- "$owner_tmp"' EXIT
-    cat > "$owner_tmp/main.cpp" <<'EOF'
+    native_tmp="$(mktemp -d)"
+    trap 'rm -rf -- "$native_tmp"' EXIT
+    cat > "$native_tmp/main.cpp" <<'EOF'
 #include <cstdio>
 
 int holder_contract_tests(int* passed);
+int edge_lanes_tests(int* passed);
 
 int main() {
     int passed = 0;
-    const int failed = holder_contract_tests(&passed);
-    std::printf("body owner contract: %d passed, %d failed\n", passed, failed);
-    return passed > 0 && failed == 0 ? 0 : 1;
+    const int ownerFailed = holder_contract_tests(&passed);
+    std::printf("body owner contract: %d passed, %d failed\n", passed, ownerFailed);
+    int edgePassed = 0;
+    const int edgeFailed = edge_lanes_tests(&edgePassed);
+    std::printf("modeled DLL lanes: %d passed, %d failed\n", edgePassed, edgeFailed);
+    return passed > 0 && edgePassed > 0 && ownerFailed == 0 && edgeFailed == 0 ? 0 : 1;
 }
 EOF
-    "${CXX:-c++}" -std=c++17 -I native/KCDMP "$owner_tmp/main.cpp" native/tests/holder_contract_tests.cpp -o "$owner_tmp/owner-contract"
-    owner_result="$("$owner_tmp/owner-contract")"
-    printf '%s\n' "$owner_result"
+    "${CXX:-c++}" -std=c++17 -I native/KCDMP "$native_tmp/main.cpp" \
+        native/tests/holder_contract_tests.cpp native/tests/edge_lanes_tests.cpp -o "$native_tmp/native-contracts"
+    native_result="$("$native_tmp/native-contracts")"
+    printf '%s\n' "$native_result"
 fi
 dotnet run --project tools/sim/KcdMp.Sim/KcdMp.Sim.csproj -c Release -- --label "$label" --out "$out" "${extra[@]}"
 if [ "$label" = ci ]; then
-    printf '\n## Body owner contract\n\n%s\n' "$owner_result" >> "$out/sim.md"
+    printf '\n## Native rule gates\n\n```text\n%s\n```\n' "$native_result" >> "$out/sim.md"
 fi
 echo "report: $out/sim.md"

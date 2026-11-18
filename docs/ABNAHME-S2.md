@@ -83,3 +83,32 @@ Beide Varianten mit einem neuen `KCDMP_RIG_RUN` und einem frischen Relay für `-
 4. Auf- und absteigen, wenn ein Pferd verfügbar ist. Den Übergang von `mount` zurück zum Writer und die Stelle des Abstiegs prüfen.
 5. Einen realen Tod im Wegwerfstand auslösen. Prüfen, dass die alte Figur liegen bleibt. Danach den Stand neu laden.
 6. Rollen tauschen und die Logs beider PCs sammeln. `owner_violations` bleibt bei null, `rp_owner_n` steigt. Abgewehrte Setter und zusätzliche Halterwechsel mit den beobachteten Aktionen abgleichen.
+
+## s2-3 · Echtzeit- und Bulk-Spuren
+
+Einen ruhigen Wegwerfstand auf einer freien, ebenen Fläche laden und beide Henrys verbinden. `lanes` startet auf jeder Spielinstanz eine native Testlast von 30 Echtzeit- und 50 Bulk-Aufträgen je Spielframe für 120 Frames. Die Probe belegt Reihenfolge, Durchsatz und Wartezeit in den nativen Spuren während der verbundenen Spielsitzung. Der Relay-Verkehr läuft parallel. Vor dem Start der Spielinstanzen und Agents die Testfreigabe setzen.
+
+```powershell
+$env:KCDMP_TEST_LANES = '1'
+$env:KCDMP_RIG_TEST_ENV = 'KCDMP_TEST_LANES=1'
+$env:KCDMP_RIG_RUN = 'lanes-normal'
+python tools/rig/pair.py relay --netz normal
+python tools/rig/scenarios.py lanes --test-lanes --netz normal
+```
+
+Für den Bot-Lauf nur Relay und geladenen Host starten. Der T4 Bot-Joiner bewegt seinen Skript-Henry in der Nähe des Hosts. Das Rig startet die native Testlast auf dem Host, sobald der Bot verbunden und bereit ist.
+
+```powershell
+$env:KCDMP_TEST_BOT = '1'
+python tools/rig/scenarios.py lanes --test-lanes --netz normal --bot
+```
+
+Beide Varianten mit neuem `KCDMP_RIG_RUN` und frisch gestartetem Relay für `--netz schlecht` wiederholen. Das Relay verzögert Frames um 150 ms plus 0–35 ms Jitter. Die in `lanes.json` gemessene Spurenzeit beginnt mit der Einreihung in der DLL. Das Rig verlangt pro Spielinstanz 3.600 abgearbeitete Echtzeit- und 6.000 geordnet abgearbeitete Bulk-Aufträge sowie Vorrang der Echtzeitspur bei gleichzeitiger Last. Die p95-Grenze für Echtzeit ist unter 34 ms grün, ab 34 ms rot. Fehlende Messabdeckung bleibt grau in T1. `proc_awaits_per_frame_max`, `http_calls_rt` und `owner_violations` müssen bei null liegen. `pipe_busy_replies` und `inproc_fallbacks` stehen im Bericht. Ein belegter Agent-Hop über 20 ms wird für die Entscheidung über den Netz-Empfang in der DLL ausgewiesen. Die Spieltests stehen aus.
+
+### Zwei-PC-Checkliste
+
+1. Beide PCs mit demselben Build und `KCDMP_TEST_LANES=1` in Spiel und Agent starten. Im Wegwerfstand verbinden und die Partnerfigur auf beiden Seiten prüfen.
+2. Beide Henrys bewegen. Auf beiden PCs in der Spielkonsole `mp_lanes --test-lanes 3101 120` ausführen. Pro Spielinstanz die Bestätigung des Agents und die native Abschlusszeile zu derselben Nummer prüfen.
+3. Pro Abschlusszeile 120 Frames, 3.600 erledigte Echtzeit- und 6.000 geordnet erledigte Bulk-Aufträge zählen. Die Echtzeitspur soll unter gleichzeitiger Last Vorrang haben. Ihre Wartezeit p95 bleibt unter 34 ms.
+4. Neu verbinden und mit dem Relay-Testplan für 150 ms plus Jitter wiederholen. Beide Henrys sollen während der Messung weiterlaufen und zuverlässig eintreffende Aktionen zeigen.
+5. Beide LogPack-Bundles sammeln. `proc_awaits_per_frame_max`, `http_calls_rt` und `owner_violations` prüfen. Pipe-Busy, In-Process-Fallbacks und Agent-Hop mit den Stichprobenzahlen festhalten.

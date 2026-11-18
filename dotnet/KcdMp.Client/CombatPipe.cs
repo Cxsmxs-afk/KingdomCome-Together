@@ -163,8 +163,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// <summary>WO-132: a watched NPC's combat state changed (or its 1 s heartbeat in combat).</summary>
     public Func<NpcCombatState, Task>? OnNpcCombat { get; set; }
     /// <summary>
-    /// WO-137: one quest State change in this game's concept graph. Called ON the reader, in the
-    /// DLL's order, so it must only enqueue (it never makes a pipe request: the WO-131 deadlock trap).
+    /// WO-137: one quest State change in this game's concept graph. Delivered in the DLL's order on the notice worker.
     /// </summary>
     public Action<QuestChange>? OnQuestChange { get; set; }
 
@@ -174,8 +173,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
     public Func<uint, byte, float, float, Task>? OnDefence { get; set; }
 
     /// <summary>
-    /// WO-138: one 0xA0 frame of the DLL's NPC rows. Called ON the reader, so it only
-    /// enqueues the sends (never a pipe request: the WO-131 deadlock trap).
+    /// WO-138: one 0xA0 frame of the DLL's NPC rows. Delivered in the DLL's order on the notice worker.
     /// </summary>
     public Action<IReadOnlyList<Wo138Row>>? OnNpcStream { get; set; }
 
@@ -183,20 +181,19 @@ public sealed partial class CombatPipe : IAsyncDisposable
     public Action<Wo138WorldState>? OnWorld { get; set; }
 
     /// <summary>
-    /// WO-184: 0xAD -- the ESC menu opened (true) or closed (false) in a session. Called ON the reader: it must not make a pipe
-    /// request (the WO-131 trap); the handler only starts its own task.
+    /// WO-184: 0xAD -- the ESC menu opened (true) or closed (false) in a session. Delivered in the DLL's order; the handler only starts its own task.
     /// </summary>
     public Action<bool>? OnMenu { get; set; }
 
     /// <summary>
     /// WO-139: 0xA3 kind 1 -- the local player's new trespass level (0 public .. 4 prohibited)
-    /// and position. Called ON the reader: it must not make a pipe request (the WO-131 trap).
+    /// and position. Delivered on the notice worker.
     /// </summary>
     public Action<byte, byte, float, float, float>? OnTrespass { get; set; }
 
     /// <summary>
     /// WO-140: 0xA5 -- (kind 1 Held: id) a sleep / wait picker the gate kept; (kind 2 State:
-    /// edge, id, hours, state) a C_SkipTime edge. Called ON the reader: no pipe request here.
+    /// edge, id, hours, state) a C_SkipTime edge. Delivered on the notice worker.
     /// </summary>
     public Action<Wo140Frame>? OnSleepFrame { get; set; }
 
@@ -496,6 +493,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 if (_pipe is { } old) Drop(old);
                 candidate = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
                 _pipe = candidate;
+                Interlocked.Increment(ref _edgeConnectionRevision);
             }
             try
             {
@@ -2264,244 +2262,259 @@ public sealed partial class CombatPipe : IAsyncDisposable
     private static void WriteSoulGuid(Guid soul, Span<byte> dest) =>
         soul.TryWriteBytes(dest);
 
-    /// <summary>Route frames: replies to the waiting command, hits to the callback.</summary>
+    // Replies stay on the physical reader; callbacks can themselves need the
+    // pipe or the relay. One FIFO worker retains unsolicited event order.
     private async Task ReadLoopAsync(NamedPipeClientStream myPipe, ChannelWriter<(byte Type, byte[] Body)> replies)
     {
+        var notices = Channel.CreateUnbounded<(byte Type, byte[] Body)>(new UnboundedChannelOptions
+        {
+            SingleReader = true, SingleWriter = true
+        });
+        _ = RunDetached(() => ReadNoticesAsync(myPipe, notices.Reader));
         try
         {
             while (myPipe.IsConnected)
             {
                 var (type, body) = await ReadFrameAsync(myPipe, CancellationToken.None);
                 if (!ReferenceEquals(_pipe, myPipe)) break;
-                if (TryLifecycleReply(myPipe, type, body)) continue;
-                // WO-118: replies are logged by their callers; 0x81/0x86/0x89
-                // arrive at frame-feed and heartbeat rates and would flood.
+                if (TryLifecycleReply(myPipe, type, body) || TryEdgeReply(myPipe, type, body)) continue;
                 if (type is not (Result or LocalStateReply or NpcStatusReply or BodyStateReply or LocalAction or PvpHitOut or NpcCombatOut or Wo132Reply or Wo131Reply or Wo137Reply or QuestChangeOut or BatchReply))
                     Console.WriteLine($"[combat] pipe frame 0x{type:X2} ({body.Length} bytes)");
-                if (type == LocalHit && body.Length >= 24)
+                if (type == BatchReply) OnBatchReply(body);
+                else if (IsPipeNotice(type))
                 {
-                    var   soul    = new Guid(body.AsSpan(0, 16));
-                    float stamina = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(16));
-                    float health  = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(20));
-                    if (body.Length > 27)
-                    {
-                        // A malformed new receipt must never become an untyped legacy damage send.
-                        if (MeasuredMissileEvidence.TryDecode(body, out var evidence) && OnMeasuredMissile is { } measured)
-                        { try { await measured(soul, stamina, health, evidence); } catch (Exception ex) { Console.WriteLine($"P6 measured hit refused: {ex.Message}"); } }
-                        continue;
-                    }
-                    // WO-86: trailing died byte; absent from a pre-WO-86 DLL.
-                    bool  died    = body.Length >= 25 && body[24] != 0;
-                    bool  byPlayer = body.Length >= 26 && body[25] != 0;   // WO-121
-                    bool  judge   = body.Length >= 27 && body[26] != 0;   // WO-210 E.2
-                    if (died) Console.WriteLine($"[npcdeath] DLL observed a lethal local reading on {soul}; authority dispatch pending (hp -{health:F1})");
-                    if (OnLocalHit is { } handler)
-                    {
-                        try { await handler(soul, stamina, health, died, byPlayer, judge); }
-                        catch (Exception ex) { Console.WriteLine($"[combat] local hit not sent: {ex.Message}"); }
-                    }
+                    if (!notices.Writer.TryWrite((type, body)))
+                        throw new InvalidOperationException("The connection's notice queue has already closed.");
                 }
-                else if (type == LocalDowned && body.Length >= 2)
-                {
-                    // WO-113: unsolicited, like LocalHit -- never a reply.
-                    if (OnLocalDowned is { } h)
-                    {
-                        try { await h(body[0] != 0, body[1]); }
-                        catch (Exception ex) { Console.WriteLine($"[respawn] downed not handled: {ex.Message}"); }
-                    }
-                }
-                else if (type == LocalRespawned && body.Length >= 13)
-                {
-                    if (OnLocalRespawned is { } h)
-                    {
-                        try
-                        {
-                            await h(BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(0)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12]);
-                        }
-                        catch (Exception ex) { Console.WriteLine($"[respawn] respawned not handled: {ex.Message}"); }
-                    }
-                }
-                else if (type == Protocol.DeathMarkerEvent)
-                {
-                    if (DeathMarkerCodec.TryNativeEvent(body, out var marker) && OnDeathMarker is { } h)
-                    {
-                        try { await h(marker); } catch (Exception ex) { Console.WriteLine($"[marker] local notice failed: {ex.Message}"); }
-                    }
-                }
-                else if (type == LocalGrave && body.Length == 21)
-                {
-                    if (OnLocalGrave is { } h)
-                    {
-                        try
-                        {
-                            await h(body[0] != 0, BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(1)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(9)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(13)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(17)));
-                        }
-                        catch (Exception ex) { Console.WriteLine($"[grave] local grave not handled: {ex.Message}"); }
-                    }
-                }
-                else if (type == LocalAction && LocalActionFrame.TryParse(body, out var la))
-                {
-                    // WO-121: unsolicited, never a reply.
-                    if (OnLocalAction is { } h)
-                    {
-                        try { await h(la); }
-                        catch (Exception ex) { Console.WriteLine($"[wo121] local action not sent: {ex.Message}"); }
-                    }
-                }
-                else if (type == PvpHitOut && body.Length == 14)
-                {
-                    if (OnPvpHit is { } h)
-                    {
-                        try
-                        {
-                            await h(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12], body[13]);
-                        }
-                        catch (Exception ex) { Console.WriteLine($"[wo121] pvp hit not sent: {ex.Message}"); }
-                    }
-                }
-                else if (type == NpcAvatarHit && body.Length >= 18 && body.Length == 18 + body[17])
-                {
-                    // WO-132: never awaited on this reader (the WO-131 deadlock trap:
-                    // a handler that makes a pipe request would wait on this loop).
-                    if (OnNpcAvatarHit is { } h)
-                    {
-                        uint v = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0));
-                        float st = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)), hp = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8));
-                        uint at = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(12));
-                        byte fl = body[16];
-                        string an = Encoding.ASCII.GetString(body, 18, body[17]);
-                        _ = Task.Run(async () => { try { await h(v, st, hp, at, fl, an); } catch (Exception ex) { Console.WriteLine($"[wo132] npc avatar hit not handled: {ex.Message}"); } });
-                    }
-                }
-                else if (type == NpcCombatOut && NpcCombatState.TryParse(body, out var ncs))
-                {
-                    if (OnNpcCombat is { } h)
-                        _ = Task.Run(async () => { try { await h(ncs); } catch (Exception ex) { Console.WriteLine($"[wo132] npc combat not handled: {ex.Message}"); } });
-                }
-                else if (type == QuestChangeOut)
-                {
-                    // WO-137: in order -- the handler only enqueues (its work runs on the agent's own loop).
-                    if (QuestChange.TryParse(body, out var qc))
-                    {
-                        try { OnQuestChange?.Invoke(qc); }
-                        catch (Exception ex) { Console.WriteLine($"[wo137] quest change not queued: {ex.Message}"); }
-                    }
-                    else Console.WriteLine($"[wo137] malformed quest change frame ({body.Length} bytes)");
-                }
-                else if (type == NpcStreamOut)
-                {
-                    if (Wo138Codec.TryParseStream(body, out var rows)) { try { OnNpcStream?.Invoke(rows); } catch (Exception ex) { Console.WriteLine($"[wo138] rows not queued: {ex.Message}"); } }
-                    else Console.WriteLine($"[wo138] malformed NpcStream frame ({body.Length} bytes)");
-                }
-                else if (type == WorldOut)
-                {
-                    if (Wo138Codec.TryParseWorld(body, out var ws)) { try { OnWorld?.Invoke(ws); } catch { } }
-                }
-                else if (type == MenuOut)
-                {
-                    // WO-184: [opened]
-                    if (body.Length >= 1) { try { OnMenu?.Invoke(body[0] != 0); } catch (Exception ex) { Console.WriteLine($"[wo184] menu edge not handled: {ex.Message}"); } }
-                    else Console.WriteLine($"[wo184] malformed Menu frame ({body.Length} bytes)");
-                }
-                else if (type == ActivityOut)
-                {
-                    // WO-141: [count]{[kind][nameLen][name][activity:30]}
-                    if (Wo141Codec.TryParseFrame(body, out var rows)) { try { OnActivityFrame?.Invoke(rows); } catch (Exception ex) { Console.WriteLine($"[wo141] activity rows not handled: {ex.Message}"); } }
-                    else Console.WriteLine($"[wo141] malformed Activity frame ({body.Length} bytes)");
-                }
-                else if (type == ExtraOut)
-                {
-                    // WO-143: [kind][...]
-                    if (Wo143DllFrame.TryParse(body, out var xf)) { try { OnExtraFrame?.Invoke(xf); } catch (Exception ex) { Console.WriteLine($"[wo143] extra frame not handled: {ex.Message}"); } }
-                    else Console.WriteLine($"[wo143] malformed extra frame ({body.Length} bytes)");
-                }
-                else if (type == SleepOut)
-                {
-                    // WO-140: [kind=1 Held][id] | [kind=2 State][edge][id][hours:4f][state]
-                    if (Wo140Frame.TryParse(body, out var sf)) { try { OnSleepFrame?.Invoke(sf); } catch (Exception ex) { Console.WriteLine($"[wo140] sleep frame not handled: {ex.Message}"); } }
-                    else Console.WriteLine($"[wo140] malformed Sleep frame ({body.Length} bytes)");
-                }
-                else if (type == CrimeOut)
-                {
-                    // WO-139: [kind=1][level][prev][x:4f][y:4f][z:4f]
-                    if (body.Length == 15 && body[0] == 1)
-                    {
-                        float tx = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(3)), ty = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(7)),
-                              tz = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(11));
-                        try { OnTrespass?.Invoke(body[1], body[2], tx, ty, tz); } catch (Exception ex) { Console.WriteLine($"[wo139] trespass edge not handled: {ex.Message}"); }
-                    }
-                    else Console.WriteLine($"[wo139] malformed Crime frame ({body.Length} bytes)");
-                }
-                else if (type == DefenceOut && body.Length == 13)
-                {
-                    if (OnDefence is { } h)
-                    {
-                        uint at = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0));
-                        byte outcome = body[4];
-                        float st = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(5)), hp = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(9));
-                        _ = Task.Run(async () => { try { await h(at, outcome, st, hp); } catch (Exception ex) { Console.WriteLine($"[wo208] defence not handled: {ex.Message}"); } });
-                    }
-                }
-                else if (type == DiscardedHit && body.Length == 12)
-                {
-                    if (OnDiscardedHit is { } h)
-                    {
-                        uint at = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0));
-                        float st = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)), hp = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8));
-                        _ = Task.Run(async () => { try { await h(at, st, hp); } catch { } });
-                    }
-                }
-                else if (type == NpcDropped && body.Length >= 2 && body.Length == 2 + body[1])
-                {
-                    // WO-118: unsolicited, never a reply.
-                    if (OnNpcDropped is { } h)
-                    {
-                        try { await h(body[0], System.Text.Encoding.UTF8.GetString(body, 2, body[1])); }
-                        catch (Exception ex) { Console.WriteLine($"[npcwrite] drop not handled: {ex.Message}"); }
-                    }
-                }
-                else if (type == NpcTraceDone && body.Length >= 5 && body.Length == 5 + body[4])
-                {
-                    if (OnNpcTraceDone is { } h)
-                    {
-                        try { await h(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)), System.Text.Encoding.UTF8.GetString(body, 5, body[4])); }
-                        catch (Exception ex) { Console.WriteLine($"[npctrace] trace-done not handled: {ex.Message}"); }
-                    }
-                }
-                else if (type == BatchReply) OnBatchReply(body);   // WO-218 A.1: never through the single requests' line
                 else if (!replies.TryWrite((type, body)))
-                {
-                    // DropOldest means TryWrite only fails on a completed
-                    // writer, which happens on Drop(). Say so rather than
-                    // losing the frame silently.
                     Console.WriteLine($"[combat] reply 0x{type:X2} arrived after the channel closed");
-                }
             }
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
-        {
-            // Normal on shutdown or if the game exits.
-        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException) { }
         catch (Exception ex)
         {
-            // Anything else would otherwise become an unobserved task exception:
-            // the reader stops and the agent goes quiet with no output at all,
-            // which is indistinguishable from the DLL never writing.
             Console.WriteLine($"[combat] reader stopped: {ex.GetType().Name}: {ex.Message}");
         }
-        Console.WriteLine("[combat] pipe reader exited");
-        // WO-153 3: the reader is the first to know the DLL is gone (the game ended). Before, only a later WRITE found it,
-        // the waiting caller sat out its full 5 s deadline ("no answer to 0x28 after 5000 ms") and the loss was declared
-        // 4.3-4.6 s late, in every one of the 12 field runs. The connection is dropped now, once, so every caller fails at
-        // once -- but only if this reader's pipe is still the current one.
-        Drop(myPipe);
+        finally
+        {
+            notices.Writer.TryComplete();
+            Console.WriteLine("[combat] pipe reader exited");
+            Drop(myPipe);
+        }
+    }
+
+    private static bool IsPipeNotice(byte type) => type is LocalHit or LocalDowned or LocalRespawned or Protocol.DeathMarkerEvent
+        or LocalGrave or LocalAction or PvpHitOut or NpcAvatarHit or NpcCombatOut or QuestChangeOut or NpcStreamOut or WorldOut
+        or MenuOut or ActivityOut or ExtraOut or SleepOut or CrimeOut or DefenceOut or DiscardedHit or NpcDropped or NpcTraceDone;
+
+    private async Task ReadNoticesAsync(NamedPipeClientStream pipe, ChannelReader<(byte Type, byte[] Body)> notices)
+    {
+        await foreach (var (type, body) in notices.ReadAllAsync())
+        {
+            if (!ReferenceEquals(_pipe, pipe)) return;
+            try { await DeliverNoticeAsync(type, body); }
+            catch (Exception ex) { Console.WriteLine($"[combat] notice 0x{type:X2} failed: {ex.GetType().Name}: {ex.Message}"); }
+        }
+    }
+
+    private async Task DeliverNoticeAsync(byte type, byte[] body)
+    {
+        if (type == LocalHit && body.Length >= 24)
+        {
+            var   soul    = new Guid(body.AsSpan(0, 16));
+            float stamina = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(16));
+            float health  = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(20));
+            if (body.Length > 27)
+            {
+                // A malformed new receipt must never become an untyped legacy damage send.
+                if (MeasuredMissileEvidence.TryDecode(body, out var evidence) && OnMeasuredMissile is { } measured)
+                { try { await measured(soul, stamina, health, evidence); } catch (Exception ex) { Console.WriteLine($"P6 measured hit refused: {ex.Message}"); } }
+                return;
+            }
+            // WO-86: trailing died byte; absent from a pre-WO-86 DLL.
+            bool  died    = body.Length >= 25 && body[24] != 0;
+            bool  byPlayer = body.Length >= 26 && body[25] != 0;   // WO-121
+            bool  judge   = body.Length >= 27 && body[26] != 0;   // WO-210 E.2
+            if (died) Console.WriteLine($"[npcdeath] DLL observed a lethal local reading on {soul}; authority dispatch pending (hp -{health:F1})");
+            if (OnLocalHit is { } handler)
+            {
+                try { await handler(soul, stamina, health, died, byPlayer, judge); }
+                catch (Exception ex) { Console.WriteLine($"[combat] local hit not sent: {ex.Message}"); }
+            }
+        }
+        else if (type == LocalDowned && body.Length >= 2)
+        {
+            // WO-113: unsolicited, like LocalHit -- never a reply.
+            if (OnLocalDowned is { } h)
+            {
+                try { await h(body[0] != 0, body[1]); }
+                catch (Exception ex) { Console.WriteLine($"[respawn] downed not handled: {ex.Message}"); }
+            }
+        }
+        else if (type == LocalRespawned && body.Length >= 13)
+        {
+            if (OnLocalRespawned is { } h)
+            {
+                try
+                {
+                    await h(BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(0)),
+                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
+                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12]);
+                }
+                catch (Exception ex) { Console.WriteLine($"[respawn] respawned not handled: {ex.Message}"); }
+            }
+        }
+        else if (type == Protocol.DeathMarkerEvent)
+        {
+            if (DeathMarkerCodec.TryNativeEvent(body, out var marker) && OnDeathMarker is { } h)
+            {
+                try { await h(marker); } catch (Exception ex) { Console.WriteLine($"[marker] local notice failed: {ex.Message}"); }
+            }
+        }
+        else if (type == LocalGrave && body.Length == 21)
+        {
+            if (OnLocalGrave is { } h)
+            {
+                try
+                {
+                    await h(body[0] != 0, BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(1)),
+                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(9)),
+                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(13)),
+                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(17)));
+                }
+                catch (Exception ex) { Console.WriteLine($"[grave] local grave not handled: {ex.Message}"); }
+            }
+        }
+        else if (type == LocalAction && LocalActionFrame.TryParse(body, out var la))
+        {
+            // WO-121: unsolicited, never a reply.
+            if (OnLocalAction is { } h)
+            {
+                try { await h(la); }
+                catch (Exception ex) { Console.WriteLine($"[wo121] local action not sent: {ex.Message}"); }
+            }
+        }
+        else if (type == PvpHitOut && body.Length == 14)
+        {
+            if (OnPvpHit is { } h)
+            {
+                try
+                {
+                    await h(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)),
+                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
+                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12], body[13]);
+                }
+                catch (Exception ex) { Console.WriteLine($"[wo121] pvp hit not sent: {ex.Message}"); }
+            }
+        }
+        else if (type == NpcAvatarHit && body.Length >= 18 && body.Length == 18 + body[17])
+        {
+            if (OnNpcAvatarHit is { } h)
+            {
+                uint v = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0));
+                float st = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)), hp = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8));
+                uint at = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(12));
+                byte fl = body[16];
+                string an = Encoding.ASCII.GetString(body, 18, body[17]);
+                try { await h(v, st, hp, at, fl, an); }
+                catch (Exception ex) { Console.WriteLine($"[wo132] npc avatar hit not handled: {ex.Message}"); }
+            }
+        }
+        else if (type == NpcCombatOut && NpcCombatState.TryParse(body, out var ncs))
+        {
+            if (OnNpcCombat is { } h)
+                _ = Task.Run(async () => { try { await h(ncs); } catch (Exception ex) { Console.WriteLine($"[wo132] npc combat not handled: {ex.Message}"); } });
+        }
+        else if (type == QuestChangeOut)
+        {
+            // WO-137: in order -- the handler only enqueues (its work runs on the agent's own loop).
+            if (QuestChange.TryParse(body, out var qc))
+            {
+                try { OnQuestChange?.Invoke(qc); }
+                catch (Exception ex) { Console.WriteLine($"[wo137] quest change not queued: {ex.Message}"); }
+            }
+            else Console.WriteLine($"[wo137] malformed quest change frame ({body.Length} bytes)");
+        }
+        else if (type == NpcStreamOut)
+        {
+            if (Wo138Codec.TryParseStream(body, out var rows)) { try { OnNpcStream?.Invoke(rows); } catch (Exception ex) { Console.WriteLine($"[wo138] rows not queued: {ex.Message}"); } }
+            else Console.WriteLine($"[wo138] malformed NpcStream frame ({body.Length} bytes)");
+        }
+        else if (type == WorldOut)
+        {
+            if (Wo138Codec.TryParseWorld(body, out var ws)) { try { OnWorld?.Invoke(ws); } catch { } }
+        }
+        else if (type == MenuOut)
+        {
+            // WO-184: [opened]
+            if (body.Length >= 1) { try { OnMenu?.Invoke(body[0] != 0); } catch (Exception ex) { Console.WriteLine($"[wo184] menu edge not handled: {ex.Message}"); } }
+            else Console.WriteLine($"[wo184] malformed Menu frame ({body.Length} bytes)");
+        }
+        else if (type == ActivityOut)
+        {
+            // WO-141: [count]{[kind][nameLen][name][activity:30]}
+            if (Wo141Codec.TryParseFrame(body, out var rows)) { try { OnActivityFrame?.Invoke(rows); } catch (Exception ex) { Console.WriteLine($"[wo141] activity rows not handled: {ex.Message}"); } }
+            else Console.WriteLine($"[wo141] malformed Activity frame ({body.Length} bytes)");
+        }
+        else if (type == ExtraOut)
+        {
+            // WO-143: [kind][...]
+            if (Wo143DllFrame.TryParse(body, out var xf)) { try { OnExtraFrame?.Invoke(xf); } catch (Exception ex) { Console.WriteLine($"[wo143] extra frame not handled: {ex.Message}"); } }
+            else Console.WriteLine($"[wo143] malformed extra frame ({body.Length} bytes)");
+        }
+        else if (type == SleepOut)
+        {
+            // WO-140: [kind=1 Held][id] | [kind=2 State][edge][id][hours:4f][state]
+            if (Wo140Frame.TryParse(body, out var sf)) { try { OnSleepFrame?.Invoke(sf); } catch (Exception ex) { Console.WriteLine($"[wo140] sleep frame not handled: {ex.Message}"); } }
+            else Console.WriteLine($"[wo140] malformed Sleep frame ({body.Length} bytes)");
+        }
+        else if (type == CrimeOut)
+        {
+            // WO-139: [kind=1][level][prev][x:4f][y:4f][z:4f]
+            if (body.Length == 15 && body[0] == 1)
+            {
+                float tx = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(3)), ty = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(7)),
+                      tz = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(11));
+                try { OnTrespass?.Invoke(body[1], body[2], tx, ty, tz); } catch (Exception ex) { Console.WriteLine($"[wo139] trespass edge not handled: {ex.Message}"); }
+            }
+            else Console.WriteLine($"[wo139] malformed Crime frame ({body.Length} bytes)");
+        }
+        else if (type == DefenceOut && body.Length == 13)
+        {
+            if (OnDefence is { } h)
+            {
+                uint at = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0));
+                byte outcome = body[4];
+                float st = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(5)), hp = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(9));
+                _ = Task.Run(async () => { try { await h(at, outcome, st, hp); } catch (Exception ex) { Console.WriteLine($"[wo208] defence not handled: {ex.Message}"); } });
+            }
+        }
+        else if (type == DiscardedHit && body.Length == 12)
+        {
+            if (OnDiscardedHit is { } h)
+            {
+                uint at = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0));
+                float st = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)), hp = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8));
+                _ = Task.Run(async () => { try { await h(at, st, hp); } catch { } });
+            }
+        }
+        else if (type == NpcDropped && body.Length >= 2 && body.Length == 2 + body[1])
+        {
+            // WO-118: unsolicited, never a reply.
+            if (OnNpcDropped is { } h)
+            {
+                try { await h(body[0], System.Text.Encoding.UTF8.GetString(body, 2, body[1])); }
+                catch (Exception ex) { Console.WriteLine($"[npcwrite] drop not handled: {ex.Message}"); }
+            }
+        }
+        else if (type == NpcTraceDone && body.Length >= 5 && body.Length == 5 + body[4])
+        {
+            if (OnNpcTraceDone is { } h)
+            {
+                try { await h(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)), System.Text.Encoding.UTF8.GetString(body, 5, body[4])); }
+                catch (Exception ex) { Console.WriteLine($"[npctrace] trace-done not handled: {ex.Message}"); }
+            }
+        }
     }
 
     private async Task<bool> SendAsync(byte type, byte[] payload, CancellationToken ct)
@@ -2669,7 +2682,8 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// S3.1's fix, which this generalises rather than duplicates).
     /// </summary>
     private async Task<(byte[]? Body, PipeReason Fail)> SendAndAwaitAsync(
-        byte type, byte[] payload, byte wantType, CancellationToken ct, Func<bool>? beforeWrite = null, bool exactSequence = false)
+        byte type, byte[] payload, byte wantType, CancellationToken ct, Func<bool>? beforeWrite = null,
+        bool exactSequence = false, NamedPipeClientStream? requiredPipe = null)
     {
         using var scope = ProcessorFrameScope.Link(ct);
         ct = scope.Token;
@@ -2677,8 +2691,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
         ct.ThrowIfCancellationRequested();
         if (Wo210PipeBlock.Blocks(type, type == Wo163 && payload.Length > 0 ? payload[0] : -1)) return (null, PipeReason.NotConnected);   // WO-210 H.3's bisect only
         if (!await EnsureConnectedAsync(ct)) return (null, PipeReason.NotConnected);
-        if (beforeWrite is null && UseBatch(type)) return await BatchSendAsync(type, payload, wantType, ct);   // WO-218 A.1: one round trip for every waiting request
-        if (CaptureSource() is not { } source) return (null, PipeReason.NotConnected);
+        // A full s2-3 stats mirror may outgrow WO-218's 4096-byte batch body.
+        const int maxBatchSubrequest = 4096 - 3 - 3; // batch and subrequest headers
+        bool largeStats = type == Wo163 && payload.Length > maxBatchSubrequest && payload[0] == Protocol.T3OpStats;
+        if (beforeWrite is null && requiredPipe is null && !largeStats && UseBatch(type))
+            return await BatchSendAsync(type, payload, wantType, ct);
+        if (CaptureSource() is not { } source || (requiredPipe is not null && !ReferenceEquals(source.Pipe, requiredPipe)))
+            return (null, PipeReason.NotConnected);
 
         long gateAt = Environment.TickCount64;
         bool line = await EnterGateAsync(ct);
@@ -2865,7 +2884,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             ct.ThrowIfCancellationRequested();
             ProcessorFrameScope.ThrowIfAbandoned();
             byte offset = 0;
-            if (type != Batch)
+            if (type is not (Batch or EdgeFrame))
             {
                 lock (_connectionState)
                 {
@@ -2924,6 +2943,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             dropped?.Dispose();
             // Complete old promises before a new connection can be published.
             OnDropLifecycle(dropped);
+            OnDropEdge(dropped);
             _replies.Writer.TryComplete();
             _replies = NewReplyChannel();
             _expectedSeq = null;

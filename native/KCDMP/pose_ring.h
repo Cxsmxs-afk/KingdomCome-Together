@@ -10,8 +10,17 @@
 // mid-copy, or is odd, is a torn write and is skipped.
 
 #include <atomic>
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace kcdmp::posering {
 
@@ -127,4 +136,154 @@ inline void leave_torn(View v) {
     s.x = 99.f;
 }
 
+// Receive direction. This ring lives in the DLL and its caller serializes
+// publish/drain. The outgoing cross-process mapping above keeps its v1 ABI.
+namespace receive {
+
+constexpr uint8_t kGhost = 0x02, kNpcStateDown = 0x27;
+constexpr size_t kEnvelope = 9, kGhostFixed = 18, kNpcTail = 27, kStateBytes = 12;
+constexpr size_t kBodyName = 63, kMaxEnvelope = kEnvelope + 2 + kBodyName + kNpcTail;
+
+struct Scope {
+    uint64_t observation = 0, connection = 0;
+    bool operator==(Scope other) const { return observation == other.observation && connection == other.connection; }
+};
+
+struct Pose {
+    uint8_t kind = 0, source = 0, flags = 0;
+    char body[kBodyName + 1]{};
+    float x = 0.0f, y = 0.0f, z = 0.0f, yaw = 0.0f;
+    uint16_t sequence = 0;
+    uint32_t senderMs = 0;
+    int64_t arrivalQpc = 0, firstByteQpc = 0, stateQpc = 0;
+    std::array<uint8_t, kStateBytes> state{};
+    bool ghost() const { return kind == kGhost; }
+};
+
+inline uint16_t u16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8)); }
+inline uint32_t u32(const uint8_t* p) { return static_cast<uint32_t>(u16(p)) | (static_cast<uint32_t>(u16(p + 2)) << 16); }
+inline float f32(const uint8_t* p) {
+    const uint32_t bits = u32(p);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+inline bool name_byte(uint8_t c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+// Matches PositionCodec.TryDecodeGhost's four versions and flag AND length
+// checks. The base transform remains usable if a sender's optional flag is short.
+inline bool decode(const uint8_t* bytes, size_t size, Pose& pose) {
+    pose = {};
+    if (!bytes || size <= kEnvelope || size > kMaxEnvelope) return false;
+    const uint64_t arrival = static_cast<uint64_t>(u32(bytes + 1)) | (static_cast<uint64_t>(u32(bytes + 5)) << 32);
+    if (!arrival || arrival > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) return false;
+    pose.kind = bytes[0];
+    pose.arrivalQpc = static_cast<int64_t>(arrival);
+    const uint8_t* payload = bytes + kEnvelope;
+    const size_t length = size - kEnvelope;
+    const uint8_t* transform;
+    if (pose.ghost()) {
+        if (length != kGhostFixed && length != kGhostFixed + 4 && length != kGhostFixed + kStateBytes &&
+            length != kGhostFixed + kStateBytes + 4) return false;
+        pose.source = payload[0];
+        std::snprintf(pose.body, sizeof(pose.body), "kcd2mp_%u", static_cast<unsigned>(pose.source));
+        transform = payload + 1;
+        const uint8_t ghostFlags = payload[17];
+        pose.flags = (ghostFlags & 0x01) ? 0x10 : 0; // the parent owns a ridden body
+        size_t tail = kGhostFixed;
+        if ((ghostFlags & 0x10) && length >= tail + kStateBytes) {
+            std::memcpy(pose.state.data(), payload + tail, kStateBytes);
+            pose.stateQpc = pose.arrivalQpc;
+            tail += kStateBytes;
+        }
+        if ((ghostFlags & 0x08) && length == tail + 4) pose.senderMs = u32(payload + tail);
+    } else if (pose.kind == kNpcStateDown) {
+        if (length < 2 + 1 + kNpcTail) return false;
+        const size_t nameSize = payload[1];
+        if (!nameSize || nameSize > kBodyName || length != 2 + nameSize + kNpcTail) return false;
+        for (size_t i = 0; i < nameSize; ++i) if (!name_byte(payload[2 + i])) return false;
+        pose.source = payload[0];
+        std::memcpy(pose.body, payload + 2, nameSize);
+        transform = payload + 2 + nameSize;
+        pose.flags = transform[20] & 0x7F; // legacy 0x80 is a pipe-only State2 marker
+        pose.sequence = u16(transform + 21);
+        pose.senderMs = u32(transform + 23);
+    } else return false;
+    pose.x = f32(transform); pose.y = f32(transform + 4);
+    pose.z = f32(transform + 8); pose.yaw = f32(transform + 12);
+    return std::isfinite(pose.x) && std::isfinite(pose.y) && std::isfinite(pose.z) && std::isfinite(pose.yaw);
+}
+
+inline std::string body_key(const char* name) {
+    std::string key(name);
+    for (char& c : key) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    return key;
+}
+
+inline bool newer(const Pose& candidate, const Pose& existing, bool senderClock) {
+    if (candidate.arrivalQpc < existing.arrivalQpc) return false;
+    if (candidate.kind != existing.kind || candidate.source != existing.source) return true;
+    if (!candidate.ghost()) {
+        const auto delta = static_cast<uint16_t>(candidate.sequence - existing.sequence);
+        if (!delta || delta > 32768) return false;
+    }
+    if (senderClock && candidate.senderMs && existing.senderMs) {
+        const auto delta = candidate.senderMs - existing.senderMs;
+        if (!delta || delta > 0x7FFFFFFFu) return false;
+    }
+    return true;
+}
+
+// Only replaceable state enters this ring. Keep an explicit State2 update if
+// the newer transform omits it, with the time at which that update arrived.
+enum class Put { Accepted, Superseded, Full };
+class Ring {
+    struct Entry { Pose pose; uint64_t order; };
+    using Entries = std::unordered_map<std::string, Entry>;
+    Entries pending_;
+    size_t capacity_;
+    Scope scope_{};
+    uint64_t next_ = 0;
+
+public:
+    explicit Ring(size_t capacity) : capacity_(capacity) {}
+
+    Put publish(Pose pose, Scope scope, bool senderClock = true) {
+        if (!(scope_ == scope)) { pending_.clear(); scope_ = scope; }
+        auto key = body_key(pose.body);
+        const auto it = pending_.find(key);
+        if (it != pending_.end()) {
+            const Pose& old = it->second.pose;
+            if (!newer(pose, old, senderClock)) return Put::Superseded;
+            if (!pose.stateQpc && old.stateQpc && pose.kind == old.kind && pose.source == old.source) {
+                pose.state = old.state;
+                pose.stateQpc = old.stateQpc;
+            }
+            it->second = {pose, ++next_};
+        } else {
+            if (pending_.size() >= capacity_) return Put::Full;
+            pending_.emplace(std::move(key), Entry{pose, ++next_});
+        }
+        return Put::Accepted;
+    }
+
+    std::vector<Pose> drain(Scope current) {
+        if (!(scope_ == current)) return {};
+        std::vector<Entry> rows;
+        rows.reserve(pending_.size());
+        for (auto& row : pending_) rows.push_back(std::move(row.second));
+        pending_.clear();
+        std::sort(rows.begin(), rows.end(), [](const Entry& a, const Entry& b) {
+            return a.pose.arrivalQpc == b.pose.arrivalQpc ? a.order < b.order : a.pose.arrivalQpc < b.pose.arrivalQpc;
+        });
+        std::vector<Pose> poses;
+        poses.reserve(rows.size());
+        for (auto& row : rows) poses.push_back(std::move(row.pose));
+        return poses;
+    }
+};
+
+} // namespace receive
 } // namespace kcdmp::posering

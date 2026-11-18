@@ -170,7 +170,7 @@ public partial class GameBridge
             _t3Counters.TryAdd("corpse_stats_unreadable", 0);
             _t3Counters.TryAdd("ranged_stats_unreadable", 0);
             byte role = W137Host ? (byte)1 : W137Joiner || _jj is not null ? (byte)2 : (byte)0;
-            Dictionary<string, long>? presentation = null;
+            Dictionary<string, long>? nativeSnapshot = null;
             if (role != 0)
             {
                 var result = await ProcessorFrameScope.RunAsync(async token =>
@@ -204,17 +204,17 @@ public partial class GameBridge
                 if (worldStats.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
                 { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); T3Increment("ranged_stats_unreadable"); }
                 if (worldStats.Status == ProcessorFrameScope.Outcome.Completed && nativeCounters?.ContainsKey("rp_e2e_n") == true)
-                    presentation = nativeCounters;
+                    nativeSnapshot = nativeCounters;
             }
             ct.ThrowIfCancellationRequested();
-            T3EmitStats(role, ct, presentation);
+            T3EmitStats(role, ct, nativeSnapshot);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex) { Console.WriteLine($"MP-T3-STATS report unavailable: {ex.GetType().Name}"); }
         finally { Interlocked.Exchange(ref _t3StatsBusy, 0); }
     }
 
-    private void T3EmitStats(byte role, CancellationToken ct, IReadOnlyDictionary<string, long>? presentation)
+    private void T3EmitStats(byte role, CancellationToken ct, IReadOnlyDictionary<string, long>? nativeSnapshot)
     {
         foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(T3LootCounters.CorpseKeys).Concat(T3RangedKeys).Concat(new[] {
             "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable", "corpse_lua_stats_unreadable" }))
@@ -225,13 +225,16 @@ public partial class GameBridge
         _t3Counters["w136_replayed"] = Interlocked.Read(ref _w136Replayed);
         _t3Counters["proc_lua_abandoned"] = _httpForMenu?.AbandonedStatements ?? 0;
         _t3Counters["proc_outbound_abandoned"] = _w213Writer?.Scheduler.CancelledDropped ?? 0;
-        IEnumerable<KeyValuePair<string, long>> counters = _t3Counters;
-        // Presentation and owner values and their sample counts must come from the same
-        // reply. A failed or old DLL read cannot repeat an earlier window.
-        if (presentation is not null)
+        IEnumerable<KeyValuePair<string, long>> counters = _t3Counters.Concat([
+            KeyValuePair.Create("proc_awaits_per_frame_max", (long)Volatile.Read(ref _edgeProcAwaitsPerFrameMax)),
+            KeyValuePair.Create("inproc_fallbacks", Interlocked.Read(ref _edgeInprocFallbacks)),
+            KeyValuePair.Create("http_calls_rt", Interlocked.Read(ref _edgeHttpCallsRt)),
+            KeyValuePair.Create("edge_proc_n", Interlocked.Read(ref _edgeFramesAdmitted))]);
+        // Use one DLL reply for the extended counters and their sample counts.
+        if (nativeSnapshot is not null)
             counters = counters.Concat(T3NativeCounters.Keys.Skip(T3NativeCounters.PresentationStart)
-                .Where(presentation.ContainsKey)
-                .Select(key => KeyValuePair.Create(key, presentation[key])));
+                .Where(nativeSnapshot.ContainsKey)
+                .Select(key => KeyValuePair.Create(key, nativeSnapshot[key])));
         string fields = string.Join(' ', counters.OrderBy(p => p.Key, StringComparer.Ordinal)
             .Select(p => p.Key + "=" + p.Value.ToString(CultureInfo.InvariantCulture)));
         Console.WriteLine($"MP-T3-STATS origin=agent role={(role == 1 ? "host" : role == 2 ? "joiner" : "off")} {fields}");
@@ -246,7 +249,9 @@ public partial class GameBridge
             stop.CancelAfter(2000);
             byte[] text = Encoding.ASCII.GetBytes(fields);
             byte[] payload = new byte[text.Length + 1]; payload[0] = role; text.CopyTo(payload, 1);
-            await _combat.Wo163Async(Protocol.T3OpStats, payload, stop.Token);
+            var reply = await _combat.Wo163Async(Protocol.T3OpStats, payload, stop.Token);
+            if (reply is not { Ok: true })
+                Console.WriteLine("MP-T3-STATS native mirror unavailable: no accepted reply");
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         { Console.WriteLine($"MP-T3-STATS native mirror unavailable: {ex.GetType().Name}"); }

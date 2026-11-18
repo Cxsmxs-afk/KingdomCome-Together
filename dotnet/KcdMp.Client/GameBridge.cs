@@ -4871,6 +4871,7 @@ public partial class GameBridge(ClientConfig config)
             if (!_w148Held.IsEmpty && Wo148DropCarried(npcName)) return;   // WO-148: a carried body is the carrier's
             int o = 2 + nameLen;
             _w164NpcPos[npcName] = (ReadFloat(payload, o), ReadFloat(payload, o + 4), Environment.TickCount64);   // WO-164 D2
+            if (EdgeForwardPose(type, payload, arrival)) return;
             _nativeFeed.Enqueue(new NativeNpcSample(payload[0], npcName,
                 ReadFloat(payload, o), ReadFloat(payload, o + 4), ReadFloat(payload, o + 8), ReadFloat(payload, o + 12),
                 // WO-121: 0x80 is the pipe's own "state block follows" bit, never a wire flag.
@@ -4881,6 +4882,7 @@ public partial class GameBridge(ClientConfig config)
         }
         else if (type == Protocol.Ghost && PositionCodec.TryDecodeGhost(payload, out var gs))
         {
+            if (Wo144DropFromRemoved(gs.GhostId)) return;
             // The ghost body is "kcd2mp_<id>" (KCD2MP_SpawnGhost); riding is
             // passed as the carried bit so the DLL leaves a rider to the horse
             // (the mod unbinds a riding ghost as well).
@@ -4891,8 +4893,9 @@ public partial class GameBridge(ClientConfig config)
             // WO-121: the v8 state block rides the same sample, so the DLL's
             // per-frame gait / crouch / combat hold for this avatar sees it in
             // the frame the position does.
-            _nativeFeed.Enqueue(new NativeNpcSample(gs.GhostId, "kcd2mp_" + gs.GhostId, gs.X, gs.Y, gs.Z, gs.RotZ,
-                gs.IsRiding ? (byte)0x10 : (byte)0, gSeq, gs.SenderMs, arrival, gs.State2));
+            if (!EdgeForwardPose(type, payload, arrival))
+                _nativeFeed.Enqueue(new NativeNpcSample(gs.GhostId, "kcd2mp_" + gs.GhostId, gs.X, gs.Y, gs.Z, gs.RotZ,
+                    gs.IsRiding ? (byte)0x10 : (byte)0, gSeq, gs.SenderMs, arrival, gs.State2));
             Wo154FeedRiddenHorse(gs, gSeq, arrival);   // WO-154 5: the ridden horse rides the rider's stream
             // WO-121: the newest sender stamp per peer -- the clock an event's
             // own stamp is judged against (Protocol.EventStaleMs).
@@ -4914,10 +4917,13 @@ public partial class GameBridge(ClientConfig config)
     }
 
     /// <summary>
-    /// Every relay frame, in arrival order: the single receive loop's handlers,
-    /// unchanged except that the native feed has already happened on the reader.
+    /// Default dispatch admits work without waiting on the game. HTTP mode
+    /// retains the previous per-session serial processor.
     /// </summary>
-    private async Task ProcessFramesAsync(ChannelReader<InFrame> frames, CancellationToken ct)
+    private Task ProcessFramesAsync(ChannelReader<InFrame> frames, CancellationToken ct) =>
+        _edgeMode == EdgeMode.Http ? ExecuteGameFramesAsync(frames, ct) : EdgeDispatchFramesAsync(frames, ct);
+
+    private async Task ExecuteGameFramesAsync(ChannelReader<InFrame> frames, CancellationToken ct)
     {
         _npcLua.Clear();
         var owner = _frameWriter;
@@ -4950,9 +4956,7 @@ public partial class GameBridge(ClientConfig config)
             // counted once by Wo207Queue; uncount it once even on cancellation.
             owner?.TryComplete();
             Interlocked.CompareExchange(ref _frameWriter, null, owner);
-            while (frames.TryRead(out var waiting))
-                if (Wo202Resolve(waiting) is { } remaining && remaining.Type != FlushTickType)
-                    Wo207Trace.Dequeued(remaining.Type);
+            EdgeDrainAbandonedFrames(frames);
         }
     }
 
@@ -6182,6 +6186,12 @@ public partial class GameBridge(ClientConfig config)
         {
             // WO-118: consumed regardless of interaction-session state, like npcid.
             HandleNativeNpcEvent(name, arg);
+            return;
+        }
+
+        if (name is "edge_mode" or "edge_probe" or "edge_lanes")
+        {
+            EdgeOnGameEvent(name, arg);
             return;
         }
 
@@ -7518,6 +7528,7 @@ public partial class GameBridge(ClientConfig config)
             if (!_combat.IsConnected && !await _combat.EnsureConnectedAsync(ct)) return;
             var st = await _combat.NpcStatusAsync(ct);
             if (st is not { } s) return;
+            _ = EdgeProbeConsoleAsync(ct);
             await ExecLuaAsync(FormattableString.Invariant(
                 $"if KCD2MP_NpcNativeAlive then KCD2MP_NpcNativeAlive({(s.Armed ? 1 : 0)}, {(s.NativeOn ? 1 : 0)}, {s.Bound}, {s.Writing}, 1) end"));
             if ((++_nativeHeartbeats % 10) == 0)
@@ -7539,7 +7550,7 @@ public partial class GameBridge(ClientConfig config)
                 Console.WriteLine($"MP-JOIN menu gate: holding world pushes into the mod until a world loads ({_menuHeldLua} so far)");
             return Task.CompletedTask;
         }
-        return _transport.ExecuteAsync(lua);
+        return EdgeExecLuaAsync(lua, EdgeLane.Bulk);
     }
 
     private bool _startedAtMenu;

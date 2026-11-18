@@ -60,6 +60,7 @@ public static class VerdictRules
     public const long PresentationGreenBelowMs = 150;
     public const long PresentationYellowBelowMs = 300;
     public const long PresentationAgentHopReviewAboveMs = 20;
+    public const long EdgeRealtimeGreenBelowMs = 34;
 
     private const string T3 = "MP-T3-STATS";
     private const string W136 = "MP-WO136-STATS";
@@ -109,10 +110,18 @@ public static class VerdictRules
         new("ranged_native_queue_overflow", VerdictStatus.Red, RequiresActivity: "ranged_out",
             Unreadable: "ranged_stats_unreadable"),
         new("ranged_missile_uncertain", VerdictStatus.Red, RequiresActivity: "ranged_missile_requests",
-            RequiresHostActivity: "ranged_missile_measured_accept")
+            RequiresHostActivity: "ranged_missile_measured_accept"),
+        new("proc_awaits_per_frame_max", VerdictStatus.Red, RequiresActivity: "edge_proc_n"),
+        new("http_calls_rt", VerdictStatus.Red, RequiresActivity: "edge_rt_n")
     ];
 
-    private sealed record PresentationRule(string Id, string Coverage, string Unit = "");
+    private sealed record PresentationRule(string Id, string Coverage, string Unit = "", string? AlternateCoverage = null,
+        bool ReportNonZeroWithoutCoverage = false)
+    {
+        public long? Count(Sample sample) => AlternateCoverage is { } alternate
+            ? Math.Max(sample.Number(Coverage) ?? 0, sample.Number(alternate) ?? 0)
+            : sample.Number(Coverage);
+    }
 
     private static readonly PresentationRule[] PresentationCounters =
     [
@@ -126,9 +135,14 @@ public static class VerdictRules
         new("rp_hard_place", "rp_pose_n"),
         new("rp_step_ratio", "rp_step_n"),
         new("rp_action_lag_ms_p95", "rp_action_n", " ms"),
-        new("owner_violations", "rp_owner_n"),
+        new("owner_violations", "rp_owner_n", ReportNonZeroWithoutCoverage: true),
         new("owner_handovers", "rp_owner_n"),
-        new("owner_denied_sets", "rp_owner_n")
+        new("owner_denied_sets", "rp_owner_n"),
+        new("edge_rt_age_ms_p95", "edge_rt_n", " ms"),
+        new("edge_rt_age_ms_max", "edge_rt_n", " ms"),
+        new("edge_bulk_age_ms_p95", "edge_bulk_n", " ms"),
+        new("pipe_busy_replies", "edge_rt_n", AlternateCoverage: "edge_bulk_n", ReportNonZeroWithoutCoverage: true),
+        new("inproc_fallbacks", "edge_proc_n", ReportNonZeroWithoutCoverage: true)
     ];
 
     private sealed record Sample(string Marker, string Role, string Origin, Dictionary<string, string> Fields)
@@ -251,10 +265,10 @@ public static class VerdictRules
         var observations = samples.Where(sample => sample.Marker == T3 ||
                 (rule.Id == "rp_step_ratio" && sample.Marker == StepPair) ||
                 (rule.Id == "owner_violations" && sample.Marker == OwnerViolation))
-            .Select(sample => (Sample: sample, Value: sample.Number(rule.Id), Count: sample.Number(rule.Coverage)))
+            .Select(sample => (Sample: sample, Value: sample.Number(rule.Id), Count: rule.Count(sample)))
             .Where(observation => observation.Value.HasValue && ((observation.Count > 0 &&
                 (rule.Coverage != "rp_owner_n" || HasOwnerCounters(observation.Sample))) ||
-                (rule.Id == "owner_violations" && observation.Value > 0))).ToList();
+                (rule.ReportNonZeroWithoutCoverage && observation.Value > 0))).ToList();
         if (observations.Count == 0)
             return Missing(rule.Id, $"Keine belegte Stichprobe in {T3}, {rule.Coverage}");
 
@@ -275,6 +289,9 @@ public static class VerdictRules
             case "rp_agent_hop_ms_p95":
                 var hop = value > PresentationAgentHopReviewAboveMs ? VerdictStatus.Yellow : VerdictStatus.Green;
                 return new(rule.Id, hop, measurement, evidence + ", Agent-Empfang bis DLL-Empfang");
+            case "edge_rt_age_ms_p95":
+                var realtime = value < EdgeRealtimeGreenBelowMs ? VerdictStatus.Green : VerdictStatus.Red;
+                return new(rule.Id, realtime, measurement, evidence + ", DLL-Empfang bis Verarbeitung im Hauptthread");
             case "owner_violations":
                 // The native guard can assert before the next periodic count.
                 if (source.Marker == OwnerViolation) return new(rule.Id, VerdictStatus.Red, "≥1", evidence);

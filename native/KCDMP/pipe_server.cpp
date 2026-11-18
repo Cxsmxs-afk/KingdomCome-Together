@@ -31,6 +31,8 @@
 #include "savelist.h"
 #include "pipe_outbox.h"
 #include "pipe_control_reader.h"
+#include "edge_lanes.h"
+#include "edge_lanes_rules.h"
 #include "leash.h"
 #include "wo131.h"
 #include "wo187.h"
@@ -85,10 +87,20 @@ std::atomic<HANDLE> g_pipe{INVALID_HANDLE_VALUE};
 uint8_t             g_seq = 0;
 std::atomic<uint64_t> g_connGen{0};
 
+enum class Priority { Normal, Realtime, Admission };
+struct EdgeReplyCapture {
+    uint8_t type = 0;
+    std::vector<uint8_t> frame;
+};
+thread_local EdgeReplyCapture* t_edgeReply = nullptr;
+
 struct Tx {
     std::mutex mutex;
     std::condition_variable cv;
     pipeout::Outbox queue;
+    std::deque<std::vector<uint8_t>> edgeRealtime, edgeAdmission;
+    size_t edgeBytes = 0;
+    unsigned edgeTurn = 0;
     HANDLE handle = INVALID_HANDLE_VALUE;
     uint64_t generation = 0;
     bool connected = false, writing = false, failed = false;
@@ -135,21 +147,54 @@ bool write_physical(HANDLE h, const void* data, DWORD len) {
     return true;
 }
 
-bool enqueue_raw(HANDLE h, const void* data, size_t len, uint64_t generation) {
+bool enqueue_raw(HANDLE h, const void* data, size_t len, uint64_t generation, Priority priority = Priority::Normal) {
     const auto* p = static_cast<const uint8_t*>(data);
+    if (t_edgeReply && len >= 3 && p[0] == t_edgeReply->type) {
+        t_edgeReply->frame.assign(p, p + len);
+        return true;
+    }
     std::lock_guard<std::mutex> lock(g_tx.mutex);
     if (h != g_tx.handle || !pipeout::same_connection(generation, g_tx.generation, g_tx.connected) || g_tx.failed) {
         SetLastError(ERROR_BROKEN_PIPE); return false;
     }
-    const bool ok = g_tx.queue.push_wire(std::vector<uint8_t>(p, p + len));
+    bool ok = false;
+    if (priority == Priority::Normal) {
+        ok = g_tx.queue.push_wire(std::vector<uint8_t>(p, p + len));
+    } else if (len <= pipeout::Outbox::kReliableBytes - g_tx.edgeBytes) {
+        auto& queue = priority == Priority::Admission ? g_tx.edgeAdmission : g_tx.edgeRealtime;
+        queue.emplace_back(p, p + len);
+        g_tx.edgeBytes += len;
+        ok = true;
+    }
     if (!ok) { g_tx.failed = true; SetLastError(ERROR_NOT_ENOUGH_MEMORY); } // explicit failure, never a silently missing reliable event
     g_tx.cv.notify_one();
     return ok;
 }
 
+void clear_tx() {
+    g_tx.queue.clear();
+    g_tx.edgeAdmission.clear();
+    g_tx.edgeRealtime.clear();
+    g_tx.edgeBytes = 0;
+    g_tx.edgeTurn = 0;
+}
+
+bool pop_tx(std::vector<uint8_t>& frame) {
+    auto* edgeQueue = !g_tx.edgeAdmission.empty() ? &g_tx.edgeAdmission : &g_tx.edgeRealtime;
+    if (edgeQueue->empty() || (g_tx.edgeAdmission.empty() && g_tx.edgeTurn >= 32 && !g_tx.queue.empty())) {
+        g_tx.edgeTurn = 0;
+        return g_tx.queue.pop(&frame);
+    }
+    frame = std::move(edgeQueue->front());
+    edgeQueue->pop_front();
+    g_tx.edgeBytes -= frame.size();
+    ++g_tx.edgeTurn;
+    return true;
+}
+
 void tx_connected(HANDLE h) {
     std::lock_guard<std::mutex> lock(g_tx.mutex);
-    g_tx.queue.clear();
+    clear_tx();
     g_tx.handle = h; g_tx.generation = g_connGen.load(); g_tx.connected = true; g_tx.failed = false;
 }
 void tx_disconnected(HANDLE h) {
@@ -159,7 +204,7 @@ void tx_disconnected(HANDLE h) {
     g_tx.cv.notify_all();
     // Pipe thread only: no CloseHandle while the writer owns an OVERLAPPED on it.
     g_tx.cv.wait(lock, [] { return !g_tx.writing; });
-    g_tx.queue.clear(); g_tx.handle = INVALID_HANDLE_VALUE;
+    clear_tx(); g_tx.handle = INVALID_HANDLE_VALUE;
 }
 void write_loop() {
     for (;;) {
@@ -170,10 +215,11 @@ void write_loop() {
         bool report = false;
         {
             std::unique_lock<std::mutex> lock(g_tx.mutex);
-            g_tx.cv.wait(lock, [] { return !g_running || (g_tx.connected && (g_tx.failed || !g_tx.queue.empty())); });
+            g_tx.cv.wait(lock, [] { return !g_running || (g_tx.connected &&
+                (g_tx.failed || !g_tx.queue.empty() || !g_tx.edgeAdmission.empty() || !g_tx.edgeRealtime.empty())); });
             if (!g_running) break;
             h = g_tx.handle; generation = g_tx.generation; failed = g_tx.failed;
-            if (!failed && !g_tx.queue.pop(&frame)) continue;
+            if (!failed && !pop_tx(frame)) continue;
             g_tx.writing = true;
         }
         const bool ok = !failed && write_physical(h, frame.data(), static_cast<DWORD>(frame.size()));
@@ -299,6 +345,171 @@ double w218_now_us() {
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
     return static_cast<double>(c.QuadPart) * usPerTick;
+}
+
+std::mutex g_edgeMutex;
+edgelanes::Queue g_edgeQueue;
+std::atomic<uint64_t> g_edgeBusy{0};
+rpmeasure::detail::Histogram g_edgeRt, g_edgeBulk; // Main thread only.
+
+struct EdgeProbe {
+    uint64_t connection = 0, scope = 0, lastRtFrame = 0;
+    uint32_t nonce = 0, frames = 0, offeredFrames = 0;
+    uint32_t rtAccepted = 0, bulkAccepted = 0, rt = 0, bulk = 0, busy = 0, rtBeforeBulk = 0;
+    bool ordered = true;
+    rpmeasure::detail::Histogram rtAge, bulkAge;
+} g_edgeProbe;
+
+int64_t edge_qpc() {
+    LARGE_INTEGER q{};
+    return QueryPerformanceCounter(&q) ? q.QuadPart : 0;
+}
+
+void edge_observe(rpmeasure::detail::Histogram& histogram, int64_t firstByte) {
+    if (firstByte <= 0) return;
+    static const double msPerTick = [] {
+        LARGE_INTEGER frequency{};
+        return QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0 ? 1000.0 / frequency.QuadPart : 0.0;
+    }();
+    const int64_t now = edge_qpc();
+    uint32_t ms = 0;
+    if (msPerTick > 0.0 && now >= firstByte &&
+        rpmeasure::detail::rounded_measurement(static_cast<double>(now - firstByte) * msPerTick, ms))
+        histogram.add(ms);
+}
+
+bool edge_reply(HANDLE h, uint64_t generation, uint32_t id, edgelanes::Status status,
+                const std::vector<uint8_t>* previous = nullptr, bool rt = false) {
+    const auto n = previous && previous->size() >= 3 ? previous->size() - 3 : 0;
+    const size_t size = edgelanes::kReplyHeader + n;
+    if (size > 0xFFFF) return false;
+    std::vector<uint8_t> frame(3 + size);
+    frame[0] = edgelanes::kReply;
+    frame[1] = static_cast<uint8_t>(size);
+    frame[2] = static_cast<uint8_t>(size >> 8);
+    edgelanes::put_u32(frame.data() + 3, id);
+    frame[7] = static_cast<uint8_t>(status);
+    frame[8] = previous ? (*previous)[0] : 0;
+    if (n) std::memcpy(frame.data() + 9, previous->data() + 3, n);
+    const Priority priority = status != edgelanes::Status::Completed ? Priority::Admission
+                            : rt ? Priority::Realtime : Priority::Normal;
+    return enqueue_raw(h, frame.data(), frame.size(), generation, priority);
+}
+
+bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) {
+    using namespace edgelanes;
+    Request request;
+    if (!decode(outer, request)) {
+        const uint32_t id = outer.body.size() >= 4 ? read_u32(outer.body.data()) : 0;
+        return id != 0 && edge_reply(h, generation, id, Status::Invalid);
+    }
+    const uint8_t nested = request.frame.type;
+    const uint32_t id = request.id;
+    const bool lifecycle = nested == kWo163 && !request.frame.body.empty() &&
+                           (request.frame.body[0] == wo216::kOpLifecycle ||
+                            request.frame.body[0] == pipecontrol::kEdgeCapabilities);
+    const bool latest = nested == kSetPartner || nested == kReadBodyState || nested == kReadLocalState;
+    if (lifecycle || (nested > kPinLabel && nested != kRawPose && nested != kProbe) ||
+        (request.lane == Lane::Latest && !latest) ||
+        (nested == kRawPose && request.lane != Lane::Realtime) || (nested == kProbe && request.lane != Lane::Bulk))
+        return edge_reply(h, generation, id, Status::Unsupported);
+    if (nested != kRawPose && !pipecontrol::complete_payload_allowed(request.frame))
+        return edge_reply(h, generation, id, Status::Invalid);
+    request.connection = generation;
+    bool accepted = false;
+    uint32_t superseded = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_edgeMutex);
+        accepted = g_edgeQueue.push(std::move(request), superseded);
+    }
+    if (!accepted) {
+        const bool sent = edge_reply(h, generation, id, Status::Busy);
+        if (sent) g_edgeBusy.fetch_add(1, std::memory_order_relaxed);
+        return sent;
+    }
+    return superseded == 0 || edge_reply(h, generation, superseded, Status::Superseded);
+}
+
+bool edge_probe_begin(uint32_t nonce, uint32_t frames, uint64_t generation, uint64_t observation) {
+    char env[2]{};
+    if (GetEnvironmentVariableA("KCDMP_TEST_LANES", env, sizeof env) != 1 || env[0] != '1' ||
+        g_edgeProbe.nonce || !nonce || !frames || frames > 600 || generation != g_connGen.load() ||
+        observation != wo216::lifecycle_observation_stamp()) return false;
+    g_edgeProbe = {};
+    g_edgeProbe.nonce = nonce;
+    g_edgeProbe.frames = frames;
+    g_edgeProbe.connection = generation;
+    g_edgeProbe.scope = observation;
+    return true;
+}
+
+void edge_probe_finish(bool valid) {
+    auto& p = g_edgeProbe;
+    const auto rt = p.rtAge.summary();
+    const auto bulk = p.bulkAge.summary();
+    logf("MP-LANES nonce=%u frames=%u rt_offered=%u bulk_offered=%u rt=%u bulk=%u busy=%u rt_before_bulk=%u "
+         "ordered=%u rt_p95_ms=%u rt_max_ms=%u bulk_p95_ms=%u valid=%u",
+         p.nonce, p.offeredFrames, p.offeredFrames * edgelanes::kRtPerFrame, p.offeredFrames * edgelanes::kBulkPerFrame,
+         p.rt, p.bulk, p.busy, p.rtBeforeBulk, p.ordered ? 1u : 0u, rt.p95, rt.max, bulk.p95, valid ? 1u : 0u);
+    p.nonce = 0;
+}
+
+void edge_probe_maybe_finish() {
+    const auto& p = g_edgeProbe;
+    if (p.nonce && p.offeredFrames == p.frames && p.rt == p.rtAccepted && p.bulk == p.bulkAccepted)
+        edge_probe_finish(p.scope == wo216::lifecycle_observation_stamp() && p.connection == g_connGen.load() &&
+                          g_connected && p.rtAge.summary().observed == p.rt && p.bulkAge.summary().observed == p.bulk);
+}
+
+void edge_probe_offer() {
+    using namespace edgelanes;
+    auto& p = g_edgeProbe;
+    if (!p.nonce) return;
+    if (p.connection != g_connGen.load() || p.scope != wo216::lifecycle_observation_stamp() || !g_connected) {
+        {
+            std::lock_guard<std::mutex> lock(g_edgeMutex);
+            g_edgeQueue.clear_probe();
+        }
+        edge_probe_finish(false);
+        return;
+    }
+    if (p.offeredFrames < p.frames) {
+        const int64_t arrived = edge_qpc();
+        std::lock_guard<std::mutex> lock(g_edgeMutex);
+        const auto offer = [&](Lane lane, unsigned count, uint32_t& accepted) {
+            for (unsigned i = 0; i < count; ++i) {
+                Request item;
+                item.probe = true;
+                item.connection = p.connection;
+                item.frame.readerQpc = arrived;
+                item.id = accepted + 1;
+                item.lane = lane;
+                uint32_t superseded = 0;
+                if (g_edgeQueue.push(std::move(item), superseded)) ++accepted;
+                else ++p.busy;
+            }
+        };
+        offer(Lane::Realtime, kRtPerFrame, p.rtAccepted);
+        offer(Lane::Bulk, kBulkPerFrame, p.bulkAccepted);
+        ++p.offeredFrames;
+    }
+    edge_probe_maybe_finish();
+}
+
+void edge_probe_work(const edgelanes::Request& request, bool rt) {
+    auto& p = g_edgeProbe;
+    if (!p.nonce) return;
+    const uint64_t frame = main_thread::frame_count();
+    if (rt) {
+        edge_observe(p.rtAge, request.frame.readerQpc);
+        p.ordered &= request.id == ++p.rt;
+        p.lastRtFrame = frame;
+    } else {
+        edge_observe(p.bulkAge, request.frame.readerQpc);
+        p.ordered &= request.id == ++p.bulk;
+        if (p.lastRtFrame == frame) ++p.rtBeforeBulk;
+    }
+    edge_probe_maybe_finish();
 }
 
 struct PendingBatch {
@@ -880,6 +1091,11 @@ static_assert(pipecontrol::kLargePayload == kNpcSamplesMaxLen, "decoder must pre
 
 bool ingest(ReaderContext& input, const uint8_t* bytes, size_t n) {
     const bool ok = input.reader.feed(bytes, n, [&](const pipecontrol::Frame& f) {
+        if (f.type == pipecontrol::kEdge) return edge_admit(input.handle, input.generation, f);
+        if (f.body.size() == 1 && f.body[0] == pipecontrol::kEdgeCapabilities) {
+            const BYTE caps[] = {1, f.sequence, pipecontrol::kEdgeCapabilities, 0, edgelanes::kVersion};
+            return send_frame(input.handle, kWo163Reply, caps, sizeof caps, input.generation);
+        }
         // Only this opcode is pure lifecycle state. Do not route any other
         // off-main op ahead of the normal FIFO, even if the registry allows it.
         BYTE out[4 + 512]{}; size_t used = 0; uint8_t reason = wo163::kRFailed;
@@ -889,9 +1105,8 @@ bool ingest(ReaderContext& input, const uint8_t* bytes, size_t n) {
         return send_frame(input.handle, kWo163Reply, out, static_cast<uint16_t>(4 + used), input.generation);
     },[](pipecontrol::Frame& f){
         f.readerTick=GetTickCount64();f.readerGeneration=wo216::lifecycle_generation();f.readerLife=p4::life_edge_tick();f.readerGameplay=wo216::lifecycle_gameplay();
-        if (f.type == kNpcSamples) {
-            LARGE_INTEGER tick{};
-            if (QueryPerformanceCounter(&tick)) f.readerQpc = tick.QuadPart;
+        if (f.type == kNpcSamples || f.type == pipecontrol::kEdge) {
+            f.readerQpc = edge_qpc();
             f.readerObservation = wo216::lifecycle_observation_stamp();
         }
     });
@@ -958,6 +1173,13 @@ constexpr uint8_t  kReasonUnknownCommand = 18;   // mirrors PipeReason.UnknownCo
 // NPC, a default BodyState would report a body at rest.
 template <typename T>
 bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& outValue, bool* faultedOut = nullptr) {
+    if (t_edgeReply) {
+        bool faulted = true;
+        try { faulted = !fault::guarded(g_sitePipeTask, [&] { work(outValue); }); }
+        catch (...) { logf("PIPE: async %s raised a C++ exception on Main", what); }
+        if (faultedOut) *faultedOut = faulted;
+        return !faulted;
+    }
     auto state = std::make_shared<PipeSyncState<T>>();
     const uint64_t generation = g_connGen.load();
     // WO-210 H.3: the task is posted to the main thread directly; serve() waits on the shared state, bounded. It used to be a detached
@@ -1005,18 +1227,10 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
     return state->ran && !state->faulted;
 }
 
-// One connected agent, until it disconnects.
-void serve(HANDLE h) {
-    tx_connected(h);
-    g_connected = true;
-    p6::connection(true);
-    logf("PIPE: agent connected");
-
-    ReaderContext input(h, g_connGen.load());
-    t_reader = &input;
-    while (g_running && !input.failed) {
-        pipecontrol::Frame incoming;
-        if (!next_normal_frame(input, &incoming)) break;
+// One existing handler per operation. The compatibility path arrives on the
+// pipe thread. An admitted lane request calls the same validation on Main and
+// captures only its expected direct reply, leaving unsolicited events intact.
+void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& incoming) {
         const uint8_t type = incoming.type;
         const uint16_t len = static_cast<uint16_t>(incoming.body.size());
         // Keep a non-null address for old handlers' zero-length branches.
@@ -1024,7 +1238,7 @@ void serve(HANDLE h) {
         const uint8_t seq = incoming.sequence;
         crash::note_pipe(type, len ? body[0] : 0, len);
         const p6render::Stamp renderStamp{incoming.readerGeneration,incoming.readerLife,incoming.readerTick,incoming.readerGameplay};
-        if (type == wo218rules::kBatch) { w218_on_batch(h, body, len,renderStamp); continue; }
+        if (type == wo218rules::kBatch) { w218_on_batch(h, body, len,renderStamp); return; }
 
         switch (type) {
             case kPing:
@@ -1397,9 +1611,27 @@ void serve(HANDLE h) {
             // (engine reads) is marshalled onto the main thread.
             case kNpcSamples: {
                 const uint8_t r = npcdrive::on_samples(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, input.generation + 1}});
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}});
                 if (r != npcdrive::kOk) logf("PIPE: NpcSamples refused (%s, %u bytes)", npcdrive::reason_name(r), len);
                 send_result(h, r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case edgelanes::kRawPose: {
+                const uint8_t r = t_edgeReply ? npcdrive::on_raw_pose(body, len,
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}}) : npcdrive::kBadRequest;
+                send_result(h, r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case edgelanes::kProbe: {
+                BYTE out[10]{};
+                if (t_edgeReply && len == 9 && body[0] == 1) {
+                    const uint32_t nonce = edgelanes::read_u32(body + 1);
+                    const uint32_t frames = edgelanes::read_u32(body + 5);
+                    out[0] = edge_probe_begin(nonce, frames, generation, incoming.readerObservation) ? 1 : 0;
+                    edgelanes::put_u32(out + 2, nonce);
+                    edgelanes::put_u32(out + 6, frames);
+                }
+                send_frame(h, edgelanes::kProbeReply, out, sizeof out, generation);
                 break;
             }
             case kNpcHold: {
@@ -1916,12 +2148,92 @@ void serve(HANDLE h) {
                 send_result(h, false, seq, kReasonUnknownCommand);
                 break;
         }
+}
+
+uint8_t direct_reply_type(uint8_t request) {
+    if (wo218rules::batchable(request)) return wo218rules::reply_type(request);
+    switch (request) {
+        case kPing: return kPong;
+        case kResolveLuaClosure: return kClosureInfo;
+        case kReadBodyState: return kBodyState;
+        case kReadLocalState: return kLocalState;
+        case kScanNpcs: return kNpcScanResult;
+        case kListGraves: return kGraveList;
+        case kNpcStatus: return kNpcStatusReply;
+        case kAttributedDamage: return kAttributedReply;
+        case kWo121Status: return kWo121StatusReply;
+        case kJoinPlace: return kJoinPlaceReply;
+        case kSaveList: return kSaveListReply;
+        case kJoinGuard: return kJoinGuardReply;
+        case kLeashSample: return kLeashReply;
+        case edgelanes::kProbe: return edgelanes::kProbeReply;
+        default: return kResult;
+    }
+}
+
+void edge_dispatch(const edgelanes::Request& request, bool rt) {
+    if (!g_connected || request.connection != g_connGen.load()) return;
+    const HANDLE handle = g_pipe.load();
+    if (handle == INVALID_HANDLE_VALUE) return;
+    const uint8_t type = request.frame.type;
+    if (type != edgelanes::kRawPose && type != edgelanes::kProbe)
+        edge_observe(rt ? g_edgeRt : g_edgeBulk, request.frame.readerQpc);
+    EdgeReplyCapture capture;
+    capture.type = direct_reply_type(type);
+    const auto previous = t_edgeReply;
+    t_edgeReply = &capture;
+    bool completed = false;
+    try {
+        completed = fault::guarded(g_sitePipeTask, [&] { dispatch_frame(handle, request.connection, request.frame); });
+    } catch (...) {
+        logf("PIPE: async dispatcher raised a C++ exception on Main");
+    }
+    t_edgeReply = previous;
+    if (completed && !capture.frame.empty()) {
+        edge_reply(handle, request.connection, request.id, edgelanes::Status::Completed, &capture.frame, rt);
+        return;
+    }
+    logf("PIPE: async dispatch type=0x%02X produced no direct result; its outcome is uncertain", type);
+    edge_reply(handle, request.connection, request.id, edgelanes::Status::Faulted);
+}
+
+void edge_drain(bool rt) {
+    if (rt) edge_probe_offer();
+    const double started = w218_now_us();
+    for (unsigned served = 0; edgelanes::may_work(rt, served, w218_now_us() - started); ++served) {
+        edgelanes::Request request;
+        {
+            std::lock_guard<std::mutex> lock(g_edgeMutex);
+            if (!g_edgeQueue.pop(rt, request)) break;
+        }
+        if (request.probe) edge_probe_work(request, rt);
+        else edge_dispatch(request, rt);
+    }
+}
+
+// One connected agent, until it disconnects.
+void serve(HANDLE h) {
+    tx_connected(h);
+    g_connected = true;
+    p6::connection(true);
+    logf("PIPE: agent connected");
+
+    ReaderContext input(h, g_connGen.load());
+    t_reader = &input;
+    while (g_running && !input.failed) {
+        pipecontrol::Frame incoming;
+        if (!next_normal_frame(input, &incoming)) break;
+        dispatch_frame(h, input.generation, incoming);
     }
 
     t_reader = nullptr;
     g_connected = false;
     p6::connection(false);
     w218_on_disconnect();   // WO-218 A.1: a waiting batch's reply never reaches the next connection
+    {
+        std::lock_guard<std::mutex> lock(g_edgeMutex);
+        g_edgeQueue.clear();
+    }
     tx_disconnected(h);
     logf("PIPE: agent disconnected");
     // WO-118: no agent, no stream -- every native binding is dropped.
@@ -2034,6 +2346,7 @@ bool start() {
     // WO-118: the native writer's and the trace's unsolicited frames.
     npcdrive::set_drop_callback(&send_npc_dropped);
     npctrace::set_done_callback(&send_trace_done);
+    main_thread::set_frame_lanes([] { edge_drain(true); }, [] { edge_drain(false); });
 
     // The injected plugin has process lifetime. Detaching keeps DLL teardown
     // free of a blocking join under the Windows loader lock.
@@ -2045,6 +2358,7 @@ bool start() {
 
 void stop() {
     if (!g_running.exchange(false)) return;
+    main_thread::set_frame_lanes(nullptr, nullptr);
     g_tx.cv.notify_all();
     const HANDLE current = g_pipe.load();
     if (current != INVALID_HANDLE_VALUE) CancelIoEx(current, nullptr);
@@ -2058,3 +2372,15 @@ bool connected() { return g_connected; }
 uint64_t observation_connection() { return g_connected ? g_connGen.load() + 1 : 0; }
 
 } // namespace kcdmp::pipe
+
+namespace kcdmp::edge {
+
+Counts snapshot() {
+    const auto rt = pipe::g_edgeRt.summary();
+    const auto bulk = pipe::g_edgeBulk.summary();
+    return {rt.p95, rt.max, bulk.p95, pipe::g_edgeBusy.load(std::memory_order_relaxed), rt.observed, bulk.observed};
+}
+
+void observe_rt(int64_t firstByteQpc) { pipe::edge_observe(pipe::g_edgeRt, firstByteQpc); }
+
+} // namespace kcdmp::edge

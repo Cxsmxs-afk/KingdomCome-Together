@@ -20,6 +20,7 @@ add_library(KCDMP SHARED
     npc_scan.cpp
     anchors.cpp
     engine.cpp
+    edge_console.cpp
     buffs.cpp
     gameover_hook.cpp
     hangover.cpp

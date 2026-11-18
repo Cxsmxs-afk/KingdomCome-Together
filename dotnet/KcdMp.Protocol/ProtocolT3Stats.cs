@@ -9,9 +9,10 @@ public static class T3NativeCounters
 {
     public const byte Version = 1;
     public const int MaxFields = 56;
-    public const int CoreFields = 19, CorpseFields = 5, RangedFields = 6, PresentationFields = 17, OwnerFields = 2;
+    public const int CoreFields = 19, CorpseFields = 5, RangedFields = 6, PresentationFields = 17, OwnerFields = 2, EdgeFields = 6;
     public const int PresentationStart = CoreFields + CorpseFields + RangedFields;
     public const int OwnerStart = PresentationStart + PresentationFields;
+    public const int EdgeStart = OwnerStart + OwnerFields;
     // IDs are append-only. Distances are rounded UP to whole metres; detailed
     // teleport logs preserve the actual coordinates and fractional distances.
     public static readonly string[] Keys = [
@@ -25,7 +26,8 @@ public static class T3NativeCounters
         "rp_e2e_ms_p50", "rp_e2e_ms_p95", "rp_e2e_ms_max", "rp_agent_hop_ms_p95",
         "rp_corr_n", "rp_corr_cm_p95", "rp_corr_cm_max", "rp_hard_place", "rp_step_ratio",
         "rp_action_lag_ms_p95", "owner_violations", "rp_e2e_n", "rp_agent_hop_n", "rp_action_n",
-        "rp_step_n", "rp_pose_n", "rp_owner_n", "owner_handovers", "owner_denied_sets"
+        "rp_step_n", "rp_pose_n", "rp_owner_n", "owner_handovers", "owner_denied_sets",
+        "edge_rt_age_ms_p95", "edge_rt_age_ms_max", "edge_bulk_age_ms_p95", "pipe_busy_replies", "edge_rt_n", "edge_bulk_n"
     ];
 
     public static bool TryRead(ReadOnlySpan<byte> payload, out Dictionary<string, long> values)
@@ -47,14 +49,16 @@ public static class T3NativeCounters
         for (int i = 0; i < CoreFields; i++) if (!seen[i]) return false;
         int corpse = 0;
         for (int i = CoreFields; i < CoreFields + CorpseFields; i++) if (seen[i]) corpse++;
-        int ranged = 0, presentation = 0, owners = 0;
+        int ranged = 0, presentation = 0, owners = 0, edge = 0;
         for (int i = CoreFields + CorpseFields; i < PresentationStart; i++) if (seen[i]) ranged++;
         for (int i = PresentationStart; i < OwnerStart; i++) if (seen[i]) presentation++;
-        for (int i = OwnerStart; i < OwnerStart + OwnerFields; i++) if (seen[i]) owners++;
+        for (int i = OwnerStart; i < EdgeStart; i++) if (seen[i]) owners++;
+        for (int i = EdgeStart; i < EdgeStart + EdgeFields; i++) if (seen[i]) edge++;
         // Older DLLs remain readable. Every extension is atomic and requires its prefix.
         return (corpse == 0 || corpse == CorpseFields) && (ranged == 0 || ranged == RangedFields) &&
             (ranged == 0 || corpse == CorpseFields) && (presentation == 0 || presentation == PresentationFields) &&
             (presentation == 0 || ranged == RangedFields) && (owners == 0 || owners == OwnerFields) &&
-            (owners == 0 || presentation == PresentationFields);
+            (owners == 0 || presentation == PresentationFields) && (edge == 0 || edge == EdgeFields) &&
+            (edge == 0 || owners == OwnerFields);
     }
 }

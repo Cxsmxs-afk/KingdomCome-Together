@@ -300,17 +300,18 @@ int wo216_tests(int* passed) {
         for (size_t i = 0; i < large.size(); ++i) allBytes = allBytes && partial.feed(large.data() + i, 1, noControl);
         WCHECK(allBytes && partial.pop(&f) && f.body.size() == 4096 && controls == 0 && partial.partial_bytes() == 0, "P1: payload larger than a small OS-buffer slice consumes bytewise without full-frame Peek");
         pc::Reader malformed;
-        const uint8_t huge[] = {pc::kGeneric, 1, 16}; //4097 is never allowed
+        const uint8_t huge[] = {pc::kGeneric, static_cast<uint8_t>(pc::kT3Payload + 1), static_cast<uint8_t>((pc::kT3Payload + 1) >> 8)};
         WCHECK(!malformed.feed(huge, sizeof huge, noControl) && malformed.failed(), "P1: oversized length rejected at header, before payload allocation");
         pc::Reader longStats;
         std::vector<uint8_t> statsBody{kcdmp::t3stats::kOp, 1};
-        for (unsigned i = 0; i < 75; ++i) {
-            const std::string field = (i ? " " : "") + std::string("metric") + std::to_string(i) + "=1234567890";
+        for (unsigned i = 0; i < 140; ++i) {
+            const std::string field = (i ? " " : "") + std::string("edge_metric_sample_") + std::to_string(i) + "=1234567890123456789";
             statsBody.insert(statsBody.end(), field.begin(), field.end());
         }
         const auto statsWire = wireFrame(pc::kGeneric, statsBody);
-        WCHECK(statsBody.size() > 1300 && kcdmp::t3stats::valid(statsBody.data() + 1, statsBody.size() - 1) && longStats.feed(statsWire.data(), statsWire.size(), noControl) && longStats.pop(&f) && f.body == statsBody,
-            "P1: numeric T3 mirror larger than1300B stays allowed with batching off");
+        WCHECK(statsBody.size() > pc::kLargePayload && statsBody.size() <= pc::kT3Payload &&
+            kcdmp::t3stats::valid(statsBody.data() + 1, statsBody.size() - 1) && longStats.feed(statsWire.data(), statsWire.size(), noControl) && longStats.pop(&f) && f.body == statsBody,
+            "s2-3: the extended numeric T3 mirror remains a single untruncated telemetry frame");
         pc::Reader forbiddenGeneric; const auto oversizedNormal = wireFrame(pc::kGeneric, std::vector<uint8_t>(1025, 42));
         WCHECK(!forbiddenGeneric.feed(oversizedNormal.data(), oversizedNormal.size(), noControl) && forbiddenGeneric.failed(), "P1: generic above1024B is rejected after decode unless opcode250");
         pc::Reader bounded; bool accepted = true;
@@ -325,6 +326,24 @@ int wo216_tests(int* passed) {
             "P1: control sequence allocated once even across255->0 normal wrap");
         pc::Reader otherOp; const auto ordinary = wireFrame(pc::kGeneric, {169});
         WCHECK(otherOp.feed(ordinary.data(), ordinary.size(), noControl) && controls == 0 && otherOp.pop(&f) && f.body[0] == 169, "P1: another off-main-capable opcode cannot bypass FIFO");
+        pc::Reader mixed(20);
+        const auto capability = wireFrame(pc::kGeneric, {pc::kEdgeCapabilities});
+        const auto edge = wireFrame(pc::kEdge, std::vector<uint8_t>(pc::kEdgePayload, 9));
+        std::vector<pc::Frame> immediate;
+        auto acceptImmediate = [&](const pc::Frame& frame) { immediate.push_back(frame); return true; };
+        const size_t firstPart = 20;
+        WCHECK(mixed.feed(ordinary.data(), ordinary.size(), acceptImmediate) && mixed.queued() == 1 &&
+            mixed.feed(capability.data(), capability.size(), acceptImmediate) && immediate.size() == 1 && immediate[0].sequence == 21 &&
+            mixed.feed(edge.data(), firstPart, acceptImmediate) && immediate.size() == 1 &&
+            mixed.feed(edge.data() + firstPart, edge.size() - firstPart, acceptImmediate) && immediate.size() == 2 &&
+            immediate[1].type == pc::kEdge && immediate[1].body.size() == pc::kEdgePayload && mixed.next_sequence() == 22 &&
+            mixed.feed(ordinary.data(), ordinary.size(), acceptImmediate) && mixed.pop(&f) && f.sequence == 20 &&
+            mixed.pop(&f) && f.sequence == 22 && !mixed.pop(&f),
+            "s2-3: complete capability and edge bypass the older legacy backlog, edge IDs do not consume legacy sequence numbers");
+        pc::Reader tooLargeEdge;
+        const uint8_t tooLargeEdgeHeader[] = {pc::kEdge, static_cast<uint8_t>(pc::kEdgePayload + 1), static_cast<uint8_t>((pc::kEdgePayload + 1) >> 8)};
+        WCHECK(!tooLargeEdge.feed(tooLargeEdgeHeader, sizeof tooLargeEdgeHeader, acceptImmediate) && tooLargeEdge.failed(),
+            "s2-3: edge envelope cap is checked before reading its body");
         std::unique_lock<std::mutex> finishedLock(mainMutex, std::defer_lock); mainLock.unlock(); finishedLock.lock();
         WCHECK(pc::wait_pumped(mainCv, finishedLock, std::chrono::milliseconds(20), [] { return false; }, [] { return false; }) == pc::Wait::TransportFailed,
             "P1: disconnected/generation-changed pump ends wait rather than touching next connection");

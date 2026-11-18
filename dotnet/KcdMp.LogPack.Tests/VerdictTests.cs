@@ -69,6 +69,46 @@ public class VerdictTests
         Assert.Equal(expected, row.Status);
     }
 
+    [Theory]
+    [InlineData(999, 0, VerdictStatus.Grey)]
+    [InlineData(0, 30, VerdictStatus.Green)]
+    [InlineData(33, 30, VerdictStatus.Green)]
+    [InlineData(34, 30, VerdictStatus.Red)]
+    public void Realtime_age_requires_lane_observations_and_a_p95_below_34_ms(int age, int count, VerdictStatus expected)
+    {
+        var input = new Briefing.Input();
+        input.Logs["kcdmp-native.log"] = [$"MP-T3-STATS origin=dll source=agent role=host edge_rt_age_ms_p95={age} edge_rt_n={count}"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == "edge_rt_age_ms_p95");
+        Assert.Equal(expected, row.Status);
+    }
+
+    [Theory]
+    [InlineData("proc_awaits_per_frame_max", "edge_proc_n", 0, 0, VerdictStatus.Grey)]
+    [InlineData("proc_awaits_per_frame_max", "edge_proc_n", 0, 80, VerdictStatus.Green)]
+    [InlineData("proc_awaits_per_frame_max", "edge_proc_n", 1, 0, VerdictStatus.Red)]
+    [InlineData("http_calls_rt", "edge_rt_n", 0, 0, VerdictStatus.Grey)]
+    [InlineData("http_calls_rt", "edge_rt_n", 0, 30, VerdictStatus.Green)]
+    [InlineData("http_calls_rt", "edge_rt_n", 1, 30, VerdictStatus.Red)]
+    public void Realtime_invariants_need_exercise_for_a_pass_and_keep_observed_violations(string metric, string coverage, int value, int count, VerdictStatus expected)
+    {
+        var input = new Briefing.Input();
+        input.Logs["agent.log"] = [$"12:00:00.000 MP-T3-STATS origin=agent role=joiner {metric}={value} {coverage}={count}"];
+        var row = Assert.Single(VerdictRules.Evaluate(input).Rows, row => row.Id == metric);
+        Assert.Equal(expected, row.Status);
+    }
+
+    [Fact]
+    public void Bulk_age_busy_replies_and_IPC_fallbacks_are_diagnostic_only()
+    {
+        var input = new Briefing.Input();
+        input.Logs["kcdmp-native.log"] = [
+            "MP-T3-STATS origin=dll source=agent role=joiner edge_bulk_age_ms_p95=47 edge_bulk_n=50 edge_rt_n=0 pipe_busy_replies=2 inproc_fallbacks=3 edge_proc_n=0"];
+        var report = VerdictRules.Evaluate(input).ToText();
+        Assert.Contains("edge_bulk_age_ms_p95\tGRAU\t47 ms\tMP-T3-STATS, DLL-Spiegel, n=50", report);
+        Assert.Contains("pipe_busy_replies\tGRAU\t2\tMP-T3-STATS, DLL-Spiegel, n=50", report);
+        Assert.Contains("inproc_fallbacks\tGRAU\t3\tMP-T3-STATS, DLL-Spiegel, ohne Grenzwert", report);
+    }
+
     [Fact]
     public void Owner_handovers_and_denials_from_a_qualified_mirror_have_no_failure_threshold()
     {

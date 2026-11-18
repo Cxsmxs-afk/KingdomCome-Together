@@ -295,24 +295,9 @@ void b_resolve() {
 void b_legacy_resolve() {
     if (g_b.conResolved) return;
     g_b.conResolved = true;
-    // the console's ExecuteString: CScriptBind_System::ExecuteCommand (CryScriptSystem, found by its own error text) calls
-    // mov rcx,[rdi+78h]; xor r9d,r9d; mov rdx,[rsp+48h]; xor r8d,r8d; mov rax,[rcx]; call [rax+<slot>]   (bSilent = 0, bDefer = 0)
-    HMODULE ss = GetModuleHandleA("CryScriptSystem.dll");
-    if (!ss) { g_b.why = "CryScriptSystem.dll not loaded"; return; }
-    int nf = 0;
-    const uint8_t* door = anchor::function_by_string(ss, "CScriptBind_System::ExecuteCommand", &nf);
-    if (!door || nf != 1) { g_b.why = "System.ExecuteCommand's binding not found as one function"; return; }
-    uint8_t code[0x100]{};
-    KCDMP_FAULT_READ(rsite, "wo216::b_resolve");
-    if (!fault::guarded(rsite, [&] { std::memcpy(code, door, sizeof code); })) { g_b.why = "the binding unreadable"; return; }
-    static const uint8_t pat[] = {0x45, 0x33, 0xC9, 0x48, 0x8B, 0x54, 0x24, 0x48, 0x45, 0x33, 0xC0, 0x48, 0x8B, 0x01, 0xFF, 0x90};
-    size_t at = 0;
-    for (size_t i = 0; i + sizeof pat + 4 <= sizeof code && !at; ++i) if (std::memcmp(code + i, pat, sizeof pat) == 0) at = i + sizeof pat;
-    if (!at) { g_b.why = "the binding's console call not found"; return; }
-    int32_t slot = 0;
-    std::memcpy(&slot, code + at, 4);
-    if (slot <= 0 || slot > 0x400 || (slot & 7)) { g_b.why = "the console call's slot is implausible"; return; }
-    g_b.conExecSlot = static_cast<size_t>(slot);
+    const char* reason = nullptr;
+    g_b.conExecSlot = engine::console_execute_slot(&reason);
+    if (!g_b.conExecSlot) { g_b.why = reason; return; }
     logf("WO216-BRAINS legacy PauseNPC console slot +0x%zX resolved from ExecuteCommand", g_b.conExecSlot);
 }
 
