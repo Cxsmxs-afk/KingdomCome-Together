@@ -425,6 +425,42 @@ public sealed class Lane1BowHandTests
         return [Peer, .. up[3..]];
     }
 
+    [Fact]
+    public async Task An_empty_local_report_keeps_repeating_a_confirmed_ordinary_weapon()
+    {
+        await using var link = new MemoryStream();
+        var bridge = await CreateHostAsync(link);
+        string sword = $"v1|1|{Sword:D}";
+        SendOwnHand(bridge, $"1 {Sword:D}");
+        Assert.Equal(sword, ReadHandPacket(link));
+
+        link.SetLength(0);
+        SendOwnHand(bridge, "1 -");
+        Assert.Equal("v1|1|-", ReadHandPacket(link));
+
+        link.SetLength(0);
+        TickHandHeartbeat(bridge);
+        Assert.Equal(sword, ReadHandPacket(link));
+    }
+
+    [Fact]
+    public async Task Only_a_current_crossbow_observation_releases_a_different_confirmed_class()
+    {
+        await using var link = new MemoryStream();
+        using var game = new GameCalls();
+        await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
+        var bridge = await CreateHostAsync(link);
+        Field("_transport").SetValue(bridge, transport);
+
+        long beforeSword = Environment.TickCount64 - 10;
+        await ReceiveFigureHandAsync(bridge, $"v1|1|{Sword:D}");
+        Call(bridge, "Wo214OnOtherRangedHand", Peer, Crossbow, beforeSword);
+        Assert.Equal(Sword, Assert.Single((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!));
+
+        Call(bridge, "Wo214OnOtherRangedHand", Peer, Crossbow, Environment.TickCount64);
+        Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
+    }
+
     private static async Task<GameBridge> CreateHostAsync(Stream link)
     {
         byte phase = 0;

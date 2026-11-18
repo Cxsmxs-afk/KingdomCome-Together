@@ -260,13 +260,11 @@ public partial class GameBridge
             Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds + step.AgeMs <= Protocol.RangedCaptureMaxAgeMs;
         if (!_p5Peers.TryGetValue(src, out var peer) || peer.Serial != frame.P6PeerSerial) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, peer.Token);
+        long capturedAt = Environment.TickCount64 - step.AgeMs - (long)Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds;
         if (step.Kind == RangedWeaponKind.Bow && BowHandProof.IsDrawnPhase(step.Phase))
-        {
-            long capturedAt = Environment.TickCount64 - step.AgeMs - (long)Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds;
             await Wo214OnRangedBowHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, capturedAt, Current, linked.Token);
-        }
         else if (step.Kind == RangedWeaponKind.Crossbow && !linked.IsCancellationRequested && Current())
-            Wo214OnOtherRangedHand(src);
+            Wo214OnOtherRangedHand(src, step.ItemClass, capturedAt);
         // Charge and Aim still lack a verified animation entry. Crossbow reload tags vary by subclass.
         string fragment = Wo201Rules.RangedFragment(step.Phase);
         if (fragment.Length == 0 || (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4))

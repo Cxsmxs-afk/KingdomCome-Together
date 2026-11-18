@@ -49,6 +49,8 @@ public partial class GameBridge
             if (kind == RangedWeaponKind.Crossbow && cls != Guid.Empty)
             {
                 Wo214ClearOwnBow("class-changed", proof.CapturedAt);
+                if (_w214OwnHand is { Drawn: true, Cls: Guid held } && held != cls)
+                    _w214OwnHand = null;
                 return;
             }
             if (kind != RangedWeaponKind.Bow) return;
@@ -103,6 +105,7 @@ public partial class GameBridge
         if (P6GetContext() is not { } context) return;
         if (!drawn || cls == Guid.Empty) cls = null;
         OwnHand hand;
+        bool livenessOnly = false;
         long now;
         lock (_w214OwnHandGate)
         {
@@ -110,13 +113,15 @@ public partial class GameBridge
             if (!P6Current(context)) return;
             if (!drawn || (cls.HasValue && cls != _w214OwnBow?.Proof.ItemClass))
                 Wo214ClearOwnBow(drawn ? "class-changed" : "sheathed", now);
-            if (_w214OwnHand is not { } previous || !ReferenceEquals(previous.Context, context) ||
-                previous.Drawn != drawn || previous.Cls != cls)
+            if (drawn && cls is null && _w214OwnHand is { Drawn: true, Cls: not null } last &&
+                ReferenceEquals(last.Context, context)) livenessOnly = Wo214OwnHandProof(last) is null;
+            else if (_w214OwnHand is not { } previous || !ReferenceEquals(previous.Context, context) ||
+                     previous.Drawn != drawn || previous.Cls != cls)
                 _w214OwnHand = new(context, drawn, cls, ++_w214OwnHandRevision);
             hand = _w214OwnHand;
-            _w214OwnHandHeartbeatAtMs = now;
+            if (!livenessOnly) _w214OwnHandHeartbeatAtMs = now;
         }
-        Wo214SendOwnHand(hand, false);
+        Wo214SendOwnHand(hand, false, livenessOnly);
     }
 
     private void Wo214HandHeartbeat(P6Context context)
@@ -141,7 +146,7 @@ public partial class GameBridge
         hand.Drawn && _w214OwnBow is { } bow && ReferenceEquals(bow.Context, hand.Context) &&
         Wo214OwnBowCurrent(bow) && (hand.Cls is null || hand.Cls == bow.Proof.ItemClass) ? bow : null;
 
-    private void Wo214SendOwnHand(OwnHand hand, bool repeat)
+    private void Wo214SendOwnHand(OwnHand hand, bool repeat, bool livenessOnly = false)
     {
         OwnBow? measured;
         long selectedAt;
@@ -156,7 +161,7 @@ public partial class GameBridge
                 measured = null;
             }
         }
-        Guid? cls = measured?.Proof.ItemClass ?? hand.Cls;
+        Guid? cls = measured?.Proof.ItemClass ?? (livenessOnly ? null : hand.Cls);
         byte host = _jj?.Host ?? (_hostModeKnown ? _hostModeFrom : Protocol.JoinTargetHost);
         var peers = W137Host ? Wo134Peers() : W137Joiner && host != Protocol.JoinTargetHost ? [host] : new List<byte>();
         string value = Wo214Rules.HandText(hand.Drawn, cls);
@@ -286,12 +291,14 @@ public partial class GameBridge
         left?.ChangedAtMs == right?.ChangedAtMs && left?.Drawn == right?.Drawn && left?.Cls == right?.Cls &&
         ReferenceEquals(left?.Context, right?.Context) && left?.PeerSerial == right?.PeerSerial;
 
-    private void Wo214OnOtherRangedHand(byte src)
+    private void Wo214OnOtherRangedHand(byte src, Guid cls, long capturedAt)
     {
-        if (_w214FigureHand.TryGetValue(src, out var hand) && hand.BowMode.HasValue)
+        bool Replaced(FigureHand hand) => Wo214HandCurrent(src, hand) && hand.Drawn && hand.Cls is Guid held &&
+            held != cls && (hand.BowMode.HasValue || hand.ChangedAtMs <= capturedAt);
+        if (_w214FigureHand.TryGetValue(src, out var hand) && Replaced(hand))
             _w214FigureHand.TryRemove(KeyValuePair.Create(src, hand));
-        if (_w214LastHeld.TryGetValue(src, out var held) && held.BowMode.HasValue)
-            _w214LastHeld.TryRemove(KeyValuePair.Create(src, held));
+        if (_w214LastHeld.TryGetValue(src, out var lastHeld) && Replaced(lastHeld))
+            _w214LastHeld.TryRemove(KeyValuePair.Create(src, lastHeld));
     }
 
     private async Task Wo214OnRangedBowHandAsync(byte src, Guid cls, P6Context context, long mode, long peerSerial,
