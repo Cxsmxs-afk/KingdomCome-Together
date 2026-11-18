@@ -159,7 +159,10 @@ public sealed class P6RangedBridgeTests
         await (Task)Call(r.Bridge, "OnLocalDownedAsync", true, (byte)0)!; await (Task)Call(r.Bridge, "OnLocalDownedAsync", false, (byte)0)!;
         await Reply(r.Server, 0xAC, 0, 86, Poll(r.Generation, 19, 3));
         await Until(() => Get<SemaphoreSlim>(r.Bridge, "_p6PollGate").CurrentCount == 1); Assert.False(r.Link.Sent.Reader.TryRead(out _));
-        Call(r.Bridge, "Wo201RangedTick"); Assert.Equal(86, (await Read(r.Server)).Body[0]); await Reply(r.Server, 0xAC, 1, 86, Poll(r.Generation, 20, 1, 2, 3));
+        Call(r.Bridge, "Wo201RangedTick"); Assert.Equal(86, (await Read(r.Server)).Body[0]);
+        // The post-wake capture must occur on a later tick than the wake itself.
+        await Until(() => Environment.TickCount64 > Get<long>(r.Bridge, "_p6VisualModeAtTick"));
+        await Reply(r.Server, 0xAC, 1, 86, Poll(r.Generation, 20, 1, 2, 3));
         for (int i = 0; i < 3; i++) Assert.Equal(Protocol.W164RangedStep, Message(await r.Link.Next()).Kind);
         await Until(() => Count(r.Bridge, "ranged_out") == 3);
     }
@@ -179,7 +182,9 @@ public sealed class P6RangedBridgeTests
         if (revoke)
         {
             Assert.Equal(1, writer.Scheduler.CancelledDropped);
-            Call(r.Bridge, "Wo201RangedTick"); await Read(r.Server); await Reply(r.Server, 0xAC, 1, 86, Poll(r.Generation, 20, 3));
+            Call(r.Bridge, "Wo201RangedTick"); await Read(r.Server);
+            await Until(() => Environment.TickCount64 > Get<long>(r.Bridge, "_p6VisualModeAtTick"));
+            await Reply(r.Server, 0xAC, 1, 86, Poll(r.Generation, 20, 3));
             await Until(() => writer.Scheduler.EventCount == 1); await writer.PumpOnceAsync(r.Stop.Token);
             Assert.Equal(1, Count(r.Bridge, "ranged_out")); Assert.Equal(1, Count(r.Bridge, "ranged_peer_tx"));
         }
