@@ -63,6 +63,7 @@ int p6_missile_flow_tests(int* passed);
 int p6_capture_flow_tests(int* passed);
 int p6_render_fence_tests(int* passed);
 int t3_native_stats_tests(int* passed);
+int t3_recovery_stats_tests(int* passed);
 int rp_measure_tests(int* passed);
 int holder_contract_tests(int* passed);
 int edge_lanes_tests(int* passed);
@@ -478,6 +479,7 @@ int main() {
     { int pp = 0; const int pf = p6_capture_flow_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = p6_render_fence_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = t3_native_stats_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = t3_recovery_stats_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_measure_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = holder_contract_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = edge_lanes_tests(&pp); g_pass += pp; g_fail += pf; }

@@ -4,6 +4,7 @@
 // Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
 using KcdMp.Server.Features.ClientHandling;
 using KcdMp.Wire;
+using System.Globalization;
 
 namespace KcdMp.Server.Features.Tcp;
 
@@ -319,6 +320,13 @@ public class TcpBroadcastService
     {
         why = "";
         bool fromHost = _clientHandler.IsDamageAuthority(source);
+        uint announcedWorld = 0;
+        if (downType == Protocol.W203Down && body.Length > Protocol.JoinHeaderLen && body[Protocol.JoinHeaderLen] == Protocol.W203Epoch)
+        {
+            if (!LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var epoch) ||
+                !TryWorldEpochDirection(epoch.Text, out from, out announcedWorld))
+            { why = "invalid-world-epoch"; return null; }
+        }
         byte target = body[0];
         ClientSession? dest = null;
         switch (from)
@@ -338,19 +346,35 @@ public class TcpBroadcastService
                 break;
         }
         if (dest is null || ReferenceEquals(dest, source)) { why = "no-target"; return null; }
-        if (fromHost && downType == Protocol.W203Down && body.Length > Protocol.JoinHeaderLen &&
-            LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var message) && message.Kind == Protocol.W203Epoch)
+        if (announcedWorld != 0)
         {
-            var words = message.Text.Split('|');
-            if (words.Length >= 4 && words[0] == "v1" && words[3] != "ack" &&
-                uint.TryParse(words[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out uint world))
-            {
-                source.ObserveWorldSyncEpoch(source.Id, world);
-                dest.ObserveWorldSyncEpoch(source.Id, world);
-            }
+            source.ObserveWorldSyncEpoch(source.Id, announcedWorld);
+            dest.ObserveWorldSyncEpoch(source.Id, announcedWorld);
         }
         dest.EnqueueSenderFact(downType, source.Id, body, HostStamp(source, senderTicks));
         return dest;
+    }
+
+    private static bool TryWorldEpochDirection(string text, out Protocol.JoinFrom from, out uint announcedWorld)
+    {
+        from = Protocol.JoinFrom.Host;
+        announcedWorld = 0;
+        var words = text.Split('|');
+        if (words.Length < 4 || words[0] != "v1" ||
+            !uint.TryParse(words[1], NumberStyles.None, CultureInfo.InvariantCulture, out uint world) || world == 0 ||
+            !uint.TryParse(words[2], NumberStyles.None, CultureInfo.InvariantCulture, out _) ||
+            words[3].Length is < 1 or > 24 || !words[3].All(c => char.IsAsciiLetterOrDigit(c) || c == '-')) return false;
+        if (words[3] == "ack")
+        {
+            from = Protocol.JoinFrom.Joiner;
+            return words.Length == 4;
+        }
+        if (words.Length > 4 && words[4] == "r1" &&
+            (words.Length != 7 || !Guid.TryParseExact(words[5], "N", out var hostSession) || hostSession == Guid.Empty ||
+                !ulong.TryParse(words[6], NumberStyles.None, CultureInfo.InvariantCulture, out ulong generation) || generation == 0))
+            return false;
+        announcedWorld = world;
+        return true;
     }
 
     private ClientSession? Find(byte id)

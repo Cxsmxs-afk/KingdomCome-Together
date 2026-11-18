@@ -505,6 +505,10 @@ def start_agent(cid, role, port, twin=False):
         k, _, v = kv.partition('=')
         if k.startswith('KCDMP_TEST_'): env[k] = v
     env.update(test_env())   # WO-213
+    if os.environ.get('KCDMP_RIG_TEST_WORLD_RECOVERY') == '1':
+        if env.get('KCDMP_TEST_WORLD_RECOVERY') != '1':
+            raise RuntimeError('the recovery Agent flag requires KCDMP_TEST_WORLD_RECOVERY=1 in KCDMP_RIG_TEST_ENV')
+        argv.append('--test-world-recovery')
     env['DOTNET_ROOT'] = os.environ.get('DOTNET_ROOT', os.path.expandvars(r'%USERPROFILE%\.dotnet-sdk8'))
     rec = procs.start(argv, p['agent_dir'], env, 'agent-' + cid)
     st['agent_' + cid.lower()] = rec; rig.save_state(st)
@@ -575,6 +579,9 @@ if __name__ == '__main__':
     a = sys.argv[2:]
     if v == 'prepare': prepare()
     elif v == 'relay':
+        if any(arg.split('=', 1)[0] == '--test-world-recovery' for arg in a):
+            import scen_s3_recovery
+            sys.exit(scen_s3_recovery.relay_run(sys.modules[__name__], a))
         if a in (['--netz', 'normal'], ['--netz', 'schlecht']):
             sys.exit(relay(profile=a[1]))
         if len(a) > 1 or (a and a[0].startswith('--')):

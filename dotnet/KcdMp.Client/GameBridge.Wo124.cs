@@ -309,6 +309,7 @@ public partial class GameBridge
             display.Equals($"playline{j.Playline}/{j.Name}.whs", StringComparison.OrdinalIgnoreCase))
         {
             if (LoadSequenceEnabled) Wo136OnLoadSeen("accepted");
+            WorldReconnectNoteEngineLoad(j.LoadGeneration, j.HostWorldEpoch);
             if (j.LoadStartUtc == default) j.LoadStartUtc = DateTime.UtcNow;
             t.TrySetResult(true);
             return;
@@ -1226,7 +1227,9 @@ public partial class GameBridge
         _modeTold.TryRemove(ghostId, out _);
         if (_hostModeKnown && ghostId == _hostModeFrom)
         {
+            bool parked = WorldRecoveryEnabled && (LinkHeld || await Wo211TryHoldAsync("host-link-lost", sameRelay: true));
             _hostModeKnown = false;
+            if (parked) return;
             if (_joinedWorld) await LeaveSharedWorldAsync("host-left", "Your host left the game.");
             else if (_jj is { Phase: "preparing" } j) await AbortJoinerJoinAsync(j, 0, "host-left", "Your host left the game.", sendAbort: false);
             else if (_jj is { Phase: "loading" } jl)

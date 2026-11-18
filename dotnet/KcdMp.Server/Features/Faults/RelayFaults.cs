@@ -42,8 +42,10 @@ public sealed class RelayFaults
 	///              trails the real load by up to 5 s; when a joiner reaches ready
 	///              without one, "loaded" fires just before "ready" (via=ready-fallback).
 	///   ready      JoinerReady (0x54) up, from the joiner
+	///   recovery-joiner-ready   A negotiated joiner's baseline application ACK, accepted by the relay.
 	/// </summary>
-	public static readonly string[] Steps = { "request", "paused", "world-sent", "received", "loaded", "ready" };
+	internal const string RecoveryJoinerReady = "recovery-joiner-ready";
+	public static readonly string[] Steps = { "request", "paused", "world-sent", "received", "loaded", "ready", RecoveryJoinerReady };
 
 	/// <summary>
 	/// ClientSession.MaxQueuedBytes (its private constant, WO-110 4.4): past this
@@ -192,7 +194,10 @@ public sealed class RelayFaults
 			Interlocked.Exchange(ref rs.EndsMs, r.ForMs > 0 ? now + r.ForMs : long.MaxValue);
 			Volatile.Write(ref rs.State, 1);
 			foreach (var s in _sessions)
+			{
+				if (r.AtStep == RecoveryJoinerReady && r.Kind == FaultKind.Cut && !ReferenceEquals(s, from)) continue;
 				if (RoleMatches(r.Role, s.Role) && (r.Kind != FaultKind.Cut || s.IsReady)) targets.Add(s);
+			}
 			if (r.Kind == FaultKind.Cut && r.ForMs > 0)
 				foreach (var s in targets)
 					if (s.Name is { } n) _refused[n] = (rs, now + r.ForMs);
@@ -301,6 +306,11 @@ public sealed class RelayFaults
 	private bool FirstLoad(uint joinId)
 	{
 		lock (_lock) return _loadedJoins.Add(joinId);
+	}
+
+	internal void OnRecoveryJoinerReady(FaultSession from)
+	{
+		if (from.IsReady && from.Role == FaultRole.Joiner) Step(RecoveryJoinerReady, from, "baseline-applied");
 	}
 
 	/// <summary>A frame just written to a client's socket (down): the offer's chunk count, the last chunk.</summary>

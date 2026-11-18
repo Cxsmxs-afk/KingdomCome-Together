@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using System.Reflection;
 using KcdMp.Server.Features.ClientHandling;
 using Microsoft.Extensions.DependencyInjection;
+using PositionCodec = KcdMp.Client.PositionCodec;
 
 namespace KcdMp.Relay.Tests;
 
@@ -324,6 +325,18 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
                 await AnnounceWorldSyncAsync(host, joiner, 73);
                 await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.Open, new(73, 9), 0, 0, 0)));
                 await ArrivesAsync(joiner, Protocol.WorldSyncStatusDown, WorldSyncStatusWire.BodyBytes);
+                return;
+            case Protocol.WorldRepairUp:
+                await OpenPresentationAsync(joiner, Protocol.LinkCapWorldSync | Protocol.LinkCapWorldRecovery);
+                var recoveryScope = new WorldSyncScope(73, 9);
+                await AnnounceWorldSyncAsync(host, joiner, recoveryScope.HostWorld);
+                await AcceptRecoveryBaselineAsync(joiner, recoveryScope);
+                var digest = await ReadWorldDigestAsync(joiner, WorldBaselineSection.Body, Wait);
+                var request = WorldRecoveryWire.BuildRequest(new(digest));
+                Assert.Equal(len + 3, request.Length);
+                await joiner.SendRawAsync(request);
+                Assert.True(WorldRecoveryWire.TryReadChunk(await joiner.ReadUntilAsync(Protocol.WorldRepairDown, Wait), out var repair));
+                Assert.Equal(digest, repair.Digest);
                 return;
             case Protocol.LinkHelloUp:   // WO-213: relay-local, the answer comes back to the sender
                 b[0] = Protocol.LinkVersion;
@@ -707,6 +720,212 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
         byte[] frame = new LootMsg(Protocol.W203Epoch, 0, text).BuildUp(Protocol.W203Up, joiner.Id);
         await host.SendRawAsync(frame);
         Assert.Equal(host.Id, (await joiner.ReadUntilAsync(Protocol.W203Down, Wait))[0]);
+    }
+
+    private static async Task<(uint Snapshot, Dictionary<WorldBaselineSection, byte[][]> Sections)> AcceptRecoveryBaselineAsync(
+        Peer joiner, WorldSyncScope scope, bool acknowledge = true)
+    {
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.Open, scope, 0)));
+        Assert.True(WorldSyncStatusWire.TryRead(await joiner.ReadUntilAsync(Protocol.WorldSyncStatusDown, Wait), out var status));
+        Assert.Equal(scope, status.Scope);
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.Ready, scope, 0)));
+        var sections = new Dictionary<WorldBaselineSection, byte[][]>();
+        int rowsReceived = 0;
+        while (sections.Count < 6 || rowsReceived != sections.Values.Sum(rows => rows.Length))
+        {
+            Assert.True(WorldSyncWire.TryReadBaseline(await joiner.ReadUntilAsync(Protocol.WorldBaselineDown, Wait), out var part));
+            Assert.Equal((scope, status.SnapshotId), (part.Scope, part.SnapshotId));
+            if (!sections.TryGetValue(part.Section, out var rows)) sections.Add(part.Section, rows = new byte[part.Count][]);
+            Assert.Null(rows[part.Index]);
+            rows[part.Index] = part.Payload;
+            rowsReceived++;
+        }
+        if (acknowledge) await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.BaselineApplied, scope, status.SnapshotId)));
+        return (status.SnapshotId, sections);
+    }
+
+    private static async Task<WorldRecoveryDigest> ReadWorldDigestAsync(Peer peer, WorldBaselineSection section, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            Assert.True(WorldRecoveryWire.TryReadDigest(await peer.ReadUntilAsync(Protocol.WorldDigestDown, deadline - DateTime.UtcNow), out var digest));
+            if (digest.Section == section) return digest;
+        }
+        throw new TimeoutException($"No {section} digest");
+    }
+
+    [Fact]
+    public async Task World_recovery_repairs_only_the_authenticated_area_without_touching_event_ids()
+    {
+        var (host, joiner) = await HostAndJoinerAsync();
+        await using var _h = host;
+        await using var _j = joiner;
+        await OpenPresentationAsync(joiner, Protocol.LinkCapWorldSync | Protocol.LinkCapWorldRecovery);
+        var scope = new WorldSyncScope(139, 15);
+        await AnnounceWorldSyncAsync(host, joiner, scope.HostWorld);
+        await host.SendRawAsync(ClaimPosition());
+        await joiner.ReadUntilAsync(Protocol.Ghost, Wait);
+        await host.SendRawAsync(Frame(Protocol.WeatherUp, [1, (byte)'a', 1, 0]));
+        await joiner.ReadUntilAsync(Protocol.WeatherDown, Wait);
+
+        var (snapshot, sections) = await AcceptRecoveryBaselineAsync(joiner, scope, acknowledge: false);
+        Assert.NotEmpty(sections[WorldBaselineSection.Body][0]);
+        Assert.NotEmpty(sections[WorldBaselineSection.Weather][0]);
+        Assert.True(await joiner.NoneOfAsync(Protocol.WorldDigestDown, TimeSpan.FromMilliseconds(150)));
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.BaselineApplied, scope, snapshot)));
+        var target = await ReadWorldDigestAsync(joiner, WorldBaselineSection.Body, Wait);
+        Assert.Equal((scope, snapshot), (target.Scope, target.SnapshotId));
+        Assert.True(WorldRecoveryWire.TryComputeHash(scope, snapshot, target.Section, sections[target.Section], out var hash));
+        Assert.Equal(hash, target.Hash);
+
+        async Task<WorldEventFrame> SendResultAsync(uint token)
+        {
+            await host.SendRawAsync(new LootMsg(Protocol.LootHostItemResult, token, "unknown").BuildUp(Protocol.LootHostUp, joiner.Id));
+            Assert.True(WorldSyncWire.TryReadEvent(await joiner.ReadUntilAsync(Protocol.WorldEventDown, Wait), out var item));
+            return item;
+        }
+
+        var first = await SendResultAsync(99);
+        Assert.Equal(1ul, first.Id);
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.EventApplied, scope, snapshot, first.Channel, first.Id)));
+        string invalid = $"{Hex(Protocol.WorldRepairUp)}:invalid-world-repair";
+        long dropped = Drops(invalid);
+        await host.SendRawAsync(WorldRecoveryWire.BuildRequest(new(target))); // an unrelated link cannot request this repair
+        await host.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await host.ReadUntilAsync(Protocol.Pong, Wait);
+        await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(target with { SnapshotId = snapshot + 1 })));
+        await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(target with { Hash = hash with { A = hash.A ^ 1 } })));
+        await joiner.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await joiner.ReadUntilAsync(Protocol.Pong, Wait);
+        Assert.Equal(dropped + 3, Drops(invalid));
+        Assert.True(await joiner.NoneOfAsync(Protocol.WorldRepairDown, TimeSpan.FromMilliseconds(80)));
+
+        await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(target)));
+        await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(target))); // same request within the throttle window
+        foreach (var row in sections[target.Section])
+        {
+            Assert.True(WorldRecoveryWire.TryReadChunk(await joiner.ReadUntilAsync(Protocol.WorldRepairDown, Wait), out var chunk));
+            Assert.Equal(target, chunk.Digest);
+            Assert.Equal(row, chunk.Payload);
+        }
+        Assert.True(await joiner.NoneOfAsync(Protocol.WorldRepairDown, TimeSpan.FromMilliseconds(150)));
+        var second = await SendResultAsync(100);
+        Assert.Equal((scope, snapshot, first.Channel, 2ul), (second.Scope, second.SnapshotId, second.Channel, second.Id));
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.EventApplied, scope, snapshot, second.Channel, second.Id)));
+
+        // A newer ordinary movement observation stays live without rewriting
+        // the immutable, already-acknowledged comparison anchor.
+        await host.SendRawAsync(PositionCodec.BuildPosition(95f, 96f, 97f, 0f, false, false, null));
+        Assert.Equal(95f, BitConverter.ToSingle(await joiner.ReadUntilAsync(Protocol.Ghost, Wait), 1));
+        Assert.Equal(target, await ReadWorldDigestAsync(joiner, target.Section, TimeSpan.FromSeconds(12)));
+
+        // A deliberate mismatch may ask for a fresh absolute body sample.
+        // Its new digest precedes the new rows and only this section moves.
+        await host.SendRawAsync(PositionCodec.BuildPosition(105f, 106f, 107f, 0f, false, false, null));
+        var currentBody = await joiner.ReadUntilAsync(Protocol.Ghost, Wait);
+        await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(target)));
+        var current = await ReadWorldDigestAsync(joiner, target.Section, Wait);
+        Assert.Equal((scope, snapshot, target.Section, target.Revision + 1), (current.Scope, current.SnapshotId, current.Section, current.Revision));
+        Assert.NotEqual(target.Hash, current.Hash);
+        Assert.True(WorldRecoveryWire.TryReadChunk(await joiner.ReadUntilAsync(Protocol.WorldRepairDown, Wait), out var latest));
+        Assert.Equal(current, latest.Digest);
+        Assert.Equal(new byte[] { Protocol.Ghost }.Concat(currentBody), latest.Payload);
+        Assert.True(WorldRecoveryWire.TryComputeHash(scope, snapshot, target.Section, [latest.Payload], out var latestHash));
+        Assert.Equal(current.Hash, latestHash);
+
+        await Task.Delay(370);
+        await host.SendRawAsync(PositionCodec.BuildPosition(1f, 2f, 3f, 0f, false, true, null));
+        await joiner.ReadUntilAsync(Protocol.Ghost, Wait);
+        await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(current)));
+        Assert.True(await joiner.NoneOfAsync(Protocol.WorldRepairDown, TimeSpan.FromMilliseconds(200)));
+    }
+
+    [Fact]
+    public async Task World_recovery_capability_depends_on_world_sync()
+    {
+        await using var peer = await Peer.ConnectAsync(_relay.TcpPort, "recovery-only");
+        await peer.SendRawAsync(Protocol.BuildLinkHelloUp(Protocol.LinkCapWorldRecovery));
+        var reply = await peer.ReadUntilAsync(Protocol.LinkHelloDown, Wait);
+        Assert.True(Protocol.TryParseLinkHello(reply, out _, out ushort caps, out _, out _));
+        Assert.Equal(0, caps);
+    }
+
+    [Fact]
+    public async Task World_recovery_clock_uses_running_samples_and_weather_applies_the_latest_profile_last()
+    {
+        var (host, joiner) = await HostAndJoinerAsync();
+        await using var _h = host;
+        await using var _j = joiner;
+        await OpenPresentationAsync(joiner, Protocol.LinkCapWorldSync | Protocol.LinkCapWorldRecovery);
+        var scope = new WorldSyncScope(141, 19);
+        await AnnounceWorldSyncAsync(host, joiner, scope.HostWorld);
+        byte[] Weather(char profile) => Frame(Protocol.WeatherUp, [1, (byte)profile, 1, 0]);
+        byte[] Clock(string sample) => new LootMsg(Protocol.W164Clock, 0, sample).BuildUp(Protocol.W164Up, joiner.Id);
+        await host.SendRawAsync(Clock("b1 1000 0 0 0 47")); // frozen join bootstrap
+        await joiner.ReadUntilAsync(Protocol.W164Down, Wait);
+        await host.SendRawAsync(Weather('a'));
+        await joiner.ReadUntilAsync(Protocol.WeatherDown, Wait);
+        await AcceptRecoveryBaselineAsync(joiner, scope);
+        var clock = await ReadWorldDigestAsync(joiner, WorldBaselineSection.Clock, Wait);
+        var weather = await ReadWorldDigestAsync(joiner, WorldBaselineSection.Weather, Wait);
+
+        await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(clock)));
+        Assert.True(await joiner.NoneOfAsync(Protocol.WorldRepairDown, TimeSpan.FromMilliseconds(360)));
+        await host.SendRawAsync(Clock("b1 4000 15000 0 0 0"));
+        var liveClock = await joiner.ReadUntilAsync(Protocol.W164Down, Wait);
+        await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(clock)));
+        var clockRevision = await ReadWorldDigestAsync(joiner, clock.Section, Wait);
+        Assert.Equal(clock.Revision + 1, clockRevision.Revision);
+        Assert.True(WorldRecoveryWire.TryReadChunk(await joiner.ReadUntilAsync(Protocol.WorldRepairDown, Wait), out var clockRepair));
+        Assert.Equal(clockRevision, clockRepair.Digest);
+        Assert.Equal(new byte[] { Protocol.W164Down }.Concat(liveClock), clockRepair.Payload);
+
+        await host.SendRawAsync(new LootMsg(Protocol.W164Weather, 0, "0.80 b").BuildUp(Protocol.W164Up, joiner.Id));
+        await joiner.ReadUntilAsync(Protocol.W164Down, Wait);
+        await host.SendRawAsync(Weather('c'));
+        var profile = await joiner.ReadUntilAsync(Protocol.WeatherDown, Wait);
+        await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(weather)));
+        var weatherRevision = await ReadWorldDigestAsync(joiner, weather.Section, Wait);
+        Assert.Equal(weather.Revision + 1, weatherRevision.Revision);
+        Assert.True(WorldRecoveryWire.TryReadChunk(await joiner.ReadUntilAsync(Protocol.WorldRepairDown, Wait), out var rainRepair));
+        Assert.True(WorldRecoveryWire.TryReadChunk(await joiner.ReadUntilAsync(Protocol.WorldRepairDown, Wait), out var profileRepair));
+        Assert.Equal((weatherRevision, (ushort)0, (ushort)2), (rainRepair.Digest, rainRepair.Index, rainRepair.Count));
+        Assert.Equal((weatherRevision, (ushort)1, (ushort)2), (profileRepair.Digest, profileRepair.Index, profileRepair.Count));
+        Assert.Equal(Protocol.W164Down, rainRepair.Payload[0]);
+        Assert.True(LootMsg.TryDecode(rainRepair.Payload.AsSpan(2 + Protocol.JoinHeaderLen), out var rain));
+        Assert.Equal("0.8 -", rain.Text);
+        Assert.Equal(new byte[] { Protocol.WeatherDown }.Concat(profile), profileRepair.Payload);
+    }
+
+    [Fact]
+    public async Task World_epoch_announcements_and_acknowledgements_have_distinct_authority()
+    {
+        var (host, joiner) = await HostAndJoinerAsync();
+        await using var _h = host;
+        await using var _j = joiner;
+        string key = Hex(Protocol.W203Up);
+        long dropped = Drops(key);
+        byte[] Epoch(string text, byte target) => new LootMsg(Protocol.W203Epoch, 0, text).BuildUp(Protocol.W203Up, target);
+        const string latest = "v1|142|2|resume|r1|452560e1066a4794a05071e8c539ecf4|81";
+        await joiner.SendRawAsync(Epoch(latest, host.Id));
+        await joiner.SendRawAsync(Epoch("v1|142|-1|ack", host.Id));
+        await joiner.SendRawAsync(Epoch("v1|142|2|ack|r1", host.Id));
+        await joiner.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await joiner.ReadUntilAsync(Protocol.Pong, Wait);
+        await host.SendRawAsync(Epoch("v1|142|2|ack", joiner.Id));
+        await host.SendRawAsync(Epoch("v1|142|2|resume|r1|malformed|81", joiner.Id));
+        await host.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await host.ReadUntilAsync(Protocol.Pong, Wait);
+        Assert.Equal(dropped + 5, Drops(key));
+        Assert.True(await host.NoneOfAsync(Protocol.W203Down, TimeSpan.FromMilliseconds(80)));
+        Assert.True(await joiner.NoneOfAsync(Protocol.W203Down, TimeSpan.FromMilliseconds(80)));
+
+        await host.SendRawAsync(Epoch(latest, joiner.Id));
+        Assert.Equal(host.Id, (await joiner.ReadUntilAsync(Protocol.W203Down, Wait))[0]);
+        await joiner.SendRawAsync(Epoch("v1|142|2|ack", Protocol.JoinTargetHost));
+        Assert.Equal(joiner.Id, (await host.ReadUntilAsync(Protocol.W203Down, Wait))[0]);
+        Assert.Equal(dropped + 5, Drops(key));
     }
 
     [Fact]

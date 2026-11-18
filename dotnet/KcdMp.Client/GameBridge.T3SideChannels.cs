@@ -53,6 +53,7 @@ public partial class GameBridge
         else
         {
             if (!config.WeatherSyncEnabled) return true;
+            RememberRecoveryWeather(frame, message);
             _t3SideChannels.Put(T3Weather, new(message.Source, message.Rain, message.Profile, message.Blend), lease);
             if (!LoadSequenceWritable && message.Profile is { } profile) LoadSequenceWeather(profile, "deferred");
         }

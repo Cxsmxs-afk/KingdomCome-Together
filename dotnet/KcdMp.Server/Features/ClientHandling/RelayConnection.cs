@@ -44,6 +44,7 @@ public sealed class RelayConnection : IDisposable
     /// <summary>WO-213 C: the scheduler's way out on this connection (the fault mode's stream, a Steam path, a TCP path); null = the
     /// session writes its stream as before.</summary>
     public KcdMp.Wire.ILinkPath? Path { get; init; }
+    internal Action? RecoveryJoinerReady { get; init; }
 
     public RelayConnection(Stream stream, string remote, bool isLoopback, string transport, Action dispose, string identityKey = "")
     {

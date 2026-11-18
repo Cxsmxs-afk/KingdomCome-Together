@@ -70,7 +70,7 @@ sealed record BotHostPlan(IReadOnlyList<string[]> Setup, IReadOnlyList<BotHostPl
 }
 
 sealed record BotHostOptions(string Save, string Host, int Port, string Name, double Duration,
-    float[] Position, long WorldTimeMs, BotHostPlan Plan, string WireVersion, string? LoadWeather, bool BaselineEvents)
+    float[] Position, long WorldTimeMs, BotHostPlan Plan, string WireVersion, string? LoadWeather, bool BaselineEvents, bool WorldRecovery)
 {
     public const string Flag = "--test-bot";
     public const string EnvironmentName = "KCDMP_TEST_BOT";
@@ -78,17 +78,19 @@ sealed record BotHostOptions(string Save, string Host, int Port, string Name, do
     public const string LoadEnvironmentName = "KCDMP_TEST_LOAD_SEQUENCE";
     public const string LoadWeatherOption = "--weather-during-load";
     public const string BaselineFlag = "--test-baseline-events";
+    public const string RecoveryFlag = "--test-world-recovery";
 
     public static BotHostOptions Parse(string[] args)
     {
         var values = new Dictionary<string, string>(StringComparer.Ordinal);
-        bool flag = false, loadFlag = false, baselineFlag = false;
+        bool flag = false, loadFlag = false, baselineFlag = false, recoveryFlag = false;
         for (int i = 0; i < args.Length; i++)
         {
             var key = args[i];
             if (key == Flag && !flag) { flag = true; continue; }
             if (key == LoadFlag && !loadFlag) { loadFlag = true; continue; }
             if (key == BaselineFlag && !baselineFlag) { baselineFlag = true; continue; }
+            if (key == RecoveryFlag && !recoveryFlag) { recoveryFlag = true; continue; }
             if (key is not ("--join-host125" or "--host" or "--port" or "--duration" or "--name" or "--host-pos" or "--world-time" or "--bot-plan" or "--wire-version" or LoadWeatherOption)
                 || i + 1 == args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal)
                 || !values.TryAdd(key, args[++i]))
@@ -96,6 +98,8 @@ sealed record BotHostOptions(string Save, string Host, int Port, string Name, do
         }
         if (baselineFlag && Environment.GetEnvironmentVariable("KCDMP_TEST_BASELINE_EVENTS") != "1")
             throw new FormatException("Der Ereignistest braucht KCDMP_TEST_BASELINE_EVENTS=1 und --test-baseline-events.");
+        if (recoveryFlag && Environment.GetEnvironmentVariable("KCDMP_TEST_WORLD_RECOVERY") != "1")
+            throw new FormatException("Der Wiederverbindungstest braucht KCDMP_TEST_WORLD_RECOVERY=1 und --test-world-recovery.");
         string? loadWeather = values.GetValueOrDefault(LoadWeatherOption);
         if (loadFlag != (loadWeather is not null) || loadFlag && Environment.GetEnvironmentVariable(LoadEnvironmentName) != "1")
             throw new FormatException("Der Wettertest braucht KCDMP_TEST_LOAD_SEQUENCE=1, --test-load-sequence und --weather-during-load.");
@@ -140,7 +144,7 @@ sealed record BotHostOptions(string Save, string Host, int Port, string Name, do
         var plan = values.TryGetValue("--bot-plan", out var planFile)
             ? BotHostPlan.Parse(ReadPlan(planFile))
             : BotHostPlan.Parse(["at 0 walk 1.4 0 4 0 100", "at 4 walk 0 1.4 4 0 100"]);
-        return new(save, host, port, name, duration, position, worldTime, plan, wireVersion, loadWeather, baselineFlag);
+        return new(save, host, port, name, duration, position, worldTime, plan, wireVersion, loadWeather, baselineFlag, recoveryFlag);
     }
 
     private static IEnumerable<string> ReadPlan(string path)

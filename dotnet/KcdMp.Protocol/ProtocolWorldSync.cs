@@ -35,9 +35,10 @@ public static class WorldSyncWire
     public const int MaxEventPayloadBytes = ushort.MaxValue - EventHeaderBytes;
 
     public static bool IsChannel(WorldEventChannel channel) => channel is >= WorldEventChannel.Body and <= WorldEventChannel.Dialog;
-    private static bool IsSection(WorldBaselineSection section) => section is >= WorldBaselineSection.Body and <= WorldBaselineSection.Weather;
+    internal static bool IsSection(WorldBaselineSection section) => section is >= WorldBaselineSection.Body and <= WorldBaselineSection.Weather;
     public static bool IsEventType(byte type) => type is not
-        (0 or Protocol.WorldBaselineDown or Protocol.WorldEventDown or Protocol.WorldSyncUp or Protocol.WorldSyncStatusDown);
+        (0 or Protocol.WorldBaselineDown or Protocol.WorldEventDown or Protocol.WorldSyncUp or Protocol.WorldSyncStatusDown or
+            Protocol.WorldDigestDown or Protocol.WorldRepairUp or Protocol.WorldRepairDown);
 
     public static byte[] BuildBaseline(WorldBaselineChunk chunk)
     {
@@ -71,7 +72,7 @@ public static class WorldSyncWire
         return true;
     }
 
-    private static bool ValidChunk(ushort index, ushort count, int size) => count is > 0 and <= MaxBaselineChunks &&
+    internal static bool ValidChunk(ushort index, ushort count, int size) => count is > 0 and <= MaxBaselineChunks &&
         index < count && size <= MaxBaselineChunkBytes && (size != 0 || count == 1);
 
     public static byte[] BuildEvent(WorldEventFrame value)
@@ -147,10 +148,10 @@ public static class WorldSyncWire
         };
     }
 
-    private static WorldSyncScope ReadScope(ReadOnlySpan<byte> body) =>
+    internal static WorldSyncScope ReadScope(ReadOnlySpan<byte> body) =>
         new(BinaryPrimitives.ReadUInt32LittleEndian(body), BinaryPrimitives.ReadUInt64LittleEndian(body[4..]));
 
-    private static void WriteScope(Span<byte> body, WorldSyncScope scope)
+    internal static void WriteScope(Span<byte> body, WorldSyncScope scope)
     {
         BinaryPrimitives.WriteUInt32LittleEndian(body, scope.HostWorld);
         BinaryPrimitives.WriteUInt64LittleEndian(body[4..], scope.Generation);

@@ -95,3 +95,47 @@ Für jede Bot-Host-Variante einen frischen Lauf mit Relay und Joiner im Hauptmen
 3. Der Joiner nimmt genau einen Gegenstand aus einer Leiche. Sein Inventar und die danach auf beiden PCs aktualisierte Leichenliste prüfen.
 4. Der Host hält eine Antwortauswahl offen. Der Joiner stimmt für zwei verschiedene Zeilen. Der Host sieht die Symbole in derselben Reihenfolge und entscheidet selbst.
 5. Mit 150 ms plus Jitter wiederholen und beide Bundles sammeln. Ereignis-ID, Anwendung und spätere Bestätigung abgleichen. `evt_gap`, `evt_dropped`, `evt_sender_dropped` und `owner_violations` bleiben null.
+
+## s3-3 · Gezielte Wiederherstellung
+
+Die Spielprüfung steht aus. Für `disconnect` den Relay-Fehlerplan vor dem Verbinden starten. Das Relay trennt den echten Joiner nach seiner bestätigten Baseline für zehn Sekunden und nimmt danach seine Verbindung wieder an. Der Host bleibt in seiner laufenden Welt. Die Spielkopien und Agenten wie unter s3-1 vorbereiten. Mit jedem Netzprofil einen frischen Lauf starten.
+
+```powershell
+$env:KCDMP_TEST_WORLD_RECOVERY = '1'
+$env:KCDMP_RIG_TEST_WORLD_RECOVERY = '1'
+$env:KCDMP_RIG_TEST_ENV = 'KCDMP_TEST_WORLD_RECOVERY=1'
+$env:KCDMP_RIG_RUN = 's3-3-disconnect-schlecht'
+python tools/rig/pair.py prepare
+python tools/rig/pair.py relay --test-world-recovery=disconnect --netz schlecht
+python tools/rig/pair.py up A
+python tools/rig/pair.py up B
+python tools/rig/pair.py host A 4 save440
+python tools/rig/pair.py join B
+python tools/rig/scenarios.py disconnect --test-world-recovery --netz schlecht
+python tools/rig/pair.py down s3-3-disconnect-schlecht
+```
+
+Für `desync` einen neuen Lauf mit dem regulären Relay-Profil starten. Nach dem Verbinden verfälscht das Rig die bestätigte lokale Darstellung eines Bereichs beim Joiner, standardmäßig das Loot-Ledger. Das Verfahren verändert die Daten für den Prüfsummenvergleich. Die Prüfsummen werden regelmäßig getrennt für Körper, NPCs, Leichen, Loot-Ledger, Zeit und Wetter verglichen. Die Reparatur muss denselben Bereich anwenden und der nächste Vergleich für die reparierte Revision wieder übereinstimmen. Die tatsächliche Spielwelt und sichtbare Objekte werden bei der Zwei-PC-Abnahme zusätzlich geprüft.
+
+```powershell
+python tools/rig/pair.py relay --netz schlecht
+python tools/rig/scenarios.py desync --test-world-recovery --netz schlecht --section loot
+```
+
+Für die T4-Variante wie bei `weatherload --bot` vor dem Vorbereiten `KCDMP_RIG_HOST=B` setzen und nur Kopie A im Hauptmenü starten. Beide Szenarien starten einen T4 Bot-Host mit externem Wegwerfstand und zugehöriger Weltzeit. Seine Hostkennung bleibt über die neue Verbindung des echten Joiners erhalten. Die Belege zur Engine stammen von der echten Spielkopie.
+
+```powershell
+$env:KCDMP_TEST_BOT = '1'
+python tools/rig/scenarios.py disconnect --test-world-recovery --netz schlecht --bot --bot-save "$TestSave" --world-time $WorldTime
+python tools/rig/scenarios.py desync --test-world-recovery --netz schlecht --section loot --bot --bot-save "$TestSave" --world-time $WorldTime
+```
+
+Die Befehle getrennt starten. Der Relay-Aufruf für `disconnect` lädt den Zehn-Sekunden-Schnitt. `desync` nutzt das normale oder schlechte Profil ohne Schnitt. `disconnect.json` und `desync.json` enthalten die Scope-Zuordnung, Zähler und LogPack-Bundles. Für das normale Profil bei Relay und Szenario `--netz normal` setzen. Das schlechte Profil verwendet 150 ms plus 0–35 ms Jitter. Der Wiederanlauf nach einem separaten Verbindungsschnitt am Host bleibt im Spiel ungeprüft.
+
+### Zwei-PC-Checkliste
+
+1. Denselben Build verwenden und einen Wegwerfstand gemeinsam laden. Host-Welt, lokale Generationen und angewendete Baseline auf beiden PCs notieren.
+2. Den Joiner durch den Relay-Fehlerplan für zehn Sekunden trennen lassen. Der Host bleibt in seiner Welt. Der Joiner nimmt die gleiche Welt innerhalb von 30 Sekunden ohne Ladebildschirm wieder auf.
+3. Nach der Rückkehr beide Figuren und ein gewöhnliches gemeinsames Ereignis im Spiel prüfen. `reconnect_reload` und `owner_violations` bleiben null.
+4. Mit aktiviertem Testschalter auf dem Joiner `mp_test_world_recovery loot` ausführen. Im Protokoll auf die absichtliche Abweichung, die Reparatur des Loot-Ledgers und die wieder übereinstimmende Prüfsumme warten. Die anderen Bereiche kontrollieren.
+5. Beide Abläufe mit 150 ms plus Jitter wiederholen und beide Bundles sammeln. `digest_mismatch_loot` und `resync_loot` steigen beim Test jeweils um eins. Die Reparaturzähler der übrigen Bereiche bleiben während der Probe unverändert.

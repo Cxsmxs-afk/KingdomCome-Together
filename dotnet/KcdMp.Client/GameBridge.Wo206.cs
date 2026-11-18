@@ -165,7 +165,8 @@ public partial class GameBridge
         _w206.EnsureHost();
         Wo206SyncPublic();
         Volatile.Write(ref _w206AnnouncedMs, Environment.TickCount64);
-        string text = Wo206Rules.EpochText(_w206.World, _w206.Join, why);
+        uint world = _w206.World;
+        string text = WorldReconnectEpochProof(Wo206Rules.EpochText(world, _w206.Join, why), world);
         List<byte> to = only is byte o ? [o] : LivePartners();
         foreach (byte g in to) await Wo203SendSideAsync(g, Protocol.W203Epoch, text);
     }

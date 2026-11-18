@@ -52,6 +52,7 @@ public partial class GameBridge
         public long ReceiptEpoch;
     }
     private (WorldSyncScope Scope, uint Snapshot)? _w134BaselineLedger;
+    private string[]? _w134BaselineLedgerParts;
     private LedgerWork? _w134BaselineLedgerWork;
     private LedgerWork? _w134LedgerPending;
     private int _w134LedgerApplyBusy;
@@ -67,6 +68,7 @@ public partial class GameBridge
             _w134GameLedgerWorld = 0;
             _w134LedgerPending = null;
             _w134BaselineLedger = null;
+            _w134BaselineLedgerParts = null;
             _w134BaselineLedgerWork = null;
             _w134LedgerLinkHeld = false;
         }

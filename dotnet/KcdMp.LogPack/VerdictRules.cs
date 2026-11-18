@@ -66,6 +66,7 @@ public static class VerdictRules
     public const long ControllerStepMinPermille = 900, ControllerStepMaxPermille = 1100;
     public const long ControllerPullsGreenBelowPermille = 200;
     public const int CombatPlaybackGreenPercent = 95;
+    public const long RecoveryReconnectMaxMs = 30_000;
 
     private const string T3 = "MP-T3-STATS";
     private const string W136 = "MP-WO136-STATS";
@@ -74,6 +75,7 @@ public static class VerdictRules
     private const string StepPair = "MP-RP-STEP";
     private const string OwnerViolation = "WO221-OWNER-VIOLATION";
     private static readonly string[] LoadPhases = ["Menu", "Offer", "Load", "Reconstruct", "Settle", "Play", "Exit"];
+    private static readonly string[] RecoveryAreas = ["body", "npc", "corpse", "loot", "clock", "weather"];
     // The agent's TeeTextWriter supplies the wall clock and optional shared-clock metadata.
     private const string AgentPrefix = @"^(?:\d\d:\d\d:\d\d(?:\.\d+)? (?:m=\d+ off=(?:[+-]?\d+|\?) )?)?";
     private static readonly Regex AgentPrefixOnly = new(AgentPrefix + @"\z", RegexOptions.Compiled);
@@ -188,6 +190,7 @@ public static class VerdictRules
         var native = Briefing.NativeLines(input);
         var samples = ReadSamples(agent, fromNativeLog: false).Concat(ReadSamples(native, fromNativeLog: true)).ToList();
         if (ReadStepPair(input) is { } stepPair) samples.Add(stepPair);
+        var role = Role(agent, samples);
         var queue = Queue(agent);
         var rows = new List<VerdictRow> { queue };
         rows.AddRange(Counters.Select(rule => Evaluate(rule, samples)));
@@ -195,13 +198,14 @@ public static class VerdictRules
         rows.Add(ActionPlayback(samples));
         rows.AddRange(LoadSequence(samples));
         rows.AddRange(WorldEvents(samples));
+        rows.AddRange(WorldRecovery(samples, role));
         rows.Add(BotPlan(input));
 
         // Traffic observable on this machine is required for green. Optional
         // rows are still shown as grey and any measured warning or fault wins.
         var status = rows.Where(row => row.Status is VerdictStatus.Yellow or VerdictStatus.Red)
             .Select(row => row.Status).DefaultIfEmpty(queue.Status).Max();
-        return new(status, Role(agent, samples), rows.AsReadOnly());
+        return new(status, role, rows.AsReadOnly());
     }
 
     private static VerdictRow BotPlan(Briefing.Input input)
@@ -502,6 +506,94 @@ public static class VerdictRules
                 "Vollständige Anwendung und Bestätigung fehlen im Messfenster")
             : Missing(id, "Kein gültiger Zähler für den aktuellen Startzustand");
 
+    private static IEnumerable<VerdictRow> WorldRecovery(IReadOnlyList<Sample> samples, string role)
+    {
+        var reports = samples.Where(sample => sample.Marker == T3 && sample.Origin is "Agent" or "DLL-Spiegel"
+            && (role == "unbekannt" || sample.Role == role) && sample.Fields.GetValueOrDefault("section") == "recovery"
+            && sample.Number("recovery_world") is > 0 and <= uint.MaxValue
+            && sample.Number("recovery_gen") > 0 && sample.Number("recovery_run") > 0).ToList();
+        var current = reports.LastOrDefault(sample => sample.Origin == "Agent") ?? reports.LastOrDefault();
+
+        // Each line contains a complete scope's snapshot. Never add periodic
+        // counters or pair a fresh reset with a previous run's confirmations.
+        foreach (string area in RecoveryAreas)
+        {
+            string checkKey = "digest_checked_" + area;
+            string mismatchKey = "digest_mismatch_" + area;
+            string repairKey = "resync_" + area;
+            string failureKey = "resync_failed_" + area;
+            var checkedCount = current?.Number(checkKey);
+            var mismatches = current?.Number(mismatchKey);
+            var repaired = current?.Number(repairKey);
+            var failureSample = reports.MaxBy(sample => sample.Number(failureKey));
+            var failures = failureSample?.Number(failureKey);
+            bool covered = checkedCount > 0 && mismatches <= checkedCount && repaired <= mismatches;
+            var comparison = covered ? repaired < mismatches ? VerdictStatus.Yellow : VerdictStatus.Green : VerdictStatus.Grey;
+            string evidence = !covered ? "Keine vollständige Prüfsummenmessung im aktuellen Lauf"
+                : repaired < mismatches ? "Gezielte Wiederherstellung steht aus" : "Prüfsummen verglichen, alle Abweichungen behoben";
+            if (covered && mismatches == 0) evidence = "Prüfsummen stimmen überein";
+
+            yield return RecoveryValue(checkKey, checkedCount, checkedCount > 0 ? VerdictStatus.Green : VerdictStatus.Grey,
+                checkedCount > 0 ? "Vergleiche im aktuellen Lauf" : "Keine Prüfsumme verglichen");
+            if (failures > 0)
+            {
+                string failureEvidence = "Endgültig abgelehnte Wiederherstellungen: " + Format(failures.Value, "");
+                yield return RecoveryValue(mismatchKey, failureSample?.Number(mismatchKey), VerdictStatus.Red, failureEvidence);
+                yield return RecoveryValue(repairKey, failureSample?.Number(repairKey), VerdictStatus.Red, failureEvidence);
+                yield return RecoveryValue(failureKey, failures, VerdictStatus.Red, failureEvidence);
+                continue;
+            }
+
+            yield return RecoveryValue(mismatchKey, mismatches, comparison, evidence);
+            yield return RecoveryValue(repairKey, repaired, mismatches > 0 ? comparison : VerdictStatus.Grey,
+                mismatches > 0 ? evidence : "Keine gezielte Wiederherstellung erforderlich oder belegt");
+            yield return RecoveryValue(failureKey, current?.Number(failureKey), covered && mismatches > 0 && repaired == mismatches
+                ? VerdictStatus.Green : VerdictStatus.Grey, evidence);
+        }
+
+        var reconnects = reports.Select(sample => new RecoveryReconnect(sample)).ToList();
+        var latest = new RecoveryReconnect(current);
+        var slowest = reconnects.MaxBy(attempt => attempt.Milliseconds);
+        var timeout = reconnects.LastOrDefault(attempt => attempt.Timeout == 1);
+        var reload = reconnects.Where(attempt => attempt.SameWorld == 1 && attempt.Reloads > 0).MaxBy(attempt => attempt.Reloads);
+        var fault = reload ?? timeout ?? (slowest?.Milliseconds > RecoveryReconnectMaxMs ? slowest : null);
+        string? failure = reload is not null ? "Neuladen bei gleicher Welt und Generation"
+            : timeout is not null ? "Reconnect abgebrochen, Zeitlimit erreicht"
+            : fault is not null ? "Reconnect dauerte länger als 30 s" : null;
+        bool passed = latest.SameWorld == 1 && latest.Success == 1 && latest.Timeout == 0 && latest.Reloads == 0
+            && latest.Milliseconds <= RecoveryReconnectMaxMs;
+        var reconnectStatus = failure is not null ? VerdictStatus.Red : passed ? VerdictStatus.Green : VerdictStatus.Grey;
+        string reconnectEvidence = failure ?? (passed ? "Gleiche Welt und Generation, ohne Neuladen" : "Kein bestätigter Reconnect derselben Welt und Generation");
+        yield return RecoveryValue("reconnect_ms", fault is not null ? fault.Milliseconds : latest.Observed ? latest.Milliseconds : null,
+            reconnectStatus, reconnectEvidence, " ms");
+        yield return RecoveryValue("reconnect_reload", reload?.Reloads ?? (latest.Observed ? latest.Reloads : null),
+            reload is not null ? VerdictStatus.Red : passed ? VerdictStatus.Green : VerdictStatus.Grey,
+            reload is not null ? "Neuladen bei gleicher Welt und Generation" : reconnectEvidence);
+        yield return RecoveryValue("reconnect_timeout", timeout?.Timeout ?? (latest.Observed ? latest.Timeout : null),
+            timeout is not null ? VerdictStatus.Red : passed ? VerdictStatus.Green : VerdictStatus.Grey,
+            timeout is not null ? "Reconnect abgebrochen, Zeitlimit erreicht" : reconnectEvidence);
+        yield return RecoveryValue("reconnect_same_world", latest.Observed ? latest.SameWorld : null,
+            passed ? VerdictStatus.Green : VerdictStatus.Grey, reconnectEvidence);
+        yield return RecoveryValue("reconnect_success", fault is not null ? fault.Success : latest.Observed ? latest.Success : null,
+            reconnectStatus, reconnectEvidence);
+    }
+
+    private sealed record RecoveryReconnect(Sample? Source)
+    {
+        public long? Milliseconds => Source?.Number("reconnect_ms");
+        public long? SameWorld => Bit("reconnect_same_world");
+        public long? Success => Bit("reconnect_success");
+        public long? Timeout => Bit("reconnect_timeout");
+        public long? Reloads => Source?.Number("reconnect_reload");
+        public bool Observed => Milliseconds > 0 || Success == 1 || Timeout == 1 || SameWorld == 1 && Reloads > 0;
+
+        private long? Bit(string key) => Source?.Number(key) is long value && value <= 1 ? value : null;
+    }
+
+    private static VerdictRow RecoveryValue(string id, long? value, VerdictStatus status, string evidence, string unit = "") =>
+        value.HasValue || status == VerdictStatus.Red ? new(id, status, value.HasValue ? Format(value.Value, unit) : "–", evidence)
+            : Missing(id, evidence);
+
     private static bool HasOwnerCounters(Sample sample) => sample.Number("owner_handovers").HasValue
         && sample.Number("owner_denied_sets").HasValue;
 
@@ -569,7 +661,8 @@ public static class VerdictRules
                 }
             }
             if (fields.Count == 0) continue;
-            if (fromNativeLog && fields.GetValueOrDefault("section") == "events" && !NativePrefixOnly.IsMatch(line.AsSpan(0, start))) continue;
+            if (fromNativeLog && fields.GetValueOrDefault("section") is "events" or "recovery"
+                && !NativePrefixOnly.IsMatch(line.AsSpan(0, start))) continue;
 
             if (marker == W136)
             {

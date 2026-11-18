@@ -34,7 +34,8 @@ public static partial class Protocol
 
     /// <summary>LinkHello caps: state as "latest wins" and unreliable on a link that has it (C), compact NPC states (D.3).</summary>
     public const ushort LinkCapLatestWins = 0x0001, LinkCapUnreliableState = 0x0002, LinkCapCompactNpc = 0x0004;
-    public const ushort LinkCapsAll = LinkCapLatestWins | LinkCapUnreliableState | LinkCapCompactNpc | LinkCapPresentationTime | LinkCapPresentationCombat | LinkCapWorldSync;
+    public const ushort LinkCapsAll = LinkCapLatestWins | LinkCapUnreliableState | LinkCapCompactNpc |
+        LinkCapPresentationTime | LinkCapPresentationCombat | LinkCapWorldSync | LinkCapWorldRecovery;
 
     public const byte LinkTransportTcp = 0, LinkTransportSteam = 1, LinkTransportShaped = 2;
 

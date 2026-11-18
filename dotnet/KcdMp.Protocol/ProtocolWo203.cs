@@ -152,6 +152,7 @@ public static partial class Protocol
         (PresentationCombatUp, "presentation-combat", PresentationTimeWire.SubjectStampLength + PlayerStateUpPayloadLen,
             PresentationTimeWire.SubjectStampLength + JoinHeaderLen + LootFixedLen + W164WireTextMax),
         (WorldSyncUp, "world-sync", WorldSyncWire.SyncBytes, WorldSyncWire.SyncBytes),
+        (WorldRepairUp, "world-repair", WorldRecoveryWire.RequestBytes, WorldRecoveryWire.RequestBytes),
         (ActionUp,          "action",            ActionUpHeaderLen, ActionUpHeaderLen + ActionPayloadMaxLen),   // and the len byte agrees
         (PlayerRespawnedUp, "player-respawned",  PlayerRespawnedUpPayloadLen, PlayerRespawnedUpPayloadLen),
         (DeathMarkerUp,     "death-marker",       DeathMarkerUpLen, DeathMarkerUpLen),
@@ -183,6 +184,7 @@ public static partial class Protocol
         LinkHelloDown, NpcStateQDown,   // WO-213
         PresentationClockDown, PresentationPoseDown, PresentationActionDown,
         WorldBaselineDown, WorldEventDown, WorldSyncStatusDown,
+        WorldDigestDown, WorldRepairDown,
     };
 
     // One lookup per type byte, built on first use (not in a field initializer: JoinWire lives in another part of this partial

@@ -60,7 +60,11 @@ public sealed class FaultSession
 		Up = new FaultLink(engine, this, FaultDir.Up);
 		Down = new FaultLink(engine, this, FaultDir.Down);
 		var fs = new FaultStream(this);
-		Connection = new RelayConnection(fs, real.Remote, real.IsLoopback, real.Transport, CloseGraceful, real.IdentityKey) { Steam = real.Steam, Path = fs };   // WO-213: the shaper is this link's path
+		Connection = new RelayConnection(fs, real.Remote, real.IsLoopback, real.Transport, CloseGraceful, real.IdentityKey)
+		{
+			Steam = real.Steam, Path = fs,
+			RecoveryJoinerReady = () => _engine.OnRecoveryJoinerReady(this),
+		};
 	}
 
 	/// <summary>Ties this connection to its session (for its role and name) and starts the pumps.</summary>

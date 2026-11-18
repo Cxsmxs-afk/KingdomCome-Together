@@ -309,9 +309,14 @@ static class Host125
             witems.Add((Guid.Parse(p[1]), float.Parse(p[2], CultureInfo.InvariantCulture), float.Parse(p[3], CultureInfo.InvariantCulture), float.Parse(p[4], CultureInfo.InvariantCulture), p[0] == "witemtaken"));
             Say($"WITEM {p[1]} at {p[2]},{p[3]},{p[4]} taken={p[0] == "witemtaken"}");
         }
+        // A test Host keeps its real fixture identity across the Joiner's link replacement.
+        uint recoveryKey = bot?.WorldRecovery == true ? (uint)Random.Shared.Next(1, int.MaxValue) : 0;
+        Guid recoveryProcess = recoveryKey == 0 ? Guid.Empty : Guid.NewGuid();
         async Task SendBotEpoch(byte target, CancellationToken? ct = null)
         {
-            await W(new LootMsg(Protocol.W203Epoch, 0, Wo206Rules.EpochText(BotWorld, 1, "tick")).BuildUp(Protocol.W203Up, target), ct);
+            string text = Wo206Rules.EpochText(BotWorld, 1, "tick");
+            if (recoveryProcess != Guid.Empty) text += $"|r1|{recoveryProcess:N}|1";
+            await W(new LootMsg(Protocol.W203Epoch, 0, text).BuildUp(Protocol.W203Up, target), ct);
         }
         async Task SendRunningCalendar(RunningCalendar? sample)
         {
@@ -335,6 +340,8 @@ static class Host125
                 if (bot is not null && g == myGhost) continue;
                 if (bot is not null) await SendBotEpoch(g);
                 await W(JoinStatusCodec.Build(g, shared ? world.Seed ?? 0 : 0, Protocol.JoinStateSession, Protocol.JoinReasonId(shared ? "shared-world" : "separate"), shared ? flags : (ushort)0));
+                if (shared && recoveryKey != 0)
+                    await W(JoinStatusCodec.Build(g, recoveryKey, Protocol.JoinStateHostKey, Protocol.JoinReasonId("host-key"), 0));
             }
         }
         byte[] WsPacket(WorldSaved ws)

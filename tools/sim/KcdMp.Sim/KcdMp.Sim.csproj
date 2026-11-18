@@ -9,5 +9,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\..\dotnet\KcdMp.Client\KcdMp.Client.csproj" />
     <ProjectReference Include="..\..\..\dotnet\KcdMp.Server\KcdMp.Server.csproj" />
+    <Compile Include="..\..\..\dotnet\KcdMp.Client\WorldRecoveryReceiver.cs" Link="WorldRecoveryReceiver.cs" />
+    <Compile Include="..\..\..\dotnet\KcdMp.Client\WorldReconnect.cs" Link="WorldReconnect.cs" />
+    <Using Include="KcdMp.Wire" />
   </ItemGroup>
 </Project>
