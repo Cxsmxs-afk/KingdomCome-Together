@@ -46,6 +46,12 @@ uint64_t lifecycle_generation();
 bool lifecycle_gameplay(); // explicit local Gameplay proof, also while authority switch is off
 bool decisions_blocked();    // Paket C: no local decision batch; direct host body actions still advance
 
+// P5 cached census scope: getter performs no engine reads or world iteration.
+uint64_t p5_corpses_visible();
+uint64_t p5_corpse_hidden_blocked();
+void p5_copy_dead_soul(void* soul); // cached tracked lookup only, no world scan
+void p5_copy_dead(uint32_t eid); // main-thread post-ApplyDeath, actual life/identity re-read
+
 int status(char* out, int n);
 
 } // namespace kcdmp::wo216

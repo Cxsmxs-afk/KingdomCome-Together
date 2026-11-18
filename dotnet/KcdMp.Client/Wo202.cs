@@ -287,6 +287,7 @@ public static class Wo202Rules
         or KcdMp.Wire.Protocol.DeathDown or KcdMp.Wire.Protocol.DeathUp
         or KcdMp.Wire.Protocol.PlayerDeathDown or KcdMp.Wire.Protocol.PlayerDeathUp
         or KcdMp.Wire.Protocol.PlayerRespawnedDown or KcdMp.Wire.Protocol.PlayerRespawnedUp
+        or KcdMp.Wire.Protocol.DeathMarkerDown or KcdMp.Wire.Protocol.DeathMarkerUp
         or KcdMp.Wire.Protocol.GraveAddDown or KcdMp.Wire.Protocol.GraveAddUp
         or KcdMp.Wire.Protocol.GraveRemoveDown or KcdMp.Wire.Protocol.GraveRemoveUp
         or KcdMp.Wire.Protocol.SessionStart or KcdMp.Wire.Protocol.SessionEnd or KcdMp.Wire.Protocol.SessionLeave

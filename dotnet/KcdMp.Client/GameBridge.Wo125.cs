@@ -924,8 +924,7 @@ public partial class GameBridge
                 Console.WriteLine("MP-HENRY exit cancelled: file moved out; cached list not refreshed");
                 return false;
             }
-            _ownLoadExpected = true;
-            await ExecLuaAsync($"if KCD2MP_Wo124LoadGame then KCD2MP_Wo124LoadGame({pl}, \"{name}\", \"exit-to-menu\") end");
+            if (!await P5LoadGameAsync(pl, name, "exit-to-menu")) return false;
             _ = Task.Run(async () =>
             {
                 for (int i = 0; i < 120 && _where != GameWhere.Menu; i++) await Task.Delay(1000);

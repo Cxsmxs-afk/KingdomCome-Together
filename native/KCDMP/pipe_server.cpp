@@ -17,6 +17,7 @@
 #include "script_context.h"
 #include "concept_read.h"
 #include "respawn.h"
+#include "p5_marker.h"
 #include "respawn_actions.h"
 #include "npc_drive.h"
 #include "motion.h"
@@ -526,18 +527,6 @@ void send_local_respawned(float x, float y, float z, respawn::Kind reason) {
     send_unsolicited(kLocalRespawned, body, sizeof(body), "LocalRespawned");
 }
 
-void send_local_grave(bool add, uint64_t id, float x, float y, float z) {
-    BYTE body[21]{};
-    body[0] = add ? 1 : 0;
-    std::memcpy(body + 1, &id, 8);
-    std::memcpy(body + 9, &x, 4);
-    std::memcpy(body + 13, &y, 4);
-    std::memcpy(body + 17, &z, 4);
-    logf("PIPE: LocalGrave %s id=0x%016llX%s", add ? "add" : "remove", static_cast<unsigned long long>(id),
-         g_connected ? "" : "  [no agent attached, not sent]");
-    send_unsolicited(kLocalGrave, body, sizeof(body), "LocalGrave");
-}
-
 // WO-118: the native writer dropped a puppet on its own (main thread).
 void send_npc_dropped(uint8_t reason, const char* name) {
     BYTE body[2 + 63]{};
@@ -640,8 +629,6 @@ void send_trace_done(uint32_t rows, const char* path) {
     send_unsolicited(kNpcTraceDone, body, static_cast<uint16_t>(5 + n), "NpcTraceDone");
 }
 
-void on_grave_add(uint64_t id, float x, float y, float z) { send_local_grave(true, id, x, y, z); }
-void on_grave_remove(uint64_t id) { send_local_grave(false, id, 0, 0, 0); }
 
 void send_grave_list(HANDLE h, bool ok, uint8_t seq, const actions::GraveInfo* g, int n) {
     BYTE body[3 + kMaxGraveList * 20]{};
@@ -1079,7 +1066,7 @@ void serve(HANDLE h) {
                 bool ok = false;
                 bool faultedFlag = false;
                 const bool ran = run_sync_bounded<bool>(
-                    [guid](bool& result) { result = rttr::apply_death(guid.data()); },
+                    [guid](bool& result) { result = rttr::apply_death(guid.data()); if(result)wo216::p5_copy_dead_soul(rttr::find_soul_by_guid(guid.data())); },
                     "ApplyDeath", ok, &faultedFlag);
                 if (!ran) logf("PIPE: ApplyDeath timed out waiting for a frame");
                 logf("PIPE: ApplyDeath -> %s", ok ? "dead" : "soul not loaded / failed");
@@ -1986,8 +1973,8 @@ bool start() {
     respawn::Events ev{};
     ev.downed = &send_local_downed;
     ev.respawned = &send_local_respawned;
-    ev.grave_add = &on_grave_add;
-    ev.grave_remove = &on_grave_remove;
+    // P5 replaces legacy 0x93 with one typed B0 route.
+    p5::set_event([](const uint8_t* b,size_t n){if(n==43)send_unsolicited(0xB0,b,43,"DeathMarker");});
     respawn::set_events(ev);
 
     // WO-121: committed actions and friendly-fire hits become unsolicited frames.

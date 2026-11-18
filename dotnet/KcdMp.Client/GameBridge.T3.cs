@@ -21,7 +21,8 @@ public partial class GameBridge
 
     private void T3LuaStats(string kind, string? fields)
     {
-        if (!T3LootCounters.TryRead(kind, fields, out var values)) { T3Increment("loot_stats_unreadable"); return; }
+        if (!T3LootCounters.TryRead(kind, fields, out var values))
+        { T3Increment(kind == "t3_corpse_stats" ? "corpse_lua_stats_unreadable" : "loot_stats_unreadable"); return; }
         foreach (var field in values) _t3Counters[field.Key] = field.Value;
     }
 
@@ -136,6 +137,7 @@ public partial class GameBridge
             _t3Counters.TryAdd("postload_timeouts", 0);
             _t3Counters.TryAdd("authority_stats_unreadable", 0);
             _t3Counters.TryAdd("world_stats_unreadable", 0);
+            _t3Counters.TryAdd("corpse_stats_unreadable", 0);
             byte role = W137Host ? (byte)1 : W137Joiner || _jj is not null ? (byte)2 : (byte)0;
             if (role != 0)
             {
@@ -154,11 +156,14 @@ public partial class GameBridge
                     var native = await _combat.Wo163Async(Protocol.T3OpStats, [], token);
                     ProcessorFrameScope.ThrowIfAbandoned();
                     if (native is { Ok: true } b && T3NativeCounters.TryRead(b.Payload, out var values))
+                    {
                         foreach (var field in values) _t3Counters[field.Key] = field.Value;
-                    else T3Increment("world_stats_unreadable");
+                        if (!values.ContainsKey("markers_off_session")) T3Increment("corpse_stats_unreadable");
+                    }
+                    else { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); }
                 }, 2000, ct);
                 if (worldStats.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
-                    T3Increment("world_stats_unreadable");
+                { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); }
             }
             ct.ThrowIfCancellationRequested();
             T3EmitStats(role, ct);
@@ -170,8 +175,8 @@ public partial class GameBridge
 
     private void T3EmitStats(byte role, CancellationToken ct)
     {
-        foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(new[] {
-            "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable" }))
+        foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(T3LootCounters.CorpseKeys).Concat(new[] {
+            "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable", "corpse_lua_stats_unreadable" }))
             _t3Counters.TryAdd(key, 0);
         foreach (string key in new[] { "proc_stalls", "proc_stall_max_ms", "proc_frames_abandoned", "deferred_sidechannel", "proc_frame_faults", "proc_tick_faults", "engine_teleport_lines", "input_owner_sync_failed", "tp_snapshot_timeouts", "tp_snapshot_refused" })
             _t3Counters.TryAdd(key, 0);

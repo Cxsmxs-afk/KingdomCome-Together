@@ -56,6 +56,9 @@ int wo215_tests(int* passed);              // wo215_tests.cpp (WO-215: the route
 int walk_holder_tests(int* passed);        // walk_holder_tests.cpp (phase 1: one holder for a walking person)
 int pose_ring_tests(int* passed);          // pose_ring_tests.cpp (phase 3: the pose ring)
 int wo216_tests(int* passed);
+int p5_corpse_tests(int* passed);
+int p5_marker_tests(int* passed);
+int t3_native_stats_tests(int* passed);
 int p4_rules_review_tests(int* passed); // independent P4 boundary review
 int p4_flow_tests(int* passed); // actual p4.cpp with engine/clock test doubles
 int wo218_tests(int* passed);              // wo218_tests.cpp (WO-218: the pipe's batch)
@@ -452,6 +455,9 @@ int main() {
         const int pf = p4_rules_review_tests(&pp);
         g_pass += pp; g_fail += pf;
     }
+    { int pp = 0; const int pf = p5_corpse_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = p5_marker_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = t3_native_stats_tests(&pp); g_pass += pp; g_fail += pf; }
     {
         int pp = 0;
         const int pf = p4_flow_tests(&pp);

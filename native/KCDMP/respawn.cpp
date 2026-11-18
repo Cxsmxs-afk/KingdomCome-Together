@@ -8,6 +8,7 @@
 #include "wo209.h"
 #include "wo209_rules.h"
 #include "respawn_actions.h"
+#include "p5_marker.h"
 #include "engine.h"
 #include "buffs.h"
 #include "hits.h"
@@ -561,11 +562,12 @@ void step_act() {
     if (k == Kind::Death || k == Kind::Execution) {
         const actions::GraveReport gr = actions::make_grave(soul, g_x.deathPos[0], g_x.deathPos[1], g_x.deathPos[2]);
         graveMade = gr.ok;
+        actions::p5_death_marker(gr);
         if (gr.ok) {
             logf("MP-RESPAWN grave id=0x%016llX at (%.1f, %.1f, %.1f) moved=%d quest_kept=%d refused=%d money=%s model=%s marker=%s",
                  static_cast<unsigned long long>(gr.id), gr.x, gr.y, gr.z, gr.moved, gr.keptQuest, gr.failed,
                  gr.money ? "yes" : "no", gr.model ? "yes" : "no", gr.marker ? "yes" : "no");
-            if (g_ev.grave_add) g_ev.grave_add(gr.id, gr.x, gr.y, gr.z);
+            // P5 emits exactly one typed logical DeathFact through B0.
         } else if (gr.nothingToBury) {
             logf("MP-RESPAWN no grave: the player carried nothing to bury");
         } else {
@@ -908,7 +910,13 @@ void tick() {
         else start(go == 44 ? Kind::Execution : Kind::Death, go, g_pendingGeneration.load(), g_pendingEpoch.load());
     }
 
-    if (g_busy.load()) { step_executor(now); return; }
+    if (g_busy.load()) {
+        // The six-second black hold must not starve a new holder's bounded
+        // identity readiness check. This visits only existing marker records.
+        static DWORD markerSample=0;
+        if(now-markerSample>=kSampleMs){markerSample=now;p5::tick();}
+        step_executor(now);return;
+    }
 
     if (g_immuneUntil && now >= g_immuneUntil) {
         g_immuneUntil = 0;

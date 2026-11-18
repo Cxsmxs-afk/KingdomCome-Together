@@ -5,6 +5,8 @@
 // route they extend (wo215.cpp: the AI update's entry, the per-copy route).
 #include "wo216.h"
 #include "wo216_authority_rules.h"
+#include "p5_corpse_rules.h"
+#include "buffs.h"
 #include "p4.h"
 #include "wo203.h"
 #include "wo163.h"
@@ -317,14 +319,17 @@ bool b_exec(const char* cmd, bool ownedCleanup = false) {
     fn(con, cmd, false, false); return true;
 }
 
+bool p5_allow_hide(uint32_t eid);
+void p5_watch(uint32_t eid);
 // The engine's own Hide, unguarded (see above), on a freshly resolved entity.
 bool b_hide(uint32_t eid, bool hide) {
-    if (!g_b.armed) return false;
+    if (!g_b.armed || (hide && !p5_allow_hide(eid))) return false;
     void* e = engine::entity_by_id(eid);
     if (!e) return false;
     void* vt = *reinterpret_cast<void**>(e);
     auto fn = reinterpret_cast<void (*)(void*, bool)>(reinterpret_cast<void**>(vt)[g_b.hideSlot / 8]);
     fn(e, hide);
+    if (hide) p5_watch(eid);
     return true;
 }
 
@@ -343,6 +348,7 @@ bool ours(const char* name) {
 struct BBody {
     std::string name;
     wo216authority::HideLease visibility;
+    p5corpse::State corpse;
     bool wantHide = false, bound = false, inNearRange = false, ready = false, lifeKnown = false, dead = false, exemptNow = false;
     double pauseAt = -1e9;
     wo216authority::PauseLease pause;
@@ -358,6 +364,71 @@ struct PauseCleanup { wo216authority::PauseLease lease; void* entity = nullptr; 
 std::deque<PauseCleanup> g_pauseCleanup;
 uint64_t g_bodyGeneration = 0;
 std::unordered_map<uint32_t, BBody> g_bodies;           // main thread
+std::atomic<uint64_t> g_p5Visible{0}, g_p5Blocked{0}, g_p5World{0};
+std::deque<uint32_t> g_p5Watch;
+std::unordered_set<uint32_t> g_p5Watching;
+void p5_watch(uint32_t eid) { if (g_p5Watching.insert(eid).second) g_p5Watch.push_back(eid); }
+void p5_retire(BBody& b) {
+    if (b.corpse.visible && g_p5Visible.load()) g_p5Visible.fetch_sub(1);
+    b.corpse = {};
+}
+void p5_capture(BBody& b, void* e, void* soul, uint64_t wuid, bool known, bool dead) {
+    uint32_t flags = 0;
+    KCDMP_FAULT_READ(site, "wo216::corpse visibility");
+    const bool visibilityKnown = (dead || b.corpse.confirmed) && g_b.armed && e && fault::guarded(site, [&] { std::memcpy(&flags, static_cast<const char*>(e) + 8, 4); });
+    const bool before = b.corpse.visible;
+    void* canonicalSoul = soul ? buffs::as_c_soul(soul) : nullptr;
+    const p5corpse::Identity identity{reinterpret_cast<uintptr_t>(e), reinterpret_cast<uintptr_t>(canonicalSoul ? canonicalSoul : soul), wuid, lifecycle_generation()};
+    if (b.corpse.identity.valid() && !b.corpse.identity.same(identity)) {
+        b.wantHide = false;
+        if (b.visibility.hidden && c_npcHidden.load()) c_npcHidden.fetch_sub(1);
+        b.visibility.applied(false, GetTickCount64()); // an old lease never shows/hides a replacement
+    }
+    b.corpse.observe(identity, known, dead, visibilityKnown, (flags & 0x10) != 0);
+    if (before != b.corpse.visible) { if (b.corpse.visible) g_p5Visible.fetch_add(1); else if (g_p5Visible.load()) g_p5Visible.fetch_sub(1); }
+    g_p5World.store(lifecycle_generation());
+    b.lifeKnown = known; if (known) b.dead = dead;
+}
+void p5_read(uint32_t eid, BBody& b) {
+    void* e = engine::entity_by_id(eid);
+    void* soul = e ? hits::soul_of_eid(eid) : nullptr;
+    bool dead = false; const bool known = soul && rttr::soul_bool(soul, "IsDead", &dead);
+    p5_capture(b, e, soul, e ? actions::entity_wuid(e) : 0, known, dead);
+}
+void p5_preserve(uint32_t eid, BBody& b) {
+    if (!b.corpse.needs_show()) return;
+    b.wantHide = false;
+    if (b.pause.owned) { g_pauseCleanup.push_back({b.pause, b.pauseEntity, b.name, false}); b.pause.forget(); }
+    if (b.visibility.hidden) {
+        if (g_p5Blocked.load() < uint64_t(INT64_MAX)) g_p5Blocked.fetch_add(1);
+        b.visibility.applied(false, GetTickCount64());
+        if (c_npcHidden.load()) c_npcHidden.fetch_sub(1);
+    }
+    // Cleanup uses only our exact legacy pause lease; never acquire a new pause
+    // or touch foreign suspend bits. The existing death path owns its physics.
+    p5corpse::reveal(b.corpse, [&] { return b_hide(eid, false); }, [&] { p5_read(eid, b); });
+}
+bool p5_allow_hide(uint32_t eid) {
+    auto it = g_bodies.find(eid);
+    if (it == g_bodies.end()) return false;
+    BBody& b = it->second; p5_read(eid, b);
+    uint64_t blocked = g_p5Blocked.load();
+    const bool allowed = p5corpse::hide(b.corpse, [] {}, blocked);
+    g_p5Blocked.store(blocked);
+    if (!allowed) p5_preserve(eid, b);
+    return allowed;
+}
+void p5_tick() {
+    size_t budget = std::min<size_t>(8, g_p5Watch.size());
+    while (budget--) {
+        const uint32_t eid = g_p5Watch.front(); g_p5Watch.pop_front();
+        auto it = g_bodies.find(eid);
+        if (it == g_bodies.end()) { g_p5Watching.erase(eid); continue; }
+        BBody& b = it->second; p5_read(eid, b); p5_preserve(eid, b);
+        if (b.corpse.confirmed || b.visibility.hidden) g_p5Watch.push_back(eid);
+        else g_p5Watching.erase(eid);
+    }
+}
 std::unordered_map<std::string, double> g_exempt;       // name -> until (s)
 std::vector<uint32_t> g_pauseQ, g_hideQ;       // main thread: the actions, at most kPerFrame a frame
 constexpr int kPerFrame = 24;
@@ -517,7 +588,7 @@ bool census_visit(void* e, void* ctx) {
     uint64_t w = 0; int st = -1, mask = -1;
     const bool brain = actions::brain_state(e, &w, &st, &mask) && w && st >= 0 && mask >= 0;
     // EIDs can be reused. An expired hide lease never migrates to a different body.
-    if ((!b.name.empty() && b.name != nm) || (b.wuid && w && b.wuid != w)) b = BBody{};
+    if ((!b.name.empty() && b.name != nm) || (b.wuid && w && b.wuid != w)) { p5_retire(b); b = BBody{}; }
     b.name = nm; b.kind = kind; b.wuid = w; b.brainState = st;
     b.bound = npcdrive::is_bound_eid(eid);
     b.exemptNow = exempt(b.name, c->now);
@@ -532,6 +603,9 @@ bool census_visit(void* e, void* ctx) {
     b.dead = false;
     void* soul = hits::soul_of_eid(eid);
     b.lifeKnown = soul && rttr::soul_bool(soul, "IsDead", &b.dead);
+    // Reuse this census' existing life/WUID reads. No second per-world soul pass.
+    p5_capture(b, e, soul, w, b.lifeKnown, b.dead); p5_preserve(eid, b);
+    if (b.corpse.confirmed) p5_watch(eid);
     // No verified reconstruction sub-entry exists in UpdateIntellects. A complete
     // brain/life read plus the global post-load settle is the conservative proxy;
     // a newly observed spawn also receives its own five-second initialization window.
@@ -651,6 +725,7 @@ void b_census(double now) {
             BBody& gone = it->second;
             if (gone.pause.owned && gone.pause.generation == g_bodyGeneration) g_pauseCleanup.push_back({gone.pause, gone.pauseEntity, gone.name, false});
             if (it->second.visibility.hidden) { if (b_hide(it->first, false)) c_bShows.fetch_add(1); if (c_npcHidden.load()) c_npcHidden.fetch_sub(1); }
+            p5_retire(gone);
             it = g_bodies.erase(it);
         } else ++it;
     }
@@ -697,7 +772,7 @@ void b_spawns(double now) {
         if (ours(nm)) continue;
         BBody& b = g_bodies[eid];
         if (b.visibility.hidden && c_npcHidden.load()) c_npcHidden.fetch_sub(1);
-        b = BBody{};
+        p5_retire(b); b = BBody{};
         b.name = nm ? nm : "?";
         b.kind = kind;
         b.spawnAt = now;
@@ -734,6 +809,7 @@ void b_spawns(double now) {
 void b_actions() {
     int budget = kPerFrame;
     char cmd[96];
+    p5_tick();
     while (budget > 0 && !g_pauseQ.empty()) {
         const uint32_t eid = g_pauseQ.back(); g_pauseQ.pop_back();
         auto it = g_bodies.find(eid);
@@ -742,6 +818,8 @@ void b_actions() {
         const char* liveName = e ? engine::entity_name(e) : nullptr;
         uint64_t w = 0; int st = -1, mask = -1;
         wo216authority::PauseLease lease;
+        p5_read(eid, b); p5_preserve(eid, b);
+        if (b.corpse.refuses_hide()) continue;
         if (!e || !liveName || b.name != liveName || !actions::brain_state(e, &w, &st, &mask) ||
             !lease.claim(eid, w, g_bodyGeneration, st, mask)) continue;
         std::snprintf(cmd, sizeof cmd, "wh_ai_PauseNPC %s", b.name.c_str());
@@ -759,6 +837,7 @@ void b_actions() {
         void* e = engine::entity_by_id(eid); bool dead = false; void* soul = hits::soul_of_eid(eid);
         uint64_t w = 0; int st = -1, mask = -1;
         const char* liveName = e ? engine::entity_name(e) : nullptr;
+        if (!p5_allow_hide(eid)) continue;
         if (!e || !liveName || b.name != liveName || !soul || !rttr::soul_bool(soul, "IsDead", &dead) || dead ||
             !actions::brain_state(e, &w, &st, &mask) || !w || st < 0 || mask < 0 || w != b.wuid || fighting_player(eid)) continue;
         if (b_hide(eid, true)) { b.visibility.applied(true, GetTickCount64()); c_bHides.fetch_add(1); c_npcHidden.fetch_add(1); }
@@ -776,6 +855,7 @@ void b_stop(const char* why) {
     }
     b_cleanup_pauses();
     g_bodies.clear();
+    g_p5Visible.store(0); g_p5Watch.clear(); g_p5Watching.clear();
     c_npcHidden.store(0); c_npcNear.store(0); c_npcBound.store(0); c_hideFailsafe.store(1);
     g_pauseQ.clear(); g_hideQ.clear();
     g_exempt.clear();
@@ -995,6 +1075,26 @@ bool authority_enabled() { return g_authorityEnabled.load(std::memory_order_acqu
 uint64_t lifecycle_generation() { return g_authorityGeneration.load(std::memory_order_acquire); }
 bool lifecycle_gameplay() { return g_authorityPhase.load(std::memory_order_acquire) == uint8_t(wo216authority::Phase::Gameplay); }
 bool decisions_blocked() { return authority_active() && g_decisionGate.load(); }
+uint64_t p5_corpses_visible() { return g_p5World.load() == lifecycle_generation() ? g_p5Visible.load() : 0; }
+uint64_t p5_corpse_hidden_blocked() { return g_p5Blocked.load(); }
+void p5_copy_dead_soul(void* soul) {
+    void* canonicalSoul = soul ? buffs::as_c_soul(soul) : nullptr;
+    const uintptr_t wanted = reinterpret_cast<uintptr_t>(canonicalSoul ? canonicalSoul : soul);
+    if (!wanted) return;
+    // Cached tracked identities only: never enumerate or query every world soul.
+    for (const auto& item : g_bodies) if (item.second.corpse.identity.soul == wanted) { p5_copy_dead(item.first); return; }
+}
+void p5_copy_dead(uint32_t eid) {
+    void* e = engine::entity_by_id(eid);
+    const char* name = e ? engine::entity_name(e) : nullptr;
+    if (!e || !name || ours(name) || npcscan::body_kind(e) < 0) return;
+    if (!g_b.armed) b_resolve();
+    BBody& b = g_bodies[eid];
+    if (b.name.empty()) b.name = name;
+    p5_read(eid, b); p5_preserve(eid, b);
+    if (b.corpse.confirmed) p5_watch(eid);
+}
+
 
 int status(char* out, int n) {
     if (!out || n <= 0) return 0;

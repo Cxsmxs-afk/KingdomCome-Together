@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #include "respawn_actions.h"
+#include "p5_marker.h"
 #include "cvar_lease_rules.h"
 #include "wo179.h"
 #include "fault_guard.h"
@@ -433,7 +434,8 @@ constexpr int    kMarkGrave     = 0x2B;
 constexpr int    kMarkSource    = 2;
 constexpr int    kMarkGeneralPoi = 0x30;
 
-struct SharedPtr { void* p; void* ctrl; };
+using SharedPtr = p5::Shared;
+using MarkRef = p5::Ref;
 
 bool          g_markArmed = false;
 void* const*  g_vftApse = nullptr;
@@ -445,13 +447,32 @@ void*         g_aiCastIntelligent = nullptr;   // WO-127: C_AIObject* -> C_Intel
 void* g_apseGetter = nullptr;
 int   g_markType = kMarkGrave;   // lifted from C_ShowMapMarker's execute: "mov rcx,[rax+0xF0]; call <getter>"
 
+// Each marker operation has its own statically-lived isolated fault Site. The
+// owning Handle becomes terminal on failure; unrelated ordinary Call8 sites stay unchanged.
+namespace marker_sites {
+#define MS(n) fault::Site n("marker::" #n, fault::Kind::Call, fault::Policy::MarkerIsolated)
+MS(apse);MS(map);MS(guidService);MS(wuid);MS(manager);MS(byWuid);MS(linkable);MS(create);MS(add);MS(remove);MS(destroy);MS(deleteControl);
+#undef MS
+}
+template<class R,class... A> bool marker_vcall(fault::Site& site,void* obj,size_t off,R* out,A... args){
+    void* fn=vslot(obj,off);if(!fn)return false;
+    return fault::guarded(site,[&]{*out=reinterpret_cast<R(*)(void*,A...)>(fn)(obj,args...);});
+}
+template<class... A> bool marker_void(fault::Site& site,void* obj,size_t off,A... args){
+    void* fn=vslot(obj,off);if(!fn)return false;
+    return fault::guarded(site,[&]{reinterpret_cast<void(*)(void*,A...)>(fn)(obj,args...);});
+}
+template<class R,class... A> bool marker_fcall(fault::Site& site,void* fn,R* out,A... args){
+    if(!fn)return false;return fault::guarded(site,[&]{*out=reinterpret_cast<R(*)(A...)>(fn)(args...);});
+}
+
 void* ui_map() {
     void* gi = engine::game_iface(); void* gui = nullptr;
     if (!gi || !rd(gi, kGiGui, &gui) || !is_a(gui, g_vftGui)) return nullptr;
     // The game's own route first -- exactly what the quest map-marker node does.
     void* apse = nullptr; void* map = nullptr;
-    if (g_apseGetter && fcall(g_apseGetter, &apse, gui) && is_a(apse, g_vftApse) &&
-        vcall(apse, kApseGetMap, &map) && is_a(map, g_vftMap))
+    if (g_apseGetter && marker_fcall(marker_sites::apse,g_apseGetter,&apse,gui) && is_a(apse, g_vftApse) &&
+        marker_vcall(marker_sites::map,apse,kApseGetMap,&map) && is_a(map, g_vftMap))
         return map;
     void* b = nullptr; void* e = nullptr;
     if (!rd(gui, kGuiElemsBegin, &b) || !rd(gui, kGuiElemsEnd, &e) || !b || e < b) return nullptr;
@@ -460,7 +481,7 @@ void* ui_map() {
         void* el = nullptr;
         if (!rd(b, i * 16, &el) || !is_a(el, g_vftApse)) continue;
         void* map = nullptr;
-        if (vcall(el, kApseGetMap, &map) && is_a(map, g_vftMap)) return map;
+        if (marker_vcall(marker_sites::map,el,kApseGetMap,&map) && is_a(map, g_vftMap)) return map;
     }
     return nullptr;
 }
@@ -484,21 +505,34 @@ void* linkable_of(void* ent, uint64_t* wuidOut) {
     return lo;
 }
 
+uint64_t marker_wuid(void* ent){
+    void* gi=engine::game_iface();void* xgen=nullptr;void* svc=nullptr;void* wp=nullptr;uint64_t w=0;
+    const uint64_t guid=engine::entity_guid(ent);
+    if(!gi||!guid||!rd(gi,kGiXGen,&xgen)||!xgen||!marker_vcall(marker_sites::guidService,xgen,kXGenGuidSvc,&svc)||!svc)return 0;
+    if(!marker_vcall(marker_sites::wuid,svc,kSvcGuidToWuid,&wp,guid)||!wp||!rd64(wp,0,&w))return 0;return w;
+}
+void* marker_linkable(void* ent,uint64_t* wuid){
+    const uint64_t w=marker_wuid(ent);if(wuid)*wuid=w;void* mgr=nullptr;void* ai=nullptr;void* lo=nullptr;
+    if(!w||!marker_fcall(marker_sites::manager,g_aiObjectManager,&mgr)||!mgr)return nullptr;
+    if(!marker_vcall(marker_sites::byWuid,mgr,kAimgrByWuid,&ai,static_cast<const uint64_t*>(&w))||!ai)return nullptr;
+    if(!marker_fcall(marker_sites::linkable,g_aiCastLinkable,&lo,ai))return nullptr;return lo;
+}
 bool sp_addref(const SharedPtr& sp) { long after = 0; return sp.ctrl && ilock_add(static_cast<char*>(sp.ctrl) + 8, 1, &after); }
-void sp_release(SharedPtr& sp) {
-    if (!sp.ctrl) return;
-    long uses = 0;
-    if (ilock_add(static_cast<char*>(sp.ctrl) + 8, -1, &uses) && uses == 0) {
-        vcall_void(sp.ctrl, 0x00);   // _Destroy
-        long weaks = 0;
-        if (ilock_add(static_cast<char*>(sp.ctrl) + 0xC, -1, &weaks) && weaks == 0) vcall_void(sp.ctrl, 0x08);   // _Delete_this
-    }
-    sp = SharedPtr{};
+bool sp_release(SharedPtr& sp) {
+    if (!sp.ctrl) return true;
+    // Ownership consumption after a fault is unknown: retire this token once,
+    // never continue into a second destructor/delete or retry its old refcount.
+    SharedPtr owned=sp;sp={};long uses=0;
+    if(!ilock_add(static_cast<char*>(owned.ctrl)+8,-1,&uses))return false;
+    if(uses!=0)return true;
+    if(!marker_void(marker_sites::destroy,owned.ctrl,0x00))return false;
+    long weaks=0;
+    if(!ilock_add(static_cast<char*>(owned.ctrl)+0xC,-1,&weaks))return false;
+    return weaks!=0||marker_void(marker_sites::deleteControl,owned.ctrl,0x08);
 }
 
 // WO-164 C1: a marker is added only when the map is ready, else it waits (the 100 ms guard retries it); a fault in the add
-// turns markers off for the session, loudly (the field's z2 crash: an add swallowed during a join's load, the game dead 70 s later).
-std::atomic<bool> g_markOff{false};
+// quarantines only that handle. Unrelated marker operations remain available.
 std::atomic<uint32_t> c_markFaults{0}, c_markQueued{0}, c_markAdded{0}, c_markHalfRemoved{0};
 uint64_t g_worldLookedMs = 0;           // GetTickCount64 of the last world look (the grave rescan); 0 = none yet this world
 constexpr uint64_t kMarkSettleMs = 5000;
@@ -507,7 +541,6 @@ int map_mark_count();
 // Ready = the world was looked at (rescan) kMarkSettleMs ago, the map object is there and its mark vector already holds one of
 // the game's own marks (a loaded world always has quest / POI marks; 0 = the map's content is not built yet).
 bool mark_ready(const char** why) {
-    if (g_markOff.load()) { *why = "markers off this session"; return false; }
     if (!g_worldLookedMs) { *why = "the world was not looked at yet"; return false; }
     if (GetTickCount64() - g_worldLookedMs < kMarkSettleMs) { *why = "the world is settling"; return false; }
     if (!ui_map()) { *why = "no map object"; return false; }
@@ -652,74 +685,67 @@ bool pic_types_install(HMODULE gm, const uint8_t* fn, const char** why) {
     return true;
 }
 
-bool mark_add_typed(void* ent, SharedPtr* out, int type, unsigned picCode = 0, const char* label = nullptr);
-bool mark_add(void* ent, SharedPtr* out) { return mark_add_typed(ent, out, g_markType); }
-bool mark_add_typed(void* ent, SharedPtr* out, int type, unsigned picCode, const char* label) {
-    if (!g_markArmed || g_markOff.load()) return false;
-    const char* why = "";
-    if (!mark_ready(&why)) {
-        static uint64_t toldMs = 0;
-        c_markQueued.fetch_add(1, std::memory_order_relaxed);
-        if (GetTickCount64() - toldMs > 30000) {
-            toldMs = GetTickCount64();
-            logf("WO164-MAPMARK queued (%s) -- added when the map is ready thread=%lu", why, static_cast<unsigned long>(GetCurrentThreadId()));
-        }
-        return false;
-    }
-    void* map = ui_map();
-    if (!map) { logf("MP-GRAVE marker: the C_UIMap was not found (UI not built yet?)"); return false; }
-    uint64_t w = 0;
-    void* lo = linkable_of(ent, &w);
-    if (!lo) {
-        logf("MP-GRAVE marker: no AI linkable object for entity wuid=0x%016llX (this entity class gets none) -- no marker",
-             static_cast<unsigned long long>(w));
-        return false;
-    }
-    SharedPtr sp{};
-    void* ret = nullptr;
-    // WO-171 M: a picture rides one of the four reserved types: the slot's string is the player's name while the mark is made (the mark
-    // keeps a copy: its hover title) and the picture's name from then on (the map reads it when it builds the marker's group).
-    char picName[10]{};
-    const int picSlot = wo171rules::slot_of_code(picCode);
-    const bool useSlot = picSlot >= 0 && g_picArmed && !g_picOff.load() && type == wo171rules::kPicTypes[picSlot] && wo171rules::picture_name(picCode, picName, sizeof picName);
-    if (useSlot && !slot_set(picSlot, (label && label[0]) ? label : "Player")) { c_picRefused.fetch_add(1, std::memory_order_relaxed); return false; }
-    const bool created = vcall(map, kMapCreate, &ret, &sp, type, lo, kMarkSource);
-    if (useSlot) {
-        if (!slot_set(picSlot, picName)) { g_picOff = true; c_picFaults.fetch_add(1, std::memory_order_relaxed); logf("WO171-MARK FAULT site=slot_buf -- marker pictures are OFF this session"); }
-        else if (created) c_picMade.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (!created || !sp.p || !sp.ctrl) {
-        logf("MP-GRAVE marker: C_UIMap create refused");
-        return false;
-    }
-    SharedPtr arg = sp;
-    if (!sp_addref(arg)) { sp_release(sp); return false; }
-    // WO-171: the compass marker is made while the map adds the mark (the slot's string is still the small picture's name: 64 px, drawn
-    // 1:1 in the compass strip); from here on the string is the large picture's name (128 px) -- what the map reads when it builds its
-    // marker groups. The pak has both under both names.
-    const bool addOk = vcall_void(map, kMapAdd, &arg);
-    if (useSlot && addOk) {
-        char big[10]{};
-        std::snprintf(big, sizeof big, "%sM", picName);
-        if (!slot_set(picSlot, big)) { g_picOff = true; c_picFaults.fetch_add(1, std::memory_order_relaxed); logf("WO171-MARK FAULT site=slot_buf -- marker pictures are OFF this session"); }
-    }
-    if (!addOk) {
-        // WO-164 C1: never swallowed. The add may have put the mark in the map's vector before it faulted: the map's own remove
-        // (slot 0x60: it never reads the linkable) takes it out again, then markers stay off for the session.
-        g_markOff = true;
-        c_markFaults.fetch_add(1, std::memory_order_relaxed);
-        SharedPtr arg2 = sp;
-        const bool removed = sp_addref(arg2) && vcall_void(map, kMapRemove, &arg2);
-        if (removed) c_markHalfRemoved.fetch_add(1, std::memory_order_relaxed);
-        logf("WO164-MAPMARK FAULT site=C_UIMap::add (map holds %d marks) -- the half-added mark %s; map markers are OFF this session thread=%lu",
-             map_mark_count(), removed ? "was removed again" : "could not be removed", static_cast<unsigned long>(GetCurrentThreadId()));
-        sp_release(sp);
-        return false;
-    }
-    c_markAdded.fetch_add(1, std::memory_order_relaxed);
-    *out = sp;
-    return true;
+bool marker_backend_ready(){const char* why=nullptr;return !p5::suspended()&&g_markArmed&&mark_ready(&why);}
+uint64_t marker_identity_faults(){
+    return uint64_t(marker_sites::apse.faults.load())+marker_sites::map.faults.load()+marker_sites::guidService.faults.load()+marker_sites::wuid.faults.load()+marker_sites::manager.faults.load()+marker_sites::byWuid.faults.load()+marker_sites::linkable.faults.load();
 }
+bool marker_source_identity(void* entity,p5::Binding* out){
+    if(!entity||!out)return false;
+    const uint64_t faults=marker_identity_faults();
+    uint32_t eid=out->eid;
+    if(out->entity){
+        if(out->entity!=entity||out->physical!=p5::physical_world()||!eid||engine::entity_by_id(eid)!=entity){out->pending=false;return false;}
+    }else{
+        eid=engine::entity_id(entity); // fresh spawn or freshly read live entity only
+        if(!eid||engine::entity_by_id(eid)!=entity)return false;
+    }
+    const uint64_t wuid=marker_wuid(entity);
+    if(out->wuid&&wuid!=out->wuid){out->pending=false;return false;}
+    *out={};out->entity=entity;out->eid=eid;out->wuid=wuid;out->physical=p5::physical_world();
+    out->pending=!wuid&&marker_identity_faults()==faults;
+    return wuid!=0;
+}
+bool marker_identify(void* entity,p5::Binding* out){
+    if(!marker_source_identity(entity,out))return false;
+    const uint64_t faults=marker_identity_faults();
+    out->map=ui_map();out->linkable=marker_linkable(entity,&out->wuid);
+    out->pending=(!out->map||!out->linkable)&&marker_identity_faults()==faults;
+    return out->map&&out->linkable;
+}
+bool marker_create(const p5::Binding& b,const p5::Spec& spec,SharedPtr* out){
+    char picName[10]{};const int slot=wo171rules::slot_of_code(spec.picture);
+    const bool custom=slot>=0&&g_picArmed&&!g_picOff.load()&&spec.type==wo171rules::kPicTypes[slot]&&wo171rules::picture_name(spec.picture,picName,sizeof picName);
+    if(custom&&!slot_set(slot,spec.label&&spec.label[0]?spec.label:"Player"))return false;
+    void* ret=nullptr;
+    const bool ok=marker_vcall(marker_sites::create,b.map,kMapCreate,&ret,out,spec.type,b.linkable,kMarkSource);
+    if(custom&&!slot_set(slot,picName)){g_picOff=true;c_picFaults.fetch_add(1);}
+    return ok;
+}
+bool marker_add(const p5::Binding& b,const p5::Spec& spec,const SharedPtr& mark){
+    SharedPtr arg=mark;if(!sp_addref(arg))return false;
+    const bool ok=marker_void(marker_sites::add,b.map,kMapAdd,&arg);
+    if(ok){char smallIcon[10]{},largeIcon[10]{};const int slot=wo171rules::slot_of_code(spec.picture);
+        if(slot>=0&&g_picArmed&&!g_picOff.load()&&wo171rules::picture_name(spec.picture,smallIcon,sizeof smallIcon)){
+            std::snprintf(largeIcon,sizeof largeIcon,"%sM",smallIcon);if(!slot_set(slot,largeIcon)){g_picOff=true;c_picFaults.fetch_add(1);}
+        }}
+    return ok;
+}
+p5::Presence marker_contains(const p5::Binding& b,const SharedPtr& mark){
+    if(!mark.p||!mark.ctrl||ui_map()!=b.map)return p5::Presence::Unknown;
+    void* begin=nullptr;void* end=nullptr;
+    if(!rd(b.map,0x5D0,&begin)||!rd(b.map,0x5D8,&end)||end<begin)return p5::Presence::Unknown;
+    const size_t bytes=static_cast<size_t>(static_cast<char*>(end)-static_cast<char*>(begin));
+    if(bytes%16||bytes/16>16384)return p5::Presence::Unknown;
+    for(size_t i=0;i<bytes/16;++i){void* p=nullptr;if(!rd(begin,i*16,&p))return p5::Presence::Unknown;if(p==mark.p)return p5::Presence::Present;}
+    return p5::Presence::Absent;
+}
+bool marker_remove(const p5::Binding& b,const SharedPtr& mark){
+    if(ui_map()!=b.map)return false;SharedPtr arg=mark;
+    return sp_addref(arg)&&marker_void(marker_sites::remove,b.map,kMapRemove,&arg);
+}
+bool marker_release(SharedPtr* sp){return !sp||sp_release(*sp);}
+bool mark_add_typed(void* entity,MarkRef* out,int type,unsigned pic=0,const char* label=nullptr){return p5::render_add(entity,out,type,pic,label);}
+bool mark_add(void* entity,MarkRef* out){return p5::render_add(entity,out,g_markType,0,nullptr,true);}
 
 // C_UIMap slot 0x60 (GUIModule 0x5A870, code-verified): decrements the mark's
 // add count (+0x18) or erases its UI element (keyed by mark id, +0x5E8) and
@@ -741,17 +767,10 @@ int map_mark_count() {
     return static_cast<int>((static_cast<char*>(e) - static_cast<char*>(b)) / 16);
 }
 
-void mark_remove(SharedPtr* sp) {
-    if (!sp || !sp->ctrl) return;
-    void* map = ui_map();
-    if (map) {
-        SharedPtr arg = *sp;
-        if (sp_addref(arg)) vcall_void(map, kMapRemove, &arg);
-    }
-    sp_release(*sp);
-}
+bool mark_remove(MarkRef* ref){return p5::render_remove(ref);}
 
 void resolve_marker() {
+    p5::set_backend(p5::Backend{marker_backend_ready,marker_identify,marker_create,marker_add,marker_contains,marker_remove,marker_release});
     HMODULE gm = GetModuleHandleA("GUIModule.dll");
     HMODULE xg = GetModuleHandleA("XGenAIModule.dll");
     if (!gm || !xg || !g_vftGui) { logf("ACTIONS: marker NOT armed -- GUIModule/XGenAIModule/C_GUIModule missing"); return; }
@@ -817,16 +836,18 @@ constexpr size_t      kMaxGraves   = 64;
 struct Grave {
     uint64_t  id = 0;
     uint32_t  eid = 0;
+    void* entity = nullptr; uint64_t wuid = 0, physical = 0;
     uint32_t  markEid = 0;   // the entity instance the map mark was made on
     float     x = 0, y = 0, z = 0;
     int64_t   createdMs = 0;
-    SharedPtr mark{};
+    MarkRef mark{};
 };
 struct Mirror {
+    void* entity = nullptr; uint64_t wuid = 0, physical = 0;
     uint8_t   owner = 0;
     uint64_t  id = 0;
     uint32_t  eid = 0;
-    SharedPtr mark{};
+    MarkRef mark{};
 };
 
 // WO-164 C2: a map pin at a partner's position -- a mark on an entity of the mod's own (the mirror's class, no model, NO_SAVE,
@@ -834,9 +855,10 @@ struct Mirror {
 // itself: a mark holds a raw linkable pointer and a reload destroys the avatar (the WO-113 map crash); the 100 ms guard takes a
 // pin's mark off the moment its entity is gone, as it does a mirror's.
 struct Pin {
+    void* entity = nullptr; uint64_t wuid = 0, physical = 0;
     uint8_t   owner = 0;
     uint32_t  eid = 0;
-    SharedPtr mark{};
+    MarkRef mark{};
     float     x = 0, y = 0, z = 0;
     unsigned  wantPic = 0;   // WO-171 M: the picture code the agent asked for (0 = the game's own icon)
     unsigned  pic = 0;       // ... and the one this pin's mark was made with
@@ -874,7 +896,7 @@ bool scan_visit(void* e, void* vctx) {
         for (const Grave& g : g_graves) if (g.id == id) return false;
         if (g_graves.size() >= kMaxGraves) return false;
         Grave g{};
-        g.id = id; g.eid = engine::entity_id(e); g.createdMs = ms;
+        g.id = id; g.eid = engine::entity_id(e); g.createdMs = ms;g.entity=e;g.wuid=marker_wuid(e);g.physical=p5::physical_world();
         float p[3]{};
         if (engine::entity_world_pos(e, p)) { g.x = p[0]; g.y = p[1]; g.z = p[2]; }
         // A load drops the model's render slot? Re-apply it; loading the same
@@ -882,6 +904,7 @@ bool scan_visit(void* e, void* vctx) {
         engine::entity_load_geometry(e, 1, g_graveModel, 0);
         if (mark_add(e, &g.mark)) g.markEid = g.eid;
         g_graves.push_back(g);
+        const float xyz[3]={g.x,g.y,g.z};p5::own_grave_loaded(g.id,e,xyz,&g_graves.back().mark);
         ++ctx->found;
     }
     return false;
@@ -906,10 +929,10 @@ void* grave_entity(Grave& g) {
     char name[96]{};
     const char* n = e ? engine::entity_name(e) : nullptr;
     uint64_t id = 0; int64_t ms = 0;
-    if (n && copy_str(n, name, sizeof(name)) && parse_grave_name(name, &id, &ms) && id == g.id) return e;
+    if (e==g.entity && g.physical==p5::physical_world() && marker_wuid(e)==g.wuid && n && copy_str(n, name, sizeof(name)) && parse_grave_name(name, &id, &ms) && id == g.id) return e;
     e = engine::entity_by_guid(g.id);
-    if (e) g.eid = engine::entity_id(e);
-    return e;
+    if (e && e==g.entity && g.physical==p5::physical_world() && marker_wuid(e)==g.wuid) return e;
+    return nullptr;
 }
 
 void resolve_graves() {
@@ -1246,6 +1269,14 @@ bool graves_available() { return g_graveArmed; }
 GraveReport make_grave(void* playerSoul, float x, float y, float z) {
     (void)playerSoul;
     GraveReport r{};
+    int64_t now = 0;
+    const bool haveTime = g_clockArmed && world_ms(&now);
+    LARGE_INTEGER qpc{};
+    QueryPerformanceCounter(&qpc);
+    uint64_t id = (static_cast<uint64_t>(qpc.QuadPart) * 0x9E3779B97F4A7C15ull) ^ (++g_idCounter << 48) ^ 0x4B43444D00000000ull;
+    if(!id)id=++g_idCounter;
+    r.id=id;r.x=x;r.y=y;r.z=z;
+
     if (!g_graveArmed) return r;
     if (!g_scanned) rescan();
     if (g_graves.size() >= kMaxGraves) { logf("MP-GRAVE %zu graves already -- no new grave", g_graves.size()); return r; }
@@ -1258,11 +1289,6 @@ GraveReport make_grave(void* playerSoul, float x, float y, float z) {
         return r;
     }
 
-    int64_t now = 0;
-    const bool haveTime = g_clockArmed && world_ms(&now);
-    LARGE_INTEGER qpc{};
-    QueryPerformanceCounter(&qpc);
-    const uint64_t id = (static_cast<uint64_t>(qpc.QuadPart) * 0x9E3779B97F4A7C15ull) ^ (++g_idCounter << 48) ^ 0x4B43444D00000000ull;
     char name[96]{};
     _snprintf_s(name, sizeof(name), _TRUNCATE, "%s%016llX_%lld", kGravePrefix,
                 static_cast<unsigned long long>(id), static_cast<long long>(haveTime ? now : 0));
@@ -1298,7 +1324,7 @@ GraveReport make_grave(void* playerSoul, float x, float y, float z) {
     const MoveStats st = move_everything(pinv, ginv);
 
     Grave g{};
-    g.id = id; g.eid = eid; g.x = x; g.y = y; g.z = z; g.createdMs = haveTime ? now : 0;
+    g.id = id; g.eid = eid; g.entity=e;g.wuid=marker_wuid(e);g.physical=p5::physical_world();g.x = x; g.y = y; g.z = z; g.createdMs = haveTime ? now : 0;
     const bool marked = mark_add(e, &g.mark);
     if (marked) g.markEid = eid;
     g_graves.push_back(g);
@@ -1334,7 +1360,7 @@ int graves_maintain(uint64_t* removed, int max) {
         else if (items == 0) why = "looted empty";
         else if (haveTime && g.createdMs > 0 && now >= g.createdMs && now - g.createdMs >= kExpiryMs) why = "expired (3 game days)";
         if (!why) { ++i; continue; }
-        mark_remove(&g.mark);
+        if (!p5::own_removed(g.id) || !mark_remove(&g.mark) || (e && !p5::may_delete_source(e))) { ++i; continue; }
         if (e) {
             if (items > 0 && ginv) vcall_void(ginv, kInvRemoveAll);
             engine::remove(g.eid);
@@ -1393,7 +1419,7 @@ bool marked_grave_alive(const Grave& g) {
     const char* n = e ? engine::entity_name(e) : nullptr;
     char name[96]{};
     uint64_t id = 0; int64_t ms = 0;
-    return n && copy_str(n, name, sizeof(name)) && parse_grave_name(name, &id, &ms) && id == g.id;
+    return e==g.entity&&g.physical==p5::physical_world()&&marker_wuid(e)==g.wuid&&n&&copy_str(n,name,sizeof(name))&&parse_grave_name(name,&id,&ms)&&id==g.id;
 }
 
 bool marked_mirror_alive(const Mirror& m) {
@@ -1402,7 +1428,7 @@ bool marked_mirror_alive(const Mirror& m) {
     char name[96]{}, want[96]{};
     _snprintf_s(want, sizeof(want), _TRUNCATE, "%s%u_%016llX", kMirrorPrefix, static_cast<unsigned>(m.owner),
                 static_cast<unsigned long long>(m.id));
-    return n && copy_str(n, name, sizeof(name)) && std::strcmp(name, want) == 0;
+    return e==m.entity&&m.physical==p5::physical_world()&&marker_wuid(e)==m.wuid&&n&&copy_str(n,name,sizeof(name))&&std::strcmp(name,want)==0;
 }
 
 bool pin_alive(const Pin& pn) {
@@ -1410,7 +1436,7 @@ bool pin_alive(const Pin& pn) {
     const char* n = e ? engine::entity_name(e) : nullptr;
     char name[64]{}, want[64]{};
     _snprintf_s(want, sizeof(want), _TRUNCATE, "%s%u", kPinPrefix, static_cast<unsigned>(pn.owner));
-    return n && copy_str(n, name, sizeof(name)) && std::strcmp(name, want) == 0;
+    return e==pn.entity&&pn.physical==p5::physical_world()&&marker_wuid(e)==pn.wuid&&n&&copy_str(n,name,sizeof(name))&&std::strcmp(name,want)==0;
 }
 
 // The pin's mark type. WO-166 M1: the game's companion icon (0x09 "Dog", GUIModule's own name table) when the map draws that
@@ -1451,15 +1477,14 @@ void marks_guard() {
     }
     // WO-164 C1: the queue -- a grave or mirror with no mark gets one once the map is ready (one per entity: coalesced)
     const char* why = "";
-    if (g_markArmed && !g_markOff.load() && mark_ready(&why)) {
+    if (g_markArmed && mark_ready(&why)) {
         for (Grave& g : g_graves) {
             if (g.mark.ctrl) continue;
             void* e = grave_entity(g);
             if (e && mark_add(e, &g.mark)) { g.markEid = g.eid; logf("WO164-MAPMARK added grave 0x%016llX (from the queue)", static_cast<unsigned long long>(g.id)); }
-            if (g_markOff.load()) break;
         }
         for (Pin& pn : g_pins) {
-            if (pn.mark.ctrl || g_markOff.load() || !pin_alive(pn)) continue;
+            if (pn.mark.ctrl || !pin_alive(pn)) continue;
             void* e = engine::entity_by_id(pn.eid);
             unsigned pic = pn.wantPic;
             const int type = pin_mark_type(&pic);
@@ -1471,7 +1496,7 @@ void marks_guard() {
             }
         }
         for (Mirror& m : g_mirrors) {
-            if (m.mark.ctrl || g_markOff.load()) continue;
+            if (m.mark.ctrl) continue;
             void* e = engine::entity_by_id(m.eid);
             if (e && marked_mirror_alive(m) && mark_add(e, &m.mark))
                 logf("WO164-MAPMARK added mirror owner=%u 0x%016llX (from the queue)", static_cast<unsigned>(m.owner), static_cast<unsigned long long>(m.id));
@@ -1488,6 +1513,7 @@ void marks_guard() {
         logf("MP-GRAVE mirror owner=%u 0x%016llX entity gone -- its map mark removed", static_cast<unsigned>(m.owner),
              static_cast<unsigned long long>(m.id));
     }
+    p5::tick();
 }
 
 // A TagPoint: no model, no physics, no script behaviour -- nothing for the
@@ -1495,6 +1521,8 @@ void marks_guard() {
 constexpr const char* kSentinelClass = "TagPoint";
 constexpr const char* kSentinelName  = "kcdmp_world_sentinel";
 uint32_t g_sentinelEid = 0;
+void* g_sentinelEntity = nullptr;
+uint64_t g_sentinelWuid = 0;
 bool     g_sentinelOff = false;
 
 bool sentinel_alive() {
@@ -1502,32 +1530,32 @@ bool sentinel_alive() {
     void* e = engine::entity_by_id(g_sentinelEid);
     const char* n = e ? engine::entity_name(e) : nullptr;
     char name[64]{};
-    return n && copy_str(n, name, sizeof(name)) && std::strcmp(name, kSentinelName) == 0;
+    return e && e == g_sentinelEntity && marker_wuid(e) == g_sentinelWuid && n && copy_str(n, name, sizeof(name)) && std::strcmp(name, kSentinelName) == 0;
 }
 } // namespace
 
-void on_world_changed() { world_changed("a load", nullptr, 0); }
+void on_world_changed() { p5::physical_world_changed(); world_changed("a load", nullptr, 0); }
 
 int marker_status(char* out, int n) {
     return _snprintf_s(out, static_cast<size_t>(n), _TRUNCATE,
                        "markers=%s mark_faults=%u mark_queued=%u mark_added=%u mark_half_removed=%u pins=%zu pin_spawned=%u pin_moved=%u pin_marked=%u pin_removed=%u pic=%s pic_made=%u pic_refused=%u pic_faults=%u",
-                       !g_markArmed ? "unarmed" : g_markOff.load() ? "off" : "on", c_markFaults.load(), c_markQueued.load(), c_markAdded.load(),
+                       !g_markArmed ? "unarmed" : "on", c_markFaults.load(), c_markQueued.load(), c_markAdded.load(),
                        c_markHalfRemoved.load(), g_pins.size(), c_pinSpawned.load(), c_pinMoved.load(), c_pinMarked.load(), c_pinRemoved.load(),
                        !g_picArmed ? "unarmed" : g_picOff.load() ? "off" : "on", c_picMade.load(), c_picRefused.load(), c_picFaults.load());
 }
 
 bool partner_pin(uint8_t owner, float x, float y, float z, unsigned pic) {
-    if (!engine::ready()) return false;
+    if (!engine::ready() || p5::suspended()) return false;
     if (!wo171rules::picture_code_ok(pic)) pic = 0;
     Pin* pn = nullptr;
     for (Pin& q : g_pins) if (q.owner == owner) { pn = &q; break; }
     const float below[3] = {x, y, z - kPinDepthM};
-    if (pn && !pin_alive(*pn)) { mark_remove(&pn->mark); pn->eid = 0; }
+    if (pn && !pin_alive(*pn)) { if(!mark_remove(&pn->mark))return false; pn->eid = 0; }
     if (!pn) { g_pins.push_back(Pin{}); pn = &g_pins.back(); pn->owner = owner; }
     // WO-171 M: another picture = a new mark (the map reads a mark's name when it is made): the old one comes off first
     pn->wantPic = pic;
-    if (pn->mark.ctrl && (pn->pic != pic || std::strcmp(pn->markLabel, pn->label) != 0) && !g_markOff.load()) {
-        mark_remove(&pn->mark);
+    if (pn->mark.ctrl && (pn->pic != pic || std::strcmp(pn->markLabel, pn->label) != 0)) {
+        if(!mark_remove(&pn->mark))return false;
         logf("WO171-MARK pin owner=%u picture %u -> %u (the mark is made again)", static_cast<unsigned>(owner), pn->pic, pic);
     }
     // WO-192 4a: a move is a new pin entity at the new place. The map and the compass draw a mark from the entity's AI linkable, which keeps
@@ -1538,7 +1566,7 @@ bool partner_pin(uint8_t owner, float x, float y, float z, unsigned pic) {
     if (pn->eid) {
         const float dx = x - pn->x, dy = y - pn->y;
         if (dx * dx + dy * dy > kPinMoveM * kPinMoveM) {
-            mark_remove(&pn->mark);
+            if(!mark_remove(&pn->mark)||!p5::may_delete_source(pn->entity))return false;
             if (pin_alive(*pn)) engine::remove(pn->eid);
             pn->eid = 0;
             moved = true;
@@ -1549,7 +1577,7 @@ bool partner_pin(uint8_t owner, float x, float y, float z, unsigned pic) {
         _snprintf_s(name, sizeof(name), _TRUNCATE, "%s%u", kPinPrefix, static_cast<unsigned>(owner));
         void* e = engine::spawn(kMirrorClass, name, below, engine::kFlagNoSave, 0);
         if (!e) { logf("WO164-MAPMARK pin owner=%u spawn FAILED", static_cast<unsigned>(owner)); return false; }
-        pn->eid = engine::entity_id(e);
+        pn->eid = engine::entity_id(e);pn->entity=e;pn->wuid=marker_wuid(e);pn->physical=p5::physical_world();
         pn->x = x; pn->y = y; pn->z = z;
         if (moved) {
             if (c_pinMoved.fetch_add(1, std::memory_order_relaxed) % 30 == 0)
@@ -1561,7 +1589,7 @@ bool partner_pin(uint8_t owner, float x, float y, float z, unsigned pic) {
                  static_cast<unsigned long>(GetCurrentThreadId()));
         }
     }
-    if (!pn->mark.ctrl && !g_markOff.load()) {
+    if (!pn->mark.ctrl) {
         void* e = engine::entity_by_id(pn->eid);
         unsigned usePic = pic;
         const int type = pin_mark_type(&usePic);
@@ -1595,7 +1623,7 @@ bool partner_pin_remove(uint8_t owner) {
     for (size_t i = 0; i < g_pins.size();) {
         Pin& pn = g_pins[i];
         if (owner != 0xFF && pn.owner != owner) { ++i; continue; }
-        mark_remove(&pn.mark);
+        if(!mark_remove(&pn.mark)||!p5::may_delete_source(pn.entity)){++i;continue;}
         if (pn.eid && pin_alive(pn)) engine::remove(pn.eid);
         logf("WO164-MAPMARK pin owner=%u removed", static_cast<unsigned>(pn.owner));
         c_pinRemoved.fetch_add(1, std::memory_order_relaxed);
@@ -1614,7 +1642,7 @@ bool sentinel_check(uint64_t* vanished, int max, int* nVanished) {
     if (!player_position(pos)) return false;       // no player yet (menu, loading)
     pos[2] -= 50.0f;
     void* e = engine::spawn(kSentinelClass, kSentinelName, pos, engine::kFlagNoSave, 0);
-    g_sentinelEid = e ? engine::entity_id(e) : 0;
+    g_sentinelEid = e ? engine::entity_id(e) : 0;g_sentinelEntity=e;g_sentinelWuid=e?marker_wuid(e):0;
     if (!e || !sentinel_alive()) {
         // Never respawn in a loop: one failure turns the sentinel off.
         if (e) engine::remove(g_sentinelEid);
@@ -1624,6 +1652,7 @@ bool sentinel_check(uint64_t* vanished, int max, int* nVanished) {
              e ? "spawned but not found again by id+name" : "spawn FAILED");
         return false;
     }
+    if (!first) p5::physical_world_changed();
     const int n = world_changed(first ? "first look after install" : "a load or level change: the NO_SAVE sentinel was purged",
                                 vanished, max);
     if (nVanished) *nVanished = n;
@@ -1729,7 +1758,7 @@ int graves_list(GraveInfo* out, int max) {
 }
 
 bool mirror_add(uint8_t owner, uint64_t id, float x, float y, float z) {
-    if (!engine::ready()) return false;
+    if (p5::suspended() || !engine::ready()) return false;
     for (Mirror& m : g_mirrors)
         if (m.owner == owner && m.id == id && engine::entity_by_id(m.eid)) return true;   // already shown
     char name[96]{};
@@ -1740,7 +1769,7 @@ bool mirror_add(uint8_t owner, uint64_t id, float x, float y, float z) {
     if (!e) { logf("MP-GRAVE mirror spawn FAILED (%s)", name); return false; }
     const int slot = engine::entity_load_geometry(e, 0, g_graveModel, 0);
     Mirror m{};
-    m.owner = owner; m.id = id; m.eid = engine::entity_id(e);
+    m.owner = owner; m.id = id; m.eid = engine::entity_id(e);m.entity=e;m.wuid=marker_wuid(e);m.physical=p5::physical_world();
     const bool marked = mark_add(e, &m.mark);
     g_mirrors.push_back(m);
     logf("MP-GRAVE mirror shown \"%s\" entity=%u model=%s marker=%s", name, m.eid, slot >= 0 ? "yes" : "NO", marked ? "yes" : "no");
@@ -1751,8 +1780,8 @@ bool mirror_remove(uint8_t owner, uint64_t id) {
     for (size_t i = 0; i < g_mirrors.size(); ++i) {
         Mirror& m = g_mirrors[i];
         if (m.owner != owner || m.id != id) continue;
-        mark_remove(&m.mark);
-        engine::remove(m.eid);
+        if(!mark_remove(&m.mark)||!p5::may_delete_source(m.entity))return false;
+        if(marked_mirror_alive(m))engine::remove(m.eid);
         logf("MP-GRAVE mirror removed owner=%u id=0x%016llX", static_cast<unsigned>(owner), static_cast<unsigned long long>(id));
         g_mirrors.erase(g_mirrors.begin() + static_cast<long long>(i));
         return true;
@@ -1765,8 +1794,8 @@ int mirror_clear(uint8_t owner) {
     for (size_t i = 0; i < g_mirrors.size();) {
         Mirror& m = g_mirrors[i];
         if (owner != 0xFF && m.owner != owner) { ++i; continue; }
-        mark_remove(&m.mark);
-        engine::remove(m.eid);
+        if(!mark_remove(&m.mark)||!p5::may_delete_source(m.entity)){++i;continue;}
+        if(marked_mirror_alive(m))engine::remove(m.eid);
         g_mirrors.erase(g_mirrors.begin() + static_cast<long long>(i));
         ++n;
     }
@@ -1954,4 +1983,39 @@ int inventory_items(void* inv, void** out, int max) {
     return k;
 }
 
+void p5_marker_counts(uint64_t out[3]) { p5::counts(out); }
+void p5_death_marker(const GraveReport& report) {
+    const float xyz[3]={report.x,report.y,report.z};
+    for(auto& g:g_graves)if(report.ok&&g.id==report.id){p5::own_death(report.id,true,g.entity,xyz,&g.mark);return;}
+    p5::own_death(report.id,false,nullptr,xyz);
+}
+// Existing verified SmartObjectHolder route, no stash/action/inventory created.
+void* p5_anchor(uint64_t id,const float xyz[3],bool grave){
+    if(p5::suspended()||!engine::ready()||!p5::finite3(xyz))return nullptr;
+    static uint64_t serial=0;char name[96]{};
+    _snprintf_s(name,sizeof name,_TRUNCATE,"kcdmp_death_%016llX_%llu",static_cast<unsigned long long>(id),static_cast<unsigned long long>(++serial));
+    void* e=engine::spawn(kMirrorClass,name,xyz,engine::kFlagNoSave,0);
+    if(e&&grave)engine::entity_load_geometry(e,0,g_graveModel,0);
+    return e;
+}
+bool p5_identity(void* entity,p5::Binding* out){return marker_source_identity(entity,out);}
+bool p5_source_alive(const p5::Binding& b){
+    if(!b.entity||!b.eid||!b.wuid||b.physical!=p5::physical_world())return false;
+    void* current=engine::entity_by_id(b.eid); // never dereference an old raw source first
+    if(current!=b.entity||marker_wuid(current)!=b.wuid)return false;
+    return !b.linkable||marker_linkable(current,nullptr)==b.linkable;
+}
+bool p5_release_anchor(const p5::Binding& b){
+    if(!p5_source_alive(b))return true;
+    return p5::may_delete_source(b.entity)&&engine::remove(b.eid);
+}
+
 } // namespace kcdmp::actions
+
+namespace kcdmp::p5 {
+void* fallback_anchor(uint64_t id,const float xyz[3],bool grave){return actions::p5_anchor(id,xyz,grave);}
+bool source_identity(void* entity,Binding* out){return actions::p5_identity(entity,out);}
+bool source_alive(const Binding& b){return actions::p5_source_alive(b);}
+bool release_anchor(const Binding& b){return actions::p5_release_anchor(b);}
+void poll_world(){actions::world_check(nullptr,0,nullptr);}
+}

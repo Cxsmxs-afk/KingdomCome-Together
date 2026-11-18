@@ -243,7 +243,11 @@ public partial class GameBridge
             case Protocol.WorldDoneDown:
             case Protocol.JoinerReadyDown:
                 if (!Wo206JoinMessageAdmitted(type, joinId, src)) return;   // WO-206 E: an attempt the host closed (or a new epoch began since)
-                if (_hostJoin is { } j && j.JoinId == joinId && j.Joiner == src) j.Inbox.Writer.TryWrite(((byte)type, body));
+                if (_hostJoin is { } j && j.JoinId == joinId && j.Joiner == src)
+                {
+                    j.Inbox.Writer.TryWrite(((byte)type, body));
+                    if (type == Protocol.JoinerReadyDown && _wo122Stream is Stream markerStream) _ = P5AnnounceMarkersAsync(markerStream, ct);
+                }
                 else Console.WriteLine($"MP-JOIN host: 0x{type:X2} for join 0x{joinId:x8} from ghost {src} -- no such join here, ignored");
                 return;
             case Protocol.JoinAbortDown:

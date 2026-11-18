@@ -2282,7 +2282,14 @@ public sealed partial class CombatPipe : IAsyncDisposable
                         catch (Exception ex) { Console.WriteLine($"[respawn] respawned not handled: {ex.Message}"); }
                     }
                 }
-                else if (type == LocalGrave && body.Length >= 21)
+                else if (type == Protocol.DeathMarkerEvent)
+                {
+                    if (DeathMarkerCodec.TryNativeEvent(body, out var marker) && OnDeathMarker is { } h)
+                    {
+                        try { await h(marker); } catch (Exception ex) { Console.WriteLine($"[marker] local notice failed: {ex.Message}"); }
+                    }
+                }
+                else if (type == LocalGrave && body.Length == 21)
                 {
                     if (OnLocalGrave is { } h)
                     {

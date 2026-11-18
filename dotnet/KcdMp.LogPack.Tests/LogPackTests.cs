@@ -209,7 +209,7 @@ public class PackerTests
                 string name = native ? "kcdmp-native.mirror.log" : "agent.log";
                 string origin = native ? "origin=dll source=agent" : "origin=agent";
                 var lines = new[] { "host", "joiner" }.Select(role =>
-                    $"12:00:00.000 MP-T3-STATS {origin} role={role} proc_stalls=0 proc_stall_max_ms=0 proc_frames_abandoned=0 deferred_sidechannel=7 w136_held=8 w136_replayed=8").ToArray();
+                    $"12:00:00.000 MP-T3-STATS {origin} role={role} proc_stalls=0 proc_stall_max_ms=0 proc_frames_abandoned=0 deferred_sidechannel=7 w136_held=8 w136_replayed=8 corpses_visible=9 corpse_hidden_blocked=10 grave_markers_added=11 grave_marker_fallbacks=12 markers_off_session=0 lua_corpse_visible=3 lua_corpse_hidden_blocked=4 lua_corpse_unknown_kept=5").ToArray();
                 expected[name] = lines;
                 string text = string.Concat(lines.Select(line => string.Concat(Enumerable.Repeat(line + "\n", repeats))));
                 src.Add(new(name, Bytes: Encoding.UTF8.GetBytes(text)));

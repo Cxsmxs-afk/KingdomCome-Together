@@ -46,8 +46,8 @@ public partial class GameBridge
 
     private Task<bool> P1BeginLoad(string why, CancellationToken ct)
     {
-        T3TpInvalidate();
         bool next = !_p1Loading;
+        T3TpInvalidate(); P5RetireOperations(cancelLoad: next);
         if (next) { Interlocked.Increment(ref _p1Serial); _p1GameplayMs = -1; _p1GameplayWorld = 0; }
         _p1Loading = true;
         long serial = Interlocked.Read(ref _p1Serial);
@@ -94,7 +94,7 @@ public partial class GameBridge
         using var link = ProcessorFrameScope.Link(ct);
         bool pending = await P1BeginLoad(why, link.Token);
         ProcessorFrameScope.ThrowIfAbandoned(); link.Token.ThrowIfCancellationRequested();
-        return pending && P1Lifecycle.Current.Confirmed && !P1Lifecycle.Current.Active;
+        return pending && P1Lifecycle.Current.Confirmed && !P1Lifecycle.Current.Active && await P5PrepareLoadAsync(link.Token);
     }
 
     private void P1OnGameplayStarted()
@@ -108,7 +108,7 @@ public partial class GameBridge
             if (_p1Pending is { } pending && !await pending) return;
             if (serial != Interlocked.Read(ref _p1Serial) || !P1HasGameplay) return;
             var state = P1Lifecycle.Current;
-            if (state.Confirmed) await P1Lifecycle.GameplayAsync(state.Generation, _wo122Ct);
+            if (state.Confirmed && await P1Lifecycle.GameplayAsync(state.Generation, _wo122Ct)) await P5AfterGameplayAsync(_wo122Ct);
         }
     }
 
@@ -121,7 +121,7 @@ public partial class GameBridge
 
     private async Task P1ResetLifecycleAsync(string why, CancellationToken ct)
     {
-        T3TpInvalidate();
+        T3TpInvalidate(); P5RetireOperations();
         bool keepGameplay = why is "role-change" or "disconnect" && P1HasGameplay && (_joinedWorld || _isDamageAuthority) && _jj is null &&
             _hostCalendarResumeEpoch == _w206.World && _where == GameWhere.World && !_ownLoadExpected && !_loadGraceOwn && !_p1Loading;
         long gameplay = keepGameplay ? _p1GameplayMs : -1;

@@ -150,6 +150,7 @@ public static partial class Protocol
         (ClockSyncUp,       "clock-sync",        ClockSyncUpPayloadLen, ClockSyncUpPayloadLen),
         (ActionUp,          "action",            ActionUpHeaderLen, ActionUpHeaderLen + ActionPayloadMaxLen),   // and the len byte agrees
         (PlayerRespawnedUp, "player-respawned",  PlayerRespawnedUpPayloadLen, PlayerRespawnedUpPayloadLen),
+        (DeathMarkerUp,     "death-marker",       DeathMarkerUpLen, DeathMarkerUpLen),
         (GraveAddUp,        "grave-add",         GraveAddUpPayloadLen, GraveAddUpPayloadLen),
         (GraveRemoveUp,     "grave-remove",      GraveRemoveUpPayloadLen, GraveRemoveUpPayloadLen),
         (PlayerHitV8Up,     "player-hit-v8",     PlayerHitV8.UpLen, PlayerHitV8.UpLen),
@@ -174,7 +175,7 @@ public static partial class Protocol
         DamageDown, DeathDown, DiceState, DiceError, DiceEnd, AppearanceDown, PauseDown, ReleaseVersion, PlayerStateDown,
         PlayerHitDown, PlayerDeathDown, CombatRole, NpcStateDown, TimeSkipDown, HorseInfoDown, CombatEventDown, WeatherDown,
         NpcDamageDown, ItemDropDown, ItemClaimDown, ServerFull, StoryBeatDown, ClockSyncDown, ActionDown, ReleaseVersionMismatch,
-        PlayerRespawnedDown, GraveAddDown, GraveRemoveDown, PlayerHitV8Down, WorldSavedDown, Ack,
+        PlayerRespawnedDown, GraveAddDown, GraveRemoveDown, DeathMarkerDown, PlayerHitV8Down, WorldSavedDown, Ack,
         LinkHelloDown, NpcStateQDown,   // WO-213
     };
 

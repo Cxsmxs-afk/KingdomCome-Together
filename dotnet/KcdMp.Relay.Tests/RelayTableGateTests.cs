@@ -397,6 +397,11 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
             case Protocol.PlayerRespawnedUp: down = Protocol.PlayerRespawnedDown; break;
             case Protocol.GraveAddUp: down = Protocol.GraveAddDown; break;
             case Protocol.GraveRemoveUp: down = Protocol.GraveRemoveDown; break;
+            case Protocol.DeathMarkerUp:
+                b = DeathMarkerCodec.BuildUp(new(DeathMarkerAction.Add, DeathMarkerKind.MarkerOnly, 1, 1, 1, 0, 0, 0))[3..];
+                Assert.Equal(len, b.Length);
+                down = Protocol.DeathMarkerDown;
+                break;
             case Protocol.WorldSavedUp: down = Protocol.WorldSavedDown; break;               // the damage authority's
             default:
                 Assert.Fail($"RelayUp type {Hex(up)} has no probe in RelayTableGateTests.ProbeAsync -- add one with the row");

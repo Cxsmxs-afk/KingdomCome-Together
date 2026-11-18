@@ -898,6 +898,13 @@ public class ClientSession
                     continue;
                 }
 
+                if (type == Protocol.DeathMarkerUp && payloadLen == Protocol.DeathMarkerUpLen)
+                {
+                    var markerBody = new byte[payloadLen]; await ReadExactAsync(markerBody);
+                    if (DeathMarkerCodec.TryRead(markerBody, out _)) _broadcastService.BroadcastSenderFact(this, Protocol.DeathMarkerDown, markerBody);
+                    continue;
+                }
+
                 // --- Death without Game Over (WO-113) ---
                 // Exact lengths: a short body forwarded on becomes a pipe
                 // command in the receiving game (a mirror gravestone spawn).

@@ -19,12 +19,12 @@ public class T3AuthorityReportTests
         Assert.Equal(0x2B, header[0]);
         var body = new byte[header[1] | header[2] << 8]; await stream.ReadExactlyAsync(body, ct); return body;
     }
-    private static async Task Reply(Stream stream, byte seq, byte op, CancellationToken ct, bool truncated = false, bool worldStats = false)
+    private static async Task Reply(Stream stream, byte seq, byte op, CancellationToken ct, bool truncated = false, bool worldStats = false, int statsFields = 24)
     {
         byte[] payload = op == Protocol.Wo216OpBrains ? Encoding.ASCII.GetBytes(truncated ? "B decision_blocked=999 npc_hidden=999" : Snapshot) : [];
         if (worldStats)
         {
-            int count = truncated ? 18 : 19;
+            int count = truncated ? 23 : statsFields;
             payload = new byte[2 + count * 9]; payload[0] = 1; payload[1] = (byte)count;
             for (int i = 0; i < count; i++) { payload[2 + i * 9] = (byte)i; BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(3 + i * 9), (ulong)(10 + i)); }
         }
@@ -34,10 +34,11 @@ public class T3AuthorityReportTests
     }
 
     [Theory]
-    [InlineData(true, 1, false)]
-    [InlineData(false, 2, false)]
-    [InlineData(false, 2, true)]
-    public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role, bool truncated)
+    [InlineData(true, 1, false, 24)]
+    [InlineData(false, 2, false, 24)]
+    [InlineData(false, 2, true, 24)]
+    [InlineData(false, 2, false, 19)]
+    public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role, bool truncated, int statsFields)
     {
         string name = "t3r-" + Guid.NewGuid().ToString("N")[..16];
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -54,11 +55,12 @@ public class T3AuthorityReportTests
         counters["postload_timeouts"] = 3;
         counters["decision_blocked"] = 9; counters["npc_hidden"] = 8;
         counters["tp_total"] = 7;
+        counters["corpses_visible"] = 6; counters["markers_off_session"] = 0;
         Task report = (Task)typeof(GameBridge).GetMethod("T3PublishStatsAsync", Private)!.Invoke(b, [stop.Token])!;
         Assert.Equal(new byte[] { Protocol.Wo216OpBrains }, await Read(server, stop.Token));
         await Reply(server, 1, Protocol.Wo216OpBrains, stop.Token, truncated);
         Assert.Equal(new byte[] { Protocol.T3OpStats }, await Read(server, stop.Token));
-        await Reply(server, 2, Protocol.T3OpStats, stop.Token, truncated, worldStats: true);
+        await Reply(server, 2, Protocol.T3OpStats, stop.Token, truncated, worldStats: true, statsFields: statsFields);
         var mirror = await Read(server, stop.Token);
         Assert.Equal(Protocol.T3OpStats, mirror[0]); Assert.Equal(role, mirror[1]);
         string fields = Encoding.ASCII.GetString(mirror, 2, mirror.Length - 2);
@@ -70,8 +72,15 @@ public class T3AuthorityReportTests
             Assert.Contains(key + "=0", fields);
         Assert.Equal(truncated ? 1 : 0, counters["authority_stats_unreadable"]);
         Assert.Equal(truncated ? 1 : 0, counters["world_stats_unreadable"]);
+        bool corpseUnavailable = truncated || statsFields < 24;
+        Assert.Equal(corpseUnavailable ? 1 : 0, counters["corpse_stats_unreadable"]);
         Assert.Contains("tp_total=" + (truncated ? 7 : 10), fields);
         Assert.Contains("falldeath_after_tp=" + (truncated ? 0 : 24), fields);
+        Assert.Contains("corpses_visible=" + (corpseUnavailable ? 6 : 29), fields);
+        Assert.Contains("grave_markers_added=" + (corpseUnavailable ? 0 : 31), fields);
+        Assert.Contains("grave_marker_fallbacks=" + (corpseUnavailable ? 0 : 32), fields);
+        Assert.Contains("markers_off_session=" + (corpseUnavailable ? 0 : 33), fields);
+        foreach (string key in new[] { "lua_corpse_visible", "lua_corpse_hidden_blocked", "lua_corpse_unknown_kept" }) Assert.Contains(key + "=0", fields);
         await Reply(server, 3, Protocol.T3OpStats, stop.Token);
         await report.WaitAsync(stop.Token);
         var gate = (SemaphoreSlim)typeof(CombatPipe).GetField("_gate", Private)!.GetValue(pipe)!;

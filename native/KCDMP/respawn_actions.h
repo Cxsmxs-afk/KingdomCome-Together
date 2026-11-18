@@ -11,6 +11,7 @@
 // with the rest (a respawn without a fade is still a respawn).
 
 #include <cstdint>
+#include <cstddef>
 #include "fader_rules.h"
 
 namespace kcdmp::actions {
@@ -84,6 +85,8 @@ struct GraveReport {
 
 // Spawn a grave at (x,y,z) and move everything except quest items into it.
 GraveReport make_grave(void* playerSoul, float x, float y, float z);
+void p5_death_marker(const GraveReport& report);
+void p5_marker_counts(uint64_t out[3]);
 
 // Periodic: graves emptied by looting are removed, graves past their expiry
 // (3 in-game days) are removed with their contents. `removed` receives the ids

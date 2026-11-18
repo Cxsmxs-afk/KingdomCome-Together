@@ -49,12 +49,15 @@ enum class Kind : uint8_t {
     Read,   // our own read / write of game memory: counted and logged, never switched off
 };
 
+enum class Policy : uint8_t { Ordinary, MarkerIsolated }; // marker handles quarantine themselves; no global marker switch
+
 constexpr uint32_t kSwitchOffAfter = 8;
 constexpr double   kSumPeriodS     = 60.0;
 
 struct Site {
     const char* const name;
     const Kind        kind;
+    const Policy      policy;
     std::atomic<uint32_t>  faults{0};
     std::atomic<uint32_t>  summed{0};      // the count the last FAULT-SUM line reported
     std::atomic<bool>      off{false};
@@ -65,7 +68,7 @@ struct Site {
     std::atomic<int>       lastAccess{-1}; // access violation: 0 read, 1 write, 8 execute
     Site* next = nullptr;                  // the registry (sites that faulted), under its lock
 
-    constexpr Site(const char* n, Kind k) noexcept : name(n), kind(k) {}
+    constexpr Site(const char* n, Kind k, Policy p = Policy::Ordinary) noexcept : name(n), kind(k), policy(p) {}
     Site(const Site&) = delete;
     Site& operator=(const Site&) = delete;
 };
