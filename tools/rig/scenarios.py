@@ -167,11 +167,14 @@ class Run:
         try: pair.collect('fail-' + row['step'], copies=tuple(c.id for c in self.copies))
         except Exception as ex: rig.say('collect failed:', ex)
 
-    def finish(self):
-        res = {'scenario': self.name, 'pass': all(s['ok'] for s in self.steps) and bool(self.steps), 'steps': self.steps}
+    def finish(self, *, skipped=()):
+        res = {'scenario': self.name, 'pass': all(s['ok'] for s in self.steps) and bool(self.steps) and not skipped, 'steps': self.steps}
+        if skipped:
+            res['skipped'] = list(skipped)
         with open(os.path.join(self.dir, 'result.json'), 'w', encoding='utf-8') as f: json.dump(res, f, indent=1)
-        rig.say('SCENARIO', self.name, 'PASS' if res['pass'] else 'FAIL', '(%d steps)' % len(self.steps))
-        return 0 if res['pass'] else 1
+        partial = bool(skipped) and all(s['ok'] for s in self.steps) and bool(self.steps)
+        rig.say('SCENARIO', self.name, 'PASS' if res['pass'] else 'SKIP' if partial else 'FAIL', '(%d steps)' % len(self.steps))
+        return 0 if res['pass'] else 2 if partial else 1
 
 
 # ---------------------------------------------------------------- the steps
@@ -3968,7 +3971,16 @@ def s_w214_hostkills(r, kills=int(os.environ.get('KCDMP_RIG_KILLS', '10')), per_
     return fn
 
 
+def smoke_plan(record):
+    return [('join', s_join(record)), ('walk30', s_walk(record)),
+            ('sleep', s_skip(record, 'sleep', 9, gap_gate=False)), ('wait', s_skip(record, 'wait', 3, gap_gate=False)),
+            ('fight', s_fight(record)), ('talk', s_talk(record)), ('loot', s_loot(record))]
+
+
 def run(name, args):
+    if name == 'abend':
+        import scen_solo_abend
+        return scen_solo_abend.run(sys.modules[__name__], args)
     if name == 'rpmeasure':
         import scen_s2_measure
         return scen_s2_measure.run(sys.modules[__name__], args)
@@ -4152,8 +4164,7 @@ def run(name, args):
                         ('talk', s_talk(r, 150))],
         # the crash work: N fights in one pair session (KCDMP_RIG_C1_N, default 10); a game that exits ends the run (copy-exited)
         'c1x': [('join', s_join(r))] + [('c1fight-%02d' % (i + 1), s_c1fight(r)) for i in range(int(os.environ.get('KCDMP_RIG_C1_N', '10')))],
-        'smoke': [('join', s_join(r)), ('walk30', s_walk(r)), ('sleep', s_skip(r, 'sleep', 9, gap_gate=False)), ('wait', s_skip(r, 'wait', 3, gap_gate=False)),
-                  ('fight', s_fight(r)), ('talk', s_talk(r)), ('loot', s_loot(r))],
+        'smoke': smoke_plan(r),
         # WO-207 F: the pair smoke grown -- the queue after the join, the clocks strict after each skip (C.3), the conversation both
         # ways with voting and the decision timer (A), the queue after the fight (B.5), no unexplained divergence at the end (D)
         'smoke2': [('join', s_join(r)), ('queue-after-join', s_queue(r)), ('walk30', s_walk(r)),

@@ -67,6 +67,10 @@ EOF
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_load_sequence.py'
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_s3_events.py'
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_s3_recovery.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_solo_*.py'
+    pwsh -NoLogo -NoProfile -NonInteractive -File tools/rig/Test-Solo-Abend.ps1
+    python3 tools/Test-NoInputTooling.py tools/rig/Solo-Abend.ps1 tools/rig/scen_solo_abend.py
+    python3 tools/Test-NoScreenshots.py tools/rig/Solo-Abend.ps1 tools/rig/scen_solo_abend.py
 fi
 dotnet run --project tools/sim/KcdMp.Sim/KcdMp.Sim.csproj -c Release -- --label "$label" --out "$out" "${extra[@]}"
 if [ "$label" = ci ]; then

@@ -55,7 +55,15 @@ def load_state():
 
 
 def save_state(s):
-    with open(STATE, 'w', encoding='utf-8') as f: json.dump(s, f, indent=1)
+    tmp = '%s.%d.tmp' % (STATE, os.getpid())
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(s, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE)
+    finally:
+        if os.path.exists(tmp): os.remove(tmp)
 
 
 _NOTE_LOCK = threading.Lock()

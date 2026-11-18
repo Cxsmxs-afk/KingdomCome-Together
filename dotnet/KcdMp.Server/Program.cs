@@ -65,6 +65,23 @@ public class Program
 		// aliases above; re-adding it last lets "--port" win over appsettings.
 		builder.Configuration.AddCommandLine(args, SwitchMappings);
 
+		string? loopbackUrl = null;
+		if (builder.Configuration.GetValue<bool>("Tcp:LoopbackOnly"))
+		{
+			if (builder.Configuration["Tcp:BindAddress"] != "127.0.0.1" ||
+				!Uri.TryCreate(builder.Configuration["urls"], UriKind.Absolute, out var local) ||
+				local.Scheme != "http" || local.Host != "127.0.0.1" || local.Port is <= 0 or > 65535)
+				throw new InvalidOperationException("Tcp:LoopbackOnly requires 127.0.0.1 for TCP and an explicit loopback HTTP URL.");
+			loopbackUrl = $"http://127.0.0.1:{local.Port}";
+			builder.WebHost.ConfigureKestrel(options =>
+			{
+				// Use the explicitly selected bench listener, including when
+				// deployment configuration names another Kestrel endpoint.
+				options.Configure(new ConfigurationBuilder().Build());
+				options.Listen(System.Net.IPAddress.Loopback, local.Port);
+			});
+		}
+
 		// Logging config
 		builder.Services.AddSerilog(options =>
 		{
@@ -101,6 +118,12 @@ public class Program
 		}
 
 		var app = builder.Build();
+		if (loopbackUrl is not null)
+			app.Lifetime.ApplicationStarted.Register(() =>
+			{
+				if (app.Urls.Count == 1 && app.Urls.Contains(loopbackUrl))
+					app.Services.GetRequiredService<Serilog.ILogger>().Information("HTTP loopback ready on {Url}.", loopbackUrl);
+			});
 
 		if (faultNote is not null)
 			app.Services.GetRequiredService<Serilog.ILogger>().Warning("{Line:l}", faultNote);

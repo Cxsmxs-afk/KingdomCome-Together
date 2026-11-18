@@ -17,6 +17,7 @@ public class TcpSocketService : BackgroundService
 {
 	private readonly ILogger _logger;
 	private readonly int _port;
+	private readonly IPAddress _bindAddress;
 	private readonly TimeSpan _idleTimeout;
 	private readonly ClientHandler _clientHandler;
 	private readonly TcpBroadcastService _broadcastService;
@@ -32,6 +33,9 @@ public class TcpSocketService : BackgroundService
 
 		var configSection = configuration.GetSection("Tcp");
 		_port = int.Parse(configSection["Port"] ?? "7778");
+		string? bind = configSection["BindAddress"];
+		_bindAddress = bind is null ? IPAddress.Any :
+			IPAddress.TryParse(bind, out var address) ? address : throw new InvalidOperationException("Tcp:BindAddress must be an IP address.");
 		// WO-102.5 Phase 4: configurable so the relay round-trip tests can use
 		// a short timeout instead of ClientSession's 30 s field default.
 		_idleTimeout = runner.IdleTimeout;
@@ -49,8 +53,9 @@ public class TcpSocketService : BackgroundService
 	/// <param name="cancellationToken"></param>
 	protected override async Task ExecuteAsync(CancellationToken cancellationToken)
 	{
-		var listener = new TcpListener(IPAddress.Any, _port);
+		var listener = new TcpListener(_bindAddress, _port);
 		listener.Start();
+		_logger.Information("TCP listener bound to {Address}:{Port}.", _bindAddress, _port);
 		_logger.Information("Listening on port {Port}...", _port);
 		_logger.Information("Waiting for clients to connect.");
 
