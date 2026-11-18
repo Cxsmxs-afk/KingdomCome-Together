@@ -484,10 +484,14 @@ do
     KCD2MP._npcPauseExec.p1_owned_pause, KCD2MP._npcPauseExec.p1_reused_pause = "ok", "ok"
     KCD2MP._npcPauseEntity.p1_owned_pause = { id = tostring(owned.id), soul = "p1-owned-soul" }
     KCD2MP._npcPauseEntity.p1_reused_pause = { id = tostring(reused.id), soul = "p1-old-soul" }
+    local noGetter = mkEntity("p1_no_soul_getter", 0, 0, 0); noGetter.soul = {}; ENTS.p1_no_soul_getter = noGetter
+    KCD2MP._npcPaused.p1_no_soul_getter, KCD2MP._npcPauseExec.p1_no_soul_getter = NOW, "ok"
+    KCD2MP._npcPauseEntity.p1_no_soul_getter = { id = tostring(noGetter.id), soul = "p1-prior-soul" }
     check("(p1) old cleanup generation is refused", KCD2MP_P1ReleaseLegacy("10") == false and #CMDS == mark)
     check("(p1) exact owned legacy pause is released", KCD2MP_P1ReleaseLegacy("11") == true and #CMDS == mark + 1
         and CMDS[#CMDS] == "wh_ai_ResumeNPC p1_owned_pause")
     check("(p1) reused body is never resumed from old name", KCD2MP._npcPaused.p1_reused_pause ~= nil)
+    check("(p1) missing soul identity getter never authorizes a cleanup resume", KCD2MP._npcPaused.p1_no_soul_getter ~= nil)
     KCD2MP_HostAuthority(true, false, "pending", "12")
     KCD2MP_ModBrainCommand("wh_ai_PauseNPC next_load_copy")
     check("(p1) next load blocks mod legacy again", #CMDS == mark + 1 and KCD2MP.hostAuthority.phase == "pending")

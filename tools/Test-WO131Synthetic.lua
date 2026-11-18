@@ -117,6 +117,7 @@ end
 local function reset()
     KCD2MP.npcPuppets = {}; KCD2MP.npcTracked = {}; KCD2MP.dragging = {}; KCD2MP.dragWatch = {}
     KCD2MP._npcPaused = {}; KCD2MP._npcResumePending = {}; KCD2MP._npcEverPaused = {}
+    KCD2MP._npcPauseExec = {}; KCD2MP._npcPauseEntity = {}
     KCD2MP.ghosts = {}; KCD2MP.horseGhosts = {}
     KCD2MP.w131.parked = {}; KCD2MP.w131.standins = {}; KCD2MP.w131.active = false; KCD2MP.w131.guard = true
     KCD2MP.w131.reassert = false; KCD2MP.w131.standinLastAt = -1e9
@@ -186,10 +187,12 @@ do -- (c) the stream unparks; (d) a release parks, never resumes
     local n = mkEntity("ttkc_man_5", 10, 0, 0); ENTS["ttkc_man_5"] = n; SPHERE = { n }
     KCD2MP_W131Tick(true, true)
     check("c: parked first (not streamed yet)", n.hidden == true)
+    KCD2MP._npcPauseEntity.ttkc_man_5 = { id = "old-body", soul = "old-soul" }
     KCD2MP_ApplyNpcState("ttkc_man_5", 50, 0, 0, 0, 100, 0, 0, 1, 1000)
     check("c: the puppet start shows the body", KCD2MP.npcPuppets["ttkc_man_5"] ~= nil and n.hidden == false
         and KCD2MP.w131.parked["ttkc_man_5"] == nil)
     check("c: and the lever pauses it", KCD2MP._npcPaused["ttkc_man_5"] ~= nil)
+    check("c: a soul without GetId cannot inherit the old body's cleanup lease", KCD2MP._npcPauseEntity.ttkc_man_5 == nil)
     KCD2MP.npcPuppets["ttkc_man_5"] = nil
     CMDS = {}
     local parked = KCD2MP_W131ParkReleased("ttkc_man_5", "silence")

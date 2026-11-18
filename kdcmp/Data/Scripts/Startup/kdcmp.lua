@@ -4663,9 +4663,13 @@ local function mp_wo102_pause(name, p, why)
     local ok, err = pcall(KCD2MP_ModBrainCommand, "wh_ai_PauseNPC " .. tostring(name))
     local exec = ok and "ok" or ("err:" .. tostring(err))
     KCD2MP._npcPauseExec[name] = exec
+    KCD2MP._npcPauseEntity[name] = nil -- a new pause cannot inherit a reused body's old cleanup lease
     if ok then pcall(function()
         local e = System.GetEntityByName(name)
-        if e and e.soul then KCD2MP._npcPauseEntity[name] = { id = tostring(e.id), soul = tostring(e.soul:GetId()) } end
+        if e and e.id ~= nil and e.soul and type(e.soul.GetId) == "function" then
+            local soulId = e.soul:GetId()
+            if soulId ~= nil then KCD2MP._npcPauseEntity[name] = { id = tostring(e.id), soul = tostring(soulId) } end
+        end
     end) end
     mp_auth_log(name, "pause", p and p.owner or "?", "wh_ai_PauseNPC", 0)
     mp_pause_log(name, "pause", exec, why or "puppet-start", p and p.owner or "?", 0)
@@ -38149,7 +38153,8 @@ do
             local identity, same = KCD2MP._npcPauseEntity[name], false
             pcall(function()
                 local e = System.GetEntityByName(name)
-                same = identity and e and e.soul and identity.id == tostring(e.id) and identity.soul == tostring(e.soul:GetId())
+                same = identity and e and e.id ~= nil and e.soul and type(e.soul.GetId) == "function"
+                    and identity.id == tostring(e.id) and identity.soul == tostring(e.soul:GetId())
             end)
             if same and KCD2MP._npcPauseExec[name] == "ok" then mp_wo102_resume(name, "p1-mode-change") end
         end
