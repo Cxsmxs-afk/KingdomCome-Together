@@ -17,11 +17,11 @@ public partial class GameBridge
     private ulong _p1LuaGeneration;
     private ulong _p1LegacyZeroGeneration;
     private long _p1RetryAtMs;
-    private bool P1JoinerIntent => !_isDamageAuthority && !_ownLoadExpected && !_loadGraceOwn && !_leaveInProgress &&
+    private bool P1JoinerIntent => !_isDamageAuthority && !OwnLoadExpected && !LoadGraceOwn && !_leaveInProgress &&
         (_joinedWorld || _jj is not null || _hostAuthorityPrepared);
     private bool P1HasGameplay => _p1GameplayMs >= 0 && _p1GameplayWorld == _w206.World;
     // Host time decisions remain host-owned even when optional story/brain suppression is disabled.
-    private bool HostWorldDecisionContext => !_isDamageAuthority && !_ownLoadExpected && !_loadGraceOwn &&
+    private bool HostWorldDecisionContext => !_isDamageAuthority && !OwnLoadExpected && !LoadGraceOwn &&
         (_hostAuthorityPrepared || _joinedWorld || (_jj is { } join && ReferenceEquals(_p1PreparedJoin, join)));
     private HostAuthorityLifecycle P1Lifecycle => LazyInitializer.EnsureInitialized(ref _p1Lifecycle, () => new HostAuthorityLifecycle(async (phase, generation, ct) =>
     {
@@ -123,7 +123,7 @@ public partial class GameBridge
     {
         T3TpInvalidate(); P6Invalidate(); P5RetireOperations();
         bool keepGameplay = why is "role-change" or "disconnect" && P1HasGameplay && (_joinedWorld || _isDamageAuthority) && _jj is null &&
-            _hostCalendarResumeEpoch == _w206.World && _where == GameWhere.World && !_ownLoadExpected && !_loadGraceOwn && !_p1Loading;
+            _hostCalendarResumeEpoch == _w206.World && _where == GameWhere.World && !OwnLoadExpected && !LoadGraceOwn && !_p1Loading;
         long gameplay = keepGameplay ? _p1GameplayMs : -1;
         uint world = keepGameplay ? _p1GameplayWorld : 0;
         Interlocked.Increment(ref _p1Serial);

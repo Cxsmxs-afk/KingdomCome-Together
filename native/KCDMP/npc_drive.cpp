@@ -30,6 +30,7 @@
 #include "rp_measure.h"
 #include "rp_timeline.h"
 #include "rp_timeline_actions.h"
+#include "load_sequence.h"
 #include "rp_controller.h"
 #include "edge_lanes.h"
 #include "pipe_server.h"
@@ -277,7 +278,7 @@ struct InSample {
     bool     haveSt2 = false;      // WO-121: pipe flag 0x80 -- a peer's avatar sample carries its v8 state block
     motion::State2 st2{};
 };
-struct InHold { char name[64]{}; uint16_t ms = 0; };
+struct InHold { char name[64]{}; uint16_t ms = 0; uint64_t loadStamp = 0; };
 
 std::mutex            g_inboxMutex;
 std::vector<InSample> g_inSamples;
@@ -858,9 +859,10 @@ void pull_flush(Puppet& p, double now) {
 
 // One puppet, one frame. Returns false on an engine fault (the caller disarms).
 bool write_one(Puppet& p, void* e, const float pose[4], holders::Holder who, bool* wrote, double* measuredCorrectionCm,
-               bool* matched) {
+               bool* matched, uint64_t loadStamp) {
     *wrote = false;
     if (matched) *matched = false;
+    if (!loadsequence::allows(loadStamp, loadsequence::Access::Live)) return true;
     float cur[3]{};
     const bool haveCur = read_pos(e, cur);
     p.curValid = haveCur;
@@ -922,6 +924,7 @@ bool write_one(Puppet& p, void* e, const float pose[4], holders::Holder who, boo
     float scale[3] = { 1, 1, 1 };
     get_scale(e, scale);
 
+    if (!loadsequence::allows(loadStamp, loadsequence::Access::Live)) return true;
     auto permit = holders::may_place(p.eid, who,
         who == holders::Holder::Seat ? "wo217-seat-place" : holders::kStreamSetter, holders::Claim::Held);
     if (!permit) {
@@ -1003,13 +1006,15 @@ const char* reason_name(uint8_t r) {
 }
 
 bool write_entity_tm(uint32_t eid, void* e, const float pos[3], const float q[4], holders::Holder who, const char* path) {
+    const uint64_t loadStamp = loadsequence::stamp();
+    if (!loadsequence::allowed(loadStamp, loadStamp, loadsequence::Access::Live)) return false;
     if (!eid || !e || engine::entity_by_id(eid) != e || !is_a(e, g_vftEntity)) return false;
     void* par = nullptr;
     if (!get_parent(e, &par) || par) return false;   // never a child: SetPosRotScale is its LOCAL transform (ef2-b11: a cart under its wagon)
     void* prs = vslot(e, kEntSetPosRotScale);
     float scale[3] = { 1, 1, 1 };
     get_scale(e, scale);
-    if (!prs) return false;
+    if (!prs || !loadsequence::allows(loadStamp, loadsequence::Access::Live)) return false;
     auto permit = holders::may_place(eid, who, path);
     if (!permit) return false;
     const bool applied = call_prs(prs, e, pos, q, scale);
@@ -1144,6 +1149,7 @@ uint8_t on_samples(const uint8_t* body, size_t len, rpmeasure::SampleScope reade
     if (o != len) return kBadRequest;
     {
         std::lock_guard<std::mutex> lock(g_inboxMutex);
+        if (!loadsequence::allows(reader.loadStamp, loadsequence::Access::Live)) return kOk;
         if (g_inSamples.size() + batch.size() > kMaxInbox) g_inSamples.clear();   // a wedged frame loop: keep only the newest
         g_inSamples.insert(g_inSamples.end(), batch.begin(), batch.end());
     }
@@ -1159,14 +1165,15 @@ uint8_t queue_raw_pose(const uint8_t* body, size_t len, rpmeasure::SampleScope r
     pose.firstByteQpc = reader.firstByteQpc;
     std::lock_guard<std::mutex> lock(g_inboxMutex);
     const rpmeasure::ReceiverScope current{wo216::lifecycle_observation_stamp(), pipe::observation_connection()};
-    if (!(reader.receiver == current)) return kOk; // the read occurred before the world/pipe changed
+    if (!(reader.receiver == current) || !loadsequence::allows(reader.loadStamp, loadsequence::Access::Live)) return kOk;
     if (timed) {
         if (!rptimeline::enabled()) return kOk; // the sender may still have one old state in flight
         if (pose.ghost()) rptimeline::note_received(pose.source, pose.hostMs);
         else pose.hostMs = pose.hostAtArrivalMs = pose.stateHostMs = 0;
     }
-    const Put result = g_inRawPoses.publish(std::move(pose), {reader.receiver.lifecycle, reader.receiver.connection},
-                                            g_senderClock.load(std::memory_order_relaxed));
+    const Scope scope{reader.receiver.lifecycle, reader.receiver.connection, reader.loadStamp};
+    loadsequence::note_stale(g_inRawPoses.retire(scope));
+    const Put result = g_inRawPoses.publish(std::move(pose), scope, g_senderClock.load(std::memory_order_relaxed));
     if (result == Put::Full) return kTableFull;
     g_statSamples.fetch_add(1, std::memory_order_relaxed);
     return kOk;
@@ -1229,14 +1236,16 @@ uint8_t authorize_remote_relocation(const uint8_t* body, size_t len, rpmeasure::
     return kOk;
 }
 
-uint8_t on_hold(const uint8_t* body, size_t len) {
+uint8_t on_hold(const uint8_t* body, size_t len, uint64_t loadStamp) {
     if (len < 4) return kBadRequest;
     InHold h{};
+    h.loadStamp = loadStamp;
     std::memcpy(&h.ms, body, 2);
     const uint8_t nl = body[2];
     if (nl == 0 || nl > 63 || static_cast<size_t>(3 + nl) != len) return kBadRequest;
     std::memcpy(h.name, body + 3, nl); h.name[nl] = 0;
     std::lock_guard<std::mutex> lock(g_inboxMutex);
+    if (!loadsequence::allows(loadStamp, loadsequence::Access::Live)) return kOk;
     if (g_inHolds.size() >= 1024) return kTableFull;
     g_inHolds.push_back(h);
     return kOk;
@@ -1531,6 +1540,62 @@ void tick() {
         else if (body->second.pendingDrop != kOk)
             drop(body, body->second.pendingDrop, body->second.tellDrop);
     }
+    const uint64_t loadStamp = loadsequence::stamp();
+    static uint64_t previousLoadStamp = 0;
+    static bool loadDrain = false;
+    if (previousLoadStamp != loadStamp) {
+        previousLoadStamp = loadStamp;
+        loadDrain = true;
+        combatactions::end_all("load sequence retired previous combat requests");
+        g_streams.clear();
+        for (auto& row : g_bound) {
+            Puppet& body = row.second;
+            auto& stream = g_streams.try_emplace(body.key).first->second;
+            stream.name = body.name;
+            stream.lastSampleAt = now;
+            body.relocation = {};
+            body.relocationQpc = 0;
+            body.timed = false;
+            body.pendingSeatPlace = false;
+            body.holdUntil = body.holdStartedAt = body.holdCooldownUntil = 0;
+            body.haveFloor = body.haveLast = body.havePrev = body.blending = false;
+            body.speedMps = body.velX = body.velY = 0;
+            body.blendPending = true;
+            body.blendWhy = "load-sequence";
+            rptimeline::forget(body.eid);
+            rpctrl::forget(body.eid);
+        }
+    }
+    if (loadDrain) {
+        bool stopped = true;
+        for (const auto& row : g_bound) stopped = stop_movement(row.second.eid, "load-sequence") && stopped;
+        loadDrain = !stopped;
+    }
+    if (!loadsequence::allowed(loadStamp, loadsequence::stamp(), loadsequence::Access::Live) || loadDrain) {
+        {
+            std::lock_guard<std::mutex> lock(g_inboxMutex);
+            const uint64_t currentStamp = loadsequence::stamp();
+            // First-byte packets cannot enter while held. Retire legacy inbox
+            // entries; retain only freshly admitted Play data if stopping an
+            // earlier asynchronous route still needs an acknowledgement.
+            const auto staleSample = [&](const InSample& sample) {
+                if (loadsequence::old_generation(sample.reader.loadStamp, currentStamp)) loadsequence::note_stale();
+                return sample.reader.loadStamp != currentStamp;
+            };
+            const auto staleHold = [&](const InHold& hold) {
+                if (loadsequence::old_generation(hold.loadStamp, currentStamp)) loadsequence::note_stale();
+                return hold.loadStamp != currentStamp;
+            };
+            const auto samples = std::remove_if(g_inSamples.begin(), g_inSamples.end(), staleSample);
+            const auto holds = std::remove_if(g_inHolds.begin(), g_inHolds.end(), staleHold);
+            g_inSamples.erase(samples, g_inSamples.end());
+            g_inHolds.erase(holds, g_inHolds.end());
+            loadsequence::note_stale(g_inRawPoses.retire({wo216::lifecycle_observation_stamp(), pipe::observation_connection(), currentStamp}));
+        }
+        g_statWriting.store(0, std::memory_order_relaxed);
+        npctrace::frame_end();
+        return;
+    }
     if (!g_armed.load(std::memory_order_relaxed)) { npctrace::frame_end(); return; }
     const double gap = (g_lastTickAt > 0 && now > g_lastTickAt) ? now - g_lastTickAt : 0.0;
     double dt = gap;
@@ -1557,10 +1622,14 @@ void tick() {
     rpmeasure::ReceiverScope reader;
     {
         std::lock_guard<std::mutex> lock(g_inboxMutex);
-        samples.swap(g_inSamples);
-        holds.swap(g_inHolds);
-        reader = {wo216::lifecycle_observation_stamp(), pipe::observation_connection()};
-        raw = g_inRawPoses.drain({reader.lifecycle, reader.connection});
+        if (loadStamp == loadsequence::stamp()) {
+            samples.swap(g_inSamples);
+            holds.swap(g_inHolds);
+            reader = {wo216::lifecycle_observation_stamp(), pipe::observation_connection()};
+            const posering::receive::Scope scope{reader.lifecycle, reader.connection, loadStamp};
+            loadsequence::note_stale(g_inRawPoses.retire(scope));
+            raw = g_inRawPoses.drain(scope);
+        }
     }
     // Playback must obey the same scope as the input slots. Clear only raw
     // history on an epoch change, leaving the legacy compatibility path intact.
@@ -1579,6 +1648,13 @@ void tick() {
         }
         rawScope = reader;
     }
+    if (loadStamp != loadsequence::stamp()) {
+        for (const auto& sample : samples) loadsequence::allows(sample.reader.loadStamp, loadsequence::Access::Live);
+        for (const auto& hold : holds) loadsequence::allows(hold.loadStamp, loadsequence::Access::Live);
+        if (loadsequence::old_generation(loadStamp, loadsequence::stamp())) loadsequence::note_stale(raw.size());
+        npctrace::frame_end();
+        return;
+    }
     const bool mixed = !samples.empty() && !raw.empty();
     for (const auto& pose : raw) {
         static_assert(sizeof(motion::State2) == posering::receive::kStateBytes, "raw Ghost State2 wire layout");
@@ -1589,7 +1665,7 @@ void tick() {
         sample.flags = pose.flags; sample.seq = pose.sequence; sample.senderMs = pose.senderMs;
         sample.arrivalQpc = pose.arrivalQpc;
         sample.hostMs = pose.hostMs; sample.hostAtArrivalMs = pose.hostAtArrivalMs; sample.stateHostMs = pose.stateHostMs;
-        sample.reader = {pose.firstByteQpc, reader};
+        sample.reader = {pose.firstByteQpc, reader, loadStamp};
         sample.raw = true; sample.rawGhost = pose.ghost();
         sample.stateQpc = pose.stateQpc;
         sample.haveSt2 = pose.stateQpc != 0;
@@ -1603,10 +1679,12 @@ void tick() {
         return a.arrivalQpc < b.arrivalQpc;
     });
     for (const auto& s : samples) {
+        if (!loadsequence::allows(s.reader.loadStamp, loadsequence::Access::Live)) continue;
         if (s.raw && (reader.lifecycle != wo216::lifecycle_observation_stamp() || reader.connection != pipe::observation_connection())) continue;
         push_sample(s, now);
     }
     for (const auto& h : holds) {
+        if (!loadsequence::allows(h.loadStamp, loadsequence::Access::Live)) continue;
         auto it = g_bound.find(lower(h.name));
         if (it != g_bound.end()) {
             Puppet& hp = it->second;
@@ -1657,6 +1735,7 @@ void tick() {
 
     uint16_t writing = 0;
     for (auto it = g_bound.begin(); it != g_bound.end();) {
+        if (loadStamp != loadsequence::stamp()) break;
         Puppet& p = it->second;
         if (p.pendingDrop != kOk) { ++it; continue; }
         auto sIt = g_streams.find(p.key);
@@ -1688,6 +1767,7 @@ void tick() {
             continue;
         }
         const Stream& s = sIt->second;
+        if (!s.n) { ++it; continue; }
         const bool figure = p.name.rfind("kcd2mp_", 0) == 0;
         uint8_t measuredPeer = 0;
         const bool measure = figure && rpmeasure::partner_id(p.name, measuredPeer) && measuredPeer == s.src;
@@ -2158,7 +2238,7 @@ void tick() {
         const uint32_t reachedSender = reached ? reachedSample->senderMs : 0;
         double correctionCm = 0.0;
         bool matched = false;
-        if (!write_one(p, e, pose, who, &wrote, measure ? &correctionCm : nullptr, useTimeline ? &matched : nullptr)) {
+        if (!write_one(p, e, pose, who, &wrote, measure ? &correctionCm : nullptr, useTimeline ? &matched : nullptr, loadStamp)) {
             if (!g_announcedFault) { g_announcedFault = true; logf("MP-NPCWRITE npc=%s engine call FAULTED", p.name.c_str()); }
             disarm("an engine call faulted inside the per-frame write");
             npctrace::frame_end();

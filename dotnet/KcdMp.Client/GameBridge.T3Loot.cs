@@ -22,6 +22,9 @@ public partial class GameBridge
                 var accounting = new T3FrameAccounting(frame);
                 try
                 {
+                    if (!LoadSequenceFrameCurrent(frame)) continue;
+                    if (LoadSequenceEnabled && Wo136Defer(frame)) continue;
+                    using var loadLife = LoadSequenceLink(frame, ct);
                     if (Wo140DropSeparate(frame.Type)) continue;
                     if (Wo206Rules.WorldCategory(frame.Type, frame.Payload) is Wo206Cat category)
                     {
@@ -47,9 +50,9 @@ public partial class GameBridge
                         Wo207Trace.Kind.Value = frame.Type;
                         try { await Wo123OnFrameAsync(frame.Type, frame.Payload, token); }
                         finally { CurrentLoot.Value = before; }
-                    }, Volatile.Read(ref _t3ProcFrameTimeoutMs), ct);
+                    }, Volatile.Read(ref _t3ProcFrameTimeoutMs), loadLife?.Token ?? ct);
                     T3FrameResult(frame.Type, result);
-                    if (result.Status == ProcessorFrameScope.Outcome.SessionCancelled) return;
+                    if (result.Status == ProcessorFrameScope.Outcome.SessionCancelled && ct.IsCancellationRequested) return;
                 }
                 finally { accounting.End(frame.Type); }
             }

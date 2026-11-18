@@ -11,6 +11,7 @@ constexpr uint8_t kOp = 250;
 constexpr uint8_t kTimelineCommand = 4;
 constexpr uint8_t kControllerCommand = 5;
 constexpr uint8_t kCombatCommand = 6;
+constexpr uint8_t kLoadCommand = 7;
 constexpr size_t kMaxText = 6400, kMaxFields = 160;
 
 // Agent-origin numeric counters only: [role 1 host / 2 joiner][key=uint ...].

@@ -930,7 +930,7 @@ public partial class GameBridge
                 for (int i = 0; i < 120 && _where != GameWhere.Menu; i++) await Task.Delay(1000);
                 await Task.Delay(1500);
                 _henry.MoveOut(path, "the exit file (its load failed as meant)");
-                _ownLoadExpected = false;
+                if (!LoadSequenceEnabled) _ownLoadExpected = false;
                 Console.WriteLine($"MP-HENRY back at the main menu after the exit file: {(_where == GameWhere.Menu ? "yes" : "NOT SEEN")}; exit file moved out");
             });
             return true;

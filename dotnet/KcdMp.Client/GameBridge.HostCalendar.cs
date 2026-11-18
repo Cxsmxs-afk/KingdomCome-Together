@@ -113,7 +113,7 @@ public partial class GameBridge
             // Native close clears its follower; only the already verified world may arm it again here.
             if (r is { Result: 0 } && generation == Interlocked.Read(ref _hostCalendarGeneration) &&
                 _hostCalendarResumeEpoch != 0 && _hostCalendarResumeEpoch == _w206.World && _joinedWorld &&
-                _jj is null && !_w211Holding && !_ownLoadExpected && !_loadGraceOwn)
+                _jj is null && !LinkHeld && !OwnLoadExpected && !LoadGraceOwn)
             {
                 if (!await ResumeHostAuthorityAsync(generation, linked.Token)) return;
                 T3SideGuard(life, true);
@@ -253,7 +253,7 @@ public partial class GameBridge
         {
             T3SideGuard(life, true);
             if (generation != Interlocked.Read(ref _hostCalendarGeneration) || _hostCalendarResumeEpoch != _w206.World ||
-                !_joinedWorld || _isDamageAuthority || _ownLoadExpected || _loadGraceOwn || _jj is not null || !sample.Fresh(Environment.TickCount64)) return;
+                !_joinedWorld || _isDamageAuthority || OwnLoadExpected || LoadGraceOwn || _jj is not null || !sample.Fresh(Environment.TickCount64)) return;
             if (!await ResumeHostAuthorityAsync(generation, linked.Token)) return;
             T3SideGuard(life, true);
             var r = await _combat.CalendarFollowAsync(2, sample.TargetMs(Environment.TickCount64), sample.Ratio, linked.Token);

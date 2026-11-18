@@ -12,6 +12,7 @@
 #include <vector>
 #include "wo216_authority_rules.h"
 #include "t3_stats_rules.h"
+#include "load_sequence_rules.h"
 
 namespace kcdmp::pipecontrol {
 constexpr uint8_t kGeneric = 0x2B, kBatch = 0x2D, kSamples = 0x10, kEdge = 0x38, kEdgeCapabilities = 255;
@@ -24,7 +25,7 @@ struct Frame {
     uint64_t readerTick = 0, readerGeneration = 0, readerLife = 0;
     bool readerGameplay = false;
     int64_t readerQpc = 0;
-    uint64_t readerObservation = 0;
+    uint64_t readerObservation = 0, loadStamp = 0;
 };
 inline bool header_payload_allowed(uint8_t type, size_t n) {
     return n <= kNormalPayload || ((type == kBatch || type == kSamples) && n <= kLargePayload) ||
@@ -35,7 +36,7 @@ inline bool complete_payload_allowed(const Frame& f) {
         (f.type == kGeneric && f.body.size() <= kT3Payload && f.body[0] == t3stats::kOp) ||
         (f.type == kEdge && f.body.size() <= kEdgePayload);
 }
-inline bool lifecycle(const Frame& f) { return f.type == kGeneric && !f.body.empty() && f.body[0] == wo216authority::kOp; }
+inline bool lifecycle(const Frame& f) { return f.type == kGeneric && !f.body.empty() && (f.body[0] == wo216authority::kOp || f.body[0] == loadsequence::kOp); }
 inline bool immediate(const Frame& f) {
     return f.type == kEdge || lifecycle(f) || (f.type == kGeneric && f.body.size() == 1 && f.body[0] == kEdgeCapabilities);
 }

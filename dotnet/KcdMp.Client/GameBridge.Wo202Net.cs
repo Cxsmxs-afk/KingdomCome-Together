@@ -107,22 +107,23 @@ public partial class GameBridge
     }
 
     /// <summary>The reader: a state frame of a body that already waits is replaced in place. True = consumed (queued or merged).</summary>
-    private bool Wo202Coalesce(ChannelWriter<InFrame> writer, int type, byte[] payload, long arrival, uint stamp,
-        PresentationFrame presentation)
+    private bool Wo202Coalesce(ChannelWriter<InFrame> writer, InFrame frame)
     {
+        int type = frame.Type;
+        long arrival = frame.Arrival;
         Volatile.Write(ref _w202LastReadMs, W147StampMs(arrival));
-        string? key = Wo202Rules.StateKey(type, payload);
+        string? key = Wo202Rules.StateKey(type, frame.Payload);
         if (key is null) return false;
         lock (_w202QLock)
         {
             if (_w202Latest.ContainsKey(key))
             {
-                _w202Latest[key] = new InFrame(type, payload, arrival, stamp) { Presentation = presentation };
+                _w202Latest[key] = frame;
                 _w202Coalesced++;
                 Volatile.Write(ref _w207LastQueuedMs, W147StampMs(arrival));   // WO-207 B.4: the waiting slot is this frame now
                 return true;
             }
-            _w202Latest[key] = new InFrame(type, payload, arrival, stamp) { Presentation = presentation };
+            _w202Latest[key] = frame;
         }
         Wo207Queue(writer, new InFrame(Wo202CoalescedType, Encoding.UTF8.GetBytes(key), arrival, 0), type);   // WO-207 B.1
         return true;
@@ -189,7 +190,7 @@ public partial class GameBridge
         if (now - _w207TraceMs < 20_000) return;
         _w207TraceMs = now;
         Console.WriteLine($"MP-W202 rejoin gates: host_mode={(_hostModeKnown ? (_hostSharedWorld ? "shared" : "separate") : "unknown")} jj={(_jj is null ? "-" : _jj.Phase)} rx={(_joinRx is null ? "-" : "on")} " +
-                          $"out=0x{_joinOutId:x8} leaving={_leaveInProgress} own_load_expected={_ownLoadExpected} where={_where} from_world={_joinFromWorldOnce} joined={_joinedWorld} " +
+                          $"out=0x{_joinOutId:x8} leaving={_leaveInProgress} own_load_expected={OwnLoadExpected} where={_where} from_world={_joinFromWorldOnce} joined={_joinedWorld} " +
                           $"rejoin_pending={_rejoinPending} auto={_autoRequests} next_in_s={(int)Math.Max(0, (_autoNextUtc - DateTime.UtcNow).TotalSeconds)} target={_w207LeaveTarget ?? "-"}");
     }
 
@@ -203,10 +204,21 @@ public partial class GameBridge
         long now = Environment.TickCount64;
         if (now - _w207LeaveAskedMs < 5000) return false;
         _w207LeaveAskedMs = now;
+        var load = _worldLoad.Current;
         string last = await AskModAsync("KCD2MP_Wo125LastLoaded", 4000);
         string got = last.StartsWith("last=", StringComparison.Ordinal) ? last[5..] : "";
         if (!string.Equals(got, target, StringComparison.OrdinalIgnoreCase)) return false;
-        _ownLoadExpected = false;
+        if (LoadSequenceEnabled)
+        {
+            if (load.OwnIntent != WorldLoadOwnIntent.ExpectedPrivate || await Wo154WhereNowAsync() != "world") return false;
+            lock (_joinGate)
+            {
+                var current = _worldLoad.Current;
+                if (current.Generation != load.Generation || current.OwnIntentRevision != load.OwnIntentRevision || _jj is not null) return false;
+                Wo124OnGameplayStarted();
+            }
+        }
+        else _ownLoadExpected = false;
         Console.WriteLine($"MP-W202 rejoin: the leave's own load is in ('{got}', its Gameplay started was not seen while the link was down) -- the join gate opens (WO-207 C.4)");
         try { await ExecLuaAsync("if KCD2MP_Wo124Where then KCD2MP_Wo124Where() end"); } catch { }   // the mod's own word on where it is
         return true;

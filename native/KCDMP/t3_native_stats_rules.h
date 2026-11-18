@@ -11,6 +11,7 @@ constexpr size_t kEdgeFields = 6;
 constexpr size_t kTimelineFields = 6, kTimelineBytes = 2 + 9 * kTimelineFields;
 constexpr size_t kControllerFields = 14, kControllerBytes = 2 + 9 * kControllerFields;
 constexpr size_t kCombatFields = 10, kCombatBytes = 2 + 9 * kCombatFields;
+constexpr size_t kLoadFields = 11, kLoadBytes = 2 + 9 * kLoadFields;
 constexpr size_t kRpOwnerViolationsIndex = 10, kRpOwnerChecksIndex = 16;
 constexpr size_t kCoreBytes = 2 + 9 * kCoreFields, kP5Bytes = 2 + 9 * (kCoreFields + kCorpseFields);
 constexpr size_t kP6Bytes = kP5Bytes + 9 * kRangedFields;
@@ -60,5 +61,8 @@ inline size_t write_controller(uint8_t* out, size_t cap, const uint64_t* values)
 }
 inline size_t write_combat(uint8_t* out, size_t cap, const uint64_t* values) {
     return write_page(out, cap, values, kCombatFields);
+}
+inline size_t write_load(uint8_t* out, size_t cap, const uint64_t* values) {
+    return write_page(out, cap, values, kLoadFields);
 }
 } // namespace kcdmp::t3native

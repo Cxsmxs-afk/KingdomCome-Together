@@ -157,8 +157,21 @@ static class Host125
         Protocol.TrySplitJoinDown(p, out byte src, out _, out uint jid, out var body) ? (src, jid, body.ToArray()) : null;
 
     static string Tag(World w) => w.Seed is uint s ? WhsSave.SeedTag(s) : "-";
+    private const uint BotWorld = 1;
     static uint _hitVerdictId;   // WO-161: the host's hit numbering (hverdict)
     private sealed record RunningCalendar(BotHostSessions.Join Scope, long WorldMs, double Start);
+
+    internal static byte[] WeatherPacket(string profile, ushort blend)
+    {
+        var name = Encoding.UTF8.GetBytes(profile);
+        var packet = new byte[3 + 1 + name.Length + 2];
+        packet[0] = Protocol.WeatherUp;
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(1), (ushort)(1 + name.Length + 2));
+        packet[3] = (byte)name.Length;
+        name.CopyTo(packet, 4);
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(4 + name.Length), blend);
+        return packet;
+    }
 
     public static async Task<int> RunAsync(string[] a, string release, BotHostOptions? bot = null)
     {
@@ -261,18 +274,19 @@ static class Host125
         RunningCalendar? runningCalendar = null;
         var pickupReplies = new Dictionary<(byte Kind, uint Token), (string Request, LootMsg Reply)>();
         bool roleLost = false;
-        async Task W(byte[] pkt, CancellationToken? cancellationToken = null, Func<bool>? stillCurrent = null)
+        async Task<bool> W(byte[] pkt, CancellationToken? cancellationToken = null, Func<bool>? stillCurrent = null)
         {
-            if (linkQuiet) return;
+            if (linkQuiet) return false;
             var ct = cancellationToken ?? hard.Token;
             await wlock.WaitAsync(ct);
             try
             {
                 ct.ThrowIfCancellationRequested();
-                if (stillCurrent is not null && !stillCurrent()) return;
+                if (stillCurrent is not null && !stillCurrent()) return false;
                 // A peer may disappear mid-write. Complete that frame on the
                 // host transport so the following join still has valid framing.
                 await st.WriteAsync(pkt, hard.Token);
+                return true;
             }
             finally { wlock.Release(); }
         }
@@ -296,7 +310,7 @@ static class Host125
         }
         async Task SendBotEpoch(byte target, CancellationToken? ct = null)
         {
-            await W(new LootMsg(Protocol.W203Epoch, 0, Wo206Rules.EpochText(1, 1, "tick")).BuildUp(Protocol.W203Up, target), ct);
+            await W(new LootMsg(Protocol.W203Epoch, 0, Wo206Rules.EpochText(BotWorld, 1, "tick")).BuildUp(Protocol.W203Up, target), ct);
         }
         async Task SendRunningCalendar(RunningCalendar? sample)
         {
@@ -703,13 +717,8 @@ static class Host125
                                 break;
                             case "weather":   // WO-151 3.7: weather <profile> [blendSec] -- the host's weather (WeatherUp 0x2E)
                             {
-                                var wn = Encoding.UTF8.GetBytes(p[1]);
                                 ushort wb = p.Length > 2 ? ushort.Parse(p[2], CultureInfo.InvariantCulture) : (ushort)30;
-                                var wp = new byte[3 + 1 + wn.Length + 2]; wp[0] = Protocol.WeatherUp;
-                                BinaryPrimitives.WriteUInt16LittleEndian(wp.AsSpan(1), (ushort)(1 + wn.Length + 2));
-                                wp[3] = (byte)wn.Length; wn.CopyTo(wp, 4);
-                                BinaryPrimitives.WriteUInt16LittleEndian(wp.AsSpan(4 + wn.Length), wb);
-                                await W(wp);
+                                await W(WeatherPacket(p[1], wb));
                                 Say($"WEATHER {p[1]} blend={wb}s");
                                 break;
                             }
@@ -1150,6 +1159,9 @@ static class Host125
                                 // may have cleared its clock when applying the epoch.
                                 if (bot is not null) await Send(BotHostCalendar.Frozen(joiner, joinId, bot.WorldTimeMs));
                                 await Send(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateWaitingReady, 0, 0));
+                                if (scope is not null && bot?.LoadWeather is { } profile &&
+                                    await W(WeatherPacket(profile, 0), transferToken, () => botSessions!.IsPending(scope)))
+                                    Say($"BOT-T4 role=host load_weather=sent peer={joiner} join=0x{joinId:x8} world={BotWorld} profile={profile}");
                                 Say(FormattableString.Invariant($"JOIN 0x{joinId:x8}: Done after {tDone - tr:F2} s; waiting for Ready"));
                                 break;
                             case Protocol.JoinerReadyDown:

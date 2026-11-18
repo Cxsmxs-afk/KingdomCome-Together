@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // WO-140 -- see wo140.h.
+#include "load_sequence.h"
 #include "wo140.h"
 #include "fault_guard.h"
 
@@ -74,6 +75,7 @@ std::mutex g_calendarMu;
 calendarfollow::Follower g_follow;
 bool g_followConnection = true;
 uint64_t g_calendarEpoch = 1; // protected by g_calendarMu, including close and request validation
+uint64_t g_calendarLoadStamp = 0;
 
 bool rd(const void* p, void* out, size_t n) {
     KCDMP_FAULT_READ(site, "wo140::rd");
@@ -237,6 +239,12 @@ void on_pipe_closed() {
 void calendar_pre_update() {
     std::lock_guard<std::mutex> lk(g_calendarMu);
     if (!g_follow.on || !g_setTime) return;
+    if (loadsequence::old_generation(g_calendarLoadStamp, loadsequence::stamp())) {
+        g_follow = {};
+        loadsequence::note_stale();
+        return;
+    }
+    if (!loadsequence::calendar_allowed()) return;
     // Always ask GetGameIface again: a load can replace Calendar, or reuse it and reset its ms.
     void* cal = calendar();
     const bool first = !g_follow.verified || cal != g_follow.lastCalendar;
@@ -426,12 +434,13 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             if (mode == 0) { g_follow = {}; out[0] = 1; return kROk; }
             if (!g_followConnection || !g_setTime) return kROk;
             if (mode == 2) {
+                g_calendarLoadStamp = loadsequence::stamp();
                 g_follow = {}; g_follow.on = true; g_follow.ms = ms; g_follow.ratio = ratio; g_follow.at = GetTickCount64();
                 out[0] = 2; // Armed, deliberately not an old/menu Calendar readback.
                 logf("MP-CALENDAR prepared before load host_ms=%lld ratio=%.3f; awaiting pre_modules_update", static_cast<long long>(ms), ratio);
                 return kROk;
             }
-            if (!g_follow.on) return kROk; // An update must never resurrect a reset follower.
+            if (!g_follow.on || loadsequence::old_generation(g_calendarLoadStamp, loadsequence::stamp())) return kROk;
             if (mode == 1) { g_follow.ms = ms; g_follow.ratio = ratio; g_follow.at = GetTickCount64(); }
             void* cal = calendar(); int64_t cur = 0;
             const bool read = cal && rd(static_cast<uint8_t*>(cal) + kOffCalMs, &cur, 8);

@@ -38,7 +38,9 @@ public partial class GameBridge
         var frozen = new Wo154Rules.FrozenWatch();
         var t0 = DateTime.UtcNow;
         string told = "";
-        bool Done() => (stage == "accept" && j.LoadStarted!.Task.IsCompleted) || j.GameplayStarted!.Task.IsCompleted;
+        int unrelatedWorldAnswers = 0;
+        var gameplayStarted = j.GameplayStarted!;
+        bool Done() => (stage == "accept" && j.LoadStarted!.Task.IsCompleted) || gameplayStarted.Task.IsCompleted;
         Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: no sign of the load's {(stage == "accept" ? "start" : "end")} yet -- asking the game where it is; it is never given up while it is busy (mp_join_patient)");
         while (true)
         {
@@ -69,10 +71,27 @@ public partial class GameBridge
             switch (v)
             {
                 case Wo154Rules.JoinLoadWatch.Verdict.InWorld:
+                    if (LoadSequenceEnabled)
+                    {
+                        // A responsive old world can also look loaded during an in-world rejoin.
+                        string save = await AskModAsync("KCD2MP_Wo125LastLoaded", 4000);
+                        lock (_joinGate)
+                        {
+                            if (j.Abandoned.Task.IsCompleted || !ReferenceEquals(_jj, j) ||
+                                !_worldLoad.IsCurrent(j.LoadGeneration)) return false;
+                            if (Done()) return true;
+                            if (!save.Equals("last=" + j.Name, StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (++unrelatedWorldAnswers >= Wo154Rules.JoinLoadWatch.IdleAnswersToAbort) return false;
+                                break;
+                            }
+                            Wo124OnGameplayStarted();
+                        }
+                    }
                     Interlocked.Increment(ref _w154JoinWaitWorlds);
                     Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: the game answers from the loaded world -- the load went through (its log line came late or not at all)");
                     if (j.GameplayUtc == default) j.GameplayUtc = DateTime.UtcNow;
-                    j.GameplayStarted.TrySetResult(true);
+                    gameplayStarted.TrySetResult(true);
                     return true;
                 case Wo154Rules.JoinLoadWatch.Verdict.Abort:
                     Interlocked.Increment(ref _w154JoinWaitAborts);

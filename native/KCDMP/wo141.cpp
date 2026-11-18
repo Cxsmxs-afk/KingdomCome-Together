@@ -1,6 +1,7 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+#include "load_sequence.h"
 #include "wo141.h"
 #include "wo208.h"
 #include "wo209.h"
@@ -881,10 +882,29 @@ bool loaded_slots(void* ctx, void** s0, void** s3) {
     return rd(b, 0 * 16, s0) && rd(b, 3 * 16, s3);
 }
 
+void synchronize_load(uint64_t stamp) {
+    static uint64_t previous = 0;
+    if (previous == stamp) return;
+    if (loadsequence::old_generation(previous, stamp)) loadsequence::note_stale(g_desired.size());
+    previous = stamp;
+    for (const auto& row : g_desired) {
+        const auto& desired = row.second;
+        if (desired.held && desired.eid) npcdrive::set_activity_hold(desired.eid, false);
+    }
+    g_desired.clear();
+    g_neutralAt.clear();
+    g_neutralMark.clear();
+    g_shownUntil = -1;
+    g_applySoon = false;
+}
+
 void reconcile_tick(double now) {
-    if (!g_applyOn.load() || !g_applyArmed) return;
+    const uint64_t loadStamp = loadsequence::stamp();
+    synchronize_load(loadStamp);
+    if (!g_applyOn.load() || !g_applyArmed || !loadsequence::allowed(loadStamp, loadStamp, loadsequence::Access::Live)) return;
     const bool neutral = wo200::copy_neutral_always();
     for (auto it = g_desired.begin(); it != g_desired.end();) {
+        if (loadStamp != loadsequence::stamp()) break;
         Desired& d = it->second;
         // WO-200 II.4: a host copy (not a partner's figure) never asks the planner for anything here: its activity shows through the
         // host's rows (WO-197) and its values; its loaded state is kept equal to what the body is, so nothing is left to demand.
@@ -1323,6 +1343,7 @@ std::string status_text() {
 }
 
 void set_desired(const std::string& name, const R::Activity& a) {
+    synchronize_load(loadsequence::stamp());
     Desired& d = g_desired[lower(name.c_str())];
     d.hostNight = (a.flags & R::kFlagNightDress) != 0;   // WO-164 N
     // WO-164 S1: the seat this figure fell back from, asked again: it keeps standing beside it for a while
@@ -1498,6 +1519,7 @@ bool apply_on() { return g_applyOn.load(); }
 // body with no activity row gets "none" beside them). Empty hands put the
 // tools away (and then the entry goes, once in step).
 void set_hands(const std::string& name, const KH::Hands& h) {
+    synchronize_load(loadsequence::stamp());
     Desired& d = g_desired[lower(name.c_str())];
     if (d.name.empty()) { d.name = name; d.a = R::normalised(R::Activity{}); }
     const bool changed = !d.handsSet || d.hands != h;
@@ -1580,6 +1602,7 @@ void on_pipe_closed() {
 }
 
 uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
+    synchronize_load(loadsequence::stamp());
     *outLen = 0;
     if (!len) return kRBadRequest;
     auto name_at = [&](size_t off, std::string* nm, size_t* next) -> bool {

@@ -10,9 +10,9 @@ namespace kcdmp::timelineactions {
 // Main thread only. The edge reply proves admission before the native action
 // is due. Body identity and scope are checked again before any engine request.
 struct Scope {
-    uint64_t lifecycle = 0, connection = 0, life = 0;
+    uint64_t lifecycle = 0, connection = 0, life = 0, load = 0;
     bool operator==(Scope other) const {
-        return lifecycle == other.lifecycle && connection == other.connection && life == other.life;
+        return lifecycle == other.lifecycle && connection == other.connection && life == other.life && load == other.load;
     }
 };
 

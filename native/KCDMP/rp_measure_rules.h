@@ -39,6 +39,7 @@ struct ReceiverScope {
 struct SampleScope {
     int64_t firstByteQpc = 0;
     ReceiverScope receiver{};
+    uint64_t loadStamp = 0;
 };
 
 inline bool sample_in_window(SampleScope sample, ReceiverScope receiver, int64_t startQpc) {

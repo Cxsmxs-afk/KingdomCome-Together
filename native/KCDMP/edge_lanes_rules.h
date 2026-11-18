@@ -58,6 +58,7 @@ inline bool decode(const pipecontrol::Frame& outer, Request& out) {
     out.frame.readerLife = outer.readerLife;
     out.frame.readerGameplay = outer.readerGameplay;
     out.frame.readerObservation = outer.readerObservation;
+    out.frame.loadStamp = outer.loadStamp;
     out.frame.body.assign(bytes.begin() + kRequestHeader, bytes.end());
     return true;
 }

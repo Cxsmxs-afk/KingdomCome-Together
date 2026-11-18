@@ -19,6 +19,7 @@
 #include "wo208.h"
 #include "wo138.h"
 #include "wo216.h"
+#include "load_sequence.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -548,6 +549,7 @@ struct Order {
     int speed = 1;
     float yaw = 0;
     uint32_t seq = 0;
+    uint64_t loadStamp = 0;
     ReqX x;
     Holder owner = Holder::Route;
     void* ent = nullptr;
@@ -568,6 +570,8 @@ bool stop_order(uint8_t kind) { return kind == kOrdCancel || kind == kOrdStopPla
 
 uint32_t submit_order(uint32_t eid, Order& o) {
     if (!stop_order(o.kind)) {
+        o.loadStamp = loadsequence::stamp();
+        if (!loadsequence::allowed(o.loadStamp, o.loadStamp, loadsequence::Access::Live)) return 0;
         o.ent = engine::entity_by_id(eid);
         if (!o.ent) return 0;
     }
@@ -707,6 +711,7 @@ void ai_drain() {
                 retire_lease(eid, o.seq, o.owner);
             } else retry_stop(eid, o);
         } else if (o.kind == kOrdCancelAny) {
+            if (!loadsequence::allows(o.loadStamp, loadsequence::Access::Live)) continue;
             if (!npc || ent != o.ent || !g_armed.load(std::memory_order_relaxed) || motion_pending(eid, Holder::Route) || motion_pending(eid, Holder::Probe)) continue;
             // WO-221 C (B1d): whatever request the body's movement task holds (its paused brain's last one: the source of the joiner's
             // "Agent is stuck" lines) ends by the task's own cancel -- here, on the AI update's thread at its entry, where the engine's
@@ -735,7 +740,7 @@ void ai_drain() {
         } else {
             oc.what = npc && ent == o.ent ? kOutRefused : kOutNoNpc;
             if (oc.what == kOutNoNpc) c_noNpcAi.fetch_add(1, std::memory_order_relaxed);
-            else if (g_armed.load(std::memory_order_relaxed)) {
+            else if (g_armed.load(std::memory_order_relaxed) && loadsequence::allows(o.loadStamp, loadsequence::Access::Live)) {
                 auto permit = holders::may_place(eid, o.owner, kPath, holders::Claim::Held);
                 if (permit) {
                     bool uncertain = false;
@@ -1010,7 +1015,7 @@ float dist2d(const float* a, const float* b) { const float dx = a[0] - b[0], dy 
 // ---------------------------------------------------------------------------------------------------- WO-216 A.1: the replay (joiner)
 // The host's lines arrive off the main thread (op 163) into g_linePending; the main thread's tick moves them into g_lines, which only
 // the main thread reads (route_frame).
-struct Line { wo216rules::RouteRec rec; double at = 0; };
+struct Line { wo216rules::RouteRec rec; double at = 0; uint64_t loadStamp = 0; };
 std::mutex g_lineMu;
 std::unordered_map<uint32_t, Line> g_linePending;     // (g_lineMu)
 std::unordered_map<uint32_t, Line> g_lines;           // the main thread only
@@ -1347,6 +1352,8 @@ bool route_in(const uint8_t* b, size_t len) {
     const size_t n = b[0];
     if (len != 1 + n * (4 + kRecWire)) return false;
     const double t = now_s();
+    const uint64_t loadStamp = loadsequence::stamp();
+    if (!loadsequence::allowed(loadStamp, loadStamp, loadsequence::Access::Live)) return false;
     std::lock_guard<std::mutex> l(g_lineMu);
     for (size_t i = 0; i < n; ++i) {
         const uint8_t* q = b + 1 + i * (4 + kRecWire);
@@ -1355,6 +1362,7 @@ bool route_in(const uint8_t* b, size_t len) {
         Line ln;
         if (!eid || !rec_get(q + 4, &ln.rec)) continue;
         ln.at = t;
+        ln.loadStamp = loadStamp;
         g_linePending[eid] = ln;
         c_rpLinesIn.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1411,7 +1419,7 @@ Rp replay_frame(Route& r, const RouteIn& in, const float body[3], int& used) {
     using namespace wo216rules;
     if (take_ended(in.eid)) r.endedAt = in.now;
     auto it = g_lines.find(in.eid);
-    if (it == g_lines.end()) { if (r.replay) replay_leave(r, false); c_rpNoLine.fetch_add(1, std::memory_order_relaxed); return Rp::Fallback; }
+    if (it == g_lines.end() || it->second.loadStamp != loadsequence::stamp()) { if (r.replay) replay_leave(r, false); c_rpNoLine.fetch_add(1, std::memory_order_relaxed); return Rp::Fallback; }
     const RouteRec& L = it->second.rec;
     const bool hostActive = (L.flags & kRecActive) != 0;
     if (!line_live(hostActive, in.now - it->second.at)) {
@@ -1618,7 +1626,7 @@ RouteOut route_frame_inner(const RouteIn& in) {
     if (in.horse && !in.figure && !in.parented && wo216::on(wo216rules::kBitRiders) && wo216::on(wo216rules::kBitRouteReplay) && on(kBitRoute) &&
         g_armed.load(std::memory_order_relaxed) && in.now >= r.refusedUntil) {
         auto li = g_lines.find(in.eid);
-        horseReplay = li != g_lines.end() && (li->second.rec.flags & wo216rules::kRecActive) && (li->second.rec.flags & wo216rules::kRecGoal) &&
+        horseReplay = li != g_lines.end() && li->second.loadStamp == loadsequence::stamp() && (li->second.rec.flags & wo216rules::kRecActive) && (li->second.rec.flags & wo216rules::kRecGoal) &&
                       wo216rules::line_live(true, in.now - li->second.at);
         if (!horseReplay && r.replay) horseReplay = true;   // its replay plays out (the frame below lets it go when the line ends)
     }
@@ -1906,7 +1914,14 @@ void tick() {
             std::lock_guard<std::mutex> l(g_lineMu);
             in.swap(g_linePending);
         }
-        for (auto& kv : in) g_lines[kv.first] = kv.second;
+        static uint64_t s_loadStamp = 0;
+        const uint64_t loadStamp = loadsequence::stamp();
+        if (s_loadStamp != loadStamp) {
+            g_lines.clear();
+            s_loadStamp = loadStamp;
+        }
+        for (auto& kv : in)
+            if (loadsequence::allows(kv.second.loadStamp, loadsequence::Access::Live)) g_lines[kv.first] = kv.second;
         static double s_linePrune = 0;
         if (now - s_linePrune > 10.0) {
             s_linePrune = now;

@@ -30,6 +30,7 @@ add_library(KCDMP SHARED
     rp_timeline.cpp
     rp_controller.cpp
     rp_timeline_actions.cpp
+    load_sequence.cpp
     p5_marker.cpp
     p6_missile.cpp
     punishment.cpp

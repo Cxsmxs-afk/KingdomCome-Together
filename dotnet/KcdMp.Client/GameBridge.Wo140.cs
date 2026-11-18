@@ -81,7 +81,7 @@ public partial class GameBridge
     private bool W140VoteRequired => Wo140Rules.VoteRequired(_w140On, _combatRoleApplied, _isDamageAuthority, _sharedWorld,
                                                              JoinerSharedEffective, _joinedWorld, Wo134Peers().Count);
     private bool W140JoinBusy => _jj is not null || _joinRx is not null || _joinOutId != 0 || _leaveInProgress || _rejoinPending
-                                 || _joinFromWorldOnce || _ownLoadExpected || _rewinding || LoadGraceActive || _w211Holding;
+                                 || _joinFromWorldOnce || OwnLoadExpected || _rewinding || LoadGraceActive || LinkHeld;
     private bool Wo140SeparateNow => Wo140Rules.Separate(_combatRoleApplied, _isDamageAuthority, _hostModeKnown, _hostSharedWorld,
                                                          _where == GameWhere.World, _joinedWorld, W140JoinBusy);
     /// <summary>A shared sleep is under way on this machine (the vote's skip): toasts quiet, the host's report says sleep.</summary>

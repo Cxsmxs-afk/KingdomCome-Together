@@ -705,8 +705,9 @@ bool join_hold(bool on, double maxS) {
              g_joinDeadline - now, held_mask());
         return true;
     }
-    if (!g_joinHeld.exchange(false)) return true;
+    if (!g_joinHeld.load()) return true;
     const bool ok = call_pause(ca, false, kJoinHoldSource, false);
+    if (ok) g_joinHeld.store(false);
     logf("WO151-JOINHOLD off after %.1f s%s (held=0x%X)", now - g_joinSince, ok ? "" : " -- PauseGame FAULTED", held_mask());
     return ok;
 }
@@ -730,8 +731,8 @@ void tick() {
     }
 }
 
-void on_pipe_closed() {
-    if (g_joinHeld.load()) main_thread::post([] { logf("WO151-JOINHOLD the agent went away -- released"); join_hold(false, 0); });
+void on_pipe_closed(bool releaseLegacyHold) {
+    if (releaseLegacyHold && g_joinHeld.load()) main_thread::post([] { logf("WO151-JOINHOLD the agent went away -- released"); join_hold(false, 0); });
     if (g_on.exchange(false)) logf("WO138-SEND off (the agent went away)");
     if (g_leversOn.exchange(false)) logf("WO138-LEVERS off (the agent went away): menus pause again");
     npcdrive::set_hold_all(false);

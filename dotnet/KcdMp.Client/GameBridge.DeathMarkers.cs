@@ -70,7 +70,7 @@ public partial class GameBridge
         });
         if (ExecutionContext.IsFlowSuppressed()) Start(); else { using (ExecutionContext.SuppressFlow()) Start(); }
     }
-    private uint P5LoadedWorld => _combatRoleApplied && _where == GameWhere.World && !_ownLoadExpected && !_loadGraceOwn
+    private uint P5LoadedWorld => _combatRoleApplied && _where == GameWhere.World && !OwnLoadExpected && !LoadGraceOwn && (!LoadSequenceEnabled || !LinkHeld)
         ? _isDamageAuthority && _sharedWorld ? _w206.World
           : _joinedWorld ? _jj is { InWorld: true } j ? j.HostWorldEpoch : _t3JoinedHostWorld : 0 : 0;
 
@@ -226,9 +226,17 @@ public partial class GameBridge
     private async Task<bool> P5LoadGameAsync(int playline, string name, string reason, CancellationToken ct = default)
     {
         if (ct == default) ct = _wo122Ct;
-        bool previousOwn = _ownLoadExpected, previousGrace = _loadGraceOwn, submitted = false;
         bool own = reason is "leave-command" or "exit-to-menu";
-        if (own) _ownLoadExpected = true; // the P1 pending mode must already know this is the private-world load
+        bool previousOwn = _ownLoadExpected, previousGrace = _loadGraceOwn, submitted = false;
+        var previous = _worldLoad.Current;
+        WorldLoadSnapshot prepared = previous;
+        if (own) // the P1 pending mode must already know this is the private-world load
+        {
+            if (!LoadSequenceEnabled) _ownLoadExpected = true;
+            else if (!_worldLoad.SetOwnIntent(previous.Generation, WorldLoadOwnIntent.ExpectedPrivate, out prepared, out previous))
+                return false;
+            else _ = LoadSequenceSyncNativeAsync();
+        }
         try
         {
             P5RetireOperations();
@@ -236,6 +244,15 @@ public partial class GameBridge
             ulong generation = P1Lifecycle.Current.Generation; long serial = Interlocked.Read(ref _p5ScopeSerial);
             string lua = $"if KCD2MP and KCD2MP.hostAuthority and tostring(KCD2MP.hostAuthority.generation)==\"{generation}\" and KCD2MP_Wo124LoadGame then KCD2MP_Wo124LoadGame({playline},\"{EscapeLua(name)}\",\"{EscapeLua(reason)}\") end";
             if (generation != P1Lifecycle.Current.Generation || serial != Interlocked.Read(ref _p5ScopeSerial)) return false;
+            if (LoadSequenceEnabled)
+            {
+                // The offer or private intent must already have closed the
+                // DLL before the actual engine load is requested.
+                if (!await LoadSequenceSyncNativeAsync()) return false;
+                var current = _worldLoad.Current;
+                if (current.Generation != prepared.Generation || current.OwnIntentRevision != prepared.OwnIntentRevision) return false;
+                LoadSequenceBeginLoad();
+            }
             var loadLife = CancellationTokenSource.CreateLinkedTokenSource(ct); _p5LoadLife = loadLife;
             _p5RebindAfterLoad = true; _p5LoadToPrivate = own;
             if (own) _w207LeaveTarget = name;
@@ -244,7 +261,11 @@ public partial class GameBridge
         }
         finally
         {
-            if (!submitted) { _ownLoadExpected = previousOwn; _loadGraceOwn = previousGrace; }
+            if (!submitted)
+            {
+                if (!LoadSequenceEnabled) { _ownLoadExpected = previousOwn; _loadGraceOwn = previousGrace; }
+                else if (own && _worldLoad.TryRestoreOwnIntent(prepared, previous)) _ = LoadSequenceSyncNativeAsync();
+            }
         }
     }
 }

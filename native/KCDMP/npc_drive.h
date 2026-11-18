@@ -89,7 +89,7 @@ uint8_t on_timed_pose(const uint8_t* body, size_t len, rpmeasure::SampleScope re
 uint8_t configure_timeline(uint8_t on);
 uint8_t authorize_remote_relocation(const uint8_t* body, size_t len, rpmeasure::SampleScope reader);
 // 0x12: [ms:2][nameLen:1][name]
-uint8_t on_hold(const uint8_t* body, size_t len);
+uint8_t on_hold(const uint8_t* body, size_t len, uint64_t loadStamp);
 // 0x13: [nativeOn:1][senderClockOn:1]
 uint8_t on_config(const uint8_t* body, size_t len);
 // The agent disconnected: every binding is dropped (no stream will follow).

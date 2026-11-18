@@ -581,11 +581,17 @@ public partial class GameBridge
     private async Task Wo151JoinHoldAsync(HostJoin j, bool on)
     {
         if (on && !_w151JoinHold) return;
-        if (!on && !j.EngineHeld) return;
+        if (!on && !j.EngineHeld && (!LoadSequenceEnabled || j.Sender is null)) return;
         // the DLL's own deadline: the join's timeout and a margin (it releases the world itself after that)
         ushort maxS = (ushort)Math.Clamp(_joinTimeoutS + 60, 60, 900);
         bool? held = null;
-        try { held = await _combat.Wo151JoinHoldAsync(on, maxS); } catch { }
+        try
+        {
+            held = LoadSequenceEnabled
+                ? await LoadSequenceHostOfferAsync(j.JoinId, on, maxS)
+                : await _combat.Wo151JoinHoldAsync(on, maxS);
+        }
+        catch { }
         if (on)
         {
             j.EngineHeld = held == true;
@@ -595,7 +601,10 @@ public partial class GameBridge
         else
         {
             j.EngineHeld = false;
-            Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: the engine's hold {(held is not null ? "released" : "release unanswered (the DLL's deadline releases it)")}");
+            string release = LoadSequenceEnabled
+                ? held == true ? "release accepted by the DLL" : "release unanswered (the DLL's deadline releases it)"
+                : held is not null ? "released" : "release unanswered (the DLL's deadline releases it)";
+            Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: the engine's hold {release}");
         }
     }
 

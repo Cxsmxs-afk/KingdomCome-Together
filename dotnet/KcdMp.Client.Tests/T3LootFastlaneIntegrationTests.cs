@@ -298,6 +298,54 @@ public class T3LootFastlaneIntegrationTests
     }
 
     [Fact]
+    public async Task The_load_sequence_retires_an_admitted_inventory_frame_before_another_world_can_apply_it()
+    {
+        var entered = Signal();
+        var release = Signal();
+        var game = new Game(async (text, _) =>
+        {
+            if (text.Contains("W134ItemResult(\"1\"")) { entered.TrySetResult(); await release.Task; }
+        });
+        await using var transport = new HttpGameTransport("http://localhost:1403", 30000, game);
+        var bridge = Bridge(transport);
+        var load = Get<WorldLoadSequence>(bridge, "_worldLoad");
+        Assert.True(load.TryBegin(0, WorldLoadStart.AdoptLoadedWorld, 7));
+        Set(bridge, "_loadSequenceRuntime", true);
+        using var stop = new CancellationTokenSource();
+        using var wire = new WireStream();
+        Task receive = Receive(bridge, wire, stop.Token);
+        try
+        {
+            wire.Feed(Answer(1));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            long waiting = Wo207Trace.WaitingTotal;
+            wire.Feed(Answer(2));
+            await Wait(() => Wo207Trace.WaitingTotal == waiting + 1);
+
+            Call(bridge, "LoadSequenceBeginLoad", false);
+            var active = load.Current;
+            Assert.Equal((2ul, WorldLoadPhase.Load), (active.Generation, active.Phase));
+            Assert.True(load.TryAdvance(active.Generation, WorldLoadPhase.Reconstruct));
+            Assert.True(load.TryAdvance(active.Generation, WorldLoadPhase.Settle));
+            Assert.True(load.TryAdvance(active.Generation, WorldLoadPhase.Play));
+            release.TrySetResult();
+            wire.Feed(Answer(3));
+
+            await Wait(() => game.Loot.Any(text => text.Contains("W134ItemResult(\"3\"")));
+            Assert.DoesNotContain(game.Loot, text => text.Contains("W134ItemResult(\"2\""));
+            Assert.Equal(1, Get<long>(bridge, "_staleGenerationDropped"));
+            Assert.Equal(0, Get<long>(bridge, "_loadScopeDropped"));
+        }
+        finally
+        {
+            release.TrySetResult();
+            wire.End();
+            await receive.WaitAsync(TimeSpan.FromSeconds(3));
+            stop.Cancel();
+        }
+    }
+
+    [Fact]
     public async Task Immediate_host_requests_carry_the_captured_generation_and_keep_take_put_argument_positions()
     {
         var game = new Game(); await using var transport = new HttpGameTransport("http://localhost:1403", 5000, game);

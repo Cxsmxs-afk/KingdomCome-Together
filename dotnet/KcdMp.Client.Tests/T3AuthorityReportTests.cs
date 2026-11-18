@@ -20,7 +20,8 @@ public class T3AuthorityReportTests
         var body = new byte[header[1] | header[2] << 8]; await stream.ReadExactlyAsync(body, ct); return body;
     }
     private static async Task Reply(Stream stream, byte seq, byte op, CancellationToken ct, bool truncated = false,
-        bool worldStats = false, int statsFields = 30, bool timeline = false, bool controller = false, bool combat = false, bool refused = false)
+        bool worldStats = false, int statsFields = 30, bool timeline = false, bool controller = false, bool combat = false,
+        bool load = false, bool refused = false)
     {
         byte[] payload = op == Protocol.Wo216OpBrains ? Encoding.ASCII.GetBytes(truncated ? "B decision_blocked=999 npc_hidden=999" : Snapshot) : [];
         if (worldStats)
@@ -29,10 +30,11 @@ public class T3AuthorityReportTests
             payload = new byte[2 + count * 9]; payload[0] = 1; payload[1] = (byte)count;
             for (int i = 0; i < count; i++) { payload[2 + i * 9] = (byte)i; BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(3 + i * 9), (ulong)(10 + i)); }
         }
-        if (timeline || controller || combat)
+        if (timeline || controller || combat || load)
         {
             ulong[] values = timeline ? [86, 42, 2, 18, 360, 4] : controller
-                ? [1500, 1499, 1, 2, 3, 4, 5, 6, 7, 8, 0, 199, 1, 301508] : [20, 19, 0, 24, 19, 3, 0, 81, 2, 1];
+                ? [1500, 1499, 1, 2, 3, 4, 5, 6, 7, 8, 0, 199, 1, 301508] : combat
+                ? [20, 19, 0, 24, 19, 3, 0, 81, 2, 1] : [1, 5, 11, 22, 333, 444, 555, 666, 0, 3, 9];
             payload = new byte[2 + values.Length * 9]; payload[0] = 1; payload[1] = (byte)values.Length;
             for (int i = 0; i < values.Length; i++)
             {
@@ -64,8 +66,10 @@ public class T3AuthorityReportTests
     [InlineData(false, 2, false, 55, true)]
     [InlineData(true, 1, false, 55, true, true)]
     [InlineData(false, 2, false, 55, true, true)]
+    [InlineData(true, 1, false, 55, true, true, true)]
+    [InlineData(false, 2, false, 55, true, true, true)]
     public async Task Both_roles_mirror_complete_snapshots_and_preserve_old_gauges_when_native_status_is_truncated(bool host, byte role,
-        bool truncated, int statsFields, bool controllerSupported = false, bool combatSupported = false)
+        bool truncated, int statsFields, bool controllerSupported = false, bool combatSupported = false, bool loadSupported = false)
     {
         string name = "t3r-" + Guid.NewGuid().ToString("N")[..16];
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -78,6 +82,13 @@ public class T3AuthorityReportTests
         Set(b, "_combat", pipe); Set(b, "_combatRoleApplied", true); Set(b, "_isDamageAuthority", host);
         Set(b, "_sharedWorld", true); Set(b, "_hostAuthority", true); Set(b, "_joinedWorld", true);
         Set(b, "_hostModeKnown", true); Set(b, "_hostSharedWorld", true);
+        if (loadSupported)
+        {
+            Set(b, "_loadSequenceRuntime", true);
+            Set(b, "_staleGenerationDropped", 2L);
+            var load = (WorldLoadSequence)typeof(GameBridge).GetField("_worldLoad", Private)!.GetValue(b)!;
+            Assert.True(load.TryBegin(0, WorldLoadStart.AdoptLoadedWorld, hostWorld: 58));
+        }
         var counters = (ConcurrentDictionary<string, long>)typeof(GameBridge).GetField("_t3Counters", Private)!.GetValue(b)!;
         counters["postload_timeouts"] = 3;
         counters["decision_blocked"] = 9; counters["npc_hidden"] = 8;
@@ -109,12 +120,35 @@ public class T3AuthorityReportTests
             await Reply(server, 5, Protocol.T3OpStats, stop.Token, combat: combatSupported, refused: !combatSupported);
             mirrorSequence++;
         }
+        if (combatSupported)
+        {
+            Assert.Equal(new byte[] { Protocol.T3OpStats, Protocol.T3LoadStatsCommand }, await Read(server, stop.Token));
+            await Reply(server, mirrorSequence++, Protocol.T3OpStats, stop.Token, load: loadSupported, refused: !loadSupported);
+        }
+        if (loadSupported)
+        {
+            var loadMirror = await Read(server, stop.Token);
+            Assert.Equal(new byte[] { Protocol.T3OpStats, Protocol.T3LoadStatsCommand, role }, loadMirror[..3]);
+            var part = Encoding.ASCII.GetString(loadMirror, 3, loadMirror.Length - 3);
+            Assert.Contains("load_gen=1 ", part);
+            Assert.Contains("load_host_world=58 ", part);
+            Assert.Contains("load_phase=5 ", part);
+            Assert.Contains("load_phase_ms_menu=", part);
+            Assert.Contains("load_native_phase_ms_load=333 ", part);
+            Assert.Contains("load_phase_native=5 ", part);
+            Assert.Contains("load_native_observations=9 ", part);
+            Assert.Contains("stale_gen_dropped=2 ", part);
+            Assert.EndsWith("stale_gen_native_dropped=3", part);
+            Assert.DoesNotContain("owner_violations=", part);
+            await Reply(server, mirrorSequence++, Protocol.T3OpStats, stop.Token);
+        }
         var mirror = await Read(server, stop.Token);
         Assert.Equal(Protocol.T3OpStats, mirror[0]); Assert.Equal(role, mirror[1]);
         Assert.InRange(mirror.Length, 4, 6402); // actual complete generic body, including op and role
         string fields = Encoding.ASCII.GetString(mirror, 2, mirror.Length - 2);
         Assert.InRange(fields.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length, 1, 160);
         Assert.True(T3AuthorityCounters.TryRead(fields, out var actual));
+        Assert.DoesNotContain("load_phase=", fields);
         Assert.Equal(truncated ? 9 : 44, actual["decision_blocked"]);
         Assert.Equal(truncated ? 8 : 60, actual["npc_hidden"]);
         Assert.Contains("postload_timeouts=3", fields);

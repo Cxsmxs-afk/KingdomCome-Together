@@ -37,7 +37,7 @@ public class ProcessorPipeTests
     {
         await using var pipe = new CombatPipe("kcdmp-p0-" + Guid.NewGuid().ToString("N"));
         using var caller = new CancellationTokenSource();
-        var gate = Gate(pipe, "_gate");
+        var gate = Gate(pipe, "_connectLock");
         await gate.WaitAsync();
         Task<bool>? request = null;
         try

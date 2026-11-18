@@ -103,6 +103,7 @@ public partial class GameBridge
                 {
                     try
                     {
+                        LoadSequenceTick();
                         // Native work spawned by replay inherits this receive lease;
                         // EOF revokes it before a queued late write can reach the game.
                         await ProcessorFrameScope.RunAsync(_ =>
@@ -174,6 +175,7 @@ public partial class GameBridge
             IReadOnlyDictionary<string, long>? timelineSnapshot = null;
             IReadOnlyDictionary<string, long>? controllerSnapshot = null;
             IReadOnlyDictionary<string, long>? combatSnapshot = null;
+            IReadOnlyDictionary<string, long>? loadSnapshot = null;
             if (role != 0)
             {
                 var result = await ProcessorFrameScope.RunAsync(async token =>
@@ -216,9 +218,11 @@ public partial class GameBridge
                     controllerSnapshot = await T3ReadNativePageAsync(Protocol.T3ControllerStatsCommand, T3NativeCounters.TryReadController, ct);
                 if (controllerSnapshot is not null)
                     combatSnapshot = await T3ReadNativePageAsync(Protocol.T3CombatStatsCommand, T3NativeCounters.TryReadCombat, ct);
+                if (combatSnapshot is not null)
+                    loadSnapshot = await T3ReadNativePageAsync(Protocol.T3LoadStatsCommand, T3NativeCounters.TryReadLoad, ct);
             }
             ct.ThrowIfCancellationRequested();
-            T3EmitStats(role, ct, nativeSnapshot, timelineSnapshot, controllerSnapshot, combatSnapshot);
+            T3EmitStats(role, ct, nativeSnapshot, timelineSnapshot, controllerSnapshot, combatSnapshot, loadSnapshot);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex) { Console.WriteLine($"MP-T3-STATS report unavailable: {ex.GetType().Name}"); }
@@ -242,7 +246,7 @@ public partial class GameBridge
 
     private void T3EmitStats(byte role, CancellationToken ct, IReadOnlyDictionary<string, long>? nativeSnapshot,
         IReadOnlyDictionary<string, long>? timelineSnapshot, IReadOnlyDictionary<string, long>? controllerSnapshot,
-        IReadOnlyDictionary<string, long>? combatSnapshot)
+        IReadOnlyDictionary<string, long>? combatSnapshot, IReadOnlyDictionary<string, long>? loadSnapshot)
     {
         foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(T3LootCounters.CorpseKeys).Concat(T3RangedKeys).Concat(new[] {
             "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable", "corpse_lua_stats_unreadable" }))
@@ -267,20 +271,60 @@ public partial class GameBridge
         if (timelineSnapshot is not null) counters = counters.Concat(timelineSnapshot);
         if (controllerSnapshot is not null) counters = counters.Concat(controllerSnapshot);
         if (combatSnapshot is not null) counters = counters.Concat(combatSnapshot);
-        string fields = string.Join(' ', counters.OrderBy(p => p.Key, StringComparer.Ordinal)
-            .Select(p => p.Key + "=" + p.Value.ToString(CultureInfo.InvariantCulture)));
-        Console.WriteLine($"MP-T3-STATS origin=agent role={(role == 1 ? "host" : role == 2 ? "joiner" : "off")} {fields}");
-        if (role != 0) _ = T3SendNativeStatsAsync(role, fields, ct);
+        string fields = T3FormatStats(counters);
+        string roleName = role == 1 ? "host" : role == 2 ? "joiner" : "off";
+        string? loadFields = T3LoadStats(loadSnapshot);
+        if (loadFields is not null)
+            Console.WriteLine($"MP-T3-STATS origin=agent role={roleName} section=load {loadFields}");
+        Console.WriteLine($"MP-T3-STATS origin=agent role={roleName} {fields}");
+        if (role != 0) _ = T3SendNativeStatsAsync(role, fields, loadSnapshot is null ? null : loadFields, ct);
     }
 
-    private async Task T3SendNativeStatsAsync(byte role, string fields, CancellationToken ct)
+    private static string T3FormatStats(IEnumerable<KeyValuePair<string, long>> counters) =>
+        string.Join(' ', counters.OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => pair.Key + "=" + pair.Value.ToString(CultureInfo.InvariantCulture)));
+
+    private string? T3LoadStats(IReadOnlyDictionary<string, long>? native)
+    {
+        var fields = new Dictionary<string, long>(StringComparer.Ordinal);
+        if (native is not null)
+            foreach (var (key, value) in native)
+                fields.Add(key, value);
+
+        if (LoadSequenceEnabled)
+        {
+            var before = _worldLoad.Current;
+            var durations = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var phase in Enum.GetValues<WorldLoadPhase>())
+                durations.Add("load_phase_ms_" + phase.ToString().ToLowerInvariant(), _worldLoad.PhaseMilliseconds(phase));
+            var after = _worldLoad.Current;
+            if (before.Generation == after.Generation && before.Phase == after.Phase)
+            {
+                fields.Add("load_gen", (long)Math.Min(after.Generation, (ulong)long.MaxValue));
+                fields.Add("load_host_world", after.HostWorld);
+                fields.Add("load_phase", (long)after.Phase);
+                foreach (var (key, value) in durations) fields.Add(key, value);
+            }
+            fields.Add("stale_gen_dropped", Interlocked.Read(ref _staleGenerationDropped));
+        }
+
+        return fields.Count == 0 ? null : T3FormatStats(fields);
+    }
+
+    private async Task T3SendNativeStatsAsync(byte role, string fields, string? loadFields, CancellationToken ct)
+    {
+        if (loadFields is not null) await T3MirrorStatsAsync(role, loadFields, ct, load: true);
+        await T3MirrorStatsAsync(role, fields, ct, load: false);
+    }
+
+    private async Task T3MirrorStatsAsync(byte role, string fields, CancellationToken ct, bool load)
     {
         try
         {
             using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
             stop.CancelAfter(2000);
             byte[] text = Encoding.ASCII.GetBytes(fields);
-            byte[] payload = new byte[text.Length + 1]; payload[0] = role; text.CopyTo(payload, 1);
+            byte[] payload = load ? [Protocol.T3LoadStatsCommand, role, .. text] : [role, .. text];
             var reply = await _combat.Wo163Async(Protocol.T3OpStats, payload, stop.Token);
             if (reply is not { Ok: true })
                 Console.WriteLine("MP-T3-STATS native mirror unavailable: no accepted reply");

@@ -87,8 +87,6 @@ public class T3ConnectionLifetimeTests
     {
         private readonly GameBridge _bridge;
         private readonly Type _type = typeof(GameBridge).GetNestedType("InFrame", BindingFlags.NonPublic)!;
-        private static readonly object NoPresentation =
-            Activator.CreateInstance(typeof(GameBridge).GetNestedType("PresentationFrame", BindingFlags.NonPublic)!)!;
         public readonly object Reader, Writer;
         public Frames(GameBridge bridge)
         {
@@ -99,14 +97,11 @@ public class T3ConnectionLifetimeTests
             Writer = channel.GetType().GetProperty("Writer")!.GetValue(channel)!;
             Set(bridge, "_frameWriter", Writer);
         }
-        public void Send(int kind, byte[] payload)
-        {
-            object frame = Activator.CreateInstance(_type, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+        private object Frame(int kind, byte[] payload) =>
+            Activator.CreateInstance(_type, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
                 null, [kind, payload, Stopwatch.GetTimestamp(), 0u], null)!;
-            Assert.True((bool)Call(_bridge, "Wo207Queue", Writer, frame, kind)!);
-        }
-        public void Coalesce(byte ghost) => Assert.True((bool)Call(_bridge, "Wo202Coalesce", Writer, (int)Protocol.Ghost,
-            new byte[] { ghost }, Stopwatch.GetTimestamp(), 0u, NoPresentation)!);
+        public void Send(int kind, byte[] payload) => Assert.True((bool)Call(_bridge, "Wo207Queue", Writer, Frame(kind, payload), kind)!);
+        public void Coalesce(byte ghost) => Assert.True((bool)Call(_bridge, "Wo202Coalesce", Writer, Frame(Protocol.Ghost, [ghost]))!);
         public Task Run(CancellationToken token) => (Task)Call(_bridge, "ProcessFramesAsync", Reader, token)!;
     }
 

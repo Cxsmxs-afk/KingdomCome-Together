@@ -1132,6 +1132,7 @@ public partial class GameBridge(ClientConfig config)
 
     public async Task RunAsync(CancellationToken ct = default)
     {
+        _loadSequenceRuntime = true;
         var http = new HttpGameTransport(config.GameApiBase) { RetryBatches = config.BatchRetryEnabled };   // WO-153 3
         await http.StartAsync(ct);
         _transport = http;
@@ -1362,7 +1363,7 @@ public partial class GameBridge(ClientConfig config)
 
             if (ct.IsCancellationRequested) break;
             int reconnectMs = Wo211ReconnectDelayMs();   // WO-211 A.1: growing gaps while a link hold runs, 3 s otherwise
-            Console.WriteLine(FormattableString.Invariant($"Reconnecting in {reconnectMs / 1000.0:0.#} s...{(_w211Holding ? " (WO-211 link hold)" : "")}"));
+            Console.WriteLine(FormattableString.Invariant($"Reconnecting in {reconnectMs / 1000.0:0.#} s...{(LinkHeld ? " (WO-211 link hold)" : "")}"));
             Console.WriteLine();
             await Task.Delay(reconnectMs, ct).ContinueWith(_ => { });
         }
@@ -1388,9 +1389,11 @@ public partial class GameBridge(ClientConfig config)
                     menuSaid = true;
                     _where = GameWhere.Menu;
                     _startedAtMenu = true;
+                    LoadSequenceObservePlace(GameWhere.Menu);
                     return;
                 }
                 Console.WriteLine("Game ready!");
+                LoadSequenceObservePlace(GameWhere.World);
                 return;
             }
             // WO-124: a joiner waits at the MAIN MENU for its host's world, and
@@ -1404,6 +1407,7 @@ public partial class GameBridge(ClientConfig config)
                 menuSaid = true;
                 _where = GameWhere.Menu;
                 _startedAtMenu = true;
+                LoadSequenceObservePlace(GameWhere.Menu);
                 return;
             }
             await Task.Delay(3000, ct).ContinueWith(_ => { });
@@ -1971,6 +1975,7 @@ public partial class GameBridge(ClientConfig config)
             tailForPause.LoadStarted += Wo206OnLoadStarted;          // WO-206 C: the digest sweep stops through a load
             tailForPause.GameplayStarted += Wo206OnGameplayStarted;  // WO-206 C: a new world epoch, the keyspace again
             tailForPause.GameplayStarted += Wo124OnGameplayStarted;  // WO-124: the joiner's load finished
+            tailForPause.LoadReconstructionStarted += LoadSequenceOnReconstruction;
             tailForPause.QuestLine += Wo137OnQuestLine;              // WO-137: dialogue lines (talking), player switches
             tailForPause.Wo144Line += Wo144OnEngineLine;             // WO-144: the engine's own reasons (refusals, dropped talks, scenes)
             tailForPause.LoadStarted += Wo124OnLoadStarted;          // WO-124
@@ -2442,6 +2447,7 @@ public partial class GameBridge(ClientConfig config)
                 tailForPause2.GameplayStarted -= Wo123OnGameplayStarted; // WO-123
                 tailForPause2.LoadStarted -= Wo123OnLoadStarted;         // WO-123
                 tailForPause2.GameplayStarted -= Wo124OnGameplayStarted; // WO-124
+                tailForPause2.LoadReconstructionStarted -= LoadSequenceOnReconstruction;
                 tailForPause2.QuestLine -= Wo137OnQuestLine;              // WO-137
                 tailForPause2.Wo144Line -= Wo144OnEngineLine;             // WO-144
                 tailForPause2.LoadStarted -= Wo124OnLoadStarted;         // WO-124
@@ -2460,6 +2466,7 @@ public partial class GameBridge(ClientConfig config)
             _sendHorseInfo = null;
             _sendCombatEvent = null;
             _sendWeather = null;
+            Interlocked.Exchange(ref _loadWeatherArm, null);
             _sendItemDrop = null;
             _sendItemClaim = null;
             Wo121OnDisconnect();   // WO-121
@@ -2526,7 +2533,7 @@ public partial class GameBridge(ClientConfig config)
             // peer's ghost removal is the RELAY's Disconnect broadcast, and the
             // local NPCs resume through Lua's own silence path (release +
             // dwell), which needs no agent.
-            if (_w211Holding) Console.WriteLine("The host's figure stays through the link hold (WO-211 A.1)...");
+            if (LinkHeld) Console.WriteLine("The host's figure stays through the link hold (WO-211 A.1)...");
             else
             {
                 Console.WriteLine("Removing all ghosts (sent now, not batched -- WO-110 R11)...");
@@ -4136,14 +4143,7 @@ public partial class GameBridge(ClientConfig config)
     {
         try
         {
-            var nameBytes = Encoding.UTF8.GetBytes(profile);
-            var packet = new byte[3 + 1 + nameBytes.Length + 2];
-            packet[0] = Protocol.WeatherUp;
-            BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(1), (ushort)(1 + nameBytes.Length + 2));
-            packet[3] = (byte)nameBytes.Length;
-            nameBytes.CopyTo(packet, 4);
-            BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(4 + nameBytes.Length), blendSec);
-            await WritePacketAsync(stream, packet, ct);
+            await WritePacketAsync(stream, BuildWeatherPacket(profile, blendSec), ct);
             Console.WriteLine($"[weather] sent profile '{profile}' blend={blendSec}");
         }
         catch (Exception ex) { Console.WriteLine($"[weather] send failed: {ex.Message}"); }
@@ -4708,6 +4708,9 @@ public partial class GameBridge(ClientConfig config)
     /// at that moment (Wo206StampAtRead); 0 = none.</summary>
     private readonly record struct InFrame(int Type, byte[] Payload, long Arrival, uint Stamp)
     {
+        public bool LoadScoped { get; init; }
+        public ulong LoadGeneration { get; init; }
+        public CancellationToken LoadCancellation { get; init; }
         public PresentationFrame Presentation { get; init; }
         public ulong LootGeneration { get; init; }
         public long TeleportLifeRevision { get; init; }
@@ -4812,6 +4815,7 @@ public partial class GameBridge(ClientConfig config)
                 await ReadExactAsync(stream, payload, ct);
                 ct.ThrowIfCancellationRequested();
                 long arrival   = Stopwatch.GetTimestamp();
+                var load = LoadSequenceCapture();
                 byte[] wirePayload = payload;
                 int wireBytes  = payloadLen + 3;
                 if (!PresentationReadFrame(presentationSession, ref type, ref payload, arrival, out var presentation, ct)) continue;
@@ -4845,10 +4849,17 @@ public partial class GameBridge(ClientConfig config)
                 if (W202("ping_network") && Wo202TakeAtRead(type, payload)) continue;   // WO-202 III.2: the network's answers, never behind the queue
                 if (Wo206TakeAtRead(type, payload)) continue;   // WO-206 E: an epoch is known from the frame it arrives in, never behind the queue
                 uint stamp = Wo206StampAtRead(payload);         // WO-206 E: the world epoch this frame was sent under
-                NotePresentationRelocationAtRead(presentationSession, type, payload, arrival, stamp);
+                var inFrame = new InFrame(type, payload, arrival, stamp)
+                {
+                    LoadScoped = LoadSequenceEnabled && LoadSequenceWorldFrame(type, payload),
+                    LoadGeneration = load.Generation, LoadCancellation = load.Token,
+                    Presentation = presentation, MarkerPeerSerial = markerPeer
+                };
+                if (!LoadSequenceFrameCurrent(inFrame)) continue;
+                if (LoadSequenceWritable) NotePresentationRelocationAtRead(presentationSession, type, payload, arrival, stamp);
                 if (p6Frame)
                 {
-                    Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp)
+                    Wo207Queue(frames.Writer, inFrame with
                     {
                         P6Generation = p6State.Generation, P6Serial = p6Serial, P6Life = p6Life,
                         P6PeerSerial = P6PeerAtRead(type, payload), P6Deadline = p6Deadline,
@@ -4860,17 +4871,18 @@ public partial class GameBridge(ClientConfig config)
                 if (T3TpTakeAtRead(type, payload, stamp)) continue;
                 if (T3LootType(type))
                 {
-                    Wo207Queue(lootLane.Writer, new InFrame(type, payload, arrival, stamp) { LootGeneration = P1Lifecycle.Current.Generation }, type);
+                    var loot = inFrame with { LootGeneration = P1Lifecycle.Current.Generation };
+                    if (!LoadSequenceEnabled || !Wo136Defer(loot)) Wo207Queue(lootLane.Writer, loot, type);
                     continue;
                 }
-                if (T3TryDeferSideChannel(new InFrame(type, payload, arrival, stamp))) continue;
-                if (Wo147IsLeashFrame(type)) { leashLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp) { TeleportLifeRevision = Interlocked.Read(ref _t3InputLifeRevision), TeleportGeneration = P1Lifecycle.Current.Generation }); continue; }
-                if (type == Protocol.ConvDown && W207("conv_lane")) { convLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }   // WO-207 A.1
+                if (T3TryDeferSideChannel(inFrame)) continue;
+                if (Wo147IsLeashFrame(type)) { leashLane.Writer.TryWrite(inFrame with { TeleportLifeRevision = Interlocked.Read(ref _t3InputLifeRevision), TeleportGeneration = P1Lifecycle.Current.Generation }); continue; }
+                if (type == Protocol.ConvDown && W207("conv_lane")) { convLane.Writer.TryWrite(inFrame); continue; }   // WO-207 A.1
                 if ((type == Protocol.ActivityHostDown || type == Protocol.ActivityExtraDown) && W207("queue_decouple"))   // WO-207 B.3
-                { actLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
-                FeedNativeAtRead(type, payload, arrival, presentation: presentation);
-                if (W202("net_game_queue") && Wo202Coalesce(frames.Writer, type, payload, arrival, stamp, presentation)) continue;   // WO-202 III.1: a waiting state is replaced
-                Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp) { MarkerPeerSerial = markerPeer, Presentation = presentation }, type);   // WO-207 B.1
+                { actLane.Writer.TryWrite(inFrame); continue; }
+                if (LoadSequenceWritable) FeedNativeAtRead(type, payload, arrival, presentation: presentation);
+                if (W202("net_game_queue") && Wo202Coalesce(frames.Writer, inFrame)) continue;   // WO-202 III.1: a waiting state is replaced
+                Wo207Queue(frames.Writer, inFrame, type);   // WO-207 B.1
             }
         }
         catch (OperationCanceledException) { }
@@ -4973,10 +4985,12 @@ public partial class GameBridge(ClientConfig config)
                 Wo206NoteProcessorOn(frame.Type);
                 try
                 {
+                    if (!LoadSequenceFrameCurrent(frame)) continue;
+                    using var loadLife = LoadSequenceLink(frame, ct);
                     var result = await ProcessorFrameScope.RunAsync(token => ProcessFrameCoreAsync(frame, token, accounting),
-                        Volatile.Read(ref _t3ProcFrameTimeoutMs), ct);
+                        Volatile.Read(ref _t3ProcFrameTimeoutMs), loadLife?.Token ?? ct);
                     T3FrameResult(frame.Type, result);
-                    if (result.Status == ProcessorFrameScope.Outcome.SessionCancelled) return;
+                    if (result.Status == ProcessorFrameScope.Outcome.SessionCancelled && ct.IsCancellationRequested) return;
                 }
                 finally
                 {
@@ -6233,6 +6247,12 @@ public partial class GameBridge(ClientConfig config)
         if (name == "edge_mode" || name == "edge_probe" || name == "edge_lanes")
         {
             EdgeOnGameEvent(name, arg);
+            return;
+        }
+
+        if (name == "test_load_weather")
+        {
+            LoadWeatherOnGameEvent(arg);
             return;
         }
 
@@ -7608,7 +7628,7 @@ public partial class GameBridge(ClientConfig config)
     public static bool IsMenuSafeLua(string lua) => MenuSafeLua.IsMatch(lua);
 
     private static readonly System.Text.RegularExpressions.Regex MenuSafeLua = new(
-        @"^(if )?KCD2MP_(Wo12[1-5]|Join|HostOnlyLock|HostAuthority|EmitEvent|SetHitSensor|WorldSavedIn|SaveRefused|SaveLeak|W154VoiceState|W207KeepAwake|W217LootReset|T3ReportCfg)|^if KCD2MP_Wo12[45]|^System\.LogAlways",
+        @"^(if )?KCD2MP_(Wo12[1-5]|Join|HostOnlyLock|HostAuthority|LoadSequence|EmitEvent|SetHitSensor|WorldSavedIn|SaveRefused|SaveLeak|W154VoiceState|W207KeepAwake|W217LootReset|T3ReportCfg)|^if KCD2MP_Wo12[45]|^System\.LogAlways",
         System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     // WO-110 R9: the client side of the framing-drop counters (the relay has
