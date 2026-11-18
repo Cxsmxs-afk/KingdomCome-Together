@@ -436,11 +436,11 @@ def host_ready(timeout):
     return False
 
 
-def join_from_menu(cid, p, st, key, port):
+def join_from_menu(cid, p, st, key, port, *, wait_host=host_ready):
     """The launcher's joiner (WO-140 / WO-159): the game stays at its main menu; CONNECT once the host is in (the WO-154
     gate), inject, verify, the agent; then the first-join answer the menu's Join gives ("bring": the joiner's own save,
     seeded into its own saves folder, is the Henry source)."""
-    if not host_ready(300):
+    if not wait_host(300):
         rig.say('copy', cid, 'the host never became the authority'); return 1
     rig.note('joiner-gate-open', copy=cid)
     if not inject_verify(cid, p, st, key): return 1
