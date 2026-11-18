@@ -109,6 +109,9 @@ public static class Wo171Rules
         return $"kct_{ColourLetters[i / Frames]}{i % Frames}{RevSuffix[rev]}";
     }
 
+    public static int PictureSlot(int code) => code is >= 1 and <= Colours * Frames * Revisions
+        ? (code - 1) / Frames % Colours + 1 : 0;
+
     /// <summary>
     /// The pictures the pak must hold, each as <c>kct_&lt;c&gt;&lt;n&gt;&lt;rev&gt;_icon.dds</c> (64 px: the compass draws it 1:1) and the same with an
     /// M after the name (128 px: the map draws its icons scaled down): 128 + 128.
@@ -136,33 +139,68 @@ public static class Wo171Rules
     // ------------------------------------------------------------------ the slots
 
     /// <summary>
-    /// Who is which colour. Slot 1 is the host; the others take 2, 3, 4 in the order they first appear. A player is known by his name (a
-    /// crash-rejoin comes back with a new ghost id and the same name), so a rejoin keeps its colour. A fifth player has no slot (0): the
-    /// companion icon.
+    /// The host's ordered reservations for slots 2–4. Slot 1 belongs to the session host. Names are the relay's identities so a
+    /// crash-rejoin can use a different ghost id. Receivers replace their snapshot whole and only look up slots.
     /// </summary>
-    public sealed class SlotTable
+    public sealed record SlotTable
     {
-        private readonly string?[] _who = new string?[Colours];
-        private readonly object _lock = new();
+        public const string WirePrefix = "marker-slots-v1|";
+        private const int RelayNameMax = 32;
+        private static readonly Encoding WireName = new UTF8Encoding(false, true);
+        private string? Purple { get; init; }
+        private string? Blue { get; init; }
+        private string? Green { get; init; }
 
-        public int Slot(string identity, bool isHost)
+        public int GuestCount => Green is not null ? 3 : Blue is not null ? 2 : Purple is not null ? 1 : 0;
+
+        public SlotTable AssignGuest(string identity)
         {
-            lock (_lock)
-            {
-                for (int i = 0; i < Colours; i++) if (_who[i] == identity) return i + 1;
-                if (isHost)
-                {
-                    if (_who[0] is null) { _who[0] = identity; return 1; }
-                    // the host's slot is taken by another name (a different host this session): it takes the first free one
-                }
-                for (int i = 1; i < Colours; i++) if (_who[i] is null) { _who[i] = identity; return i + 1; }
-                return 0;
-            }
+            if (identity.Length is 0 or > RelayNameMax || FindSlot(identity, isHost: false).HasValue) return this;
+            if (Purple is null) return this with { Purple = identity };
+            if (Blue is null) return this with { Blue = identity };
+            return this with { Green = identity };
         }
 
-        public void Reset() { lock (_lock) Array.Clear(_who); }
+        /// <summary>Null while the host's assignment is unknown. Slot 0 is a confirmed companion when all colours are reserved.</summary>
+        public int? FindSlot(string? identity, bool isHost)
+        {
+            if (isHost) return 1;
+            if (string.IsNullOrEmpty(identity)) return null;
+            if (identity == Purple) return 2;
+            if (identity == Blue) return 3;
+            if (identity == Green) return 4;
+            return Green is not null ? 0 : null;
+        }
 
-        public int Count { get { lock (_lock) return _who.Count(w => w is not null); } }
+        public string ToWire() => $"{WirePrefix}{Encode(Purple)}|{Encode(Blue)}|{Encode(Green)}";
+
+        private static string Encode(string? name) => name is null ? "" : Convert.ToBase64String(WireName.GetBytes(name));
+
+        public static bool TryRead(string text, out SlotTable slots)
+        {
+            slots = new();
+            if (!text.StartsWith(WirePrefix, StringComparison.Ordinal)) return false;
+            string[] names = text[WirePrefix.Length..].Split('|');
+            if (names.Length != Colours - 1) return false;
+
+            var parsed = slots;
+            bool vacant = false;
+            foreach (string encoded in names)
+            {
+                if (encoded.Length == 0) { vacant = true; continue; }
+                if (vacant || encoded.Length > RelayNameMax * 4) return false;
+                string name;
+                try { name = WireName.GetString(Convert.FromBase64String(encoded)); }
+                catch (FormatException) { return false; }
+                catch (DecoderFallbackException) { return false; }
+                if (Encode(name) != encoded || parsed.FindSlot(name, isHost: false).HasValue) return false;
+                var next = parsed.AssignGuest(name);
+                if (ReferenceEquals(next, parsed)) return false;
+                parsed = next;
+            }
+            slots = parsed;
+            return true;
+        }
     }
 
     // ------------------------------------------------------------------ the throttles
