@@ -39,7 +39,7 @@ dotnet test dotnet/KcdMp.Setup.Tests/KcdMp.Setup.Tests.csproj -c Release
 dotnet test dotnet/KcdMp.LogPack.Tests/KcdMp.LogPack.Tests.csproj -c Release
 tools/sim/run-sim ci /tmp/kct-sim --timeline both   # = CI-Job "sim": native Regelsuiten, Rig-Python, Solo/Guided, Sim 2/3/4 Spieler
 ```
-Die Client-Tests werden über ihr eigenes Projekt aufgerufen. `tools/Required-TestResults.ps1` prüft im Windows-Build die vier TRX-Berichte, die Mindestzahlen und das native Ergebnis.
+Die Client-Tests werden über ihr eigenes Projekt aufgerufen. `tools/Required-TestResults.ps1` prüft im Windows-Build die vier TRX-Berichte, die Mindestzahlen und das native Ergebnis. `tools/sim/run-required-python.py` führt jede Python-Pflichtsuite getrennt aus und meldet Skips, leere Läufe und Testfehler als Fehler.
 
 Der Windows-Build braucht MSVC und Inno Setup. `tools/Build-Installer.ps1` führt das Relay-Table-Gate, die Synthetic-Suiten, die statischen Checks, `KCDMP_NativeTests.exe` und die Savegame-Tests aus. Danach kommen `tools/Package-DropIn.ps1` und „Verify drop-in contents“ über `tools/Verify-DropIn.ps1`. Kommandos und ausdrücklich markierte Übergangsprüfungen H20/H19/H21 stehen in `.github/workflows/build-windows.yml` und `docs/H0-SELBSTKONTROLLE.md`.
 - Wenn ein benötigter lokaler Lauf fehlt, den Grund und den belegten Stand im Bericht nennen und die Vorgabe in `AGENTS.md` beachten. Die ausdrücklich freigegebene GitHub-Windows-Vorabprüfung gilt für H0. Einen erfolgreichen CI-Lauf mit Link als solchen ausweisen.
