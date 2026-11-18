@@ -48,17 +48,22 @@ int p6_render_fence_tests(int* passed){
         RCHECK(r.feed(packet.data()+split,packet.size()-split,[](const pc::Frame&){return true;},tag),"every remaining header/body suffix completes under the new life");
         pc::Frame f;calls=0;RCHECK(r.pop(&f)&&stamps==1&&f.readerTick==1000&&f.readerLife==900&&!invoke(f,c,&calls)&&calls==0,"partial completion preserves original first-byte proof and refuses the old life");}
 
-    // Real pumped wait receives complete/partial normal work while a Main task stays unfinished.
+    // Deliver the scripted inputs in one pump: Windows can spend most of the wait
+    // budget in a single condition-variable slice, regardless of pipe readiness.
     {
-        pc::Reader r;Context c;bool done=false;unsigned pumps=0,controls=0;std::mutex mutex;std::condition_variable cv;std::unique_lock<std::mutex> lock(mutex);
+        pc::Reader r;Context c;bool done=false;bool delivered=false;unsigned controls=0;std::mutex mutex;std::condition_variable cv;std::unique_lock<std::mutex> lock(mutex);
         const auto normal=wire(0x28,bow);std::vector<uint8_t> control(kcdmp::wo216authority::kRequestBytes,0);control[0]=kcdmp::wo216authority::kOp;
         const auto ctl=wire(pc::kGeneric,control);
+        const auto onControl=[&](const pc::Frame&){++controls;return true;};
+        const auto onStamp=[&](pc::Frame& f){stamp(f,c);};
         const auto status=pc::wait_pumped(cv,lock,std::chrono::milliseconds(25),[&]{return done;},[&]{
-            ++pumps;if(pumps==1)return r.feed(normal.data(),1,[&](const pc::Frame&){++controls;return true;},[&](pc::Frame& f){stamp(f,c);});
-            if(pumps==2){c.now+=2001;return r.feed(normal.data()+1,normal.size()-1,[&](const pc::Frame&){++controls;return true;},[&](pc::Frame& f){stamp(f,c);});}
-            if(pumps==3)return r.feed(ctl.data(),ctl.size(),[&](const pc::Frame&){++controls;return true;},[&](pc::Frame& f){stamp(f,c);});return true;
+            if(delivered)return true;
+            delivered=true;
+            if(!r.feed(normal.data(),1,onControl,onStamp))return false;
+            c.now+=2001;
+            return r.feed(normal.data()+1,normal.size()-1,onControl,onStamp)&&r.feed(ctl.data(),ctl.size(),onControl,onStamp);
         });
-        pc::Frame old;calls=0;RCHECK(status==pc::Wait::TimedOut&&!done&&controls==1&&r.pop(&old)&&!invoke(old,c,&calls)&&calls==0,"control pump while Main unfinished never freshens deferred ranged work before its later invoke");
+        pc::Frame old;calls=0;RCHECK(status==pc::Wait::TimedOut&&!done&&controls==1&&r.pop(&old)&&old.readerTick==1000&&!invoke(old,c,&calls)&&calls==0,"control pump while Main unfinished never freshens deferred ranged work before its later invoke");
     }
     // A batch is one reader receipt. Later subs/frames inherit its stamp, never their own dispatch time.
     {
