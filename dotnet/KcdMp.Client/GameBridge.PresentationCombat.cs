@@ -73,11 +73,11 @@ public partial class GameBridge
     }
 
     private static PresentationCombatAdmission RecordPresentationCombatAdmission(byte peer, ushort seq, byte kind, ulong hostMs,
-        uint sourceMs, EdgePipeReply reply, bool current, bool recovery = false)
+        uint sourceMs, EdgePipeReply reply, bool current, bool recovery = false, bool melee = false)
     {
         if (!current) return PresentationCombatAdmission.Suppressed;
         var admission = recovery && (reply.Outcome is EdgeOutcome.Busy or EdgeOutcome.Unavailable) ? PresentationCombatAdmission.Fallback :
-            CombatPipe.GetPresentationCombatAdmission(reply);
+            melee ? PresentationMeleeAdmission(reply) : CombatPipe.GetPresentationCombatAdmission(reply);
         string status = admission switch
         {
             PresentationCombatAdmission.Accepted => "accepted",
@@ -89,33 +89,60 @@ public partial class GameBridge
         return admission;
     }
 
+    // A typed DLL can temporarily be unable to play an action. Only a DLL that does not implement the request uses legacy playback.
+    internal static PresentationCombatAdmission PresentationMeleeAdmission(EdgePipeReply reply) =>
+        reply is { Outcome: EdgeOutcome.Completed, Payload: [0, 0, 1] }
+            ? PresentationCombatAdmission.Suppressed
+            : CombatPipe.GetPresentationCombatAdmission(reply);
+
+    internal static byte PresentationMeleeKind(ActionKind action, string table, byte flags, int actionType = -1) => (action, table) switch
+    {
+        (ActionKind.Attack, "combat_action_attack") when (flags & AttackEvent.FlagCombo) == 0 => (byte)ActionKind.Attack,
+        (ActionKind.BlockImpulse, "combat_action_block") when (flags & Wo187Rules.NativeFlagPerfect) == 0 => (byte)ActionKind.BlockImpulse,
+        (ActionKind.BlockImpulse, "combat_action_perfect_block")
+            when (flags & Wo187Rules.NativeFlagPerfect) != 0 && !ActionRowCatalog.IsMasterStrike(actionType) => 0x83,
+        (ActionKind.Dodge, "combat_action_dodge") => (byte)ActionKind.Dodge,
+        (ActionKind.AvatarHit, "combat_action_hit") => 0x84,
+        (ActionKind.AvatarRecoil, "combat_action_failed_attack") => 0x85,
+        _ => 0
+    };
+
     private async Task<bool> TrySchedulePresentationRowAsync(InboundAction action, uint eid, ActionRowCatalog.Row row,
         byte flags, PresentationFrame stamp, CancellationToken ct)
     {
-        async Task<bool> LegacyAsync(Func<bool>? beforeWrite = null)
-        {
-            if (beforeWrite is not null && !beforeWrite()) return true;
-            return row.Table != "combat_action_sync_attack" &&
-                await TryScheduleLegacyPresentationRowAsync(action, eid, row.Spec, stamp, ct, beforeWrite);
-        }
-        if (!W221On("rp_combat")) return await LegacyAsync();
-        if (stamp.Session is null || stamp.HostAtArrivalMs == 0) return false;
-        if (action.Phase != ActionPhase.Commit || !TryPresentationCombatScope(action.SourceGhostId, eid, stamp, out var scope))
-            return true;
-
-        byte kind = (action.Kind, row.Table) switch
-        {
-            (ActionKind.Attack, "combat_action_attack" or "combat_action_sync_attack") => (byte)ActionKind.Attack,
-            (ActionKind.BlockImpulse, "combat_action_perfect_block") when (flags & Wo187Rules.NativeFlagPerfect) != 0 => 0x83,
-            (ActionKind.BlockImpulse, "combat_action_block") => (byte)ActionKind.BlockImpulse,
-            (ActionKind.Dodge, "combat_action_dodge") => (byte)ActionKind.Dodge,
-            (ActionKind.AvatarHit, "combat_action_hit") => 0x84,
-            (ActionKind.AvatarRecoil, "combat_action_failed_attack") => 0x85,
-            _ => 0
-        };
-        if (kind == 0) return true;
-
+        if (action.Phase != ActionPhase.Commit) return true;
         byte peer = action.SourceGhostId;
+        uint sourceMs = action.Payload.Length >= 4 ? BinaryPrimitives.ReadUInt32LittleEndian(action.Payload) : 0;
+        byte kind = PresentationMeleeKind(action.Kind, row.Table, flags, row.ActionType);
+        if (kind == 0)
+        {
+            // The verified native owner installs a single body's row. A paired action needs an engine entry for both bodies.
+            string disposition = (action.Kind, row.Table) switch
+            {
+                (ActionKind.Attack, "combat_action_sync_attack") => "result=grey reason=paired-engine-entry-unverified",
+                (ActionKind.BlockImpulse, "combat_action_sync_attack") when (flags & Wo187Rules.NativeFlagPerfect) != 0
+                    => "result=grey reason=paired-engine-entry-unverified",
+                (ActionKind.BlockImpulse, "combat_action_perfect_block")
+                    when (flags & Wo187Rules.NativeFlagPerfect) != 0 && ActionRowCatalog.IsMasterStrike(row.ActionType)
+                    => "result=grey reason=counter-engine-entry-unverified",
+                _ => "result=refused reason=kind-table-mismatch"
+            };
+            ReportRow(disposition);
+            return true;
+        }
+
+        void ReportRow(string disposition) => Console.WriteLine(FormattableString.Invariant(
+            $"MP-RP-MELEE-ROW peer={peer} kind={action.Kind} seq={action.Seq} source_ms={sourceMs} table={row.Table} {disposition}"));
+        Task<bool> LegacyAsync(Func<bool>? beforeWrite = null) => beforeWrite is not null && !beforeWrite()
+            ? Task.FromResult(true)
+            : TryScheduleLegacyPresentationRowAsync(action, eid, row.Spec, stamp, ct, beforeWrite);
+        if (!W221On("rp_combat")) return await LegacyAsync();
+        if (stamp.Session is null || stamp.HostAtArrivalMs == 0)
+        {
+            ReportRow("result=refused reason=missing-presentation-clock");
+            return true;
+        }
+        if (!TryPresentationCombatScope(peer, eid, stamp, out var scope)) return true;
         bool Current() => TryPresentationCombatScope(peer, eid, stamp, out var current) && current == scope;
         if (Interlocked.Read(ref _presentationCombatUnsupportedConnection) == scope.Actor.Pipe) return await LegacyAsync(Current);
         var rows = _presentationCombatRows.AddOrUpdate(peer, _ => new(scope),
@@ -135,7 +162,7 @@ public partial class GameBridge
             if (!Current()) return PresentationCombatAdmission.Suppressed;
             if (receipt.Outcome == EdgeOutcome.Unsupported)
                 Interlocked.Exchange(ref _presentationCombatUnsupportedConnection, scope.Actor.Pipe);
-            var status = CombatPipe.GetPresentationCombatAdmission(receipt);
+            var status = PresentationMeleeAdmission(receipt);
             entry.Registered = status == PresentationCombatAdmission.Accepted;
             return status;
         }
@@ -161,8 +188,7 @@ public partial class GameBridge
             if (await RegisterAsync() == PresentationCombatAdmission.Accepted)
                 reply = await RequestPresentationCombatAsync(SubmitAsync, Current, ct);
         }
-        uint sourceMs = action.Payload.Length >= 4 ? BinaryPrimitives.ReadUInt32LittleEndian(action.Payload) : 0;
-        var admission = RecordPresentationCombatAdmission(peer, action.Seq, kind, stamp.SampleMs, sourceMs, reply, Current());
+        var admission = RecordPresentationCombatAdmission(peer, action.Seq, kind, stamp.SampleMs, sourceMs, reply, Current(), melee: true);
         if (admission != PresentationCombatAdmission.Fallback) return true;
         if (reply.Outcome == EdgeOutcome.Unsupported)
             Interlocked.Exchange(ref _presentationCombatUnsupportedConnection, scope.Actor.Pipe);
