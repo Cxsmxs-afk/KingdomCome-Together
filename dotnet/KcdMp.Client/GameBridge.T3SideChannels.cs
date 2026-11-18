@@ -17,7 +17,8 @@ public partial class GameBridge
     private readonly T3SideChannelQueue<T3SideValue> _t3SideChannels = new();
     private readonly AsyncLocal<T3SideChannelQueue<T3SideValue>.Lease?> _t3SideAmbient = new();
     private bool T3SideWorldWritable => _where == GameWhere.World && !OwnLoadExpected && !LoadGraceOwn &&
-        !LinkHeld && LoadSequenceWritable && (_isDamageAuthority || (_joinedWorld && _jj is null));
+        !LinkHeld && LoadSequenceWritable && WorldSyncReady &&
+        (_isDamageAuthority || (_joinedWorld && _jj is null));
     private T3SideChannelQueue<T3SideValue>.Lease T3SideLease() => _t3SideAmbient.Value ?? _t3SideChannels.Capture(_w206.World);
     private sealed class T3SideContext : IDisposable
     {

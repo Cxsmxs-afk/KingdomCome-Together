@@ -18,7 +18,7 @@ namespace KcdMp.Server.Features.ClientHandling;
 ///
 /// See <see cref="Protocol"/> for the framing and packet layouts.
 /// </summary>
-public class ClientSession
+public partial class ClientSession
 {
     private readonly ILogger _logger;
     // WO-127: the transport is a RelayConnection (TCP or Steam P2P), never a
@@ -100,7 +100,7 @@ public class ClientSession
         (ushort)((W213Switch.TwinOff("link_sched") ? 0 : Protocol.LinkCapLatestWins)
                | (W213Switch.TwinOff("link_sched") || W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
                | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc)
-               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat);
+               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapWorldSync);
 
     private void OnLinkHello(byte[] hello)
     {
@@ -114,6 +114,8 @@ public class ClientSession
         LinkCompactNpc = (both & Protocol.LinkCapCompactNpc) != 0;
         _linkPresentationTime = (both & Protocol.LinkCapPresentationTime) != 0;
         _linkPresentationCombat = _linkPresentationTime && (both & Protocol.LinkCapPresentationCombat) != 0;
+        _linkWorldSync = (both & Protocol.LinkCapWorldSync) != 0;
+        if (_linkWorldSync) _worldSyncTick ??= RunWorldSyncAsync();
         if (!_linkPresentationTime)
         {
             lock (_presentationClockGate) { _presentationProbe = default; _presentationClock = null; }
@@ -259,17 +261,18 @@ public class ClientSession
     }
 
     /// <summary>WO-213 C: a frame into the scheduler; the events' backlog keeps the 0.63.9 cap (past it the client is cut).</summary>
-    private void SchedEnqueue(byte[] packet)
+    private bool SchedEnqueue(byte[] packet)
     {
-        lock (_writeQueueLock) if (_writeQueueStopped) return;
+        lock (_writeQueueLock) if (_writeQueueStopped) return false;
         if (_sched!.EventBytes + packet.Length > MaxQueuedBytes)
         {
             AbortWriteQueue($"outbound queue limit reached ({MaxQueuedBytes / 1024} KB of events waiting)");
-            return;
+            return false;
         }
         try { _writer!.Enqueue(packet); }
-        catch (IOException) { AbortWriteQueue(null); return; }
+        catch (IOException) { AbortWriteQueue(null); return false; }
         _writeSignal.Release();
+        return true;
     }
 
     private async Task SchedWriteLoopAsync()
@@ -530,6 +533,14 @@ public class ClientSession
                             _clientHandler.CountDrop(inner, why, Protocol.W164RangedStep);
                     }
                     else _clientHandler.CountDrop(inner, "invalid-combat-length");
+                    continue;
+                }
+
+                if (type == Protocol.WorldSyncUp)
+                {
+                    var control = new byte[payloadLen];
+                    await ReadExactAsync(control);
+                    if (!HandleWorldSync(control)) _clientHandler.CountDrop((byte)type, "invalid-world-sync");
                     continue;
                 }
 
@@ -1132,6 +1143,9 @@ public class ClientSession
         }
         finally
         {
+            _worldSyncStop.Cancel();
+            if (_worldSyncTick is not null) await _worldSyncTick;
+            _worldSyncStop.Dispose();
             StopWriteQueue();
             await writeTask;
             _idleRead.Dispose();
@@ -1631,17 +1645,23 @@ public class ClientSession
 
     private void EnqueueRaw(byte[] packet)
     {
-        if (_writer is not null) { SchedEnqueue(packet); return; }   // WO-213 C
+        if (!ObserveWorldSyncDown(packet)) EnqueueWire(packet);
+    }
+
+    private bool EnqueueWire(byte[] packet)
+    {
+        if (_writer is not null) return SchedEnqueue(packet);   // WO-213 C
         bool overflow;
         lock (_writeQueueLock)
         {
-            if (_writeQueueStopped) return;
+            if (_writeQueueStopped) return false;
             overflow = _queuedBytes + packet.Length > MaxQueuedBytes;
             if (!overflow) { _writeQueue.Enqueue(new(packet, null, null, Now())); _queuedBytes += packet.Length; }
         }
 
         if (overflow) AbortWriteQueue($"outbound queue limit reached ({MaxQueuedBytes / 1024} KB queued; {_npcCoalesced} NPC samples were already thinned)");
         else _writeSignal.Release();
+        return !overflow;
     }
 
     /// <summary>
@@ -1653,6 +1673,7 @@ public class ClientSession
     /// </summary>
     private void EnqueueNpcPacket(string key, byte[] packet)
     {
+        ObserveWorldSyncDown(packet);
         if (_writer is not null) { SchedEnqueue(packet); return; }   // WO-213 C: one slot per (source, NPC), always
         bool overflow = false, queued = false, coalesced = false;
         lock (_writeQueueLock)
@@ -1684,6 +1705,7 @@ public class ClientSession
 
     private void EnqueueGhostPacket(byte ghostId, byte[] packet)
     {
+        ObserveWorldSyncDown(packet);
         if (_writer is not null) { SchedEnqueue(packet); return; }   // WO-213 C: one slot per player
         bool overflow;
         bool queued = false;

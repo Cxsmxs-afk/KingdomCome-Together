@@ -278,6 +278,7 @@ public partial class GameBridge
         if (ExecutionContext.IsFlowSuppressed()) _ = Task.Run(RunWriter);
         else { using (ExecutionContext.SuppressFlow()) _ = Task.Run(RunWriter); }
         ushort caps = (ushort)(Protocol.LinkCapLatestWins | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat
+                     | (LoadSequenceEnabled && W221On("baseline_events") ? Protocol.LinkCapWorldSync : 0)
                      | (W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
                      | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc));
         w.Enqueue(Protocol.BuildLinkHelloUp(caps));

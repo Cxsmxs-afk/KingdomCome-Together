@@ -89,14 +89,14 @@ public partial class GameBridge
         _suppressJumpUntilUtc = DateTime.UtcNow.AddSeconds(30);
     }
 
-    private async Task UpdateHostCalendarAsync(HostCalendarSample sample, long generation)
+    private async Task<bool> UpdateHostCalendarAsync(HostCalendarSample sample, long generation)
     {
         ProcessorFrameScope.ThrowIfAbandoned();
         var life = T3SideLease();
         if (!T3SideReady)
         {
             _t3SideChannels.Put(T3Clock, new(0, Calendar: sample, CalendarGeneration: generation), life);
-            T3Increment("deferred_sidechannel"); return;
+            T3Increment("deferred_sidechannel"); return false;
         }
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token);
         using var scope = ProcessorFrameScope.Link(linked.Token);
@@ -104,8 +104,8 @@ public partial class GameBridge
         try
         {
             T3SideGuard(life, true);
-            if (!HostCalendarOwned || generation != Interlocked.Read(ref _hostCalendarGeneration) || !sample.Fresh(Environment.TickCount64)) return;
-            lock (_hostCalendarLock) if (_hostCalendar != sample) return;
+            if (!HostCalendarOwned || generation != Interlocked.Read(ref _hostCalendarGeneration) || !sample.Fresh(Environment.TickCount64)) return false;
+            lock (_hostCalendarLock) if (_hostCalendar != sample) return false;
             // The native prehook leaves the player's own picker/sleep/wait alone. It retains the newest host target for the first frame after it.
             var r = await _combat.CalendarFollowAsync(1, sample.TargetMs(Environment.TickCount64), sample.Ratio, linked.Token);
             T3SideGuard(life, true);
@@ -115,23 +115,24 @@ public partial class GameBridge
                 _hostCalendarResumeEpoch != 0 && _hostCalendarResumeEpoch == _w206.World && _joinedWorld &&
                 _jj is null && !LinkHeld && !OwnLoadExpected && !LoadGraceOwn)
             {
-                if (!await ResumeHostAuthorityAsync(generation, linked.Token)) return;
+                if (!await ResumeHostAuthorityAsync(generation, linked.Token)) return false;
                 T3SideGuard(life, true);
                 r = await _combat.CalendarFollowAsync(2, sample.TargetMs(Environment.TickCount64), sample.Ratio, linked.Token);
                 T3SideGuard(life, true);
             }
             for (int i = 0; r is { Result: 2 } && i < 3 && !_localSkipActive && !_w140LocalSkipping; i++)
             {
-                if (generation != Interlocked.Read(ref _hostCalendarGeneration)) return;
+                if (generation != Interlocked.Read(ref _hostCalendarGeneration)) return false;
                 await Task.Delay(50, linked.Token);
                 T3SideGuard(life, true);
                 r = await _combat.CalendarFollowAsync(3, ct: linked.Token);
                 T3SideGuard(life, true);
             }
-            if (r is not { Result: 1 } read || generation != Interlocked.Read(ref _hostCalendarGeneration)) return;
+            if (r is not { Result: 1 } read || generation != Interlocked.Read(ref _hostCalendarGeneration)) return false;
             RebaseCalendarPoll(read.AfterMs, sample.Ratio);
             double target = sample.TargetMs(Environment.TickCount64) / 1000.0;
             Wo210OnHostClock((uint)target, sample.Ratio, read.AfterMs / 1000.0 - target, _localSkipActive || _w140LocalSkipping);
+            return Math.Abs(read.AfterMs / 1000.0 - target) <= 2;
         }
         finally { _hostCalendarGate.Release(); }
     }

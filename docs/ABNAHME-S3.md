@@ -54,3 +54,44 @@ Jede Variante in einem neuen Lauf mit `--netz schlecht` wiederholen. Relay und S
 3. Für den Wetterlauf den Host-Agent mit `KCDMP_TEST_LOAD_SEQUENCE=1` starten. Vor dem Reload in der Host-Konsole `mp_test_weatherload --test-load-sequence foggy_drizzly_light` ausführen. Das Profil wird nach der Save-Übertragung gesendet. Beim Joiner die zurückgestellte Meldung, danach die bestätigte Anwendung ab `Play` im Spielprotokoll und im Spiel vergleichen.
 4. Beide Läufe mit 150 ms plus Jitter wiederholen. Beim Reload die alte Partnerfigur aus der Szene verschwinden sehen und nach der Rekonstruktion die neue Figur an der richtigen Stelle prüfen.
 5. Beide LogPack-Bundles sammeln. `owner_violations` bleibt null. Phasenzeit und getrennte Zähler für alte Agent- und native Frames mit den beobachteten Ladewechseln abgleichen. Einen Lauf ohne beobachtete Abweisung als fehlende Messabdeckung erfassen.
+
+## s3-2 · Baseline und bestätigte Ereignisse
+
+Das Rig wartet nach dem gemeinsamen Laden auf eine angewendete Baseline der Version 1 und ihre Bestätigung am Relay. Die Schritte laufen in Wegwerfständen. Vor dem Start beider Agents die Testumgebung setzen. Das normale Relay-Profil eignet sich zum Einrichten des Teststands. Die Abnahme umfasst auch `--netz schlecht` mit 150 ms plus Jitter.
+
+```powershell
+$env:KCDMP_TEST_BASELINE_EVENTS = '1'
+$env:KCDMP_RIG_TEST_ENV = 'KCDMP_TEST_BASELINE_EVENTS=1'
+python tools/rig/pair.py relay --netz schlecht
+python tools/rig/scenarios.py pickup --test-baseline-events --netz schlecht
+python tools/rig/scenarios.py corpse --test-baseline-events --netz schlecht
+python tools/rig/scenarios.py dialog --test-baseline-events --netz schlecht
+```
+
+Zuerst beide Spielkopien wie unter s3-1 starten und verbinden. Nach der Aufforderung im Terminal die jeweilige Aktion normal im Spiel ausführen. Das Rig prüft je Ereignis den Relay-Versand, den angewendeten Spielzustand und die danach geschriebene und vom Relay empfangene Bestätigung. `pickup` erwartet einen bestätigten losen Weltgegenstand. `corpse` erwartet einen Gegenstand aus der Leichenansicht mit bestätigter Aufnahme ins Inventar. `dialog` erwartet zwei verschiedene Stimmen für dieselbe offene Entscheidung. Die Berichte `pickup.json`, `corpse.json` und `dialog.json` enthalten Welt, Generation, Snapshot, Ereignis-ID und bestätigte Grenzen. `evt_gap`, `evt_dropped`, `evt_sender_dropped` und `owner_violations` bleiben null. `evt_retx` zeigt wiederholte Übertragungen an.
+
+### T4-Varianten
+
+Für `dialog --bot` Relay und nur den geladenen echten Host starten. Der Host beginnt im Spiel ein Gespräch mit mindestens zwei Antwortoptionen. Der Bot-Joiner folgt dem Gespräch und sendet zwei Stimmen. Die Bestätigung des Symbols im HUD stammt vom echten Host.
+
+```powershell
+$env:KCDMP_TEST_BOT = '1'
+python tools/rig/scenarios.py dialog --test-baseline-events --netz schlecht --bot
+```
+
+Für `pickup --bot` und `corpse --bot` den echten Joiner alleine im Hauptmenü starten. Im A/B-Rig dazu wie bei `weatherload --bot` vor der Vorbereitung `KCDMP_RIG_HOST=B` setzen und nur Kopie A starten. Der T4 Bot-Host serviert den externen Wegwerfstand und entscheidet anhand des Testplans. Der echte Joiner hebt den Gegenstand auf oder entnimmt ihn der Leiche. Teststand, Weltzeit und Plan stammen aus derselben vorbereiteten Spielsituation. Im Plan enthält `setup witem <Klassen-GUID> <x> <y> <z>` einen losen Gegenstand und `setup bodyset <Name> <Klassen-GUID>:<Anzahl>:<Zustand>` den Inhalt einer vorhandenen Leiche. Der Zustand ist normiert, zum Beispiel `1` für vollständig erhaltene Gegenstände. Eine zeitgesteuerte `at 0 pos <x> <y> <z>`-Zeile vervollständigt den Plan. Der Bot führt eine synthetische Inventarliste. Maßgeblich für die Abnahme bleibt das Inventar des echten Joiners.
+
+```powershell
+python tools/rig/scenarios.py pickup --test-baseline-events --netz schlecht --bot --bot-save "$TestSave" --bot-plan "$PickupPlan" --world-time $WorldTime
+python tools/rig/scenarios.py corpse --test-baseline-events --netz schlecht --bot --bot-save "$TestSave" --bot-plan "$CorpsePlan" --world-time $WorldTime
+```
+
+Für jede Bot-Host-Variante einen frischen Lauf mit Relay und Joiner im Hauptmenü verwenden. Die automatische Prüfung verwendet synthetische Fixtures. Die Spielprüfung steht aus.
+
+### Zwei-PC-Checkliste
+
+1. Denselben Build verwenden und in einem Wegwerfstand verbinden. Nach dem Laden Baseline-Version 1 in der richtigen Weltgeneration und die Relay-Bestätigung prüfen.
+2. Der Joiner hebt einen losen Weltgegenstand auf. Den bestätigten Gegenstand und seine Anzahl im Inventar mit dem bestätigten Pickup-Ereignis abgleichen.
+3. Der Joiner nimmt genau einen Gegenstand aus einer Leiche. Sein Inventar und die danach auf beiden PCs aktualisierte Leichenliste prüfen.
+4. Der Host hält eine Antwortauswahl offen. Der Joiner stimmt für zwei verschiedene Zeilen. Der Host sieht die Symbole in derselben Reihenfolge und entscheidet selbst.
+5. Mit 150 ms plus Jitter wiederholen und beide Bundles sammeln. Ereignis-ID, Anwendung und spätere Bestätigung abgleichen. `evt_gap`, `evt_dropped`, `evt_sender_dropped` und `owner_violations` bleiben null.

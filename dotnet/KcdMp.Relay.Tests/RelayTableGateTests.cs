@@ -319,6 +319,12 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
                 await host.SendRawAsync(stamped);
                 await ArrivesAsync(joiner, Protocol.PlayerStateDown, Protocol.PlayerStateDownPayloadLen, host.Id);
                 return;
+            case Protocol.WorldSyncUp:
+                await OpenPresentationAsync(joiner, Protocol.LinkCapWorldSync);
+                await AnnounceWorldSyncAsync(host, joiner, 73);
+                await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.Open, new(73, 9), 0, 0, 0)));
+                await ArrivesAsync(joiner, Protocol.WorldSyncStatusDown, WorldSyncStatusWire.BodyBytes);
+                return;
             case Protocol.LinkHelloUp:   // WO-213: relay-local, the answer comes back to the sender
                 b[0] = Protocol.LinkVersion;
                 await host.SendRawAsync(Frame(up, b));
@@ -693,6 +699,89 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
         Assert.True(PresentationTimeWire.TryRead(wrapper, body, out var stamp, out byte type, out int offset));
         Assert.Equal(inner, type);
         return (stamp, body[offset..]);
+    }
+
+    private static async Task AnnounceWorldSyncAsync(Peer host, Peer joiner, uint world)
+    {
+        string text = FormattableString.Invariant($"v1|{world}|1|fixture");
+        byte[] frame = new LootMsg(Protocol.W203Epoch, 0, text).BuildUp(Protocol.W203Up, joiner.Id);
+        await host.SendRawAsync(frame);
+        Assert.Equal(host.Id, (await joiner.ReadUntilAsync(Protocol.W203Down, Wait))[0]);
+    }
+
+    [Fact]
+    public async Task World_sync_keeps_more_than_512_ordered_results_and_waits_for_applied_acknowledgements()
+    {
+        var (host, joiner) = await HostAndJoinerAsync();
+        await using var _h = host;
+        await using var _j = joiner;
+        await OpenPresentationAsync(joiner, Protocol.LinkCapWorldSync);
+        var scope = new WorldSyncScope(77, 85);
+        await AnnounceWorldSyncAsync(host, joiner, scope.HostWorld);
+        await host.SendRawAsync(new LootMsg(Protocol.LootHostItemResult, 1, "unknown").BuildUp(Protocol.LootHostUp, joiner.Id));
+        await joiner.ReadUntilAsync(Protocol.LootHostDown, Wait);
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.Open, scope, 0, 0, 0)));
+        var rawStatus = await joiner.ReadUntilAsync(Protocol.WorldSyncStatusDown, Wait);
+        Assert.True(WorldSyncStatusWire.TryRead(rawStatus, out var status));
+        Assert.Equal(scope, status.Scope);
+        Assert.Equal(joiner.Id, status.Recipient);
+        uint snapshot = status.SnapshotId;
+        string invalid = $"{Hex(Protocol.WorldSyncUp)}:invalid-world-sync";
+        long before = Drops(invalid);
+
+        const int count = 650;
+        for (uint token = 2; token <= count; token++)
+            await host.SendRawAsync(new LootMsg(Protocol.LootHostItemResult, token, "unknown").BuildUp(Protocol.LootHostUp, joiner.Id));
+        await host.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await ArrivesAsync(host, Protocol.Pong, Protocol.PingPayloadLen);
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.EventApplied, scope, snapshot, WorldEventChannel.Loot, 1)));
+        await joiner.SendRawAsync(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await ArrivesAsync(joiner, Protocol.Pong, Protocol.PingPayloadLen);
+        Assert.Equal(before + 1, Drops(invalid));
+
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.Ready, scope, 0, 0, 0)));
+        var sections = new HashSet<WorldBaselineSection>();
+        while (sections.Count < 6)
+        {
+            byte[] bytes = await joiner.ReadUntilAsync(Protocol.WorldBaselineDown, Wait);
+            Assert.True(WorldSyncWire.TryReadBaseline(bytes, out var part));
+            Assert.Equal((scope, snapshot, (ushort)1), (part.Scope, part.SnapshotId, part.Version));
+            sections.Add(part.Section);
+        }
+        await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.BaselineApplied, scope, snapshot, 0, 0)));
+
+        var arrived = new HashSet<ulong>();
+        bool retriedFirst = false;
+        ulong contiguous = 0;
+        while (contiguous < count)
+        {
+            byte[] bytes = await joiner.ReadUntilAsync(Protocol.WorldEventDown, Wait);
+            Assert.True(WorldSyncWire.TryReadEvent(bytes, out var item));
+            Assert.Equal((scope, snapshot, Protocol.LootHostDown, WorldEventChannel.Loot), (item.Scope, item.SnapshotId, item.Type, item.Channel));
+            Assert.Equal(host.Id, item.Payload[0]);
+            Assert.True(LootMsg.TryDecode(item.Payload.AsSpan(1 + Protocol.JoinHeaderLen), out var msg));
+            Assert.Equal(item.Id, (ulong)msg.Tok);
+            if (!arrived.Add(item.Id) && item.Id == 1) retriedFirst = true;
+            // Make the relay retry the first result. Thereafter a cumulative
+            // receipt may retire only the contiguous applied prefix.
+            if (!retriedFirst) continue;
+            ulong prior = contiguous;
+            while (arrived.Contains(contiguous + 1)) contiguous++;
+            if (contiguous != prior)
+                await joiner.SendRawAsync(WorldSyncWire.BuildSync(new(WorldSyncOperation.EventApplied, scope, snapshot, WorldEventChannel.Loot, contiguous)));
+        }
+        Assert.True(retriedFirst);
+        Assert.Equal(count, arrived.Count);
+        using var deadline = new CancellationTokenSource(Wait);
+        do
+        {
+            Assert.True(WorldSyncStatusWire.TryRead(await joiner.ReadUntilAsync(Protocol.WorldSyncStatusDown, Wait), out status));
+            deadline.Token.ThrowIfCancellationRequested();
+        }
+        while (status.Counts.Acked != count);
+        Assert.Equal(count, status.Counts.Sent);
+        Assert.True(status.Counts.Retx > 0);
+        Assert.Equal(0, status.Counts.Dropped);
     }
 
     [Fact]

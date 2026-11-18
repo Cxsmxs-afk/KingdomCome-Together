@@ -28,10 +28,13 @@ public partial class GameBridge
         public long TimerSentMs;
         public List<Wo204Rules.OptRow> Rows = [];
         public readonly List<Wo204Rules.ConvLineMsg> Lines = [];
+        public readonly Dictionary<byte, (ulong SnapshotId, ulong EventId, string Token)> VoteReceipts = new();
     }
 
     private W204ConvState? _w204Conv;          // the starter's (one conversation at a time, as WO-203B's talk)
     private int _w204OptPolling;
+    private readonly SemaphoreSlim _w204VoteApply = new(1, 1);
+
     private (byte Starter, int Cid, int DecId) _w204ListenDec;   // the listener: the decision his HUD shows
     private long _w204LinesOut, _w204LinesIn, _w204LinesVoiced, _w204LinesNoBody, _w204OptionsOut, _w204OptionsIn, _w204VotesOut, _w204VotesIn,
                  _w204VoteIcons, _w204ChosenOut, _w204ChosenIn, _w204ConvBad;
@@ -139,8 +142,16 @@ public partial class GameBridge
                     Wo210NoteCurrent(c.Cid, c.DecId, cur, c.Open);   // WO-210 F.2a: the starter's cursor, to the listeners (<= 10 a second)
                     if (rows.Count > 0 && seq != 0 && seq != c.SnapSeq)
                     {
-                        c.SnapSeq = seq; c.Rows = rows; c.Open = true; ++c.DecId;
-                        text = Wo204Rules.OptionsText(c.Cid, c.DecId, 0, rows);
+                        bool next = !WorldSyncEffective || !c.Open || !c.Rows.SequenceEqual(rows);
+                        c.SnapSeq = seq;
+                        c.Rows = rows;
+                        if (next)
+                        {
+                            c.Open = true;
+                            ++c.DecId;
+                            c.VoteReceipts.Clear();
+                            text = Wo204Rules.OptionsText(c.Cid, c.DecId, 0, rows);
+                        }
                     }
                 }
                 lock (_w3cLock) to = [.. talk.Listeners];
@@ -183,6 +194,94 @@ public partial class GameBridge
         _ = Task.Run(async () => { foreach (byte p in to) await Wo203SendConvAsync(p, Protocol.ConvChosen, text); });
     }
 
+    private Task<bool> ApplyConfirmedDialogVoteAsync(byte source, string voteText, Func<bool> current,
+        CancellationToken ct, ulong eventId = 0, ulong snapshotId = 0)
+    {
+        if (!Wo204Rules.TryParseVote(voteText, out int cid, out int decision, out int index)) return Task.FromResult(false);
+        return Wo204ApplyVoteAsync(source, cid, decision, index, current, ct, eventId, snapshotId);
+    }
+
+    private async Task<bool> Wo204ApplyVoteAsync(byte? source, int cid, int decision, int index, Func<bool> current,
+        CancellationToken ct, ulong eventId = 0, ulong snapshotId = 0)
+    {
+        try
+        {
+            await _w204VoteApply.WaitAsync(ct);
+            try
+            {
+                if (!current() || !LoadSequenceWritable || index < -1 || W204ConvOf(cid) is not { } conv) return false;
+                W203Talk? talk;
+                lock (_w3cLock) talk = _w3cTalk;
+                if (talk is null || talk.Cid != cid) return false;
+                uint snap;
+                string rows, token;
+                ulong generation = _worldLoad.Current.Generation;
+                lock (conv)
+                {
+                    if (!conv.Open || conv.DecId != decision || conv.SnapSeq == 0 || index >= conv.Rows.Count) return false;
+                    snap = conv.SnapSeq;
+                    rows = Wo204Rules.RowsForLua(conv.Rows);
+                    if (source is byte peer && eventId != 0)
+                    {
+                        if (!conv.VoteReceipts.TryGetValue(peer, out var previous) ||
+                            (previous.SnapshotId, previous.EventId) != (snapshotId, eventId))
+                            conv.VoteReceipts[peer] = previous = (snapshotId, eventId, Guid.NewGuid().ToString("N"));
+                        token = previous.Token;
+                    }
+                    else token = Guid.NewGuid().ToString("N");
+                }
+
+                bool StillCurrent()
+                {
+                    if (!current() || ct.IsCancellationRequested || !LoadSequenceWritable ||
+                        _worldLoad.Current.Generation != generation) return false;
+                    lock (_w3cLock)
+                    {
+                        if (!ReferenceEquals(talk, _w3cTalk) ||
+                            (source is byte peer ? !talk.Listeners.Contains(peer) : talk.Listeners.Count != 0)) return false;
+                        lock (conv)
+                        {
+                            if (!ReferenceEquals(conv, _w204Conv) || !conv.Open || conv.DecId != decision || conv.SnapSeq == 0)
+                                return false;
+                            snap = conv.SnapSeq;
+                            return true;
+                        }
+                    }
+                }
+
+                if (!StillCurrent()) return false;
+                string arg = FormattableString.Invariant(
+                    $"\"{token}\",\"{_loadPublisherId}\",\"{generation}\",\"{EscapeLua(rows)}\",{index}");
+                if (await AskModAsync("KCD2MP_W204StageVote", 1800, arg).WaitAsync(ct) != "staged" || !StillCurrent()) return false;
+
+                var applied = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (!_wo124Replies.TryAdd(token, applied)) return false;
+                try
+                {
+                    const byte voteMarkOp = 92;
+                    var native = await _combat.Wo163Async(voteMarkOp, Wo204Rules.ConfirmedVoteMark(snap, index, token), ct);
+                    if (native is not { Ok: true, Payload: [0] }) return false;
+                    if (await applied.Task.WaitAsync(TimeSpan.FromMilliseconds(1800), ct) != "applied" ||
+                        !current() || _worldLoad.Current.Generation != generation) return false;
+                    Interlocked.Increment(ref _w204VoteIcons);
+                    if (source.HasValue)
+                    {
+                        Interlocked.Increment(ref _w204VotesIn);
+                        Console.WriteLine(FormattableString.Invariant(
+                            $"MP-W204-VOTE-APPLIED peer={source.Value} cid={cid} decision={decision} index={index} event_id={eventId} world_gen={generation}"));
+                    }
+                    return true;
+                }
+                finally { _wo124Replies.TryRemove(token, out _); }
+            }
+            finally { _w204VoteApply.Release(); }
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or OperationCanceledException or TimeoutException)
+        {
+            return false;
+        }
+    }
+
     private void Wo204ConvOnVote(byte src, int cid, int decId, int index)
     {
         if (W204ConvOf(cid) is not { } c) return;
@@ -214,6 +313,13 @@ public partial class GameBridge
         {
             if (!c.Open || c.Rows.Count == 0) return;
             rows = Wo204Rules.RowsForLua(c.Rows); cur = c.Current; right = c.OnRight;
+        }
+        if (WorldSyncEffective)
+        {
+            int decision;
+            lock (c) decision = c.DecId;
+            _ = Wo204ApplyVoteAsync(null, cid, decision, -1, () => WorldSyncEffective, _wo122Ct);
+            return;
         }
         Console.WriteLine($"WO204-CONV conversation {cid}: no listener left -- the vote icon cleared");
         _ = Task.Run(async () =>
@@ -257,7 +363,7 @@ public partial class GameBridge
                 return;
             }
             case Protocol.ConvVote when Wo204Rules.TryParseVote(m.Text, out int vcid, out int vdec, out int vidx):
-                Wo204ConvOnVote(src, vcid, vdec, vidx);
+                if (!WorldSyncEffective) Wo204ConvOnVote(src, vcid, vdec, vidx);
                 return;
             case Protocol.ConvTimer when Wo207Rules.TryParseTimer(m.Text, out int tcid, out int tdec, out bool ton, out float tleft, out float trate):
                 Interlocked.Increment(ref _w207TimersIn);

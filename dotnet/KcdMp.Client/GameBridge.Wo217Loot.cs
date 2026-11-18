@@ -119,11 +119,20 @@ public partial class GameBridge
                     foreach (byte j in Wo134Peers()) _ = Wo134SendAsync(Protocol.LootHostUp, j, Protocol.LootHostCorpses, 0, arg);
                 if (arg is { Length: > 1 }) Wo221OnHostCorpses(arg);   // WO-221 E.1: their wounds follow
                 return true;
-            case "w217_corpse":  // joiner: <name> <spawned|waiting|alive|shown>  (E.1)
+            case "w217_corpse":  // joiner: <name> <spawned|waiting|alive|shown> [load-generation] (E.1)
             {
                 var sp = (arg ?? "").Split(' ');
-                if (sp.Length == 2 && Wo134Rules.BodyName.IsMatch(sp[0])) _ = Wo217OnCorpseStateAsync(sp[0], sp[1]);
-                if (sp.Length == 2 && sp[1] == "shown") Wo221OnCorpseShown(sp[0]);   // WO-221 E.1: its wounds, once it is shown
+                ulong generation = 0;
+                if ((sp.Length == 2 || sp.Length == 3 && ulong.TryParse(sp[2], NumberStyles.None, CultureInfo.InvariantCulture, out generation)) &&
+                    Wo134Rules.BodyName.IsMatch(sp[0]))
+                {
+                    var scope = _w217CorpseWorld;
+                    if ((scope?.Frame.LoadGeneration ?? 0) == generation && Wo217CorpseCurrent(scope))
+                    {
+                        _ = Wo217OnCorpseStateAsync(sp[0], sp[1], scope);
+                        if (sp[1] == "shown") Wo221OnCorpseShown(sp[0]);   // WO-221 E.1: its wounds, once shown
+                    }
+                }
                 return true;
             }
             case "w217_prop":     // host: <name|class|arch|model|x|y|z|ax|ay|az>  (E.2)
@@ -234,31 +243,60 @@ public partial class GameBridge
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _w217CorpseAt = new(StringComparer.Ordinal);
     private long _w217CorpsesIn, _w217CorpseApplied, _w217CorpseShown, _w217CorpseMade;
     private byte _w217CorpseSrc;
+    private sealed record CorpseWorld(InFrame Frame);
+    private volatile CorpseWorld? _w217CorpseWorld;
 
-    private Task Wo217CorpseLuaAsync(Wo217LootRules.Corpse c) => ExecLuaAsync(string.Create(CultureInfo.InvariantCulture,
-        $"if KCD2MP_W217Corpse then KCD2MP_W217Corpse(\"{c.Name}\", {c.X:0.0}, {c.Y:0.0}, {c.Z:0.0}, {c.Yaw:0.00}) end"));
+    private bool Wo217CorpseCurrent(CorpseWorld? world) => ReferenceEquals(_w217CorpseWorld, world) &&
+        (world is null || WorldBaselineCurrent(world.Frame, world.Frame.LoadCancellation));
 
-    private async Task Wo217OnCorpsesAsync(byte src, List<Wo217LootRules.Corpse> corpses)
+    private Task Wo217CorpseLuaAsync(Wo217LootRules.Corpse c, CorpseWorld? world)
     {
-        if (!W217On("encounter_world")) return;
+        if (!Wo217CorpseCurrent(world)) return Task.CompletedTask;
+        string scope = world is null ? "" : FormattableString.Invariant($", \"{world.Frame.LoadGeneration}\"");
+        string lua = FormattableString.Invariant(
+            $"if KCD2MP_W217Corpse then KCD2MP_W217Corpse(\"{c.Name}\", {c.X:0.0}, {c.Y:0.0}, {c.Z:0.0}, {c.Yaw:0.00}{scope}) end");
+        return world is null ? ExecLuaAsync(lua) : GameCalls.ExecuteNowAsync(lua, world.Frame.LoadCancellation);
+    }
+
+    private async Task Wo217OnCorpsesAsync(byte src, List<Wo217LootRules.Corpse> corpses, InFrame? scoped = null)
+    {
+        if (!W217On("encounter_world") || scoped is { } rejected && !WorldBaselineCurrent(rejected, rejected.LoadCancellation)) return;
+        var world = _w217CorpseWorld;
+        if (scoped is { } frame && (world is null || frame.LoadCancellation != world.Frame.LoadCancellation))
+        {
+            _w217CorpseWant.Clear();
+            _w217CorpseState.Clear();
+            _w217CorpseAt.Clear();
+            _w217CorpseWorld = world = new(frame);
+        }
+        else if (scoped is null && world is not null)
+        {
+            if (Wo217CorpseCurrent(world)) return;
+            _w217CorpseWant.Clear();
+            _w217CorpseState.Clear();
+            _w217CorpseAt.Clear();
+            _w217CorpseWorld = world = null;
+        }
         Interlocked.Increment(ref _w217CorpsesIn);
         _w217CorpseSrc = src;
         var names = new HashSet<string>(StringComparer.Ordinal);
         foreach (var c in corpses)
         {
+            if (!Wo217CorpseCurrent(world)) return;
             names.Add(c.Name);
             bool fresh = !_w217CorpseWant.ContainsKey(c.Name);
             _w217CorpseWant[c.Name] = c;
             if (fresh) _w217CorpseState[c.Name] = ("asked", 0);
-            if (!_w217CorpseState.TryGetValue(c.Name, out var st) || st.State != "shown") await Wo217CorpseLuaAsync(c);
+            if (!_w217CorpseState.TryGetValue(c.Name, out var st) || st.State != "shown") await Wo217CorpseLuaAsync(c, world);
         }
+        if (!Wo217CorpseCurrent(world)) return;
         foreach (var k in _w217CorpseWant.Keys) if (!names.Contains(k)) { _w217CorpseWant.TryRemove(k, out _); _w217CorpseState.TryRemove(k, out _); }
     }
 
     // the Lua's answer for one body: made or alive here -> its death applied (the owner-death apply WO-86 built), then asked again
-    private async Task Wo217OnCorpseStateAsync(string name, string state)
+    private async Task Wo217OnCorpseStateAsync(string name, string state, CorpseWorld? world)
     {
-        if (!_w217CorpseWant.TryGetValue(name, out var c)) return;
+        if (!Wo217CorpseCurrent(world) || !_w217CorpseWant.TryGetValue(name, out var c)) return;
         int tries = _w217CorpseState.TryGetValue(name, out var st) ? st.Tries : 0;
         _w217CorpseState[name] = (state, tries);
         if (state == "shown") { if (st.State != "shown") Interlocked.Increment(ref _w217CorpseShown); return; }
@@ -269,20 +307,22 @@ public partial class GameBridge
             if (_w217CorpseAt.TryGetValue(name, out long at) && now - at < 20_000) return;
             _w217CorpseAt[name] = now;
             Interlocked.Increment(ref _w217CorpseApplied);
-            try { await ApplyRemoteNpcDeathAsync(name, null, _w217CorpseSrc, "w217-corpse", CancellationToken.None, bypassDedupe: state == "spawned"); }
+            try { await ApplyRemoteNpcDeathAsync(name, null, _w217CorpseSrc, "w217-corpse", world?.Frame.LoadCancellation ?? CancellationToken.None, bypassDedupe: state == "spawned"); }
             catch (Exception ex) { Console.WriteLine($"MP-W217 corpse {name}: the death not applied ({ex.Message})"); }
-            await Wo217CorpseLuaAsync(c);
+            await Wo217CorpseLuaAsync(c, world);
         }
     }
 
     // every 2 s: each listed corpse not yet shown here is asked again (15 tries, then left: named in the stats)
     private async Task Wo217CorpseRetryAsync()
     {
+        var world = _w217CorpseWorld;
         foreach (var (name, c) in _w217CorpseWant)
         {
+            if (!Wo217CorpseCurrent(world)) return;
             if (!_w217CorpseState.TryGetValue(name, out var st) || st.State == "shown" || st.Tries >= 15) continue;
             _w217CorpseState[name] = (st.State, st.Tries + 1);
-            await Wo217CorpseLuaAsync(c);
+            await Wo217CorpseLuaAsync(c, world);
         }
     }
 

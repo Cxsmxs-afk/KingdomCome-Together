@@ -104,6 +104,7 @@ public partial class GameBridge
                     try
                     {
                         LoadSequenceTick();
+                        WorldSyncTick(ct);
                         // Native work spawned by replay inherits this receive lease;
                         // EOF revokes it before a queued late write can reach the game.
                         await ProcessorFrameScope.RunAsync(_ =>
@@ -274,10 +275,13 @@ public partial class GameBridge
         string fields = T3FormatStats(counters);
         string roleName = role == 1 ? "host" : role == 2 ? "joiner" : "off";
         string? loadFields = T3LoadStats(loadSnapshot);
+        string? worldSyncFields = T3WorldSyncStats();
         if (loadFields is not null)
             Console.WriteLine($"MP-T3-STATS origin=agent role={roleName} section=load {loadFields}");
+        if (worldSyncFields is not null)
+            Console.WriteLine($"MP-T3-STATS origin=agent role={roleName} section=events {worldSyncFields}");
         Console.WriteLine($"MP-T3-STATS origin=agent role={roleName} {fields}");
-        if (role != 0) _ = T3SendNativeStatsAsync(role, fields, loadSnapshot is null ? null : loadFields, ct);
+        if (role != 0) _ = T3SendNativeStatsAsync(role, fields, loadSnapshot is null ? null : loadFields, worldSyncFields, ct);
     }
 
     private static string T3FormatStats(IEnumerable<KeyValuePair<string, long>> counters) =>
@@ -311,20 +315,21 @@ public partial class GameBridge
         return fields.Count == 0 ? null : T3FormatStats(fields);
     }
 
-    private async Task T3SendNativeStatsAsync(byte role, string fields, string? loadFields, CancellationToken ct)
+    private async Task T3SendNativeStatsAsync(byte role, string fields, string? loadFields, string? worldSyncFields, CancellationToken ct)
     {
-        if (loadFields is not null) await T3MirrorStatsAsync(role, loadFields, ct, load: true);
-        await T3MirrorStatsAsync(role, fields, ct, load: false);
+        if (loadFields is not null) await T3MirrorStatsAsync(role, loadFields, ct, Protocol.T3LoadStatsCommand);
+        if (worldSyncFields is not null) await T3MirrorStatsAsync(role, worldSyncFields, ct, Protocol.T3WorldSyncStatsMirror);
+        await T3MirrorStatsAsync(role, fields, ct);
     }
 
-    private async Task T3MirrorStatsAsync(byte role, string fields, CancellationToken ct, bool load)
+    private async Task T3MirrorStatsAsync(byte role, string fields, CancellationToken ct, byte section = 0)
     {
         try
         {
             using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
             stop.CancelAfter(2000);
             byte[] text = Encoding.ASCII.GetBytes(fields);
-            byte[] payload = load ? [Protocol.T3LoadStatsCommand, role, .. text] : [role, .. text];
+            byte[] payload = section == 0 ? [role, .. text] : [section, role, .. text];
             var reply = await _combat.Wo163Async(Protocol.T3OpStats, payload, stop.Token);
             if (reply is not { Ok: true })
                 Console.WriteLine("MP-T3-STATS native mirror unavailable: no accepted reply");

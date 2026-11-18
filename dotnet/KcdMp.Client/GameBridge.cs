@@ -4773,6 +4773,7 @@ public partial class GameBridge(ClientConfig config)
         {
             if (Interlocked.Exchange(ref stopped, 1) != 0) return;
             P6EndReceive(stream, ct);
+            WorldSyncStop(stream);
             T3TpEndReceive(tpConnection);
             if (ReferenceEquals(Interlocked.CompareExchange(ref _presentationSession, null, presentationSession), presentationSession))
                 PresentationResetNative();
@@ -4819,6 +4820,11 @@ public partial class GameBridge(ClientConfig config)
                 byte[] wirePayload = payload;
                 int wireBytes  = payloadLen + 3;
                 if (!PresentationReadFrame(presentationSession, ref type, ref payload, arrival, out var presentation, ct)) continue;
+                if (WorldSyncAtRead(type, payload, stream))
+                {
+                    if (_sessionRecorder is not null) RecordRelayRead(header, wirePayload);
+                    continue;
+                }
                 long p6ReadTick = Environment.TickCount64;
                 var p6State = type == Protocol.W164Down ? P1Lifecycle.Current : default;
                 long p6Serial = type == Protocol.W164Down ? Interlocked.Read(ref _p1Serial) : 0, p6Life = type == Protocol.W164Down ? Interlocked.Read(ref _t3InputLifeRevision) : 0;
@@ -4856,6 +4862,9 @@ public partial class GameBridge(ClientConfig config)
                     Presentation = presentation, MarkerPeerSerial = markerPeer
                 };
                 if (!LoadSequenceFrameCurrent(inFrame)) continue;
+                if (WorldSyncEffective && WorldSyncCatalog.EventChannel(type, payload) is not null) continue;
+                if (T3TryDeferSideChannel(inFrame)) continue;
+                if (!WorldSyncReady && inFrame.LoadScoped) continue;
                 if (LoadSequenceWritable) NotePresentationRelocationAtRead(presentationSession, type, payload, arrival, stamp);
                 if (p6Frame)
                 {
@@ -4875,7 +4884,6 @@ public partial class GameBridge(ClientConfig config)
                     if (!LoadSequenceEnabled || !Wo136Defer(loot)) Wo207Queue(lootLane.Writer, loot, type);
                     continue;
                 }
-                if (T3TryDeferSideChannel(inFrame)) continue;
                 if (Wo147IsLeashFrame(type)) { leashLane.Writer.TryWrite(inFrame with { TeleportLifeRevision = Interlocked.Read(ref _t3InputLifeRevision), TeleportGeneration = P1Lifecycle.Current.Generation }); continue; }
                 if (type == Protocol.ConvDown && W207("conv_lane")) { convLane.Writer.TryWrite(inFrame); continue; }   // WO-207 A.1
                 if ((type == Protocol.ActivityHostDown || type == Protocol.ActivityExtraDown) && W207("queue_decouple"))   // WO-207 B.3
@@ -5019,6 +5027,7 @@ public partial class GameBridge(ClientConfig config)
         {
             if (await P6TryProcessFrameAsync(frame, ct)) return;
             if (T3TryDeferSideChannel(frame)) return;
+            if (!WorldSyncReady && frame.LoadScoped) return;
             ProcessorFrameScope.ThrowIfAbandoned();
             Wo147NoteProcessing(frame.Arrival);   // the backlog fix: how far behind the reader this processor is
             if (Wo136Defer(frame)) return;   // WO-136: the host's NPCs and avatars wait for the world to load

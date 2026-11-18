@@ -45,7 +45,7 @@ public static class W221Switch
     /// mod's own: a talk the copy never takes is started the game's forced way), ragdoll_once (A: a fresh corpse is laid down by one
     /// ragdoll at a time, only after the game's own death action had its time -- the joiner's crashes came ~1 s after a ragdoll of a
     /// body 0.65 s dead).</summary>
-    public static readonly string[] AgentNames = ["shop_keeper", "talk_force", "horse_drop", "saddlebags", "route_quiet", "cart_seat", "cart_wheels", "ragdoll_once", "load_sequence"];
+    public static readonly string[] AgentNames = ["shop_keeper", "talk_force", "horse_drop", "saddlebags", "route_quiet", "cart_seat", "cart_wheels", "ragdoll_once", "load_sequence", "baseline_events"];
 
     public static readonly string[] Names = [.. NativeNames, .. AgentNames];
 

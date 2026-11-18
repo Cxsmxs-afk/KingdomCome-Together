@@ -195,6 +195,19 @@ public class Wo204Tests
     }
 
     [Fact]
+    public void ConfirmedVoteBindsTheNativeSnapshotAndOpaqueReceipt()
+    {
+        const string token = "00112233445566778899aabbccddeeff";
+        Assert.Equal(new byte[] { 3, 255, 0x78, 0x56, 0x34, 0x12 }
+            .Concat(System.Text.Encoding.ASCII.GetBytes(token)), Wo204Rules.ConfirmedVoteMark(0x12345678, 3, token));
+        Assert.Equal(byte.MaxValue, Wo204Rules.ConfirmedVoteMark(1, -1, token)[0]);
+        Assert.Throws<ArgumentException>(() => Wo204Rules.ConfirmedVoteMark(0, 3, token));
+        Assert.Throws<ArgumentException>(() => Wo204Rules.ConfirmedVoteMark(1, 8, token));
+        Assert.Throws<ArgumentException>(() => Wo204Rules.ConfirmedVoteMark(1, 0, token.ToUpperInvariant()));
+        Assert.Throws<ArgumentException>(() => Wo204Rules.ConfirmedVoteMark(1, 0, token[..31] + "\""));
+    }
+
+    [Fact]
     public void Trialog_RolesFromTheDialoguesOwnFile()
     {
         const string xml = "\uFEFF<?xml version=\"1.0\" encoding=\"utf-8\"?><Database Name=\"x\"><Skald>"

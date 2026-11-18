@@ -24,6 +24,7 @@
 #include "rp_measure.h"
 #include "rp_timeline_actions.h"
 #include "load_sequence.h"
+#include "dialog_vote_rules.h"
 #include "respawn_actions.h"
 #include "npc_drive.h"
 #include "motion.h"
@@ -638,6 +639,7 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
         case kWo151:
             return op == wo151::kOpCopyFight ? LoadAccess::Live : LoadAccess::Control;
         case kWo163:
+            if (dialogvote::typed(body, n)) return LoadAccess::Live;
             return op == wo163::kOpReplay || op == wo163::kOpSkirmishPair ||
                    op == wo173::kOpRealHit || op == wo197::kOpPair || op == wo197::kOpSyncGuard ||
                    op == wo197::kOpEnsureGuard || op == wo187::kOpOpponent || op == wo187::kOpGuardHold ||

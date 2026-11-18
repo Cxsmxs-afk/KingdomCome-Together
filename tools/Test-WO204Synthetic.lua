@@ -246,6 +246,55 @@ do
     check("d: no Lua errors", #ERRS == 0, ERRS[1])
 end
 
+-- The confirmed vote stages without changing the HUD. Only the checked
+-- commit issues an applied receipt, with same-token retransmission harmless.
+do
+    clearLog()
+    local session = string.rep("a", 32)
+    local vote, refused, cleared = string.rep("b", 32), string.rep("c", 32), string.rep("d", 32)
+    local rows = "0~ui_test___seq1~0~-~0~0;1~ui_test___seq2~0~-~0~0"
+    local writes, array, highlight = 0, nil, nil
+    local accepted = true
+    local priorScope, priorDialog = KCD2MP.w136.loadSequence, player.human.IsInDialog
+    player.human.IsInDialog = function() return true end
+    KCD2MP.w136.loadSequence = { enabled = true, session = session, generation = "41", phase = 5, flags = 0 }
+    UIAction.SetArray = function(_, _, _, entries) writes = writes + 1; array = entries end
+    UIAction.CallFunction = function(_, _, fn, arg)
+        if fn == "SetDialogSequences" then return accepted end
+        if fn == "SetActiveSequenceChanged" then highlight = arg end
+    end
+    KCD2MP_W204StageVote("ask", vote, session, "41", rows, 1)
+    check("confirmed vote stages without touching HUD", writes == 0 and evts("wo124_reply")[1] == "ask staged")
+    check("confirmed vote marks the row and preserves cursor", KCD2MP_W204CommitVote(vote, 1, 0, true)
+        and array[8] == "kct_vote" and highlight == 0 and evts("wo124_reply")[2] == vote .. " applied")
+    check("confirmed vote retry returns same proof without replay", KCD2MP_W204CommitVote(vote, 1, 0, true)
+        and writes == 1 and evts("wo124_reply")[3] == vote .. " applied")
+    accepted = false
+    KCD2MP_W204StageVote("ask2", refused, session, "41", rows, 0)
+    check("HUD refusal never emits applied", not KCD2MP_W204CommitVote(refused, 0, 1, true)
+        and evts("wo124_reply")[5] == refused .. " refused")
+    accepted = true
+    KCD2MP_W204StageVote("ask3", cleared, session, "41", rows, -1)
+    check("confirmed clear removes the vote marker", KCD2MP_W204CommitVote(cleared, -1, 0, true)
+        and array[3] == "" and array[8] == "")
+    KCD2MP.w136.loadSequence = { enabled = true, session = session, generation = "42", phase = 5, flags = 0 }
+    local before = writes
+    check("new world refuses previous applied receipt", not KCD2MP_W204CommitVote(cleared, -1, 0, true) and writes == before)
+    KCD2MP_W204StageVote("ask4", vote, session, "41", rows, 0)
+    local replies = evts("wo124_reply")
+    check("stale generation cannot stage a vote", replies[#replies] == "ask4 refused")
+    KCD2MP_W204StageVote("ask5", vote, session, "42", rows, 0)
+    player.human.IsInDialog = function() return false end
+    check("closed dialogue cannot render a staged vote", not KCD2MP_W204CommitVote(vote, 0, 0, true) and writes == before)
+    local on = KCD2MP_W221On
+    KCD2MP_W221On = function(name) return name ~= "baseline_events" and on(name) end
+    KCD2MP_W204StageVote("ask6", vote, session, "42", rows, 0)
+    replies = evts("wo124_reply")
+    check("legacy mode blocks typed vote staging", replies[#replies] == "ask6 refused")
+    KCD2MP_W221On = on
+    KCD2MP.w136.loadSequence, player.human.IsInDialog = priorScope, priorDialog
+end
+
 -- (e) IV.1: the joiner's load progress renews the paused join's safety timer
 do
     ERRS = {}; TIMERS = {}

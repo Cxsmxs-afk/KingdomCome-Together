@@ -55,7 +55,7 @@ public static class NoiseRules
     };
 
     /// <summary>Keep marks, faults, measurements and summaries wherever they occur.</summary>
-    private static readonly Regex Protected = new(@"MP-MARK|FAULT|STATS|SUMMARY|summary|MP-W207-Q |MP-LOAD-(?:SEQUENCE|STALE) |MP-RP-(?:MEASURE|CONFIG|CTRL(?:-STANCE)?|COMBAT-ACTION|KO|DAMAGE) |WO221-OWNER-VIOLATION ",
+    private static readonly Regex Protected = new(@"MP-MARK|FAULT|STATS|SUMMARY|summary|MP-W207-Q |MP-LOAD-(?:SEQUENCE|STALE) |MP-WORLD-(?:BASELINE|EVENT(?:-SCOPE)?) |MP-RP-(?:MEASURE|CONFIG|CTRL(?:-STANCE)?|COMBAT-ACTION|KO|DAMAGE) |WO221-OWNER-VIOLATION ",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>A line that is never collapsed, whatever it is next to.</summary>

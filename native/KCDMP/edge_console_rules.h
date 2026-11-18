@@ -15,6 +15,10 @@ constexpr size_t kMaxRequestBytes = 1024;
 constexpr size_t kNonceBytes = 8;
 enum class Kind : uint8_t { Probe = 0, Lua = 1 };
 enum class Result : uint8_t { NotEntered = 0, Returned = 1, Uncertain = 2 };
+// Main only. This narrow call runs the staged vote for the same HUD snapshot
+// that WO-203 just verified. Returning is separate from Lua's applied receipt.
+Result present_dialog_vote(const char* token, int index, int current, bool right);
+
 
 struct Command {
     Kind kind;

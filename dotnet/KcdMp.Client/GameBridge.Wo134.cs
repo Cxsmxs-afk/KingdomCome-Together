@@ -49,7 +49,10 @@ public partial class GameBridge
     {
         public List<string>? Calls;
         public int Next;
+        public long ReceiptEpoch;
     }
+    private (WorldSyncScope Scope, uint Snapshot)? _w134BaselineLedger;
+    private LedgerWork? _w134BaselineLedgerWork;
     private LedgerWork? _w134LedgerPending;
     private int _w134LedgerApplyBusy;
     private volatile bool _w134LedgerLinkHeld;
@@ -63,6 +66,8 @@ public partial class GameBridge
             Interlocked.Exchange(ref _w134GameLedgerEpoch, 0);
             _w134GameLedgerWorld = 0;
             _w134LedgerPending = null;
+            _w134BaselineLedger = null;
+            _w134BaselineLedgerWork = null;
             _w134LedgerLinkHeld = false;
         }
     }
@@ -556,6 +561,8 @@ public partial class GameBridge
         {
             if (_w206.World != world || generation != Interlocked.Read(ref _w134LedgerGeneration)) return;
             _w134LedgerPending = work;
+            if (_w134BaselineLedger is { } baseline && baseline.Scope.HostWorld == world)
+                _w134BaselineLedgerWork = work;
         }
         await Wo134SendLedgerWorkAsync(work);
     }
@@ -584,6 +591,7 @@ public partial class GameBridge
                     if (!Wo134LedgerCurrent(work)) return;
                     _w134GameLedgerWorld = work.World;
                     Interlocked.Exchange(ref _w134GameLedgerEpoch, epoch);
+                    work.ReceiptEpoch = epoch;
                     work.Calls = Wo134Rules.HerbCalls(work.Herbs, epoch);
                     work.Calls.AddRange(Wo134Rules.ApplyCalls(work.Rows, epoch: epoch, serial: work.Generation));
                     work.Calls.Add($"if KCD2MP_W134OwnershipReady then KCD2MP_W134OwnershipReady({epoch}) end");
@@ -596,7 +604,7 @@ public partial class GameBridge
                 // Stable epoch/serial/part makes a transport retry idempotent even
                 // when the game accepted the previous HTTP request before its reply was lost.
                 await _transport.ExecuteNowAsync(work.Calls[work.Next]);
-                work.Next++;
+                lock (_w134Gate) work.Next++;
                 await Task.Delay(50);
             }
             lock (_w134Gate) if (ReferenceEquals(_w134LedgerPending, work)) _w134LedgerPending = null;

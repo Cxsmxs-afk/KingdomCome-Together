@@ -7554,6 +7554,73 @@ function KCD2MP_W136Held()
     return true
 end
 
+local function s3BaselineWorld(generation)
+    local w = KCD2MP.w136 and KCD2MP.w136.loadSequence
+    return w and w.enabled and w.generation == generation and w.phase == 5 and w.flags == 0
+        and KCD2MP_Wo124WhereNow and KCD2MP_Wo124WhereNow() == "world"
+end
+
+-- One receipt from the engine entity, never from the incoming samples or the
+-- Lua shadow. Missing methods, a hidden entity and an old world stay unconfirmed.
+function KCD2MP_S3ReadBody(tok, generation, kind, name)
+    local reply = "unavailable"
+    if s3BaselineWorld(generation) then
+        pcall(function()
+            local e
+            if kind == "ghost" then
+                local g = KCD2MP.ghosts and KCD2MP.ghosts[name]
+                e = g and g.entity
+            elseif kind == "npc" then e = System.GetEntityByName(name) end
+            if not e or e == player or not e.IsHidden then return end
+            local hidden = e:IsHidden()
+            if hidden ~= false and hidden ~= 0 then return end
+            local p, a = e:GetWorldPos(), e:GetWorldAngles()
+            if not p or not a then return end
+            local dead, down, hp = "-", "-", "-"
+            pcall(function()
+                local d = e.actor:IsDead()
+                if d == true or d == false then dead = d and "1" or "0" end
+            end)
+            pcall(function()
+                local d = e.actor:IsUnconscious()
+                if d == true or d == false then down = d and "1" or "0" end
+            end)
+            pcall(function()
+                local h = e.actor:GetHealth()
+                if type(h) == "number" then hp = string.format("%.3f", h) end
+            end)
+            reply = string.format("%.3f %.3f %.3f %.4f %s %s %s", p.x, p.y, p.z, a.z, dead, down, hp)
+        end)
+    end
+    KCD2MP_EmitEvent("wo124_reply", tok .. " " .. reply)
+end
+
+function KCD2MP_S3ReadRain(tok, generation)
+    local reply = "unavailable"
+    if s3BaselineWorld(generation) then
+        pcall(function()
+            local rain = EnvironmentModule.GetRainIntensity()
+            if type(rain) == "number" then reply = string.format("%.3f", rain) end
+        end)
+    end
+    KCD2MP_EmitEvent("wo124_reply", tok .. " " .. reply)
+end
+
+function KCD2MP_S3SetWeather(generation, profile, rain)
+    if not s3BaselineWorld(generation) then return false end
+    if type(rain) == "number" and KCD2MP_W166WeatherApply then KCD2MP_W166WeatherApply(rain, profile) end
+    if profile ~= "" and KCD2MP_ApplyWeather then KCD2MP_ApplyWeather(profile, 1) end
+    return true
+end
+
+-- This is the vitals presentation record. The partner figure's own health is
+-- intentionally untouched by the remote player's health/stamina packet.
+function KCD2MP_S3ReadVitals(tok, generation, ghost)
+    local v = s3BaselineWorld(generation) and KCD2MP.ghostHealth[ghost]
+    local reply = v and string.format("%.1f %.1f %d", v.h, v.s, v.flags) or "unavailable"
+    KCD2MP_EmitEvent("wo124_reply", tok .. " " .. reply)
+end
+
 -- on = true|false; ttlS = how long a hold may last unlifted (default 240 s:
 -- the field's join took 112 s from the command to "Gameplay started").
 function KCD2MP_W136Hold(on, ttlS, why, sequenced)
@@ -18892,8 +18959,8 @@ function KCD2MP_W134ItemResult(tok, verdict, generation)
 end
 
 -- Agent -> joiner: the host (or another joiner) took this world item.
-function KCD2MP_W134ItemGone(cls, x, y, z, generation)
-    if W134.deferHost(KCD2MP_W134ItemGone, generation, cls, x, y, z, generation) then return false end
+function KCD2MP_W134ItemGone(cls, x, y, z, generation, expectedId)
+    if W134.deferHost(KCD2MP_W134ItemGone, generation, cls, x, y, z, generation, expectedId) then return false end
     local w = KCD2MP.w134
     x, y, z = tonumber(x), tonumber(y), tonumber(z)
     W134.syncLife()
@@ -18904,6 +18971,7 @@ function KCD2MP_W134ItemGone(cls, x, y, z, generation)
     end
     local e, d = W134.findItem(tostring(cls), x, y, z, w.matchM)
     if not e then e, d = W134.findItem(tostring(cls), x, y, z, w.deadBodyMatchM); if e and not W134.belongsToBody(e) then e = nil end end
+    if expectedId ~= nil and (not e or e.id ~= expectedId) then return false end
     if not e then
         W134.log(string.format("WO134-ITEM host-gone cls=%s at=(%.2f,%.2f,%.2f) -- nothing here to remove", tostring(cls), x, y, z))
         return false
@@ -18911,6 +18979,53 @@ function KCD2MP_W134ItemGone(cls, x, y, z, generation)
     local how = W134.takeAway(e)
     W134.log(string.format("WO134-ITEM host-gone cls=%s at=(%.2f,%.2f,%.2f) -- %s here (matched %.3f m)", tostring(cls), x, y, z, how, d))
     return true
+end
+
+function KCD2MP_S3ApplyItemResult(reply, scope, generation, tok, verdict, cls, x, y, z)
+    local okay = false
+    if s3BaselineWorld(scope) and W134.generationCurrent(generation) then
+        local r = (KCD2MP.w134.itemTickets or {})[tok]
+        if W134.ticketCurrent(r) and string.lower(r.cls) == cls and (r.x - x)^2 + (r.y - y)^2 + (r.z - z)^2 <= 0.01 then
+            KCD2MP_W134ItemResult(tok, verdict, generation)
+            okay = r.verdict == verdict and r.captured and r.settled == true
+        end
+    end
+    KCD2MP_EmitEvent("wo124_reply", reply .. (okay and " applied" or " pending"))
+end
+
+function KCD2MP_S3ApplyItemGone(reply, scope, generation, key, cls, x, y, z)
+    local okay = false
+    if s3BaselineWorld(scope) and W134.generationCurrent(generation) and not W134.held() then
+        local w = KCD2MP.w134
+        if w.s3ItemScope ~= scope then w.s3ItemScope, w.s3Items, w.s3ItemOrder = scope, {}, {} end
+        local receipt = w.s3Items[key]
+        if not receipt then
+            local e = W134.findItem(cls, x, y, z, w.matchM)
+            if not e then
+                e = W134.findItem(cls, x, y, z, w.deadBodyMatchM)
+                if e and not W134.belongsToBody(e) then e = nil end
+            end
+            if e and e.id then
+                -- Reserve this engine entity before touching it. A retry may
+                -- read the same entity, never pick a neighboring item.
+                receipt = { id = e.id }
+                w.s3Items[key] = receipt
+                w.s3ItemOrder[#w.s3ItemOrder + 1] = key
+                if #w.s3ItemOrder > 256 then w.s3Items[table.remove(w.s3ItemOrder, 1)] = nil end
+                KCD2MP_W134ItemGone(cls, x, y, z, generation, receipt.id)
+            end
+        end
+        if receipt then
+            if not receipt.applied then
+                pcall(function()
+                    local after = System.GetEntity(receipt.id)
+                    receipt.applied = after == nil or not KCD2MP_W134IsWorldItem(after) or (after.IsHidden and after:IsHidden() == true)
+                end)
+            end
+            okay = receipt.applied == true
+        end
+    end
+    KCD2MP_EmitEvent("wo124_reply", reply .. (okay and " applied" or " pending"))
 end
 
 function W134.installPickup()
@@ -19150,7 +19265,7 @@ function W134.ledgerReset(why)
     local w = KCD2MP.w134
     KCD2MP._w134LedgerEpoch = (KCD2MP._w134LedgerEpoch or 0) + 1
     w.ledger = { rows = {}, head = 1, tail = 0, scheduled = false, lastAt = -1e9,
-                 applied = 0, expired = 0, skipped = 0, operations = 0, held = false, epoch = KCD2MP._w134LedgerEpoch, seen = {}, order = {}, nextId = 0 }
+                 applied = 0, expired = 0, skipped = 0, operations = 0, held = false, epoch = KCD2MP._w134LedgerEpoch, seen = {}, order = {}, nextId = 0, batches = {} }
 end
 function KCD2MP_W134LedgerReset(why) W134.ledgerReset(why) end
 function KCD2MP_W134LedgerLinkHold(on)
@@ -19187,6 +19302,12 @@ function KCD2MP_W134ChestApply(rows, epoch, serial, part)
     if epoch ~= nil and tonumber(epoch) ~= q.epoch then return false end
     local key = serial and part and (tostring(serial) .. ":" .. tostring(part)) or nil
     if key and q.seen[key] then return true end
+    local batch
+    if key then
+        q.batches = q.batches or {}
+        batch = q.batches[serial]
+        if not batch then batch = { count = 0, confirmed = 0 }; q.batches[serial] = batch end
+    end
     for _, r in ipairs(rows or {}) do
         q.tail = q.tail + 1
         q.nextId = q.nextId + 1
@@ -19196,10 +19317,18 @@ function KCD2MP_W134ChestApply(rows, epoch, serial, part)
         q.rows[q.tail] = { name, tostring(r[2]), tonumber(r[3]) or 0,
                          tonumber(r[4]) or 1, tonumber(r[5]) or 0, tonumber(r[6]) or 0, 0 }
         q.rows[q.tail][12] = q.nextId
+        if batch then batch.count = batch.count + 1; q.rows[q.tail][13] = batch end
     end
     if key then q.seen[key] = true end
     W134.ledgerSchedule(q)
     return true
+end
+
+function KCD2MP_S3ReadLedger(tok, generation, epoch, serial, rows)
+    local q = s3BaselineWorld(generation) and KCD2MP.w134.ledger
+    local b = q and q.epoch == epoch and q.batches and q.batches[serial]
+    local applied = b and q.received and b.count == rows and b.confirmed == rows
+    KCD2MP_EmitEvent("wo124_reply", tok .. (applied and " applied" or " pending"))
 end
 function KCD2MP_W134OwnershipReady(epoch)
     local q = KCD2MP.w134.ledger
@@ -19265,6 +19394,8 @@ function KCD2MP_W134LedgerDrain()
             end
             done = r[3] == 0
             if done then
+                local batch = r[13]
+                if batch then batch.confirmed = batch.confirmed + 1 end -- settled against read engine counts
                 if r[7] ~= 0 then
                     q.applied = q.applied + 1
                     KCD2MP_EmitEvent("w134_ledger_row", string.format("%d %s %s %d", q.epoch, name, cls, r[7]))
@@ -35168,7 +35299,11 @@ do
         if marks and marks.hover ~= nil and r.index == marks.hover then return "kct_hover" end
         return nil
     end
-    local function c4_send(rows, voteIdx, right, marks)
+    local function c4_hud_call(fn, ...)
+        local ok, result = pcall(fn, ...)
+        return ok and result ~= false
+    end
+    local function c4_send(rows, voteIdx, right, marks, confirmed)
         local flat = {}
         local over = not (KCD2MP_W210IsOn and not KCD2MP_W210IsOn("conv_mark_over_icon"))
         for _, r in ipairs(rows) do
@@ -35177,8 +35312,10 @@ do
             if mark and (icon == "" or over) then icon = mark end   -- off: a row with an icon of its own keeps it
             flat[#flat + 1] = r.text; flat[#flat + 1] = r.used; flat[#flat + 1] = icon; flat[#flat + 1] = r.diff; flat[#flat + 1] = r.val
         end
-        pcall(UIAction.SetArray, "hud", 0, "SequenceList", flat)
-        pcall(UIAction.CallFunction, "hud", 0, "SetDialogSequences", right ~= false)
+        local stored = c4_hud_call(UIAction.SetArray, "hud", 0, "SequenceList", flat)
+        if confirmed and not stored then return false end
+        local shown = c4_hud_call(UIAction.CallFunction, "hud", 0, "SetDialogSequences", right ~= false)
+        return stored and shown
     end
     -- WO-210 F.1: the listener's key counts of one decision (which device moved the cursor), told when the decision ends
     local function c4_keys_flush(why)
@@ -35345,6 +35482,50 @@ do
         C4.stats.icons = C4.stats.icons + 1
         KCD2MP_EmitEvent("w207_icon", tostring((v ~= nil and v >= 0) and v or "clear"))   -- WO-207 A.4: when it showed (the agent stamps it)
         return true
+    end
+    -- Staging only stores the copied rows. The DLL checks the starter's
+    -- actual HUD snapshot immediately before invoking the commit on Main.
+    local function c4_vote_scope(session, generation)
+        local w = KCD2MP.w136 and KCD2MP.w136.loadSequence
+        if not w or not w.enabled or w.session ~= session or w.generation ~= generation or w.phase ~= 5 or w.flags ~= 0 or
+            (KCD2MP_W221On and not KCD2MP_W221On("baseline_events")) then return nil end
+        return w
+    end
+    function KCD2MP_W204StageVote(ask, token, session, generation, csv, voteIdx)
+        local scope = c4_vote_scope(session, generation)
+        local rows, index = c4_rows(csv), tonumber(voteIdx)
+        local valid = scope and type(token) == "string" and #token == 32 and string.match(token, "^%x+$") and
+            index and index >= -1 and index < #rows and #rows > 0
+        if valid then C4.pendingVote = { token = token, scope = scope, rows = rows, index = index } end
+        KCD2MP_EmitEvent("wo124_reply", tostring(ask) .. (valid and " staged" or " refused"))
+    end
+    function KCD2MP_W204CommitVote(token, index, current, onRight)
+        local pending, previous = C4.pendingVote, C4.appliedVote
+        local accepted = false
+        local scope = KCD2MP.w136 and KCD2MP.w136.loadSequence
+        if not scope or not c4_vote_scope(scope.session, scope.generation) then
+            KCD2MP_EmitEvent("wo124_reply", token .. " refused")
+            return false
+        end
+        if previous and previous.token == token and previous.scope == scope and previous.index == index then
+            accepted = true
+        elseif pending and pending.token == token and pending.scope == scope and pending.index == index then
+            local inDialog = false
+            pcall(function() inDialog = player and player.human and player.human:IsInDialog() == true end)
+            local vote = (index >= 0) and index or nil
+            accepted = inDialog and c4_send(pending.rows, vote, onRight == true, nil, true)
+            if accepted and current >= 0 then
+                accepted = c4_hud_call(UIAction.CallFunction, "hud", 0, "SetActiveSequenceChanged", current, 0)
+            end
+            if accepted then
+                C4.appliedVote = { token = token, scope = scope, index = index }
+                C4.pendingVote = nil
+                C4.stats.icons = C4.stats.icons + 1
+                KCD2MP_EmitEvent("w207_icon", tostring(vote or "clear"))
+            end
+        end
+        KCD2MP_EmitEvent("wo124_reply", token .. (accepted and " applied" or " refused"))
+        return accepted
     end
     -- WO-207 A.3, the listener: the starter's decision timer on this player's own HUD (SetDialogTimeLimit, UpdateDialogTimeLimit 1 -> 0,
     -- ClearDialogTimeLimit: the HUD's own functions, WO-203's map), run on between the starter's messages by its rate. Only a display:
@@ -36978,7 +37159,7 @@ do
         shop_keeper = "mp_shop_keeper", own_horse = "mp_own_horse", talk_force = "mp_talk_force",
         corpse_look = "mp_corpse_look", horse_drop = "mp_horse_drop", saddlebags = "mp_saddlebags", route_quiet = "mp_route_quiet", cart_seat = "mp_cart_seat", cart_wheels = "mp_cart_wheels",
         ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller", rp_combat = "mp_rp_combat",
-        load_sequence = "mp_load_sequence",
+        load_sequence = "mp_load_sequence", baseline_events = "mp_baseline_events",
     }
     W221.HELP = {
         combat_action_end = "A: (both) no combat animation of ours outlives its body's combat part (the joiner's fight crash)",
@@ -36998,6 +37179,7 @@ do
         rp_controller = "Move the partner's figure through the game's movement request when the body supports it",
         rp_combat = "Play the partner's timed combat through native requests",
         load_sequence = "Apply the world only for its current load generation",
+        baseline_events = "Install the world baseline and confirm each ordered event",
     }
     function KCD2MP_W221On(name)
         local v = W221.on[tostring(name)]
@@ -38325,6 +38507,23 @@ do
         s.pinv = L.ids(player)
         return s.pend[tok] == nil
     end
+    function KCD2MP_S3ApplyCorpseTake(reply, scope, generation, tok, verdict, name, hostId, owner, stolen)
+        local okay = false
+        if s3BaselineWorld(scope) and W134.generationCurrent(generation) then
+            local s = L.sess[name]
+            local pending = s and s.pend[tok]
+            if s then
+                s.s3Verdicts = s.s3Verdicts or {}
+                if pending and pending.hid == hostId then
+                    s.s3Verdicts[tok] = hostId .. ":" .. verdict
+                    KCD2MP_W217TakeResult(tok, verdict, name, hostId, owner, stolen, generation)
+                end
+                local applied = s.done and s.done[tok]
+                okay = s.s3Verdicts[tok] == hostId .. ":" .. verdict and applied == (verdict == "grant" and "applied" or "cancel")
+            end
+        end
+        KCD2MP_EmitEvent("wo124_reply", reply .. (okay and " applied" or " pending"))
+    end
     function KCD2MP_W217LootReset()
         L.sess = {}; L.hostLive = {}; L.hostEsc = {}; L.hostDone = {}; L.partial = {}; L.restore = {}; L.fellBack = {}
         L.cancelClean, L.held, L.heldResults = {}, {}, {}
@@ -38396,7 +38595,9 @@ do
     end
     -- the joiner, per body of the host's list: a missing one is made (WO-131's stand-in, created dead); one alive here is reported (the
     -- agent applies its death); a dead one is shown, kept out of B's hiding and laid where the host's lies
-    function KCD2MP_W217Corpse(name, x, y, z, yaw)
+    function KCD2MP_W217Corpse(name, x, y, z, yaw, generation)
+        if generation ~= nil and not s3BaselineWorld(generation) then return false end
+        local scoped = generation and (" " .. generation) or ""
         if not KCD2MP_W217On("encounter_world") then return false end
         name = tostring(name)
         E.listed[name] = os.clock()
@@ -38409,7 +38610,7 @@ do
                 E.stats.made = (E.stats.made or 0) + 1
                 mp_log(string.format("WO217-CORPSE npc=%s here=made -- the host's dead body is not in this world (an encounter's own): a stand-in made dead where the host's lies [n=%d]",
                     name, E.stats.made))
-                KCD2MP_EmitEvent("w217_corpse", name .. " spawned")
+                KCD2MP_EmitEvent("w217_corpse", name .. " spawned" .. scoped)
                 return true
             end
             if not E.seen[name] then
@@ -38418,13 +38619,13 @@ do
                 mp_log(string.format("WO217-CORPSE npc=%s here=waiting -- the host's dead body is not in this world: its stand-in waits for the host's soul or the guard [n=%d]",
                     name, E.stats.missing))
             end
-            KCD2MP_EmitEvent("w217_corpse", name .. " waiting")
+            KCD2MP_EmitEvent("w217_corpse", name .. " waiting" .. scoped)
             return false
         end
         local deadNow = false
         pcall(function() deadNow = e.actor ~= nil and e.actor:IsDead() == true end)
         if not deadNow then
-            KCD2MP_EmitEvent("w217_corpse", name .. " alive")
+            KCD2MP_EmitEvent("w217_corpse", name .. " alive" .. scoped)
             return false
         end
         KCD2MP_T3CorpseProbe(name, e)
@@ -38449,7 +38650,7 @@ do
             -- an upright dead copy is laid down the game's way (WO-195's rule)
             if dead and KCD2MP_W195Ragdoll then pcall(KCD2MP_W195Ragdoll, name) end
         end
-        KCD2MP_EmitEvent("w217_corpse", name .. " shown")
+        KCD2MP_EmitEvent("w217_corpse", name .. " shown" .. scoped)
         return true
     end
     -- WO-221 E.1 (corpse_look), the joiner, every 2 s (the agent's tick): the ragdoll call a death makes does nothing for a body outside

@@ -11,20 +11,23 @@ using KcdMp.Wire;
 static partial class P
 {
     private const string BotEnv = "KCDMP_TEST_BOT";
+    private const string BaselineEnv = "KCDMP_TEST_BASELINE_EVENTS";
+    private const string BaselineFlag = "--test-baseline-events";
+    private const string DialogFlag = "--dialog-votes";
     private static readonly Guid BotSwingRow = Guid.Parse("3e27732b-b152-4a27-97d2-1ebba717a588");
     private static readonly HashSet<string> BotVerbs = new(StringComparer.Ordinal)
     {
         "stand", "move", "curve", "strafe", "state", "attack", "block_impulse", "hit", "hit_reaction",
         "vitals", "death", "respawned", "ranged", "appearance", "bow_equip", "activity", "ride", "draw", "sheathe"
     };
-    private static readonly string[] BotOptions = ["--test-bot", "--self-test", "--origin", "--bow-class", "--ranged-kind", "--tables-pak", "--duration", "--wire-version"];
+    private static readonly string[] BotOptions = ["--test-bot", "--self-test", "--origin", "--bow-class", "--ranged-kind", "--tables-pak", "--duration", "--wire-version", BaselineFlag, DialogFlag];
     private static readonly string[] BotValueOptions =
         ["--scenario", "--host", "--port", "--name", "--origin", "--bow-class", "--ranged-kind", "--tables-pak", "--duration", "--wire-version"];
 
     private sealed record BotPlan(IReadOnlyList<Step> Steps, double End);
     private sealed record BotContext(byte Host, uint World, (float X, float Y, float Z)? Origin);
     private sealed record BotOptionsParsed(string? Scenario, IPAddress Address, int Port, string Name, TimeSpan Duration,
-        (float X, float Y, float Z)? Origin, string? Tables, Guid RangedClass, RangedWeaponKind RangedKind, string WireVersion);
+        (float X, float Y, float Z)? Origin, string? Tables, Guid RangedClass, RangedWeaponKind RangedKind, string WireVersion, bool DialogVotes);
     private sealed class BotRoleException() : IOException("Start the host before the T4 joiner.");
 
     private static uint PlannedHostMs(uint start, double seconds) => unchecked(start + (uint)(seconds * 1000));
@@ -51,14 +54,21 @@ static partial class P
     private static BotOptionsParsed ParseBotOptions(string[] args)
     {
         var fields = new Dictionary<string, string>(StringComparer.Ordinal);
+        bool baseline = false, dialog = false;
         for (int index = 0; index < args.Length; index++)
         {
             string key = args[index];
             if (key == "--test-bot") continue;
+            if (key == BaselineFlag && !baseline) { baseline = true; continue; }
+            if (key == DialogFlag && !dialog) { dialog = true; continue; }
             if (!BotValueOptions.Contains(key) || index + 1 == args.Length || args[index + 1].StartsWith("--", StringComparison.Ordinal)
                 || !fields.TryAdd(key, args[++index]))
                 throw new FormatException("Unknown, duplicate or incomplete T4 option.");
         }
+        if (baseline != dialog || baseline && Environment.GetEnvironmentVariable(BaselineEnv) != "1")
+            throw new FormatException("Dialogue votes require KCDMP_TEST_BASELINE_EVENTS=1, --test-baseline-events and --dialog-votes.");
+        if (dialog && fields.Keys.Any(key => key is "--scenario" or "--origin" or "--bow-class" or "--ranged-kind" or "--tables-pak"))
+            throw new FormatException("Dialogue votes use the Host’s live conversation, without a separate route or ranged plan.");
 
         string address = fields.GetValueOrDefault("--host", "127.0.0.1");
         if (!IPAddress.TryParse(address, out var loopback) || !IPAddress.IsLoopback(loopback))
@@ -90,7 +100,7 @@ static partial class P
         };
         return new(fields.GetValueOrDefault("--scenario"), loopback, port, name, TimeSpan.FromSeconds(duration), origin,
             fields.GetValueOrDefault("--tables-pak"), rangedClass, rangedKind,
-            BotWireVersion(fields.GetValueOrDefault("--wire-version", ReleaseVersionInfo.Wire)));
+            BotWireVersion(fields.GetValueOrDefault("--wire-version", ReleaseVersionInfo.Wire)), dialog);
     }
 
     private static Guid FindBotRangedClass(BotOptionsParsed options)
@@ -242,7 +252,8 @@ static partial class P
         new LootMsg(Protocol.W203Epoch, 0u, Wo206Rules.EpochText(world, join, Wo206Rules.Ack))
             .BuildUp(Protocol.W203Up, Protocol.JoinTargetHost);
 
-    private static async Task<BotContext> PrepareBotAsync(NetworkStream stream, byte myId, bool needsOrigin, CancellationToken token)
+    private static async Task<BotContext> PrepareBotAsync(NetworkStream stream, byte myId, bool needsOrigin, CancellationToken token,
+        bool dialogOnly = false)
     {
         string staging = Directory.CreateTempSubdirectory("kcdmp-t4-").FullName;
         WorldReceiver? receiver = null;
@@ -260,7 +271,7 @@ static partial class P
             {
                 if (requested && Stopwatch.GetElapsedTime(lastHeartbeat).TotalSeconds >= 2)
                 {
-                    await Send(stream, PositionCodec.BuildPosition(0, 0, 0, 0, false, true, null), token);
+                    await Send(stream, dialogOnly ? BotDialogPing() : PositionCodec.BuildPosition(0, 0, 0, 0, false, true, null), token);
                     lastHeartbeat = Stopwatch.GetTimestamp();
                 }
                 if (!read.IsCompleted && await Task.WhenAny(read, Task.Delay(100, token)) != read) continue;
@@ -412,6 +423,7 @@ static partial class P
                 throw new InvalidOperationException("T4 must reject invalid artifact build identifiers.");
             }
             catch (FormatException) { }
+            TestBotDialogue();
             Console.WriteLine("BOT-T4 role=joiner selftest=PASS");
             return 0;
         }

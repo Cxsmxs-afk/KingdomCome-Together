@@ -1076,7 +1076,7 @@ public partial class GameBridge
     private Task<string> AskModAsync(string fn, int timeoutMs) => AskModAsync(fn, timeoutMs, null);
 
     /// <summary>WO-183: with one more argument after the token, already a Lua literal ("..." for a string, a number).</summary>
-    private async Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg)
+    private async Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg, CancellationToken ct = default)
     {
         string tok = Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
         var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1085,9 +1085,12 @@ public partial class GameBridge
         {
             long t0 = Environment.TickCount64;
             string call = luaArg is null ? $"{fn}(\"{tok}\")" : $"{fn}(\"{tok}\", {luaArg})";
-            await ExecLuaAsync($"if {fn} then {call} else KCD2MP_EmitEvent(\"wo124_reply\", \"{tok} missing\") end");
+            string lua = $"if {fn} then {call} else KCD2MP_EmitEvent(\"wo124_reply\", \"{tok} missing\") end";
+            if (ct.CanBeCanceled) await GameCalls.ExecuteNowAsync(lua, ct);
+            else await ExecLuaAsync(lua);
             long sent = Environment.TickCount64 - t0;
-            var done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
+            var done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs, ct));
+            ct.ThrowIfCancellationRequested();
             if (done == tcs.Task) return tcs.Task.Result;
             Console.WriteLine($"MP-ASK timeout fn={fn} tok={tok} send_ms={sent} waited_ms={Environment.TickCount64 - t0}");
             return "timeout";
