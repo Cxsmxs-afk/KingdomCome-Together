@@ -38,12 +38,15 @@ public class Wo171SlotIntegrationTests
         return bridge;
     }
 
-    private static void ConfirmHost(GameBridge bridge)
+    private static void ConfirmHost(GameBridge bridge, byte host = Host)
     {
         Set(bridge, "_hostModeKnown", true);
         Set(bridge, "_hostSharedWorld", true);
-        Set(bridge, "_hostModeFrom", Host);
+        Set(bridge, "_hostModeFrom", host);
     }
+
+    private static byte[] SnapshotBody(Wo171Rules.SlotTable slots, byte target) =>
+        new LootMsg(Protocol.W164MarkNote, 1, slots.ToWire()).BuildUp(Protocol.W164Up, target)[(3 + Protocol.JoinHeaderLen)..];
 
     private static (byte Target, byte[] Body) ReadSlotPacket(Stream stream)
     {
@@ -119,23 +122,152 @@ public class Wo171SlotIntegrationTests
         Peers(joiner).Connected(Bob, "Bob");
         var hostSlots = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob");
         var otherSlots = new Wo171Rules.SlotTable().AssignGuest("Bob").AssignGuest("Ann");
-        static byte[] Body(Wo171Rules.SlotTable slots) =>
-            new LootMsg(Protocol.W164MarkNote, 1, slots.ToWire()).BuildUp(Protocol.W164Up, Ann)[(3 + Protocol.JoinHeaderLen)..];
+        byte[] accepted = SnapshotBody(hostSlots, Ann);
+        byte[] untrusted = SnapshotBody(otherSlots, Ann);
 
-        await Receive(joiner, Host, Body(hostSlots));
-        await Receive(joiner, earliestPeer, Body(otherSlots));
+        await Receive(joiner, Host, accepted);
+        await Receive(joiner, earliestPeer, untrusted);
         Assert.Null(Slot(joiner, Bob));
         ConfirmHost(joiner);
-        await Receive(joiner, earliestPeer, Body(otherSlots));
+        await Receive(joiner, earliestPeer, untrusted);
         Assert.Null(Slot(joiner, Bob));
-        await Receive(joiner, Host, Body(hostSlots));
+        await Receive(joiner, Host, accepted);
         Assert.Equal(3, Slot(joiner, Bob));
-        await Receive(joiner, earliestPeer, Body(otherSlots));
+        await Receive(joiner, earliestPeer, untrusted);
         Assert.Equal(3, Slot(joiner, Bob));
 
         Set(joiner, "_wo122Stream", newRelay);
         Assert.Null(Slot(joiner, Bob));
-        await Receive(joiner, Host, Body(hostSlots));
+        await Receive(joiner, Host, accepted);
         Assert.Equal(3, Slot(joiner, Bob));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Losing_host_confirmation_on_the_same_stream_preserves_rendered_slots_without_accepting_snapshots(bool hostStillLive)
+    {
+        const byte cy = 10, observer = 11;
+        using var relay = new MemoryStream();
+        var joiner = Bridge(observer, relay);
+        Peers(joiner).Connected(Host, "Host");
+        Peers(joiner).Connected(Ann, "Ann");
+        Peers(joiner).Connected(Bob, "Bob");
+        Peers(joiner).Connected(cy, "Cy");
+        ConfirmHost(joiner);
+        var original = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob").AssignGuest("Cy");
+        var conflicting = new Wo171Rules.SlotTable().AssignGuest("Cy").AssignGuest("Bob").AssignGuest("Ann");
+        await Receive(joiner, Host, SnapshotBody(original, observer));
+
+        int?[] Slots() => [Slot(joiner, Host), Slot(joiner, Ann), Slot(joiner, Bob), Slot(joiner, cy)];
+        int?[] expected = [1, 2, 3, 4];
+        Assert.Equal(expected, Slots());
+
+        if (hostStillLive)
+        {
+            Set(joiner, "_hostModeKnown", false);
+            // The renderer sees unknown confirmation before the next packet does.
+            Assert.Equal(expected, Slots());
+        }
+        else
+        {
+            // The next packet sees the host leave the roster before the renderer polls.
+            Peers(joiner).Disconnected(Host);
+        }
+        await Receive(joiner, Host, SnapshotBody(conflicting, observer));
+        Assert.Equal(hostStillLive ? expected : new int?[] { null, 2, 3, 4 }, Slots());
+        if (!hostStillLive)
+        {
+            Set(joiner, "_hostModeKnown", false);
+            Peers(joiner).Connected(Host, "Different player");
+            Assert.Equal(0, Slot(joiner, Host));
+        }
+        Assert.Equal(new[] { 2, 3, 4 }, Slots().Skip(1).Select(slot =>
+            Wo171Rules.PictureSlot(Wo171Rules.CodeFor(Wo171Rules.Style.Rotating, slot ?? 0, 0, 0))));
+
+        Peers(joiner).Connected(Host, "Host");
+        ConfirmHost(joiner);
+        Assert.Equal(expected, Slots());
+    }
+
+    [Fact]
+    public async Task Pins_stay_visible_during_unknown_host_mode_but_reset_when_separate_worlds_are_confirmed()
+    {
+        using var relay = new MemoryStream();
+        var joiner = Bridge(Ann, relay);
+        Peers(joiner).Connected(Host, "Host");
+        Peers(joiner).Connected(Bob, "Bob");
+        Set(joiner, "_joinedWorld", true);
+        Set(joiner, "_hostAuthority", true);
+        Set(joiner, "_sharedWorld", false);
+        ConfirmHost(joiner);
+        var slots = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob");
+        byte[] snapshot = SnapshotBody(slots, Ann);
+        await Receive(joiner, Host, snapshot);
+
+        bool PinsVisible() => (bool)Call(joiner, "Wo171PinSession")!;
+        Assert.True(PinsVisible());
+        Assert.Equal(3, Slot(joiner, Bob));
+
+        Set(joiner, "_hostModeKnown", false);
+        Assert.True(PinsVisible());
+        Assert.Equal(3, Slot(joiner, Bob));
+        Set(joiner, "_joinedWorld", false);
+        Assert.False(PinsVisible());
+        Set(joiner, "_joinedWorld", true);
+
+        Set(joiner, "_hostSharedWorld", false);
+        Set(joiner, "_hostModeKnown", true);
+        Assert.False(PinsVisible());
+        await Receive(joiner, Host, snapshot);
+        ConfirmHost(joiner);
+        Assert.True(PinsVisible());
+        Assert.Null(Slot(joiner, Bob));
+        await Receive(joiner, Host, snapshot);
+        Assert.Equal(3, Slot(joiner, Bob));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_new_stream_or_confirmed_host_discards_the_previous_slots_even_after_an_unknown_host(bool newStream)
+    {
+        const byte replacementHost = 3;
+        using var relay = new MemoryStream();
+        using var replacementRelay = new MemoryStream();
+        var joiner = Bridge(Ann, relay);
+        Peers(joiner).Connected(Host, "Host");
+        Peers(joiner).Connected(Bob, "Bob");
+        Peers(joiner).Connected(replacementHost, "Replacement");
+        ConfirmHost(joiner);
+        var original = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob");
+        var replacement = new Wo171Rules.SlotTable().AssignGuest("Bob").AssignGuest("Ann");
+        byte[] originalBody = SnapshotBody(original, Ann);
+        byte[] replacementBody = SnapshotBody(replacement, Ann);
+        await Receive(joiner, Host, originalBody);
+        Assert.Equal(3, Slot(joiner, Bob));
+        Set(joiner, "_hostModeKnown", false);
+        Assert.Equal(3, Slot(joiner, Bob));
+
+        byte nextHost;
+        if (newStream)
+        {
+            Set(joiner, "_wo122Stream", replacementRelay);
+            Assert.Null(Slot(joiner, Host));
+            nextHost = Host;
+        }
+        else
+        {
+            nextHost = replacementHost;
+            ConfirmHost(joiner, nextHost);
+            Assert.Null(Slot(joiner, Host));
+            await Receive(joiner, Host, originalBody);
+        }
+        Assert.Null(Slot(joiner, Bob));
+        ConfirmHost(joiner, nextHost);
+        Assert.Equal(1, Slot(joiner, nextHost));
+        Assert.Null(Slot(joiner, Bob));
+        await Receive(joiner, nextHost, replacementBody);
+        Assert.Equal(2, Slot(joiner, Bob));
     }
 }

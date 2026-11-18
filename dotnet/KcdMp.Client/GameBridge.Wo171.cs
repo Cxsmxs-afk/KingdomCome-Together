@@ -18,6 +18,7 @@ public partial class GameBridge
     private readonly object _w171SlotLock = new();
     private Stream? _w171SlotStream;
     private byte _w171SlotHost = 0xFF;
+    private string? _w171SlotHostName;
     private Wo171Rules.SlotTable? _w171Slots;
     private long _w171NextSlotSend;
 
@@ -53,12 +54,21 @@ public partial class GameBridge
     private byte Wo171HostId() => W137Host ? _myGhostId
         : !_isDamageAuthority && _hostModeKnown && _hostSharedWorld && IsLivePeer(_hostModeFrom) ? _hostModeFrom : (byte)0xFF;
 
-    // Called under _w171SlotLock. Keep the reservations across world loads and a guest's reconnect on the same host link.
+    // Called under _w171SlotLock. A temporarily unknown host cannot replace a confirmed table on the same stream.
     private void Wo171BindSlots(Stream? stream, byte host)
     {
-        if (ReferenceEquals(_w171SlotStream, stream) && _w171SlotHost == host) return;
+        bool sameStream = ReferenceEquals(_w171SlotStream, stream);
+        if (sameStream && host == 0xFF)
+        {
+            bool separate = _isDamageAuthority ? _combatRoleApplied && !_sharedWorld
+                : _hostModeKnown && !_hostSharedWorld && IsLivePeer(_hostModeFrom);
+            if (!separate) return;
+        }
+        string? hostName = host != 0xFF && host != _myGhostId ? _peers.NameOf(host) : null;
+        if (sameStream && _w171SlotHost == host && _w171SlotHostName == hostName) return;
         _w171SlotStream = stream;
         _w171SlotHost = host;
+        _w171SlotHostName = hostName;
         _w171Slots = null;
         _w171NextSlotSend = 0;
     }
@@ -118,9 +128,25 @@ public partial class GameBridge
             Wo171BindSlots(_wo122Stream, host);
             if (_wo122Stream is null || _wo122Ct.IsCancellationRequested) return null;
             // The old one-peer marker harness bypasses the join and supplies no session-mode frame.
-            if (host == 0xFF)
+            if (_w171SlotHost == 0xFF)
                 return W164TestJoinerInWorld && !_isDamageAuthority && LivePartners() is [var only] && ghost == only ? 1 : null;
-            return ghost == host ? 1 : _w171Slots?.FindSlot(name, isHost: false);
+            // Relay IDs can be recycled while the host is unknown. Only the same named host keeps the red pin then.
+            bool isHost = ghost == _w171SlotHost && (ghost == host || (name is not null && name == _w171SlotHostName));
+            return isHost ? 1 : _w171Slots?.FindSlot(name, isHost: false);
+        }
+    }
+
+    private bool Wo171PinSession()
+    {
+        if (W137Host || W137Joiner) return true;
+        if (!_joinedWorld || !_combatRoleApplied || _isDamageAuthority || !_hostAuthority) return false;
+
+        // A missing host mode can briefly make W137Joiner fall back to the local shared-world setting.
+        lock (_w171SlotLock)
+        {
+            byte host = Wo171HostId();
+            Wo171BindSlots(_wo122Stream, host);
+            return host == 0xFF && _w171Slots is not null && _wo122Stream is not null && !_wo122Ct.IsCancellationRequested;
         }
     }
 

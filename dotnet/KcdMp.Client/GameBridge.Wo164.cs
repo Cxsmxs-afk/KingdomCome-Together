@@ -710,7 +710,7 @@ public partial class GameBridge
     /// </summary>
     private async Task W164PinTickAsync()
     {
-        bool inSession = W137Host || W137Joiner;
+        bool inSession = Wo171PinSession();
         bool want = _w164PinOn && inSession;
         var fresh = new HashSet<byte>();
         // WO-166 M1: only a live peer has a pin, and one per partner (a crash-rejoin's old id is gone from the relay's set at once)
@@ -733,7 +733,7 @@ public partial class GameBridge
             await _combat.MirrorGraveAsync(4, g, 0, 0, 0, 0);
             Interlocked.Increment(ref _w164PinRemoves);
             W171Removed(g);
-            Console.WriteLine($"WO164-MAPMARK pin of player {g} removed ({(!_w164PinOn ? "mp_partner_marker off" : !(W137Host || W137Joiner) ? "not in a session" : !keep.Contains(g) ? "not a live partner (WO-166 M1)" : "no position for 10 s")})");
+            Console.WriteLine($"WO164-MAPMARK pin of player {g} removed ({(!_w164PinOn ? "mp_partner_marker off" : !inSession ? "not in a session" : !keep.Contains(g) ? "not a live partner (WO-166 M1)" : "no position for 10 s")})");
         }
     }
 
