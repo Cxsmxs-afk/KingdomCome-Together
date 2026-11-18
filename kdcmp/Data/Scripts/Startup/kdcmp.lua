@@ -5380,7 +5380,7 @@ end
 -- EnableActionFilter is not registered in either build: only EnableActionMap.)
 -- The release always undoes the method the hold used (w.holdUsed).
 KCD2MP_JoinHoldMethods = { noinput = true, actionmap = true, noninteractive = true, none = true }
-function KCD2MP_JoinHold(on, method)
+function KCD2MP_JoinHold(on, method, inputOwner, inputLease)
     local w = KCD2MP.w123
     method = tostring(method or (not on and w.holdUsed) or w.holdMethod)
     if on then w.holdUsed = method end
@@ -5397,7 +5397,7 @@ function KCD2MP_JoinHold(on, method)
     elseif method == "actionmap" then maps = { { "player", not on }, { "movement", not on } }
     else return false, "unknown-method-" .. method end
     for _, m in ipairs(maps) do
-        local ok, err = pcall(ActionMapManager.EnableActionMap, m[1], m[2])
+        local ok, err = pcall(KCD2MP_T3InputWrite, inputOwner or "join", inputLease or w.joinId or w.safetyGen, m[1], m[2])
         okAll = okAll and ok
         detail = detail .. string.format("%s%s=%s%s", detail == "" and "" or ",", m[1], tostring(m[2]), ok and "" or ("!" .. tostring(err)))
     end
@@ -7272,6 +7272,7 @@ end
 function KCD2MP_W136Hold(on, ttlS, why)
     local w = KCD2MP.w136
     local now = os.clock()
+    if on and not w.hold and KCD2MP_T3InputReset then KCD2MP_T3InputReset("load-hold") end
     if on then
         if not w.hold and KCD2MP_W134LedgerReset then KCD2MP_W134LedgerReset("load") end
         local ttl = tonumber(ttlS) or 240
@@ -17512,7 +17513,7 @@ end
 
 function W134.tok()
     local w = KCD2MP.w134
-    w.tokN = (w.tokN % 99999) + 1
+    repeat w.tokN = (w.tokN % 16000000) + 1 until not (w.itemTickets and w.itemTickets[tostring(w.tokN)])
     return tostring(w.tokN)
 end
 
@@ -17729,6 +17730,8 @@ end
 function KCD2MP_W134LootRequest(body, orig, user, slot)
     local w = KCD2MP.w134
     if not (w.bodies and KCD2MP_W134JoinerActive()) then return false end
+    W134.startLoop()
+    W134.syncLife()
     local name = W134.name(body)
     if not name then return false end
     w.pendingOpen[name] = { at = os.clock(), ent = body, orig = orig, user = user, slot = slot }
@@ -17744,13 +17747,14 @@ end
 -- console command runs past the engine's limit). reason = open (answer to a loot
 -- request) | update (the host's body changed). flags: 1 dead or down on the host.
 -- items = { { cls, amt, hp, worn } ... }
-function KCD2MP_W134BodyState(name, reason, flags, part, nparts, items)
+function KCD2MP_W134BodyState(name, reason, flags, part, nparts, items, generation)
+    if not W134.generationCurrent(generation) then return false end
     local w = KCD2MP.w134
     name = tostring(name)
     part, nparts = tonumber(part) or 1, tonumber(nparts) or 1
     local acc = w.partial[name]
     -- Parts may arrive in any order; a part seen twice (or a new part count) starts a new list.
-    if not acc or acc.n ~= nparts or acc.parts[part] then acc = { parts = {}, n = nparts, reason = reason, flags = tonumber(flags) or 0 }; w.partial[name] = acc end
+    if not acc or acc.n ~= nparts or acc.generation ~= generation or acc.parts[part] then acc = { parts = {}, n = nparts, reason = reason, flags = tonumber(flags) or 0, generation = generation }; w.partial[name] = acc end
     if reason == "open" then acc.reason = "open" end
     acc.parts[part] = items or {}
     for i = 1, acc.n do if not acc.parts[i] then return end end
@@ -17761,18 +17765,26 @@ function KCD2MP_W134BodyState(name, reason, flags, part, nparts, items)
             list[#list + 1] = { cls = tostring(it[1]), amt = tonumber(it[2]) or 1, hp = tonumber(it[3]) or 1, worn = it[4] == true }
         end
     end
-    W134.bodyState(name, acc.reason, acc.flags, list)
+    W134.bodyState(name, acc.reason, acc.flags, list, generation)
 end
 
-function W134.bodyState(name, reason, flags, list)
+function W134.bodyState(name, reason, flags, list, generation)
     local w = KCD2MP.w134
+    generation = generation or list.__lootGeneration
+    if not W134.generationCurrent(generation) then return false end
+    list.__lootGeneration = generation
+    if W134.held() then
+        w.heldBodies = w.heldBodies or {}
+        w.heldBodies[name] = { reason = reason, flags = flags, list = list, generation = generation, epoch = w.lootEpoch }
+        return false
+    end
     if KCD2MP_W217LootLive and KCD2MP_W217LootLive() and W217 and W217.L then   -- WO-217 C: the live list is this copy's one writer
         if W217.L.sess[name] then return end
         if reason == "open" and w.pendingOpen[name] then return end -- wait/retry the authoritative live list; never open a second loot path
     end
     if KCD2MP_W166LootDefer and KCD2MP_W166LootDefer(name, reason, flags, list) then return end   -- WO-166 L1: the loot screen is open on it
     if reason ~= "open" and KCD2MP_W201InvBusy and KCD2MP_W201InvBusy(name) then   -- WO-201 B5: any open screen on it (not only ours)
-        return KCD2MP_W201InvDefer("w134-state", name, "the host's list of this body", function() W134.bodyState(name, reason, flags, list) end)
+        return KCD2MP_W201InvDefer("w134-state", name, "the host's list of this body", function() W134.bodyState(name, reason, flags, list, generation) end)
     end
     w.stats.states = w.stats.states + 1
     local e = nil
@@ -17959,7 +17971,8 @@ end
 
 -- Agent -> joiner: the host's answer to a take. ok = it came out of the host's
 -- body; gone = someone had taken it first: the item is taken back off Henry.
-function KCD2MP_W134TakeResult(tok, verdict, name)
+function KCD2MP_W134TakeResult(tok, verdict, name, generation)
+    if W134.deferHost(KCD2MP_W134TakeResult, generation, tok, verdict, name, generation) then return false end
     local w = KCD2MP.w134
     tok = tostring(tok)
     for bname, sess in pairs(w.sessions) do
@@ -17972,7 +17985,7 @@ function KCD2MP_W134TakeResult(tok, verdict, name)
             elseif KCD2MP_W201InvBusy and KCD2MP_W201InvBusy("player") and not KCD2MP_W166LootOpenOn(bname) then
                 -- WO-201 B5: a screen (not WO-166's own) is open on Henry's pack: the take-back waits for its close
                 sess.pend[tok] = t
-                return KCD2MP_W201InvDefer("w134-takeback", "player", "a take-back off Henry (" .. tostring(verdict) .. ")", function() KCD2MP_W134TakeResult(tok, verdict, name) end)
+                return KCD2MP_W201InvDefer("w134-takeback", "player", "a take-back off Henry (" .. tostring(verdict) .. ")", function() KCD2MP_W134TakeResult(tok, verdict, name, generation) end)
             elseif verdict == "mine" or verdict == "none" then
                 -- WO-136 Phase 7: a duplicate of my own earlier take (take all +
                 -- a single take, a retry) or an item the host's body never held
@@ -17999,7 +18012,8 @@ end
 -- ---- NPC bodies: the host -------------------------------------------------------
 
 -- Agent -> host: a joiner asked for a body. Answer with its items (parts of 10).
-function KCD2MP_W134HostOpen(peer, tok, name)
+function KCD2MP_W134HostOpen(peer, tok, name, generation)
+    if W134.deferHost(KCD2MP_W134HostOpen, generation, peer, tok, name, generation) then return false end
     if KCD2MP_W217HostOpen and KCD2MP_W217HostOpen(peer, name) then return end
     W134.hostSend(tostring(peer), tostring(tok), tostring(name), "open")
 end
@@ -18029,7 +18043,8 @@ end
 
 -- Agent -> host: a joiner took an item out of its copy of this body. The host's
 -- body is the one inventory: the item comes out here, or it was already gone.
-function KCD2MP_W134HostTake(peer, tok, name, cls, amt, hp, screen)
+function KCD2MP_W134HostTake(peer, tok, name, cls, amt, hp, screen, generation)
+    if W134.deferHost(KCD2MP_W134HostTake, generation, peer, tok, name, cls, amt, hp, screen, generation) then return false end
     local w = KCD2MP.w134
     amt = tonumber(amt) or 1
     local e = nil
@@ -18070,12 +18085,13 @@ function KCD2MP_W134HostTake(peer, tok, name, cls, amt, hp, screen)
 end
 
 -- Agent -> host: a joiner put an item into its copy of this body: it goes into the host's too.
-function KCD2MP_W134HostPut(peer, tok, name, cls, amt, hp)
+function KCD2MP_W134HostPut(peer, tok, name, cls, amt, hp, generation)
+    if W134.deferHost(KCD2MP_W134HostPut, generation, peer, tok, name, cls, amt, hp, generation) then return false end
     local e = nil
     pcall(function() e = System.GetEntityByName(tostring(name)) end)
     if not e then return end
     if KCD2MP_W201InvBusy and KCD2MP_W201InvBusy(tostring(name)) then   -- WO-201 B5
-        return KCD2MP_W201InvDefer("w134-put", tostring(name), "a joiner's put", function() KCD2MP_W134HostPut(peer, tok, name, cls, amt, hp) end)
+        return KCD2MP_W201InvDefer("w134-put", tostring(name), "a joiner's put", function() KCD2MP_W134HostPut(peer, tok, name, cls, amt, hp, generation) end)
     end
     pcall(function() e.inventory:CreateItem(tostring(cls), tonumber(hp) or 1, tonumber(amt) or 1) end)
     KCD2MP.w134.bodySig[tostring(name)] = nil
@@ -18119,6 +18135,281 @@ end
 
 -- ---- loose world items ------------------------------------------------------------
 
+-- P3: UI deadlines are independent of body/inventory writes and of the agent's poll.
+function W134.held()
+    if KCD2MP_W136Held and KCD2MP_W136Held() then return true end
+    local loading = false
+    if Game and type(Game.IsLoadingEngineSaveGame) == "function" then pcall(function() loading = Game.IsLoadingEngineSaveGame() == true end) end
+    return loading
+end
+function W134.lootReset(why)
+    local w = KCD2MP.w134
+    w.lootEpoch = (w.lootEpoch or 0) + 1
+    w.itemReq, w.itemTickets, w.itemByEntity, w.pickupAccounts = {}, {}, {}, {}
+    w.sessions, w.pendingOpen, w.stash, w.partial, w.hostVerify = {}, {}, {}, {}, {}
+    w.bodyChunks, w.heldBodies, w.hostDeferred = {}, {}, {}
+    if KCD2MP_W217LootReset then KCD2MP_W217LootReset() end
+end
+function W134.syncLife()
+    local w = KCD2MP.w134
+    local down = false
+    if player and player.actor then
+        if type(player.actor.IsDead) == "function" then pcall(function() down = player.actor:IsDead() == true end) end
+        if not down and type(player.actor.IsUnconscious) == "function" then pcall(function() down = player.actor:IsUnconscious() == true end) end
+    end
+    if (player ~= nil and w.lootPlayer ~= player) or (down and not w.lootDown) then
+        W134.lootReset("player-life")
+        w.lootLife = (w.lootLife or 0) + 1
+    end
+    if player ~= nil then w.lootPlayer = player end
+    w.lootDown = down
+    return not down
+end
+function KCD2MP_W134LootLifeReset()
+    W134.lootReset("life-event")
+    KCD2MP.w134.lootLife = (KCD2MP.w134.lootLife or 0) + 1
+end
+function W134.ticketScope(r)
+    local w = KCD2MP.w134
+    return r and r.epoch == w.lootEpoch and r.life == w.lootLife and r.user == w.lootPlayer and not w.lootDown
+end
+function W134.ticketCurrent(r)
+    return W134.ticketScope(r) and r.user == player and player ~= nil
+end
+function W134.generationCurrent(generation)
+    return generation == nil or (KCD2MP.hostAuthority and KCD2MP.hostAuthority.generation == tostring(generation))
+end
+-- Local HTTP subchunks preserve the original wire part/revision. Never apply an incomplete part.
+function W134.chunk(family, name, revision, flags, part, nparts, chunk, nchunks, items, receipt, generation)
+    if not W134.generationCurrent(generation) or type(items) ~= "table" then return nil end
+    name, revision = tostring(name), tostring(revision)
+    part, nparts, chunk, nchunks = tonumber(part), tonumber(nparts), tonumber(chunk), tonumber(nchunks)
+    local maxparts, maxitems = family == "live" and 40 or 20, family == "live" and 40 or 80
+    if #name > 384 or not part or not nparts or not chunk or not nchunks or part ~= math.floor(part) or nparts ~= math.floor(nparts)
+        or chunk ~= math.floor(chunk) or nchunks ~= math.floor(nchunks) or part < 1 or part > nparts or nparts > maxparts
+        or chunk < 1 or chunk > nchunks or nchunks > 40 or #items > maxitems then return nil end
+    local w, now = KCD2MP.w134, os.clock()
+    w.bodyChunks = w.bodyChunks or {}
+    local key = family .. "|" .. name .. "|" .. revision .. "|" .. tostring(flags) .. "|" .. part .. "|" .. tostring(receipt) .. "|" .. tostring(generation)
+    local count = 0
+    for k, old in pairs(w.bodyChunks) do
+        if now - old.at >= 10 or old.epoch ~= w.lootEpoch then w.bodyChunks[k] = nil else count = count + 1 end
+    end
+    local acc = w.bodyChunks[key]
+    if not acc then
+        if count >= 64 then return nil end
+        acc = { at = now, epoch = w.lootEpoch, nparts = nparts, nchunks = nchunks, parts = {}, sigs = {} }; w.bodyChunks[key] = acc
+    end
+    -- Legacy lists have no wire revision. Their next first subchunk starts a
+    -- new transfer even when that first portion stayed identical (A+B -> A+C).
+    if family == "legacy" and chunk == 1 and (acc.complete or acc.bad) then
+        acc = { at = now, epoch = w.lootEpoch, nparts = nparts, nchunks = nchunks, parts = {}, sigs = {} }; w.bodyChunks[key] = acc
+    end
+    if acc.bad or acc.nparts ~= nparts or acc.nchunks ~= nchunks then return nil end
+    local sig = {}
+    for _, it in ipairs(items) do
+        if type(it) ~= "table" then acc.bad = true; return nil end
+        if family == "live" then sig[#sig + 1] = table.concat({tostring(it.id),tostring(it.cls),tostring(it.amt),tostring(it.hp),tostring(it.worn),tostring(it.stolen),tostring(it.owner)}, ":")
+        else sig[#sig + 1] = table.concat({tostring(it[1]),tostring(it[2]),tostring(it[3]),tostring(it[4])}, ":") end
+    end
+    sig = table.concat(sig, ",")
+    if acc.sigs[chunk] and acc.sigs[chunk] ~= sig then acc.bad = true; return nil end
+    acc.parts[chunk], acc.sigs[chunk] = items, sig
+    for i = 1, nchunks do if not acc.parts[i] then return nil end end
+    if acc.complete then return nil end
+    local all = {}
+    for i = 1, nchunks do for _, it in ipairs(acc.parts[i]) do all[#all + 1] = it end end
+    if #all > maxitems then acc.bad = true; return nil end
+    acc.complete = true
+    return all
+end
+function KCD2MP_W134BodyStateChunk(name, reason, flags, part, nparts, chunk, nchunks, items, generation)
+    local all = W134.chunk("legacy", name, reason, flags, part, nparts, chunk, nchunks, items, nil, generation)
+    if not all then return false end
+    KCD2MP_W134BodyState(name, reason, flags, part, nparts, all, generation)
+    return true
+end
+function KCD2MP_W217BodyListChunk(name, rev, part, nparts, chunk, nchunks, items, receipt, generation)
+    local all = W134.chunk("live", name, rev, nil, part, nparts, chunk, nchunks, items, receipt, generation)
+    if not all then return false end
+    KCD2MP_W217BodyList(name, rev, part, nparts, all, receipt, generation)
+    return true
+end
+
+function W134.deferHost(fn, generation, ...)
+    if not W134.generationCurrent(generation) then return true end
+    if not W134.held() then return false end
+    local w = KCD2MP.w134
+    w.hostDeferred = w.hostDeferred or {}
+    -- Reliable host mutations keep their FIFO order until this load's scope ends.
+    w.hostDeferred[#w.hostDeferred + 1] = { fn = fn, args = { ... }, n = select("#", ...), generation = generation, epoch = w.lootEpoch }
+    return true
+end
+function W134.drainHost()
+    local q = KCD2MP.w134.hostDeferred or {}
+    local used, start = 0, os.clock()
+    while #q > 0 and used < 4 and os.clock() - start < 0.002 and not W134.held() do
+        local r = table.remove(q, 1)
+        if r.epoch == KCD2MP.w134.lootEpoch and W134.generationCurrent(r.generation) then r.fn(unpack(r.args, 1, r.n)) end
+        used = used + 1
+    end
+end
+function W134.endUse(r, why)
+    if r.useEnded then return end
+    r.useEnded = true
+    if not r.started or not W134.ticketCurrent(r) or not r.input or not KCD2MP_T3InputUseCanEnd then return end
+    local can = KCD2MP_T3InputUseCanEnd(r.input)
+    if not can then return end
+    if r.ent and type(r.ent.AbortUse) == "function" then pcall(r.ent.AbortUse, r.ent, r.user) end
+    if r.user.player and type(r.user.player.OnEndInteractive) == "function" then pcall(r.user.player.OnEndInteractive, r.user.player) end
+end
+function W134.pickupSnapshot()
+    if not (player and player.inventory and type(player.inventory.GetInventoryTable) == "function") then return nil end
+    local ok, ids = pcall(player.inventory.GetInventoryTable, player.inventory)
+    if not ok or type(ids) ~= "table" then return nil end
+    local out = {}
+    for _, id in ipairs(ids) do
+        local read, it = pcall(ItemManager.GetItem, id)
+        if not read or not it or not it.class then return nil end
+        out[tostring(id)] = { w = id, cls = it.class, amt = tonumber(it.amount) or 1, hp = tonumber(it.health) or 1 }
+    end
+    return out
+end
+-- Every provisional stack delta has one account. Other tickets' amounts and the
+-- pre-existing floor are protected even if confirmations arrive in reverse order.
+function W134.capturePickup(r, immediate)
+    if not W134.ticketCurrent(r) or not r.before or r.captured then return end
+    local after = W134.pickupSnapshot()
+    if not after then return end
+    local left, gains = r.amt, {}
+    for key, it in pairs(after) do
+        local before = r.before[key]
+        local delta = it.cls == r.cls and math.max(0, it.amt - (before and before.amt or 0)) or 0
+        if delta > 0 and (key == r.source or immediate) then gains[#gains + 1] = { key = key, it = it, before = before, amount = math.min(delta, r.amt) } end
+    end
+    table.sort(gains, function(a, b) return a.key == r.source and b.key ~= r.source end)
+    for _, gain in ipairs(gains) do
+        local n = math.min(left, gain.amount)
+        if n > 0 then
+            local account = KCD2MP.w134.pickupAccounts[gain.key]
+            if not account then account = { floor = gain.before and gain.before.amt or 0, entries = {} }; KCD2MP.w134.pickupAccounts[gain.key] = account end
+            account.entries[r.tok] = n
+            r.gains[#r.gains + 1] = { key = gain.key, w = gain.it.w, amount = n }
+            left = left - n
+        end
+    end
+    if #r.gains > 0 then r.captured = true end
+end
+function W134.settlePickup(r)
+    local accounts = KCD2MP.w134.pickupAccounts
+    for _, gain in ipairs(r.gains) do
+        local account = accounts[gain.key]
+        if account then
+            account.floor = account.floor + (account.entries[r.tok] or 0)
+            account.entries[r.tok] = nil
+            if next(account.entries) == nil then accounts[gain.key] = nil end
+        end
+    end
+    r.settled = true
+end
+function W134.rollbackPickup(r)
+    if not W134.ticketCurrent(r) or W134.held() then return false end
+    W134.capturePickup(r, false)
+    if not r.captured then return false end -- an unknown acquisition never authorizes deleting old equipment
+    local snapshot = W134.pickupSnapshot()
+    if not snapshot then return false end
+    local accounts, remaining = KCD2MP.w134.pickupAccounts, 0
+    for _, gain in ipairs(r.gains) do
+        local account = accounts[gain.key]
+        local pending = account and account.entries[r.tok] or 0
+        local current = snapshot[gain.key]
+        local count = current and current.cls == r.cls and current.amt or 0
+        if gain.op then
+            local actual = math.min(gain.op.amount, math.max(0, gain.op.before - count))
+            pending = math.max(0, pending - actual)
+            if account then account.entries[r.tok] = pending > 0 and pending or nil end
+            r.rolled = (r.rolled or 0) + actual
+            gain.op = nil
+        end
+        if pending > 0 and current and account then
+            local other = 0
+            for tok, n in pairs(account.entries) do if tok ~= r.tok then other = other + n end end
+            local amount = math.min(pending, math.max(0, count - account.floor - other))
+            if amount > 0 then
+                gain.op = { before = count, amount = amount }
+                pcall(function() r.user.inventory:DeleteItem(gain.w, amount) end)
+                local after = W134.pickupSnapshot()
+                if not after then return false end -- retain the exact unconfirmed write, never repeat it blindly
+                snapshot = after
+                local n = after[gain.key] and after[gain.key].amt or 0
+                local actual = math.min(amount, math.max(0, count - n))
+                pending = pending - actual; r.rolled = (r.rolled or 0) + actual
+                account.entries[r.tok] = pending > 0 and pending or nil
+                gain.op = nil
+            end
+        end
+        remaining = remaining + pending
+        if account and next(account.entries) == nil then accounts[gain.key] = nil end
+    end
+    if remaining == 0 then
+        r.settled = true
+        if not r.rollbackCounted then
+            r.rollbackCounted = true
+            local s = KCD2MP.w134.stats; s.pickup_rollbacks = (s.pickup_rollbacks or 0) + 1
+            W134.log(string.format("T3-LOOT rollback tok=%s cls=%s amount=%d -- confirmed own acquisition only", r.tok, r.cls, r.rolled or 0))
+        end
+        return true
+    end
+    return false
+end
+function W134.sendPickup(r)
+    if r.sent or not r.captured or not W134.ticketCurrent(r) then return end
+    r.sent, r.sentAt = true, os.clock()
+    local s = KCD2MP.w134.stats
+    s.itemAsk = s.itemAsk + 1; s.pickup_asks = (s.pickup_asks or 0) + 1
+    KCD2MP_EmitEvent("w134_item", string.format("%s %s %.3f %.3f %.3f %d %d", r.tok, r.cls, r.x, r.y, r.z, r.body and 1 or 0, r.amt))
+    W134.log(string.format("WO134-ITEM ask tok=%s cls=%s at=(%.2f,%.2f,%.2f) name=%s -- already picked up locally", r.tok, r.cls, r.x, r.y, r.z, tostring(r.name)))
+end
+function W134.deadlines(now)
+    local w = KCD2MP.w134
+    W134.syncLife()
+    for name, po in pairs(w.pendingOpen) do
+        if now >= po.at + w.askTimeoutS then
+            w.pendingOpen[name] = nil
+            w.stats.ask_timeouts = (w.stats.ask_timeouts or 0) + 1
+            KCD2MP_ShowNativeToast("The host didn't answer -- try again.")
+            W134.log(string.format("WO134-BODY open npc=%s -- no answer from the host", name))
+        end
+    end
+    for tok, r in pairs(w.itemTickets or {}) do
+        if not W134.ticketScope(r) or now >= r.at + 30 then
+            W134.settlePickup(r) -- abandon uncertain provenance; never delete a new world's inventory
+            w.itemReq[tok], w.itemTickets[tok] = nil, nil
+            if w.itemByEntity[r.ent] == r then w.itemByEntity[r.ent] = nil end
+        else
+            if not r.verdict and not r.captured and not W134.held() then W134.capturePickup(r, false); W134.sendPickup(r) end
+            if not r.timeout and not r.verdict and now >= r.at + w.askTimeoutS then
+                r.timeout = true; w.itemReq[tok] = nil
+                w.stats.itemTimeout = w.stats.itemTimeout + 1; w.stats.ask_timeouts = (w.stats.ask_timeouts or 0) + 1
+                W134.endUse(r, "timeout")
+                KCD2MP_ShowNativeToast("Pickup kept locally. The host's confirmation is late.")
+                W134.log(string.format("WO134-ITEM timeout tok=%s cls=%s -- local pickup kept; bounded rollback ticket retained", tok, tostring(r.cls)))
+            end
+            if r.verdict and not r.settled and (r.verdict == "gone" or r.verdict == "mine") then W134.rollbackPickup(r) end
+        end
+    end
+    if KCD2MP_W217LootDeadlines then KCD2MP_W217LootDeadlines(now) end
+    if now - (w.lootStatsAt or now) >= 60 then
+        w.lootStatsAt = now
+        local fields = {}
+        for _, key in ipairs({ "pickup_asks", "pickup_optimistic", "pickup_rollbacks", "pickup_unknown_kept", "ask_timeouts", "ask_latency_ms_p95", "take_busy_refusals" }) do
+            fields[#fields + 1] = key .. "=" .. string.format("%d", math.max(0, math.floor(tonumber(w.stats[key]) or 0)))
+        end
+        KCD2MP_EmitEvent("t3_loot_stats", table.concat(fields, " "))
+    elseif not w.lootStatsAt then w.lootStatsAt = now end
+end
+
+
 -- The wrapped pickup (PickableItem.OnUsed / OnUsedHold, what the game's use action
 -- calls). Returns handled, result.
 function W134.onPickup(self, user, slot, hold, orig)
@@ -18126,32 +18417,38 @@ function W134.onPickup(self, user, slot, hold, orig)
     if W134.bypass or not w.items or user ~= player then return false end
     if KCD2MP_W134JoinerActive() then
         if not KCD2MP_W134IsWorldItem(self) then return false end
-        local name = W134.name(self)
-        for _, r in pairs(w.itemReq) do
-            if r.name == name then
-                -- already asked; the answer decides. WO-177 B1: never silent -- "E does nothing" was a field report; the player is told the host is being asked
-                if (os.clock() - (w.pendingToldAt or -1e9)) > 3 then
-                    w.pendingToldAt = os.clock()
-                    KCD2MP_ShowNativeToast("Asking the host...")
-                    W134.log(string.format("WO134-ITEM pickup of %s waits: the host's answer to tok has not come yet (%.1f s)", tostring(name), os.clock() - r.at))
-                end
-                return true, true
-            end
-        end
+        W134.startLoop()
+        W134.syncLife()
+        w.itemTickets, w.itemByEntity, w.pickupAccounts = w.itemTickets or {}, w.itemByEntity or {}, w.pickupAccounts or {}
+        local prior = w.itemByEntity[self]
+        if prior then return true, prior.result end -- OnUsed/OnUsedHold/reentry share one engine call
+        local count = 0; for _ in pairs(w.itemTickets) do count = count + 1 end
+        if count >= 64 then KCD2MP_ShowNativeToast("Too many pickups are awaiting confirmation. Please wait a moment."); return true, false end
         local p = W134.pos(self)
         if not p then return false end
         local tok = W134.tok()
-        local cls = self.Properties.sItemClassId
-        w.itemReq[tok] = { name = name, ent = self, hold = hold, cls = cls, x = p.x, y = p.y, z = p.z, at = os.clock(), orig = orig, slot = slot,
-                           body = W134.belongsToBody(self) }
-        w.stats.itemAsk = w.stats.itemAsk + 1
-        local amt = 1
+        local amt, source = 1, nil
         pcall(function() amt = math.max(1, math.floor(tonumber(self.Properties.nAmount) or 1)) end)
-        w.itemReq[tok].amt = amt
-        KCD2MP_EmitEvent("w134_item", string.format("%s %s %.3f %.3f %.3f %d %d", tok, cls, p.x, p.y, p.z, w.itemReq[tok].body and 1 or 0, amt))
-        W134.log(string.format("WO134-ITEM ask tok=%s cls=%s at=(%.2f,%.2f,%.2f) name=%s -- the host decides", tok, cls, p.x, p.y, p.z, tostring(name)))
-        W134.startLoop()
-        return true, true
+        if self.item and type(self.item.GetId) == "function" then pcall(function() local id = self.item:GetId(); if id ~= nil then source = tostring(id) end end) end
+        local r = { tok = tok, name = W134.name(self), ent = self, user = user, hold = hold, cls = self.Properties.sItemClassId,
+            x = p.x, y = p.y, z = p.z, at = os.clock(), amt = amt, source = source, body = W134.belongsToBody(self),
+            epoch = w.lootEpoch, life = w.lootLife, before = W134.pickupSnapshot(), gains = {}, result = true }
+        if not r.before then KCD2MP_ShowNativeToast("Inventory is still loading. Please try again in a moment."); return true, false end
+        w.itemReq[tok], w.itemTickets[tok], w.itemByEntity[self] = r, r, r
+        r.originalCalled = true
+        local ok, result = pcall(orig, self, user, slot)
+        r.started, r.result = ok and result ~= false, result
+        if not ok then r.result = false end
+        if r.started and KCD2MP_T3InputUseSnapshot then r.input = KCD2MP_T3InputUseSnapshot() end
+        W134.capturePickup(r, true)
+        if r.captured then
+            w.stats.pickup_optimistic = (w.stats.pickup_optimistic or 0) + 1
+            local steal = self.__w139steal
+            if steal and KCD2MP_W139Stole then pcall(KCD2MP_W139Stole, steal) end
+            W134.sendPickup(r)
+        end
+        if not ok then W134.log("WO134-ITEM original pickup failed tok=" .. tok .. " -- not repeated") end
+        return true, r.result
     end
     if KCD2MP_W134HostActive() and KCD2MP_W134IsWorldItem(self) then
         local p = W134.pos(self)
@@ -18183,7 +18480,8 @@ end
 
 -- Agent -> host: a joiner wants this world item. body = 1: an item that fell off a
 -- corpse (each machine's physics placed it; matched within deadBodyMatchM).
-function KCD2MP_W134HostItem(peer, tok, cls, x, y, z, body, amt)
+function KCD2MP_W134HostItem(peer, tok, cls, x, y, z, body, amt, generation)
+    if W134.deferHost(KCD2MP_W134HostItem, generation, peer, tok, cls, x, y, z, body, amt, generation) then return false end
     local w = KCD2MP.w134
     x, y, z = tonumber(x), tonumber(y), tonumber(z)
     amt = tonumber(amt)
@@ -18212,49 +18510,55 @@ function KCD2MP_W134HostItem(peer, tok, cls, x, y, z, body, amt)
         (amt and hostAmt) and string.format(" amount joiner=%d host=%d%s", amt, hostAmt, amt == hostAmt and "" or " -- DIFFERENT: each machine's own pickup counts") or ""))
 end
 
--- Agent -> joiner: the host's answer. ok = the host's copy is gone, pick mine up;
--- gone = someone took it first; unknown = the host has no such item (a spawned or
--- moved one): left per machine, picked up here as before.
-function KCD2MP_W134ItemResult(tok, verdict)
+-- Host confirmation never calls the original pickup again. A refusal owns only its captured acquisition.
+function KCD2MP_W134ItemResult(tok, verdict, generation)
+    if not W134.generationCurrent(generation) then return false end
     local w = KCD2MP.w134
     tok = tostring(tok)
-    local r = w.itemReq[tok]
-    if not r then return end
-    w.itemReq[tok] = nil
-    if verdict == "ok" or verdict == "unknown" then
-        if verdict == "ok" then w.stats.itemOk = w.stats.itemOk + 1 else w.stats.itemUnmatched = w.stats.itemUnmatched + 1 end
-        W134.bypass = true
-        local ok, res = pcall(function() return r.orig(r.ent, player, r.slot) end)
-        W134.bypass = false
-        local steal = nil
-        pcall(function() steal = r.ent.__w139steal end)
-        if ok and steal and KCD2MP_W139Stole then pcall(KCD2MP_W139Stole, steal) end   -- WO-139
-        W134.log(string.format("WO134-ITEM %s tok=%s cls=%s -- picked up here ok=%s res=%s%s", verdict == "ok" and "ok" or "unmatched", tok, tostring(r.cls),
-            tostring(ok), tostring(res), verdict == "ok" and " (the host's copy is gone)" or " (the host has no such item: per machine, as before)"))
-    elseif verdict == "mine" then
-        -- WO-136 Phase 7: my own earlier take of it (a retry): removed here, no notice.
-        w.stats.itemDup = (w.stats.itemDup or 0) + 1
-        W134.takeAway(r.ent)
-        W134.log(string.format("WO134-ITEM mine tok=%s cls=%s -- already mine (my own earlier take); removed here, no notice", tok, tostring(r.cls)))
-    else
-        w.stats.itemGone = w.stats.itemGone + 1
-        W134.takeAway(r.ent)
-        W134.log(string.format("WO134-ITEM gone tok=%s cls=%s -- someone else took it first; removed here", tok, tostring(r.cls)))
-        KCD2MP_ShowNativeToast("Someone already took that.")
+    W134.syncLife()
+    local r = (w.itemTickets or {})[tok]
+    if not W134.ticketCurrent(r) or r.verdict then return false end
+    if verdict ~= "ok" and verdict ~= "unknown" and verdict ~= "gone" and verdict ~= "mine" then return false end
+    r.verdict = verdict; w.itemReq[tok] = nil
+    if r.sentAt then
+        w.pickupLatency = w.pickupLatency or {}
+        w.pickupLatency[#w.pickupLatency + 1] = math.max(0, math.floor((os.clock() - r.sentAt) * 1000))
+        if #w.pickupLatency > 64 then table.remove(w.pickupLatency, 1) end
+        local ordered = {}; for i, n in ipairs(w.pickupLatency) do ordered[i] = n end; table.sort(ordered)
+        w.stats.ask_latency_ms_p95 = ordered[math.max(1, math.ceil(#ordered * 0.95))]
     end
+    if not r.timeout then r.useEnded = true end -- the engine owns a normally completed pickup
+    if verdict == "ok" or verdict == "unknown" then
+        if verdict == "ok" then w.stats.itemOk = w.stats.itemOk + 1
+        else w.stats.itemUnmatched = w.stats.itemUnmatched + 1; w.stats.pickup_unknown_kept = (w.stats.pickup_unknown_kept or 0) + 1 end
+        W134.settlePickup(r)
+        W134.log(string.format("WO134-ITEM %s tok=%s cls=%s -- optimistic pickup kept; original never repeated", verdict, tok, r.cls))
+    else
+        if verdict == "mine" then w.stats.itemDup = (w.stats.itemDup or 0) + 1 else
+            w.stats.itemGone = w.stats.itemGone + 1; KCD2MP_ShowNativeToast("Someone already took that.")
+        end
+        W134.rollbackPickup(r)
+    end
+    return true
 end
 
 -- Agent -> joiner: the host (or another joiner) took this world item.
-function KCD2MP_W134ItemGone(cls, x, y, z)
+function KCD2MP_W134ItemGone(cls, x, y, z, generation)
+    if W134.deferHost(KCD2MP_W134ItemGone, generation, cls, x, y, z, generation) then return false end
     local w = KCD2MP.w134
     x, y, z = tonumber(x), tonumber(y), tonumber(z)
+    W134.syncLife()
+    for tok, r in pairs(w.itemTickets or {}) do
+        if not r.verdict and r.cls == tostring(cls) and (r.x-x)^2 + (r.y-y)^2 + (r.z-z)^2 <= (r.body and w.deadBodyMatchM or w.matchM)^2 then
+            KCD2MP_W134ItemResult(tok, "gone", generation)
+        end
+    end
     local e, d = W134.findItem(tostring(cls), x, y, z, w.matchM)
     if not e then e, d = W134.findItem(tostring(cls), x, y, z, w.deadBodyMatchM); if e and not W134.belongsToBody(e) then e = nil end end
     if not e then
         W134.log(string.format("WO134-ITEM host-gone cls=%s at=(%.2f,%.2f,%.2f) -- nothing here to remove", tostring(cls), x, y, z))
         return false
     end
-    for tok, r in pairs(w.itemReq) do if r.ent == e then w.itemReq[tok] = nil end end
     local how = W134.takeAway(e)
     W134.log(string.format("WO134-ITEM host-gone cls=%s at=(%.2f,%.2f,%.2f) -- %s here (matched %.3f m)", tostring(cls), x, y, z, how, d))
     return true
@@ -18493,6 +18797,7 @@ end
 -- Paket D: receiving a ledger never edits an inventory. One timer owns a small
 -- FIFO slice; every row and large item amount yields, including across pipe bursts.
 function W134.ledgerReset(why)
+    if why == "load" then W134.lootReset(why) end
     local w = KCD2MP.w134
     KCD2MP._w134LedgerEpoch = (KCD2MP._w134LedgerEpoch or 0) + 1
     w.ledger = { rows = {}, head = 1, tail = 0, scheduled = false, lastAt = -1e9,
@@ -18647,9 +18952,15 @@ function W134.loop()
     if not KCD2MP.w134LoopRunning then return end
     Script.SetTimer(w.loopMs, W134.loop)   -- reschedule FIRST
     KCD2MP._w134LoopAliveAt = os.clock()
+    W134.deadlines(os.clock())
     if not player then return end
-    if KCD2MP_W136Held and KCD2MP_W136Held() then return end   -- WO-136: bodies and chests wait for the world
+    if W134.held() then return end   -- deadlines already ran; inventory work waits for the world
     local now = os.clock()
+    for name, held in pairs(w.heldBodies or {}) do
+        w.heldBodies[name] = nil
+        if held.epoch == w.lootEpoch then W134.bodyState(name, held.reason, held.flags, held.list, held.generation) end
+    end
+    W134.drainHost()
     -- joiner: loot sessions (a session ends 5 m away or after 10 min)
     for name, sess in pairs(w.sessions) do
         local e = nil
@@ -18671,22 +18982,6 @@ function W134.loop()
         if not e then w.stash[name] = nil
         elseif W134.isDeadBody(e) then W134.bodyState(name, "update", 1, list) end
     end
-    -- joiner: unanswered asks
-    for name, po in pairs(w.pendingOpen) do
-        if (now - po.at) > w.askTimeoutS then
-            w.pendingOpen[name] = nil
-            KCD2MP_ShowNativeToast("The host didn't answer -- try again.")
-            W134.log(string.format("WO134-BODY open npc=%s -- no answer from the host", name))
-        end
-    end
-    for tok, r in pairs(w.itemReq) do
-        if (now - r.at) > w.askTimeoutS then
-            w.itemReq[tok] = nil
-            w.stats.itemTimeout = w.stats.itemTimeout + 1
-            KCD2MP_ShowNativeToast("The host didn't answer -- try again.")
-            W134.log(string.format("WO134-ITEM timeout tok=%s cls=%s", tok, tostring(r.cls)))
-        end
-    end
     -- host
     if #w.hostVerify > 0 then W134.hostVerifyPass() end
     if KCD2MP_W134HostActive() and w.bodies then
@@ -18698,6 +18993,7 @@ function W134.loop()
 end
 
 function W134.forgetWorld(why)
+    W134.lootReset(why)
     W134.ledgerReset(why)
     KCD2MP.w134.herbs = nil
     local w = KCD2MP.w134
@@ -18726,6 +19022,8 @@ KCD2MP.w134.loopOnce = function() local r = KCD2MP.w134LoopRunning; KCD2MP.w134L
 -- The agent, once a second while connected: this machine's role in a shared world.
 function KCD2MP_W134Tick(joiner, host, shared, peers)
     local w = KCD2MP.w134
+    if w.shared and not shared and not (w.ledger and w.ledger.linkHeld) then W134.lootReset("role") end
+    W134.syncLife()
     w.joiner = joiner == true
     w.host = host == true
     w.shared = shared == true
@@ -34253,7 +34551,7 @@ end
         if KCD2MP_W204ConvClear then pcall(KCD2MP_W204ConvClear) end   -- WO-204: the partner's rows and lines go with the view
         w3c_head(false)   -- WO-208 C.5
         w3c_hud(false)
-        pcall(ActionMapManager.EnableActionMap, L.map or "dialog", false)
+        pcall(KCD2MP_T3InputWrite, "listener", L.inputLease, L.map or "dialog", false)
         W3C.listening = nil
         W3C.gen = W3C.gen + 1   -- the watch chain stops
         W3C.stats.leaves = W3C.stats.leaves + 1
@@ -34282,7 +34580,7 @@ end
         -- WO-218 B.3 (listen_reassert): the listen map again once a second -- another exclusive map must never keep the listener's keys
         L.ticks = (L.ticks or 0) + 1
         if L.ticks % 5 == 0 and L.map and ((not KCD2MP_W218On) or KCD2MP_W218On("listen_reassert")) then
-            pcall(ActionMapManager.EnableActionMap, L.map, true)
+            pcall(KCD2MP_T3InputWrite, "listener", L.inputLease, L.map, true)
         end
         Script.SetTimer(200, function() w3c_watch(gen) end)
 end
@@ -34311,7 +34609,8 @@ end
         -- WO-207 A.4 (mp_listen_map): the listener's own exclusive map (the keys pak's kcd2mp_listen: the four listen actions only); the
         -- game's "dialog" map includes open_pause_menu on the same Back keys -- a Back that cleared a vote opened the pause menu
         W3C.listening.map = (W207 and W207.on and W207.on.listen_map == false) and "dialog" or "kcd2mp_listen"
-        pcall(ActionMapManager.EnableActionMap, W3C.listening.map, true)
+        W3C.listening.inputLease = tostring(W3C.gen + 1) .. ":" .. W3C.listening.starter .. ":" .. W3C.listening.cid
+        pcall(KCD2MP_T3InputWrite, "listener", W3C.listening.inputLease, W3C.listening.map, true)
         do   -- WO-218 B.3: the HUD and the player's state as the listen begins (WO-213: 7 of 37 host listens began with 2 of 9 clips visible)
             local vis, inDlg, danger = {}, false, false
             for _, clip in ipairs(W3C_HUD) do local ok, v = pcall(UIAction.IsVisible, "hud", 0, clip); if ok and v then vis[#vis + 1] = clip end end
@@ -35282,13 +35581,15 @@ do
     -- The agent calls it again every second while the hold runs (idempotent: a load or another path that resumed the clock is undone).
     function KCD2MP_W211LinkHold(on, left, text)
         local w = KCD2MP.w211
+        KCD2MP_T3InputLink(on, left)
         if on then
             if not w.holding then
                 w.holding = true
                 w.holds = w.holds + 1
                 w.ratioWas, w.ratioSet = nil, false
                 pcall(function() w.ratioWas = Calendar.GetWorldTimeRatio() end)
-                local okH, how = KCD2MP_JoinHold(true, "actionmap")
+                w.t3InputLease = (w.t3InputLease or 0) + 1
+                local okH, how = KCD2MP_JoinHold(true, "actionmap", "link", w.t3InputLease)
                 w.holdUsed = okH and true or false
                 mp_log(string.format("WO211-LINK hold on: clock ratio was %s, movement %s (%s)", tostring(w.ratioWas), okH and "held" or "NOT held", tostring(how)))
                 pcall(KCD2MP_ShowNativeToast, "Connection to your host lost -- reconnecting...")
@@ -35302,7 +35603,7 @@ do
         w.holding = false
         if w.ratioSet and w.ratioWas ~= nil then pcall(function() Calendar.SetWorldTimeRatio(w.ratioWas) end) end
         w.ratioSet = false
-        if w.holdUsed then pcall(KCD2MP_JoinHold, false, "actionmap") end
+        if w.holdUsed then pcall(KCD2MP_JoinHold, false, "actionmap", "link", w.t3InputLease) end
         w.holdUsed = false
         pcall(KCD2MP_ShowInteractionMsg, "")
         mp_log("WO211-LINK hold off: the clock and the player's movement given back")
@@ -37182,7 +37483,8 @@ do
         lg("WO217-LOOT host-open npc=%s peer=%s -- the live list goes to the joiner on every change", name, tostring(peer))
         return true
     end
-    function KCD2MP_W217HostEnd(peer, name)
+    function KCD2MP_W217HostEnd(peer, name, generation)
+        if W134.deferHost(KCD2MP_W217HostEnd, generation, peer, name, generation) then return false end
         local h = L.hostLive[tostring(name)]
         if h then h.peers[tostring(peer)] = nil end
         L.setActive()
@@ -37191,7 +37493,8 @@ do
     -- a joiner's take: the item with that host id, if the body still has it
     -- A token names one immutable request. Retries replay its verdict; they
     -- never reserve a second item or overwrite a grant that awaits its ACK.
-    function KCD2MP_W217HostTakeReq(peer, tok, name, hostId, cls, amt)
+    function KCD2MP_W217HostTakeReq(peer, tok, name, hostId, cls, amt, generation)
+        if W134.deferHost(KCD2MP_W217HostTakeReq, generation, peer, tok, name, hostId, cls, amt, generation) then return false end
         name, hostId, tok, peer = tostring(name), tostring(hostId), tostring(tok), tostring(peer)
         amt = tonumber(amt) or 0
         local key = peer .. ":" .. tok
@@ -37208,8 +37511,16 @@ do
         ledger("host", "request", name, hostId, cls, amt, tok, "peer=" .. peer)
         local reason = nil
         if not have then reason = "gone"
-        elseif not (KCD2MP_W134HostActive() and W134.isDeadBody(e) and h and h.peers[peer]) then reason = "busy"
+        elseif W134.held() or not (KCD2MP_W134HostActive() and W134.isDeadBody(e)) then reason = "busy"
         elseif string.lower(have.cls) ~= string.lower(tostring(cls)) or amt < 1 or amt > have.amt or amt ~= math.floor(amt) then reason = "busy" end
+        if not reason then
+            h = h or { peers = {}, rev = 0, sig = nil, ids = {} }
+            L.hostLive[name] = h
+            h.peers[peer], h.at = os.clock(), os.clock()
+            L.setActive()
+        elseif reason == "busy" then
+            KCD2MP.w134.stats.take_busy_refusals = (KCD2MP.w134.stats.take_busy_refusals or 0) + 1
+        end
         local owner, stolen = "-", 0
         local reserved = nil
         if not reason then
@@ -37233,7 +37544,8 @@ do
         L.hostSend(name, true)
         return reason == nil
     end
-    function KCD2MP_W217HostAck(peer, tok, what, name)
+    function KCD2MP_W217HostAck(peer, tok, what, name, generation)
+        if W134.deferHost(KCD2MP_W217HostAck, generation, peer, tok, what, name, generation) then return false end
         local key = tostring(peer) .. ":" .. tostring(tok)
         local done = L.hostDone[key]
         local t = L.hostEsc[key]
@@ -37264,7 +37576,8 @@ do
         L.hostSend(done.body, true, peer, tok) -- receipt reaches the requester only
         return true
     end
-    function KCD2MP_W217HostStateAck(peer, name, rev, ok)
+    function KCD2MP_W217HostStateAck(peer, name, rev, ok, generation)
+        if W134.deferHost(KCD2MP_W217HostStateAck, generation, peer, name, rev, ok, generation) then return false end
         local h = L.hostLive[tostring(name)]
         if not (h and h.peers[tostring(peer)] and tonumber(rev) == h.rev) then return false end
         lg("WO217-LOOT final-state npc=%s rev=%d peer=%s applied=%s", name, rev, tostring(peer), tostring(ok))
@@ -37274,6 +37587,7 @@ do
     -- ======================================================================== the joiner
     function L.setActive()
         local n = #L.restore
+        for _ in pairs(L.cancelClean or {}) do n = n + 1 end
         for _, _ in pairs(L.sess) do n = n + 1 end
         for _, _ in pairs((KCD2MP.w134 or {}).pendingOpen or {}) do n = n + 1 end
         for _, h in pairs(L.hostLive) do for _, _ in pairs(h.peers) do n = n + 1 end end
@@ -37355,24 +37669,32 @@ do
         return false
     end
     -- the host's live list, in parts
-    function KCD2MP_W217BodyList(name, rev, part, nparts, items, receipt)
+    function KCD2MP_W217BodyList(name, rev, part, nparts, items, receipt, generation)
+        if not W134.generationCurrent(generation) then return false end
         name = tostring(name)
         part, nparts, rev = tonumber(part) or 1, tonumber(nparts) or 1, tonumber(rev) or 0
         local acc = L.partial[name]
         local session = L.sess[name]
         if session and rev < (session.rev or 0) then return end
         if acc and rev < acc.rev then return end
-        if not acc or acc.rev ~= rev or acc.n ~= nparts then acc = { parts = {}, n = nparts, rev = rev, receipt = receipt }; L.partial[name] = acc end
+        if not acc or acc.rev ~= rev or acc.n ~= nparts or acc.generation ~= generation or acc.receipt ~= receipt then acc = { parts = {}, n = nparts, rev = rev, receipt = receipt, generation = generation }; L.partial[name] = acc end
         acc.parts[part] = items or {}
         for i = 1, acc.n do if not acc.parts[i] then return end end
         L.partial[name] = nil
         local list = {}
         for i = 1, acc.n do for _, it in ipairs(acc.parts[i]) do list[#list + 1] = it end end
-        L.apply(name, rev, list, acc.receipt)
+        L.apply(name, rev, list, acc.receipt, generation)
     end
     -- the copy follows the host's list by its ids
-    function L.apply(name, rev, list, receipt)
+    function L.apply(name, rev, list, receipt, generation)
         local w = KCD2MP.w134
+        if not W134.generationCurrent(generation) then return false end
+        if W134.held() or not player then
+            L.held = L.held or {}
+            local prior = L.held[name]
+            if not prior or rev >= prior.rev then L.held[name] = { rev = rev, list = list, receipt = receipt, generation = generation, epoch = w.lootEpoch } end
+            return false
+        end
         local e = nil
         pcall(function() e = System.GetEntityByName(name) end)
         if not e then lg("WO217-LOOT list npc=%s rev=%d -- no such body here", name, rev); return end
@@ -37472,17 +37794,51 @@ do
             L.setActive()
         end
     end
+    function KCD2MP_W217LootDeadlines(now)
+        now = now or os.clock()
+        L.cancelClean = L.cancelClean or {}
+        for name, s in pairs(L.sess) do
+            for tok, t in pairs(s.pend) do
+                if now >= t.at + L.ASK_S then
+                    s.pend[tok] = nil
+                    s.cleanupCount = (s.cleanupCount or 0) + 1
+                    L.cancelClean[name .. ":" .. tok] = { w = t.w, s = s, epoch = KCD2MP.w134.lootEpoch }
+                    L.stats.cancels = L.stats.cancels + 1
+                    KCD2MP.w134.stats.ask_timeouts = (KCD2MP.w134.stats.ask_timeouts or 0) + 1
+                    ledger("joiner", "cancel", name, t.hid, t.cls, t.amt, tok, "why=no-answer")
+                    L.ack(s, tok, name, "cancel", now)
+                    KCD2MP_ShowNativeToast("The host did not confirm this take. Please try again.")
+                end
+            end
+            for tok, ack in pairs(s.acks or {}) do
+                if now - ack.at >= 1 then ack.at = now; KCD2MP_EmitEvent("w217_tack", string.format("%s %s %s", tok, name, ack.what)) end
+            end
+        end
+        L.setActive()
+    end
+
     -- the agent, ten times a second while a session lives (both machines)
     function KCD2MP_W217LootPoll()
         if not KCD2MP_W217LootLive() then return false end
         local now = os.clock()
-        for name, po in pairs(KCD2MP.w134.pendingOpen or {}) do
-            if now - po.at > 15 then
-                KCD2MP.w134.pendingOpen[name] = nil
-                KCD2MP_ShowNativeToast("The host's loot list did not arrive. Please try again.")
-            elseif now - (po.retryAt or po.at) >= 1 then
-                po.retryAt = now; KCD2MP_EmitEvent("w134_open", name)
+        W134.deadlines(now)
+        if W134.held() or not player then return true end
+        for name, held in pairs(L.held or {}) do
+            L.held[name] = nil
+            if held.epoch == KCD2MP.w134.lootEpoch then L.apply(name, held.rev, held.list, held.receipt, held.generation) end
+        end
+        for key, result in pairs(L.heldResults or {}) do
+            L.heldResults[key] = nil
+            if result.epoch == KCD2MP.w134.lootEpoch then KCD2MP_W217TakeResult(unpack(result.args, 1, result.n)) end
+        end
+        for key, cleanup in pairs(L.cancelClean or {}) do
+            if cleanup.epoch ~= KCD2MP.w134.lootEpoch or L.erase(L.escrow(), cleanup.w) then
+                cleanup.s.cleanupCount = math.max(0, (cleanup.s.cleanupCount or 1) - 1)
+                L.cancelClean[key] = nil
             end
+        end
+        for name, po in pairs(KCD2MP.w134.pendingOpen or {}) do
+            if now - (po.retryAt or po.at) >= 1 then po.retryAt = now; KCD2MP_EmitEvent("w134_open", name) end
         end
         for i = #L.restore, 1, -1 do
             local r = L.restore[i]
@@ -37535,27 +37891,15 @@ do
                         ledger("joiner", "put", name, "local:" .. lid, v.cls, v.amt, tok)
                     end
                 end
-                -- unanswered takes: cancelled (nothing changes on either side: the escrow's item goes, the host puts a granted one back)
                 for tok, t in pairs(s.pend) do
-                    if now - t.at > L.ASK_S then
-                        esc = esc or L.escrow()
-                        if L.erase(esc, t.w) then
-                            s.pend[tok] = nil
-                            L.stats.cancels = L.stats.cancels + 1
-                            ledger("joiner", "cancel", name, t.hid, t.cls, t.amt, tok, "why=no-answer")
-                            L.ack(s, tok, name, "cancel", now)
-                        end
-                    elseif now - (t.sentAt or t.at) >= 1 then
+                    if now - (t.sentAt or t.at) >= 1 then
                         t.sentAt = now
                         KCD2MP_EmitEvent("w217_treq", string.format("%s %s %s %s %d", tok, name, t.hid, t.cls, t.amt))
                     end
                 end
-                for tok, ack in pairs(s.acks or {}) do
-                    if now - ack.at >= 1 then ack.at = now; KCD2MP_EmitEvent("w217_tack", string.format("%s %s %s", tok, name, ack.what)) end
-                end
                 -- the session's end: 10 minutes, or the player away from the body with no screen open on it
                 local away = not W134.near(e, 6.0) and not (KCD2MP_W166LootOpenOn and KCD2MP_W166LootOpenOn(name))
-                if (now - s.at > L.SESSION_S or away) and next(s.pend) == nil and next(s.acks or {}) == nil then
+                if (now - s.at > L.SESSION_S or away) and next(s.pend) == nil and next(s.acks or {}) == nil and (s.cleanupCount or 0) == 0 then
                     L.sess[name] = nil
                     KCD2MP_EmitEvent("w217_lootend", name)
                     lg("WO217-LOOT end npc=%s -- %s", name, away and "the player walked away" or "10 minutes")
@@ -37566,7 +37910,8 @@ do
         return true
     end
     -- the host's answer to a take
-    function KCD2MP_W217TakeResult(tok, verdict, name, hostId, owner, stolen)
+    function KCD2MP_W217TakeResult(tok, verdict, name, hostId, owner, stolen, generation)
+        if not W134.generationCurrent(generation) then return false end
         tok, name, hostId = tostring(tok), tostring(name), tostring(hostId)
         local s = L.sess[name]
         local t = s and s.pend[tok] or nil
@@ -37576,6 +37921,11 @@ do
             return false
         end
         if t.hid ~= hostId then return false end
+        if W134.held() or not player then
+            L.heldResults = L.heldResults or {}
+            L.heldResults[name .. ":" .. tok] = { epoch = KCD2MP.w134.lootEpoch, args = { tok, verdict, name, hostId, owner, stolen, generation }, n = 7 }
+            return false
+        end
         local esc = L.escrow()
         if verdict == "grant" then
             if L.move(esc, t.w, player) then
@@ -37600,6 +37950,7 @@ do
     end
     function KCD2MP_W217LootReset()
         L.sess = {}; L.hostLive = {}; L.hostEsc = {}; L.hostDone = {}; L.partial = {}; L.restore = {}; L.fellBack = {}
+        L.cancelClean, L.held, L.heldResults = {}, {}, {}
         if KCD2MP.w134 then KCD2MP.w134.pendingOpen = {} end
         if L.active > 0 then KCD2MP_EmitEvent("w217_lootlive", "0") end
         L.active = 0
@@ -38180,3 +38531,255 @@ end
 
 
 
+
+-- ===== P3/T3: observed Lua input writes, bounded owner-aware recovery =============
+-- This observes EnableActionMap calls, never invents a native map readback.
+-- Native input writes bypassing this Lua slot remain unobservable.
+do
+    local I = { generation = 1, serial = 0, rows = {}, context = nil, depth = 0,
+        playerRef = player, loading = nil, dead = nil, menu = false, link = nil, use = nil, agentSerial = -1, agentDowned = nil, agentAuthority = nil, agentLifeRevision = 0,
+        stats = { input_held_max_s = 0, input_releases = 0 }, reportedAt = os.clock() }
+    KCD2MP.t3Input = I
+    local unpackValues = unpack or table.unpack
+    local function pack(...) return { n = select("#", ...), ... } end
+    local heldValue = { no_input = true, noninteractive = true, player = false, movement = false, dialog = true, kcd2mp_listen = true }
+    local maps = { "no_input", "noninteractive", "player", "movement" }
+    local function log(s) if type(mp_log) == "function" then mp_log(s) end end
+    local function bool(v)
+        if v == true or v == 1 then return true end
+        if v == false or v == 0 then return false end
+        return nil
+    end
+    local function readBool(object, method)
+        if not object or type(object[method]) ~= "function" then return nil end
+        local ok, value = pcall(object[method], object)
+        if not ok then return nil end
+        return bool(value)
+    end
+    local function loading()
+        if not Game or type(Game.IsLoadingEngineSaveGame) ~= "function" then return nil end
+        local ok, value = pcall(Game.IsLoadingEngineSaveGame)
+        if ok then return bool(value) end
+        return nil
+    end
+    function KCD2MP_T3InputReset(reason)
+        I.generation, I.serial = I.generation + 1, I.serial + 1
+        I.rows, I.link, I.use = {}, nil, nil
+        I.playerRef, I.loading = player, loading()
+        I.dead = nil
+        if player then I.dead = readBool(player.actor, "IsDead") end
+        log("T3-INPUT-RESET generation=" .. I.generation .. " reason=" .. tostring(reason or "lifecycle"))
+        return I.generation
+    end
+    local function syncWorld()
+        local load, dead = loading(), nil
+        if player then dead = readBool(player.actor, "IsDead") end
+        if player ~= I.playerRef then KCD2MP_T3InputReset("player-change")
+        elseif load ~= nil and I.loading ~= nil and load ~= I.loading then KCD2MP_T3InputReset("loading-edge")
+        elseif dead ~= nil and I.dead ~= nil and dead ~= I.dead then KCD2MP_T3InputReset("life-edge") end
+        I.playerRef, I.loading, I.dead = player, load, dead
+    end
+    function KCD2MP_T3InputMenu(opened)
+        local value = bool(opened)
+        if value == nil then return false end
+        I.menu = value
+        return true
+    end
+    -- Existing native menu/downed events, delivered by the independent agent
+    -- tick. Authority generation and monotonic serial fence delayed HTTP calls.
+    function KCD2MP_T3InputAgentState(menuOpen, downed, serial, authorityGeneration, lifeRevision)
+        local menuValue, downValue = bool(menuOpen), bool(downed)
+        serial = tonumber(serial)
+        if menuValue == nil or downValue == nil or not serial or serial < 0 or
+            serial ~= math.floor(serial) or serial > 9007199254740991 then return false end
+        if lifeRevision ~= nil then
+            lifeRevision = tonumber(lifeRevision)
+            if not lifeRevision or lifeRevision < 0 or lifeRevision ~= math.floor(lifeRevision) or
+                lifeRevision > 9007199254740991 then return false end
+        end
+        local authority = KCD2MP.hostAuthority
+        if authority and authority.generation ~= nil and
+            tostring(authorityGeneration) ~= tostring(authority.generation) then return false end
+        local generationKey = tostring(authorityGeneration)
+        local generationChanged = I.agentAuthority ~= generationKey
+        if generationChanged then
+            I.agentAuthority, I.agentSerial, I.agentDowned = generationKey, -1, nil
+            -- Agent sends a nonzero revision only when the actual event's
+            -- captured authority generation equals this snapshot generation.
+        end
+        if serial <= I.agentSerial then return false end
+        I.agentSerial = serial
+        local edge
+        if lifeRevision ~= nil then
+            edge = lifeRevision > 0 and lifeRevision > I.agentLifeRevision
+            I.agentLifeRevision = math.max(I.agentLifeRevision, lifeRevision)
+        else
+            edge = (I.agentDowned ~= nil and I.agentDowned ~= downValue) or (I.agentDowned == nil and downValue)
+        end
+        I.agentDowned, I.menu = downValue, menuValue
+        if edge then
+            KCD2MP_T3InputReset(downValue and "agent-downed" or "agent-wake")
+            if type(KCD2MP_W134LootLifeReset) == "function" then KCD2MP_W134LootLifeReset() end
+        end
+        return true
+    end
+    -- Called by the existing link-hold entry. Reasserts cannot extend beyond the
+    -- original bounded hold; neither this nor a fader is an input-map readback.
+    function KCD2MP_T3InputLink(on, left)
+        if on ~= true then I.link = nil; return true end
+        local now = os.clock()
+        if not I.link then I.link = { at = now, generation = I.generation } end
+        local remaining = math.max(0, math.min(600, tonumber(left) or 0))
+        I.link.untilAt = math.min(I.link.at + 600, now + remaining)
+        return true
+    end
+    local function currentOwner(ignoredUse)
+        syncWorld()
+        if not player then return "menu/no-player" end
+        if I.menu then return "menu" end
+        if I.loading == nil then return "unknown-loading" end
+        if I.loading then return "loading" end
+        local w = KCD2MP.w136
+        if w and w.hold and os.clock() <= (tonumber(w.holdUntil) or 0) then return "load-hold" end
+        if KCD2MP.cutsceneActive then return "scene" end
+        w = KCD2MP.w179
+        if w and w.vid then return "video" end
+        local dialog = readBool(player.human, "IsInDialog")
+        if dialog == nil then return "unknown-dialog" end
+        if dialog then return "dialog" end
+        w = KCD2MP.W203 and KCD2MP.W203.cam
+        if w and w.listening then return "listener" end
+        if I.dead == nil then return "unknown-dead" end
+        if I.dead then return "dead" end
+        if I.agentDowned then return "downed-event" end
+        local down = readBool(player.actor, "IsUnconscious")
+        if down == nil then return "unknown-unconscious" end
+        if down then return "unconscious" end
+        local sleep = readBool(player.human, "IsSleeping")
+        if sleep == nil then return "unknown-sleeping" end
+        if sleep then return "sleeping" end
+        w = KCD2MP.w123
+        if w and w.paused and w.joinId and w.pausedAt and
+            os.clock() - w.pausedAt <= (tonumber(w.timeoutS) or 180) + 15 then return "join" end
+        w = KCD2MP.w211
+        if w and w.holding and I.link and I.link.generation == I.generation and
+            os.clock() <= (I.link.untilAt or 0) then return "link" end
+        if I.use and I.use ~= ignoredUse and os.clock() < I.use.untilAt then return "pickup-use" end
+        return nil
+    end
+    function KCD2MP_T3InputOwner() return currentOwner(nil) end
+    local function observed(map, value, returned)
+        if returned == false then return end -- explicit refusal is not a successful write
+        I.serial = I.serial + 1 -- any new map write fences a previous use ticket
+        local on = bool(value)
+        if heldValue[map] == nil or on == nil then return end
+        if on ~= heldValue[map] then I.rows[map] = nil; return end
+        local c, old = I.context, I.rows[map]
+        local owner, lease = c and c.owner or nil, c and c.lease or nil
+        if old and old.generation == I.generation and old.owner == owner and old.lease == lease then
+            old.writeSerial = I.serial -- same hold's age/attempt remain unchanged
+            return
+        end
+        I.rows[map] = { at = os.clock(), owner = owner, lease = lease,
+            generation = I.generation, serial = I.serial, writeSerial = I.serial, attempted = false }
+    end
+    function KCD2MP_T3InputInstall()
+        if not ActionMapManager or type(ActionMapManager.EnableActionMap) ~= "function" then return false end
+        if ActionMapManager.EnableActionMap == I.wrapper then return true end
+        local original = ActionMapManager.EnableActionMap
+        I.wrapper = function(...)
+            local args = pack(...)
+            local outer = I.depth == 0
+            if outer then syncWorld() end
+            I.depth = I.depth + 1
+            local results = pack(pcall(original, unpackValues(args, 1, args.n)))
+            I.depth = I.depth - 1
+            if not results[1] then error(results[2], 0) end
+            if outer then observed(args[1], args[2], results[2]) end
+            return unpackValues(results, 2, results.n)
+        end
+        ActionMapManager.EnableActionMap = I.wrapper
+        return true
+    end
+    -- Only known mod writers use this helper. An old lease cannot undo a later
+    -- observed writer's map. The slot wrapper itself preserves original results.
+    function KCD2MP_T3InputWrite(owner, lease, map, on)
+        syncWorld()
+        if not KCD2MP_T3InputInstall() then error("no-ActionMapManager", 0) end
+        owner, lease = tostring(owner), tostring(lease)
+        if heldValue[map] ~= nil and bool(on) ~= heldValue[map] then
+            local row = I.rows[map]
+            if not row or row.generation ~= I.generation or row.owner ~= owner or row.lease ~= lease then
+                error("stale-input-owner", 0)
+            end
+        end
+        local previous = I.context
+        I.context = { owner = owner, lease = lease }
+        local results = pack(pcall(ActionMapManager.EnableActionMap, map, on))
+        I.context = previous
+        if not results[1] then error(results[2], 0) end
+        return unpackValues(results, 2, results.n)
+    end
+    function KCD2MP_T3InputUseSnapshot()
+        syncWorld()
+        if not player then return nil end
+        local snapshot = { generation = I.generation, playerRef = player, playerId = tostring(player.id),
+            writeSerial = I.serial, untilAt = os.clock() + 4 }
+        I.use = snapshot -- a newer actual use fences an older ticket even without a map write
+        return snapshot
+    end
+    function KCD2MP_T3InputUseCanEnd(snapshot)
+        local owner = currentOwner(snapshot)
+        if owner then return false, owner end
+        if type(snapshot) ~= "table" or I.use ~= snapshot or snapshot.generation ~= I.generation or
+            snapshot.playerRef ~= player or snapshot.playerId ~= tostring(player.id) then return false, "stale-life" end
+        if snapshot.writeSerial ~= I.serial then return false, "new-input-write" end
+        return true, "same-use"
+    end
+    function KCD2MP_T3InputTick()
+        syncWorld()
+        KCD2MP_T3InputInstall()
+        local now, owner = os.clock(), KCD2MP_T3InputOwner()
+        for _, map in ipairs(maps) do
+            local row = I.rows[map]
+            if row and row.generation == I.generation then
+                local age = math.max(0, now - row.at)
+                I.stats.input_held_max_s = math.max(I.stats.input_held_max_s, math.ceil(age))
+                if age > 3 and not owner and not row.attempted then
+                    row.attempted = true -- at most one recovery attempt per hold episode
+                    local use, serial = I.use, I.serial
+                    local ok, result = pcall(ActionMapManager.EnableActionMap, map, not heldValue[map])
+                    if ok and result ~= false and I.rows[map] == nil then
+                        -- Our own inverse write is not a newer activity. Let the
+                        -- same use ticket still run its guarded EndInteractive.
+                        if use and I.use == use and use.generation == I.generation and
+                            use.writeSerial == serial and I.serial == serial + 1 then use.writeSerial = I.serial end
+                        I.stats.input_releases = I.stats.input_releases + 1
+                        log(string.format("T3-INPUT-RELEASE owner=? held_s=%.3f map=%s seq=%d source=lua-write observed_owner=%s",
+                            age, map, row.serial, tostring(row.owner or "unknown")))
+                    else
+                        log(string.format("T3-INPUT-REFUSED held_s=%.3f map=%s seq=%d source=lua-write", age, map, row.serial))
+                    end
+                end
+            end
+        end
+        if now - I.reportedAt >= 60 then
+            I.reportedAt = now
+            if type(KCD2MP_EmitEvent) == "function" then
+                KCD2MP_EmitEvent("t3_input_stats", string.format("input_held_max_s=%d input_releases=%d",
+                    I.stats.input_held_max_s, I.stats.input_releases))
+            end
+        end
+        return true
+    end
+    -- One independent small timer. No NPC/inventory/world scan, no global AI
+    -- abort, no fader/time change; engine-load pauses can also pause this timer.
+    local function timer()
+        if KCD2MP.t3Input ~= I then return end -- a script reload retires this timer
+        local ok = pcall(KCD2MP_T3InputTick)
+        if not ok then log("T3-INPUT-TICK refused: unreadable engine signal") end
+        Script.SetTimer(250, timer)
+    end
+    KCD2MP_T3InputInstall()
+    Script.SetTimer(250, timer)
+end

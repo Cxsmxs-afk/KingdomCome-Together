@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/t3-p1-intellect-gate
+      - codex/t3-p3-pickup-freeze
 
 jobs:
   build:

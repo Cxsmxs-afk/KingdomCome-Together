@@ -56,6 +56,8 @@ public class T3AuthorityReportTests
         Assert.Equal(truncated ? 9 : 44, actual["decision_blocked"]);
         Assert.Equal(truncated ? 8 : 60, actual["npc_hidden"]);
         Assert.Contains("postload_timeouts=3", fields);
+        foreach (string key in new[] { "pickup_asks", "pickup_optimistic", "pickup_rollbacks", "pickup_unknown_kept", "ask_timeouts", "ask_latency_ms_p95", "take_busy_refusals", "input_held_max_s", "input_releases", "auto_rejoins_in_world" })
+            Assert.Contains(key + "=0", fields);
         Assert.Equal(truncated ? 1 : 0, counters["authority_stats_unreadable"]);
         await Reply(server, 2, Protocol.T3OpStats, stop.Token);
         await report.WaitAsync(stop.Token);

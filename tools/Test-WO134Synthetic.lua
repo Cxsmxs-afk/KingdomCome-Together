@@ -367,7 +367,7 @@ world(); asJoiner()
 local egg = mkPickable("egg000352", EGG, 1, 1, 101, 100, 10, newItem(EGG, 1, 1))
 PickableItem.OnUsed(egg, player)
 local ask = events("w134_item")[1]
-check("I1 a joiner's pickup of a world item asks the host (class + position), nothing picked up", ask ~= nil and string.find(ask, EGG .. " 101.000 100.000 10.000 0", 1, true) ~= nil and ENTS["egg000352"] ~= nil and player.inventory:GetCountOfClass(EGG) == 0, ask)
+check("I1 a joiner picks up immediately and asks the host afterwards (class + position)", ask ~= nil and string.find(ask, EGG .. " 101.000 100.000 10.000 0", 1, true) ~= nil and ENTS["egg000352"] == nil and player.inventory:GetCountOfClass(EGG) == 1, ask)
 PickableItem.OnUsed(egg, player)
 check("I1 pressing again while asking sends nothing more", #events("w134_item") == 1)
 KCD2MP_W134ItemResult(firstTok("w134_item"), "ok")
@@ -383,7 +383,7 @@ check("I4 host unknown (no such item there): picked up here as before (per machi
 local ax = mkPickable("axe000354", "1fc42528-2bef-4dde-bf8a-04febeef41c8", 1, 1, 106, 100, 10, newItem("1fc42528-2bef-4dde-bf8a-04febeef41c8", 1, 1))
 LOG = {}; TOASTS = {}; PickableItem.OnUsed(ax, player)
 for i = 1, 20 do loop() end
-check("I5 no answer: told, the item stays", ENTS["axe000354"] ~= nil and lastToast() == "The host didn't answer -- try again.", lastToast())
+check("I5 no answer: told, the optimistic item stays in the pack", ENTS["axe000354"] == nil and player.inventory:GetCountOfClass("1fc42528-2bef-4dde-bf8a-04febeef41c8") == 1 and lastToast() == "Pickup kept locally. The host's confirmation is late.", lastToast())
 KCD2MP.itemDrops["3000000009"] = { state = "ground", entName = "onion009999", mine = false }
 local drop = mkPickable("onion009999", ONION, 1, 1, 102, 100, 10, newItem(ONION, 1, 1))
 LOG = {}; PickableItem.OnUsed(drop, player)
@@ -725,6 +725,156 @@ LOG={}; other:Gather()
 check("E an unpicked private patch stays gatherable", #events("w134_herb") == 1)
 check("E stale herb restore cannot cross a world", KCD2MP_W134HerbsRestore({{APPLE,105,100,10,2,1000}},herbEpoch-1)==false)
 PickableArea = nil
+
+
+-- ================= P3: optimistic acquisition and lifecycle =================
+do
+    world(); asJoiner()
+    local e = mkPickable("p3_once", SWORD, 1, 1, 101, 100, 10, newItem(SWORD, 1, 1))
+    local original, calls = e.item.OnUsed, 0
+    e.item.OnUsed = function(...) calls = calls + 1; return original(...) end
+    PickableItem.OnUsed(e, player); PickableItem.OnUsed(e, player); PickableItem.OnUsedHold(e, player)
+    local t = firstTok("w134_item")
+    check("P3 pickup executes the original once before any host reply", calls == 1 and player.inventory:GetCountOfClass(SWORD) == 1)
+    KCD2MP_W134ItemResult(t, "unknown"); KCD2MP_W134ItemResult(t, "unknown"); PickableItem.OnUsed(e, player)
+    check("P3 unknown and duplicate input never repeat original or ask", calls == 1 and #events("w134_item") == 1 and player.inventory:GetCountOfClass(SWORD) == 1)
+
+    world(); asJoiner()
+    player.inventory:CreateItem(SWORD, 1, 1)
+    local old = player.inventory.list[1]
+    local acquired = newItem(SWORD, 0.5, 1)
+    local sword = mkPickable("p3_sword", SWORD, 1, 0.5, 101, 100, 10, acquired)
+    PickableItem.OnUsed(sword, player)
+    local st = firstTok("w134_item")
+    KCD2MP_W134ItemResult(st, "gone"); KCD2MP_W134ItemResult(st, "gone")
+    check("P3 gone removes only acquired sword and preserves existing equipment", ITEMS[old] ~= nil and ITEMS[acquired] == nil and player.inventory:GetCountOfClass(SWORD) == 1)
+
+    world(); asJoiner()
+    player.inventory:CreateItem(APPLE, 1, 5)
+    local stack = player.inventory.list[1]
+    local function merge(name, amount)
+        local item = mkPickable(name, APPLE, amount, 1, 101, 100, 10, newItem(APPLE, 1, amount))
+        item.item.OnUsed = function() ENTS[name] = nil; ITEMS[stack].amount = ITEMS[stack].amount + amount; return true end
+        LOG = {}; PickableItem.OnUsed(item, player)
+        return firstTok("w134_item")
+    end
+    local a, b = merge("p3_merge_a", 2), merge("p3_merge_b", 3)
+    KCD2MP_W134ItemResult(a, "gone"); KCD2MP_W134ItemResult(b, "gone")
+    check("P3 two merged provisional gains rollback without deleting original five", player.inventory:GetCountOfClass(APPLE) == 5)
+    local c, d = merge("p3_merge_c", 2), merge("p3_merge_d", 3)
+    KCD2MP_W134ItemResult(d, "unknown"); KCD2MP_W134ItemResult(c, "gone")
+    check("P3 reverse confirmations protect the confirmed later merged gain", player.inventory:GetCountOfClass(APPLE) == 8)
+
+    world(); asJoiner()
+    local wuid = newItem(EGG, 1, 1)
+    local item = mkPickable("p3_write_readback", EGG, 1, 1, 101, 100, 10, wuid)
+    PickableItem.OnUsed(item, player)
+    local token = firstTok("w134_item")
+    local inv, writes, fault = player.inventory, 0, false
+    local delete, read = inv.DeleteItem, inv.GetInventoryTable
+    inv.DeleteItem = function(self, id, n) writes = writes + 1; local r = delete(self, id, n); fault = true; return r end
+    inv.GetInventoryTable = function(self) if fault then return nil end; return read(self) end
+    KCD2MP_W134ItemResult(token, "gone")
+    fault = false; KCD2MP.w134.loopOnce()
+    check("P3 a lost post-delete readback is resolved without a second delete", writes == 1 and ITEMS[wuid] == nil and KCD2MP.w134.itemTickets[token].settled)
+    inv.DeleteItem, inv.GetInventoryTable = delete, read
+
+    world(); asJoiner()
+    local delayedId = newItem(EGG, 1, 1)
+    local delayed = mkPickable("p3_delayed", EGG, 1, 1, 101, 100, 10, delayedId)
+    local runs = 0
+    delayed.item.OnUsed = function() runs = runs + 1; return true end
+    PickableItem.OnUsed(delayed, player)
+    check("P3 asynchronous pickup does not authorize host removal before acquisition", runs == 1 and #events("w134_item") == 0)
+    player.inventory:AddItem(delayedId); KCD2MP.w134.loopOnce()
+    check("P3 observed delayed source id sends the request without replaying original", runs == 1 and #events("w134_item") == 1)
+
+    world(); asJoiner()
+    local timedId = newItem(EGG, 1, 1)
+    local timed = mkPickable("p3_hold", EGG, 1, 1, 101, 100, 10, timedId)
+    local snap, canEnd = KCD2MP_T3InputUseSnapshot, KCD2MP_T3InputUseCanEnd
+    local ended, checked = 0, 0
+    player.player = { OnEndInteractive = function() ended = ended + 1 end }
+    KCD2MP_T3InputUseSnapshot = function() return { test = true } end
+    KCD2MP_T3InputUseCanEnd = function(v) checked = checked + 1; return v.test == true end
+    PickableItem.OnUsed(timed, player)
+    local tt, at = firstTok("w134_item"), NOW
+    local held = KCD2MP_W136Held
+    KCD2MP_W136Held = function() return true end
+    NOW = at + 3.999; KCD2MP.w134.loopOnce()
+    check("P3 hold does not trigger deadline early", KCD2MP.w134.itemReq[tt] ~= nil and ended == 0)
+    NOW = at + 4; KCD2MP.w134.loopOnce()
+    check("P3 hold permits the four-second UI deadline and exact owned Use end", KCD2MP.w134.itemReq[tt] == nil and KCD2MP.w134.itemTickets[tt] ~= nil and ended == 1, "ended=" .. ended .. " ownerChecks=" .. checked)
+    KCD2MP_W134ItemResult(tt, "gone")
+    check("P3 late gone in hold records verdict without touching inventory", player.inventory:GetCountOfClass(EGG) == 1)
+    KCD2MP_W136Held = held; KCD2MP.w134.loopOnce()
+    check("P3 late gone rolls back once after hold release", player.inventory:GetCountOfClass(EGG) == 0 and ended == 1, "count=" .. player.inventory:GetCountOfClass(EGG) .. " ended=" .. ended)
+    player.player = nil; KCD2MP_T3InputUseSnapshot, KCD2MP_T3InputUseCanEnd = snap, canEnd
+
+    world(); asJoiner()
+    local open = mkBody("p3_no_player", 101, 100, 10)
+    BasicAIActions.OnLoot(open, player, 1)
+    local own, started = player, NOW
+    player = nil; NOW = started + 4; KCD2MP.w134.loopOnce()
+    check("P3 open deadline runs even with no player entity", KCD2MP.w134.pendingOpen.p3_no_player == nil)
+    player = own
+
+    world(); asJoiner()
+    local lateId = newItem(SWORD, 1, 1)
+    PickableItem.OnUsed(mkPickable("p3_old_life", SWORD, 1, 1, 101, 100, 10, lateId), player)
+    local stale = firstTok("w134_item")
+    KCD2MP_W134LootLifeReset()
+    player.inventory:CreateItem(SWORD, 1, 1)
+    KCD2MP_W134ItemResult(stale, "gone")
+    check("P3 old life reply never deletes the new life's inventory", player.inventory:GetCountOfClass(SWORD) == 2)
+
+    world(); asJoiner()
+    local corpse = mkBody("p3_chunks", 101, 100, 10)
+    BasicAIActions.OnLoot(corpse, player, 1)
+    local heldFn = KCD2MP_W136Held
+    KCD2MP_W136Held = function() return true end
+    KCD2MP_W134BodyStateChunk("p3_chunks", "open", 1, 1, 1, 2, 2, {{MONEY, 3, 1, false}})
+    check("P3 incomplete local body subchunks apply nothing", #LOOTS == 0 and corpse.inventory:GetCountOfClass(MONEY) == 0)
+    KCD2MP_W134BodyStateChunk("p3_chunks", "open", 1, 1, 1, 1, 2, {{COAT, 1, 1, false}})
+    check("P3 complete body subchunks only collect during hold", #LOOTS == 0 and corpse.inventory:GetCountOfClass(COAT) == 0)
+    KCD2MP_W136Held = heldFn; KCD2MP.w134.loopOnce()
+    check("P3 hold release applies one complete original wire part", #LOOTS == 1 and corpse.inventory:GetCountOfClass(MONEY) == 3 and corpse.inventory:GetCountOfClass(COAT) == 1)
+    KCD2MP_W134BodyStateChunk("p3_chunks", "open", 1, 1, 1, 1, 2, {{COAT, 1, 1, false}})
+    check("P3 duplicate completed body subchunk never opens twice", #LOOTS == 1)
+    KCD2MP_W134BodyStateChunk("p3_chunks", "open", 1, 1, 1, 2, 2, {{MONEY, 9, 1, false}})
+    check("P3 next legacy A+C transfer accepts unchanged first subchunk", corpse.inventory:GetCountOfClass(MONEY) == 9 and corpse.inventory:GetCountOfClass(COAT) == 1 and #LOOTS == 1)
+
+    world(); asJoiner()
+    local ground = mkPickable("p3_held_ground", EGG, 1, 1, 101, 100, 10, newItem(EGG, 1, 1))
+    local holdGround = KCD2MP_W136Held
+    KCD2MP_W136Held = function() return true end
+    KCD2MP_W134ItemGone(EGG, 101, 100, 10)
+    check("P3 ItemGone never removes a ground entity during hold", ENTS.p3_held_ground == ground)
+    KCD2MP_W136Held = holdGround; KCD2MP.w134.loopOnce()
+    check("P3 ItemGone applies the ordered removal after hold release", ENTS.p3_held_ground == nil)
+
+    world(); asJoiner()
+    player.inventory:CreateItem(SWORD, 1, 1)
+    KCD2MP.w134.sessions.p3_legacy_held = { pend = { p3take = { cls = SWORD, amt = 1, hp = 1, at = NOW } }, puts = {} }
+    local legacyHeld = KCD2MP_W136Held
+    KCD2MP_W136Held = function() return true end
+    KCD2MP_W134TakeResult("p3take", "gone", "p3_legacy_held")
+    check("P3 legacy take refusal never edits player inventory during hold", player.inventory:GetCountOfClass(SWORD) == 1 and KCD2MP.w134.sessions.p3_legacy_held.pend.p3take ~= nil)
+    KCD2MP_W136Held = legacyHeld; KCD2MP.w134.loopOnce()
+    check("P3 legacy take refusal applies after hold release", player.inventory:GetCountOfClass(SWORD) == 0)
+
+    world(); asJoiner()
+    local a = KCD2MP.hostAuthority
+    local priorGeneration = a.generation
+    a.generation = "500"
+    local staleGround = mkPickable("p3_stale_ground", EGG, 1, 1, 101, 100, 10, newItem(EGG, 1, 1))
+    local holdStale = KCD2MP_W136Held
+    KCD2MP_W136Held = function() return true end
+    KCD2MP_W134ItemGone(EGG, 101, 100, 10, "500")
+    a.generation = "501"; KCD2MP_W136Held = holdStale; KCD2MP.w134.loopOnce()
+    check("P3 a delayed held ground removal keeps its captured generation", ENTS.p3_stale_ground == staleGround)
+    a.generation = priorGeneration
+end
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0

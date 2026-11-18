@@ -253,11 +253,11 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- frames from the relay
 
-    private async Task Wo134OnFrameAsync(int type, byte src, byte[] body)
+    private async Task Wo134OnFrameAsync(int type, byte src, byte[] body, CancellationToken ct = default)
     {
         if (!LootMsg.TryDecode(body, out var m)) { Interlocked.Increment(ref _w134Dropped); return; }
         if (await Wo135OnLootFrameAsync(type, src, m)) return;   // WO-135: takedowns, the host's build
-        if (await Wo217OnLootFrameAsync(type, src, m)) return;   // WO-217 C: the live loot (requests, grants, the body's list by item ids)
+        if (await Wo217OnLootFrameAsync(type, src, m, ct)) return;   // WO-217 C: the live loot (requests, grants, the body's list by item ids)
         var f = m.Text.Split(' ');
         string Q(string s) => EscapeLua(s);
         if (type == Protocol.LootAskDown)
@@ -268,19 +268,19 @@ public partial class GameBridge
             switch (m.Kind)
             {
                 case Protocol.LootAskBodyOpen when f.Length == 1 && Wo134Rules.BodyName.IsMatch(f[0]):
-                    await ExecLuaAsync($"if KCD2MP_W134HostOpen then KCD2MP_W134HostOpen({src}, {m.Tok}, \"{f[0]}\") end");
+                    await T3LootExecAsync($"if KCD2MP_W134HostOpen then KCD2MP_W134HostOpen({src}, {m.Tok}, \"{f[0]}\", \"{T3LootGeneration}\") end", ct);
                     return;
                 case Protocol.LootAskBodyTake or Protocol.LootAskBodyPut when (f.Length == 4 || (f.Length == 5 && m.Kind == Protocol.LootAskBodyTake && Wo195Rules.IsScreenMark(f[4])))
                         && Wo134Rules.BodyName.IsMatch(f[0])
                         && Wo134Rules.TryClass(f[1], out var cls) && Wo134Rules.TryAmount(f[2], out int amt) && Wo134Rules.TryHealth(f[3], out float hp):
                     string fn = m.Kind == Protocol.LootAskBodyTake ? "KCD2MP_W134HostTake" : "KCD2MP_W134HostPut";
                     bool screenTake = f.Length == 5 && _w195BodyLootHost;   // WO-195 3: the joiner's loot screen made this item (the home key)
-                    await ExecLuaAsync($"if {fn} then {fn}({src}, {m.Tok}, \"{f[0]}\", \"{cls:D}\", {amt}, {Wo134Rules.F(hp)}{(screenTake ? ", true" : "")}) end");
+                    await T3LootExecAsync($"if {fn} then {fn}({src}, {m.Tok}, \"{f[0]}\", \"{cls:D}\", {amt}, {Wo134Rules.F(hp)}{(m.Kind == Protocol.LootAskBodyTake ? (screenTake ? ", true" : ", false") : "")}, \"{T3LootGeneration}\") end", ct);
                     return;
                 case Protocol.LootAskItemTake when f.Length is 5 or 6 && Wo134Rules.TryClass(f[0], out var icls) && Wo134Rules.TryCoord(f[1], out float x)
                         && Wo134Rules.TryCoord(f[2], out float y) && Wo134Rules.TryCoord(f[3], out float z) && f[4] is "0" or "1"
                         && (f.Length == 5 || Wo134Rules.TryAmount(f[5], out _)):
-                    await ExecLuaAsync($"if KCD2MP_W134HostItem then KCD2MP_W134HostItem({src}, {m.Tok}, \"{icls:D}\", {Wo134Rules.F3(x)}, {Wo134Rules.F3(y)}, {Wo134Rules.F3(z)}, {f[4]}, {(f.Length == 6 ? f[5] : "nil")}) end");
+                    await T3LootExecAsync($"if KCD2MP_W134HostItem then KCD2MP_W134HostItem({src}, {m.Tok}, \"{icls:D}\", {Wo134Rules.F3(x)}, {Wo134Rules.F3(y)}, {Wo134Rules.F3(z)}, {f[4]}, {(f.Length == 6 ? f[5] : "nil")}, \"{T3LootGeneration}\") end", ct);
                     return;
             }
             Interlocked.Increment(ref _w134Dropped);
@@ -297,17 +297,18 @@ public partial class GameBridge
                     && int.TryParse(f[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out int part)
                     && int.TryParse(f[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out int np) && part >= 1 && np >= 1 && part <= np && np <= 20
                     && Wo134Rules.ParseItems(f[5]) is { } items:
-                await ExecLuaAsync($"if KCD2MP_W134BodyState then KCD2MP_W134BodyState(\"{f[0]}\", \"{f[1]}\", {flags}, {part}, {np}, {Wo134Rules.LuaItems(items)}) end");
+                await T3LootItemsAsync(items, Wo134Rules.LuaItems, (chunk, chunks, table) =>
+                    $"if KCD2MP_W134BodyStateChunk then KCD2MP_W134BodyStateChunk(\"{f[0]}\", \"{f[1]}\", {flags}, {part}, {np}, {chunk}, {chunks}, {table}, \"{T3LootGeneration}\") end", ct);
                 return;
             case Protocol.LootHostTakeResult when f.Length == 4 && Wo136Rules.IsTakeVerdict(f[0]) && Wo134Rules.BodyName.IsMatch(f[1]):
-                await ExecLuaAsync($"if KCD2MP_W134TakeResult then KCD2MP_W134TakeResult(\"{m.Tok}\", \"{f[0]}\", \"{f[1]}\") end");
+                await T3LootExecAsync($"if KCD2MP_W134TakeResult then KCD2MP_W134TakeResult(\"{m.Tok}\", \"{f[0]}\", \"{f[1]}\", \"{T3LootGeneration}\") end", ct);
                 return;
             case Protocol.LootHostItemResult when f.Length == 5 && Wo136Rules.IsItemVerdict(f[0]):
-                await ExecLuaAsync($"if KCD2MP_W134ItemResult then KCD2MP_W134ItemResult(\"{m.Tok}\", \"{f[0]}\") end");
+                await T3LootExecAsync($"if KCD2MP_W134ItemResult then KCD2MP_W134ItemResult(\"{m.Tok}\", \"{f[0]}\", \"{T3LootGeneration}\") end", ct);
                 return;
             case Protocol.LootHostItemGone when f.Length == 4 && Wo134Rules.TryClass(f[0], out var gcls) && Wo134Rules.TryCoord(f[1], out float gx)
                     && Wo134Rules.TryCoord(f[2], out float gy) && Wo134Rules.TryCoord(f[3], out float gz):
-                await ExecLuaAsync($"if KCD2MP_W134ItemGone then KCD2MP_W134ItemGone(\"{gcls:D}\", {Wo134Rules.F3(gx)}, {Wo134Rules.F3(gy)}, {Wo134Rules.F3(gz)}) end");
+                await T3LootExecAsync($"if KCD2MP_W134ItemGone then KCD2MP_W134ItemGone(\"{gcls:D}\", {Wo134Rules.F3(gx)}, {Wo134Rules.F3(gy)}, {Wo134Rules.F3(gz)}, \"{T3LootGeneration}\") end", ct);
                 return;
             case Protocol.LootHostLedger when Wo134Rules.ParseLedgerPart(m.Text) is { } lp:
                 Wo134OnLedgerPart(lp.Part, lp.N, lp.Rows);

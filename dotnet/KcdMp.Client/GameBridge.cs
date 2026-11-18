@@ -4043,7 +4043,7 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private Task OnLocalDownedAsync(bool on, byte kind)
     {
-        _localDowned = on;
+        T3NoteInputLifeEdge(on);
         _localDownedKind = kind;
         if (on) Wo166NoteLocalDown(_lastX, _lastY, _lastZ);   // WO-166 R1: where this player went down
         if (on) _w132LocalGate.Down(DateTime.UtcNow); else _w132LocalGate.Up(DateTime.UtcNow);   // WO-132
@@ -4700,7 +4700,10 @@ public partial class GameBridge(ClientConfig config)
 
     /// <summary>One relay frame, stamped the moment its last byte was read. WO-206 E: <paramref name="Stamp"/> is the world epoch known
     /// at that moment (Wo206StampAtRead); 0 = none.</summary>
-    private readonly record struct InFrame(int Type, byte[] Payload, long Arrival, uint Stamp);
+    private readonly record struct InFrame(int Type, byte[] Payload, long Arrival, uint Stamp)
+    {
+        public ulong LootGeneration { get; init; }
+    }
 
     /// <summary>
     /// WO-118 follow-up: the relay reader. It only reads, stamps and feeds:
@@ -4736,6 +4739,8 @@ public partial class GameBridge(ClientConfig config)
         // WO-207 B.3: the activity frames' own lane (each row a native write through the pipe; in order, never in the frame processor's way)
         var actLane = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
         _ = Wo207ActivityLaneAsync(actLane.Reader, ct);
+        var lootLane = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
+        var lootProcessor = T3LootLaneAsync(lootLane, ct);
         int stopped = 0;
         void StopReceive()
         {
@@ -4745,9 +4750,11 @@ public partial class GameBridge(ClientConfig config)
             _ = receiveLife.CancelAsync().ContinueWith(t => { _ = t.Exception; receiveLife.Dispose(); },
                 CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             Interlocked.CompareExchange(ref _frameWriter, null, frames.Writer);
-            frames.Writer.TryComplete(); leashLane.Writer.TryComplete(); convLane.Writer.TryComplete(); actLane.Writer.TryComplete();
+            frames.Writer.TryComplete(); leashLane.Writer.TryComplete(); convLane.Writer.TryComplete(); actLane.Writer.TryComplete(); lootLane.Writer.TryComplete();
         }
         _ = processor.ContinueWith(_ => StopReceive(), CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        _ = lootProcessor.ContinueWith(t => { _ = t.Exception; if (!ct.IsCancellationRequested) StopReceive(); }, CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         // The coalescer's clock: a pending Lua push must go out once it is due
         // even when no further frame for that NPC arrives (a puppet that just
@@ -4798,6 +4805,11 @@ public partial class GameBridge(ClientConfig config)
                 if (W202("ping_network") && Wo202TakeAtRead(type, payload)) continue;   // WO-202 III.2: the network's answers, never behind the queue
                 if (Wo206TakeAtRead(type, payload)) continue;   // WO-206 E: an epoch is known from the frame it arrives in, never behind the queue
                 uint stamp = Wo206StampAtRead(payload);         // WO-206 E: the world epoch this frame was sent under
+                if (T3LootType(type))
+                {
+                    Wo207Queue(lootLane.Writer, new InFrame(type, payload, arrival, stamp) { LootGeneration = P1Lifecycle.Current.Generation }, type);
+                    continue;
+                }
                 if (T3TryDeferSideChannel(new InFrame(type, payload, arrival, stamp))) continue;
                 if (Wo147IsLeashFrame(type)) { leashLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
                 if (type == Protocol.ConvDown && W207("conv_lane")) { convLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }   // WO-207 A.1
@@ -4812,6 +4824,7 @@ public partial class GameBridge(ClientConfig config)
         catch (Exception ex) when (ex is IOException or SocketException or EndOfStreamException) { }
         finally { StopReceive(); }
         await processor;
+        await lootProcessor; // bounded scopes revoke hung leaves; drain accepted rows before returning
     }
 
     /// <summary>
@@ -5093,7 +5106,7 @@ public partial class GameBridge(ClientConfig config)
             else if (Protocol.IsJoinDown(type, payloadLen))
             {
                 // WO-123: the join channel (request, offer, chunks, acks, done, abort, ready, status).
-                await Wo123OnFrameAsync(type, payload, ct);
+                await Wo123OnFrameAsync(type, payload, ct, frame.Stamp);
             }
             else if (type == Protocol.WorldSavedDown && payloadLen == Protocol.WorldSavedDownPayloadLen)
             {
@@ -6276,6 +6289,10 @@ public partial class GameBridge(ClientConfig config)
                 return;
             case "t3_proc_timeout":
                 T3ProcessorTimeout(arg);
+                return;
+            case "t3_loot_stats":
+            case "t3_input_stats":
+                T3LuaStats(name, arg);
                 return;
             case "p1_host_authority":
                 P1OnAuthorityConfig(arg);

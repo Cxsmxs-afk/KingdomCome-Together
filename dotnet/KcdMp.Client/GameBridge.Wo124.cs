@@ -75,6 +75,7 @@ public partial class GameBridge
         public uint JoinId;
         public byte Host;
         public uint WorldSavedSeq;
+        public uint HostWorldEpoch;
         public HenrySource? Source;
         public string? PlacedPath;
         public bool PlacedVerified;
@@ -413,6 +414,7 @@ public partial class GameBridge
                 await LeaveSharedWorldAsync("rejoin-timeout", "Could not rejoin your host after its reload.");
                 return;
             }
+            if (!T3AdmitInWorldRejoin()) return;
             _autoNextUtc = DateTime.UtcNow.AddSeconds(W202("rejoin_recover") ? Wo202Rules.RejoinGapS(_w202RejoinFails) : 20);
             Console.WriteLine("MP-HENRY joiner: asking the host for its reloaded world (an in-world rejoin)");
             await SendJoinRequestAsync();
@@ -501,10 +503,10 @@ public partial class GameBridge
     // ---------------------------------------------------------------- Phase 2+3: splice, place, load
 
     /// <summary>WO-123 received and verified the world (Done sent). Called from the chunk handler.</summary>
-    private Task Wo124OnWorldReceivedAsync(uint joinId, byte host, string stagedPath, uint seq)
+    private Task Wo124OnWorldReceivedAsync(uint joinId, byte host, string stagedPath, uint seq, uint hostWorldEpoch)
     {
         if (!JoinerSharedEffective) return Task.CompletedTask;
-        var j = new JoinerJoin { JoinId = joinId, Host = host, WorldSavedSeq = seq, InWorld = _where == GameWhere.World, OfferMd5 = _joinReceivedMd5 };
+        var j = new JoinerJoin { JoinId = joinId, Host = host, WorldSavedSeq = seq, HostWorldEpoch = hostWorldEpoch, InWorld = _where == GameWhere.World, OfferMd5 = _joinReceivedMd5 };
         lock (_joinGate) _jj = j;
         // Never awaited by the frame loop: observed, awaiting it held every relay
         // frame (the host's positions, its aborts) for the whole ~50 s load.
@@ -862,7 +864,7 @@ public partial class GameBridge
             return;
         }
         if (Wo206JoinGone(j, "after Ready") || j.Phase != "post-load") return;
-        if (j.WorldTag is string wt && j.SplicedParts is { } sp) Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, readySeq);   // WO-125: the join save's matched pair
+        if (j.WorldTag is string wt && j.SplicedParts is { } sp) Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, readySeq, j.HostWorldEpoch);   // WO-125: the join save's matched pair
         JoinerJoin[] completed;
         lock (_joinGate)
         {
@@ -873,6 +875,7 @@ public partial class GameBridge
             _jj = null;
         }
         await CleanupRetainedJoinWorldsAsync(completed, "join=in");
+        T3AfterJoinedWorldCleanup();
         try { await ExecLuaAsync("if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"Co-op: you are in your host's world.\") end"); }
         catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: joined notification failed: {ex.Message}"); }
         _ = Task.Delay(10000).ContinueWith(_ => { if (_joinUiState == "in") SetJoinUi("idle", ""); });

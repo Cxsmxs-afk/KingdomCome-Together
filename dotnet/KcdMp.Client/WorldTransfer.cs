@@ -99,6 +99,8 @@ public sealed class WorldReceiver : IDisposable
 
     public uint JoinId { get; }
     public byte Host { get; }
+    /// <summary>Local reader stamp of the offer; never refreshed by a later chunk or queue drain.</summary>
+    public uint HostWorldEpoch { get; init; }
     public WorldOffer Offer { get; }
     public string PartPath { get; }
     public string FinalPath { get; }

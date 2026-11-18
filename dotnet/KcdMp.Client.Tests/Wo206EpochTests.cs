@@ -109,7 +109,11 @@ public class Wo206EpochTests
         Assert.Equal(Wo206Cat.Quest, Wo206Rules.WorldCategory(Protocol.QuestAskDown, Join(Joiner, Protocol.QuestAskUp, Protocol.QuestAskRequest, "x")));
         Assert.Equal(Wo206Cat.Loot, Wo206Rules.WorldCategory(Protocol.LootHostDown, Join(Host, Protocol.LootHostUp, Protocol.LootHostLedger, "x")));
         Assert.Null(Wo206Rules.WorldCategory(Protocol.QuestHostDown, Join(Host, Protocol.QuestHostUp, Protocol.QuestHostMode, "on x")));
-        Assert.Null(Wo206Rules.WorldCategory(Protocol.LootHostDown, Join(Host, Protocol.LootHostUp, Protocol.LootHostBodyState, "x")));
+        Assert.Equal(Wo206Cat.Loot, Wo206Rules.WorldCategory(Protocol.LootHostDown, Join(Host, Protocol.LootHostUp, Protocol.LootHostBodyState, "x")));
+        Assert.Equal(Wo206Cat.Loot, Wo206Rules.WorldCategory(Protocol.LootAskDown, Join(Joiner, Protocol.LootAskUp, Protocol.LootAskTakeReq, "x")));
+        Assert.Equal(Wo206Cat.Loot, Wo206Rules.WorldCategory(Protocol.LootHostDown, Join(Host, Protocol.LootHostUp, Protocol.LootHostBodyList, "x")));
+        Assert.Equal(Wo206Cat.Loot, Wo206Rules.WorldCategory(Protocol.LootHostDown, Join(Host, Protocol.LootHostUp, Protocol.LootHostTakeVerdict, "x")));
+        Assert.Null(Wo206Rules.WorldCategory(Protocol.LootHostDown, Join(Host, Protocol.LootHostUp, Protocol.LootHostBuild, "x")));
         Assert.Null(Wo206Rules.WorldCategory(Protocol.Ghost, new byte[18]));
     }
 
