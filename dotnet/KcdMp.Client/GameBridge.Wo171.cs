@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Collections.Concurrent;
 using System.Globalization;
+using KcdMp.Wire;
 
 namespace KcdMp.Client;
 
@@ -10,10 +11,16 @@ public partial class GameBridge
 {
     // ================================================================ WO-171 M: the partner's own colour and facing on the map
 
+    private const string Wo171SlotMismatch = "marker_slot_mismatch";
     private volatile Wo171Rules.Style _w171Style = Wo171Rules.Style.Rotating;   // mp_partner_marker_style
     private volatile int _w171Offset;                                          // mp_marker_dir_offset 0..7
     private volatile bool _w171Flip;                                           // mp_marker_dir_flip
-    private readonly Wo171Rules.SlotTable _w171Slots = new();
+    private readonly object _w171SlotLock = new();
+    private Stream? _w171SlotStream;
+    private byte _w171SlotHost = 0xFF;
+    private string? _w171SlotHostName;
+    private Wo171Rules.SlotTable? _w171Slots;
+    private long _w171NextSlotSend;
 
     private sealed class W171Pin
     {
@@ -44,34 +51,124 @@ public partial class GameBridge
         Console.WriteLine($"WO171-CFG marker style={Wo171Rules.StyleWord(_w171Style)} offset={_w171Offset} flip={(_w171Flip ? "on" : "off")}");
     }
 
-    /// <summary>This player's id of the host, when this machine is a joiner (the host is always slot 1, red).</summary>
-    private byte Wo171HostId()
+    private byte Wo171HostId() => W137Host ? _myGhostId
+        : !_isDamageAuthority && _hostModeKnown && _hostSharedWorld && IsLivePeer(_hostModeFrom) ? _hostModeFrom : (byte)0xFF;
+
+    // Called under _w171SlotLock. A temporarily unknown host cannot replace a confirmed table on the same stream.
+    private void Wo171BindSlots(Stream? stream, byte host)
     {
-        byte known = _leashHostId != 0xFF ? _leashHostId : _hostModeFrom;
-        if (known != 0xFF) return known;
-        // not told yet (or a harness): the relay's rule, the lowest live id is the authority -- the host
-        var live = LivePartners();
-        return live.Count > 0 ? live.Min() : (byte)0xFF;
+        bool sameStream = ReferenceEquals(_w171SlotStream, stream);
+        if (sameStream && host == 0xFF)
+        {
+            bool separate = _isDamageAuthority ? _combatRoleApplied && !_sharedWorld
+                : _hostModeKnown && !_hostSharedWorld && IsLivePeer(_hostModeFrom);
+            if (!separate) return;
+        }
+        string? hostName = host != 0xFF && host != _myGhostId ? _peers.NameOf(host) : null;
+        if (sameStream && _w171SlotHost == host && _w171SlotHostName == hostName) return;
+        _w171SlotStream = stream;
+        _w171SlotHost = host;
+        _w171SlotHostName = hostName;
+        _w171Slots = null;
+        _w171NextSlotSend = 0;
+    }
+
+    private async Task Wo171SyncSlotsAsync()
+    {
+        List<byte> peers;
+        Wo171Rules.SlotTable slots;
+        Stream? stream;
+        CancellationToken ct;
+        lock (_w171SlotLock)
+        {
+            stream = _wo122Stream;
+            ct = _wo122Ct;
+            byte host = Wo171HostId();
+            Wo171BindSlots(stream, host);
+            if (host != _myGhostId || !W137Host || stream is null || ct.IsCancellationRequested) return;
+
+            peers = LivePartners();
+            slots = _w171Slots ?? new();
+            // First observation in the host's live relay roster. Relay id breaks ties within the same tick.
+            foreach (byte peer in peers)
+                if (_peers.NameOf(peer) is string name) slots = slots.AssignGuest(name);
+            long now = Environment.TickCount64;
+            if (peers.Count == 0 || (ReferenceEquals(_w171Slots, slots) && now < _w171NextSlotSend)) return;
+            _w171Slots = slots;
+            _w171NextSlotSend = now + 5_000;
+        }
+
+        // Repeat the full table for late peers and receivers still waiting for the host's session announcement.
+        string wire = slots.ToWire();
+        foreach (byte peer in peers)
+        {
+            if (!W137Host || ct.IsCancellationRequested || !ReferenceEquals(stream, _wo122Stream)) return;
+            await W164SendAsync(peer, Protocol.W164MarkNote, wire, ct);
+        }
+    }
+
+    private void Wo171OnSlotSnapshot(byte src, string text)
+    {
+        lock (_w171SlotLock)
+        {
+            ProcessorFrameScope.ThrowIfAbandoned();
+            byte host = Wo171HostId();
+            Wo171BindSlots(_wo122Stream, host);
+            if (_wo122Stream is null || _wo122Ct.IsCancellationRequested || W137Host || host == 0xFF || src != host) return;
+            if (!Wo171Rules.SlotTable.TryRead(text, out var slots)) return;
+            _w171Slots = slots;
+        }
+    }
+
+    private int? Wo171PinSlot(byte ghost, string? name)
+    {
+        lock (_w171SlotLock)
+        {
+            byte host = Wo171HostId();
+            Wo171BindSlots(_wo122Stream, host);
+            if (_wo122Stream is null || _wo122Ct.IsCancellationRequested) return null;
+            // The old one-peer marker harness bypasses the join and supplies no session-mode frame.
+            if (_w171SlotHost == 0xFF)
+                return W164TestJoinerInWorld && !_isDamageAuthority && LivePartners() is [var only] && ghost == only ? 1 : null;
+            // Relay IDs can be recycled while the host is unknown. Only the same named host keeps the red pin then.
+            bool isHost = ghost == _w171SlotHost && (ghost == host || (name is not null && name == _w171SlotHostName));
+            return isHost ? 1 : _w171Slots?.FindSlot(name, isHost: false);
+        }
+    }
+
+    private bool Wo171PinSession()
+    {
+        if (W137Host || W137Joiner) return true;
+        if (!_joinedWorld || !_combatRoleApplied || _isDamageAuthority || !_hostAuthority) return false;
+
+        // A missing host mode can briefly make W137Joiner fall back to the local shared-world setting.
+        lock (_w171SlotLock)
+        {
+            byte host = Wo171HostId();
+            Wo171BindSlots(_wo122Stream, host);
+            return host == 0xFF && _w171Slots is not null && _wo122Stream is not null && !_wo122Ct.IsCancellationRequested;
+        }
     }
 
     /// <summary>One partner's pin this second: sets it, moves it, turns it or just keeps it alive.</summary>
     private async Task W171PinOneAsync(byte g, float x, float y, float z, long nowMs)
     {
         var st = _w171Pins.GetOrAdd(g, _ => new W171Pin());
-        string? who = _ghostNames.TryGetValue(g, out var nm) ? nm : null;
+        string? who = _peers.NameOf(g);
         st.Name = Wo171Rules.SanitizeLabel(who);
-        string identity = who is { Length: > 0 } ? who : "id" + g.ToString(CultureInfo.InvariantCulture);
-        bool isHost = !W137Host && g == Wo171HostId();
-        int slot = _w171Slots.Slot(identity, isHost);
+        int? hostSlot = Wo171PinSlot(g, who);
+        int slot = hostSlot ?? 0;
         int rev = slot is >= 1 and <= Wo171Rules.Colours ? Wo171NoteName(slot, st.Name) : 0;
         float yaw = _ghostLastYaw.TryGetValue(g, out var yv) ? yv : 0f;   // a mounted partner's stream is the horse's too (the saddle turns with it)
         st.RawOctant = Wo171Rules.PickOctant(st.RawOctant, Wo171Rules.HeadingDeg(yaw));
         int oct = Wo171Rules.ApplyOffsetFlip(st.RawOctant, _w171Offset, _w171Flip);
-        int code = Wo171Rules.CodeFor(_w171Style, slot, oct, _w171Offset, rev);
+        var style = _w171Style;
+        int code = Wo171Rules.CodeFor(style, slot, oct, _w171Offset, rev);
 
         bool first = st.SentCode < 0;
         bool moveDue = first || st.Gate.Due(x, y, nowMs);
-        bool turnDue = !first && Wo171Rules.TurnDue(st.SentCode, code, st.LastTurnMs, nowMs);
+        bool turnDue = !first && (st.Slot != slot || (st.SentCode == 0) != (code == 0)
+            || Wo171Rules.TurnDue(st.SentCode, code, st.LastTurnMs, nowMs));
         bool beat = !first && nowMs - st.LastSendMs >= 5000;
         if (!moveDue && !turnDue && !beat) return;
 
@@ -79,6 +176,11 @@ public partial class GameBridge
         float sx = moveDue ? x : st.X, sy = moveDue ? y : st.Y, sz = moveDue ? z : st.Z;
         if ((first || turnDue || beat) && sendCode != 0) await _combat.PinLabelAsync(g, st.Name);   // the hover title (the DLL forgets its pins at a load: said again every 5 s)
         if (!await _combat.MirrorGraveAsync(3, g, (ulong)sendCode, sx, sy, sz)) return;
+        if (hostSlot is int expected)
+        {
+            int mismatch = Wo171Rules.PictureSlot(sendCode) == (style == Wo171Rules.Style.Companion ? 0 : expected) ? 0 : 1;
+            T3Increment(Wo171SlotMismatch, mismatch);
+        }
         Interlocked.Increment(ref _w164PinSets);
         _w164PinAt[g] = (sx, sy);
         st.LastSendMs = nowMs;
@@ -90,7 +192,7 @@ public partial class GameBridge
             st.SentCode = sendCode; st.LastTurnMs = nowMs; st.X = sx; st.Y = sy; st.Z = sz; st.Octant = oct;
             st.Gate.Sent(sx, sy, nowMs, counted: false);
             Interlocked.Increment(ref _w171Adds);
-            Console.WriteLine(FormattableString.Invariant($"WO171-MARK slot={slot} colour={colour} dir={dir} name=\"{st.Name}\" picture={Wo171Rules.PictureName(sendCode)} style={Wo171Rules.StyleWord(_w171Style)} added"));
+            Console.WriteLine(FormattableString.Invariant($"WO171-MARK slot={slot} colour={colour} dir={dir} name=\"{st.Name}\" picture={Wo171Rules.PictureName(sendCode)} style={Wo171Rules.StyleWord(style)} added"));
             return;
         }
         if (moveDue)
@@ -105,7 +207,7 @@ public partial class GameBridge
         {
             st.SentCode = sendCode; st.LastTurnMs = nowMs; st.Octant = oct;
             Interlocked.Increment(ref _w171Turns);
-            Console.WriteLine(FormattableString.Invariant($"WO171-MARK slot={slot} colour={colour} dir={dir} picture={Wo171Rules.PictureName(sendCode)} turned"));
+            Console.WriteLine(FormattableString.Invariant($"WO171-MARK slot={slot} colour={colour} dir={dir} name=\"{st.Name}\" picture={Wo171Rules.PictureName(sendCode)} turned"));
         }
         else if (!moveDue) Interlocked.Increment(ref _w171Heartbeats);
     }
@@ -183,5 +285,5 @@ public partial class GameBridge
     }
 
     private string Wo171StatsText() => FormattableString.Invariant(
-        $"style={Wo171Rules.StyleWord(_w171Style)} offset={_w171Offset} flip={(_w171Flip ? "on" : "off")} added={Interlocked.Read(ref _w171Adds)} turns={Interlocked.Read(ref _w171Turns)} move_sends={Interlocked.Read(ref _w171MoveSends)} heartbeats={Interlocked.Read(ref _w171Heartbeats)} removed={Interlocked.Read(ref _w171Removes)} slots={_w171Slots.Count}");
+        $"style={Wo171Rules.StyleWord(_w171Style)} offset={_w171Offset} flip={(_w171Flip ? "on" : "off")} added={Interlocked.Read(ref _w171Adds)} turns={Interlocked.Read(ref _w171Turns)} move_sends={Interlocked.Read(ref _w171MoveSends)} heartbeats={Interlocked.Read(ref _w171Heartbeats)} removed={Interlocked.Read(ref _w171Removes)} slots={Volatile.Read(ref _w171Slots)?.GuestCount ?? 0} {Wo171SlotMismatch}={_t3Counters.GetValueOrDefault(Wo171SlotMismatch)}");
 }

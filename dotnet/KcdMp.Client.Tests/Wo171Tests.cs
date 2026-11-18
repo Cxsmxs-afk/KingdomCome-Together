@@ -2,59 +2,138 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using KcdMp.Client;
+using Xunit.Abstractions;
 
 namespace KcdMp.Client.Tests;
 
 /// <summary>WO-171 M: the partner map marker's rules -- colours, the eight facings, the throttles, the name, the pictures' manifest.</summary>
-public class Wo171Tests
+public class Wo171Tests(ITestOutputHelper output)
 {
     // ------------------------------------------------------------------ the slot table
 
     [Fact]
-    public void The_host_is_slot_1_and_the_others_take_2_to_4_in_the_order_they_appear()
+    public void The_host_assigns_its_guests_slots_2_to_4_in_join_order()
     {
-        var t = new Wo171Rules.SlotTable();
-        Assert.Equal(1, t.Slot("Host", isHost: true));
-        Assert.Equal(2, t.Slot("Ann", false));
-        Assert.Equal(3, t.Slot("Bob", false));
-        Assert.Equal(4, t.Slot("Cy", false));
-        Assert.Equal(0, t.Slot("Di", false));         // a fifth has no colour of his own: the companion icon
-        Assert.Equal(2, t.Slot("Ann", false));        // asking again changes nothing
+        var empty = new Wo171Rules.SlotTable();
+        var afterFirstJoin = empty.AssignGuest("Ann");
+        var full = afterFirstJoin.AssignGuest("Bob").AssignGuest("Cy");
+        Assert.Null(empty.FindSlot("Ann", false));
+        Assert.Null(afterFirstJoin.FindSlot("Bob", false));
+        Assert.Equal(1, full.FindSlot("Host", isHost: true));
+        Assert.Equal(2, full.FindSlot("Ann", false));
+        Assert.Equal(3, full.FindSlot("Bob", false));
+        Assert.Equal(4, full.FindSlot("Cy", false));
+        var withFifthPlayer = full.AssignGuest("Di");
+        Assert.Equal(0, withFifthPlayer.FindSlot("Di", false));
+        Assert.Equal(0, Wo171Rules.CodeFor(Wo171Rules.Style.Rotating, withFifthPlayer.FindSlot("Di", false)!.Value, 0, 0));
+        Assert.Equal(full.ToWire(), withFifthPlayer.ToWire());
+        Assert.Equal(full.ToWire(), full.AssignGuest("Ann").ToWire());
     }
 
     [Fact]
     public void A_rejoin_with_a_new_ghost_id_keeps_its_colour_because_the_name_is_the_key()
     {
-        var t = new Wo171Rules.SlotTable();
-        t.Slot("Host", true);
-        Assert.Equal(2, t.Slot("Ann", false));
-        Assert.Equal(3, t.Slot("Bob", false));
-        // Ann crashes and comes back: same name -> still purple (2), Bob still blue (3), and a newcomer takes the free slot 4
-        Assert.Equal(2, t.Slot("Ann", false));
-        Assert.Equal(3, t.Slot("Bob", false));
-        Assert.Equal(4, t.Slot("Cy", false));
+        var host = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob");
+        var namesByGhostId = new Dictionary<byte, string> { [11] = "Ann", [12] = "Bob" };
+        Assert.True(Wo171Rules.SlotTable.TryRead(host.ToWire(), out var firstView));
+        Assert.Equal(2, firstView.FindSlot(namesByGhostId[11], false));
+        Assert.Equal(3, firstView.FindSlot(namesByGhostId[12], false));
+
+        namesByGhostId.Remove(11);
+        namesByGhostId.Add(28, "Ann");
+        namesByGhostId.Add(29, "Cy");
+        host = host.AssignGuest(namesByGhostId[28]).AssignGuest(namesByGhostId[29]);
+        Assert.True(Wo171Rules.SlotTable.TryRead(host.ToWire(), out var rejoinView));
+        Assert.Equal(2, rejoinView.FindSlot(namesByGhostId[28], false));
+        Assert.Equal(3, rejoinView.FindSlot(namesByGhostId[12], false));
+        Assert.Equal(4, rejoinView.FindSlot(namesByGhostId[29], false));
+        Assert.Equal(3, host.GuestCount);
     }
 
     [Fact]
     public void On_the_hosts_own_machine_the_joiners_never_take_slot_1()
     {
-        var t = new Wo171Rules.SlotTable();     // this machine is the host: it never asks for itself
-        Assert.Equal(2, t.Slot("Ann", false));
-        Assert.Equal(3, t.Slot("Bob", false));
-        Assert.Equal(4, t.Slot("Cy", false));
-        Assert.Equal(0, t.Slot("Di", false));   // red stays the host's
+        var host = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob").AssignGuest("Cy");
+        Assert.Equal(2, host.FindSlot("Ann", false));
+        Assert.Equal(3, host.FindSlot("Bob", false));
+        Assert.Equal(4, host.FindSlot("Cy", false));
+        Assert.Equal(0, host.FindSlot("Di", false));
     }
 
     [Fact]
-    public void Four_synthetic_peers_get_four_colours_and_a_reset_forgets_them()
+    public void Four_synthetic_peers_get_four_colours_and_a_new_session_starts_empty()
     {
-        var t = new Wo171Rules.SlotTable();
-        int[] got = { t.Slot("H", true), t.Slot("P2", false), t.Slot("P3", false), t.Slot("P4", false) };
+        var host = new Wo171Rules.SlotTable().AssignGuest("P2").AssignGuest("P3").AssignGuest("P4");
+        var got = new[] { "H", "P2", "P3", "P4" }.Select(name => host.FindSlot(name, name == "H")!.Value).ToArray();
         Assert.Equal(new[] { 1, 2, 3, 4 }, got);
         Assert.Equal(new[] { "red", "purple", "blue", "green" }, got.Select(s => Wo171Rules.ColourNames[s - 1]));
-        t.Reset();
-        Assert.Equal(0, t.Count);
-        Assert.Equal(2, t.Slot("P3", false));
+        var newSession = new Wo171Rules.SlotTable();
+        Assert.Equal(0, newSession.GuestCount);
+        Assert.Null(newSession.FindSlot("P2", false));
+        Assert.Equal(2, newSession.AssignGuest("P3").FindSlot("P3", false));
+    }
+
+    [Fact]
+    public void Three_synthetic_peers_keep_the_same_slots_in_different_visibility_orders()
+    {
+        string[] viewA = ["Host", "Ann", "Bob"];
+        string[] viewB = ["Bob", "Host", "Ann"];
+        var expected = new Dictionary<string, int> { ["Host"] = 1, ["Ann"] = 2, ["Bob"] = 3 };
+        var host = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob");
+        Assert.True(Wo171Rules.SlotTable.TryRead(host.ToWire(), out var observerA));
+        Assert.True(Wo171Rules.SlotTable.TryRead(host.ToWire(), out var observerB));
+
+        static int OldFirstSightSlot(string identity, string[] order) =>
+            Array.IndexOf(order.Where(name => name != "Host").ToArray(), identity) + 2;
+
+        Assert.Equal(3, OldFirstSightSlot("Bob", viewA));
+        Assert.Equal(2, OldFirstSightSlot("Bob", viewB));
+        Assert.Equal(2, OldFirstSightSlot("Ann", viewA));
+        Assert.Equal(3, OldFirstSightSlot("Ann", viewB));
+
+        int mismatches = 0;
+        foreach (var (observer, slots, order) in new[] { ("A", observerA, viewA), ("B", observerB, viewB) })
+        {
+            foreach (string name in order)
+            {
+                var slot = slots.FindSlot(name, name == "Host");
+                if (slot != expected[name]) mismatches++;
+                Assert.Equal(expected[name], slot);
+                string colour = Wo171Rules.ColourNames[slot!.Value - 1];
+                int picture = Wo171Rules.CodeFor(Wo171Rules.Style.Rotating, slot.Value, 0, 0);
+                output.WriteLine($"synthetic observer={observer} name={name} slot={slot} colour={colour} picture={Wo171Rules.PictureName(picture)}");
+            }
+        }
+        output.WriteLine($"synthetic marker_slot_mismatch={mismatches}");
+        Assert.Equal(0, mismatches);
+    }
+
+    [Fact]
+    public void Slot_snapshot_preserves_names_and_reports_pending_guests()
+    {
+        const string name = "Änne | 🔥";
+        var host = new Wo171Rules.SlotTable().AssignGuest(name);
+        string wire = host.ToWire();
+        Assert.True(Wo171Rules.SlotTable.TryRead(wire, out var observer));
+        Assert.Equal(1, observer.GuestCount);
+        Assert.Equal(wire, observer.ToWire());
+        Assert.Equal(1, observer.FindSlot(null, true));
+        Assert.Equal(2, observer.FindSlot(name, false));
+        Assert.Null(observer.FindSlot("Bob", false));
+        Assert.Null(observer.FindSlot(null, false));
+    }
+
+    [Theory]
+    [InlineData("marker-slots-v2|QW5u||")]
+    [InlineData("marker-slots-v1|QW5u|")]
+    [InlineData("marker-slots-v1|QW5u|||")]
+    [InlineData("marker-slots-v1|QW5u||Qm9i")]
+    [InlineData("marker-slots-v1|QW5u|QW5u|")]
+    [InlineData("marker-slots-v1|~||")]
+    [InlineData("marker-slots-v1|wK8=||")]
+    public void Invalid_slot_snapshots_are_rejected(string wire)
+    {
+        Assert.False(Wo171Rules.SlotTable.TryRead(wire, out _));
     }
 
     // ------------------------------------------------------------------ the facing
