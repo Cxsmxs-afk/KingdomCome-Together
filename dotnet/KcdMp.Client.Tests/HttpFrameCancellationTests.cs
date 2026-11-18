@@ -255,14 +255,14 @@ public class HttpFrameCancellationTests
         await using var transport = Transport(game);
         transport.RecoveryIntervalMs = 200;
         var holdEntered = Signal();
-        var releaseHold = Signal();
+        using var releaseHold = new ManualResetEventSlim();
         var release = Signal();
         var frameEnded = Signal();
         var clock = new ManualFrameTime();
         transport.NowMs = () =>
         {
             // EnterHold sets Held before reading the clock and launching recovery.
-            if (transport.Held && holdEntered.TrySetResult() && !releaseHold.Task.Wait(FrameTestWatchdog))
+            if (transport.Held && holdEntered.TrySetResult() && !releaseHold.Wait(FrameTestWatchdog))
                 throw new TimeoutException("The test did not release the transport hold");
             return Environment.TickCount64;
         };
@@ -284,7 +284,7 @@ public class HttpFrameCancellationTests
             Assert.True(transport.Held);
             clock.Expire();
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(FrameTestWatchdog)).Status);
-            releaseHold.SetResult();
+            releaseHold.Set();
             release.SetResult();
             await probeEntered.Task.WaitAsync(FrameTestWatchdog);
             using var deadline = new CancellationTokenSource(FrameTestWatchdog);
@@ -302,7 +302,7 @@ public class HttpFrameCancellationTests
         finally
         {
             clock.Expire();
-            releaseHold.TrySetResult();
+            releaseHold.Set();
             release.TrySetResult();
             // A frame already in EnterHold must finish launching recovery before transport disposal.
             if (holdEntered.Task.IsCompleted)
