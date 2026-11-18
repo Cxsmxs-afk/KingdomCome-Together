@@ -68,6 +68,17 @@ const char* swing_result_name(SwingResult r);
 /// fails to resolve; a visually inert success (weapon sheathed) still
 /// returns Ok, matching WO-45's live observation.
 SwingResult ghost_swing(uint32_t entityId, const char* fragSpec, uint64_t timelineToken = 0, bool* watching = nullptr);
+struct CombatRow {
+    void* actor = nullptr;
+    void* actorClass = nullptr;
+    uint32_t fragment = 0;
+    uint8_t tags[20]{};
+};
+// Typed combat prepares the verified descriptor on the bulk lane. Realtime
+// uses only this numeric record and the checked actor action queue.
+SwingResult prepare_ghost_row(uint32_t entityId, const char* fragSpec, CombatRow* row);
+bool combat_row_current(uint32_t entityId, const CombatRow& row);
+SwingResult queue_ghost_row(uint32_t entityId, const CombatRow& row, uint64_t token, bool* watching);
 
 // Reserve the body before entering an engine request that can animate its root.
 // The existing native pose hold outlives the call; the caller records acceptance.

@@ -223,13 +223,13 @@ public partial class GameBridge
     // =====================================================================
 
     /// <summary>Every inbound vitals sample: the downed bit's edges are the peer's down and (knockdown) wake.</summary>
-    private void Wo132OnPeerVitals(byte ghost, float health, byte flags)
+    private void Wo132OnPeerVitals(byte ghost, float health, byte flags, PresentationFrame presentation)
     {
         bool down = (flags & Protocol.PlayerStateFlagUnconscious) != 0;
         bool was = _w132PeerFlags.TryGetValue(ghost, out byte f0) && (f0 & Protocol.PlayerStateFlagUnconscious) != 0;
         _w132PeerFlags[ghost] = flags;
         // WO-154 2: a knockdown is shown lying where he fell (the avatar falls on the Downed bit); only a death hides it
-        Wo197OnPeerVitals(ghost, flags);   // WO-197 B4: the engine-knockout bit's edges (his figure falls and stands up the game's way)
+        Wo197OnPeerVitals(ghost, flags, presentation);   // WO-197 B4: the engine-knockout bit's edges
         bool knockedDown = (flags & Protocol.PlayerStateFlagKnockedDown) != 0;
         bool wasKnocked = (f0 & Protocol.PlayerStateFlagKnockedDown) != 0;
         // WO-155: a death lays the figure down where it stands (the lying body is the proof of the death); nothing

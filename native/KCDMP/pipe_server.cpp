@@ -11,6 +11,7 @@
 #include "local_state.h"
 #include "npc_scan.h"
 #include "main_thread.h"
+#include "engine.h"
 #include "rttr_abi.h"
 #include "combat_swing.h"
 #include "lua_closure.h"
@@ -58,6 +59,7 @@
 #include "instance.h"
 #include "wo206.h"
 #include "wo218_rules.h"
+#include "wo221.h"
 #include "log.h"
 
 #include <windows.h>
@@ -464,10 +466,12 @@ bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) 
                            (request.frame.body[0] == wo216::kOpLifecycle ||
                             request.frame.body[0] == pipecontrol::kEdgeCapabilities);
     const bool latest = nested == kSetPartner || nested == kReadBodyState || nested == kReadLocalState;
-    const bool presentation = nested == kTimedAction || nested == kTimedPose || nested == kTimelineConfig || nested == kRemoteRelocation;
-    if (lifecycle || (nested > kPinLabel && nested != kRawPose && nested != kProbe && !presentation) ||
+    const bool presentation = nested == kTimedAction || nested == kTimedPose || nested == kTimelineConfig ||
+                              nested == kRemoteRelocation || nested == kCombatEvent;
+    const bool bulk = nested == kProbe || nested == kCombatRow;
+    if (lifecycle || (nested > kPinLabel && nested != kRawPose && !bulk && !presentation) ||
         (request.lane == Lane::Latest && !latest) ||
-        ((nested == kRawPose || presentation) && request.lane != Lane::Realtime) || (nested == kProbe && request.lane != Lane::Bulk))
+        ((nested == kRawPose || presentation) && request.lane != Lane::Realtime) || (bulk && request.lane != Lane::Bulk))
         return reject(Status::Unsupported);
     if (nested != kRawPose && !pipecontrol::complete_payload_allowed(request.frame))
         return reject(Status::Invalid);
@@ -1417,6 +1421,15 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 rttr::SwingResult res = rttr::SwingResult::Ok;
                 const bool ran = run_sync_bounded<rttr::SwingResult>(
                     [entityId, spec, renderStamp](rttr::SwingResult& result) {
+                        if (wo221::on(wo221::kBitRemoteCombat)) {
+                            void* entity = engine::entity_by_id(entityId);
+                            const char* name = entity ? engine::entity_name(entity) : nullptr;
+                            uint8_t peer = 0;
+                            if (name && rpmeasure::partner_id(name, peer)) {
+                                result = rttr::SwingResult::OwnerOwns;
+                                return;
+                            }
+                        }
                         if (kcdmp::wo209::row_attack(entityId, spec.c_str())) { result = rttr::SwingResult::Ok; return; }   // WO-209 B: the copy's own attack
                         // WO-216 F.4 / G: the owner plays the host's row on its copy (never "owner-owns"): poses for a fight with a player,
                         // npc_fights for a fight among the host's NPCs; reaction rows keep WO-214's own path below
@@ -1703,6 +1716,15 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 const auto r = t_edgeReply ? timelineactions::submit(body, len,
                     {incoming.readerObservation, generation + 1, incoming.readerLife}, incoming.readerTick) : timelineactions::Invalid;
                 send_result(h, r == timelineactions::Accepted, seq, static_cast<uint8_t>(r));
+                break;
+            }
+            case edgelanes::kCombatRow:
+            case edgelanes::kCombatEvent: {
+                const timelineactions::Scope scope{incoming.readerObservation, generation + 1, incoming.readerLife};
+                const auto result = !t_edgeReply ? timelineactions::Invalid :
+                    (type == edgelanes::kCombatRow ? timelineactions::register_combat(body, len, scope) :
+                                                   timelineactions::submit_combat(body, len, scope, incoming.readerTick));
+                send_result(h, result == timelineactions::Accepted, seq, static_cast<uint8_t>(result));
                 break;
             }
             case edgelanes::kRemoteRelocation: {

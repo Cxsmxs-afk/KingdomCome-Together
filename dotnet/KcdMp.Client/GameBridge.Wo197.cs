@@ -167,7 +167,7 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- B1: in
 
-    private async Task Wo197OnRecoilInAsync(InboundAction a, ActionRowCatalog? catalog, CancellationToken ct)
+    private async Task Wo197OnRecoilInAsync(InboundAction a, ActionRowCatalog? catalog, PresentationFrame presentation, CancellationToken ct)
     {
         if (!RowEvent.TryFromBytes(a.Payload, out var re)) return;
         Interlocked.Increment(ref _w197RecoilIn);
@@ -187,6 +187,7 @@ public partial class GameBridge
             if (fr is null) { Interlocked.Increment(ref _w197RecoilNoRow); Console.WriteLine($"{head} swing=\"{last.Row.Spec}\" dispatch=none (no recoil row for this weapon: blunt and unarmed blows run on)"); return; }
             row = fr.Value; how = "picked for his swing's weapon";
         }
+        if (await TrySchedulePresentationRowAsync(a, feid, row, re.Flags, presentation, ct)) return;
         _ = _combat.NpcHoldAsync("kcd2mp_" + gid, 900, ct);
         var r = await _combat.GhostSwingForResultAsync(feid, row.Spec, ct);
         if (r.Ok) Interlocked.Increment(ref _w197RecoilPlayed);
@@ -328,17 +329,23 @@ public partial class GameBridge
         _w197Knockout && Wo197Rules.EngineKnockout(isUnconscious, _localDowned) ? Protocol.PlayerStateFlagEngineKnockout : (byte)0;
 
     /// <summary>Every inbound vitals sample (Wo132OnPeerVitals): the engine-knockout bit's edges.</summary>
-    private void Wo197OnPeerVitals(byte ghost, byte flags)
+    private void Wo197OnPeerVitals(byte ghost, byte flags, PresentationFrame presentation)
     {
         byte was = _w197PeerFlags.TryGetValue(ghost, out byte f0) ? f0 : (byte)0;
         _w197PeerFlags[ghost] = flags;
         var edge = Wo197Rules.KnockoutEdge(was, flags);
-        if (edge == Wo197Rules.KnockEdge.None) return;
-        if (!_w197Knockout) { Console.WriteLine($"MP-W197 peer {ghost} knockout {(edge == Wo197Rules.KnockEdge.Down ? "down" : "up")} -- mp_anim_knockout off: his figure stays as it is"); return; }
+        if (edge == Wo197Rules.KnockEdge.None)
+        {
+            if ((flags & Protocol.PlayerStateFlagEngineKnockout) == 0 && presentation.HostAtArrivalMs != 0 && PresentationWakePending(ghost))
+                _ = PresentKnockoutAsync(ghost, false, presentation, retryWake: true);
+            return;
+        }
+        if (!_w197Knockout && (edge == Wo197Rules.KnockEdge.Down || !_presentationKnockouts.ContainsKey(ghost)))
+        { Console.WriteLine($"MP-W197 peer {ghost} knockout {(edge == Wo197Rules.KnockEdge.Down ? "down" : "up")} -- mp_anim_knockout off: his figure stays as it is"); return; }
         bool down = edge == Wo197Rules.KnockEdge.Down;
         if (down) Interlocked.Increment(ref _w197KnockDown); else Interlocked.Increment(ref _w197KnockUp);
         Console.WriteLine($"MP-W197 peer {ghost} {(down ? "KNOCKED OUT in his world -> his figure falls with the game's own unconsciousness" : "woke -> his figure stands up the game's way")}");
-        _ = Wo201FigureKnockoutAsync(ghost, down);
+        _ = PresentKnockoutAsync(ghost, down, presentation);
     }
 
     /// <summary>WO-201 V.4: the figure goes down and gets up the engine's own way -- the guard swapped by the DLL (its upr=1 killed the

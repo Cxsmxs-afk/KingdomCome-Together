@@ -10,9 +10,12 @@
 #include "wo170_rules.h"
 #include "wo174_rules.h"
 #include "wo176.h"
+#include "visual_damage_rules.h"
+#include "wo210_hit.h"
 #include "fault_guard.h"
 
 #include <windows.h>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -51,6 +54,7 @@ constexpr size_t kSitRelation = 0x08;
 constexpr size_t kActorGetSoul = 0x6E0;
 constexpr size_t kSoulCombat  = 0x108;   // C_CombatSoul from the actor's soul (WO-119 s2.1, observed)
 constexpr double kEngagementS = 30.0;    // one skirmish add per (victim, avatar) per this
+constexpr size_t kVisualFigures = 16;
 
 template <class T> bool rd(const void* base, size_t off, T* out) {
     KCDMP_FAULT_READ(site, "hits::rd");
@@ -125,6 +129,20 @@ void* avatar_soul(uint32_t eid) {
     return nullptr;
 }
 
+// Keep a figure's damage fence past a transform unbind. A mount/respawn or
+// other presentation handover can release the writer while its action still
+// exists. This table retires the exact physical actor when its entity is gone.
+struct VisualBody {
+    visualdamage::Identity id;
+    void* entity = nullptr;
+    void* combatSoul = nullptr;
+    bool bypassedMeleeGate = false;
+};
+std::mutex g_visualMu;
+std::array<VisualBody, kVisualFigures> g_visualBodies{};
+std::atomic<unsigned> g_visualCount{0};
+std::atomic<uint64_t> c_visualBlocked{0}, c_visualEscape{0};
+
 // ---- the hook's queue (any thread -> main thread) -----------------------------------
 struct PvpHit { uint32_t victimEid; float st, hp; uint8_t flags, material; };
 struct PlayerHitMark { uint32_t victimEid; double at; bool invalidate=false; };
@@ -181,11 +199,15 @@ std::vector<uint32_t> g_cancelFigure;      // victims another hit landed on: the
 std::atomic<uint32_t> g_figureWatchesOpen{0};
 std::atomic<uint32_t> c_figSeen{0}, c_figRelayed{0}, c_figDropped{0}, c_figPutBack{0}, c_figFatal{0}, c_figCancelled{0}, c_figUnread{0}, c_figMissile{0};
 
-// WO-165: the replay window (main thread opens and closes it around its own call; the hook runs on the same thread inside it).
-struct ReplayWindow { uint32_t attacker = 0, victim = 0, seq = 0; void* victimSoul = nullptr; bool victimIsPlayer = false; DWORD tid = 0; };
-ReplayWindow g_replay;                 // main thread only (the hook reads it only on the opening thread)
-std::atomic<bool> g_replayOpen{false};
-ReplayCapture g_replayCap;
+// WO-165: only the thread that opens the existing authority-selected replay
+// may use its exact actor/victim permit. Other engine jobs see an empty window.
+struct ReplayWindow {
+    visualdamage::ReplayPermit permit;
+    uint32_t seq = 0;
+    void* victimSoul = nullptr;
+};
+thread_local ReplayWindow t_replay;
+thread_local ReplayCapture t_replayCap;
 std::atomic<ReplayDmgFn> g_replayDmgFn{nullptr};
 std::atomic<uint32_t> c_replaySeen{0};
 
@@ -222,34 +244,49 @@ void* hit_common(bool missile, HitFn orig, void* self, void* out, const uint8_t*
     // the discard (WO-162 Q1.3 #9: a replay from an engaged copy would be put back) and from every other branch: the record the engine
     // built is copied (the probe's reads: block +0x54/+0x55, perfect +0x56, broken +0x57, zone mismatch +0x61), the victim is watched
     // to MEASURE the damage the engine applies, and the original runs (never skipped: Q1.3).
-    if (!missile && g_replayOpen.load(std::memory_order_relaxed) && GetCurrentThreadId() == g_replay.tid && aeid == g_replay.attacker &&
-        veid == g_replay.victim) {
+    if (!missile && t_replay.permit.combat && aeid == t_replay.permit.attacker && veid == t_replay.permit.victim) {
         c_replaySeen.fetch_add(1, std::memory_order_relaxed);
-        g_replayCap.seen = true; g_replayCap.self = self;
+        t_replayCap.seen = true; t_replayCap.self = self;
         KCDMP_FAULT_READ(cpSite, "hits::replay_copy");
-        fault::guarded(cpSite, [&] { std::memcpy(g_replayCap.rec, data, sizeof g_replayCap.rec); });
-        void* vs = g_replay.victimSoul;
+        fault::guarded(cpSite, [&] { std::memcpy(t_replayCap.rec, data, sizeof t_replayCap.rec); });
+        void* vs = t_replay.victimSoul;
         float hp0 = 0, st0 = 0;
         const bool r0 = vs && rttr::soul_state(vs, "health", &hp0) && rttr::soul_state(vs, "stamina", &st0);
         void* res = orig(self, out, data);
         if (r0) {
             std::lock_guard<std::mutex> lock(g_qMutex);
-            g_newWatches.push_back({vs, veid, hp0, st0, 0, mat, static_cast<uint8_t>(kWatchReplay), g_replay.seq});
+            g_newWatches.push_back({vs, veid, hp0, st0, 0, mat, static_cast<uint8_t>(kWatchReplay), t_replay.seq});
             // WO-173: a put-back watch of a dropped figure blow on this victim must not undo the engine's own blow
             if (g_figureWatchesOpen.load(std::memory_order_relaxed) > 0 && g_cancelFigure.size() < 64) g_cancelFigure.push_back(veid);
         }
         return res;
     }
+    bool protectedVisual = false;
+    if (aeid && self && wo210hit::visual_gate_ready() && g_visualCount.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_visualMu);
+        for (auto& body : g_visualBodies) {
+            if (body.id.eid != aeid || body.combatSoul != self) continue;
+            protectedVisual = true;
+            if (!missile) body.bypassedMeleeGate = true;
+            break;
+        }
+    }
+    if (protectedVisual) {
+        const uint64_t n = c_visualEscape.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 10 || n % 50 == 0)
+            logf("MP-RP-DAMAGE escaped_cause attacker=0x%X victim=0x%X missile=%d application=unconfirmed n=%llu",
+                 aeid, veid, missile ? 1 : 0, static_cast<unsigned long long>(n));
+    }
     // WO-170 F1: a blow of a partner's figure. The figure only ever does what its partner does: a blow that no relayed swing of his
     // matches is the figure's own (its brain, an animation's collision) and is measured and put back like the avatar's own hits above --
     // never skipped (the engine's call wants a cause back). P6: remote-figure missiles have no relayed shooting authority;
     // use the existing measured put-back watch, never the melee ledger or a synthetic cause.
-    if (p6rules::figure_guard(missile,g_figureGuard.load(std::memory_order_relaxed)) && aeid && avatar_soul(aeid) && veid != aeid) {
+    if ((protectedVisual || (p6rules::figure_guard(missile,g_figureGuard.load(std::memory_order_relaxed)) && aeid && avatar_soul(aeid))) && veid != aeid) {
         c_figSeen.fetch_add(1, std::memory_order_relaxed);
         {
             if(missile)c_figMissile.fetch_add(1,std::memory_order_relaxed);
             bool ledgerMatch=false;
-            if(!missile){std::lock_guard<std::mutex> lock(g_qMutex);ledgerMatch=g_ledger.take(aeid,now_s())==wo170rules::Verdict::Relayed;}
+            if(!missile && !protectedVisual){std::lock_guard<std::mutex> lock(g_qMutex);ledgerMatch=g_ledger.take(aeid,now_s())==wo170rules::Verdict::Relayed;}
             if (p6rules::figure_relayed(missile,ledgerMatch)) {
                 const uint32_t n = c_figRelayed.fetch_add(1, std::memory_order_relaxed);
                 if (n < 20 || (n % 50) == 0) logf("WO170-FIGUREHIT relayed by=0x%X victim=0x%X -- matches a swing the partner sent: applied [n=%u]", aeid, veid, n + 1);
@@ -407,6 +444,45 @@ void* soul_of_actor(void* actor) {
     return fn && call_p0(fn, actor, &soul) ? soul : nullptr;
 }
 
+void remember_visual(uint32_t eid, void* soul) {
+    void* entity = engine::entity_by_id(eid);
+    void* actor = motion::actor_of(eid);
+    if (!entity || !actor || !soul || soul_of_actor(actor) != soul) return;
+    void* combatSoul = static_cast<char*>(soul) + kSoulCombat;
+    if (!is_a(combatSoul, g_vftCombatSoul)) combatSoul = nullptr;
+    const visualdamage::Identity id{eid, actor};
+    std::lock_guard<std::mutex> lock(g_visualMu);
+    VisualBody* empty = nullptr;
+    for (auto& body : g_visualBodies) {
+        if (visualdamage::same(body.id, id) && body.entity == entity) {
+            body.combatSoul = combatSoul;
+            return;
+        }
+        if (!body.entity && !empty) empty = &body;
+    }
+    if (empty) {
+        *empty = {id, entity, combatSoul, false};
+        g_visualCount.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void retire_missing_figures() {
+    std::array<VisualBody, kVisualFigures> bodies;
+    {
+        std::lock_guard<std::mutex> lock(g_visualMu);
+        bodies = g_visualBodies;
+    }
+    for (const auto& known : bodies) {
+        if (!known.entity || engine::entity_by_id(known.id.eid) == known.entity) continue;
+        std::lock_guard<std::mutex> lock(g_visualMu);
+        for (auto& body : g_visualBodies) {
+            if (body.entity != known.entity || !visualdamage::same(body.id, known.id)) continue;
+            body = {};
+            g_visualCount.fetch_sub(1, std::memory_order_release);
+        }
+    }
+}
+
 struct FindName { const char* name; uint32_t eid; };
 bool find_name_visit(void* e, void* ctx) {
     auto* f = static_cast<FindName*>(ctx);
@@ -538,11 +614,68 @@ bool avatar_known(uint32_t eid){return avatar_soul(eid)!=nullptr;}
 void note_avatar(uint32_t eid, void* soul, bool on) {
     if (!on) { std::lock_guard<std::mutex> lock(g_qMutex); g_ledger.forget(eid); }   // WO-170: a released body's swings are not licences
     if (on) {
+        remember_visual(eid, soul);
         for (auto& a : g_avatars) if (a.eid.load() == eid) { a.soul = soul; return; }
         for (auto& a : g_avatars) if (a.eid.load() == 0) { a.soul = soul; a.eid = eid; return; }
     } else {
         for (auto& a : g_avatars) if (a.eid.load() == eid) { a.eid = 0; a.soul = nullptr; }
     }
+}
+
+bool visual_damage_ready(uint32_t figureEid) {
+    if (!wo210hit::visual_gate_ready() || !g_hookArmed.load(std::memory_order_acquire)) return false;
+    void* soul = avatar_soul(figureEid);
+    void* actor = soul ? motion::actor_of(figureEid) : nullptr;
+    void* entity = actor ? engine::entity_by_id(figureEid) : nullptr;
+    if (!entity || soul_of_actor(actor) != soul) return false;
+    bool currentFigure = false;
+    {
+        std::lock_guard<std::mutex> lock(g_visualMu);
+        for (const auto& body : g_visualBodies) {
+            if (body.entity != entity || !visualdamage::same(body.id, {figureEid, actor})) continue;
+            currentFigure = body.combatSoul && !body.bypassedMeleeGate;
+            break;
+        }
+    }
+    if (!currentFigure) return false;
+
+    // The same actor's combat component can be recreated by the engine after
+    // streaming. Provision it only once the exact registered figure is known.
+    void* combat = nullptr;
+    void* model = nullptr;
+    uint32_t verifiedEid = 0;
+    void* verifiedActor = nullptr;
+    return motion::combat_parts(figureEid, true, &combat, &model) &&
+           motion::combat_actor_identity(combat, &verifiedEid, &verifiedActor) &&
+           visualdamage::same({figureEid, actor}, {verifiedEid, verifiedActor});
+}
+
+bool filter_visual_contact(void* attackerCombat, uint32_t victimEid) {
+    if (!g_visualCount.load(std::memory_order_acquire)) return false;
+    visualdamage::Identity current;
+    void* actor = nullptr;
+    if (!motion::combat_actor_identity(attackerCombat, &current.eid, &actor)) return false;
+    current.actor = actor;
+    auto decision = visualdamage::Contact::Ordinary;
+    {
+        std::lock_guard<std::mutex> lock(g_visualMu);
+        for (const auto& body : g_visualBodies) {
+            decision = visualdamage::decide(body.id, current, victimEid, attackerCombat, t_replay.permit);
+            if (decision != visualdamage::Contact::Ordinary) break;
+        }
+    }
+    if (decision != visualdamage::Contact::Suppressed) return false;
+    const uint64_t n = c_visualBlocked.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 20 || n % 100 == 0)
+        logf("MP-RP-DAMAGE blocked attacker=0x%X victim=0x%X before_cause=1 n=%llu", current.eid, victimEid, static_cast<unsigned long long>(n));
+    return true;
+}
+
+VisualDamageStats visual_damage_stats() {
+    // The lower-level slot queues a cause. It has no event-bound damage
+    // receipt. Escaped causes therefore remain unconfirmed rather than
+    // describing every nearby health delta as a second application.
+    return {c_visualBlocked.load(std::memory_order_relaxed), 0, c_visualEscape.load(std::memory_order_relaxed)};
 }
 
 AttribResult apply_attributed(const uint8_t* body, size_t len) { return apply_attributed_ex(body, len, true, -1.0f, true); }
@@ -807,16 +940,14 @@ void note_applied_damage(uint32_t victimEid, float stamina, float health) {
     for (auto& w : g_watches) if (w.kind == kWatchFigure && w.eid == victimEid) { w.hp0 -= health; w.st0 -= stamina; }
 }
 
-void replay_begin(uint32_t attackerEid, uint32_t victimEid, uint32_t seq, void* victimSoul, bool victimIsPlayer) {
-    g_replay = ReplayWindow{attackerEid, victimEid, seq, victimSoul, victimIsPlayer, GetCurrentThreadId()};
-    g_replayCap = ReplayCapture{};
-    g_replayOpen.store(true, std::memory_order_relaxed);
+void replay_begin(uint32_t attackerEid, uint32_t victimEid, uint32_t seq, void* attackerCombat, void* victimSoul, bool) {
+    t_replay = {{attackerEid, victimEid, attackerCombat, false}, seq, victimSoul};
+    t_replayCap = {};
 }
 
 void replay_end(ReplayCapture* out) {
-    g_replayOpen.store(false, std::memory_order_relaxed);
-    if (out) *out = g_replayCap;
-    g_replay = ReplayWindow{};
+    if (out) *out = t_replayCap;
+    t_replay = {};
 }
 
 void set_replay_damage_callback(ReplayDmgFn fn) { g_replayDmgFn.store(fn); }
@@ -842,6 +973,7 @@ void tick() {
     if (now - s_lastWuid > 1.0) {
         s_lastWuid = now;
         if (void* e = engine::entity_by_id(0x7777)) { g_playerWuid = actions::entity_wuid(e); g_playerEid = engine::entity_id(e); }
+        retire_missing_figures();
     }
     std::vector<PvpHit> pvp;
     std::vector<PlayerHitMark> marks;

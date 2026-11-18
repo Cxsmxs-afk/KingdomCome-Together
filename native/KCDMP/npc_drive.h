@@ -159,6 +159,7 @@ bool   entity_pos(void* e, float out[3]);          // world translation, SEH-gua
 float  entity_yaw(void* e);                        // WO-155: the body's yaw (atan2 of the world matrix's x axis); forward = (-sin, cos)
 void*  entity_by_name(const char* name);           // one full walk; null when absent
 bool   living_flying(void* e, int* flying);        // pe_status_living.bFlying, when readable
+bool   unparented_body(uint32_t eid);                // verified CEntity, current entity parent read
 
 // WO-127 (leash recorder), main thread, read-only.
 struct PhysicsStatus {

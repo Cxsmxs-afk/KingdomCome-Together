@@ -65,6 +65,7 @@ public static class VerdictRules
     public const long TimelineSkewGreenBelowMs = 20, TimelineSkewYellowBelowMs = 50;
     public const long ControllerStepMinPermille = 900, ControllerStepMaxPermille = 1100;
     public const long ControllerPullsGreenBelowPermille = 200;
+    public const int CombatPlaybackGreenPercent = 95;
 
     private const string T3 = "MP-T3-STATS";
     private const string W136 = "MP-WO136-STATS";
@@ -117,7 +118,8 @@ public static class VerdictRules
             RequiresHostActivity: "ranged_missile_measured_accept"),
         new("proc_awaits_per_frame_max", VerdictStatus.Red, RequiresActivity: "edge_proc_n"),
         new("http_calls_rt", VerdictStatus.Red, RequiresActivity: "edge_rt_n"),
-        new("rp_hard_tp_unsafe", VerdictStatus.Red, RequiresActivity: "rp_ctrl_frames")
+        new("rp_hard_tp_unsafe", VerdictStatus.Red, RequiresActivity: "rp_ctrl_frames"),
+        new("dmg_double", VerdictStatus.Red, RequiresActivity: "dmg_double_blocked", Unreadable: "dmg_double_unconfirmed")
     ];
 
     private sealed record PresentationRule(string Id, string Coverage, string Unit = "", string? AlternateCoverage = null,
@@ -162,7 +164,11 @@ public static class VerdictRules
         new("rp_hard_tp_by_join", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
         new("rp_hard_tp_by_respawn", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
         new("rp_hard_tp_by_travel", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
-        new("rp_pulls_per_min", "rp_pull_observed_ms", " / min")
+        new("rp_pulls_per_min", "rp_pull_observed_ms", " / min"),
+        new("rp_actions_in", "rp_actions_in"),
+        new("dmg_double_blocked", "dmg_double_blocked"),
+        new("dmg_double_unconfirmed", "dmg_double_blocked", ReportNonZeroWithoutCoverage: true),
+        new("rp_ko_up_lag_ms_p95", "rp_ko_up_n", " ms")
     ];
 
     private sealed record Sample(string Marker, string Role, string Origin, Dictionary<string, string> Fields)
@@ -181,6 +187,7 @@ public static class VerdictRules
         var rows = new List<VerdictRow> { queue };
         rows.AddRange(Counters.Select(rule => Evaluate(rule, samples)));
         rows.AddRange(PresentationCounters.Select(rule => EvaluatePresentation(rule, samples)));
+        rows.Add(ActionPlayback(samples));
         rows.Add(BotPlan(input));
 
         // Traffic observable on this machine is required for green. Optional
@@ -271,27 +278,32 @@ public static class VerdictRules
         if (value > rule.Limit) return new(rule.Id, rule.AboveLimit, measurement, evidence);
 
         if (rule.Unreadable is { } unreadable && observations.Any(observation => observation.Sample.Number(unreadable) != 0))
-            return new(rule.Id, VerdictStatus.Grey, measurement, $"Lesbarkeit offen, {unreadable}");
+            return new(rule.Id, VerdictStatus.Grey, measurement, rule.Id == "dmg_double"
+                ? $"Schadenswirkung ungeklärt, {unreadable}" : $"Lesbarkeit offen, {unreadable}");
         if (observations.All(observation => rule.ActivityFor(observation.Sample.Role) is { } activity
             && !(observation.Sample.Number(activity) > 0)))
             return new(rule.Id, VerdictStatus.Grey, measurement, $"Kein beobachteter Vorgang, {rule.ActivityFor(source.Role)}");
         if (rule.ZeroMeansMissing && value == 0) return Missing(rule.Id, "Keine aufgezeichnete Stichprobe");
 
+        if (rule.Id == "dmg_double") evidence += ", beobachtete Treffer vor der Schadensursache blockiert";
         return new(rule.Id, VerdictStatus.Green, measurement, evidence);
     }
 
     private static VerdictRow EvaluatePresentation(PresentationRule rule, IReadOnlyList<Sample> samples)
     {
+        const string confirmed = "rp_action_confirmed_n";
+        var useCombatLatency = rule.Id == "rp_action_lag_ms_p95" &&
+            samples.Any(sample => sample.Marker == T3 && sample.Fields.ContainsKey(confirmed));
         var observations = samples.Where(sample => sample.Marker == T3 ||
                 (rule.Id == "rp_step_ratio" && sample.Marker == StepPair) ||
                 (rule.Id == "owner_violations" && sample.Marker == OwnerViolation))
-            .Select(sample => (Sample: sample, Value: sample.Number(rule.Id), Count: rule.Count(sample)))
+            .Select(sample => (Sample: sample, Value: sample.Number(rule.Id), Count: useCombatLatency ? sample.Number(confirmed) : rule.Count(sample)))
             .Where(observation => observation.Value.HasValue && ((observation.Count > 0 &&
                 (rule.Coverage != "rp_owner_n" || HasOwnerCounters(observation.Sample)) &&
                 (rule.Id != "rp_pulls_per_min" || HasPullEvidence(observation.Sample, observation.Value.Value, observation.Count.GetValueOrDefault()))) ||
                 (rule.ReportNonZeroWithoutCoverage && observation.Value > 0))).ToList();
         if (observations.Count == 0)
-            return Missing(rule.Id, $"Keine belegte Stichprobe in {T3}, {rule.Coverage}");
+            return Missing(rule.Id, $"Keine belegte Stichprobe in {T3}, {(useCombatLatency ? confirmed : rule.Coverage)}");
 
         // A scope-matched skeleton comparison takes precedence over a raw
         // number from the status line, which carries no paired capture.
@@ -345,10 +357,29 @@ public static class VerdictRules
                 if (source.Marker == OwnerViolation) return new(rule.Id, VerdictStatus.Red, "≥1", evidence);
                 return new(rule.Id, value == 0 ? VerdictStatus.Green : VerdictStatus.Red, measurement, evidence);
             case "rp_action_lag_ms_p95":
-                return new(rule.Id, VerdictStatus.Grey, measurement, evidence + ", DLL-Empfang bis zur angenommenen Aktion, ohne Grenzwert");
+                return new(rule.Id, VerdictStatus.Grey, measurement, evidence + (useCombatLatency
+                    ? ", DLL-Empfang bis bestätigter Engine-Wiedergabe, ohne Grenzwert"
+                    : ", DLL-Empfang bis zur angenommenen Aktion, ohne Grenzwert"));
+            case "rp_ko_up_lag_ms_p95":
+                return new(rule.Id, VerdictStatus.Grey, measurement, evidence + ", DLL-Empfang bis bestätigtem KO-/Aufstehzustand, ohne Grenzwert");
             default:
                 return new(rule.Id, VerdictStatus.Grey, measurement, evidence + ", ohne Grenzwert");
         }
+    }
+
+    private static VerdictRow ActionPlayback(IReadOnlyList<Sample> samples)
+    {
+        const string id = "rp_actions_played";
+        var observations = samples.Where(sample => sample.Marker == T3 && sample.Number("rp_actions_pending") == 0)
+            .Select(sample => (Sample: sample, Received: sample.Number("rp_actions_in"), Played: sample.Number(id)))
+            .Where(x => x.Received > 0 && x.Played.HasValue && x.Played <= x.Received).ToList();
+        if (observations.Count == 0) return Missing(id, "Keine abgeschlossene Stichprobe bestätigter Engine-Aktionen");
+
+        var (source, received, played) = observations.MinBy(x => (decimal)x.Played.GetValueOrDefault() / x.Received.GetValueOrDefault());
+        decimal percent = played.GetValueOrDefault() * 100m / received.GetValueOrDefault();
+        string measurement = string.Create(CultureInfo.InvariantCulture, $"{played}/{received} ({percent:0.00} %)");
+        var status = percent >= CombatPlaybackGreenPercent ? VerdictStatus.Green : VerdictStatus.Yellow;
+        return new(id, status, measurement, $"{source.Marker}, {source.Origin}, bestätigte Engine-Wiedergabe");
     }
 
     private static bool HasOwnerCounters(Sample sample) => sample.Number("owner_handovers").HasValue

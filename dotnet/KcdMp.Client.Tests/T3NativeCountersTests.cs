@@ -203,4 +203,28 @@ public class T3NativeCountersTests
         page[2 + 13 * 9] = 12;
         Assert.False(T3NativeCounters.TryReadController(page, out _));
     }
+
+    [Fact]
+    public void Combat_page_keeps_native_confirmations_and_coverage_together()
+    {
+        byte[] page = Payload(10);
+        Assert.Equal(92, page.Length);
+        Assert.True(T3NativeCounters.TryReadCombat(page, out var values));
+        Assert.Equal(0, values["rp_actions_in"]);
+        Assert.Equal(1, values["rp_actions_played"]);
+        Assert.Equal(2, values["rp_actions_pending"]);
+        Assert.Equal(3, values["rp_action_lag_ms_p95"]);
+        Assert.Equal(4, values["rp_action_confirmed_n"]);
+        Assert.Equal(5, values["dmg_double_blocked"]);
+        Assert.Equal(6, values["dmg_double"]);
+        Assert.Equal(7, values["rp_ko_up_lag_ms_p95"]);
+        Assert.Equal(8, values["rp_ko_up_n"]);
+        Assert.Equal(9, values["dmg_double_unconfirmed"]);
+        Assert.False(T3NativeCounters.TryReadCombat(Payload(9), out _));
+        Assert.False(T3NativeCounters.TryReadCombat(Payload(55), out _));
+        Assert.False(T3NativeCounters.TryReadCombat(Payload(14), out _));
+        Assert.False(T3NativeCounters.TryReadController(page, out _));
+        page[2 + 9 * 9] = 8;
+        Assert.False(T3NativeCounters.TryReadCombat(page, out _));
+    }
 }

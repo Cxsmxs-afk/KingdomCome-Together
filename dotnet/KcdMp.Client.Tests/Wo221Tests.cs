@@ -59,7 +59,8 @@ public class Wo221Tests
         Assert.Equal(0b0101u, W221Switch.NativeBits(n => n is "combat_action_end" or "drive"));
         Assert.Equal(4, Array.IndexOf(W221Switch.NativeNames, "own_horse"));   // wo221.h kBitOwnHorse = 1 << 4
         Assert.Equal(1u << 6, W221Switch.NativeBits(n => n == "rp_controller"));
-        Assert.Equal(0x3Fu, W221Switch.NativeBits(n => n != "rp_controller"));
+        Assert.Equal(1u << 7, W221Switch.NativeBits(n => n == "rp_combat"));
+        Assert.Equal(0x3Fu, W221Switch.NativeBits(n => n is not ("rp_controller" or "rp_combat")));
         Assert.Contains("talk_force", W221Switch.AgentNames);
     }
 

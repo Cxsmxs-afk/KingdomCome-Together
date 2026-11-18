@@ -60,4 +60,9 @@ bool activity_locomotion(uint32_t eid);
 // the copy's owner holds the full body meanwhile.
 bool shot_in_flight(uint32_t eid);
 
+// S2-6: a typed P6 ranged presentation with a matching actual hand item.
+// Only the animation request runs on this body, without a shooting action.
+bool rp_ranged_available(uint32_t eid, const uint8_t itemClass[16]);
+bool rp_ranged(uint32_t eid, uint8_t weapon, uint8_t phase, const uint8_t itemClass[16], uint64_t token);
+
 } // namespace kcdmp::wo143

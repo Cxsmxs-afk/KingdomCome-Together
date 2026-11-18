@@ -12,12 +12,17 @@ static partial class P
         private readonly PresentationClockClient _clock = new();
         private readonly TaskCompletionSource<bool> _initial = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private bool _supported;
+        private bool _combat;
         private long _lastQuery = -PresentationClock.ProbeIntervalMs;
 
         public Task Initial => _initial.Task;
+        public bool SupportsCombat
+        {
+            get { lock (_sync) return _combat && _initial.Task.IsCompletedSuccessfully && _initial.Task.Result; }
+        }
 
         public Task NegotiateAsync(CancellationToken token) =>
-            Send(stream, Protocol.BuildLinkHelloUp(Protocol.LinkCapPresentationTime), token);
+            Send(stream, Protocol.BuildLinkHelloUp(Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat), token);
 
         public Task RefreshAsync(CancellationToken token)
         {
@@ -36,10 +41,15 @@ static partial class P
         {
             if (type == Protocol.LinkHelloDown)
             {
+                ushort caps = 0;
                 bool supported = payload.Length == Protocol.LinkHelloDownLen &&
-                    Protocol.TryParseLinkHello(payload, out byte version, out ushort caps, out _, out _) &&
+                    Protocol.TryParseLinkHello(payload, out byte version, out caps, out _, out _) &&
                     version == Protocol.LinkVersion && (caps & Protocol.LinkCapPresentationTime) != 0;
-                lock (_sync) _supported = supported;
+                lock (_sync)
+                {
+                    _supported = supported;
+                    _combat = supported && (caps & Protocol.LinkCapPresentationCombat) != 0;
+                }
                 if (supported) await RefreshAsync(token);
                 else if (_initial.TrySetResult(false))
                     Console.WriteLine("BOT-T4 role=joiner presentation_clock=legacy reason=relay");

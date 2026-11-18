@@ -80,14 +80,18 @@ public partial class GameBridge
         finally { _presentationConfigGate.Release(); }
     }
 
-    private bool PresentationReady(PresentationFrame stamp, out long connection)
+    private bool PresentationClockScopeCurrent(PresentationFrame stamp, out long connection)
     {
         connection = _combat.EdgeConnectionRevision;
-        return _presentationOn && stamp.SampleMs != 0 && stamp.HostAtArrivalMs != 0 && _combat.EdgeActive &&
-            stamp.Session is { } session && ReferenceEquals(Volatile.Read(ref _presentationSession), session) && session.IsEpoch(stamp.Epoch) &&
+        return stamp.SampleMs != 0 && stamp.HostAtArrivalMs != 0 && _combat.EdgeActive &&
+            stamp.Session is { } session && !session.Lifetime.IsCancellationRequested &&
+            ReferenceEquals(Volatile.Read(ref _presentationSession), session) && session.IsEpoch(stamp.Epoch);
+    }
+
+    private bool PresentationReady(PresentationFrame stamp, out long connection) =>
+        PresentationClockScopeCurrent(stamp, out connection) && _presentationOn &&
             Volatile.Read(ref _presentationNativeConfig) is { Enabled: true } config && config.Connection == connection &&
             config.Revision == Interlocked.Read(ref _presentationRevision);
-    }
 
     private async Task PresentationClockLoopAsync(PresentationSession session, CancellationToken ct)
     {
@@ -126,13 +130,13 @@ public partial class GameBridge
         if (changed) PresentationResetNative(ct);
         type = inner;
         payload = payload[offset..];
-        if (session.Clock.TryHostAt(localArrival, stamp.RelayToHostMs, out ulong projectedHost))
-            presentation = new PresentationFrame(session, stamp.Epoch, stamp.HostMs, projectedHost);
+        session.Clock.TryHostAt(localArrival, stamp.RelayToHostMs, out ulong projectedHost);
+        presentation = new PresentationFrame(session, stamp.Epoch, stamp.HostMs, projectedHost);
         return true;
     }
 
-    private async Task<bool> TrySchedulePresentationRowAsync(InboundAction action, uint eid, string spec,
-        PresentationFrame stamp, CancellationToken ct)
+    private async Task<bool> TryScheduleLegacyPresentationRowAsync(InboundAction action, uint eid, string spec,
+        PresentationFrame stamp, CancellationToken ct, Func<bool>? beforeWrite = null)
     {
         if (action.Phase != ActionPhase.Commit || action.Kind is not (ActionKind.Attack or ActionKind.BlockImpulse or ActionKind.Dodge) ||
             !PresentationReady(stamp, out long connection) || !NpcNativeBound("kcd2mp_" + action.SourceGhostId)) return false;
@@ -147,10 +151,10 @@ public partial class GameBridge
         body[16] = (byte)action.Phase;
         Encoding.UTF8.GetBytes(spec, body.AsSpan(17));
         var result = await _combat.EdgeRequestAsync(PresentationActionType, body, PresentationResult,
-            EdgeLane.Realtime, ct, connectionRevision: connection);
+            EdgeLane.Realtime, ct, connectionRevision: connection, beforeWrite: beforeWrite);
         if (result.Outcome is EdgeOutcome.Busy or EdgeOutcome.Unsupported or EdgeOutcome.Unavailable ||
             (result.Outcome == EdgeOutcome.Completed && result.Payload is [0, 0, 1]))
-            return !PresentationReady(stamp, out var current) || current != connection;
+            return !PresentationReady(stamp, out var current) || current != connection || !(beforeWrite?.Invoke() ?? true);
         bool accepted = result.Outcome == EdgeOutcome.Completed && result.Payload is [1, 0, 0];
         uint sourceMs = action.Payload.Length >= 4 ? BinaryPrimitives.ReadUInt32LittleEndian(action.Payload) : 0;
         string status = accepted ? "accepted" : result.Outcome == EdgeOutcome.Ambiguous ? "ambiguous" : "refused";

@@ -272,7 +272,7 @@ Result replay(const Request& rq) {
     if (ok) {
         uint8_t prevIntended = 0;
         const bool marked = (rq.flags & kFlagIntended) && wo173::mark_intended(aModel, true, &prevIntended);
-        hits::replay_begin(rq.attackerEid, veid, res.seq, vSoul, victimIsPlayer);
+        hits::replay_begin(rq.attackerEid, veid, res.seq, aCa, vSoul, victimIsPlayer);
         // WO-178: his own held block decides -- it faces the swing as the engine's "block in place" would (a copy's swing never puts
         // him there: live, block zone 2 vs the swing's zone 5 left a "blocked" blow at almost a hit's damage); put back after the call
         int32_t prevBz = 0;

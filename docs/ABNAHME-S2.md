@@ -174,3 +174,43 @@ Beide Szenarien und Varianten mit einem neuen `KCDMP_RIG_RUN` und einem frisch g
 3. Stehen, ducken, geduckt bewegen, aufstehen und eine Nahkampfwaffe ziehen. Am Empfänger Haltung und Waffe am selben Henry prüfen.
 4. Rollen tauschen und mit 150 ms zusätzlicher Relay-Latenz plus Jitter wiederholen. Bewegungsunterbrechungen und Wechsel auf den Writer im Log festhalten.
 5. Beide Bundles sammeln. Engine-Requests, Schrittverhältnis, Pulls und Teleport-Gründe prüfen. `owner_violations` bleibt null, harte Teleports haben einen erlaubten Grund.
+
+## s2-6 · Native Kampfaktionen des zweiten Henry
+
+`mp_rp_combat` steht standardmäßig auf `on`. In einem Wegwerfstand zwei Spielinstanzen verbinden und je nach Szenario Nahkampfwaffe, Bogen oder Armbrust bereithalten. `rpfight` führt den Sender erst zum Partner und dann zu einem lebenden Banditen (`$Bandit`, Entitätsname im lokalen Teststand). Das Rig erfasst Schlag, Block, Parade und Trefferreaktion. `rpdown` beobachtet je Spielrichtung den tatsächlichen KO und das Aufstehen am selben Ort. `rpbow` ordnet eine tatsächlich gesendete, typisierte P6-Schussfreigabe der nativen Animation zu. Ohne `--sender` laufen bei `rpdown` beide Richtungen.
+
+Für die T4-Varianten nur Relay und den echten Host im Wegwerfstand starten. Bei `rpfight` braucht der Bot eine lokale Waffenklasse und passende Aktionszeilen aus dem verwendeten Build. Er nähert sich dem Host und dem geladenen Banditen und spielt feste Aktionen ab. Auch die Trefferreaktion ist ein Skriptimpuls. Belege für angewandte Animation oder Schaden stammen aus dem echten Empfänger. `rpdown` gibt beim Bot den KO und das Aufstehen vor. `rpbow` wählt die Waffenklasse aus der lokalen `Tables.pak` oder prüft optional `--item-class` dagegen.
+
+```powershell
+$env:KCDMP_TEST_RP_COMBAT = '1'
+$env:KCDMP_TEST_BOT = '1'
+$env:KCDMP_RIG_RUN = 'rp-combat-bot-normal'
+python tools/rig/pair.py relay --netz normal
+python tools/rig/scenarios.py rpfight --test-rp-combat --netz normal --bot --bandit $Bandit --melee-class $MeleeClass --block-row $BlockRow --parry-row $ParryRow --hit-row $HitRow
+python tools/rig/scenarios.py rpdown --test-rp-combat --netz normal --bot
+python tools/rig/scenarios.py rpbow --test-rp-combat --netz normal --bot --weapon bow
+python tools/rig/scenarios.py rpbow --test-rp-combat --netz normal --bot --weapon crossbow
+```
+
+Für `--netz schlecht` ein frisches Relay mit dem gleichnamigen Profil verwenden. Die Richtung und native Körper-ID pro Aktion stehen in den JSON-Berichten. Gezählt werden bestätigte Installationen auf der richtigen Figur. Die T1-Ampel wertet ab 95 Prozent grün, fehlende Messbelege bleiben grau. Die Verzögerung beginnt bei der DLL und endet mit dem nativen Nachweis. `dmg_double>0` ist rot. Ein belegter blockierter Doppelpfad mit `dmg_double=0` und `dmg_double_unconfirmed=0` ist grün. Ungeklärte Schadensanwendungen und Läufe ohne belegte Unterdrückung bleiben grau. `owner_violations` bleibt null. Die Spielabnahme steht aus.
+
+Für den Lauf mit echten Spielern nach dem Relay-Start beide Spielinstanzen über `pair.py prepare`, `up`, `host` und `join` wie in s2-1 verbinden. Im Wegwerfstand für den Partnerkampf die Host-Einstellung `mp_friendly_fire on` verwenden. Beim Blockschritt führt der Partner den Gegenschlag aus. Die Szenarien führen durch die einzelnen Aktionen.
+
+```powershell
+$env:KCDMP_TEST_RP_COMBAT = '1'
+$env:KCDMP_RIG_RUN = 'rp-combat-normal'
+python tools/rig/pair.py relay --netz normal
+python tools/rig/scenarios.py rpfight --test-rp-combat --netz normal --bandit $Bandit
+python tools/rig/scenarios.py rpdown --test-rp-combat --netz normal
+python tools/rig/scenarios.py rpbow --test-rp-combat --netz normal --weapon bow
+python tools/rig/scenarios.py rpbow --test-rp-combat --netz normal --weapon crossbow
+```
+
+### Zwei-PC-Checkliste
+
+1. Mit demselben Build in einem Wegwerfstand verbinden. Sichtweite, Nahkampfwaffen und einen geladenen Banditen prüfen.
+2. Schlagen, blocken und parieren, dann eine echte Trefferreaktion auslösen. Die andere Seite beobachtet die Partnerfigur. Spieler- und NPC-Schaden im jeweils zuständigen Spiel prüfen.
+3. Nacheinander auf beiden Seiten KO gehen und aufstehen. Die Partnerfigur soll dort aufstehen, wo sie zu Boden ging. Körper-ID und KO-/Aufstehbelege prüfen.
+4. Einen Schuss mit Bogen und mit Armbrust abgeben. Waffenart und Freigabe bei der anderen Figur prüfen.
+5. Die Abläufe mit 150 ms zusätzlicher Relay-Latenz plus Jitter wiederholen. Beide Bundles sammeln.
+6. Bestätigte Aktionen und p95 prüfen. `owner_violations` und `dmg_double` bleiben null. Fehlende oder unbestätigte Nachweise festhalten.

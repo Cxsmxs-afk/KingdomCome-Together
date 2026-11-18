@@ -24,6 +24,8 @@ class TimelineEvidenceTests(unittest.TestCase):
         self.assertEqual([], timeline.paired_actions([101], [inbound(result='refused')], [installed()], 2))
         rows = timeline.paired_actions([101], [inbound()], fixture + [installed(pose=4990, skew=11)], 2)
         self.assertEqual([(101, 5, 11)], [(row['source_ms'], row['seq'], row['skew_ms']) for row in rows])
+        new_row = installed(pose=4990, skew=11).replace('TIMELINE-ACTION', 'COMBAT-ACTION').replace('skew_ms=11', 'lag_ms=9')
+        self.assertEqual(rows, timeline.paired_actions([101], [inbound()], [new_row], 2))
 
     def test_body_measurement_does_not_mix_figure_or_generation(self):
         source = [inbound(), inbound(source=102, seq=6)]

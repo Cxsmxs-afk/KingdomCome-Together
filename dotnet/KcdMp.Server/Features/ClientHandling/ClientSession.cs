@@ -57,7 +57,7 @@ public class ClientSession
     private readonly object _presentationClockGate = new();
     private (long Query, long Received, long Sent) _presentationProbe;
     private PresentationClockSample? _presentationClock;
-    private volatile bool _linkPresentationTime;
+    private volatile bool _linkPresentationTime, _linkPresentationCombat;
 
     private readonly record struct QueuedWrite(byte[]? Packet, byte? GhostId, string? NpcKey = null, long Ts = 0);
 
@@ -100,7 +100,7 @@ public class ClientSession
         (ushort)((W213Switch.TwinOff("link_sched") ? 0 : Protocol.LinkCapLatestWins)
                | (W213Switch.TwinOff("link_sched") || W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
                | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc)
-               | Protocol.LinkCapPresentationTime);
+               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat);
 
     private void OnLinkHello(byte[] hello)
     {
@@ -113,6 +113,7 @@ public class ClientSession
         if (_sched is not null && _writer is not null) _sched.Options.Unreliable = LinkUnreliableState && _writer.Path.CanSendUnreliable;
         LinkCompactNpc = (both & Protocol.LinkCapCompactNpc) != 0;
         _linkPresentationTime = (both & Protocol.LinkCapPresentationTime) != 0;
+        _linkPresentationCombat = _linkPresentationTime && (both & Protocol.LinkCapPresentationCombat) != 0;
         if (!_linkPresentationTime)
         {
             lock (_presentationClockGate) { _presentationProbe = default; _presentationClock = null; }
@@ -160,7 +161,8 @@ public class ClientSession
     }
 
     private byte[] BuildPresentationPacket(byte type, byte[] payload, PresentationStamp? stamp) =>
-        _linkPresentationTime && stamp is { } timing ? PresentationTimeWire.Wrap(type, payload, timing) : BuildPacket(type, payload);
+        _linkPresentationTime && ((type is not (Protocol.PlayerStateDown or Protocol.W164Down)) || _linkPresentationCombat) &&
+        stamp is { } timing ? PresentationTimeWire.Wrap(type, payload, timing) : BuildPacket(type, payload);
 
     /// <summary>
     /// WO-76: assigned by <see cref="ClientHandler.TryMarkReady"/> from its
@@ -511,6 +513,23 @@ public class ClientSession
                     await ReadExactAsync(clock);
                     if (!HandlePresentationClock(clock, PresentationClock.NowMs()))
                         _clientHandler.CountDrop(Protocol.PresentationClockUp, "invalid-exchange");
+                    continue;
+                }
+
+                if (type == Protocol.PresentationCombatUp)
+                {
+                    var timed = new byte[payloadLen];
+                    await ReadExactAsync(timed);
+                    if (!_linkPresentationCombat || !PresentationTimeWire.TryReadCombatUp(timed, out var inner, out var ticks))
+                    { _clientHandler.CountDrop((byte)type, "invalid-combat-stamp"); continue; }
+                    var body = timed[PresentationTimeWire.SubjectStampLength..];
+                    if (inner == Protocol.PlayerStateUp) _broadcastService.BroadcastPlayerState(this, body, ticks);
+                    else if (Protocol.JoinWireFor(inner) is { } route && body.Length >= route.Min && body.Length <= route.Max)
+                    {
+                        if (_broadcastService.RouteJoin(this, route.Down, route.From, body, out string why, ticks) is null)
+                            _clientHandler.CountDrop(inner, why, Protocol.W164RangedStep);
+                    }
+                    else _clientHandler.CountDrop(inner, "invalid-combat-length");
                     continue;
                 }
 
@@ -1208,12 +1227,12 @@ public class ClientSession
     /// Thread-safe: enqueue a PlayerStateDown (0x20). The body is the upstream
     /// [health][stamina][flags] payload verbatim, prefixed with whose health it is.
     /// </summary>
-    public void EnqueuePlayerState(byte sourceId, byte[] upstreamBody)
+    public void EnqueuePlayerState(byte sourceId, byte[] upstreamBody, PresentationStamp? stamp = null)
     {
         var payload = new byte[1 + upstreamBody.Length];
         payload[0] = sourceId;
         Buffer.BlockCopy(upstreamBody, 0, payload, 1, upstreamBody.Length);
-        EnqueueRaw(BuildPacket(Protocol.PlayerStateDown, payload));
+        EnqueueRaw(BuildPresentationPacket(Protocol.PlayerStateDown, payload, stamp));
     }
 
     /// <summary>
@@ -1313,12 +1332,12 @@ public class ClientSession
     /// GraveAddDown (0x41) or GraveRemoveDown (0x43). Facts about the sender,
     /// relayed verbatim like WeatherDown.
     /// </summary>
-    public void EnqueueSenderFact(byte downType, byte sourceId, byte[] upstreamBody)
+    public void EnqueueSenderFact(byte downType, byte sourceId, byte[] upstreamBody, PresentationStamp? stamp = null)
     {
         var payload = new byte[1 + upstreamBody.Length];
         payload[0] = sourceId;
         Buffer.BlockCopy(upstreamBody, 0, payload, 1, upstreamBody.Length);
-        EnqueueRaw(BuildPacket(downType, payload));
+        EnqueueRaw(BuildPresentationPacket(downType, payload, stamp));
     }
 
     public void EnqueueWeather(byte sourceId, byte[] upstreamBody)

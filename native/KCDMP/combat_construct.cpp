@@ -827,86 +827,8 @@ static std::optional<holders::Permit> begin_death_pose(uint32_t eid) {
     return std::optional<holders::Permit>(std::move(permit));
 }
 
-SwingResult ghost_swing(uint32_t entityId, const char* fragSpec, uint64_t timelineToken, bool* watching) {
-    if (watching) *watching = false;
-    if (!fragSpec || !fragSpec[0] || std::strlen(fragSpec) > 191) {
-        logf("SWING: rejected -- missing/oversized fragment spec");
-        return SwingResult::BadSpec;
-    }
-
-    HMODULE entityModule = GetModuleHandleA("EntityModule.dll");
-    HMODULE animModule   = GetModuleHandleA("AnimationModule.dll");
-    HMODULE combatModule = GetModuleHandleA("CombatModule.dll");
-    if (!entityModule || !animModule || !combatModule) {
-        logf("SWING: entity=%u rejected -- a required module is not loaded", entityId);
-        return SwingResult::ModuleMissing;
-    }
-
-    // Prologue-verify all three hardcoded RVAs once per process (fail closed,
-    // WO-42 §7's discipline). A build mismatch disables native swings rather
-    // than calling into the wrong bytes.
-    auto* parseFn = reinterpret_cast<char*>(animModule)   + kRvaParseFragmentSpec;
-    auto* ctorFn  = reinterpret_cast<char*>(combatModule) + kRvaCombatAnimCtor;
-    auto* queueFn = reinterpret_cast<char*>(combatModule) + kRvaQueueAction;
-    static int prologueState = 0;   // 0 unchecked, 1 ok, -1 mismatch
-    if (prologueState == 0) {
-        prologueState =
-            (prologue_matches(parseFn, kPrologueParse, sizeof(kPrologueParse)) &&
-             prologue_matches(ctorFn,  kPrologueCtor,  sizeof(kPrologueCtor))  &&
-             prologue_matches(queueFn, kPrologueQueue, sizeof(kPrologueQueue))) ? 1 : -1;
-        if (prologueState < 0)
-            logf("SWING: RVA prologue mismatch -- native swings disabled for this build");
-    }
-    if (prologueState < 0) return SwingResult::BuildMismatch;
-
-    const auto exports = module_exports(entityModule);
-    if (exports.empty()) {
-        logf("SWING: entity=%u -- EntityModule has no export table", entityId);
-        return SwingResult::NoExports;
-    }
-    void* actor = resolve_actor(entityModule, exports, /*wantPlayer*/ false, entityId);
-    static bool s_agreeChecked = false;
-    if (actor && !s_agreeChecked) {
-        s_agreeChecked = true;
-        void* any = resolve_any_actor(entityId);
-        logf("SWING: actor lookups %s (human bind %p, actor system %p) -- WO-141's animal route %s",
-             any == actor ? "agree" : "DIFFER", actor, any, any == actor ? "is the same actor" : "would hand a different pointer");
-    }
-    if (!actor) {
-        // WO-141: not a human (a wolf, a dog, a boar): the actor system's own actor.
-        actor = resolve_any_actor(entityId);
-        if (actor) logf("SWING: entity=%u is not a human -- the actor system's own actor %p (an animal's attack)", entityId, actor);
-    }
-    if (!actor) {
-        logf("SWING: entity=%u -- actor did not resolve (despawned or stale id)", entityId);
-        return SwingResult::ActorNotResolved;
-    }
-
-    void* combatActor = nullptr;
-    if (!read_ptr(actor, kOffCombatActorInActor, &combatActor)) {
-        logf("SWING: entity=%u -- actor+0x300 read faulted", entityId);
-        return SwingResult::CombatActorFailed;
-    }
-    if (!combatActor) {
-        auto fn = reinterpret_cast<GetOrCreateFn>(
-            reinterpret_cast<char*>(entityModule) + kRvaGetOrCreateCombat);
-        if (!call_get_or_create(fn, actor, &combatActor) || !combatActor) {
-            logf("SWING: entity=%u -- GetOrCreateCombatActor faulted/null", entityId);
-            return SwingResult::CombatActorFailed;
-        }
-    }
-    void* manager = nullptr;
-    if (!read_ptr(combatActor, kOffAnimActionManager, &manager) || !manager) {
-        logf("SWING: entity=%u -- anim-action manager (+0x490) unreadable/null", entityId);
-        return SwingResult::ManagerMissing;
-    }
-
-    void* allocFn = nullptr;
-    if (!read_ptr(combatModule, kRvaCombatAllocGlobal, &allocFn) || !allocFn) {
-        logf("SWING: entity=%u -- CombatModule allocator global unreadable/null", entityId);
-        return SwingResult::AllocatorMissing;
-    }
-
+static SwingResult prepare_actor_row(uint32_t entityId, void* actor, void* parseFn,
+                                     const char* fragSpec, CombatRow* row) {
     void* giFn = nullptr;
     if (HMODULE shared = GetModuleHandleA("Shared.dll"))
         giFn = GetProcAddress(shared, kGetGameIfaceName);
@@ -954,7 +876,128 @@ SwingResult ghost_swing(uint32_t entityId, const char* fragSpec, uint64_t timeli
         return SwingResult::FragmentUnknown;
     }
 
-    const bool death = wo214rules::death_row(fragSpec);
+    row->actor = actor;
+    row->actorClass = actorClass;
+    row->fragment = static_cast<uint32_t>(out.fragmentID);
+    std::memcpy(row->tags, out.tagsB, sizeof row->tags);
+    return SwingResult::Ok;
+}
+
+SwingResult prepare_ghost_row(uint32_t entityId, const char* fragSpec, CombatRow* row) {
+    if (!row || !fragSpec || !fragSpec[0] || std::strlen(fragSpec) > 191 || wo214rules::death_row(fragSpec))
+        return SwingResult::BadSpec;
+    if (!hits::visual_damage_ready(entityId)) return SwingResult::OwnerOwns;
+    const auto module = GetModuleHandleA("AnimationModule.dll");
+    if (!module) return SwingResult::ModuleMissing;
+    auto* parseFn = reinterpret_cast<char*>(module) + kRvaParseFragmentSpec;
+    if (!prologue_matches(parseFn, kPrologueParse, sizeof(kPrologueParse))) return SwingResult::BuildMismatch;
+    void* actor = motion::actor_of(entityId);
+    if (!actor) return SwingResult::ActorNotResolved;
+    return prepare_actor_row(entityId, actor, parseFn, fragSpec, row);
+}
+
+bool combat_row_current(uint32_t entityId, const CombatRow& row) {
+    void* actor = motion::actor_of(entityId);
+    void* actorClass = nullptr;
+    return actor && actor == row.actor && call_vtbl_ptr(actor, kVtblGetActorClass, &actorClass) &&
+           actorClass && actorClass == row.actorClass;
+}
+
+static SwingResult queue_swing(uint32_t entityId, const char* fragSpec, const CombatRow* cached,
+                               uint64_t timelineToken, bool* watching) {
+    if (watching) *watching = false;
+    if (!cached && (!fragSpec || !fragSpec[0] || std::strlen(fragSpec) > 191)) {
+        logf("SWING: rejected -- missing/oversized fragment spec");
+        return SwingResult::BadSpec;
+    }
+
+    HMODULE entityModule = GetModuleHandleA("EntityModule.dll");
+    HMODULE animModule   = GetModuleHandleA("AnimationModule.dll");
+    HMODULE combatModule = GetModuleHandleA("CombatModule.dll");
+    if (!entityModule || !animModule || !combatModule) {
+        logf("SWING: entity=%u rejected -- a required module is not loaded", entityId);
+        return SwingResult::ModuleMissing;
+    }
+
+    // Prologue-verify all three hardcoded RVAs once per process (fail closed,
+    // WO-42 §7's discipline). A build mismatch disables native swings rather
+    // than calling into the wrong bytes.
+    auto* parseFn = reinterpret_cast<char*>(animModule)   + kRvaParseFragmentSpec;
+    auto* ctorFn  = reinterpret_cast<char*>(combatModule) + kRvaCombatAnimCtor;
+    auto* queueFn = reinterpret_cast<char*>(combatModule) + kRvaQueueAction;
+    static int prologueState = 0;   // 0 unchecked, 1 ok, -1 mismatch
+    if (prologueState == 0) {
+        prologueState =
+            (prologue_matches(parseFn, kPrologueParse, sizeof(kPrologueParse)) &&
+             prologue_matches(ctorFn,  kPrologueCtor,  sizeof(kPrologueCtor))  &&
+             prologue_matches(queueFn, kPrologueQueue, sizeof(kPrologueQueue))) ? 1 : -1;
+        if (prologueState < 0)
+            logf("SWING: RVA prologue mismatch -- native swings disabled for this build");
+    }
+    if (prologueState < 0) return SwingResult::BuildMismatch;
+
+    void* actor = nullptr;
+    if (cached) {
+        if (!combat_row_current(entityId, *cached)) return SwingResult::ActorNotResolved;
+        actor = cached->actor;
+    } else {
+        const auto exports = module_exports(entityModule);
+        if (exports.empty()) {
+            logf("SWING: entity=%u -- EntityModule has no export table", entityId);
+            return SwingResult::NoExports;
+        }
+        actor = resolve_actor(entityModule, exports, /*wantPlayer*/ false, entityId);
+        static bool s_agreeChecked = false;
+        if (actor && !s_agreeChecked) {
+            s_agreeChecked = true;
+            void* any = resolve_any_actor(entityId);
+            logf("SWING: actor lookups %s (human bind %p, actor system %p) -- WO-141's animal route %s",
+                 any == actor ? "agree" : "DIFFER", actor, any, any == actor ? "is the same actor" : "would hand a different pointer");
+        }
+        if (!actor) {
+            // WO-141: not a human (a wolf, a dog, a boar): the actor system's own actor.
+            actor = resolve_any_actor(entityId);
+            if (actor) logf("SWING: entity=%u is not a human -- the actor system's own actor %p (an animal's attack)", entityId, actor);
+        }
+        if (!actor) {
+            logf("SWING: entity=%u -- actor did not resolve (despawned or stale id)", entityId);
+            return SwingResult::ActorNotResolved;
+        }
+    }
+
+    void* combatActor = nullptr;
+    if (!read_ptr(actor, kOffCombatActorInActor, &combatActor)) {
+        logf("SWING: entity=%u -- actor+0x300 read faulted", entityId);
+        return SwingResult::CombatActorFailed;
+    }
+    if (!combatActor) {
+        auto fn = reinterpret_cast<GetOrCreateFn>(
+            reinterpret_cast<char*>(entityModule) + kRvaGetOrCreateCombat);
+        if (!call_get_or_create(fn, actor, &combatActor) || !combatActor) {
+            logf("SWING: entity=%u -- GetOrCreateCombatActor faulted/null", entityId);
+            return SwingResult::CombatActorFailed;
+        }
+    }
+    void* manager = nullptr;
+    if (!read_ptr(combatActor, kOffAnimActionManager, &manager) || !manager) {
+        logf("SWING: entity=%u -- anim-action manager (+0x490) unreadable/null", entityId);
+        return SwingResult::ManagerMissing;
+    }
+
+    void* allocFn = nullptr;
+    if (!read_ptr(combatModule, kRvaCombatAllocGlobal, &allocFn) || !allocFn) {
+        logf("SWING: entity=%u -- CombatModule allocator global unreadable/null", entityId);
+        return SwingResult::AllocatorMissing;
+    }
+
+    CombatRow row;
+    if (cached) row = *cached;
+    else {
+        const auto prepared = prepare_actor_row(entityId, actor, parseFn, fragSpec, &row);
+        if (prepared != SwingResult::Ok) return prepared;
+    }
+
+    const bool death = !cached && wo214rules::death_row(fragSpec);
     auto permit = death ? begin_death_pose(entityId) : begin_combat_pose(entityId, "rttr.swing_pose");
     if (!permit) return SwingResult::OwnerOwns;
     void* mem = nullptr;
@@ -964,8 +1007,8 @@ SwingResult ghost_swing(uint32_t entityId, const char* fragSpec, uint64_t timeli
     }
     void* anim = nullptr;
     if (!call_anim_ctor(reinterpret_cast<AnimCtorFn>(ctorFn), mem, combatActor,
-                        /*priority*/ 5, static_cast<uint32_t>(out.fragmentID),
-                        out.tagsB, &anim) || !anim) {
+                        /*priority*/ 5, row.fragment,
+                        row.tags, &anim) || !anim) {
         logf("SWING: entity=%u -- C_CombatAnimAction ctor faulted/null", entityId);
         return SwingResult::CtorFailed;
     }
@@ -978,6 +1021,12 @@ SwingResult ghost_swing(uint32_t entityId, const char* fragSpec, uint64_t timeli
     swing_lower_previous(entityId);   // WO-202 IV.1: the copy's own last swing steps down the way the engine's Withdraw does
     if (!call_queue_action(reinterpret_cast<QueueActionFn>(queueFn), manager, &sp, -1.0f)) {
         logf("SWING: entity=%u -- QueueAction FAULTED", entityId);
+        if (cached) {
+            // A fault can occur after a partial engine install. Keep the
+            // one-shot holder until the existing action tracker reads it back.
+            permit->wrote();
+            combatactions::track(entityId, actor, anim, true);
+        }
         call_release(anim);   // still drop our ref; the object outlives the fault path
         return SwingResult::QueueFaulted;
     }
@@ -992,10 +1041,25 @@ SwingResult ghost_swing(uint32_t entityId, const char* fragSpec, uint64_t timeli
     if (watching) *watching = watched;
     swing_keep_last(entityId, anim);   // WO-202 IV.1: one reference of ours until the next swing (or kLastSwingKeepS)
     if (!watched) call_release(anim);
-    logf("SWING: entity=%u queued fragment %d status=%u ref(controller)=%u%s spec=\"%s\"",
-         entityId, out.fragmentID, status, refc ? refc - 1 : 0, watched ? " watched" : "", fragSpec);
-    kcdmp::hits::note_figure_swing(entityId);   // WO-170 F1: a partner's figure's swing the partner sent -- one blow of it is licensed (hits.cpp)
+    if (cached) {
+        logf("SWING: entity=%u queued typed fragment %u status=%u ref(controller)=%u%s",
+             entityId, row.fragment, status, refc ? refc - 1 : 0, watched ? " watched" : "");
+    } else {
+        logf("SWING: entity=%u queued fragment %u status=%u ref(controller)=%u%s spec=\"%s\"",
+             entityId, row.fragment, status, refc ? refc - 1 : 0, watched ? " watched" : "", fragSpec);
+        kcdmp::hits::note_figure_swing(entityId); // The compatibility lane keeps its original WO-170 window.
+    }
     return SwingResult::Ok;
+}
+
+SwingResult ghost_swing(uint32_t entityId, const char* fragSpec, uint64_t timelineToken, bool* watching) {
+    return queue_swing(entityId, fragSpec, nullptr, timelineToken, watching);
+}
+
+SwingResult queue_ghost_row(uint32_t entityId, const CombatRow& row, uint64_t token, bool* watching) {
+    if (watching) *watching = false;
+    if (!hits::visual_damage_ready(entityId)) return SwingResult::OwnerOwns;
+    return queue_swing(entityId, nullptr, &row, token, watching);
 }
 
 // --- WO-208 A: one fragment, as the host's world ran it --------------------

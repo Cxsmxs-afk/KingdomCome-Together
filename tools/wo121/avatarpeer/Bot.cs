@@ -14,17 +14,17 @@ static partial class P
     private static readonly Guid BotSwingRow = Guid.Parse("3e27732b-b152-4a27-97d2-1ebba717a588");
     private static readonly HashSet<string> BotVerbs = new(StringComparer.Ordinal)
     {
-        "stand", "move", "curve", "strafe", "state", "attack", "block_impulse", "hit",
+        "stand", "move", "curve", "strafe", "state", "attack", "block_impulse", "hit", "hit_reaction",
         "vitals", "death", "respawned", "ranged", "appearance", "bow_equip", "activity", "ride", "draw", "sheathe"
     };
-    private static readonly string[] BotOptions = ["--test-bot", "--self-test", "--origin", "--bow-class", "--tables-pak", "--duration", "--wire-version"];
+    private static readonly string[] BotOptions = ["--test-bot", "--self-test", "--origin", "--bow-class", "--ranged-kind", "--tables-pak", "--duration", "--wire-version"];
     private static readonly string[] BotValueOptions =
-        ["--scenario", "--host", "--port", "--name", "--origin", "--bow-class", "--tables-pak", "--duration", "--wire-version"];
+        ["--scenario", "--host", "--port", "--name", "--origin", "--bow-class", "--ranged-kind", "--tables-pak", "--duration", "--wire-version"];
 
     private sealed record BotPlan(IReadOnlyList<Step> Steps, double End);
     private sealed record BotContext(byte Host, uint World, (float X, float Y, float Z)? Origin);
     private sealed record BotOptionsParsed(string? Scenario, IPAddress Address, int Port, string Name, TimeSpan Duration,
-        (float X, float Y, float Z)? Origin, string? Tables, Guid Bow, string WireVersion);
+        (float X, float Y, float Z)? Origin, string? Tables, Guid RangedClass, RangedWeaponKind RangedKind, string WireVersion);
     private sealed class BotRoleException() : IOException("Start the host before the T4 joiner.");
 
     private static uint PlannedHostMs(uint start, double seconds) => unchecked(start + (uint)(seconds * 1000));
@@ -79,15 +79,21 @@ static partial class P
             if (coordinates.Length != 3) throw new FormatException("Origin must be x,y,z.");
             origin = (Finite(coordinates[0]), Finite(coordinates[1]), Finite(coordinates[2]));
         }
-        Guid bow = Guid.Empty;
-        if (fields.GetValueOrDefault("--bow-class") is string item && (!Guid.TryParseExact(item, "D", out bow) || bow == Guid.Empty))
-            throw new FormatException("Bow class must be a non-empty GUID.");
+        Guid rangedClass = Guid.Empty;
+        if (fields.GetValueOrDefault("--bow-class") is string item && (!Guid.TryParseExact(item, "D", out rangedClass) || rangedClass == Guid.Empty))
+            throw new FormatException("Ranged class must be a non-empty GUID.");
+        var rangedKind = fields.GetValueOrDefault("--ranged-kind", "bow") switch
+        {
+            "bow" => RangedWeaponKind.Bow,
+            "crossbow" => RangedWeaponKind.Crossbow,
+            _ => throw new FormatException("Ranged kind must be bow or crossbow.")
+        };
         return new(fields.GetValueOrDefault("--scenario"), loopback, port, name, TimeSpan.FromSeconds(duration), origin,
-            fields.GetValueOrDefault("--tables-pak"), bow,
+            fields.GetValueOrDefault("--tables-pak"), rangedClass, rangedKind,
             BotWireVersion(fields.GetValueOrDefault("--wire-version", ReleaseVersionInfo.Wire)));
     }
 
-    private static Guid FindBotBow(BotOptionsParsed options)
+    private static Guid FindBotRangedClass(BotOptionsParsed options)
     {
         string? tables = options.Tables;
         if (tables is null && Environment.GetEnvironmentVariable("KCD2MP_INSTALL") is { Length: > 0 } root)
@@ -95,19 +101,19 @@ static partial class P
             string configured = Path.Combine(root, "Data", "Tables.pak");
             if (File.Exists(configured)) tables = configured;
         }
-        if (options.Bow != Guid.Empty && tables is null) return options.Bow;
+        if (options.RangedClass != Guid.Empty && tables is null && options.RangedKind == RangedWeaponKind.Bow) return options.RangedClass;
         tables ??= WeaponSwingCatalog.FindTablesPak();
         if (tables is null) throw new InvalidOperationException("Set --tables-pak or --bow-class for the ranged station.");
         var catalog = RangedItemCatalog.Read(tables);
-        if (options.Bow != Guid.Empty)
+        if (options.RangedClass != Guid.Empty)
         {
-            if (catalog.Kind(options.Bow) != RangedWeaponKind.Bow) throw new InvalidOperationException("The chosen class is not a bow in Tables.pak.");
-            return options.Bow;
+            if (catalog.Kind(options.RangedClass) != options.RangedKind) throw new InvalidOperationException("The chosen class does not match the ranged kind in Tables.pak.");
+            return options.RangedClass;
         }
         foreach (var key in Wo201ItemModels.Read(tables).Keys.Order(StringComparer.Ordinal))
-            if (Guid.TryParse(key, out Guid item) && catalog.Kind(item) == RangedWeaponKind.Bow)
+            if (Guid.TryParse(key, out Guid item) && catalog.Kind(item) == options.RangedKind)
                 return item;
-        throw new InvalidOperationException("Tables.pak contains no usable bow class.");
+        throw new InvalidOperationException("Tables.pak contains no usable class for the ranged kind.");
     }
 
     private static BotPlan ReadBotPlan(IEnumerable<string> lines)
@@ -159,12 +165,13 @@ static partial class P
                 break;
             case "attack" when Count(2, 3):
             case "block_impulse" when Count(2, 3):
+            case "hit_reaction" when Count(2, 2):
                 if (Guid.TryParseExact(f[1], "D", out Guid row) && row != Guid.Empty) return;
                 break;
             case "hit" when Count(3, 4):
             case "vitals" when Count(3, 4):
                 if (Finite(f[1]) is >= 0 and <= 100 && Finite(f[2]) is >= 0 and <= 100 &&
-                    (f.Length == 3 || (f[0] == "hit" ? f[3] == "unarmed" : f[3] is "downed" or "knockeddown"))) return;
+                    (f.Length == 3 || (f[0] == "hit" ? f[3] == "unarmed" : f[3] is "downed" or "knockeddown" or "knockout"))) return;
                 break;
             case "death" or "bow_equip" or "draw" or "sheathe" when Count(1, 1): return;
             case "ranged" when Count(2, 2): _ = BotRangedPhase(f[1]); return;
@@ -225,9 +232,10 @@ static partial class P
         end 60
         """).ReplaceLineEndings("\n").Split('\n'));
 
-    private static byte[] BuildBotRanged(byte host, uint world, ulong epoch, uint sequence, byte phase, Guid bow, uint age) =>
+    private static byte[] BuildBotRanged(byte host, uint world, ulong epoch, uint sequence, byte phase, Guid item, uint age,
+        RangedWeaponKind kind = RangedWeaponKind.Bow) =>
         new LootMsg(Protocol.W164RangedStep, 0u,
-            new RangedStepV2(world, 1, epoch, sequence, phase, RangedWeaponKind.Bow, bow, age, 1).Encode())
+            new RangedStepV2(world, 1, epoch, sequence, phase, kind, item, age, 1).Encode())
         .BuildUp(Protocol.W164Up, host);
 
     private static byte[] BotEpochAck(uint world, uint join) =>
@@ -354,6 +362,7 @@ static partial class P
             var plan = DefaultBotPlan((132.5f, -220, 23));
             var bow = Guid.Parse("10000000-0000-0000-0000-000000000009");
             var packet = BuildBotRanged(0, 42, 2, 7, 3, bow, 11);
+            var crossbow = BuildBotRanged(0, 42, 2, 8, 3, bow, 12, RangedWeaponKind.Crossbow);
             if (plan.End != 60 || plan.Steps.Count(s => s.F[0] == "curve") != 2 ||
                 !new[] { "hit", "vitals", "death", "respawned", "ranged", "attack" }
                     .All(verb => plan.Steps.Any(s => s.F[0] == verb))
@@ -363,6 +372,9 @@ static partial class P
                 !LootMsg.TryDecode(packet.AsSpan(3 + Protocol.JoinHeaderLen), out var msg) || msg.Kind != Protocol.W164RangedStep ||
                 !RangedStepV2.TryDecode(msg.Text, out var step) || step is not { World: 42, Epoch: 2, Sequence: 7, Phase: 3, AgeMs: 11 }
                 || step.ItemClass != bow || step.Kind != RangedWeaponKind.Bow
+                || !LootMsg.TryDecode(crossbow.AsSpan(3 + Protocol.JoinHeaderLen), out var crossbowMsg)
+                || !RangedStepV2.TryDecode(crossbowMsg.Text, out var crossbowStep) || crossbowStep.Kind != RangedWeaponKind.Crossbow
+                || ParseBotOptions(["--test-bot", "--ranged-kind", "crossbow"]).RangedKind != RangedWeaponKind.Crossbow
                 || PlannedHostMs(uint.MaxValue - 499, 0.5) != 0 || ScheduledAgeMs(uint.MaxValue - 5, 10) != 16)
                 throw new InvalidOperationException("T4 joiner plan or packet self-test failed.");
             try
@@ -376,6 +388,10 @@ static partial class P
             if (handoverPlan.Steps.Count != 5) throw new InvalidOperationException("T4 owner handover plan self-test failed.");
             var stancePlan = ReadBotPlan(["at 0 stand 0 0 0 0", "at 2 state crouch=1", "at 3 state crouch=0", "at 4 draw", "at 5 sheathe", "end 6"]);
             if (stancePlan.Steps.Count != 5) throw new InvalidOperationException("T4 controller stance plan self-test failed.");
+            var reactionPlan = ReadBotPlan(["at 0 stand 0 0 0 0", $"at 1 hit_reaction {bow:D}", "end 2"]);
+            if (reactionPlan.Steps.Count != 2) throw new InvalidOperationException("T4 hit reaction plan self-test failed.");
+            if (ReadBotPlan(["at 0 stand 0 0 0 0", "at 1 vitals 20 30 knockout", "end 3"]).Steps.Count != 2)
+                throw new InvalidOperationException("T4 engine-knockout fixture self-test failed.");
             foreach (string invalid in new[] { "activity stance 3 0000000000000000", "activity stance 256 0123456789abcdef", "activity bad", "ride", "ride -", "ride " + new string('á', 128), "draw extra", "sheathe extra" })
             {
                 try

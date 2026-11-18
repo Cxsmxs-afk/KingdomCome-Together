@@ -122,18 +122,20 @@ void switch_off(const char* what) {
 
 // RPGProcessHit's entry (any thread the melee handlers run on). true = filtered (RPGProcessHit returns 0, its caller skips the victim).
 bool gate(void* rpg, void* result, void* hitIn, void* flags) {
-    if (g_off.load(std::memory_order_relaxed) || !rpg || !hitIn || !result || !wo210::on(kBitHitLocalNone)) return false;
-    void* me = motion::player_combat_actor();
-    if (!me) return false;
+    if (!rpg) return false;
     void* aCa = nullptr; uint32_t veid = 0; uint8_t skip = 0;
-    if (!fault::guarded(g_siteRead, [&] {
-            aCa = *reinterpret_cast<void**>(static_cast<uint8_t*>(rpg) + 8);
+    if (!fault::guarded(g_siteRead, [&] { aCa = *reinterpret_cast<void**>(static_cast<uint8_t*>(rpg) + 8); })) return false;
+    const bool hasVictim = hitIn && fault::guarded(g_siteRead, [&] {
             skip = *static_cast<const uint8_t*>(hitIn);
             const uint8_t* det = *reinterpret_cast<uint8_t* const*>(static_cast<uint8_t*>(hitIn) + g_rph.detOff);
             if (det) veid = *reinterpret_cast<const uint32_t*>(det + g_rph.vidOff);
-        }))
-        return false;
-    if (aCa != me || !listed(veid)) return false;
+        });
+    // False from RPGProcessHit is the existing native filtered-hit outcome.
+    // This is before the core creates causes and changes health, stamina or wear.
+    if (hits::filter_visual_contact(aCa, veid)) return true;
+    if (!hasVictim || !result || g_off.load(std::memory_order_relaxed) || !wo210::on(kBitHitLocalNone)) return false;
+    void* me = motion::player_combat_actor();
+    if (!me || aCa != me || !listed(veid)) return false;
     // the attacker's attack type and strength, each read through its property's own getter (RPGProcessHit's reads)
     void* model = nullptr; int32_t type = -1, none = 0; float strength = 0;
     if (!fault::guarded(g_siteFields, [&] {
@@ -425,5 +427,6 @@ const bool kReg = wo203::reg_install("w210hit", &install_reg) && wo203::reg_tick
 } // namespace
 
 void set_frame_callback(FrameFn fn) { g_frame = fn; }
+bool visual_gate_ready() { return g_armed.load(std::memory_order_acquire); }
 
 } // namespace kcdmp::wo210hit

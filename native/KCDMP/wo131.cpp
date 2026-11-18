@@ -11,16 +11,24 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 
 #include "buffs.h"
 #include "engine.h"
 #include "holders.h"
 #include "log.h"
 #include "npc_drive.h"
+#include "p4.h"
+#include "pipe_server.h"
 #include "respawn_actions.h"
+#include "rp_body_action_rules.h"
+#include "rp_timeline_actions.h"
 #include "rttr_abi.h"
+#include "script_context.h"
 #include "motion.h"
+#include "wo187.h"
 #include "wo210_kd.h"
+#include "wo216.h"
 
 namespace kcdmp::wo131 {
 namespace {
@@ -33,6 +41,19 @@ constexpr const char* kKoGuardGuidText  = "4b43444d-7113-4d67-b1a5-9e2f6d8c0a14"
 constexpr const char* kUnconsciousText  = "f8d60fe4-e2c1-420a-946a-213e1cd09265";   // unconscious_nonpersistend (Cpp:Unconscious)
 constexpr const char* kInfiniteUncText  = "74cf0c29-d03e-4233-9352-b91ca5ea69ea";   // infinite_unconsciousness_nonpersistent (ufo*0)
 constexpr const char* kRemoveUncText    = "bd22f98a-e61f-4d83-b39c-79d1d85b6b91";   // remove_unconsciousness
+constexpr char kKoPoseSetter[] = "wo131.unconscious_pose";
+constexpr char kHolsterContext[] = "UnconsciousHolsterInsteadDropWeapons";   // shipped rule, WO-68 control read
+constexpr double kWakeSettleS = 1.2;   // WO-197/201: let the full-body get-up blend finish before writing the body again
+
+struct RemoteKo {
+    void* entity = nullptr;
+    void* soul = nullptr;
+    timelineactions::Scope scope{};
+    uint64_t token = 0;
+    double deadline = 0, stableSince = 0;
+    bool down = true, standRequested = false, ownsHolster = false;
+};
+std::unordered_map<uint32_t, RemoteKo> g_remoteKo;
 
 template <class T> bool rd(const void* base, size_t off, T* out) {
     KCDMP_FAULT_READ(site, "wo131::rd");
@@ -87,11 +108,205 @@ const KoGuids* ko_guids() {
 std::atomic<uint32_t> c_checks{0}, c_guardOn{0}, c_guardOff{0}, c_follow{0}, c_followCredit{0}, c_followStamina{0},
                       c_stopFight{0}, c_restore{0}, c_faction{0}, c_fail{0}, c_knockouts{0}, c_wakes{0};
 
+void* current_soul(uint32_t eid) {
+    void* soul = soul_of_eid(eid);
+    return soul && buffs::as_c_soul(soul) ? buffs::as_c_soul(soul) : soul;
+}
+
+timelineactions::Scope scope_now() {
+    return {wo216::lifecycle_observation_stamp(), pipe::observation_connection(), p4::life_edge_tick()};
+}
+
+bool active_ko(const RemoteKo& ko, uint32_t eid, void* soul) {
+    return ko.soul == soul && ko.scope == scope_now() && ko.entity == engine::entity_by_id(eid);
+}
+
+void report_ko(uint32_t eid, RemoteKo& ko, bool confirmed) {
+    if (!ko.token) return;
+    timelineactions::observed(ko.token, confirmed);
+    logf("MP-RP-KO eid=0x%X token=%llu down=%u result=%s", eid, static_cast<unsigned long long>(ko.token),
+         ko.down ? 1u : 0u, confirmed ? "confirmed" : "unconfirmed");
+    ko.token = 0;
+}
+
+bool toggle_holster(uint32_t eid, void* soul, bool on, bool* owned) {
+    auto permit = holders::may_place(eid, holders::Holder::Fall, kKoPoseSetter, holders::Claim::Held);
+    if (!permit) return false;
+    const int result = sctx::set_soul_context_quiet(soul, kHolsterContext, on);
+    if (result < 0) return false;
+    if (result > 0) permit.wrote();
+    if (owned) *owned = result > 0;
+    return true;
+}
+
+bool set_ko(uint32_t eid, void* cs, bool down, bool& present, bool typed = false) {
+    const KoGuids& k = *ko_guids();
+    auto permit = holders::may_place(eid, holders::Holder::Fall, kKoPoseSetter, holders::Claim::Held);
+    if (!permit) return false;
+    if (down) {
+        // The imm-only guard precedes the full guard's removal. Its upr=1 blocks unconsciousness.
+        if (buffs::has(cs, k.ko) <= 0 && !buffs::add(cs, k.ko)) return false;
+        if (!typed) motion::set_ko_hold(eid, true);
+        buffs::remove_all(cs, guard_guid());
+        if (buffs::has(cs, k.inf) <= 0) buffs::add(cs, k.inf);
+        if (buffs::has(cs, k.unc) <= 0) {
+            if (!buffs::add(cs, k.unc)) {
+                if (typed) {
+                    buffs::remove_all(cs, k.inf);
+                    if (buffs::has(cs, guard_guid()) > 0 || buffs::add(cs, guard_guid())) buffs::remove_all(cs, k.ko);
+                }
+                return false;
+            }
+            permit.wrote();
+        }
+        if (!typed) wo210kd::note_buff_pose(eid, true);
+        c_knockouts.fetch_add(1);
+        present = buffs::has(cs, k.unc) > 0;
+        logf("WO135-KO copy eid=0x%X knocked out: unconscious=%d imm-only guard=%d", eid, present ? 1 : 0, buffs::has(cs, k.ko));
+    } else {
+        if (!typed) motion::set_ko_hold(eid, false);
+        buffs::remove_all(cs, k.inf);
+        const int removed = buffs::remove_all(cs, k.unc);
+        if (buffs::add(cs, k.rem) || removed > 0) permit.wrote();
+        if (buffs::has(cs, guard_guid()) <= 0) buffs::add(cs, guard_guid());
+        buffs::remove_all(cs, k.ko);
+        if (!typed) wo210kd::note_buff_pose(eid, false);
+        c_wakes.fetch_add(1);
+        present = buffs::has(cs, guard_guid()) > 0;
+        logf("WO135-KO copy eid=0x%X woken: unconscious=%d guard=%d", eid, buffs::has(cs, k.unc), present ? 1 : 0);
+    }
+    return true;
+}
+
+bool standing_idle(uint32_t eid) {
+    wo187::ScopeInfo scopes[12];
+    const int n = wo187::read_all_scopes(eid, scopes, 12);
+    for (int i = 0; i < n; ++i) {
+        const auto& s = scopes[i];
+        if (!s.ok || s.empty || std::strcmp(s.name, "FullBody")) continue;
+        char fragment[48]{};
+        return wo187::fragment_name(eid, s.frag, fragment, sizeof fragment) && std::strncmp(fragment, "MotionIdle", 10) == 0;
+    }
+    return false;
+}
+
 void put_f(uint8_t* p, float v) { std::memcpy(p, &v, 4); }
 float get_f(const uint8_t* p) { float v; std::memcpy(&v, p, 4); return v; }
 uint32_t get_u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 
 } // namespace
+
+bool rp_knockout_available(uint32_t eid, bool down) {
+    void* entity = engine::entity_by_id(eid);
+    const char* name = entity ? engine::entity_name(entity) : nullptr;
+    if (!name || std::strncmp(name, "kcd2mp_", 7) || !npcdrive::is_bound_eid(eid) ||
+        !npcdrive::unparented_body(eid) || !buffs::ready() || !guard_guid() || !ko_guids()) return false;
+    using holders::Holder;
+    const Holder owner = holders::of(eid);
+    if (owner != Holder::Writer && owner != Holder::Figure && owner != Holder::Driver &&
+        owner != Holder::OneShot && owner != Holder::Fall) return false;
+    void* soul = current_soul(eid);
+    bool dead = false, unconscious = false, ragdoll = false;
+    if (!soul || !rttr::soul_bool(soul, "IsDead", &dead) || dead ||
+        !rttr::soul_bool(soul, "IsUnconscious", &unconscious) || !wo210kd::rp_ragdoll_state(eid, &ragdoll)) return false;
+    if (!down) return true;   // a queued down event may still be waiting for the host clock
+    if (unconscious || ragdoll) return false;
+    // Rivals cannot use the ordinary knockout's weapon-drop path on a figure.
+    // Use the game's pre-existing player holster context, verified by readback.
+    return sctx::has_soul_context(soul, kHolsterContext) >= 0;
+}
+
+bool rp_knockout_holds(uint32_t eid) {
+    const auto it = g_remoteKo.find(eid);
+    return it != g_remoteKo.end() && active_ko(it->second, eid, current_soul(eid));
+}
+
+bool rp_knockout_wake_pending(uint32_t eid) {
+    const auto it = g_remoteKo.find(eid);
+    return it != g_remoteKo.end() && it->second.down && active_ko(it->second, eid, current_soul(eid));
+}
+
+bool rp_knockout(uint32_t eid, bool down, uint64_t token) {
+    if (!token || !rp_knockout_available(eid, down)) return false;
+    const double now = npcdrive::now_s();
+    const auto scope = scope_now();
+    void* entity = engine::entity_by_id(eid);
+    void* soul = current_soul(eid);
+    if (!scope.connection || !entity || !soul) return false;
+    auto old = g_remoteKo.find(eid);
+    if (!down && !rp_knockout_wake_pending(eid)) return false;
+    if (down && old != g_remoteKo.end()) return false;
+    if (!wo210kd::take_fall(eid, engine::entity_name(entity), now)) return false;
+    bool present = false;
+    if (down) {
+        bool ownsHolster = false;
+        if (!toggle_holster(eid, soul, true, &ownsHolster)) return false;
+        if (!set_ko(eid, soul, true, present, true)) {
+            if (ownsHolster) toggle_holster(eid, soul, false, nullptr);
+            return false;
+        }
+        g_remoteKo.emplace(eid, RemoteKo{entity, soul, scope, token, now + 6.0, 0, true, false, ownsHolster});
+    } else {
+        if (!set_ko(eid, soul, false, present, true)) return false;
+        auto& ko = old->second;
+        report_ko(eid, ko, false);   // a wake cannot confirm a down that was never seen
+        ko.down = false;
+        ko.token = token;
+        ko.deadline = now + 25.0;
+    }
+    return true;
+}
+
+void rp_knockout_tick() {
+    if (g_remoteKo.empty()) return;
+    const auto scope = scope_now();
+    const double now = npcdrive::now_s();
+    for (auto it = g_remoteKo.begin(); it != g_remoteKo.end();) {
+        const uint32_t eid = it->first;
+        auto& ko = it->second;
+        if (!(ko.scope == scope) || ko.entity != engine::entity_by_id(eid) || ko.soul != current_soul(eid) ||
+            !npcdrive::is_bound_eid(eid)) {
+            report_ko(eid, ko, false);
+            it = g_remoteKo.erase(it);
+            continue;
+        }
+        ++it;
+        bool dead = false, unc = false;
+        if (now >= ko.deadline) report_ko(eid, ko, false);
+        if (!rttr::soul_bool(ko.soul, "IsDead", &dead)) { ko.stableSince = 0; continue; }
+        if (dead) {
+            report_ko(eid, ko, false);
+            if (ko.ownsHolster) toggle_holster(eid, ko.soul, false, nullptr);
+            g_remoteKo.erase(eid);
+            continue;
+        }
+        if (!rttr::soul_bool(ko.soul, "IsUnconscious", &unc) || holders::of(eid) != holders::Holder::Fall) {
+            ko.stableSince = 0;
+            continue;
+        }
+        npcdrive::PhysicsStatus ps{};
+        if (!npcdrive::physics_status(ko.entity, &ps)) { ko.stableSince = 0; continue; }
+        if (ko.down) {
+            if (rpbodyactions::down_confirmed(unc, ps.present != 0, ps.living != 0)) report_ko(eid, ko, true);
+            continue;
+        }
+        bool rag = false;
+        if (unc || !wo210kd::rp_ragdoll_state(eid, &rag)) { ko.stableSince = 0; continue; }
+        int flying = 1;
+        const bool grounded = ps.living && npcdrive::living_flying(ko.entity, &flying) && !flying;
+        if (!rpbodyactions::up_confirmed(unc, ps.present != 0, ps.living != 0, grounded, rag)) {
+            ko.stableSince = 0;
+            if (!ko.standRequested && ps.present && (rag || !ps.living)) ko.standRequested = wo210kd::rp_stand_up(eid, kKoPoseSetter);
+            continue;
+        }
+        if (!standing_idle(eid)) { ko.stableSince = 0; continue; }
+        report_ko(eid, ko, true);
+        if (!ko.stableSince) ko.stableSince = now;
+        if (now - ko.stableSince < kWakeSettleS) continue;
+        if (ko.ownsHolster && !toggle_holster(eid, ko.soul, false, nullptr)) continue;
+        g_remoteKo.erase(eid);
+    }
+}
 
 uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
     *outLen = 0;
@@ -144,15 +359,23 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
         void* soul = soul_of_eid(eid);
         if (!soul) { c_fail.fetch_add(1); return kRNoActor; }
         void* cs = buffs::as_c_soul(soul) ? buffs::as_c_soul(soul) : soul;
+        auto typed = g_remoteKo.find(eid);
+        const bool tracked = typed != g_remoteKo.end() && active_ko(typed->second, eid, cs);
         bool present = false;
         switch (mode) {
         case kGuardOn:
+            if (tracked && typed->second.down) { present = k && buffs::has(cs, k->ko) > 0; break; }
             if (k) buffs::remove_all(cs, k->ko);
             if (buffs::has(cs, guard_guid()) <= 0 && !buffs::add(cs, guard_guid())) { c_fail.fetch_add(1); return kRFailed; }
             c_guardOn.fetch_add(1);
             present = buffs::has(cs, guard_guid()) > 0;
             break;
         case kGuardOff:
+            if (tracked) {
+                report_ko(eid, typed->second, false);
+                if (typed->second.ownsHolster) toggle_holster(eid, cs, false, nullptr);
+                g_remoteKo.erase(typed);
+            }
             motion::set_ko_hold(eid, false);
             wo210kd::clear_buff_pose(eid);
             buffs::remove_all(cs, guard_guid());
@@ -162,38 +385,10 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             break;
         case kGuardKnockout:
         case kGuardWake: {
+            if (tracked) return kRFailed;  // a typed KO owns the guard swap through physical get-up
             if (!wo210kd::take_fall(eid, engine::entity_name(engine::entity_by_id(eid)), npcdrive::now_s()))
                 return kRFailed;
-            auto permit = holders::may_place(eid, holders::Holder::Fall, "wo131.unconscious_pose");
-            if (!permit) return kRFailed;
-            if (mode == kGuardKnockout) {
-                // The imm-only guard precedes the full guard's removal. Its upr=1 blocks unconsciousness.
-                if (buffs::has(cs, k->ko) <= 0 && !buffs::add(cs, k->ko)) { c_fail.fetch_add(1); return kRFailed; }
-                motion::set_ko_hold(eid, true);   // stop the figure's guard refresh from undoing the knockout
-                buffs::remove_all(cs, guard_guid());
-                if (buffs::has(cs, k->inf) <= 0) buffs::add(cs, k->inf);
-                if (buffs::has(cs, k->unc) <= 0) {
-                    if (!buffs::add(cs, k->unc)) { c_fail.fetch_add(1); return kRFailed; }
-                    permit.wrote();
-                }
-                wo210kd::note_buff_pose(eid, true);
-                c_knockouts.fetch_add(1);
-                present = buffs::has(cs, k->unc) > 0;
-                logf("WO135-KO copy eid=0x%X knocked out (the host's NPC is): unconscious=%d imm-only guard=%d", eid,
-                     present ? 1 : 0, buffs::has(cs, k->ko));
-            } else {
-                motion::set_ko_hold(eid, false);
-                buffs::remove_all(cs, k->inf);
-                const int removed = buffs::remove_all(cs, k->unc);
-                if (buffs::add(cs, k->rem) || removed > 0) permit.wrote();
-                if (buffs::has(cs, guard_guid()) <= 0) buffs::add(cs, guard_guid());
-                buffs::remove_all(cs, k->ko);
-                wo210kd::note_buff_pose(eid, false);
-                c_wakes.fetch_add(1);
-                present = buffs::has(cs, guard_guid()) > 0;
-                logf("WO135-KO copy eid=0x%X woken (the host's NPC is up): unconscious=%d guard=%d", eid,
-                     buffs::has(cs, k->unc), present ? 1 : 0);
-            }
+            if (!set_ko(eid, cs, mode == kGuardKnockout, present)) { c_fail.fetch_add(1); return kRFailed; }
             break;
         }
         }

@@ -278,7 +278,7 @@ public partial class GameBridge
     /// (mp_anim_hit_fallback; the figure's weapon from the last weapon row the partner played on it, bare hands first when none yet).
     ///   MP-ACTION section=inbound ghost=&lt;g&gt; kind=AvatarHit row=&lt;r&gt; spec="..." dispatch=native-hit result=&lt;tag&gt;
     /// </summary>
-    private async Task Wo187OnAvatarHitInAsync(InboundAction a, ActionRowCatalog? catalog, CancellationToken ct)
+    private async Task Wo187OnAvatarHitInAsync(InboundAction a, ActionRowCatalog? catalog, PresentationFrame presentation, CancellationToken ct)
     {
         if (!RowEvent.TryFromBytes(a.Payload, out var he)) return;
         Interlocked.Increment(ref _w187AvatarHitIn);
@@ -298,6 +298,7 @@ public partial class GameBridge
             Console.WriteLine($"MP-ACTION section=inbound ghost={gid} kind=AvatarHit row={he.Row} dispatch=skipped ({(known ? "his figure is down here" : "no figure here yet")})");
             return;
         }
+        if (await TrySchedulePresentationRowAsync(a, feid, row, he.Flags, presentation, ct)) return;
         _ = _combat.NpcHoldAsync("kcd2mp_" + gid, 800, ct);
         var r = await _combat.GhostSwingForResultAsync(feid, row.Spec, ct);
         Console.WriteLine($"MP-ACTION section=inbound ghost={gid} kind=AvatarHit row={he.Row} table={row.Table} spec=\"{row.Spec}\" dispatch=native-hit result={r.ReasonTag}");

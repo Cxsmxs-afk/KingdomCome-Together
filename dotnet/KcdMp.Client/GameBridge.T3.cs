@@ -173,6 +173,7 @@ public partial class GameBridge
             Dictionary<string, long>? nativeSnapshot = null;
             IReadOnlyDictionary<string, long>? timelineSnapshot = null;
             IReadOnlyDictionary<string, long>? controllerSnapshot = null;
+            IReadOnlyDictionary<string, long>? combatSnapshot = null;
             if (role != 0)
             {
                 var result = await ProcessorFrameScope.RunAsync(async token =>
@@ -213,9 +214,11 @@ public partial class GameBridge
                     timelineSnapshot = await T3ReadNativePageAsync(Protocol.T3TimelineStatsCommand, T3NativeCounters.TryReadTimeline, ct);
                 if (timelineSnapshot is not null)
                     controllerSnapshot = await T3ReadNativePageAsync(Protocol.T3ControllerStatsCommand, T3NativeCounters.TryReadController, ct);
+                if (controllerSnapshot is not null)
+                    combatSnapshot = await T3ReadNativePageAsync(Protocol.T3CombatStatsCommand, T3NativeCounters.TryReadCombat, ct);
             }
             ct.ThrowIfCancellationRequested();
-            T3EmitStats(role, ct, nativeSnapshot, timelineSnapshot, controllerSnapshot);
+            T3EmitStats(role, ct, nativeSnapshot, timelineSnapshot, controllerSnapshot, combatSnapshot);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex) { Console.WriteLine($"MP-T3-STATS report unavailable: {ex.GetType().Name}"); }
@@ -238,7 +241,8 @@ public partial class GameBridge
     }
 
     private void T3EmitStats(byte role, CancellationToken ct, IReadOnlyDictionary<string, long>? nativeSnapshot,
-        IReadOnlyDictionary<string, long>? timelineSnapshot, IReadOnlyDictionary<string, long>? controllerSnapshot)
+        IReadOnlyDictionary<string, long>? timelineSnapshot, IReadOnlyDictionary<string, long>? controllerSnapshot,
+        IReadOnlyDictionary<string, long>? combatSnapshot)
     {
         foreach (string key in T3LootCounters.LootKeys.Concat(T3LootCounters.InputKeys).Concat(T3LootCounters.CorpseKeys).Concat(T3RangedKeys).Concat(new[] {
             "auto_rejoins_in_world", "loot_fastlane_frames", "loot_fastlane_max_wait_ms", "loot_fastlane_unknown_epoch", "loot_fastlane_stale", "loot_stats_unreadable", "corpse_lua_stats_unreadable" }))
@@ -254,13 +258,15 @@ public partial class GameBridge
             KeyValuePair.Create("inproc_fallbacks", Interlocked.Read(ref _edgeInprocFallbacks)),
             KeyValuePair.Create("http_calls_rt", Interlocked.Read(ref _edgeHttpCallsRt)),
             KeyValuePair.Create("edge_proc_n", Interlocked.Read(ref _edgeFramesAdmitted))]);
-        // Use one DLL reply for the extended counters and their sample counts.
+        // The combat page supplies its own action latency measured at actual
+        // playback. Older snapshot latency stays available with older DLLs.
         if (nativeSnapshot is not null)
             counters = counters.Concat(T3NativeCounters.Keys.Skip(T3NativeCounters.PresentationStart)
-                .Where(nativeSnapshot.ContainsKey)
+                .Where(key => nativeSnapshot.ContainsKey(key) && combatSnapshot?.ContainsKey(key) != true)
                 .Select(key => KeyValuePair.Create(key, nativeSnapshot[key])));
         if (timelineSnapshot is not null) counters = counters.Concat(timelineSnapshot);
         if (controllerSnapshot is not null) counters = counters.Concat(controllerSnapshot);
+        if (combatSnapshot is not null) counters = counters.Concat(combatSnapshot);
         string fields = string.Join(' ', counters.OrderBy(p => p.Key, StringComparer.Ordinal)
             .Select(p => p.Key + "=" + p.Value.ToString(CultureInfo.InvariantCulture)));
         Console.WriteLine($"MP-T3-STATS origin=agent role={(role == 1 ? "host" : role == 2 ? "joiner" : "off")} {fields}");
