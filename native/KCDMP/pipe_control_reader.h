@@ -14,8 +14,9 @@
 #include "t3_stats_rules.h"
 
 namespace kcdmp::pipecontrol {
-constexpr uint8_t kGeneric = 0x2B, kBatch = 0x2D, kSamples = 0x10;
+constexpr uint8_t kGeneric = 0x2B, kBatch = 0x2D, kSamples = 0x10, kEdge = 0x38, kEdgeCapabilities = 255;
 constexpr size_t kNormalPayload = 1024, kLargePayload = 4096;
+constexpr size_t kEdgePayload = kLargePayload + 10, kT3Payload = t3stats::kMaxText + 2;
 constexpr size_t kDeferredFrames = 128, kDeferredBytes = 64 * 1024;
 struct Frame {
     uint8_t type = 0, sequence = 0;
@@ -26,18 +27,24 @@ struct Frame {
     uint64_t readerObservation = 0;
 };
 inline bool header_payload_allowed(uint8_t type, size_t n) {
-    return n <= kNormalPayload || ((type == kBatch || type == kSamples || type == kGeneric) && n <= kLargePayload);
+    return n <= kNormalPayload || ((type == kBatch || type == kSamples) && n <= kLargePayload) ||
+        (type == kGeneric && n <= kT3Payload) || (type == kEdge && n <= kEdgePayload);
 }
 inline bool complete_payload_allowed(const Frame& f) {
     return f.body.size() <= kNormalPayload || ((f.type == kBatch || f.type == kSamples) && f.body.size() <= kLargePayload) ||
-        (f.type == kGeneric && f.body.size() <= kLargePayload && !f.body.empty() && f.body[0] == t3stats::kOp);
+        (f.type == kGeneric && f.body.size() <= kT3Payload && f.body[0] == t3stats::kOp) ||
+        (f.type == kEdge && f.body.size() <= kEdgePayload);
 }
 inline bool lifecycle(const Frame& f) { return f.type == kGeneric && !f.body.empty() && f.body[0] == wo216authority::kOp; }
+inline bool immediate(const Frame& f) {
+    return f.type == kEdge || lifecycle(f) || (f.type == kGeneric && f.body.size() == 1 && f.body[0] == kEdgeCapabilities);
+}
 
 // One decoder is shared by the ordinary serve loop and its short control pump.
 // It consumes every available byte, including an incomplete header/body, so a
 // full-frame Peek requirement can never deadlock behind the OS pipe buffer.
-// Only complete standalone lifecycle frames bypass the deferred normal FIFO.
+// Lifecycle and request-ID edge frames bypass the deferred legacy FIFO only
+// once complete. Edge traffic keeps its own request IDs and sequencing.
 class Reader {
     uint8_t head_[3]{}; size_t header_ = 0, wanted_ = 0;
     std::vector<uint8_t> body_;Frame reading_;
@@ -70,10 +77,10 @@ public:
             Frame f=std::move(reading_); f.type = head_[0]; f.body = std::move(body_);
             if (!complete_payload_allowed(f)) { failed_ = true; return false; }
             // Assigned exactly once in wire-read order, not when normal work is
-            // eventually dispatched. Batches never consume the single sequence.
-            if (f.type != kBatch) f.sequence = sequence_++;
+            // eventually dispatched. Batches and edge envelopes have their own IDs.
+            if (f.type != kBatch && f.type != kEdge) f.sequence = sequence_++;
             header_ = 0; wanted_ = 0; body_.clear();
-            if (lifecycle(f)) {
+            if (immediate(f)) {
                 if (!control(f)) { failed_ = true; return false; }
             } else {
                 const size_t cost = 3 + f.body.size();

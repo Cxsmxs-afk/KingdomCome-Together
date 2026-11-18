@@ -38812,6 +38812,43 @@ end
 System.AddCCommand("mp_rp_measure_clock", 'KCD2MP_RpMeasureClock(%line)',
     "Shared-clock measurement for two instances on the same machine: mp_rp_measure_clock on|off")
 
+-- s2-3: a nonce echoed by this Lua chunk proves the in-process door actually
+-- executed Lua. The native console's void return is insufficient proof.
+function KCD2MP_EdgeProbe(nonce)
+    if type(nonce) ~= "string" or #nonce ~= 16 or not nonce:match("^[0-9a-f]+$") then return false end
+    KCD2MP_EmitEvent("edge_probe", nonce)
+    return true
+end
+
+function KCD2MP_SetEdgeMode(arg)
+    local mode = tostring(arg or ""):match("^%s*(.-)%s*$")
+    if mode ~= "auto" and mode ~= "inproc" and mode ~= "http" then
+        mp_log("mp_edge: expected auto|inproc|http")
+        return false
+    end
+    KCD2MP_EmitEvent("edge_mode", mode)
+    mp_log("MP-EDGE mode_requested=" .. mode)
+    return true
+end
+System.AddCCommand("mp_edge", 'KCD2MP_SetEdgeMode(%line)',
+    "Lua edge transport: mp_edge auto|inproc|http (default auto)")
+
+-- Both the agent and the DLL additionally require KCDMP_TEST_LANES=1.
+function KCD2MP_EdgeLanes(arg)
+    local text = tostring(arg or ""):match("^%s*(.-)%s*$")
+    local nonce, frames = text:match("^%-%-test%-lanes%s+([1-9]%d*)%s+(%d+)$")
+    local count = tonumber(frames)
+    if not nonce or #nonce > 20 or (#nonce == 20 and nonce > "18446744073709551615") or
+        not count or count < 1 or count > 600 then
+        mp_log("mp_lanes: expected --test-lanes <nonce> <frames 1..600>")
+        return false
+    end
+    KCD2MP_EmitEvent("edge_lanes", nonce .. " " .. tostring(count))
+    return true
+end
+System.AddCCommand("mp_lanes", 'KCD2MP_EdgeLanes(%line)',
+    "DLL lane test: mp_lanes --test-lanes <nonce> <frames 1..600>")
+
 -- ===== P1: optional host decision authority, native load lifecycle owns activation =================
 do
     if KCD2MP.p1AuthorityEnabled == nil then KCD2MP.p1AuthorityEnabled = true end

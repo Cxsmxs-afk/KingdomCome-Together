@@ -63,6 +63,16 @@ int t3_native_stats_tests(int* passed) {
           std::memcmp(p6.data() + 2, measured.data() + 2, 423) == 0, "owner group keeps the complete measurement prefix and stays under the reply budget");
     check(p6[425] == 47 && kcdmp::p4rules::u64(p6.data() + 426) == 7 &&
           p6[434] == 48 && kcdmp::p4rules::u64(p6.data() + 435) == 42, "owner handover and denial IDs carry exact counts");
+    const auto owned = p6;
+    const uint64_t edges[] = {21, 35, 74, 8, 200, 400};
+    check(kcdmp::t3native::append_edge(p6.data(), 443, 496, edges) == 0 && p6 == owned,
+        "short capacity leaves the complete owner snapshot untouched");
+    check(kcdmp::t3native::append_edge(p6.data(), 443, p6.size(), edges) == 497 && p6[1] == 55 &&
+          std::memcmp(p6.data() + 2, owned.data() + 2, 441) == 0, "edge group stays in the 512-byte budget and preserves owner data");
+    for (size_t i = 0; i < kcdmp::t3native::kEdgeFields; ++i) {
+        check(p6[443 + 9*i] == 49 + i, "edge field identity is append-only");
+        check(kcdmp::p4rules::u64(p6.data() + 444 + 9*i) == edges[i], "edge age, busy replies and sample counts retain their exact values");
+    }
     p6 = base;
     check(kcdmp::t3native::append_rp_measure(p6.data(), 272, 424, measure) == 0 && p6 == base,
         "short replies cannot contain partial measurement coverage");

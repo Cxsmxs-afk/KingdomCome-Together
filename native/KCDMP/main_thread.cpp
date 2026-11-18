@@ -58,6 +58,7 @@ std::condition_variable                 g_drained;
 std::atomic<unsigned long long>         g_frames{0};
 std::atomic<float>                      g_lastDt{0.0f};   // WO-138
 DWORD                                   g_main_thread_id = 0;
+std::atomic<Drain> g_realtimeDrain{nullptr}, g_bulkDrain{nullptr};
 
 // One-shot work (the pipe's commands, posted fixes): the calls into the game inside it
 // have their own sites; this one catches what escapes them. Never switched off -- it
@@ -172,6 +173,7 @@ void hooked_update(void* self, float dt) {
     // WO-202 I.1 (research only, KCDMP_TEST_CRASH): a deliberate main-thread fault outside every guard, so the crash capture is
     // proven on the path a real engine crash takes.
     if (crash::test_main_fault_due()) *reinterpret_cast<volatile int*>(0x10) = 1;
+    if (const auto drain = g_realtimeDrain.load(std::memory_order_acquire)) drain();
 
     // Swap under the lock and run outside it: queued work may post more work,
     // and holding the lock across a call into the game invites a deadlock.
@@ -204,6 +206,7 @@ void hooked_update(void* self, float dt) {
         if (d > topUs) { topUs = d; topName = r.name; }
     }
 
+    if (const auto drain = g_bulkDrain.load(std::memory_order_acquire)) drain();
     double batchUs = 0;
     uint32_t items = 0;
     if (!batch.empty()) {
@@ -295,6 +298,11 @@ void post_repeating(const char* name, std::function<void()> work) {
     if (test_task_blocked(name)) { r->blocked = true; logf("MAIN: task %s blocked for this game (KCDMP_TEST_TASK_BLOCK, research)", r->name); }
     std::lock_guard<std::mutex> lock(g_mutex);
     g_repeating.push_back(std::move(r));
+}
+
+void set_frame_lanes(Drain realtime, Drain bulk) {
+    g_realtimeDrain.store(realtime, std::memory_order_release);
+    g_bulkDrain.store(bulk, std::memory_order_release);
 }
 
 void post(std::function<void()> work) {

@@ -82,6 +82,8 @@ bool armed();
 // 0x10: [count:1]{[src:1][nameLen:1][name][x:4f][y:4f][z:4f][rot:4f][flags:1]
 //                  [seq:2][senderMs:4][arrivalQpc:8]}*count
 uint8_t on_samples(const uint8_t* body, size_t len, rpmeasure::SampleScope reader);
+// Edge 0x39. One original Ghost/NpcStateDown body plus the Agent's receive QPC.
+uint8_t on_raw_pose(const uint8_t* body, size_t len, rpmeasure::SampleScope reader);
 // 0x12: [ms:2][nameLen:1][name]
 uint8_t on_hold(const uint8_t* body, size_t len);
 // 0x13: [nativeOn:1][senderClockOn:1]

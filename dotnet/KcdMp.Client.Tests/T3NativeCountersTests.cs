@@ -126,7 +126,32 @@ public class T3NativeCountersTests
         Assert.False(T3NativeCounters.TryRead(onlyDenials, out _));
         byte[] missingPresentation = [1, 32, .. bytes.AsSpan(2, 30 * 9), .. bytes.AsSpan(2 + 47 * 9)];
         Assert.False(T3NativeCounters.TryRead(missingPresentation, out _));
-        Assert.True(T3NativeCounters.TryRead(Payload(50), out var future));
+        byte[] unknown = Payload(50);
+        unknown[2 + 49 * 9] = 80;
+        Assert.True(T3NativeCounters.TryRead(unknown, out var future));
         Assert.Equal(49, future.Count);
+    }
+
+    [Fact]
+    public void Edge_lane_counters_extend_the_owner_snapshot_without_exceeding_the_reply_budget()
+    {
+        byte[] bytes = Payload(55);
+        Assert.Equal(497, bytes.Length);
+        Assert.True(T3NativeCounters.TryRead(bytes, out var values));
+        Assert.Equal(47, values["owner_handovers"]);
+        Assert.Equal(49, values["edge_rt_age_ms_p95"]);
+        Assert.Equal(50, values["edge_rt_age_ms_max"]);
+        Assert.Equal(51, values["edge_bulk_age_ms_p95"]);
+        Assert.Equal(52, values["pipe_busy_replies"]);
+        Assert.Equal(53, values["edge_rt_n"]);
+        Assert.Equal(54, values["edge_bulk_n"]);
+
+        for (int n = 50; n < 55; n++) Assert.False(T3NativeCounters.TryRead(Payload(n), out _));
+        byte[] missingOwner = [1, 53, .. bytes.AsSpan(2, 47 * 9), .. bytes.AsSpan(2 + 49 * 9)];
+        Assert.False(T3NativeCounters.TryRead(missingOwner, out _));
+        Assert.True(T3NativeCounters.TryRead(Payload(49), out var old));
+        Assert.DoesNotContain("edge_rt_n", old.Keys);
+        Assert.True(T3NativeCounters.TryRead(Payload(56), out var future));
+        Assert.Equal(55, future.Count);
     }
 }

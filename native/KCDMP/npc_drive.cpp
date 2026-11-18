@@ -28,6 +28,9 @@
 #include "motion.h"
 #include "respawn_actions.h"
 #include "rp_measure.h"
+#include "edge_lanes.h"
+#include "pipe_server.h"
+#include "pose_ring.h"
 #include "combat_actions.h"
 #include "body_drive.h"
 #include "walk_holder.h"
@@ -36,6 +39,7 @@
 #include "wo221.h"
 
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -262,6 +266,8 @@ struct InSample {
     uint32_t senderMs = 0;
     int64_t  arrivalQpc = 0;
     rpmeasure::SampleScope reader{};
+    bool     raw = false, rawGhost = false;
+    int64_t  stateQpc = 0;
     bool     haveSt2 = false;      // WO-121: pipe flag 0x80 -- a peer's avatar sample carries its v8 state block
     motion::State2 st2{};
 };
@@ -270,6 +276,7 @@ struct InHold { char name[64]{}; uint16_t ms = 0; };
 std::mutex            g_inboxMutex;
 std::vector<InSample> g_inSamples;
 std::vector<InHold>   g_inHolds;
+posering::receive::Ring g_inRawPoses(kMaxStreams);
 
 // ---- main-thread state --------------------------------------------------------
 struct RingSample {
@@ -285,6 +292,8 @@ struct Stream {
     int         n = 0;
     bool        haveSeq = false;
     uint16_t    lastSeq = 0;
+    bool        lastRaw = false, lastRawGhost = false;
+    int64_t     lastArrivalQpc = 0;
     uint8_t     flags = 0;
     uint8_t     src = 0;
     double      lastSampleAt = 0;   // local clock of the last sample (accepted or not)
@@ -552,8 +561,16 @@ void push_sample(const InSample& in, double now) {
     // was rejected as "older" until its seq passed the old one -- a bound,
     // frozen puppet (observed solo, WO-118: writes=1 after a peer restart).
     if (s.haveSeq && now - s.lastAcceptedAt > kSeqRestartS) { s.haveSeq = false; s.haveSenderMs = false; }
+    // Raw ghosts have no sequence on the relay wire. A compatibility switch
+    // restarts the local numbering, but the arrival and sender times still
+    // fence a pose which was already superseded on the other path.
+    const bool olderIngress = (in.raw || s.lastRaw) && in.arrivalQpc > 0 && s.lastArrivalQpc > 0 &&
+                             in.arrivalQpc <= s.lastArrivalQpc;
+    const bool sameSource = !s.haveSeq || in.src == s.src;
+    if (!sameSource && !olderIngress) { s.haveSeq = false; s.haveSenderMs = false; }
     bool seqOk = true;
-    if (s.haveSeq) {
+    if (olderIngress) seqOk = false;
+    if (seqOk && s.haveSeq && !in.rawGhost && !s.lastRawGhost) {
         const uint16_t d = static_cast<uint16_t>(in.seq - s.lastSeq);
         if (d == 0 || d > 32768) seqOk = false;
     }
@@ -569,13 +586,21 @@ void push_sample(const InSample& in, double now) {
     if (s.lastSampleAt > 0 && now - s.lastSampleAt >= wo214rules::kResumeBlendS) s.resumedAfterS = now - s.lastSampleAt;   // WO-214 B
     s.lastSampleAt = now;
     g_anySampleAt.store(now, std::memory_order_relaxed);   // WO-215 A: the link's own pulse (any body's sample)
-    s.src = in.src;
     if (!seqOk) return;
+    s.src = in.src;
     if (s.lastAcceptedAt > 0) s.gapEma = wo215rules::gap_ema(s.gapEma, now - s.lastAcceptedAt);   // WO-215 A: the body's own cadence
     s.haveSeq = true; s.lastSeq = in.seq; s.lastAcceptedAt = now;
+    s.lastRaw = in.raw; s.lastRawGhost = in.rawGhost;
+    s.lastArrivalQpc = in.arrivalQpc;
     if (stamped) { s.haveSenderMs = true; s.lastSenderMs = in.senderMs; }
     s.flags = in.flags;
-    if (in.haveSt2) { s.haveSt2 = true; s.st2 = in.st2; s.st2At = now; }
+    if (in.haveSt2) {
+        s.haveSt2 = true; s.st2 = in.st2; s.st2At = now;
+        if (in.stateQpc > 0 && g_qpcPeriod > 0.0) {
+            const double stateAt = qpc_to_s(in.stateQpc);
+            if (stateAt <= now) s.st2At = stateAt;
+        }
+    }
     // The need, measured before this sample joins the ring: how long after the
     // newest sample's stamp the next one actually became renderable. A
     // streaming 95th percentile: up by q steps when above the estimate, down
@@ -621,6 +646,7 @@ void push_sample(const InSample& in, double now) {
     }
     if (s.n == kRingDepth) { for (int i = 1; i < kRingDepth; ++i) s.ring[i - 1] = s.ring[i]; s.n = kRingDepth - 1; }
     s.ring[s.n++] = r;
+    if (in.raw) edge::observe_rt(in.reader.firstByteQpc);
 }
 
 float lerp_angle(float a, float b, float t) {
@@ -1082,6 +1108,22 @@ uint8_t on_samples(const uint8_t* body, size_t len, rpmeasure::SampleScope reade
     return kOk;
 }
 
+uint8_t on_raw_pose(const uint8_t* body, size_t len, rpmeasure::SampleScope reader) {
+    using namespace posering::receive;
+    Pose pose;
+    if (!reader.receiver.connected() || !decode(body, len, pose) ||
+        (reader.firstByteQpc > 0 && pose.arrivalQpc > reader.firstByteQpc)) return kBadRequest;
+    pose.firstByteQpc = reader.firstByteQpc;
+    std::lock_guard<std::mutex> lock(g_inboxMutex);
+    const rpmeasure::ReceiverScope current{wo216::lifecycle_observation_stamp(), pipe::observation_connection()};
+    if (!(reader.receiver == current)) return kOk; // the read occurred before the world/pipe changed
+    const Put result = g_inRawPoses.publish(std::move(pose), {reader.receiver.lifecycle, reader.receiver.connection},
+                                            g_senderClock.load(std::memory_order_relaxed));
+    if (result == Put::Full) return kTableFull;
+    g_statSamples.fetch_add(1, std::memory_order_relaxed);
+    return kOk;
+}
+
 uint8_t on_hold(const uint8_t* body, size_t len) {
     if (len < 4) return kBadRequest;
     InHold h{};
@@ -1090,7 +1132,8 @@ uint8_t on_hold(const uint8_t* body, size_t len) {
     if (nl == 0 || nl > 63 || static_cast<size_t>(3 + nl) != len) return kBadRequest;
     std::memcpy(h.name, body + 3, nl); h.name[nl] = 0;
     std::lock_guard<std::mutex> lock(g_inboxMutex);
-    if (g_inHolds.size() < 1024) g_inHolds.push_back(h);
+    if (g_inHolds.size() >= 1024) return kTableFull;
+    g_inHolds.push_back(h);
     return kOk;
 }
 
@@ -1399,12 +1442,54 @@ void tick() {
 
     std::vector<InSample> samples;
     std::vector<InHold> holds;
+    std::vector<posering::receive::Pose> raw;
+    rpmeasure::ReceiverScope reader;
     {
         std::lock_guard<std::mutex> lock(g_inboxMutex);
         samples.swap(g_inSamples);
         holds.swap(g_inHolds);
+        reader = {wo216::lifecycle_observation_stamp(), pipe::observation_connection()};
+        raw = g_inRawPoses.drain({reader.lifecycle, reader.connection});
     }
-    for (const auto& s : samples) push_sample(s, now);
+    // Playback must obey the same scope as the input slots. Clear only raw
+    // history on an epoch change, leaving the legacy compatibility path intact.
+    static rpmeasure::ReceiverScope rawScope;
+    if (!(rawScope == reader)) {
+        for (auto& row : g_streams) {
+            Stream& stream = row.second;
+            if (!stream.lastRaw) continue;
+            auto name = std::move(stream.name);
+            stream = Stream{};
+            stream.name = std::move(name);
+        }
+        rawScope = reader;
+    }
+    const bool mixed = !samples.empty() && !raw.empty();
+    for (const auto& pose : raw) {
+        static_assert(sizeof(motion::State2) == posering::receive::kStateBytes, "raw Ghost State2 wire layout");
+        InSample sample{};
+        std::memcpy(sample.name, pose.body, sizeof(sample.name));
+        sample.src = pose.source;
+        sample.x = pose.x; sample.y = pose.y; sample.z = pose.z; sample.rot = pose.yaw;
+        sample.flags = pose.flags; sample.seq = pose.sequence; sample.senderMs = pose.senderMs;
+        sample.arrivalQpc = pose.arrivalQpc;
+        sample.reader = {pose.firstByteQpc, reader};
+        sample.raw = true; sample.rawGhost = pose.ghost();
+        sample.stateQpc = pose.stateQpc;
+        sample.haveSt2 = pose.stateQpc != 0;
+        if (sample.haveSt2) std::memcpy(&sample.st2, pose.state.data(), sizeof(sample.st2));
+        samples.push_back(sample);
+    }
+    // A switch or a backed-up old sender can leave both formats in flight.
+    // Apply them in their real arrival order, so an omitted State2 on the
+    // newest transform can still inherit the preceding body state.
+    if (mixed) std::stable_sort(samples.begin(), samples.end(), [](const InSample& a, const InSample& b) {
+        return a.arrivalQpc < b.arrivalQpc;
+    });
+    for (const auto& s : samples) {
+        if (s.raw && (reader.lifecycle != wo216::lifecycle_observation_stamp() || reader.connection != pipe::observation_connection())) continue;
+        push_sample(s, now);
+    }
     for (const auto& h : holds) {
         auto it = g_bound.find(lower(h.name));
         if (it != g_bound.end()) {

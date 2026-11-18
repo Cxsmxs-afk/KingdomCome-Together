@@ -39,6 +39,11 @@ void post_when(std::function<bool()> eligible, std::function<void()> work);
 void post_repeating(std::function<void()> work);
 void post_repeating(const char* name, std::function<void()> work);
 
+// Pipe realtime runs before ordinary repeating work, bulk afterwards. These
+// drains use their own budgets and never wait for the compatibility queue.
+using Drain = void (*)();
+void set_frame_lanes(Drain realtime, Drain bulk);
+
 // WO-151: mp_main_cost -- the per-task frame-cost meter (off by default).
 void set_cost_meter(bool on);
 bool cost_meter();

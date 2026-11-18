@@ -4,6 +4,7 @@
 #include "engine.h"
 #include "fault_guard.h"
 #include "anchors.h"
+#include "edge_console_rules.h"
 #include "holders.h"
 #include "log.h"
 
@@ -178,6 +179,28 @@ void* entity_system() {
 void* console() {
     void* env = genv(); void* con = nullptr;
     return (env && rd(env, kEnvConsole, &con) && is_a(con, g_vftConsole)) ? con : nullptr;
+}
+
+size_t console_execute_slot(const char** why) {
+    HMODULE ss = GetModuleHandleA("CryScriptSystem.dll");
+    if (!ss) { *why = "CryScriptSystem.dll not loaded"; return 0; }
+    int matches = 0;
+    const auto* binding = anchor::function_by_string(ss, "CScriptBind_System::ExecuteCommand", &matches);
+    anchor::Range range{};
+    if (!binding || matches != 1 || !anchor::function_range(ss, binding, &range) || range.begin != binding) {
+        *why = "System.ExecuteCommand's binding not found as one function";
+        return 0;
+    }
+    uint8_t code[0x100]{};
+    const size_t bytes = range.size() < sizeof(code) ? range.size() : sizeof(code);
+    KCDMP_FAULT_READ(site, "engine::console_execute_slot");
+    if (!fault::guarded(site, [&] { std::memcpy(code, binding, bytes); })) {
+        *why = "System.ExecuteCommand's binding unreadable";
+        return 0;
+    }
+    const size_t slot = edgeconsole::execute_slot(code, bytes);
+    *why = slot ? "armed" : "System.ExecuteCommand's console call did not match uniquely";
+    return slot;
 }
 
 void* entity_by_id(uint32_t id) {

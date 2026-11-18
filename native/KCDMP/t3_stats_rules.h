@@ -8,7 +8,7 @@
 
 namespace kcdmp::t3stats {
 constexpr uint8_t kOp = 250;
-constexpr size_t kMaxText = 4096;
+constexpr size_t kMaxText = 6144, kMaxFields = 160;
 
 // Agent-origin numeric counters only: [role 1 host / 2 joiner][key=uint ...].
 // Never accept formatting/control characters into the DLL's log line.
@@ -29,7 +29,7 @@ inline bool valid(const uint8_t* body, size_t len) {
             if (value > ((std::numeric_limits<uint64_t>::max)() - digit) / 10 || ++digits > 20) return false;
             value = value * 10 + digit;
         }
-        if (!digits || ++fields > 128) return false;
+        if (!digits || ++fields > kMaxFields) return false;
         if (i == len) return true;
         if (body[i++] != ' ' || i == len) return false;
     }
