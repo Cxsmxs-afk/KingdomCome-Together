@@ -119,6 +119,20 @@ class SoloLifecycleTests(unittest.TestCase):
         self.assertEqual('127.0.0.1', started[started.index('--Tcp:BindAddress') + 1])
         self.assertEqual(f'http://127.0.0.1:{pair.RELAY_HTTP}', started[started.index('--urls') + 1])
         self.assertEqual('false', started[started.index('--Steam:Enabled') + 1])
+        self.assertTrue(pair.rig.load_state()['relay']['loopback_ready'])
+
+    def test_retry_does_not_reuse_an_unconfirmed_relay_or_another_fault_plan(self):
+        self.own()
+        relay = {'pid': 79, 'loopback': True, 'fault_plan': ''}
+        state = {'solo_run': self.run_id, 'relay': relay}
+        pair.rig.save_state(state)
+        with patch.object(pair.procs, 'start') as start, patch.object(pair.procs, 'matches', side_effect=bool):
+            self.assertEqual(2, pair.relay(profile='normal', loopback=True))
+            relay['loopback_ready'] = True
+            pair.rig.save_state(state)
+            self.assertEqual(2, pair.relay('cut.json', loopback=True))
+            self.assertEqual(0, pair.relay(profile='normal', loopback=True))
+            start.assert_not_called()
 
     def test_old_relay_is_refused_and_apphost_target_support_is_checked(self):
         self.own()

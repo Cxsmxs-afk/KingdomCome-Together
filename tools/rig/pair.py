@@ -370,10 +370,10 @@ def relay(plan_file=None, *, profile=None, loopback=False):
         plan_file = POOR_NETWORK
     active = st.get('relay')
     if procs.matches(active):
-        if loopback and not active.get('loopback'):
-            rig.say('the existing relay was not started on the loopback address')
+        if loopback and (not active.get('loopback') or not active.get('loopback_ready')):
+            rig.say('both listeners of the existing loopback relay were not confirmed')
             return 2
-        if profile is not None and active.get('fault_plan', '') != (plan_file or ''):
+        if (loopback or profile is not None) and active.get('fault_plan', '') != (os.path.abspath(plan_file) if plan_file else ''):
             rig.say('running relay has another network profile; stop it before starting the requested profile')
             return 2
         rig.say('relay already up')
@@ -406,6 +406,9 @@ def relay(plan_file=None, *, profile=None, loopback=False):
                 ready = f.read()
                 if (('TCP listener bound to 127.0.0.1:%d.' % RELAY_PORT).encode('ascii') in ready and
                     ('HTTP loopback ready on http://127.0.0.1:%d.' % RELAY_HTTP).encode('ascii') in ready):
+                    if not procs.matches(rec): break
+                    rec['loopback_ready'] = True
+                    record_start(st, 'relay', rec)
                     return 0
             time.sleep(0.2)
         rig.say('both loopback relay listeners were not confirmed')
