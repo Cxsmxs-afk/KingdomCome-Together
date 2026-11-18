@@ -41,6 +41,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\KcdMp.Protocol\KcdMp.Protocol.csproj" />
+    <ProjectReference Include="..\KcdMp.LogPack\KcdMp.LogPack.csproj" />
     <!-- WO-127: Steam as an optional connection path (RelayConnector). -->
     <ProjectReference Include="..\KcdMp.Steam\KcdMp.Steam.csproj" />
     <InternalsVisibleTo Include="KcdMp.Client.Tests" />

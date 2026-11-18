@@ -1132,6 +1132,7 @@ public partial class GameBridge(ClientConfig config)
 
     public async Task RunAsync(CancellationToken ct = default)
     {
+        _guidedRunLifetime = ct;
         _loadSequenceRuntime = true;
         var http = new HttpGameTransport(config.GameApiBase) { RetryBatches = config.BatchRetryEnabled };   // WO-153 3
         await http.StartAsync(ct);
@@ -2414,6 +2415,7 @@ public partial class GameBridge(ClientConfig config)
             // decided before the per-WO teardowns below, which read it (the save lock stays, the leave does not run, the host stays shown)
             if (!appCt.IsCancellationRequested)
             {
+                GuidedRunObserveLoss(stream);
                 WorldReconnectHostLost(appCt);
                 try { await Wo211TryHoldAsync("relay-lost"); } catch (Exception ex) { Console.WriteLine($"WO211-LINK hold failed: {ex.Message}"); }
             }
@@ -4863,6 +4865,7 @@ public partial class GameBridge(ClientConfig config)
                     payload = kept;
                 }
                 if (W202("ping_network") && Wo202TakeAtRead(type, payload)) continue;   // WO-202 III.2: the network's answers, never behind the queue
+                if (type == Protocol.Disconnect && payload.Length == 1) GuidedRunObserveLoss(stream, payload[0]);
                 WorldReconnectObserveAtRead(presentationSession, type, payload);
                 if (Wo206TakeAtRead(type, payload)) continue;   // WO-206 E: an epoch is known from the frame it arrives in, never behind the queue
                 uint stamp = Wo206StampAtRead(payload);         // WO-206 E: the world epoch this frame was sent under
@@ -6074,6 +6077,7 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private void OnGameEvent(string name, string arg)
     {
+        if (name == "guided_run") { GuidedRunGameEvent(arg); return; }
         if (_sessionRecorder is not null && TestRecordingOptions.AllowsGameEvent(name))
             RecordGameEvent(name, arg);
         // WO-38: the world-clock reading is consumed regardless of the

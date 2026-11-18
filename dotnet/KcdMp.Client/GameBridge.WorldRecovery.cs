@@ -37,7 +37,12 @@ public partial class GameBridge
         {
             if (WorldRecoveryWire.TryReadDigest(body, out var digest) && digest.Scope == receiver.Scope &&
                 digest.SnapshotId == receiver.Snapshot)
+            {
+                // The Relay only sends these after accepting this baseline's
+                // acknowledgement, even during a quiet interval with no events.
+                receiver.ServerInstalled = true;
                 ReceiveWorldDigest(receiver, digest);
+            }
             return;
         }
         if (!WorldRecoveryWire.TryReadChunk(body, out var chunk) || chunk.Digest.Scope != receiver.Scope ||

@@ -200,11 +200,15 @@ public static class VerdictRules
         rows.AddRange(WorldEvents(samples));
         rows.AddRange(WorldRecovery(samples, role));
         rows.Add(BotPlan(input));
+        var guidedRun = GuidedRunVerdictEvidence.Evaluate(input, role);
+        if (guidedRun is not null) rows.Add(guidedRun);
 
         // Traffic observable on this machine is required for green. Optional
         // rows are still shown as grey and any measured warning or fault wins.
         var status = rows.Where(row => row.Status is VerdictStatus.Yellow or VerdictStatus.Red)
             .Select(row => row.Status).DefaultIfEmpty(queue.Status).Max();
+        if (status == VerdictStatus.Green && guidedRun?.Status == VerdictStatus.Grey)
+            status = VerdictStatus.Grey;
         return new(status, role, rows.AsReadOnly());
     }
 

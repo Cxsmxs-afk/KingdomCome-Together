@@ -71,6 +71,20 @@ EOF
     pwsh -NoLogo -NoProfile -NonInteractive -File tools/rig/Test-Solo-Abend.ps1
     python3 tools/Test-NoInputTooling.py tools/rig/Solo-Abend.ps1 tools/rig/scen_solo_abend.py
     python3 tools/Test-NoScreenshots.py tools/rig/Solo-Abend.ps1 tools/rig/scen_solo_abend.py
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/rig -p 'test_guided_*.py'
+    pwsh -NoLogo -NoProfile -NonInteractive -File tools/Test-TestlaufSynthetic.ps1
+    guided_sources=(kdcmp/Data/Scripts/Startup/kdcmp.lua
+        dotnet/KcdMp.Client/GuidedRun.cs dotnet/KcdMp.Client/GameBridge.GuidedRun.cs
+        dotnet/KcdMp.Client/GameBridge.GuidedRunLogs.cs dotnet/KcdMp.LogPack/GuidedRunVerdictEvidence.cs
+        tools/rig/scen_guided_run.py tools/Test-TestlaufSynthetic.ps1 tools/Test-TestlaufSynthetic.lua)
+    for guided_source in "${guided_sources[@]}"; do
+        if [ ! -f "$guided_source" ]; then
+            echo "Guided-run source missing: $guided_source" >&2
+            exit 1
+        fi
+    done
+    python3 tools/Test-NoInputTooling.py "${guided_sources[@]}"
+    python3 tools/Test-NoScreenshots.py "${guided_sources[@]}"
 fi
 dotnet run --project tools/sim/KcdMp.Sim/KcdMp.Sim.csproj -c Release -- --label "$label" --out "$out" "${extra[@]}"
 if [ "$label" = ci ]; then
