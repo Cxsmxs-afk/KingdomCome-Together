@@ -22,7 +22,9 @@ constexpr uint32_t kBitDrive = 1u << 2;             // C: a walking human copy i
 constexpr uint32_t kBitHolders = 1u << 3;           // C.3: one table of who holds a body
 constexpr uint32_t kBitOwnHorse = 1u << 4;          // D: each player's own horse (the quest gate's horse rule on this machine)
 constexpr uint32_t kBitCorpseLook = 1u << 5;        // E.1: a dead body's wounds from the host's body
-constexpr uint32_t kBitsDefault = kBitCombatActionEnd | kBitTalkHold | kBitDrive | kBitHolders | kBitOwnHorse | kBitCorpseLook;
+constexpr uint32_t kBitRemoteController = 1u << 6;  // the partner's figure uses the engine movement request
+constexpr uint32_t kBitsDefault = kBitCombatActionEnd | kBitTalkHold | kBitDrive | kBitHolders | kBitOwnHorse | kBitCorpseLook |
+                                  kBitRemoteController;
 
 uint8_t role();            // 0 none, 1 the host, 2 a joiner in the host's world
 bool on(uint32_t bit);     // the agent's word, less the bench twin's

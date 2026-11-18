@@ -13,6 +13,7 @@ namespace kcdmp::edgelanes {
 
 constexpr uint8_t kReply = 0xB8, kRawPose = 0x39, kProbe = 0x3A, kProbeReply = 0xBA;
 constexpr uint8_t kTimedAction = 0x3B, kTimedPose = 0x3C, kTimelineConfig = 0x3D;
+constexpr uint8_t kRemoteRelocation = 0x3E;
 constexpr uint8_t kVersion = 1;
 constexpr size_t kRequestHeader = 10, kReplyHeader = 6;
 constexpr size_t kRtLimit = 192, kBulkLimit = 256;

@@ -21,6 +21,7 @@ int holder_contract_tests(int* passed);
 int edge_lanes_tests(int* passed);
 int rp_timeline_tests(int* passed);
 int rp_timeline_action_tests(int* passed);
+int rp_controller_tests(int* passed);
 
 bool run_tests(const char* name, int (*suite)(int*)) {
     int passed = 0;
@@ -34,12 +35,14 @@ int main() {
     passed &= run_tests("modeled DLL lanes", &edge_lanes_tests);
     passed &= run_tests("modeled presentation clock", &rp_timeline_tests);
     passed &= run_tests("presentation action order", &rp_timeline_action_tests);
+    passed &= run_tests("remote movement and relocation", &rp_controller_tests);
     return passed ? 0 : 1;
 }
 EOF
     "${CXX:-c++}" -std=c++17 -I native/KCDMP "$native_tmp/main.cpp" \
         native/tests/holder_contract_tests.cpp native/tests/edge_lanes_tests.cpp \
-        native/tests/rp_timeline_tests.cpp native/tests/rp_timeline_action_tests.cpp -o "$native_tmp/native-contracts"
+        native/tests/rp_timeline_tests.cpp native/tests/rp_timeline_action_tests.cpp \
+        native/tests/rp_controller_tests.cpp -o "$native_tmp/native-contracts"
     native_result="$("$native_tmp/native-contracts")"
     printf '%s\n' "$native_result"
 fi

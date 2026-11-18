@@ -4724,7 +4724,7 @@ public partial class GameBridge(ClientConfig config)
         ct = receiveLife.Token;
         P6BeginReceive(stream, ct);
         var tpConnection = T3TpBeginReceive(stream, ct);
-        var presentationSession = new PresentationSession(stream);
+        var presentationSession = new PresentationSession(stream, ct);
         Volatile.Write(ref _presentationSession, presentationSession);
         PresentationResetNative(ct);
         _ = PresentationClockLoopAsync(presentationSession, ct);
@@ -4824,6 +4824,7 @@ public partial class GameBridge(ClientConfig config)
                 if (W202("ping_network") && Wo202TakeAtRead(type, payload)) continue;   // WO-202 III.2: the network's answers, never behind the queue
                 if (Wo206TakeAtRead(type, payload)) continue;   // WO-206 E: an epoch is known from the frame it arrives in, never behind the queue
                 uint stamp = Wo206StampAtRead(payload);         // WO-206 E: the world epoch this frame was sent under
+                NotePresentationRelocationAtRead(presentationSession, type, payload, arrival, stamp);
                 if (p6Frame)
                 {
                     Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp)
@@ -4901,8 +4902,12 @@ public partial class GameBridge(ClientConfig config)
             // WO-121: the v8 state block rides the same sample, so the DLL's
             // per-frame gait / crouch / combat hold for this avatar sees it in
             // the frame the position does.
-            bool timeForwarded = _nativeWriteOn && PresentationReady(presentation, out long connection) &&
-                _combat.PostPresentationPose((byte)type, payload, arrival, presentation.SampleMs, presentation.HostAtArrivalMs, connection);
+            bool timeForwarded = false;
+            if (_nativeWriteOn && PresentationReady(presentation, out long connection))
+            {
+                OfferPresentationRelocation(gs, arrival, presentation, connection);
+                timeForwarded = _combat.PostPresentationPose((byte)type, payload, arrival, presentation.SampleMs, presentation.HostAtArrivalMs, connection);
+            }
             if (!timeForwarded && !EdgeForwardPose(type, payload, arrival))
                 _nativeFeed.Enqueue(new NativeNpcSample(gs.GhostId, "kcd2mp_" + gs.GhostId, gs.X, gs.Y, gs.Z, gs.RotZ,
                     gs.IsRiding ? (byte)0x10 : (byte)0, gSeq, gs.SenderMs, arrival, gs.State2));
@@ -6085,6 +6090,7 @@ public partial class GameBridge(ClientConfig config)
                 // every event still in flight for the old one is now invalid.
                 if (previousEntityId is uint had && had != (uint)rawId)
                     BumpGhostGeneration(giParts[0], $"entity 0x{had:X} -> 0x{rawId:X}");
+                if (previousEntityId != (uint)rawId) NotePresentationGhostSpawn(giParts[0], (uint)rawId);
                 Console.WriteLine($"[combatviz] ghost {giParts[0]} entity id 0x{rawId:X} cached for native swings");
 
                 // WO-88 finding 2: a NEW entity id for a ghost we already

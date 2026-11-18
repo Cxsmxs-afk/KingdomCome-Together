@@ -181,6 +181,33 @@ public sealed class EdgePipeTests
     }
 
     [Fact]
+    public async Task A_relocation_fence_rechecks_scope_at_the_physical_writer()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var body = new RemoteRelocationApproval(7, 100, RemoteRelocationReason.Join, new(1, 2, 3), 20, 1).Build();
+        int current = 1;
+        await conn.Writer.WaitAsync(conn.Token);
+        Task<EdgePipeReply> stale;
+        try
+        {
+            stale = conn.Pipe.EdgeRequestAsync(0x3E, body, 0x81, EdgeLane.Realtime, conn.Token,
+                beforeWrite: () => Volatile.Read(ref current) == 1);
+            Volatile.Write(ref current, 0);
+        }
+        finally { conn.Writer.Release(); }
+        Assert.Equal(EdgeOutcome.Unavailable, (await stale).Outcome);
+        var valid = conn.Pipe.EdgeRequestAsync(0x3E, body, 0x81, EdgeLane.Realtime, conn.Token,
+            beforeWrite: () => Volatile.Read(ref current) == 0);
+        var frame = await conn.Read(Request);
+        Assert.Equal(new byte[] { 1, 0x3E, 0, 0, 0, 0 }, frame[4..10]);
+        Assert.Equal(body, frame[10..]);
+        Assert.Equal(2u, Id(frame)); // the first request was skipped before any bytes were written
+        await conn.Respond(Id(frame), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        Assert.Equal(EdgeOutcome.Completed, (await valid).Outcome);
+    }
+
+    [Fact]
     public async Task The_writer_keeps_fifo_within_each_lane_and_gives_waiting_bulk_every_fourth_turn()
     {
         await using var conn = new Connection();

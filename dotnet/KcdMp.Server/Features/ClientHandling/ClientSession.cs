@@ -1010,6 +1010,9 @@ public class ClientSession
                         { routeFrom = Protocol.JoinFrom.Joiner; invalid = !MeasuredMissileRequest.TryDecode(p6.Text, out _); }
                         else if (p6.Kind == Protocol.W164RealHit && p6.Text.StartsWith("m1|", StringComparison.Ordinal))
                         { routeFrom = Protocol.JoinFrom.Host; invalid = !MeasuredMissileResult.TryDecode(p6.Text, out _); }
+                        else if (p6.Kind == Protocol.W164Travel &&
+                                 W164Text.TryParseTravel(p6.Text, out char travel, out _, out _, out _))
+                            routeFrom = travel == 'r' ? Protocol.JoinFrom.Joiner : Protocol.JoinFrom.Host;
                         if (invalid) { _clientHandler.CountDrop((byte)type, "p6-malformed", p6.Kind); continue; }
                     }
                     var dest = _broadcastService.RouteJoin(this, jw.Down, routeFrom, body, out string why);

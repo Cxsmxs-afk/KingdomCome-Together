@@ -464,10 +464,10 @@ bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) 
                            (request.frame.body[0] == wo216::kOpLifecycle ||
                             request.frame.body[0] == pipecontrol::kEdgeCapabilities);
     const bool latest = nested == kSetPartner || nested == kReadBodyState || nested == kReadLocalState;
-    const bool timeline = nested == kTimedAction || nested == kTimedPose || nested == kTimelineConfig;
-    if (lifecycle || (nested > kPinLabel && nested != kRawPose && nested != kProbe && !timeline) ||
+    const bool presentation = nested == kTimedAction || nested == kTimedPose || nested == kTimelineConfig || nested == kRemoteRelocation;
+    if (lifecycle || (nested > kPinLabel && nested != kRawPose && nested != kProbe && !presentation) ||
         (request.lane == Lane::Latest && !latest) ||
-        ((nested == kRawPose || timeline) && request.lane != Lane::Realtime) || (nested == kProbe && request.lane != Lane::Bulk))
+        ((nested == kRawPose || presentation) && request.lane != Lane::Realtime) || (nested == kProbe && request.lane != Lane::Bulk))
         return reject(Status::Unsupported);
     if (nested != kRawPose && !pipecontrol::complete_payload_allowed(request.frame))
         return reject(Status::Invalid);
@@ -1703,6 +1703,12 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 const auto r = t_edgeReply ? timelineactions::submit(body, len,
                     {incoming.readerObservation, generation + 1, incoming.readerLife}, incoming.readerTick) : timelineactions::Invalid;
                 send_result(h, r == timelineactions::Accepted, seq, static_cast<uint8_t>(r));
+                break;
+            }
+            case edgelanes::kRemoteRelocation: {
+                const uint8_t r = t_edgeReply ? npcdrive::authorize_remote_relocation(body, len,
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}}) : npcdrive::kBadRequest;
+                send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
             case edgelanes::kProbe: {

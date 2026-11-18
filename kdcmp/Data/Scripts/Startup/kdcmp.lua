@@ -2312,6 +2312,24 @@ function KCD2MP_SetPerf(arg)
     return true
 end
 
+-- Match the native remote Writer's ordinary correction bounds if this
+-- installation has confirmed writer handovers but Lua owns the body.
+function KCD2MP_PartnerWriterStep(e, x, y, z, yaw, speed, dt)
+    local ok, p, a = pcall(function() return e:GetWorldPos(), e:GetWorldAngles() end)
+    if not ok or not p or not a or not (p.x and p.y and p.z and a.z) then return end
+    local dx, dy, dz = x - p.x, y - p.y, z - p.z
+    local turn = (yaw - a.z + math.pi) % (2 * math.pi) - math.pi
+    local distance = math.sqrt(dx * dx + dy * dy)
+    if distance ~= distance or distance == math.huge or dz ~= dz or math.abs(dz) == math.huge or turn ~= turn then return end
+    local elapsed = math.max(0, math.min(dt, 0.05))
+    local allowance = math.max(0.9, math.min((speed or 0) + 0.9, 6.5)) * elapsed
+    if distance > allowance then
+        x, y = p.x + dx * allowance / distance, p.y + dy * allowance / distance
+    end
+    local height, angle = 2.5 * elapsed, 3.2 * elapsed
+    return x, y, p.z + math.max(-height, math.min(dz, height)), a.z + math.max(-angle, math.min(turn, angle))
+end
+
 -- True when the smoothed pose has moved far enough from the last SetWorldPos
 -- to be worth another one. A settled ghost used to call into the entity
 -- transform path every 20 ms for a fraction of a millimetre.
@@ -14281,18 +14299,26 @@ function KCD2MP_InterpTick(arg, gen)
                 -- no position/angle writes; the one-shot owns the body
             elseif istate.nativeOwned or KCD2MP_NpcNativeLeaseBusy("kcd2mp_" .. tostring(id)) then
                 -- WO-118 Phase 2b: KCDMP.dll writes this ghost every frame at its frame hook
-            elseif not istate.nativeMounted and KCD2MP_PoseChanged(istate, x, y, sz, r) then
-                local _, err = pcall(function()
-                    local sp, sa = SCRATCH.SETPOS, SCRATCH.SETANG
-                    sp.x, sp.y, sp.z = x, y, sz
-                    sa.x, sa.y, sa.z = 0, 0, r
-                    ghost.entity:SetWorldPos(sp)
-                    ghost.entity:SetWorldAngles(sa)
-                end)
-                if err then
-                    System.LogAlways("[KCD2-MP] InterpTick err '" .. id .. "': " .. tostring(err))
-                    ghost.entity = nil
-                    ok = false
+            elseif not istate.nativeMounted then
+                local wx, wy, wz, wr = x, y, sz, r
+                if KCD2MP._npcNative.confirmedRelease and KCD2MP_W221On and KCD2MP_W221On("rp_controller") then
+                    wx, wy, wz, wr = KCD2MP_PartnerWriterStep(ghost.entity, x, y, sz, r, istate.smoothedSpeed, dt)
+                end
+                if wx and KCD2MP_PoseChanged(istate, wx, wy, wz, wr) then
+                    local _, err = pcall(function()
+                        local sp, sa = SCRATCH.SETPOS, SCRATCH.SETANG
+                        sp.x, sp.y, sp.z = wx, wy, wz
+                        sa.x, sa.y, sa.z = 0, 0, wr
+                        ghost.entity:SetWorldPos(sp)
+                        ghost.entity:SetWorldAngles(sa)
+                    end)
+                    if err then
+                        System.LogAlways("[KCD2-MP] InterpTick err '" .. id .. "': " .. tostring(err))
+                        ghost.entity = nil
+                        ok = false
+                    else
+                        x, y, sz = wx, wy, wz
+                    end
                 end
             end
             if ok then
@@ -36913,7 +36939,7 @@ do
         combat_action_end = "mp_combat_action_end", talk_hold = "mp_talk_hold", drive = "mp_drive", holders = "mp_holders",
         shop_keeper = "mp_shop_keeper", own_horse = "mp_own_horse", talk_force = "mp_talk_force",
         corpse_look = "mp_corpse_look", horse_drop = "mp_horse_drop", saddlebags = "mp_saddlebags", route_quiet = "mp_route_quiet", cart_seat = "mp_cart_seat", cart_wheels = "mp_cart_wheels",
-        ragdoll_once = "mp_ragdoll_once",
+        ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller",
     }
     W221.HELP = {
         combat_action_end = "A: (both) no combat animation of ours outlives its body's combat part (the joiner's fight crash)",
@@ -36930,6 +36956,7 @@ do
         cart_wheels = "E.2: (joiner) the wheels of a cart's copy turn with the way the copy moves",
         talk_force = "B: (joiner) a talk the person never answers (the request and its retry time out) is started the game's forced way",
         ragdoll_once = "A: (joiner) a fresh corpse is laid down by one ragdoll at a time, after the game's own death action had its time, never when it already lies",
+        rp_controller = "Move the partner's figure through the game's movement request when the body supports it",
     }
     function KCD2MP_W221On(name)
         local v = W221.on[tostring(name)]

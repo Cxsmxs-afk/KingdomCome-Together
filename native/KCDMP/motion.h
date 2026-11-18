@@ -99,6 +99,9 @@ void body_frame(const char* key, void* ent, uint32_t eid, float renderSpeedMps, 
 void body_released(const char* key, uint32_t eid);
 // The accepted engine jump owns the attached figure until it lands or falls.
 bool figure_jump_hold(uint32_t eid, void* ent, double now);
+// An attached Driver has a fresh jump receipt awaiting its ordinary Writer
+// handover. This is a fallback request, not an active engine jump.
+bool figure_jump_pending(uint32_t eid, void* ent, double now);
 // WO-154 2: the avatar's identity at spawn, by its soul's guid (the agent's isolate call); main thread.
 void identity(const unsigned char guid[16], bool on);
 // WO-154 2: the session is over: every avatar identity this DLL set is cleared; main thread.

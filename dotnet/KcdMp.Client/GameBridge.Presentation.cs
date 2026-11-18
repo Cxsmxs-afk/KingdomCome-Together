@@ -12,10 +12,12 @@ public partial class GameBridge
 {
     private const byte PresentationConfigType = 0x3D, PresentationActionType = 0x3B, PresentationResult = 0x81;
     private readonly record struct PresentationFrame(PresentationSession? Session, ulong Epoch, ulong SampleMs, ulong HostAtArrivalMs);
-    private sealed class PresentationSession(Stream relay)
+    private sealed class PresentationSession(Stream relay, CancellationToken lifetime)
     {
         public readonly Stream Relay = relay;
+        public readonly CancellationToken Lifetime = lifetime;
         public readonly PresentationClockClient Clock = new();
+        public readonly RemoteRelocationProofs Relocations = new();
         public ulong Epoch { get; private set; }
 
         public bool AcceptEpoch(ulong epoch, out bool changed)

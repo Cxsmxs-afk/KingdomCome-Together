@@ -7,6 +7,7 @@
 #include "wo216.h"
 #include "respawn_actions.h"
 #include "rp_measure.h"
+#include "rp_controller.h"
 #include "rp_timeline.h"
 #include "wo201.h"
 
@@ -46,5 +47,16 @@ inline size_t timeline_stats(uint8_t* out, size_t cap) {
     const uint64_t counts[] = {timeline.buffer_ms, timeline.extrap_ms_max, timeline.late_samples,
                                timeline.action_pos_skew_ms_p95, timeline.pose_n, timeline.action_n};
     return write_timeline(out, cap, counts);
+}
+
+inline size_t controller_stats(uint8_t* out, size_t cap) {
+    const auto controller = rpctrl::snapshot();
+    const uint64_t counts[] = {controller.ctrl_frames, controller.req_ok, controller.req_fail,
+                               controller.fallback_jump, controller.fallback_mount,
+                               controller.fallback_ragdoll, controller.fallback_air,
+                               controller.hard_tp_join, controller.hard_tp_respawn, controller.hard_tp_travel,
+                               controller.hard_tp_unapproved, controller.pulls_per_min,
+                               controller.pulls, controller.pull_observed_ms};
+    return write_controller(out, cap, counts);
 }
 } // namespace kcdmp::t3native

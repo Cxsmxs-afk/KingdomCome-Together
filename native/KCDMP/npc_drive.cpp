@@ -29,6 +29,7 @@
 #include "respawn_actions.h"
 #include "rp_measure.h"
 #include "rp_timeline.h"
+#include "rp_controller.h"
 #include "edge_lanes.h"
 #include "pipe_server.h"
 #include "pose_ring.h"
@@ -383,6 +384,8 @@ struct Puppet {
     bool     tellDrop = false;
     bool     pendingSeatPlace = false;
     bool     timed = false;
+    rpctrl::Proof relocation{};
+    int64_t relocationQpc = 0;
     float    anchor[3]{};
     double   delay = 0.12;
     double   lateApplied = 0;       // the jitter allowance in use (slewed toward late_target)
@@ -502,6 +505,7 @@ bool drop(std::unordered_map<std::string, Puppet>::iterator it, uint8_t reason, 
     motion::body_released(it->second.key.c_str(), it->second.eid);   // WO-121: gait/combat hand the body back
     rpmeasure::forget(it->second.eid);
     rptimeline::forget(it->second.eid);
+    rpctrl::forget(it->second.eid);
     if (tell) notify_drop(reason, it->second.name);
     if (reason == kNotLiving) {   // WO-147: remembered for the hit gate (a ragdoll is a moment, not a release)
         const double t = now_s();
@@ -1183,6 +1187,7 @@ uint8_t configure_timeline(uint8_t on) {
     for (auto& row : g_streams) row.second.timed.reset();
     for (auto& row : g_bound) {
         auto& body = row.second;
+        body.relocation.consume();
         if (!body.timed) continue;
         body.timed = false;
         body.haveLast = body.havePrev = false;
@@ -1191,6 +1196,34 @@ uint8_t configure_timeline(uint8_t on) {
     }
     rptimeline::configure(on == 1);
     logf("MP-RP-TIMELINE mode=%s", on ? "on" : "off");
+    return kOk;
+}
+
+uint8_t authorize_remote_relocation(const uint8_t* body, size_t len, rpmeasure::SampleScope reader) {
+    if (!body || len != 18 || !reader.receiver.connected() || reader.firstByteQpc <= 0 ||
+        !wo221::on(wo221::kBitRemoteController)) return kBadRequest;
+    const uint8_t peer = body[0], reason = body[5];
+    if (reason < static_cast<uint8_t>(rpctrl::Relocation::Join) || reason > static_cast<uint8_t>(rpctrl::Relocation::Travel))
+        return kBadRequest;
+    const rpmeasure::ReceiverScope current{wo216::lifecycle_observation_stamp(), pipe::observation_connection()};
+    if (!(reader.receiver == current)) return kBadRequest;
+    uint32_t eid = 0;
+    std::memcpy(&eid, body + 1, sizeof eid);
+    rpctrl::Proof proof;
+    proof.kind = static_cast<rpctrl::Relocation>(reason);
+    proof.lifecycle = current.lifecycle;
+    proof.connection = current.connection;
+    proof.receivedMs = local_ms(qpc_to_s(reader.firstByteQpc));
+    std::memcpy(proof.endpoint, body + 6, sizeof proof.endpoint);
+    if (!proof.valid(local_ms(now_s()), current.lifecycle, current.connection) || !rpctrl::finite_position(proof.endpoint))
+        return kBadRequest;
+    char name[16]{};
+    std::snprintf(name, sizeof name, "kcd2mp_%u", static_cast<unsigned>(peer));
+    const auto it = g_bound.find(name);
+    if (!eid || it == g_bound.end() || it->second.eid != eid || it->second.pendingDrop != kOk ||
+        !it->second.ent || engine::entity_by_id(eid) != it->second.ent) return kNoEntity;
+    it->second.relocation = proof;
+    it->second.relocationQpc = reader.firstByteQpc;
     return kOk;
 }
 
@@ -1525,6 +1558,8 @@ void tick() {
     // history on an epoch change, leaving the legacy compatibility path intact.
     static rpmeasure::ReceiverScope rawScope;
     rptimeline::synchronize(reader);
+    const bool remoteControllerOn = wo221::on(wo221::kBitRemoteController);
+    rpctrl::synchronize(remoteControllerOn, reader);
     if (!(rawScope == reader)) {
         for (auto& row : g_streams) {
             Stream& stream = row.second;
@@ -1648,6 +1683,7 @@ void tick() {
         const bool figure = p.name.rfind("kcd2mp_", 0) == 0;
         uint8_t measuredPeer = 0;
         const bool measure = figure && rpmeasure::partner_id(p.name, measuredPeer) && measuredPeer == s.src;
+        const bool remoteController = figure && remoteControllerOn;
         const uint64_t nowMs = local_ms(now);
         const bool useTimeline = measure && rptimeline::enabled() && s.timed && s.timed->live(nowMs) &&
                                  (s.lastUntimedQpc <= s.lastTimedQpc || s.timed->fresh(nowMs));
@@ -1661,10 +1697,29 @@ void tick() {
         auto timed = useTimeline ? s.timed->render(nowMs) : rptimeline::Output{};
         if (useTimeline) rptimeline::note_target(p.eid, measuredPeer, timed.targetHostMs);
         const uint8_t flags = timed.ready() ? timed.source.flags : s.flags;
+        motion::State2 timelineState{};
+        const bool haveTimelineState = timed.source.stateHostMs != 0;
+        if (haveTimelineState) std::memcpy(&timelineState, timed.source.state.data(), sizeof timelineState);
         // A body that became parented after the bind (a rider mounting, a body
         // picked up) has LOCAL coordinates: never written until it is free.
         void* parent = nullptr;
         const bool parented = get_parent(e, &parent) && parent != nullptr;
+        const float vertical = timed.ready() ? timed.vz : stream_vz(s);
+        const bool jumpHold = motion::figure_jump_hold(p.eid, e, now);
+        const bool down = (flags & (0x01 | 0x02)) != 0 || wo210kd::held_down(p.eid) ||
+                          (remoteController && (timelineState.bits & motion::kBitDowned) != 0);
+        int flying = 0;
+        const bool actualAir = remoteController && !parented && !down && living_flying(e, &flying) && flying != 0;
+        // Short height impulses in the interpolation are normal on a stair.
+        // Use the checked living-physics flag or a sustained source slope.
+        const float airborne = actualAir ? 2.f : remoteController && timed.ready() ? stream_vz(s) : vertical;
+        const auto fallback = remoteController
+            ? rpctrl::fallback(jumpHold || motion::figure_jump_pending(p.eid, e, now),
+                               parented || (flags & 0x10) != 0, down, airborne)
+            : rpctrl::Fallback::None;
+        if (p.relocation.kind != rpctrl::Relocation::None &&
+            (!remoteController || !p.relocation.valid(nowMs, reader.lifecycle, reader.connection)))
+            p.relocation.consume();
         // WO-187 B2: a hold already running ends when the host's NPC breaks into a run (the stream moves on without the copy)
         if (now < p.holdUntil && wo187::chase_follow_on() && stream_speed(s) >= wo187rules::kChaseFollowMps) {
             p.holdUntil = now;
@@ -1758,10 +1813,10 @@ void tick() {
         // decides among them, records the holder and counts every hand-over. Off (the twin): the writer's own yield rules, as 0.65.0.
         const bool tableOn = holders::on();
         holders::Claims hc;
-        hc.fall = (flags & (0x01 | 0x02 | 0x10)) != 0 || wo210kd::held_down(p.eid);
+        hc.fall = down || (flags & 0x10) != 0;
         hc.mount = parented;
         hc.oneShot = now < p.holdUntil || g_unboundShots.count(p.eid) != 0 ||
-                     motion::figure_jump_hold(p.eid, e, now) || action_owns_pose(p.eid);
+                     jumpHold || action_owns_pose(p.eid);
         const auto activity = g_activityHeld.find(p.eid);
         hc.seat = seatHeld || (!seatPlace && activity != g_activityHeld.end() && activity->second == holders::Holder::Seat);
         // The old switch retains its yield policy. Admission at the actual
@@ -1786,6 +1841,7 @@ void tick() {
             const bool stopped = hold == holders::Holder::Probe ? bodydrive::release(p.eid, "probe")
                                                                  : stop_movement(p.eid, "held");
             if (!stopped || !holders::handover(p.eid, p.name.c_str(), hold, now)) { ++it; continue; }
+            if (remoteController && measure) rpctrl::fallback(p.eid, measuredPeer, fallback);
             p.seatPrevWriter = holders::name(hold);
             // WO-163 (A5): a swing hold is a fight hold -- the frame is an unwritten one, the engine's position is what is seen.
             // The other reasons are not a fight: no hold, no step across them.
@@ -1812,6 +1868,7 @@ void tick() {
             if (psOk) p.noPhys = !ps.present;   // WO-215 A: physics comes and goes with this machine's physics range
             if (!p.beast && psOk && ps.present && !ps.living) {   // WO-144: a horse's is never a living entity
                 auto cur = it++;
+                if (remoteController && measure) rpctrl::fallback(p.eid, measuredPeer, rpctrl::Fallback::Ragdoll);
                 drop(cur, kNotLiving, true);
                 continue;
             }
@@ -1846,7 +1903,7 @@ void tick() {
         const bool fightNow = wo216::on(wo216rules::kBitRouteReplay)
                                   ? ((flags & (0x08 | 0x20)) != 0 || now < p.holdUntil || wo209::mirrored(p.eid))
                                   : ((flags & (0x04 | 0x08)) != 0 || now < p.holdUntil || wo209::mirrored(p.eid));
-        const float vzNow = timed.ready() ? timed.vz : stream_vz(s);
+        const float vzNow = vertical;
         const bool oneHolder = kcdmp::walkhold::driver_class(figure, p.beast, parented, p.human, !p.noPhys, fightNow, vzNow);
         // Phase 2: a player and a walking person render on a fixed delay. The
         // adaptive play-out and the lateness slew stay for horses and fights.
@@ -1887,10 +1944,57 @@ void tick() {
             p.blendPending = true; p.blendWhy = "extrap-end"; c_extrapEnds.fetch_add(1, std::memory_order_relaxed);
         }
         p.extrapolating = holding;
+        const auto availableRelocation = [&] {
+            if (!remoteController || !useTimeline || seatPlace || fallback != rpctrl::Fallback::None ||
+                p.relocation.kind == rpctrl::Relocation::None || s.lastTimedQpc < p.relocationQpc)
+                return false;
+            const float confirmed[3] = {timed.source.x, timed.source.y, timed.source.z};
+            float actual[3];
+            return read_pos(e, actual) &&
+                   p.relocation.allows(nowMs, reader.lifecycle, reader.connection, confirmed, actual);
+        };
+        const bool hardRelocation = availableRelocation();
+        if (remoteController && useTimeline && !hardRelocation && !seatPlace && fallback == rpctrl::Fallback::None &&
+            p.human && !p.beast && !p.noPhys && !fightNow) {
+            bodydrive::RemoteIn in;
+            in.eid = p.eid; in.peer = measuredPeer; in.ent = e; in.name = p.name.c_str();
+            std::memcpy(in.pose, pose, sizeof in.pose);
+            in.vx = timed.vx; in.vy = timed.vy;
+            const bool predicted = timed.extrapMs || timed.appliedHostMs < timed.targetHostMs;
+            in.pace = haveTimelineState && !predicted ? timelineState.speedCm / 100.f : segMps;
+            in.crouch = haveTimelineState && (timelineState.bits & motion::kBitCrouch) != 0;
+            in.now = now;
+            float observed[3]{};
+            const auto driven = bodydrive::remote_frame(in, observed);
+            if (driven == bodydrive::Remote::Draining) { ++it; continue; }
+            if (driven == bodydrive::Remote::Driven) {
+                // The engine's previous update is observable here. A request
+                // alone is not evidence that it reached this timeline pose.
+                if (rpctrl::distance(observed, pose) <= 0.15f && std::fabs(wrap_pi(yaw_of(e) - pose[3])) <= 0.20f) {
+                    rptimeline::note_pose(p.eid, measuredPeer, timed);
+                    if (reachedSample && reachedSample->sourceId == measuredPeer) {
+                        rpmeasure::note_pose(measuredPeer, p.eid, reachedSample->reader, reachedSample->senderMs,
+                                             static_cast<uint32_t>(local_ms(now)), 0.0, false);
+                    }
+                }
+                const double age = haveTimelineState ? (timed.appliedHostMs - timed.source.stateHostMs) / 1000.0 : 1e9;
+                if (predicted) timelineState.speedCm = static_cast<uint16_t>(segMps * 100.f);
+                motion::body_frame(p.key.c_str(), e, p.eid, in.pace, timed.vx, timed.vy,
+                                   haveTimelineState ? &timelineState : nullptr, age, now, -1);
+                p.haveLast = p.havePrev = false;
+                p.blendPending = true;
+                p.blendWhy = "controller-handover";
+                p.seatPrevWriter = "driver";
+                ++it;
+                continue;
+            }
+        }
+        if (figure && !bodydrive::release(p.eid, "partner writer handover")) { ++it; continue; }
+        if (remoteController && measure) rpctrl::fallback(p.eid, measuredPeer, fallback);
         // WO-215 A: the route. A copy on the ground moves by the engine's own movement request toward its stream (the writer does not
         // write it); the writer corrects a body the stream left over mp_route_correct_m behind (a blend, never a snap) and keeps what the
         // route cannot do: figures, beasts, riders, falls, fighting bodies, a body whose request the engine refused (wo215_rules.h).
-        if (!seatPlace && !useTimeline) {
+        if (!seatPlace && !useTimeline && !remoteController) {
             wo215::RouteIn ri;
             ri.eid = p.eid; ri.ent = e; ri.name = p.name.c_str();
             const RingSample& nsm = s.ring[s.n - 1];
@@ -1986,6 +2090,10 @@ void tick() {
             ++it;
             continue;
         }
+        if (hardRelocation) {
+            pose[0] = timed.source.x; pose[1] = timed.source.y; pose[2] = timed.source.z; pose[3] = timed.source.yaw;
+            p.haveLast = p.havePrev = p.blendPending = p.blending = false;
+        }
         if (p.blendPending) {
             blend_start(p, e, pose);
             // WO-214 A.3: a blend over 1 m, with the stream's own last gap -- a big blend on a stream that had no 1 s gap is the receiver's
@@ -2010,8 +2118,14 @@ void tick() {
             kcdmp::walkhold::limit_step(p.last[0], p.last[1], pose[0], pose[1], pace, static_cast<float>(dt));
             p.speedMps = pace;
         }
-        if (fixedTl && !p.beast && std::fabs(vzNow) <= kcdmp::walkhold::kAirVzMps)
+        if (!hardRelocation && fixedTl && !p.beast && std::fabs(vzNow) <= kcdmp::walkhold::kAirVzMps)
             snap_pose_floor(p, pose, vzNow, now);
+        if (remoteController && !hardRelocation) {
+            float observed[3];
+            if (!read_pos(e, observed) || !rpctrl::finite_position(observed) ||
+                !rpctrl::finite_position(pose) || !std::isfinite(pose[3])) { ++it; continue; }
+            rpctrl::soften(observed, yaw_of(e), pose, useTimeline ? segMps : p.speedMps, dt);
+        }
         bool wrote = false;
         // WO-121: the rendered planar speed (this pose against the last one written).
         if (p.haveLast && dt > 0.0005) {
@@ -2043,6 +2157,9 @@ void tick() {
             return;
         }
         if (wrote) { ++writing; g_statWrites.fetch_add(1, std::memory_order_relaxed); npctrace::note_write(e, pose); }
+        if (wrote && remoteController && measure && p.curValid && rpctrl::distance(pose, p.curRead) > rpctrl::kHardStepM)
+            rpctrl::place(p.eid, measuredPeer, hardRelocation ? p.relocation.kind : rpctrl::Relocation::None);
+        if (wrote && hardRelocation) p.relocation.consume();
         if (useTimeline && !seatPlace && matched && pose[0] == streamX && pose[1] == streamY &&
             std::fabs(wrap_pi(pose[3] - timed.yaw)) < 0.001f)
             rptimeline::note_pose(p.eid, measuredPeer, timed);
@@ -2064,15 +2181,13 @@ void tick() {
         const double renderAt = now - renderDelay;
         const double gapS = s.n > 0 && renderAt > s.ring[s.n - 1].at ? renderAt - s.ring[s.n - 1].at : -1.0;
         if (useTimeline) {
-            motion::State2 state{};
-            if (timed.source.stateHostMs) std::memcpy(&state, timed.source.state.data(), sizeof state);
             // Locomotion eases to rest with the capped prediction. Other
             // posture bits retain the same timestamp and freshness rule.
             const bool predicted = timed.extrapMs || timed.appliedHostMs < timed.targetHostMs;
-            if (predicted) state.speedCm = static_cast<uint16_t>(segMps * 100.f);
-            const double age = timed.source.stateHostMs ? (timed.appliedHostMs - timed.source.stateHostMs) / 1000.0 : 1e9;
+            if (predicted) timelineState.speedCm = static_cast<uint16_t>(segMps * 100.f);
+            const double age = haveTimelineState ? (timed.appliedHostMs - timed.source.stateHostMs) / 1000.0 : 1e9;
             motion::body_frame(p.key.c_str(), e, p.eid, segMps, timed.vx, timed.vy,
-                               timed.source.stateHostMs ? &state : nullptr, age, now, -1);
+                               haveTimelineState ? &timelineState : nullptr, age, now, -1);
         } else {
             motion::body_frame(p.key.c_str(), e, p.eid, p.speedMps, p.velX, p.velY,
                                s.haveSt2 ? &s.st2 : nullptr, s.haveSt2 ? now - s.st2At : 1e9, now, gapS);

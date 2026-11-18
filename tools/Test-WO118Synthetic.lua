@@ -599,6 +599,19 @@ do
     check("owner: no Lua errors", #ERRS == 0, ERRS[1])
 end
 
+do
+    reset(); NOW = 1400
+    local e = mkEntity("kcd2mp_8", 10, 20, 1)
+    e.rz = math.pi - 0.05
+    local x, y, z, yaw = KCD2MP_PartnerWriterStep(e, 100, 120, 20, -math.pi + 0.2, 8, 1)
+    local travel = math.sqrt((x - 10)^2 + (y - 20)^2)
+    check("controller: Lua fallback bounds an unproved horizontal jump", travel > 0 and travel <= 0.326, travel)
+    check("controller: Lua fallback bounds height", z > 1 and z <= 1.126, z)
+    check("controller: Lua fallback takes the shortest bounded turn", yaw > e.rz and yaw - e.rz <= 0.161, yaw)
+    e.GetWorldAngles = function() return nil end
+    check("controller: Lua fallback defers without an observed pose", KCD2MP_PartnerWriterStep(e, 100, 120, 20, 3, 8, 1) == nil)
+end
+
 -- Summary, in the shared driver's contract (Test-NpcSmoothSynthetic.ps1 reads
 -- the global OUT).
 local pass, fail = 0, 0

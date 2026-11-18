@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // WO-121 -- movement and combat on native-written bodies. See motion.h.
 #include "motion.h"
+#include "motion_remote_rules.h"
 #include "wo178.h"
 #include "wo163_rules.h"
 #include "fault_guard.h"
@@ -41,12 +42,14 @@
 #include "log.h"
 #include "hits.h"
 #include "p4.h"
+#include "pipe_server.h"
 #include "pe_exports.h"
 #include "script_context.h"
 #include "wo195.h"
 #include "wo195_rules.h"
 #include "wo201_rules.h"
 #include "wo215.h"
+#include "wo216.h"
 #include "body_drive.h"
 
 namespace kcdmp::motion {
@@ -264,6 +267,7 @@ struct Body {
     int   copySlot = -1;          // WO-201 follow-up B9: index into g_copyTable, -1 none
     // moves
     bool crouchApplied = false;
+    double crouchReadbackUntil = -1.0;   // only the verified remote Driver's own request
     uint8_t autoMode = 255;       // WO-166 C1: the automation pattern applied while held in combat (255 = none)
     // combat
     bool automationOff = false, combatHeld = false, blockApplied = false;
@@ -285,6 +289,7 @@ std::unordered_map<uint32_t, Body> g_bodies;
 std::unordered_map<uint32_t, double> g_freshPending;   // WO-167 C1: a fresh-spawn mark that came before its body was bound (main thread)
 std::atomic<uint32_t> c_freshPulses{0};
 constexpr double kNudgeAfterS = 0.1, kNudgeS = 0.6;
+constexpr double kCrouchReadbackS = 0.6;
 constexpr float kNudgeMps = 0.3f;   // WO-155: the T-pose pulse (body_frame)
 
 // WO-132: NPC copies engaged on a joiner -- the host NPC's combat state (a
@@ -355,6 +360,8 @@ std::mutex g_evMutex;
 std::vector<PendingEvent> g_events;
 struct FigureJump { void* ent = nullptr; double acceptedAt = 0; bool airborne = false; };
 std::unordered_map<uint32_t, FigureJump> g_figureJumps;   // main thread only
+struct DeferredJump { remote::JumpScope scope; double deadline; };
+std::unordered_map<uint32_t, DeferredJump> g_deferredJumps;   // only attached figures, Main
 
 // ---- captured actions (any thread -> main thread) --------------------------------
 struct Captured {
@@ -821,10 +828,13 @@ void unpublish_gait(Body& b);
 void release_gait(Body& b) {
     unpublish_gait(b);   // WO-129: the tag update is the engine's own again from the next frame
     if (!b.gaitWritten || !b.actor) return;
-    void* fn = vslot(b.actor, kActorSetPseudoSpeed);
-    if (fn == A.fnSetPseudo) {
-        auto permit = stream_permit(b.eid);
-        if (permit && call_f(fn, b.actor, 0.0f)) permit.wrote();
+    // A fresh engine request already supplies the gait when the Driver takes over.
+    if (!bodydrive::driven(b.eid)) {
+        void* fn = vslot(b.actor, kActorSetPseudoSpeed);
+        if (fn == A.fnSetPseudo) {
+            auto permit = stream_permit(b.eid);
+            if (permit && call_f(fn, b.actor, 0.0f)) permit.wrote();
+        }
     }
     b.gaitWritten = false;
 }
@@ -836,17 +846,36 @@ std::atomic<uint32_t> c_gaitHeld{0};   // WO-190 A4: frames a body's gait was he
 std::atomic<uint32_t> c_locoFrames[2]{}, c_locoGlide[2]{}, c_locoInPlace[2]{}, c_locoClsChanges[2]{};
 
 void apply_crouch(Body& b, bool want) {
-    if (!b.exp) b.exp = expansion_of(b.actor);
+    const bool driver = b.avatar && bodydrive::driven(b.eid) && holders::of(b.eid) == holders::Holder::Driver;
+    // Refresh through the current actor when the Driver changes stance. A
+    // replaced expansion must never receive a request through a cached slot.
+    if (driver && actor_by_eid(b.eid) != b.actor) return;
+    if (driver || !b.exp) b.exp = expansion_of(b.actor);
     if (!b.exp) { if (c_crouchApplyFail.fetch_add(1) < 5) logf("WO135-CROUCH body=%s apply refused: no state expansion", b.key.c_str()); return; }
     void* fn = vslot(b.exp, kExpSetCrouch);
-    if (fn != A.fnSetCrouch) { if (c_crouchApplyFail.fetch_add(1) < 5) logf("WO135-CROUCH body=%s apply refused: SetCrouch slot mismatch", b.key.c_str()); return; }
-    auto permit = stream_permit(b.eid);
+    if (!fn || fn != A.fnSetCrouch) { if (c_crouchApplyFail.fetch_add(1) < 5) logf("WO135-CROUCH body=%s apply refused: SetCrouch slot mismatch", b.key.c_str()); return; }
+    auto permit = driver ? holders::may_place(b.eid, holders::Holder::Driver, holders::kRemoteControllerSetter,
+                                              holders::Claim::Held) : stream_permit(b.eid);
     if (!permit) return;
     if (!call_bb(fn, b.exp, want, false)) { c_faults.fetch_add(1); g_moves = false; g_whyMoves = "SetCrouch faulted"; return; }
     permit.wrote();
     b.crouchApplied = want;
+    // A successful call alone does not confirm the body has changed stance.
+    b.crouchReadbackUntil = driver ? npcdrive::now_s() + kCrouchReadbackS : -1.0;
     c_crouch.fetch_add(1);
     logf("WO121-MOTION body=%s crouch=%d", b.key.c_str(), want ? 1 : 0);
+}
+
+void confirm_driver_crouch(Body& b, double now) {
+    if (b.crouchReadbackUntil < 0.0) return;
+    if (!bodydrive::driven(b.eid) || holders::of(b.eid) != holders::Holder::Driver ||
+        actor_by_eid(b.eid) != b.actor) { b.crouchReadbackUntil = -1.0; return; }
+    bool actual = false;
+    if (actor_is_crouched(b.actor, &actual) && actual == b.crouchApplied) {
+        logf("MP-RP-CTRL-STANCE body=%s eid=0x%X owner=driver crouch=%d result=confirmed", b.key.c_str(), b.eid, actual ? 1 : 0);
+    } else if (now < b.crouchReadbackUntil) return;
+    else logf("MP-RP-CTRL-STANCE body=%s eid=0x%X owner=driver crouch=%d result=unconfirmed", b.key.c_str(), b.eid, b.crouchApplied ? 1 : 0);
+    b.crouchReadbackUntil = -1.0;
 }
 
 void set_guard_flag(Body& b, uint8_t v) {
@@ -1609,7 +1638,11 @@ void body_frame(const char* key, void* ent, uint32_t eid, float renderSpeedMps, 
     const bool fresh = st && stAgeS < 1.5;
     // gait
     // WO-215 A: a routed copy's gait is its own movement system's -- the request's speed class and its own locomotion; ours stays off it
-    const bool gaitOn = g_gait && (b.avatar ? g_cfgAvatarGait.load() : g_cfgNpcGait.load()) && (b.avatar || (!wo215::routed(eid) && !bodydrive::driven(eid)));   // WO-221 C: a driven copy's gait is the engine's
+    // A delivered native movement request carries the gait class. The old
+    // pseudo-speed and velocity/tag setters stay on the transform author.
+    const bool engineDriven = bodydrive::driven(eid);
+    const bool gaitOn = g_gait && !engineDriven && (b.avatar ? g_cfgAvatarGait.load()
+                                                            : g_cfgNpcGait.load() && !wo215::routed(eid));
     if (gaitOn) {
         float s = (b.avatar && fresh) ? st->speedCm / 100.0f : renderSpeedMps;
         // A render step faster than any gait (> 9 m/s) is a snap or a teleport,
@@ -1742,6 +1775,7 @@ void body_frame(const char* key, void* ent, uint32_t eid, float renderSpeedMps, 
         const bool want = fresh && (st->bits & kBitCrouch);
         if (want != b.crouchApplied) apply_crouch(b, want);
     } else if (b.crouchApplied) apply_crouch(b, false);
+    confirm_driver_crouch(b, now);
     // combat
     if (g_combat && g_cfgCombat) {
         // WO-187 C2: a quiet stream (no fresh sample) keeps the partner's last fresh combat state for kFigureLingerS -- the guard idle stays
@@ -1762,9 +1796,13 @@ void body_frame(const char* key, void* ent, uint32_t eid, float renderSpeedMps, 
 }
 
 void identity(const unsigned char guid[16], bool on) { avatar_identity(guid, on); }
-void on_pipe_closed() { release_identities("the agent went away"); }
+void on_pipe_closed() {
+    g_deferredJumps.clear();
+    release_identities("the agent went away");
+}
 
 void body_released(const char* key, uint32_t eid) {
+    g_deferredJumps.erase(eid);
     g_figureJumps.erase(eid);
     auto it = g_bodies.find(eid);
     if (it == g_bodies.end()) return;
@@ -1787,12 +1825,56 @@ bool figure_jump_hold(uint32_t eid, void* ent, double now) {
         }
         // The request is consumed by the next controller update. Wait briefly
         // for its first readback, then follow the engine's landing edge.
-        constexpr double kTakeoffReadbackS = 0.25;
-        if (!jump.airborne && now - jump.acceptedAt < kTakeoffReadbackS) return true;
+        if (!jump.airborne && now - jump.acceptedAt < remote::kJumpHandoverS) return true;
         if (jump.airborne && !read) return true;
     }
     g_figureJumps.erase(it);
     return false;
+}
+
+namespace {
+
+remote::JumpScope jump_scope(uint32_t eid, void* ent) {
+    return {ent, actor_by_eid(eid), wo216::lifecycle_observation_stamp(), pipe::observation_connection(), p4::life_edge_tick()};
+}
+
+void launch_stream_jump(Body& b, void* ent, double now) {
+    using holders::Holder;
+    const Holder previous = holders::of(b.eid);
+    if (!b.actor || !remote::stream_may_jump(previous) || actor_by_eid(b.eid) != b.actor) return;
+    void* exp = expansion_of(b.actor);
+    void* fn = exp ? vslot(exp, kExpRequestJump) : nullptr;
+    const bool hooked = fn == reinterpret_cast<void*>(&hk_request_jump) && g_origJump;
+    if (!hooked && (!fn || fn != A.fnRequestJump)) return;
+    float origin[3];
+    int flying = 0;
+    if (!engine::entity_world_pos(ent, origin) || !npcdrive::living_flying(ent, &flying) || flying) return;
+    if (!holders::handover(b.eid, b.key.c_str(), Holder::OneShot, now)) return;
+    bool ok = false;
+    bool attempted = false;
+    bool ran = false;
+    {
+        auto permit = holders::may_place(b.eid, Holder::OneShot, "motion::RequestJump", holders::Claim::Held);
+        if (permit) {
+            attempted = true;
+            ran = hooked ? call_jump(g_origJump, exp, &ok) : call_ret_b(fn, exp, &ok);
+            if (ran && ok) permit.wrote();
+            if (!ran) c_faults.fetch_add(1);
+        }
+    }
+    if (attempted && (ok || !ran)) g_figureJumps[b.eid] = {ent, now, false};
+    else holders::handover(b.eid, b.key.c_str(), previous, now);
+    (ok ? c_jumps : c_jumpFail).fetch_add(1);
+    logf("WO121-MOTION eid=0x%X jump -> %s", b.eid, ok ? "accepted" : "refused");
+}
+
+} // namespace
+
+bool figure_jump_pending(uint32_t eid, void* ent, double now) {
+    const auto it = g_deferredJumps.find(eid);
+    if (it == g_deferredJumps.end() || !g_moves || !g_cfgMoves) return false;
+    const auto& jump = it->second;
+    return now < jump.deadline && jump.scope.matches(jump_scope(eid, ent));
 }
 
 // WO-154 2: the local player's body is down when its physics is no living entity: the ragdoll of a
@@ -1897,6 +1979,18 @@ void tick() {
     }
     std::vector<PendingEvent> evs;
     { std::lock_guard<std::mutex> lock(g_evMutex); evs.swap(g_events); }
+    const double now = npcdrive::now_s();
+    for (auto jump = g_deferredJumps.begin(); jump != g_deferredJumps.end();) {
+        const uint32_t eid = jump->first;
+        void* ent = engine::entity_by_id(eid);
+        const auto disposition = remote::jump_after_handover(jump->second.scope, jump_scope(eid, ent), jump->second.deadline, now, holders::of(eid));
+        if (g_moves && g_cfgMoves && disposition == remote::JumpDisposition::Wait) { ++jump; continue; }
+        if (g_moves && g_cfgMoves && disposition == remote::JumpDisposition::Submit) {
+            auto body = g_bodies.find(eid);
+            if (body != g_bodies.end() && body->second.avatar && body->second.ent == ent) launch_stream_jump(body->second, ent, now);
+        }
+        jump = g_deferredJumps.erase(jump);
+    }
     for (const auto& e : evs) {
         if (e.kind == 2) { rearm_nudge(e.eid, "a loop was stopped (the agent)"); continue; }   // WO-160
         if (e.kind == 3) { mark_fresh(e.eid); continue; }   // WO-167 C1: a fresh spawn (a stand-in)
@@ -1907,35 +2001,13 @@ void tick() {
         // Only this attached figure's current actor may receive the request.
         if (!ent || it == g_bodies.end() || !it->second.avatar || it->second.ent != ent) continue;
         Body& b = it->second;
-        void* exp = b.exp ? b.exp : (b.actor ? expansion_of(b.actor) : nullptr);
-        void* fn = exp ? vslot(exp, kExpRequestJump) : nullptr;
-        const bool hooked = fn == reinterpret_cast<void*>(&hk_request_jump) && g_origJump;
-        if (!hooked && (!fn || fn != A.fnRequestJump)) continue;
-        float origin[3];
-        int flying = 0;
-        if (!engine::entity_world_pos(ent, origin) || !npcdrive::living_flying(ent, &flying) || flying) continue;
-        using holders::Holder;
-        const Holder previous = holders::of(e.eid);
-        const bool fromStream = previous == Holder::Writer || previous == Holder::Figure;
-        if (!fromStream) continue;
-        const double now = npcdrive::now_s();
-        if (!holders::handover(e.eid, b.key.c_str(), Holder::OneShot, now)) continue;
-        bool ok = false;
-        bool attempted = false;
-        bool ran = false;
-        {
-            auto permit = holders::may_place(e.eid, Holder::OneShot, "motion::RequestJump", holders::Claim::Held);
-            if (permit) {
-                attempted = true;
-                ran = hooked ? call_jump(g_origJump, exp, &ok) : call_ret_b(fn, exp, &ok);
-                if (ran && ok) permit.wrote();
-                if (!ran) c_faults.fetch_add(1);
-            }
+        if (holders::of(e.eid) == holders::Holder::Driver) {
+            const auto scope = jump_scope(e.eid, ent);
+            if (scope.actor == b.actor && scope.actor && scope.connection)
+                g_deferredJumps.try_emplace(e.eid, DeferredJump{scope, now + remote::kJumpHandoverS});
+        } else {
+            launch_stream_jump(b, ent, now);
         }
-        if (attempted && (ok || !ran)) g_figureJumps[e.eid] = {ent, now, false};
-        else holders::handover(e.eid, b.key.c_str(), previous, now);
-        (ok ? c_jumps : c_jumpFail).fetch_add(1);
-        logf("WO121-MOTION eid=0x%X jump -> %s", e.eid, ok ? "accepted" : "refused");
     }
     if (!g_freshPending.empty()) {   // WO-167 C1: a mark whose body never came
         const double now = npcdrive::now_s();

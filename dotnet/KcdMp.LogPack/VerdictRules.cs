@@ -63,6 +63,8 @@ public static class VerdictRules
     public const long EdgeRealtimeGreenBelowMs = 34;
     public const long TimelineBufferMinMs = 60, TimelineBufferMaxMs = 120, TimelineExtrapolationMaxMs = 200;
     public const long TimelineSkewGreenBelowMs = 20, TimelineSkewYellowBelowMs = 50;
+    public const long ControllerStepMinPermille = 900, ControllerStepMaxPermille = 1100;
+    public const long ControllerPullsGreenBelowPermille = 200;
 
     private const string T3 = "MP-T3-STATS";
     private const string W136 = "MP-WO136-STATS";
@@ -114,7 +116,8 @@ public static class VerdictRules
         new("ranged_missile_uncertain", VerdictStatus.Red, RequiresActivity: "ranged_missile_requests",
             RequiresHostActivity: "ranged_missile_measured_accept"),
         new("proc_awaits_per_frame_max", VerdictStatus.Red, RequiresActivity: "edge_proc_n"),
-        new("http_calls_rt", VerdictStatus.Red, RequiresActivity: "edge_rt_n")
+        new("http_calls_rt", VerdictStatus.Red, RequiresActivity: "edge_rt_n"),
+        new("rp_hard_tp_unsafe", VerdictStatus.Red, RequiresActivity: "rp_ctrl_frames")
     ];
 
     private sealed record PresentationRule(string Id, string Coverage, string Unit = "", string? AlternateCoverage = null,
@@ -148,7 +151,18 @@ public static class VerdictRules
         new("rp_buffer_ms", "rp_timeline_pose_n", " ms"),
         new("rp_extrap_ms_max", "rp_timeline_pose_n", " ms"),
         new("rp_late_samples", "rp_timeline_pose_n", ReportNonZeroWithoutCoverage: true),
-        new("rp_action_pos_skew_ms_p95", "rp_timeline_skew_n", " ms")
+        new("rp_action_pos_skew_ms_p95", "rp_timeline_skew_n", " ms"),
+        new("rp_ctrl_frames", "rp_ctrl_frames"),
+        new("rp_req_ok", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
+        new("rp_req_fail", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
+        new("rp_fallback_by_jump", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
+        new("rp_fallback_by_mount", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
+        new("rp_fallback_by_ragdoll", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
+        new("rp_fallback_by_air", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
+        new("rp_hard_tp_by_join", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
+        new("rp_hard_tp_by_respawn", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
+        new("rp_hard_tp_by_travel", "rp_ctrl_frames", ReportNonZeroWithoutCoverage: true),
+        new("rp_pulls_per_min", "rp_pull_observed_ms", " / min")
     ];
 
     private sealed record Sample(string Marker, string Role, string Origin, Dictionary<string, string> Fields)
@@ -273,18 +287,23 @@ public static class VerdictRules
                 (rule.Id == "owner_violations" && sample.Marker == OwnerViolation))
             .Select(sample => (Sample: sample, Value: sample.Number(rule.Id), Count: rule.Count(sample)))
             .Where(observation => observation.Value.HasValue && ((observation.Count > 0 &&
-                (rule.Coverage != "rp_owner_n" || HasOwnerCounters(observation.Sample))) ||
+                (rule.Coverage != "rp_owner_n" || HasOwnerCounters(observation.Sample)) &&
+                (rule.Id != "rp_pulls_per_min" || HasPullEvidence(observation.Sample, observation.Value.Value, observation.Count.GetValueOrDefault()))) ||
                 (rule.ReportNonZeroWithoutCoverage && observation.Value > 0))).ToList();
         if (observations.Count == 0)
             return Missing(rule.Id, $"Keine belegte Stichprobe in {T3}, {rule.Coverage}");
 
-        var (source, observed, count) = observations.MaxBy(observation => observation.Value);
+        // A scope-matched skeleton comparison takes precedence over a raw
+        // number from the status line, which carries no paired capture.
+        var pairedStep = rule.Id == "rp_step_ratio" ? observations.FirstOrDefault(x => x.Sample.Marker == StepPair) : default;
+        var (source, observed, count) = pairedStep.Value.HasValue ? pairedStep : observations.MaxBy(observation => observation.Value);
         long value = observed!.Value;
-        string measurement = rule.Id == "rp_step_ratio"
-            ? (value / 1000m).ToString("0.000", CultureInfo.InvariantCulture)
+        string measurement = rule.Id is "rp_step_ratio" or "rp_pulls_per_min"
+            ? (value / 1000m).ToString("0.000", CultureInfo.InvariantCulture) + rule.Unit
             : Format(value, rule.Unit);
         string evidence = $"{source.Marker}, {source.Origin}";
-        if (count is long samplesCount && samplesCount > 0) evidence += $", n={Format(samplesCount, "")}";
+        if (count is long samplesCount && samplesCount > 0)
+            evidence += rule.Id == "rp_pulls_per_min" ? $", {Format(samplesCount, " ms")} beobachtet" : $", n={Format(samplesCount, "")}";
 
         switch (rule.Id)
         {
@@ -315,6 +334,12 @@ public static class VerdictRules
                 var skew = value < TimelineSkewGreenBelowMs ? VerdictStatus.Green :
                     value < TimelineSkewYellowBelowMs ? VerdictStatus.Yellow : VerdictStatus.Red;
                 return new(rule.Id, skew, measurement, evidence + ", Host-Zeit der ausgelösten Aktion und der dargestellten Pose");
+            case "rp_step_ratio" when source.Marker == StepPair:
+                var step = value is >= ControllerStepMinPermille and <= ControllerStepMaxPermille ? VerdictStatus.Green : VerdictStatus.Yellow;
+                return new(rule.Id, step, measurement, evidence + ", gepaarte Skelettmessung");
+            case "rp_pulls_per_min":
+                var pulls = value < ControllerPullsGreenBelowPermille ? VerdictStatus.Green : VerdictStatus.Yellow;
+                return new(rule.Id, pulls, measurement, evidence + ", Position der tatsächlich geführten Figur");
             case "owner_violations":
                 // The native guard can assert before the next periodic count.
                 if (source.Marker == OwnerViolation) return new(rule.Id, VerdictStatus.Red, "≥1", evidence);
@@ -328,6 +353,10 @@ public static class VerdictRules
 
     private static bool HasOwnerCounters(Sample sample) => sample.Number("owner_handovers").HasValue
         && sample.Number("owner_denied_sets").HasValue;
+
+    private static bool HasPullEvidence(Sample sample, long rate, long observedMs) =>
+        sample.Number("rp_pull_n") is long pulls &&
+        Math.Min(long.MaxValue, Math.Floor(pulls * 60_000_000m / observedMs)) == rate;
 
     private static Sample? ReadStepPair(Briefing.Input input)
     {
