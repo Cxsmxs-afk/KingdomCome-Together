@@ -2,12 +2,15 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using KcdMp.Client;
 using KcdMp.Server;
+using KcdMp.Server.Features.ClientHandling;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
 namespace KcdMp.Relay.Tests;
@@ -223,13 +226,30 @@ public class RelayRoundTripTests : IClassFixture<RelayFixture>
 
     private async Task<(Peer A, Peer B)> TwoPeersAsync()
     {
+        // The relay releases wire IDs asynchronously when a prior pair closes.
+        // Alpha must take the lowest free ID before Bravo joins this fixture.
+        var clients = _relay.Services.GetRequiredService<ClientHandler>();
+        long started = Stopwatch.GetTimestamp();
+        while (clients.ClientCount != 0)
+        {
+            Assert.True(Stopwatch.GetElapsedTime(started) < Wait, "The previous relay peers have not disconnected.");
+            await Task.Delay(10);
+        }
         var a = await Peer.ConnectAsync(_relay.TcpPort, "alpha");
-        var b = await Peer.ConnectAsync(_relay.TcpPort, "bravo");
-        // Let the relay finish both ready-handshakes before anything is sent,
-        // otherwise a Position from A can race B's TryMarkReady and be
-        // (correctly) not forwarded.
-        await Task.Delay(100);
-        return (a, b);
+        Peer? b = null;
+        try
+        {
+            b = await Peer.ConnectAsync(_relay.TcpPort, "bravo");
+            Assert.Equal(new byte[] { 1 }, await a.ReadUntilAsync(Protocol.CombatRole, Wait));
+            Assert.Equal(new byte[] { 0 }, await b.ReadUntilAsync(Protocol.CombatRole, Wait));
+            return (a, b);
+        }
+        catch
+        {
+            if (b is not null) await b.DisposeAsync();
+            await a.DisposeAsync();
+            throw;
+        }
     }
 
     // ---- Position 0x01 -> Ghost 0x02 (protocol v8, WO-121) ----------------
