@@ -158,7 +158,7 @@ static class Host125
 
     static string Tag(World w) => w.Seed is uint s ? WhsSave.SeedTag(s) : "-";
     static uint _hitVerdictId;   // WO-161: the host's hit numbering (hverdict)
-    private sealed record BotJoinScope(byte Peer, uint JoinId);
+    private sealed record RunningCalendar(BotHostSessions.Join Scope, long WorldMs, double Start);
 
     public static async Task<int> RunAsync(string[] a, string release, BotHostOptions? bot = null)
     {
@@ -207,6 +207,9 @@ static class Host125
         if (bot is not null) handshake.CancelAfter(TimeSpan.FromSeconds(5));
         await tcp.ConnectAsync(host, port, handshake.Token);
         var st = tcp.GetStream();
+        if (bot is not null)
+            await st.WriteAsync(RelayConnector.BuildHandshake(name, release), handshake.Token);
+        else
         {
             var nb = Encoding.UTF8.GetBytes(name); var rb = Encoding.UTF8.GetBytes(release);
             int hl = 2 + nb.Length + rb.Length; var hs = new byte[3 + hl];
@@ -214,7 +217,14 @@ static class Host125
             hs[3] = Protocol.Version; hs[4] = (byte)nb.Length; nb.CopyTo(hs, 5); rb.CopyTo(hs, 5 + nb.Length);
             await st.WriteAsync(hs, handshake.Token);
         }
-        var inbox = Channel.CreateUnbounded<(byte Type, byte[] Payload)>();
+        var botSessions = bot is null ? null : new BotHostSessions();
+        var inbox = Channel.CreateUnbounded<(byte Type, byte[] Payload, BotHostSessions.Peer? Peer)>();
+        void ObservePeer(byte type, byte[] payload)
+        {
+            if (botSessions is null) return;
+            if (type == Protocol.Name && payload.Length != 0) botSessions.Announce(payload[0]);
+            if (type == Protocol.Disconnect && payload is [var id]) botSessions.Disconnect(id);
+        }
         async Task<(byte, byte[])> Read(CancellationToken ct)
         {
             var h = new byte[3]; await st.ReadExactlyAsync(h, ct);
@@ -230,6 +240,7 @@ static class Host125
             while (true)
             {
                 var (type, data) = await Read(handshake.Token);
+                ObservePeer(type, data);
                 if (type != Protocol.CombatRole) continue;
                 if (data is not [1]) { Say("BOT-T4 role=host refused=relay_role"); return 2; }
                 break;
@@ -246,10 +257,25 @@ static class Host125
         double walkUntil = 0; float wvx = 0, wvy = 0, wvz = 0; int walkGen = 0;                                                   // WO-148: walk
         var readyAt = new TaskCompletionSource<double>(TaskCreationOptions.RunContinuationsAsynchronously);
         int played = 0;
-        BotJoinScope? readyJoin = null, pickupJoin = null;
+        BotHostSessions.Join? pickupJoin = null;
+        RunningCalendar? runningCalendar = null;
         var pickupReplies = new Dictionary<(byte Kind, uint Token), (string Request, LootMsg Reply)>();
         bool roleLost = false;
-        async Task W(byte[] pkt) { if (linkQuiet) return; await wlock.WaitAsync(hard.Token); try { await st.WriteAsync(pkt, hard.Token); } finally { wlock.Release(); } }
+        async Task W(byte[] pkt, CancellationToken? cancellationToken = null, Func<bool>? stillCurrent = null)
+        {
+            if (linkQuiet) return;
+            var ct = cancellationToken ?? hard.Token;
+            await wlock.WaitAsync(ct);
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                if (stillCurrent is not null && !stillCurrent()) return;
+                // A peer may disappear mid-write. Complete that frame on the
+                // host transport so the following join still has valid framing.
+                await st.WriteAsync(pkt, hard.Token);
+            }
+            finally { wlock.Release(); }
+        }
         byte[] HostPosition(float yaw, BodyState2? state)
         {
             var position = hp;
@@ -268,9 +294,22 @@ static class Host125
             witems.Add((Guid.Parse(p[1]), float.Parse(p[2], CultureInfo.InvariantCulture), float.Parse(p[3], CultureInfo.InvariantCulture), float.Parse(p[4], CultureInfo.InvariantCulture), p[0] == "witemtaken"));
             Say($"WITEM {p[1]} at {p[2]},{p[3]},{p[4]} taken={p[0] == "witemtaken"}");
         }
-        async Task SendBotEpoch(byte target)
+        async Task SendBotEpoch(byte target, CancellationToken? ct = null)
         {
-            await W(new LootMsg(Protocol.W203Epoch, 0, Wo206Rules.EpochText(1, 1, "tick")).BuildUp(Protocol.W203Up, target));
+            await W(new LootMsg(Protocol.W203Epoch, 0, Wo206Rules.EpochText(1, 1, "tick")).BuildUp(Protocol.W203Up, target), ct);
+        }
+        async Task SendRunningCalendar(RunningCalendar? sample)
+        {
+            if (sample is null || botSessions!.ReadyFor(sample.Scope.Peer) != sample.Scope) return;
+            var peer = sample.Scope.Peer;
+            var elapsed = TimeSpan.FromSeconds(Math.Max(0, Clock.Elapsed.TotalSeconds - sample.Start));
+            using var clockLifetime = CancellationTokenSource.CreateLinkedTokenSource(hard.Token, peer.Disconnected);
+            try
+            {
+                await W(BotHostCalendar.Running(peer.Id, sample.WorldMs, elapsed), clockLifetime.Token,
+                    () => botSessions.ReadyFor(peer) == sample.Scope && ReferenceEquals(Volatile.Read(ref runningCalendar), sample));
+            }
+            catch (OperationCanceledException) when (peer.Disconnected.IsCancellationRequested) { }
         }
         async Task Announce()
         {
@@ -307,7 +346,16 @@ static class Host125
         // reader
         _ = Task.Run(async () =>
         {
-            try { while (true) { var p = await Read(hard.Token); await inbox.Writer.WriteAsync(p, hard.Token); } }
+            try
+            {
+                while (true)
+                {
+                    var (type, payload) = await Read(hard.Token);
+                    ObservePeer(type, payload);
+                    var peer = botSessions is not null && Protocol.IsJoinDown(type, payload.Length) ? botSessions.Find(payload[0]) : null;
+                    await inbox.Writer.WriteAsync((type, payload, peer), hard.Token);
+                }
+            }
             catch (Exception ex)
             {
                 if (!hard.IsCancellationRequested) Say(bot is null ? $"connection ended: {ex.Message}" : $"BOT-T4 role=host stopped=connection");
@@ -326,6 +374,7 @@ static class Host125
                         await W(HostPosition(hyaw, hostSt2));   // WO-127: the synthetic host claims the session like a real one (WO-135: + its state block)
                     if (vitHp >= 0 && n % 2 == 0) await W(VitalsPacket(vitHp, vitSt, vitFlags));   // WO-154
                     if (n++ % 5 == 0) await Announce();
+                    if (bot is not null) await SendRunningCalendar(Volatile.Read(ref runningCalendar));
                     if (carryBody is not null && carryHeld && n % 2 == 0)   // WO-148: still carrying (every 2 s)
                         for (byte g = 1; g < 8; g++)
                             if (g != myGhost) await W(new LootMsg(Protocol.CarryHeld, carryTok, CarryText.Held(myGhost, carryWhat ?? "dead", carryBody, hp[0], hp[1], hp[2])).BuildUp(Protocol.CarryUp, g));
@@ -335,8 +384,8 @@ static class Host125
             catch { }
         });
         // control file
-        var joinQ = Channel.CreateUnbounded<(byte Joiner, uint JoinId)>();
-        var joinMsgs = Channel.CreateUnbounded<(byte Source, uint JoinId, byte Type, byte[] Body)>();
+        var joinQ = Channel.CreateUnbounded<(byte Joiner, uint JoinId, BotHostSessions.Peer? Peer)>();
+        var joinMsgs = Channel.CreateUnbounded<(byte Source, uint JoinId, byte Type, byte[] Body, BotHostSessions.Peer? Peer)>();
         _ = Task.Run(async () =>
         {
             int done = 0;
@@ -490,6 +539,17 @@ static class Host125
                             case "clock":       // WO-140: the host's clock announce
                             case "sleeptime":   // WO-140: the host's own sleep's result
                             {
+                                if (bot is not null)
+                                {
+                                    var current = Volatile.Read(ref runningCalendar);
+                                    if (current is not null)
+                                    {
+                                        var updated = current with { WorldMs = BotHostCalendar.ParseWorldTime(p[1]), Start = Clock.Elapsed.TotalSeconds };
+                                        if (ReferenceEquals(Interlocked.CompareExchange(ref runningCalendar, updated, current), current))
+                                            await SendRunningCalendar(updated);
+                                    }
+                                    break;
+                                }
                                 uint wt = uint.Parse(p[1], CultureInfo.InvariantCulture);
                                 var phases = p[0] == "clock" ? new[] { Protocol.TimeSkipPhaseSync } : new[] { Protocol.TimeSkipPhaseStart, Protocol.TimeSkipPhaseDone };
                                 foreach (byte ph in phases)
@@ -1017,101 +1077,118 @@ static class Host125
         // joins, one at a time
         _ = Task.Run(async () =>
         {
-            await foreach (var (joiner, joinId) in joinQ.Reader.ReadAllAsync(hard.Token))
+            await foreach (var (joiner, joinId, peer) in joinQ.Reader.ReadAllAsync(hard.Token))
             {
-                while (loading) await Task.Delay(500, hard.Token);   // a real host defers a join through its load
-                var w0 = world;
-                if (!shared) { await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateRefused, Protocol.JoinReasonId("shared-world-off"), 0)); Say("refused: shared-world-off"); continue; }
-                if (!w0.Henry)
+                var scope = peer is not null ? botSessions!.Begin(peer, joinId) : null;
+                if (botSessions is not null && scope is null) continue;
+                using var transfer = peer is null ? null : CancellationTokenSource.CreateLinkedTokenSource(hard.Token, peer.Disconnected);
+                var transferToken = transfer?.Token ?? hard.Token;
+                Task Send(byte[] packet) => W(packet, transferToken);
+                try
                 {
-                    await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateRefused, Protocol.JoinReasonId("not-henry"), 0));
-                    Say($"JOIN 0x{joinId:x8} refused: this world's player is not Henry ({w0.Player}) -- NOT paused");
-                    continue;
-                }
-                double tr = Clock.Elapsed.TotalSeconds;
-                if (bot is not null)
-                {
-                    Volatile.Write(ref readyJoin, null);
-                    await SendBotEpoch(joiner);
-                }
-                await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStatePaused, 0, 0));
-                await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateSaving, 0, 0));
-                Say(bot is null
-                    ? $"JOIN 0x{joinId:x8} from {joiner}: 'paused' (synthetic); serving {w0.Label} md5={w0.Md5[..8]} (the join save = the current world)"
-                    : $"JOIN 0x{joinId:x8} from {joiner}: serving fixed test save");
-                var tx = new WorldSender(w0.Bytes, joinId, joiner, seq, Convert.FromHexString(w0.Md5));
-                await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateSending, 0, 0));
-                var br = Branch(); br.Reverse();
-                for (int i = 0; i < br.Count; i++)
-                {
-                    var id = names.TryGetValue(br[i], out var x) ? x : (Protocol.SaveKindAuto, (byte)1, (ushort)0);
-                    await W(WsPacket(new WorldSaved((uint)br.Count, i, (byte)(Protocol.SaveKindBranchFlag | id.Item1), id.Item2, id.Item3, Convert.FromHexString(br[i]))));
-                }
-                Say(bot is null
-                    ? $"JOIN 0x{joinId:x8}: branch replayed ({br.Count}, newest {br[^1][..8]})"
-                    : $"JOIN 0x{joinId:x8}: branch replayed ({br.Count})");
-                await W(tx.BuildOfferPacket());
-                bool done = false; double tDone = 0; string end = "";
-                while (end == "")
-                {
-                    foreach (var pkt in tx.TakeSendable()) await W(pkt);
-                    double left = done ? 300 - (Clock.Elapsed.TotalSeconds - tDone) : 60;
-                    using var wait = CancellationTokenSource.CreateLinkedTokenSource(hard.Token);
-                    wait.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, left)));
-                    (byte Source, uint JoinId, byte Type, byte[] Body) message;
-                    try { message = await joinMsgs.Reader.ReadAsync(wait.Token); }
-                    catch (OperationCanceledException) when (!hard.IsCancellationRequested)
-                    { await W(WorldReceiver.BuildAbort(joiner, joinId, Protocol.JoinAbortTimeout)); end = "timeout"; break; }
-                    var (msgSrc, msgJid, ty, body) = message;
-                    if (bot is not null && (msgSrc != joiner || msgJid != joinId)) continue;
-                    switch (ty)
+                    while (loading) await Task.Delay(500, transferToken);   // a real host defers a join through its load
+                    var w0 = world;
+                    if (!shared) { await Send(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateRefused, Protocol.JoinReasonId("shared-world-off"), 0)); Say("refused: shared-world-off"); continue; }
+                    if (!w0.Henry)
                     {
-                        case Protocol.WorldAckDown:
-                            if (!tx.OnAck(BinaryPrimitives.ReadUInt32LittleEndian(body), out _) && bot is not null)
-                            {
-                                await W(WorldReceiver.BuildAbort(joiner, joinId, Protocol.JoinAbortProtocol));
-                                end = "bad_ack";
-                            }
-                            break;
-                        case Protocol.WorldDoneDown:
-                            if (bot is not null && (!tx.AllAcked || !body.AsSpan().SequenceEqual(tx.Offer.Sha256.AsSpan(0, 8))))
-                            {
-                                await W(WorldReceiver.BuildAbort(joiner, joinId, Protocol.JoinAbortHashMismatch));
-                                end = "bad_done";
+                        await Send(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateRefused, Protocol.JoinReasonId("not-henry"), 0));
+                        Say($"JOIN 0x{joinId:x8} refused: this world's player is not Henry ({w0.Player}) -- NOT paused");
+                        continue;
+                    }
+                    double tr = Clock.Elapsed.TotalSeconds;
+                    if (bot is not null) await SendBotEpoch(joiner, transferToken);
+                    await Send(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStatePaused, 0, 0));
+                    await Send(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateSaving, 0, 0));
+                    if (bot is not null) await Send(BotHostCalendar.Frozen(joiner, joinId, bot.WorldTimeMs));
+                    Say(bot is null
+                        ? $"JOIN 0x{joinId:x8} from {joiner}: 'paused' (synthetic); serving {w0.Label} md5={w0.Md5[..8]} (the join save = the current world)"
+                        : $"JOIN 0x{joinId:x8} from {joiner}: serving fixed test save");
+                    var tx = new WorldSender(w0.Bytes, joinId, joiner, seq, Convert.FromHexString(w0.Md5));
+                    await Send(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateSending, 0, 0));
+                    var br = Branch(); br.Reverse();
+                    for (int i = 0; i < br.Count; i++)
+                    {
+                        var id = names.TryGetValue(br[i], out var x) ? x : (Protocol.SaveKindAuto, (byte)1, (ushort)0);
+                        await Send(WsPacket(new WorldSaved((uint)br.Count, i, (byte)(Protocol.SaveKindBranchFlag | id.Item1), id.Item2, id.Item3, Convert.FromHexString(br[i]))));
+                    }
+                    Say(bot is null
+                        ? $"JOIN 0x{joinId:x8}: branch replayed ({br.Count}, newest {br[^1][..8]})"
+                        : $"JOIN 0x{joinId:x8}: branch replayed ({br.Count})");
+                    await Send(tx.BuildOfferPacket());
+                    bool done = false; double tDone = 0; string end = "";
+                    while (end == "")
+                    {
+                        foreach (var pkt in tx.TakeSendable()) await Send(pkt);
+                        double left = done ? 300 - (Clock.Elapsed.TotalSeconds - tDone) : 60;
+                        using var wait = CancellationTokenSource.CreateLinkedTokenSource(transferToken);
+                        wait.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, left)));
+                        (byte Source, uint JoinId, byte Type, byte[] Body, BotHostSessions.Peer? Peer) message;
+                        try { message = await joinMsgs.Reader.ReadAsync(wait.Token); }
+                        catch (OperationCanceledException) when (!transferToken.IsCancellationRequested)
+                        { await Send(WorldReceiver.BuildAbort(joiner, joinId, Protocol.JoinAbortTimeout)); end = "timeout"; break; }
+                        var (msgSrc, msgJid, ty, body, messagePeer) = message;
+                        if (scope is not null && (msgSrc != joiner || msgJid != joinId || messagePeer != peer)) continue;
+                        switch (ty)
+                        {
+                            case Protocol.WorldAckDown:
+                                if (!tx.OnAck(BinaryPrimitives.ReadUInt32LittleEndian(body), out _) && bot is not null)
+                                {
+                                    await Send(WorldReceiver.BuildAbort(joiner, joinId, Protocol.JoinAbortProtocol));
+                                    end = "bad_ack";
+                                }
                                 break;
-                            }
-                            if (bot is not null && done) break;
-                            done = true; tDone = Clock.Elapsed.TotalSeconds;
-                            await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateWaitingReady, 0, 0));
-                            Say(FormattableString.Invariant($"JOIN 0x{joinId:x8}: Done after {tDone - tr:F2} s; waiting for Ready"));
-                            break;
-                        case Protocol.JoinerReadyDown:
-                            if (bot is null || done && BinaryPrimitives.ReadUInt32LittleEndian(body) == tx.Offer.WorldSavedSeq)
-                                end = "ready";
-                            break;
-                        case Protocol.JoinAbortDown: end = "abort " + Protocol.JoinAbortName(body.Length > 0 ? body[0] : (byte)0); break;
+                            case Protocol.WorldDoneDown:
+                                if (bot is not null && (!tx.AllAcked || !body.AsSpan().SequenceEqual(tx.Offer.Sha256.AsSpan(0, 8))))
+                                {
+                                    await Send(WorldReceiver.BuildAbort(joiner, joinId, Protocol.JoinAbortHashMismatch));
+                                    end = "bad_done";
+                                    break;
+                                }
+                                if (bot is not null && done) break;
+                                done = true; tDone = Clock.Elapsed.TotalSeconds;
+                                // Repeat the bootstrap while still frozen. The joiner
+                                // may have cleared its clock when applying the epoch.
+                                if (bot is not null) await Send(BotHostCalendar.Frozen(joiner, joinId, bot.WorldTimeMs));
+                                await Send(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateWaitingReady, 0, 0));
+                                Say(FormattableString.Invariant($"JOIN 0x{joinId:x8}: Done after {tDone - tr:F2} s; waiting for Ready"));
+                                break;
+                            case Protocol.JoinerReadyDown:
+                                if (bot is null || done && BinaryPrimitives.ReadUInt32LittleEndian(body) == tx.Offer.WorldSavedSeq)
+                                    end = "ready";
+                                break;
+                            case Protocol.JoinAbortDown: end = "abort " + Protocol.JoinAbortName(body.Length > 0 ? body[0] : (byte)0); break;
+                        }
+                    }
+                    double now = Clock.Elapsed.TotalSeconds;
+                    if (end == "ready" && scope is not null && !botSessions!.MarkReady(scope)) continue;
+                    await Send(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateResumed, Protocol.JoinReasonId(end == "ready" ? "ready" : "failed"), (ushort)(now - tr)));
+                    Say(FormattableString.Invariant($"JOIN 0x{joinId:x8} ended: {end} after {now - tr:F1} s -- THE HOST RESUMES"));
+                    if (end == "ready")   // WO-134: this world's chest ledger, as a real host sends it
+                    {
+                        if (scope is not null)
+                        {
+                            if (botSessions!.ReadyFor(peer) != scope) continue;
+                            var calendar = new RunningCalendar(scope, bot!.WorldTimeMs, now);
+                            Volatile.Write(ref runningCalendar, calendar);
+                            await SendRunningCalendar(calendar);
+                            if (botSessions.ReadyFor(peer) != scope) continue;
+                            Say($"BOT-T4 role=host ready=1 peer={joiner}");
+                            readyAt.TrySetResult(now);
+                        }
+                        var lps = Wo134Rules.LedgerParts(ledger);
+                        foreach (var lp in lps) await Send(new LootMsg(Protocol.LootHostLedger, 0, lp).BuildUp(Protocol.LootHostUp, joiner));
+                        Say($"LEDGER sent to {joiner}: {ledger.Entries.Count} entries in {lps.Count} part(s)");
                     }
                 }
-                double now = Clock.Elapsed.TotalSeconds;
-                await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateResumed, Protocol.JoinReasonId(end == "ready" ? "ready" : "failed"), (ushort)(now - tr)));
-                Say(FormattableString.Invariant($"JOIN 0x{joinId:x8} ended: {end} after {now - tr:F1} s -- THE HOST RESUMES"));
-                if (end == "ready")   // WO-134: this world's chest ledger, as a real host sends it
+                catch (OperationCanceledException) when (peer is not null && peer.Disconnected.IsCancellationRequested)
                 {
-                    if (bot is not null)
-                    {
-                        Volatile.Write(ref readyJoin, new BotJoinScope(joiner, joinId));
-                        Say($"BOT-T4 role=host ready=1 peer={joiner}");
-                        readyAt.TrySetResult(now);
-                    }
-                    var lps = Wo134Rules.LedgerParts(ledger);
-                    foreach (var lp in lps) await W(new LootMsg(Protocol.LootHostLedger, 0, lp).BuildUp(Protocol.LootHostUp, joiner));
-                    Say($"LEDGER sent to {joiner}: {ledger.Entries.Count} entries in {lps.Count} part(s)");
+                    Say($"BOT-T4 role=host peer_disconnected={joiner}");
                 }
             }
         });
         try
         {
-            await foreach (var (type, p) in inbox.Reader.ReadAllAsync(hard.Token))
+            await foreach (var (type, p, peer) in inbox.Reader.ReadAllAsync(hard.Token))
             {
                 if (bot is not null && type == Protocol.CombatRole && p is not [1])
                 {
@@ -1160,10 +1237,17 @@ static class Host125
                     var f = la.Text.Split(' ');
                     var key = (la.Kind, la.Tok);
                     bool remember = bot is not null && la.Kind is Protocol.LootAskItemTake or Protocol.LootAskBodyTake;
+                    async Task SendPickup(LootMsg reply)
+                    {
+                        if (peer is null) { await W(reply.BuildUp(Protocol.LootHostUp, src)); return; }
+                        using var pickup = CancellationTokenSource.CreateLinkedTokenSource(hard.Token, peer.Disconnected);
+                        try { await W(reply.BuildUp(Protocol.LootHostUp, src), pickup.Token); }
+                        catch (OperationCanceledException) when (peer.Disconnected.IsCancellationRequested) { }
+                    }
                     if (bot is not null)
                     {
-                        var scope = Volatile.Read(ref readyJoin);
-                        if (scope?.Peer != src || !BotPickupRequest(la.Kind, f)) continue;
+                        var scope = botSessions!.ReadyFor(peer);
+                        if (scope is null || scope.Peer.Id != src || !BotPickupRequest(la.Kind, f)) continue;
                         if (pickupJoin != scope)
                         {
                             pickupReplies.Clear();
@@ -1171,7 +1255,7 @@ static class Host125
                         }
                         if (remember && pickupReplies.TryGetValue(key, out var previous))
                         {
-                            if (previous.Request == la.Text) await W(previous.Reply.BuildUp(Protocol.LootHostUp, src));
+                            if (previous.Request == la.Text) await SendPickup(previous.Reply);
                             continue;
                         }
                         if (remember && pickupReplies.Count >= 4096) continue;
@@ -1179,7 +1263,7 @@ static class Host125
                     async Task ReplyPickup(LootMsg reply)
                     {
                         if (remember) pickupReplies.Add(key, (la.Text, reply));
-                        await W(reply.BuildUp(Protocol.LootHostUp, src));
+                        await SendPickup(reply);
                     }
                     Say($"LOOTASK {Protocol.LootAskName(la.Kind)} tok={la.Tok} from {src}: {la.Text}");
                     switch (la.Kind)
@@ -1188,7 +1272,7 @@ static class Host125
                         {
                             var items = bodies.GetValueOrDefault(f[0]);
                             string bst = items is null ? $"{f[0]} open 2 1 1 -" : $"{f[0]} open 1 1 1 {Wo134Rules.FormatItems(items)}";
-                            await W(new LootMsg(Protocol.LootHostBodyState, la.Tok, bst).BuildUp(Protocol.LootHostUp, src));
+                            await SendPickup(new LootMsg(Protocol.LootHostBodyState, la.Tok, bst));
                             Say($"  -> BodyState {bst}");
                             break;
                         }
@@ -1301,9 +1385,9 @@ static class Host125
                     Say($"CRIMEASK {Protocol.CrimeAskName(ca.Kind)} tok={ca.Tok} from {src}: {ca.Text}");
                     continue;
                 }
-                if (type == Protocol.JoinRequestDown) { Say($"JoinRequest 0x{jid:x8} from {src}"); await joinQ.Writer.WriteAsync((src, jid), hard.Token); }
+                if (type == Protocol.JoinRequestDown) { Say($"JoinRequest 0x{jid:x8} from {src}"); await joinQ.Writer.WriteAsync((src, jid, peer), hard.Token); }
                 else if (bot is null || type is Protocol.WorldAckDown or Protocol.WorldDoneDown or Protocol.JoinerReadyDown or Protocol.JoinAbortDown)
-                    await joinMsgs.Writer.WriteAsync((src, jid, type, body), hard.Token);
+                    await joinMsgs.Writer.WriteAsync((src, jid, type, body, peer), hard.Token);
             }
         }
         catch (OperationCanceledException) { Say("stopped"); }

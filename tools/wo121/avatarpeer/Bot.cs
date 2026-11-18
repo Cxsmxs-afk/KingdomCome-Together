@@ -16,14 +16,14 @@ static partial class P
         "stand", "move", "curve", "strafe", "state", "attack", "block_impulse", "hit",
         "vitals", "death", "respawned", "ranged", "appearance", "bow_equip"
     };
-    private static readonly string[] BotOptions = ["--test-bot", "--self-test", "--origin", "--bow-class", "--tables-pak", "--duration"];
+    private static readonly string[] BotOptions = ["--test-bot", "--self-test", "--origin", "--bow-class", "--tables-pak", "--duration", "--wire-version"];
     private static readonly string[] BotValueOptions =
-        ["--scenario", "--host", "--port", "--name", "--origin", "--bow-class", "--tables-pak", "--duration"];
+        ["--scenario", "--host", "--port", "--name", "--origin", "--bow-class", "--tables-pak", "--duration", "--wire-version"];
 
     private sealed record BotPlan(IReadOnlyList<Step> Steps, double End);
     private sealed record BotContext(byte Host, uint World, (float X, float Y, float Z)? Origin);
     private sealed record BotOptionsParsed(string? Scenario, IPAddress Address, int Port, string Name, TimeSpan Duration,
-        (float X, float Y, float Z)? Origin, string? Tables, Guid Bow);
+        (float X, float Y, float Z)? Origin, string? Tables, Guid Bow, string WireVersion);
     private sealed class BotRoleException() : IOException("Start the host before the T4 joiner.");
 
     private static uint PlannedHostMs(uint start, double seconds) => unchecked(start + (uint)(seconds * 1000));
@@ -36,6 +36,16 @@ static partial class P
     private static double Time(string text) =>
         double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out double value) && double.IsFinite(value)
             ? value : throw new FormatException("Expected a finite time.");
+
+    private static string BotWireVersion(string wire)
+    {
+        var (version, build) = BuildId.Split(wire);
+        if (!string.Equals(version, BuildId.Split(ReleaseVersionInfo.Wire).Version, StringComparison.Ordinal) ||
+            (build.Length != 0 && (!BuildId.IsBuildId(build) || build.Any(char.IsControl))) ||
+            !string.Equals(wire, BuildId.Wire(version, build), StringComparison.Ordinal))
+            throw new FormatException("Wire version must name this release and use an optional canonical build ID.");
+        return wire;
+    }
 
     private static BotOptionsParsed ParseBotOptions(string[] args)
     {
@@ -72,7 +82,8 @@ static partial class P
         if (fields.GetValueOrDefault("--bow-class") is string item && (!Guid.TryParseExact(item, "D", out bow) || bow == Guid.Empty))
             throw new FormatException("Bow class must be a non-empty GUID.");
         return new(fields.GetValueOrDefault("--scenario"), loopback, port, name, TimeSpan.FromSeconds(duration), origin,
-            fields.GetValueOrDefault("--tables-pak"), bow);
+            fields.GetValueOrDefault("--tables-pak"), bow,
+            BotWireVersion(fields.GetValueOrDefault("--wire-version", ReleaseVersionInfo.Wire)));
     }
 
     private static Guid FindBotBow(BotOptionsParsed options)
@@ -157,7 +168,7 @@ static partial class P
             case "death" or "bow_equip" when Count(1, 1): return;
             case "ranged" when Count(2, 2): _ = BotRangedPhase(f[1]); return;
             case "appearance" when Count(2, 2):
-                if (f[1] == "mirror" || f[1].Split(',').All(s => Guid.TryParseExact(s, "D", out _))) return;
+                if (f[1].Split(',').All(s => Guid.TryParseExact(s, "D", out Guid id) && id != Guid.Empty)) return;
                 break;
         }
         throw new FormatException("Invalid parameters for a T4 scenario step.");
@@ -345,6 +356,23 @@ static partial class P
                 || step.ItemClass != bow || step.Kind != RangedWeaponKind.Bow
                 || PlannedHostMs(uint.MaxValue - 499, 0.5) != 0 || ScheduledAgeMs(uint.MaxValue - 5, 10) != 16)
                 throw new InvalidOperationException("T4 joiner plan or packet self-test failed.");
+            try
+            {
+                _ = ReadBotPlan(["at 0 stand 0 0 0 0", "at 0.1 appearance mirror", "end 1"]);
+                throw new InvalidOperationException("T4 plans must not depend on the host's appearance.");
+            }
+            catch (FormatException) { }
+            string localVersion = BuildId.Split(ReleaseVersionInfo.Wire).Version;
+            string testWire = BuildId.Wire(localVersion, "t4-fixture-0000000000");
+            if (ParseBotOptions(["--test-bot"]).WireVersion != ReleaseVersionInfo.Wire ||
+                ParseBotOptions(["--test-bot", "--wire-version", testWire]).WireVersion != testWire)
+                throw new InvalidOperationException("T4 bot must send the staged wire release.");
+            try
+            {
+                _ = BotWireVersion(localVersion + "+invalid build");
+                throw new InvalidOperationException("T4 must reject invalid artifact build identifiers.");
+            }
+            catch (FormatException) { }
             Console.WriteLine("BOT-T4 role=joiner selftest=PASS");
             return 0;
         }

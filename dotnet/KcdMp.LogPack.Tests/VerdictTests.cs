@@ -96,6 +96,8 @@ public class VerdictTests
     [Theory]
     [InlineData("", VerdictStatus.Grey)]
     [InlineData("BOT-T4 role=joiner complete=1 poses=12", VerdictStatus.Grey)]
+    [InlineData("BOT-T4 role=joiner complete=0 reason=relay_role", VerdictStatus.Red)]
+    [InlineData("SYNTH125 t=0.16s BOT-T4 role=host refused=relay_role", VerdictStatus.Red)]
     [InlineData("BOT-T4 role=joiner ready=1\nBOT-T4 role=host complete=1", VerdictStatus.Red)]
     [InlineData("BOT-T4 role=joiner ready=1\nBOT-T4 role=joiner complete=1 poses=12", VerdictStatus.Green)]
     [InlineData("SYNTH125 t=0.00s BOT-T4 role=host started=1\nSYNTH125 t=4.24s BOT-T4 role=host complete=1 played=2", VerdictStatus.Green)]

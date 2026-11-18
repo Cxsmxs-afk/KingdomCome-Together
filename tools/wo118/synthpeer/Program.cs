@@ -263,8 +263,8 @@ static class P
             }
             try
             {
-                var bot = BotHostOptions.Parse(a, FindUp("VERSION"));
-                return await Host125.RunAsync(a, File.ReadAllText(bot.VersionFile).Trim(), bot);
+                var bot = BotHostOptions.Parse(a);
+                return await Host125.RunAsync(a, bot.WireVersion, bot);
             }
             catch (FormatException ex)
             {
@@ -277,9 +277,9 @@ static class P
                 return 1;
             }
         }
-        if (a.Contains("--bot-plan"))
+        if (a.Any(arg => arg is "--bot-plan" or "--world-time" or "--wire-version"))
         {
-            Console.Error.WriteLine("Der zeitgesteuerte Bot-Host-Plan benötigt --test-bot.");
+            Console.Error.WriteLine("Bot-Host-Optionen benötigen --test-bot.");
             return 2;
         }
 

@@ -137,7 +137,7 @@ static partial class P
         using var botTimeout = bot is null ? null : new CancellationTokenSource(bot.Duration);
         var hard = botTimeout?.Token ?? CancellationToken.None;
         SkewMs = long.Parse(Arg(a, "--skew-ms", "0"), CultureInfo.InvariantCulture);
-        string release = File.ReadAllText(FindUp("VERSION")).Trim();
+        string release = bot?.WireVersion ?? File.ReadAllText(FindUp("VERSION")).Trim();
         var steps = new List<Step>(); double endT = 60;
         BotPlan? plan = bot is null ? null : bot.Scenario is string scenario
             ? ReadBotPlan(File.ReadLines(scenario)) : DefaultBotPlan(bot.Origin ?? (0, 0, 0));
@@ -157,10 +157,15 @@ static partial class P
         if (bot is null) await tcp.ConnectAsync(host, port);
         else await tcp.ConnectAsync(bot.Address, bot.Port, hard);
         var st = tcp.GetStream();
-        var nb = Encoding.UTF8.GetBytes(name); var rb = Encoding.UTF8.GetBytes(release);
-        int hl = 2 + nb.Length + rb.Length; var hs = new byte[3 + hl];
-        hs[0] = Protocol.Handshake; BinaryPrimitives.WriteUInt16LittleEndian(hs.AsSpan(1), (ushort)hl);
-        hs[3] = Protocol.Version; hs[4] = (byte)nb.Length; nb.CopyTo(hs, 5); rb.CopyTo(hs, 5 + nb.Length);
+        byte[] hs;
+        if (bot is not null) hs = RelayConnector.BuildHandshake(name, release);
+        else
+        {
+            var nb = Encoding.UTF8.GetBytes(name); var rb = Encoding.UTF8.GetBytes(release);
+            int hl = 2 + nb.Length + rb.Length; hs = new byte[3 + hl];
+            hs[0] = Protocol.Handshake; BinaryPrimitives.WriteUInt16LittleEndian(hs.AsSpan(1), (ushort)hl);
+            hs[3] = Protocol.Version; hs[4] = (byte)nb.Length; nb.CopyTo(hs, 5); rb.CopyTo(hs, 5 + nb.Length);
+        }
         await st.WriteAsync(hs, hard);
         var (ty, pl) = await ReadPacket(st, hard);
         if (ty != Protocol.Ack || pl.Length == 0) { Console.WriteLine($"PEER refused: 0x{ty:X2} {Encoding.UTF8.GetString(pl)}"); return 1; }
@@ -232,7 +237,7 @@ static partial class P
                     }
                     if (rec is not null && (t2 == Protocol.NpcStateDown || t2 == Protocol.ActionDown || t2 == Protocol.NpcDamageDown || t2 == Protocol.PauseDown || t2 == Protocol.ActivityHostDown || t2 == Protocol.ActivityExtraDown))   // WO-138: + the pause announcement; WO-141: + activities; WO-143: + hands, gaits, one-shots, looks
                         lock (rec) rec.WriteLine($"{recClock.ElapsedMilliseconds} {t2:X2} {Convert.ToHexString(b2)}");
-                    if (t2 == Protocol.AppearanceDown && b2.Length >= 2 && b2[0] != myId) hostAppearance = b2.AsSpan(1).ToArray();   // [src][count][classes]
+                    if (bot is null && t2 == Protocol.AppearanceDown && b2.Length >= 2 && b2[0] != myId) hostAppearance = b2.AsSpan(1).ToArray();   // [src][count][classes]
                     if (t2 == Protocol.Name && b2.Length >= 2 && b2[0] != myId) { joiner ??= b2[0]; }
                     else if (t2 == Protocol.Ghost && b2.Length >= 1 && b2[0] != myId)
                     {
@@ -292,12 +297,13 @@ static partial class P
                              && LootMsg.TryDecode(b2.AsSpan(1 + Protocol.JoinHeaderLen), out var svm))   // WO-140
                     {
                         Console.WriteLine($"PEER t={recClock.Elapsed.TotalSeconds:F1} got SleepVote {Protocol.SleepVoteName(svm.Kind)} tok=0x{svm.Tok:X8} from={b2[0]}: {svm.Text}");
-                        sleepIn.Enqueue((b2[0], svm));
+                        if (bot is null) sleepIn.Enqueue((b2[0], svm));
                     }
                     else if (t2 == Protocol.CarryDown && b2.Length > 1 + Protocol.JoinHeaderLen
                              && LootMsg.TryDecode(b2.AsSpan(1 + Protocol.JoinHeaderLen), out var crm))   // WO-148
                         Console.WriteLine($"PEER t={recClock.Elapsed.TotalSeconds:F1} got Carry {Protocol.CarryKindName(crm.Kind)} tok={crm.Tok} from={b2[0]}: {crm.Text}");
-                    else if (t2 == Protocol.LeashDown && b2.Length > 1 + Protocol.JoinHeaderLen
+                    // A T4 route is scripted. The legacy live peer may obey a host pull.
+                    else if (bot is null && t2 == Protocol.LeashDown && b2.Length > 1 + Protocol.JoinHeaderLen
                              && LeashCommand.TryDecode(b2.AsSpan(1 + Protocol.JoinHeaderLen), out var lc))
                         leashIn.Enqueue((b2[0], lc));   // WO-114: handled on the main loop
                 }

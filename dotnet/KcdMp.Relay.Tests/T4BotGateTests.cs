@@ -116,6 +116,7 @@ internal sealed class T4BotTools : IAsyncDisposable
     private readonly Process _process;
     private readonly Task<string> _stdout;
     private readonly Task<string> _stderr;
+    public bool HasExited => _process.HasExited;
 
     private T4BotTools(Process process)
     {

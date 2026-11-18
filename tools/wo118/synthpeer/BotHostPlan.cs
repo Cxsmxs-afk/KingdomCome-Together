@@ -57,7 +57,7 @@ sealed record BotHostPlan(IReadOnlyList<string[]> Setup, IReadOnlyList<BotHostPl
             && Finite(duration, out var seconds) && seconds is > 0 and <= 300
             && (rest.Length == 0 || rest.Length <= 2 && Speed(rest[0])
                 && (rest.Length == 1 || int.TryParse(rest[1], NumberStyles.None, CultureInfo.InvariantCulture, out int ms) && ms is >= 20 and <= 1000)),
-        ["clock", var value] => uint.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out _),
+        ["clock", var value] => BotHostCalendar.TryParseWorldTime(value, out _),
         ["hstate", _, .. var rest] => fields.Skip(1).All(IsBodyState) && rest.Length < 4,
         _ => false
     };
@@ -70,12 +70,12 @@ sealed record BotHostPlan(IReadOnlyList<string[]> Setup, IReadOnlyList<BotHostPl
 }
 
 sealed record BotHostOptions(string Save, string Host, int Port, string Name, double Duration,
-    float[] Position, BotHostPlan Plan, string VersionFile)
+    float[] Position, long WorldTimeMs, BotHostPlan Plan, string WireVersion)
 {
     public const string Flag = "--test-bot";
     public const string EnvironmentName = "KCDMP_TEST_BOT";
 
-    public static BotHostOptions Parse(string[] args, string defaultVersionFile)
+    public static BotHostOptions Parse(string[] args)
     {
         var values = new Dictionary<string, string>(StringComparer.Ordinal);
         bool flag = false;
@@ -83,7 +83,7 @@ sealed record BotHostOptions(string Save, string Host, int Port, string Name, do
         {
             var key = args[i];
             if (key == Flag && !flag) { flag = true; continue; }
-            if (key is not ("--join-host125" or "--host" or "--port" or "--duration" or "--name" or "--host-pos" or "--bot-plan" or "--version-file")
+            if (key is not ("--join-host125" or "--host" or "--port" or "--duration" or "--name" or "--host-pos" or "--world-time" or "--bot-plan" or "--wire-version")
                 || i + 1 == args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal)
                 || !values.TryAdd(key, args[++i]))
                 throw new FormatException("Ungültige Bot-Host-Argumente.");
@@ -97,6 +97,14 @@ sealed record BotHostOptions(string Save, string Host, int Port, string Name, do
             throw new FormatException("Der Bot-Host braucht einen gültigen Relay-Port.");
         if (!BotHostPlan.Finite(values.GetValueOrDefault("--duration", "3600"), out var duration) || duration is <= 0 or > 7200)
             throw new FormatException("Die Bot-Host-Laufzeit muss zwischen 0 und 7200 Sekunden liegen.");
+        if (!values.TryGetValue("--world-time", out var calendar))
+            throw new FormatException("Der Bot-Host braucht --world-time in Weltsekunden.");
+        long worldTime = BotHostCalendar.ParseWorldTime(calendar);
+        string wireVersion = values.GetValueOrDefault("--wire-version", ReleaseVersionInfo.Wire);
+        var (version, build) = BuildId.Split(wireVersion);
+        if (version != BuildId.Split(ReleaseVersionInfo.Wire).Version || wireVersion.Any(char.IsControl)
+            || BuildId.Wire(version, build) != wireVersion)
+            throw new FormatException("Der Bot-Host braucht die passende Relay-Version mit optionaler Build-ID.");
 
         var xy = values.GetValueOrDefault("--host-pos", "0,0,0").Split(',');
         if (xy.Length != 3 || xy.Any(value => !Wo134Rules.TryCoord(value, out _)))
@@ -118,7 +126,7 @@ sealed record BotHostOptions(string Save, string Host, int Port, string Name, do
         var plan = values.TryGetValue("--bot-plan", out var planFile)
             ? BotHostPlan.Parse(ReadPlan(planFile))
             : BotHostPlan.Parse(["at 0 walk 1.4 0 4 0 100", "at 4 walk 0 1.4 4 0 100"]);
-        return new(save, host, port, name, duration, position, plan, values.GetValueOrDefault("--version-file", defaultVersionFile));
+        return new(save, host, port, name, duration, position, worldTime, plan, wireVersion);
     }
 
     private static IEnumerable<string> ReadPlan(string path)

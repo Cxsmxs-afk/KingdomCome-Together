@@ -14,6 +14,7 @@ namespace KcdMp.Relay.Tests;
 public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFixture>
 {
     private const uint World = 43;
+    private const long FrozenWorldMs = 28_800_000;
     private static readonly Guid Item = new("00000001-0000-0000-0000-000000000001");
     private static readonly Guid Bow = new("00000002-0000-0000-0000-000000000002");
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(12);
@@ -44,7 +45,7 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
         string save = fixture.Write("world.whs", BotFixture.Save());
         string plan = fixture.Write("host-plan.txt", "at 0 pos 1 2 3\n");
         await using var bot = T4BotTools.Start("SynthPeer", true, "--test-bot", "--join-host125", save,
-            "--bot-plan", plan, "--host", "127.0.0.1", "--port", Port, "--duration", "10");
+            "--bot-plan", plan, "--world-time", "28800", "--host", "127.0.0.1", "--port", Port, "--duration", "10");
         var result = await bot.WaitAsync();
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("refused=relay_role", result.Output);
@@ -62,18 +63,7 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
         await using var bot = T4BotTools.Start("AvatarPeer", true, "--test-bot", "--scenario", scenario,
             "--bow-class", Bow.ToString("D"), "--host", "127.0.0.1", "--port", Port, "--duration", "20");
 
-        var (botId, join, _) = ReadJoin(await host.ReadUntilAsync(Protocol.JoinRequestDown, Wait));
-        byte[] save = BotFixture.Save();
-        var sender = new WorldSender(save, join, botId, 1, Convert.FromHexString(WhsSave.Verify(save).Md5));
-        await host.SendRawAsync(new LootMsg(Protocol.W203Epoch, 0, Wo206Rules.EpochText(World, join, "tick"))
-            .BuildUp(Protocol.W203Up, botId));
-        await host.SendRawAsync(PositionCodec.BuildPosition(10, 20, 30, 0, false, false, null, 300_000));
-        await host.SendRawAsync(sender.BuildOfferPacket());
-        foreach (byte[] chunk in sender.TakeSendable()) await host.SendRawAsync(chunk);
-        var (readyPeer, readyJoin, readyBody) = ReadJoin(await host.ReadUntilAsync(Protocol.JoinerReadyDown, Wait));
-        Assert.Equal((botId, join), (readyPeer, readyJoin));
-        Assert.Equal(sender.Offer.WorldSavedSeq, BinaryPrimitives.ReadUInt32LittleEndian(readyBody));
-        await host.SendRawAsync(JoinStatusCodec.Build(botId, join, Protocol.JoinStateResumed, Protocol.JoinReasonId("ready"), 0));
+        byte botId = await ResumeBotJoinerAsync(host, bot);
 
         var steps = new List<RangedStepV2>();
         GhostSample? position = null;
@@ -113,6 +103,41 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
     }
 
     [Fact]
+    public async Task Joiner_keeps_its_fixed_route_when_the_host_sends_a_pull()
+    {
+        await WaitForAsync(() => Clients.ReadyClientCount == 0, "Previous relay peers did not disconnect");
+        await using var host = await Peer.ConnectAsync(relay.TcpPort, "t4-fixture-host");
+        Assert.Equal(new byte[] { 1 }, await host.ReadUntilAsync(Protocol.CombatRole, Wait));
+        using var fixture = new BotFixture();
+        string scenario = fixture.Write("route.txt", "at 0 stand 10 20 30 0\nat 0 move 1 0 2\nend 2.5\n");
+        await using var bot = T4BotTools.Start("AvatarPeer", true, "--test-bot", "--scenario", scenario,
+            "--host", "127.0.0.1", "--port", Port, "--duration", "20");
+        byte botId = await ResumeBotJoinerAsync(host, bot);
+        var pull = new LeashCommand(Protocol.LeashKindPull, 7, Protocol.LeashReasonDistance, 250, 360, 77, 350);
+        await host.SendRawAsync(pull.Build(botId));
+
+        float furthest = 20;
+        long since = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            TimeSpan left = Wait - Stopwatch.GetElapsedTime(since);
+            Assert.True(left > TimeSpan.Zero, "The scripted route did not finish after the pull");
+            var (type, payload) = await host.ReadPacketAsync(left);
+            if (type == Protocol.Disconnect && payload.Length > 0 && payload[0] == botId) break;
+            if (type != Protocol.Ghost || !PositionCodec.TryDecodeGhost(payload, out var sample)
+                || sample.GhostId != botId || sample.IsStale) continue;
+            Assert.Equal(10f, sample.X);
+            Assert.Equal(30f, sample.Z);
+            Assert.InRange(sample.Y, 20f, 22.1f);
+            furthest = Math.Max(furthest, sample.Y);
+        }
+        Assert.True(furthest > 21.2f, "The joiner did not keep walking after the pull");
+        var result = await bot.WaitAsync();
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Contains("BOT-T4 role=joiner complete=1", result.Output);
+    }
+
+    [Fact]
     public async Task Host_sends_the_supplied_world_and_returns_scripted_pickup_results()
     {
         await WaitForAsync(() => Clients.ReadyClientCount == 0, "Previous relay peers did not disconnect");
@@ -121,33 +146,12 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
         string savePath = fixture.Write("world.whs", save);
         string plan = fixture.Write("host-plan.txt", $"setup witem {Item:D} 1 2 3\nat 0 pos 1 2 3\nat 0.6 pos 4 5 6\n");
         await using var bot = T4BotTools.Start("SynthPeer", true, "--test-bot", "--join-host125", savePath,
-            "--bot-plan", plan, "--host", "127.0.0.1", "--port", Port, "--name", "t4-scripted-host", "--duration", "20");
-        await WaitForAsync(() => Clients.DamageAuthority?.Name == "t4-scripted-host", "Bot-Host did not acquire relay authority");
+            "--bot-plan", plan, "--world-time", "28800", "--host", "127.0.0.1", "--port", Port, "--name", "t4-scripted-host", "--duration", "20");
+        await WaitForAsync(() => Clients.DamageAuthority?.Name == "t4-scripted-host", "Bot-Host did not acquire relay authority", bot);
         await using var joiner = await Peer.ConnectAsync(relay.TcpPort, "t4-fixture-joiner");
         Assert.Equal(new byte[] { 0 }, await joiner.ReadUntilAsync(Protocol.CombatRole, Wait));
 
-        const uint joinId = 125;
-        await joiner.SendRawAsync(WorldReceiver.BuildRequest(joinId));
-        var (hostId, offerId, offerBody) = ReadJoin(await joiner.ReadUntilAsync(Protocol.WorldOfferDown, Wait));
-        Assert.Equal(joinId, offerId);
-        var offer = WorldOffer.TryDecode(offerBody, out string why);
-        Assert.True(offer.HasValue, why);
-        using var receiver = new WorldReceiver(fixture.Directory, joinId, hostId, offer.Value);
-        for (int i = 0; i < offer.Value.ChunkCount; i++)
-        {
-            var (sender, chunkJoin, body) = ReadJoin(await joiner.ReadUntilAsync(Protocol.WorldChunkDown, Wait));
-            Assert.Equal((hostId, joinId), (sender, chunkJoin));
-            var chunk = receiver.Accept(BinaryPrimitives.ReadUInt32LittleEndian(body), body.AsSpan(4), out why);
-            Assert.NotEqual(WorldReceiver.ChunkResult.Error, chunk);
-            if (chunk is WorldReceiver.ChunkResult.AckDue or WorldReceiver.ChunkResult.Complete)
-                await joiner.SendRawAsync(receiver.BuildAck());
-        }
-        var verified = receiver.Finish();
-        Assert.True(verified.Ok, verified.Why);
-        Assert.Equal(save, await File.ReadAllBytesAsync(receiver.FinalPath));
-        await joiner.SendRawAsync(receiver.BuildDone());
-        await joiner.SendRawAsync(WorldReceiver.BuildReady(joinId, offer.Value.WorldSavedSeq));
-        await WaitForReadyAsync(joiner, hostId, joinId);
+        byte hostId = await LoadHostedWorldAsync(joiner, fixture, save, 125);
 
         var ghosts = new List<GhostSample>();
         long since = Stopwatch.GetTimestamp();
@@ -165,20 +169,138 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
 
 
         foreach (var (item, expected, token) in new[] { (Item, "ok", 1u), (Item, "ok", 1u), (Item, "gone", 2u), (Bow, "unknown", 3u) })
+            await ExpectPickupAsync(joiner, hostId, item, token, expected);
+    }
+
+    [Fact]
+    public async Task Host_rejects_pickups_from_a_reused_peer_id_until_that_connection_completes_its_own_join()
+    {
+        await WaitForAsync(() => Clients.ReadyClientCount == 0, "Previous relay peers did not disconnect");
+        using var fixture = new BotFixture();
+        byte[] save = BotFixture.Save();
+        string savePath = fixture.Write("world.whs", save);
+        string plan = fixture.Write("host-plan.txt", $"setup witem {Item:D} 1 2 3\nsetup witem {Bow:D} 1 2 3\nat 0 pos 1 2 3\n");
+        await using var bot = T4BotTools.Start("SynthPeer", true, "--test-bot", "--join-host125", savePath,
+            "--bot-plan", plan, "--world-time", "28800", "--host", "127.0.0.1", "--port", Port, "--name", "t4-scripted-host", "--duration", "20");
+        await WaitForAsync(() => Clients.DamageAuthority?.Name == "t4-scripted-host", "Bot-Host did not acquire relay authority", bot);
+
+        byte formerId;
+        await using (var original = await Peer.ConnectAsync(relay.TcpPort, "t4-original"))
         {
-            await joiner.SendRawAsync(new LootMsg(Protocol.LootAskItemTake, token, $"{item:D} 1 2 3 0")
-                .BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost));
-            while (true)
-            {
-                var (source, _, body) = ReadJoin(await joiner.ReadUntilAsync(Protocol.LootHostDown, Wait));
-                Assert.Equal(hostId, source);
-                Assert.True(LootMsg.TryDecode(body, out var result));
-                if (result.Kind != Protocol.LootHostItemResult) continue;
-                Assert.Equal(token, result.Tok);
-                Assert.StartsWith(expected + " ", result.Text);
-                break;
-            }
+            Assert.Equal(new byte[] { 0 }, await original.ReadUntilAsync(Protocol.CombatRole, Wait));
+            formerId = original.Id;
+            byte hostId = await LoadHostedWorldAsync(original, fixture, save, 125);
+            await ExpectPickupAsync(original, hostId, Item, 51, "ok");
         }
+        await WaitForAsync(() => Clients.ReadyClientCount == 1, "Relay did not release the original wire ID");
+
+        await using var replacement = await Peer.ConnectAsync(relay.TcpPort, "t4-replacement");
+        Assert.Equal(new byte[] { 0 }, await replacement.ReadUntilAsync(Protocol.CombatRole, Wait));
+        Assert.Equal(formerId, replacement.Id);
+        // Try both the prior connection's cached grant and an uncached write.
+        // The next WorldOffer is the reliable reply barrier for these two requests.
+        await replacement.SendRawAsync(Pickup(Item, 51));
+        await replacement.SendRawAsync(Pickup(Bow, 52));
+        byte replacementHost = await LoadHostedWorldAsync(replacement, fixture, save, 126, refusePreOfferPickups: true);
+        await ExpectPickupAsync(replacement, replacementHost, Item, 51, "gone");
+        await ExpectPickupAsync(replacement, replacementHost, Bow, 52, "ok");
+    }
+
+    private static byte[] Pickup(Guid item, uint token) => new LootMsg(Protocol.LootAskItemTake, token, $"{item:D} 1 2 3 0")
+        .BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost);
+
+    private static async Task ExpectPickupAsync(Peer joiner, byte host, Guid item, uint token, string expected)
+    {
+        await joiner.SendRawAsync(Pickup(item, token));
+        while (true)
+        {
+            var (source, _, body) = ReadJoin(await joiner.ReadUntilAsync(Protocol.LootHostDown, Wait));
+            Assert.Equal(host, source);
+            Assert.True(LootMsg.TryDecode(body, out var result));
+            if (result.Kind != Protocol.LootHostItemResult) continue;
+            Assert.Equal(token, result.Tok);
+            Assert.StartsWith(expected + " ", result.Text);
+            return;
+        }
+    }
+
+    private static async Task<byte> ResumeBotJoinerAsync(Peer host, T4BotTools bot)
+    {
+        byte[] request;
+        try { request = await host.ReadUntilAsync(Protocol.JoinRequestDown, Wait); }
+        catch (OperationCanceledException) when (bot.HasExited)
+        {
+            throw await BotFailureAsync(bot, "Bot-Joiner exited before requesting the test world");
+        }
+        var (botId, join, _) = ReadJoin(request);
+        byte[] save = BotFixture.Save();
+        var sender = new WorldSender(save, join, botId, 1, Convert.FromHexString(WhsSave.Verify(save).Md5));
+        await host.SendRawAsync(new LootMsg(Protocol.W203Epoch, 0, Wo206Rules.EpochText(World, join, "tick"))
+            .BuildUp(Protocol.W203Up, botId));
+        await host.SendRawAsync(PositionCodec.BuildPosition(10, 20, 30, 0, false, false, null, 300_000));
+        await host.SendRawAsync(sender.BuildOfferPacket());
+        foreach (byte[] chunk in sender.TakeSendable()) await host.SendRawAsync(chunk);
+        var (readyPeer, readyJoin, readyBody) = ReadJoin(await host.ReadUntilAsync(Protocol.JoinerReadyDown, Wait));
+        Assert.Equal((botId, join), (readyPeer, readyJoin));
+        Assert.Equal(sender.Offer.WorldSavedSeq, BinaryPrimitives.ReadUInt32LittleEndian(readyBody));
+        await host.SendRawAsync(JoinStatusCodec.Build(botId, join, Protocol.JoinStateResumed, Protocol.JoinReasonId("ready"), 0));
+        return botId;
+    }
+
+    private static async Task<byte> LoadHostedWorldAsync(Peer joiner, BotFixture fixture, byte[] expectedSave, uint joinId,
+        bool refusePreOfferPickups = false)
+    {
+        await joiner.SendRawAsync(WorldReceiver.BuildRequest(joinId));
+        byte[] body;
+        byte? frozenSource = null;
+        long since = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            TimeSpan left = Wait - Stopwatch.GetElapsedTime(since);
+            Assert.True(left > TimeSpan.Zero, "The bot did not offer its world");
+            var (type, payload) = await joiner.ReadPacketAsync(left);
+            if (type == Protocol.WorldOfferDown) { body = payload; break; }
+            if (type == Protocol.W164Down)
+            {
+                var (source, _, data) = ReadJoin(payload);
+                if (LootMsg.TryDecode(data, out var clock) && clock.Kind == Protocol.W164Clock)
+                {
+                    Assert.True(HostCalendar.TryParse(clock.Text, Environment.TickCount64, 0, false, 0, out var frozen));
+                    if (frozen.JoinId == joinId)
+                    {
+                        Assert.Equal(FrozenWorldMs, frozen.WorldMs);
+                        Assert.Equal(0, frozen.Ratio1000);
+                        frozenSource = source;
+                    }
+                }
+            }
+            if (refusePreOfferPickups && type == Protocol.LootHostDown
+                && LootMsg.TryDecode(ReadJoin(payload).Body, out var result))
+                Assert.False(result.Kind == Protocol.LootHostItemResult,
+                    $"Replacement peer {joiner.Id} received pickup token {result.Tok} before its own world offer");
+        }
+        var (hostId, offerId, offerBody) = ReadJoin(body);
+        Assert.Equal(joinId, offerId);
+        Assert.True(frozenSource == hostId, "Host sent the save offer before its typed frozen calendar for this join");
+        var offer = WorldOffer.TryDecode(offerBody, out string why);
+        Assert.True(offer.HasValue, why);
+        using var receiver = new WorldReceiver(fixture.Directory, joinId, hostId, offer.Value);
+        for (int i = 0; i < offer.Value.ChunkCount; i++)
+        {
+            var (sender, chunkJoin, chunkBody) = ReadJoin(await joiner.ReadUntilAsync(Protocol.WorldChunkDown, Wait));
+            Assert.Equal((hostId, joinId), (sender, chunkJoin));
+            var chunk = receiver.Accept(BinaryPrimitives.ReadUInt32LittleEndian(chunkBody), chunkBody.AsSpan(4), out why);
+            Assert.NotEqual(WorldReceiver.ChunkResult.Error, chunk);
+            if (chunk is WorldReceiver.ChunkResult.AckDue or WorldReceiver.ChunkResult.Complete)
+                await joiner.SendRawAsync(receiver.BuildAck());
+        }
+        var verified = receiver.Finish();
+        Assert.True(verified.Ok, verified.Why);
+        Assert.Equal(expectedSave, await File.ReadAllBytesAsync(receiver.FinalPath));
+        await joiner.SendRawAsync(receiver.BuildDone());
+        await joiner.SendRawAsync(WorldReceiver.BuildReady(joinId, offer.Value.WorldSavedSeq));
+        await WaitForReadyAsync(joiner, hostId, joinId);
+        return hostId;
     }
 
     private static async Task WaitForReadyAsync(Peer peer, byte host, uint join)
@@ -203,14 +325,21 @@ public sealed class T4BotRelayTests(RelayFixture relay) : IClassFixture<RelayFix
         return (source, join, body.ToArray());
     }
 
-    private static async Task WaitForAsync(Func<bool> condition, string reason)
+    private static async Task WaitForAsync(Func<bool> condition, string reason, T4BotTools? bot = null)
     {
         long since = Stopwatch.GetTimestamp();
         while (!condition())
         {
+            if (bot?.HasExited == true) throw await BotFailureAsync(bot, reason);
             Assert.True(Stopwatch.GetElapsedTime(since) < Wait, reason);
             await Task.Delay(15);
         }
+    }
+
+    private static async Task<Xunit.Sdk.XunitException> BotFailureAsync(T4BotTools bot, string reason)
+    {
+        var (exitCode, output) = await bot.WaitAsync();
+        return new Xunit.Sdk.XunitException($"{reason} (exit {exitCode}).\n{output}");
     }
 
     private sealed class BotFixture : IDisposable

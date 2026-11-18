@@ -966,6 +966,12 @@ def s_bot_joiner(r):
         start = '%.3f,%.3f,%.3f' % (origin[0] + 2, origin[1], origin[2])
         command = [sys.executable, '-X', 'utf8', tool, '--test-bot', '--port', str(pair.RELAY_PORT),
                    '--origin=' + start, '--tables-pak', tables]
+        for line in reversed(r.a.lines(r.a.alog, 0)):
+            build = re.search(r'MP-BUILD version=([\w.-]+) build=([\w.-]+)(?: |$)', line)
+            if build:
+                version, stamp = build.groups()
+                command += ['--wire-version', version if stamp == 'dev' else version + '+' + stamp]
+                break
         log = os.path.join(r.dir, 'bot-t4.log')
         with open(log, 'w', encoding='utf-8') as stream:
             status = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT).returncode
