@@ -61,6 +61,7 @@ public partial class GameBridge
     { lock (_p6StateGate) { if (ReferenceEquals(_p6ReceiveStream, stream) && _p6ReceiveToken == ct) { _p6ReceiveStream = null; P6Invalidate(); } } }
     private void P6NoteVisualAtRead(int type, byte[] payload)
     {
+        if (type == Protocol.W203Down) Wo214NoteHandAtRead(payload);
         if (type == Protocol.ConvDown || (type == Protocol.W164Down && payload.Length > 6 && payload[6] == Protocol.W164SceneBus))
             Interlocked.Increment(ref _p6VisualSerial);
     }
@@ -98,13 +99,15 @@ public partial class GameBridge
     private void Wo201RangedTick()
     {
         if (!_w201Connected) { P6Invalidate(); return; }
+        var context = P6GetContext();
+        if (context is not null) Wo214HandHeartbeat(context);
         if (!W201("figure_ranged"))
         {
-            if (Interlocked.Exchange(ref _p6CaptureWasOn, 0) == 1 && P6GetContext() is { } offContext) _ = P6CaptureOffAsync(offContext);
+            if (Interlocked.Exchange(ref _p6CaptureWasOn, 0) == 1 && context is not null) _ = P6CaptureOffAsync(context);
             return; // presentation off never disables real contact evidence/Host acceptance
         }
         Interlocked.Exchange(ref _p6CaptureWasOn, 1);
-        if (_localDowned || Environment.TickCount64 < _w201RangedRetryAtMs || P6GetContext() is not { } context) return;
+        if (_localDowned || Environment.TickCount64 < _w201RangedRetryAtMs || context is null) return;
         _ = Wo201RangedPollAsync(context);
     }
     private async Task P6CaptureOffAsync(P6Context context)

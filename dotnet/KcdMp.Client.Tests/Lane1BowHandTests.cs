@@ -65,6 +65,63 @@ public sealed class Lane1BowHandTests
     }
 
     [Fact]
+    public async Task The_agent_repeats_drawn_and_sheathed_states_without_another_lua_event()
+    {
+        await using var link = new MemoryStream();
+        var bridge = await CreateHostAsync(link);
+        TickHandHeartbeat(bridge);
+        Assert.Equal(0L, link.Length);
+
+        Observe(bridge, 2, RangedWeaponKind.Bow, Bow);
+        SendOwnHand(bridge, "1 -");
+        Assert.Equal($"v1|1|{Bow:D}", ReadHandPacket(link));
+        link.SetLength(0);
+
+        TickHandHeartbeat(bridge, elapsedMs: 0);
+        Assert.Equal(0L, link.Length);
+
+        TickHandHeartbeat(bridge);
+        Assert.Equal($"v1|1|{Bow:D}", ReadHandPacket(link));
+        link.SetLength(0);
+
+        SendOwnHand(bridge, "0 -");
+        Assert.Equal("v1|0|-", ReadHandPacket(link));
+        link.SetLength(0);
+
+        TickHandHeartbeat(bridge);
+        Assert.Equal("v1|0|-", ReadHandPacket(link));
+        link.SetLength(0);
+
+        TickHandHeartbeat(bridge);
+        Assert.Equal("v1|0|-", ReadHandPacket(link));
+        link.SetLength(0);
+
+        DisconnectPeer(bridge);
+        TickHandHeartbeat(bridge);
+        Assert.Equal(0L, link.Length);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_measured_draw_is_never_repeated_after_its_mode_or_session_ends(bool modeChanged)
+    {
+        await using var link = new MemoryStream();
+        var bridge = await CreateHostAsync(link);
+        Observe(bridge, 2, RangedWeaponKind.Bow, Bow);
+        SendOwnHand(bridge, "1 -");
+        Assert.Equal($"v1|1|{Bow:D}", ReadHandPacket(link));
+        link.SetLength(0);
+
+        var context = Call(bridge, "P6GetContext");
+        if (modeChanged) Call(bridge, "P6VisualModeChanged");
+        else Call(bridge, "P6EndReceive", link, CancellationToken.None);
+        RunHandHeartbeat(bridge, context, Protocol.BodyState2HeartbeatMs);
+
+        Assert.Equal(0L, link.Length);
+    }
+
+    [Fact]
     public async Task The_same_bow_report_and_an_unknown_capture_keep_the_class_until_a_typed_crossbow_arrives()
     {
         await using var link = new MemoryStream();
@@ -83,7 +140,17 @@ public sealed class Lane1BowHandTests
         Assert.Equal($"v1|1|{Bow:D}", ReadHandPacket(link));
         link.SetLength(0);
 
+        SendOwnHand(bridge, $"1 {Bow:D}");
+        Assert.Equal($"v1|1|{Bow:D}", ReadHandPacket(link));
+        link.SetLength(0);
+
         Observe(bridge, 2, RangedWeaponKind.Crossbow, Crossbow);
+        TickHandHeartbeat(bridge);
+        if (link.Length != 0)
+        {
+            Assert.Equal($"v1|1|{Crossbow:D}", ReadHandPacket(link));
+            link.SetLength(0);
+        }
         SendOwnHand(bridge, "1 -");
         Assert.Equal("v1|1|-", ReadHandPacket(link));
     }
@@ -178,17 +245,72 @@ public sealed class Lane1BowHandTests
         await ReceiveRangedBowAsync(bridge, Environment.TickCount64);
 
         // Advance the receipt timestamp past the ordinary 25-second WO-214 deadline.
-        var hands = Field("_w214FigureHand").GetValue(bridge)!;
-        var hand = hands.GetType().GetProperty("Item")!.GetValue(hands, [(object)Peer])!;
-        hand.GetType().GetProperty("AtMs")!.SetValue(hand, Environment.TickCount64 - Wo214Rules.HandFreshMs - 1);
+        AgeFigureHand(bridge);
 
+        long receivedAt = Environment.TickCount64;
         await ReceiveFigureHandAsync(bridge, "v1|1|-");
 
         var kept = (HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!;
         Assert.Equal(Bow, Assert.Single(kept));
+        var hand = FigureHand(bridge);
+        Assert.True((long)hand.GetType().GetProperty("AtMs")!.GetValue(hand)! >= receivedAt);
         Assert.Single(game.Requests);
 
         Call(bridge, "P6VisualModeChanged");
+        Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
+    }
+
+    [Theory]
+    [InlineData("peer-lost")]
+    [InlineData("session-ended")]
+    [InlineData("sheathed")]
+    public async Task A_silent_but_connected_figure_keeps_the_bow_until_a_new_state_or_scope_ends(string next)
+    {
+        await using var link = new MemoryStream();
+        using var game = new GameCalls();
+        await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
+        var bridge = await CreateHostAsync(link);
+        Field("_transport").SetValue(bridge, transport);
+        await ReceiveRangedBowAsync(bridge, Environment.TickCount64);
+        AgeFigureHand(bridge);
+
+        var kept = (HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!;
+        Assert.Equal(Bow, Assert.Single(kept));
+
+        switch (next)
+        {
+            case "peer-lost":
+                DisconnectPeer(bridge);
+                break;
+            case "session-ended":
+                Call(bridge, "P6EndReceive", link, CancellationToken.None);
+                break;
+            case "sheathed":
+                await ReceiveFigureHandAsync(bridge, "v1|0|-");
+                await ReceiveFigureHandAsync(bridge, "v1|0|-");
+                string command = Assert.Single(game.Requests.Where(request => request.Contains($"KCD2MP_W214FigureHand(\"{Peer}\", false, \"-\"", StringComparison.Ordinal)));
+                Assert.Contains($"KCD2MP_GhostCombat(\"{Peer}\",{Protocol.CombatEventWeaponSheathed})", command.Replace(" ", ""));
+                break;
+        }
+
+        Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
+    }
+
+    [Fact]
+    public async Task A_class_report_on_the_wo214_channel_has_no_age_timeout_while_the_peer_is_connected()
+    {
+        await using var link = new MemoryStream();
+        using var game = new GameCalls();
+        await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
+        var bridge = await CreateHostAsync(link);
+        Field("_transport").SetValue(bridge, transport);
+        await ReceiveFigureHandAsync(bridge, $"v1|1|{Bow:D}");
+        AgeFigureHand(bridge);
+
+        var kept = (HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!;
+        Assert.Equal(Bow, Assert.Single(kept));
+
+        DisconnectPeer(bridge);
         Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
     }
 
@@ -230,6 +352,77 @@ public sealed class Lane1BowHandTests
         var kept = (HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!;
         Assert.Equal(Sword, Assert.Single(kept));
         Assert.DoesNotContain(game.Requests, command => command.Contains(Bow.ToString("D"), StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task An_older_queued_draw_cannot_apply_after_the_reader_receives_sheathe()
+    {
+        await using var link = new MemoryStream();
+        using var game = new GameCalls();
+        await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
+        var bridge = await CreateHostAsync(link);
+        Field("_transport").SetValue(bridge, transport);
+
+        byte[] older = HandPayload(10, $"v1|1|{Bow:D}");
+        byte[] newer = HandPayload(11, "v1|0|-");
+        Call(bridge, "P6NoteVisualAtRead", (int)Protocol.W203Down, older);
+        Call(bridge, "P6NoteVisualAtRead", (int)Protocol.W203Down, newer);
+
+        await (Task)Call(bridge, "Wo203OnSideFrameAsync", Peer, older[(1 + Protocol.JoinHeaderLen)..])!;
+
+        Assert.Empty(game.Requests);
+        Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
+
+        await (Task)Call(bridge, "Wo203OnSideFrameAsync", Peer, newer[(1 + Protocol.JoinHeaderLen)..])!;
+
+        Assert.Contains($"KCD2MP_W214FigureHand(\"{Peer}\", false, \"-\"", Assert.Single(game.Requests));
+        Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
+
+    }
+
+    [Fact]
+    public async Task An_empty_receipt_cannot_supersede_a_queued_confirmed_class()
+    {
+        await using var link = new MemoryStream();
+        using var game = new GameCalls();
+        await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
+        var bridge = await CreateHostAsync(link);
+        Field("_transport").SetValue(bridge, transport);
+        byte[] confirmed = HandPayload(10, $"v1|1|{Bow:D}");
+        byte[] empty = HandPayload(11, "v1|1|-");
+        Call(bridge, "P6NoteVisualAtRead", (int)Protocol.W203Down, confirmed);
+        Call(bridge, "P6NoteVisualAtRead", (int)Protocol.W203Down, empty);
+
+        await (Task)Call(bridge, "Wo203OnSideFrameAsync", Peer, confirmed[(1 + Protocol.JoinHeaderLen)..])!;
+        await (Task)Call(bridge, "Wo203OnSideFrameAsync", Peer, empty[(1 + Protocol.JoinHeaderLen)..])!;
+
+        Assert.Contains(Bow.ToString("D"), Assert.Single(game.Requests));
+        Assert.Equal(Bow, Assert.Single((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!));
+    }
+
+    [Fact]
+    public async Task A_stalled_writer_keeps_only_one_repeat_of_the_sheathed_state_per_peer()
+    {
+        await using var link = new MemoryStream();
+        var bridge = await CreateHostAsync(link);
+        var writer = new LinkWriter(new LinkScheduler(new LinkSchedOptions { Budget = false }), new StreamLinkPath(link));
+        Field("_w213Writer").SetValue(bridge, writer);
+        Field("_w213Stream").SetValue(bridge, link);
+
+        SendOwnHand(bridge, "0 -");
+        for (int n = 0; n < 4; n++) TickHandHeartbeat(bridge);
+        Assert.Equal(2, writer.Scheduler.EventCount);
+
+        await writer.PumpOnceAsync(CancellationToken.None);
+        Assert.Equal(2, writer.Written);
+        TickHandHeartbeat(bridge);
+        Assert.Equal(1, writer.Scheduler.EventCount);
+    }
+
+    private static byte[] HandPayload(uint token, string value)
+    {
+        byte[] up = new LootMsg(Protocol.W203FigureHand, token, value).BuildUp(Protocol.W203Up, 0);
+        return [Peer, .. up[3..]];
     }
 
     private static async Task<GameBridge> CreateHostAsync(Stream link)
@@ -275,6 +468,33 @@ public sealed class Lane1BowHandTests
     }
 
     private static void SendOwnHand(GameBridge bridge, string report) => Call(bridge, "Wo214OnEvent", "w214_hand", report);
+
+    private static void TickHandHeartbeat(GameBridge bridge, int elapsedMs = Protocol.BodyState2HeartbeatMs) =>
+        RunHandHeartbeat(bridge, Call(bridge, "P6GetContext"), elapsedMs);
+
+    private static void RunHandHeartbeat(GameBridge bridge, object? context, int elapsedMs)
+    {
+        Field("_w214OwnHandHeartbeatAtMs").SetValue(bridge, Environment.TickCount64 - elapsedMs);
+        Call(bridge, "Wo214HandHeartbeat", context);
+    }
+
+    private static void DisconnectPeer(GameBridge bridge)
+    {
+        Call(bridge, "P5PeerAtRead", (int)Protocol.Disconnect, new byte[] { Peer });
+        ((PeerSet)Field("_peers").GetValue(bridge)!).Disconnected(Peer);
+    }
+
+    private static object FigureHand(GameBridge bridge)
+    {
+        var hands = Field("_w214FigureHand").GetValue(bridge)!;
+        return hands.GetType().GetProperty("Item")!.GetValue(hands, [(object)Peer])!;
+    }
+
+    private static void AgeFigureHand(GameBridge bridge)
+    {
+        var hand = FigureHand(bridge);
+        hand.GetType().GetProperty("AtMs")!.SetValue(hand, Environment.TickCount64 - Wo214Rules.HandFreshMs - 1);
+    }
 
     private static Task ReceiveRangedBowAsync(GameBridge bridge, long capturedAt)
     {
