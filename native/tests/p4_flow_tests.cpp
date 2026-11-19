@@ -164,6 +164,25 @@ int p4_flow_tests(int* passed) {
     reset();kcdmp::p4::arm_recovery(&playerObject);kcdmp::p4::invalidate();
     PCHECK(!kcdmp::p4::recovery_policy(),"world/session invalidation clears any-thread recovery policy");
 
+    reset();
+    const uint64_t beforeDown = kcdmp::p4::pvp_life_proof();
+    PCHECK(beforeDown != 0, "observing the current native body exposes its PvP proof");
+    PCHECK(kcdmp::p4::pvp_body_matches(&playerObject, playerWuid), "current actual Soul and WUID agree with the proof");
+    PCHECK(!kcdmp::p4::pvp_body_matches(&otherObject, playerWuid), "an unsampled Soul replacement cannot inherit the old proof");
+    PCHECK(!kcdmp::p4::pvp_body_matches(&playerObject, playerWuid + 1), "a reused Soul pointer cannot inherit the old WUID's proof");
+    kcdmp::p4::note_life_edge("fixture-down");
+    const uint64_t downProof = kcdmp::p4::pvp_life_proof();
+    kcdmp::p4::note_life_edge("fixture-wake");
+    const uint64_t afterWake = kcdmp::p4::pvp_life_proof();
+    PCHECK(downProof != 0 && afterWake != 0 && beforeDown != downProof && beforeDown != afterWake && downProof != afterWake,
+           "successive native edges change proof even at the same tick and with the same body pointer");
+    kcdmp::p4::invalidate();
+    PCHECK(kcdmp::p4::pvp_life_proof() == 0, "no proof while the new generation still lacks an observed body");
+    clockMs += 100;
+    kcdmp::p4::tick();
+    const uint64_t rebound = kcdmp::p4::pvp_life_proof();
+    PCHECK(rebound != 0 && rebound != afterWake, "observing the new body publishes a fresh scope");
+
     reset();r=kcdmp::p4::place(partner,3,ctx());const uint64_t first=clockMs;
     clockMs=first+1;kcdmp::p4::tick();clockMs=first+251;kcdmp::p4::tick();
     clockMs=first+900;r=kcdmp::p4::place(partner,3,ctx());PCHECK(r.ok,"second placement is valid before first landing completes");

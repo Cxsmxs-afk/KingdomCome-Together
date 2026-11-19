@@ -410,6 +410,12 @@ public class TcpBroadcastService
         }
     }
 
+    internal void BroadcastPvpLife(ClientSession source)
+    {
+        foreach (var peer in Others(source))
+            if (peer.LinkPvpLife) peer.EnqueuePvpPeer(source);
+    }
+
     /// <summary>
     /// Relays a PlayerDeathUp (0x23) to all other ready clients as a
     /// PlayerDeathDown (0x24) (WO-28 Flow C). Idempotent at the receiver.

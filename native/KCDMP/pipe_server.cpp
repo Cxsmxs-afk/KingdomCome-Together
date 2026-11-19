@@ -2777,6 +2777,29 @@ void stop() {
 bool connected() { return g_connected; }
 uint64_t observation_connection() { return g_connected ? g_connGen.load() + 1 : 0; }
 
+void publish_pvp_life() {
+    const uint64_t connection = observation_connection();
+    if (!connection) return;
+    const uint64_t proof = p4::pvp_life_proof();
+    static uint64_t observedConnection = 0, observedProof = 0, retryAt = 0;
+    static unsigned attempts = 0;
+    static bool queued = false;
+    if (observedConnection != connection || observedProof != proof) {
+        observedConnection = connection;
+        observedProof = proof;
+        attempts = 0;
+        queued = false;
+    }
+    if (queued || attempts >= 2 || (attempts && GetTickCount64() < retryAt)) return;
+    ++attempts;
+    queued = send_frame(g_pipe.load(), kPvpLifeOut, &proof, sizeof(proof), connection - 1);
+    if (!queued) {
+        const DWORD err = GetLastError();
+        retryAt = GetTickCount64() + 100;
+        logf("PIPE: PvpLife enqueue failed: %lu", err);
+    }
+}
+
 } // namespace kcdmp::pipe
 
 namespace kcdmp::edge {

@@ -20,10 +20,12 @@ struct Recipient {
     uint64_t life;
     uint64_t connection;
     bool gameplay;
+    uint64_t proof = 0;
     bool matches(Recipient current, uint64_t readTick) const {
         return generation && connection && gameplay && current.gameplay &&
             generation == current.generation && life == current.life &&
-            connection == current.connection && readTick > life;
+            connection == current.connection && readTick > life &&
+            (!proof || proof == current.proof);
     }
 };
 

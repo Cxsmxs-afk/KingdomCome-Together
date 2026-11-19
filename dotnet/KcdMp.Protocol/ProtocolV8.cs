@@ -242,6 +242,7 @@ public readonly record struct RowEvent(uint SenderMs, byte Flags, Guid Row, stri
 /// Down: <c>[attackerGhostId:1]</c> + the up body (12).
 /// With LinkCapPvpContact, both forms add a sequence and incarnation (two little-endian u64s).
 /// Up names the recipient incarnation, down names the relay-authenticated source incarnation.
+/// With LinkCapPvpLife, both forms also carry the same recipient-issued native life proof (u64).
 /// stamina/health are LOSS amounts, as TakeDamage takes them.
 /// </summary>
 public readonly record struct PlayerHitV8(byte Victim, float Stamina, float Health, byte Flags, byte Material)
@@ -250,15 +251,18 @@ public readonly record struct PlayerHitV8(byte Victim, float Stamina, float Heal
     public const int DownLen = 12;
     public const int IdentifiedUpLen = UpLen + 2 * sizeof(ulong);
     public const int IdentifiedDownLen = DownLen + 2 * sizeof(ulong);
+    public const int LifeUpLen = IdentifiedUpLen + sizeof(ulong);
+    public const int LifeDownLen = IdentifiedDownLen + sizeof(ulong);
     /// <summary>The attacker had no weapon in hand: a fist hit (a knockdown, never a grave).</summary>
     public const byte FlagUnarmed = 0x01;
     /// <summary>A missile (arrow/bolt) hit, from the combat soul's missile slot.</summary>
     public const byte FlagMissile = 0x02;
 
-    public byte[] BuildUp(ulong sequence = 0, ulong recipient = 0)
+    public byte[] BuildUp(ulong sequence = 0, ulong recipient = 0, ulong recipientLife = 0)
     {
-        if ((sequence == 0) != (recipient == 0)) throw new ArgumentException("A contact needs both sequence and recipient.");
-        int length = sequence > 0 ? IdentifiedUpLen : UpLen;
+        if ((sequence == 0) != (recipient == 0) || (sequence == 0 && recipientLife != 0))
+            throw new ArgumentException("A contact needs both sequence and recipient.");
+        int length = recipientLife != 0 ? LifeUpLen : sequence != 0 ? IdentifiedUpLen : UpLen;
         var p = new byte[3 + length];
         p[0] = Protocol.PlayerHitV8Up;
         BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(1), (ushort)length);
@@ -271,6 +275,7 @@ public readonly record struct PlayerHitV8(byte Victim, float Stamina, float Heal
             BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(3 + UpLen), sequence);
             BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(3 + UpLen + sizeof(ulong)), recipient);
         }
+        if (recipientLife != 0) BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(3 + IdentifiedUpLen), recipientLife);
         return p;
     }
 
@@ -279,16 +284,25 @@ public readonly record struct PlayerHitV8(byte Victim, float Stamina, float Heal
         TryDecodeDown(b, out attacker, out hit, out _, out _);
 
     public static bool TryDecodeDown(ReadOnlySpan<byte> b, out byte attacker, out PlayerHitV8 hit,
-        out ulong sequence, out ulong incarnation)
+        out ulong sequence, out ulong incarnation) =>
+        TryDecodeDown(b, out attacker, out hit, out sequence, out incarnation, out _);
+
+    public static bool TryDecodeDown(ReadOnlySpan<byte> b, out byte attacker, out PlayerHitV8 hit,
+        out ulong sequence, out ulong incarnation, out ulong recipientLife)
     {
         attacker = 0; hit = default;
-        sequence = incarnation = 0;
-        if (b.Length is not (DownLen or IdentifiedDownLen)) return false;
-        if (b.Length == IdentifiedDownLen)
+        sequence = incarnation = recipientLife = 0;
+        if (b.Length is not (DownLen or IdentifiedDownLen or LifeDownLen)) return false;
+        if (b.Length >= IdentifiedDownLen)
         {
             sequence = BinaryPrimitives.ReadUInt64LittleEndian(b[DownLen..]);
             incarnation = BinaryPrimitives.ReadUInt64LittleEndian(b[(DownLen + sizeof(ulong))..]);
             if (sequence == 0 || incarnation == 0) return false;
+        }
+        if (b.Length == LifeDownLen)
+        {
+            recipientLife = BinaryPrimitives.ReadUInt64LittleEndian(b[IdentifiedDownLen..]);
+            if (recipientLife == 0) return false;
         }
         attacker = b[0];
         float st = BinaryPrimitives.ReadSingleLittleEndian(b[2..]);
@@ -303,20 +317,51 @@ public readonly record struct PlayerHitV8(byte Victim, float Stamina, float Heal
         $"victim={Victim} hp={Health:F2} st={Stamina:F2} unarmed={(Unarmed ? 1 : 0)} missile={((Flags & FlagMissile) != 0 ? 1 : 0)} material={Material}");
 }
 
+/// <summary>The owner link announces changes in order. Proof zero retires the native binding.</summary>
+public readonly record struct PvpLifeState(ulong Revision, ulong Proof)
+{
+    public const int Length = 2 * sizeof(ulong);
+    public void Write(Span<byte> bytes)
+    {
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, Revision);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[8..], Proof);
+    }
+
+    public static PvpLifeState Read(ReadOnlySpan<byte> bytes) =>
+        new(BinaryPrimitives.ReadUInt64LittleEndian(bytes), BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]));
+
+    public byte[] BuildUp()
+    {
+        var frame = new byte[3 + Length];
+        frame[0] = Protocol.PvpLifeUp;
+        frame[1] = Length;
+        Write(frame.AsSpan(3));
+        return frame;
+    }
+}
+
 public static partial class Protocol
 {
     // ---- WO-121 type bytes ----
     public const byte PlayerHitV8Up   = 0x44;
     public const byte PlayerHitV8Down = 0x45;
     public const byte PvpPeerDown = 0x94; // negotiated relay roster entry [ghost:1][incarnation:8]
+    public const byte PvpLifeUp = 0x95; // negotiated owner change [revision:8][proof:8]
     public const int PvpPeerLen = 1 + sizeof(ulong);
+    public const int PvpPeerLifeLen = PvpPeerLen + PvpLifeState.Length;
 
-    public static bool TryReadPvpPeer(ReadOnlySpan<byte> body, out byte ghost, out ulong incarnation)
+    public static bool TryReadPvpPeer(ReadOnlySpan<byte> body, out byte ghost, out ulong incarnation) =>
+        TryReadPvpPeer(body, out ghost, out incarnation, out _);
+
+    public static bool TryReadPvpPeer(ReadOnlySpan<byte> body, out byte ghost, out ulong incarnation, out PvpLifeState life)
     {
         ghost = 0; incarnation = 0;
-        if (body.Length != PvpPeerLen) return false;
+        life = default;
+        if (body.Length is not (PvpPeerLen or PvpPeerLifeLen)) return false;
         ghost = body[0];
         incarnation = BinaryPrimitives.ReadUInt64LittleEndian(body[1..]);
+        if (body.Length == PvpPeerLifeLen) life = PvpLifeState.Read(body[PvpPeerLen..]);
+        if (life.Revision == 0 && life.Proof != 0) return false;
         return incarnation != 0;
     }
 
