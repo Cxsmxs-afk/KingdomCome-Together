@@ -12,7 +12,10 @@ public partial class GameBridge
     private readonly SemaphoreSlim _hostCalendarGate = new(1, 1);
     private readonly SemaphoreSlim _hostCalendarSendGate = new(1, 1);
     private readonly object _hostCalendarLock = new();
-    private sealed record JoinCalendarRequest(uint JoinId, byte Host, Stream Link);
+    private sealed record JoinCalendarRequest(uint JoinId, byte Host, Stream Link)
+    {
+        public JoinCharacterSelection? Character { get; init; }
+    }
     private JoinCalendarRequest? _joinCalendarRequest;
     private HostCalendarSample? _hostCalendar;
     private HostCalendarSample? _hostCalendarBootstrap;
@@ -167,7 +170,7 @@ public partial class GameBridge
         {
             if (_joinCalendarRequest is not { } request || host is byte source && request.Host != source || !ReferenceEquals(request.Link, stream) ||
                 joinId is uint aborted && request.JoinId != aborted) return;
-            Volatile.Write(ref _joinCalendarRequest, null);
+            ClearJoinCharacterRequest();
             ClearJoinCalendarBootstrap();
             if (_jj is { } active && active.JoinId == request.JoinId && active.Host == request.Host)
             {
@@ -181,6 +184,14 @@ public partial class GameBridge
             }
             Console.WriteLine($"MP-CALENDAR join 0x{request.JoinId:x8}: bootstrap retired reason={(host is null ? "relay-lost" : joinId is null ? "host-left" : "host-abort")}");
         }
+    }
+
+    // Caller owns _joinGate. A join already in gameplay retains its own character lease.
+    private void ClearJoinCharacterRequest()
+    {
+        var old = _joinCalendarRequest;
+        Volatile.Write(ref _joinCalendarRequest, null);
+        ReleasePendingCharacter(old?.Character);
     }
 
     private bool DropJoinCalendar(byte source, uint joinId, string reason)

@@ -69,6 +69,7 @@ public partial class GameBridge
     {
         if (_joinedWorld == on) return;
         _joinedWorld = on;
+        if (!on) ReleaseJoinedCharacter();
         if (!on) _ = Wo134InvalidateLedgerAsync("left-host-world");
         if (!on) _ = ResetHostCalendarAsync("left-host-world");
         Wo122EnsureWatcher();
@@ -81,6 +82,9 @@ public partial class GameBridge
         public uint WorldSavedSeq;
         public uint HostWorldEpoch;
         public JoinRetryBlock? RetryScope;
+        public JoinCharacterSelection? Character;
+        public WorldRunOffer? RunOffer;
+        public HenryCharacterScope? CharacterScope;
         public HenrySource? Source;
         public string? SavesRoot;
         public string? PlacedPath;   // the reserved destination, verified separately after publication
@@ -114,6 +118,7 @@ public partial class GameBridge
     private readonly JoinWorldFiles<JoinerJoin> _retainedJoinWorlds = new();
     private volatile bool _joinedWorld;            // this game's loaded world is the host's (after a join, until it leaves)
     private HenrySource? _joinedSource;            // the save to go back to when leaving
+    private string? _joinedSourceFingerprint;
     private volatile bool _ownLoadExpected;        // our own "leave" load is running
     private bool OwnLoadExpected => LoadSequenceEnabled
         ? _worldLoad.Current.OwnIntent == WorldLoadOwnIntent.ExpectedPrivate : _ownLoadExpected;
@@ -575,7 +580,7 @@ public partial class GameBridge
         _autoRequests++;
         _autoNextUtc = DateTime.UtcNow.AddSeconds(30);
         if (fromWorld) _joinFromWorldOnce = false;
-        string what = _henry.HasWorld(_peerTag!) ? $"its own Henry for world {_peerTag} is restored" : $"first join ({CurrentChoice()})";
+        string what = CurrentChoice() is null ? "restoring the paired character" : "using the selected character";
         Console.WriteLine($"MP-JOIN joiner: {(fromWorld ? "in its own world after the host changed worlds" : "at the main menu")} with a shared-world host -- asking for the world (auto, try {_autoRequests}; {what})");
         await SendJoinRequestAsync();
         if (_joinOutId != 0) SetJoinUi("waiting", "Waiting for your host...");
@@ -626,14 +631,19 @@ public partial class GameBridge
     // ---------------------------------------------------------------- Phase 2+3: splice, place, load
 
     /// <summary>WO-123 received and verified the world (Done sent). Called from the chunk handler.</summary>
-    private Task Wo124OnWorldReceivedAsync(uint joinId, byte host, string stagedPath, uint seq, uint hostWorldEpoch)
+    private Task Wo124OnWorldReceivedAsync(uint joinId, byte host, string stagedPath, uint seq, uint hostWorldEpoch, WorldRunOffer? runOffer = null)
     {
         if (!JoinerSharedEffective) return Task.CompletedTask;
+        var request = Volatile.Read(ref _joinCalendarRequest);
+        var character = request is not null && request.JoinId == joinId && request.Host == host &&
+            ReferenceEquals(request.Link, _wo122Stream) ? request.Character : null;
         var j = new JoinerJoin
         {
             JoinId = joinId, Host = host, WorldSavedSeq = seq, HostWorldEpoch = hostWorldEpoch,
             InWorld = _where == GameWhere.World, OfferMd5 = _joinReceivedMd5,
-            RetryScope = new(_wo122Stream, host, hostWorldEpoch, _peerTag, CurrentChoice())
+            Character = character,
+            RunOffer = runOffer,
+            RetryScope = new(_wo122Stream, host, hostWorldEpoch, _peerTag, character?.Intent?.Key)
         };
         lock (_joinGate)
         {
@@ -672,7 +682,7 @@ public partial class GameBridge
 
             // ---- Phase 1 (WO-125): which Henry. The world's own (restore) or the first-join choice
             // (bring / fresh); the world must be the one announced and a Henry world.
-            var choice = Wo125HenryForWorld(j.JoinId, hostBytes, out string why, out byte abortWhy, out string worldTag);
+            var choice = Wo125HenryForWorld(j, hostBytes, out string why, out byte abortWhy, out string worldTag);
             if (choice is null)
             {
                 Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: {why}");
@@ -889,7 +899,12 @@ public partial class GameBridge
             {
                 if (!ReferenceEquals(_jj, j) || j.Abandoned.Task.IsCompleted || j.Phase != "loading") return;
                 j.Phase = "post-load";
-                _joinedSource = choice.Save;
+                if (choice.Save is not null || !j.InWorld)
+                {
+                    _joinedSource = choice.Save;
+                    _joinedSourceFingerprint = choice.Fingerprint;
+                }
+                Volatile.Write(ref _joinedCharacter, BindLoadedCharacter(j));
                 SetJoinedWorld(true);   // the saves watch runs: a save that still lands here is a leak (QuickSave passes the lock)
             }
 
@@ -1141,7 +1156,10 @@ public partial class GameBridge
             return;
         }
         if (j.WorldTag is string wt && j.SplicedParts is { } sp)
+        {
             Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, j.WorldSavedSeq, j.HostWorldEpoch);
+            if (j.Character?.Intent is { } intent) Interlocked.CompareExchange(ref _firstCharacter, null, intent);
+        }
         _ = Wo210AfterSkipAsync("join");
         await CleanupRetainedJoinWorldsAsync(completed, "join=in");
         T3AfterJoinedWorldCleanup();
@@ -1324,6 +1342,7 @@ public partial class GameBridge
             WorldReceiver.SweepStaging(WorldReceiver.DefaultStagingDir());
             _joinReceivedId = 0;
             _jj = null;
+            if (_joinCalendarRequest?.JoinId == j.JoinId) ClearJoinCharacterRequest();
             if (LoadSequenceEnabled && _worldLoad.IsCurrent(j.LoadGeneration))
             {
                 LoadSequenceOnExit();
@@ -1375,12 +1394,16 @@ public partial class GameBridge
     private async Task LeaveSharedWorldCoreAsync(string why, string message, JoinerJoin? expected)
     {
         bool hostAbsent;
+        HenrySource? selectedHome;
+        string? homeFingerprint;
         lock (_joinGate)
         {
             if (_leaveInProgress || (expected is not null && !ReferenceEquals(_jj, expected))) return;
             if (!_joinedWorld && _jj is null) return;
             _leaveInProgress = true;  // The private load must settle before another join.
             hostAbsent = HostAbsentPause;
+            selectedHome = expected?.Character?.First?.Save ?? _joinedSource;
+            homeFingerprint = expected?.Character?.First?.Fingerprint ?? _joinedSourceFingerprint;
         }
         LoadSequenceOnExit();
         await ResetHostCalendarAsync("leave");
@@ -1392,10 +1415,12 @@ public partial class GameBridge
         if (finalWhy is not ("" or "-")) message += " " + Wo211Rules.SnapshotLostText(finalWhy);   // WO-211 A.2.4: never silent
         // WO-125 Phase 2: the target is recomputed now -- the newest own save whose playthrough is not the
         // host's (a hand-placed copy of the host's world is never "own"). None: the way back to the menu.
-        var (src, ownWhy) = await Wo125NewestOwnLoadableAsync();
+        var (src, ownWhy) = selectedHome is not null && homeFingerprint is not null
+            ? await Wo125CapturedHomeAsync(selectedHome, homeFingerprint)
+            : await Wo125NewestOwnLoadableAsync();
         // WO-211 A.2.3: a leave after a dropped link goes home with the drop moment's Henry -- the paired final snapshot spliced into this
         // player's own newest save (his own quest items kept, the host world's left there), placed where he stood
-        if (why == "relay-lost" && finalWhy == "" && src is not null && _joinedTag is string homeTag && W211Fix("drop_henry_home"))
+        if (selectedHome is null && why == "relay-lost" && finalWhy == "" && src is not null && _joinedTag is string homeTag && W211Fix("drop_henry_home"))
             src = await Wo211SpliceHomeAsync(homeTag, src) ?? src;
         lock (_joinGate)
         {

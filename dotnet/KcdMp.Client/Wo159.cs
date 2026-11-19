@@ -427,8 +427,7 @@ public static class Wo159
                 if (saves is null) { Out(new { ok = false, why = "no saves folder" }); return 1; }
                 // WO-180: the list is the player's saves as they are (a co-op playline an old WO-175 copy made is an ordinary save)
                 var r = HostWorlds(saves, ledger);
-                // a staged start save never played: what New adventure loads
-                var st = ReadLedger(ledger).LastOrDefault(e => File.Exists(e.Path));
+                var (localStyles, characters) = LocalStartMenuChoices(saves);
                 Out(new
                 {
                     ok = true,
@@ -438,7 +437,8 @@ public static class Wo159
                     hiddenCopies = r.HiddenCopies,
                     hiddenPrologue = r.HiddenPrologue,
                     free = r.Free,
-                    staged = st is null ? null : new { pl = WorldSaved.ParsePath(st.Path)?.Playline ?? 255, name = Path.GetFileNameWithoutExtension(st.Path), path = st.Path, seedTag = st.SeedTag },
+                    localStyles,
+                    characters,
                 });
                 return 0;
             }
@@ -493,6 +493,33 @@ public static class Wo159
         Out(new { ok = false, why = "usage: --w159 saves|stage|swap|unstage|used|validate" });
         return 2;
     }
+
+    private sealed record MenuCharacter(Guid Id, string Name);
+
+    private static (List<string> Styles, List<MenuCharacter> Characters) LocalStartMenuChoices(string saves)
+    {
+        List<string> styles = [];
+        List<MenuCharacter> characters = [];
+        try
+        {
+            string folder = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(saves)))!;
+            if (!LocalStartCheckpointStore.SafeDirectory(saves)) return (styles, characters);
+            string profile = LocalStartCheckpointStore.ProfileId(folder);
+            var checkpoints = new LocalStartCheckpointStore(LocalStartCheckpointStore.DefaultRoot(), profile);
+            var catalog = new HenryCharacterCatalog(HenryCharacterCatalog.DefaultRoot(), profile);
+            foreach (string style in Wo159Rules.Styles)
+                if (checkpoints.TryFind(style, null, out var start, out _) && !catalog.IsDeletedCreation(start.CreationId) &&
+                    LocalStartCheckpointStore.EngineHomeMatches(folder, start)) styles.Add(style);
+            if (catalog.TryList(out var active))
+                foreach (var entry in active)
+                    if (checkpoints.TryRead(entry.CreationId, entry.EngineBuild, out var saved, out _) &&
+                        entry.CheckpointSha256 == saved.Sha256 && entry.Style == saved.Style &&
+                        LocalStartCheckpointStore.EngineHomeMatches(folder, saved))
+                        characters.Add(new(entry.CharacterId, entry.DisplayName));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
+        return (styles, characters);
+    }
 }
 
 /// <summary>WO-159: the small rules shared by the agent, its IPC and the launcher's words.</summary>
@@ -514,8 +541,10 @@ public static class Wo159Rules
     {
         c = (c ?? "").Trim().ToLowerInvariant();
         choice = ""; style = null;
-        if (c is "bring" or "fresh") { choice = c; return true; }
+        if (c is "bring" or "fresh" or "restore") { choice = c; return true; }
         if (c.StartsWith("fresh:", StringComparison.Ordinal) && Styles.Contains(c[6..])) { choice = "fresh"; style = c[6..]; return true; }
+        int idAt = c.StartsWith("character:", StringComparison.Ordinal) ? 10 : c.StartsWith("restore:", StringComparison.Ordinal) ? 8 : 0;
+        if (idAt > 0 && Guid.TryParseExact(c.AsSpan(idAt), "N", out var id) && id != Guid.Empty) { choice = c; return true; }
         return false;
     }
 
@@ -531,13 +560,6 @@ public static class Wo159Rules
     public static string DeferredText(string reason, ushort arg) => reason == "prologue"
         ? $"Your host is watching the prologue (about {Math.Max(1, (int)arg)} min left). You'll join as soon as it ends or they skip it."
         : "Your host is busy, you'll join in a moment.";
-
-    /// <summary>KCDMP_START_SAVE (tests) or start-save beside this agent (Setup puts it beside the launcher and the agent).</summary>
-    public static string? StartSaveRoot()
-    {
-        string root = Environment.GetEnvironmentVariable("KCDMP_START_SAVE") is { Length: > 0 } e ? e : Path.Combine(AppContext.BaseDirectory, "start-save");
-        return Directory.Exists(root) ? root : null;
-    }
 
     /// <summary>
     /// A new player whose game has run (its user folder exists) but who never saved has no saves folder yet: it is made,

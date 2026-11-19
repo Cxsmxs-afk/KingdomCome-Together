@@ -16,6 +16,7 @@ public partial class GameBridge
     /// <summary>The host's own engine lines: a save begins / ends; a load begins (the load's end is its gameplay start).</summary>
     private void Wo201BusyOnEngineLine(string line)
     {
+        H21HostEngineSaveLine(line);
         if (!W137Host || !W201("host_load_toast")) return;
         string? text = null;
         if (line.StartsWith("[SAVE GAME] Quick-saving to", StringComparison.Ordinal) || line.StartsWith("[SAVE GAME] Saving", StringComparison.Ordinal)) text = "save 1";
@@ -27,6 +28,7 @@ public partial class GameBridge
     /// <summary>The host's load begins (WO-125's own edge).</summary>
     private void Wo201HostLoadStart()
     {
+        if (H21Hosting) H21RetireActiveHostRun();
         if (_w201Dude2Eid != 0) _ = Wo201Dude2SetAsync(0, false, "the host's load");   // V.3: the bit never rides into a load
         if (W137Host && W201("host_load_toast")) _ = Wo201SendBusyAsync("load 1");
     }
