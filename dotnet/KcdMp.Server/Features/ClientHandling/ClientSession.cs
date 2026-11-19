@@ -199,6 +199,16 @@ public partial class ClientSession
     /// </summary>
     public bool ClaimsHost { get; private set; }
 
+    /// <summary>The last world epoch and run this client announced. Zero and an empty guid mean "not announced".</summary>
+    public uint AnnouncedWorldEpoch { get; private set; }
+    public Guid AnnouncedRunId { get; private set; }
+
+    internal void NoteAnnouncement(uint world, Guid run)
+    {
+        if (world != 0) AnnouncedWorldEpoch = world;
+        if (run != Guid.Empty) AnnouncedRunId = run;
+    }
+
     /// <summary>WO-213 C.2: the client's LinkHello said it sends and takes state the unreliable way (and the relay agreed).</summary>
     public bool LinkUnreliableState { get; internal set; }
 
@@ -650,9 +660,10 @@ public partial class ClientSession
                     // cannot inject NPC damage into someone else's game.
                     if (!_clientHandler.IsDamageAuthority(this))
                     {
-                        _logger.Warning("[!] '{Name}' (id={Id}) sent PlayerHitUp without holding damage authority -- dropped.",
-                            Name, Id);
-                        _clientHandler.CountDrop(Protocol.PlayerHitUp, "not-host");   // WO-203 II.5: counted, not only a line
+                        string why = _clientHandler.HostAbsent ? "host-absent" : "not-host";
+                        _logger.Warning("[!] '{Name}' (id={Id}) sent PlayerHitUp without holding damage authority -- dropped ({Why}).",
+                            Name, Id, why);
+                        _clientHandler.CountDrop(Protocol.PlayerHitUp, why);
                         continue;
                     }
                     _broadcastService.RoutePlayerHit(this, body);
@@ -1083,8 +1094,9 @@ public partial class ClientSession
                     var ws = WorldSaved.TryDecode(body, down: false, out _);
                     if (!_clientHandler.IsDamageAuthority(this))
                     {
-                        _logger.Warning("[!] '{Name}' (id={Id}) sent WorldSaved without holding damage authority -- dropped.", Name, Id);
-                        _clientHandler.CountDrop(Protocol.WorldSavedUp, "not-host");   // WO-203 II.5: counted, not only a line
+                        string why = _clientHandler.HostAbsent ? "host-absent" : "not-host";
+                        _logger.Warning("[!] '{Name}' (id={Id}) sent WorldSaved without holding damage authority -- dropped ({Why}).", Name, Id, why);
+                        _clientHandler.CountDrop(Protocol.WorldSavedUp, why);
                         continue;
                     }
                     _logger.Information("[worldsave] '{Name}' (id={Id}) saved the world: seq {Seq} playline{Playline}/{File}.",
@@ -1126,9 +1138,15 @@ public partial class ClientSession
                 // receiver sees exactly what it saw before WO-127.
                 bool claims = (flags & Protocol.PositionFlagHostClaim) != 0;
                 flags = (byte)(flags & ~Protocol.PositionFlagHostClaim);
+                if (claims && _clientHandler.HostAbsent && !_clientHandler.IsReturningHost(this))
+                {
+                    _logger.Information("MP-HOST-ABSENT claim refused name={Name} reason=not-the-host", Name);
+                    claims = false;
+                }
                 if (claims != ClaimsHost)
                 {
                     ClaimsHost = claims;
+                    if (claims) _clientHandler.TryResumeHost(this);
                     _logger.Information("MP-HOST-CLAIM '{Name}' (id={Id}, {Transport}) {What} the session host.",
                         Name, Id, Transport, claims ? "claims" : "no longer claims");
                     _broadcastService.BroadcastCombatRole();   // re-decides and logs MP-AUTHORITY-OWNER

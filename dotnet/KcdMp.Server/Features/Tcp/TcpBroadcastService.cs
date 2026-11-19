@@ -320,12 +320,15 @@ public class TcpBroadcastService
     {
         why = "";
         bool fromHost = _clientHandler.IsDamageAuthority(source);
+        bool returning = _clientHandler.IsReturningHost(source);
         uint announcedWorld = 0;
+        string? epochText = null;
         if (downType == Protocol.W203Down && body.Length > Protocol.JoinHeaderLen && body[Protocol.JoinHeaderLen] == Protocol.W203Epoch)
         {
             if (!LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var epoch) ||
                 !TryWorldEpochDirection(epoch.Text, out from, out announcedWorld))
             { why = "invalid-world-epoch"; return null; }
+            epochText = epoch.Text;
         }
         byte target = body[0];
         ClientSession? dest = null;
@@ -338,18 +341,30 @@ public class TcpBroadcastService
                 if (target != KcdMp.Wire.Protocol.JoinTargetHost && target != dest.Id) { why = "target-not-host"; return null; }
                 break;
             case KcdMp.Wire.Protocol.JoinFrom.Host:
-                if (!fromHost) { why = "not-the-host"; return null; }
+                // A returning host may announce the paused world's epoch before the relay hands authority back.
+                // Every other host-only row still waits until that epoch and run match.
+                if (!fromHost && !(returning && announcedWorld != 0)) { why = "not-the-host"; return null; }
                 dest = Find(target);
                 break;
             default:
                 dest = target == KcdMp.Wire.Protocol.JoinTargetHost ? _clientHandler.DamageAuthority : Find(target);
                 break;
         }
-        if (dest is null || ReferenceEquals(dest, source)) { why = "no-target"; return null; }
+        if (dest is null || ReferenceEquals(dest, source))
+        {
+            why = dest is null && _clientHandler.HostAbsent ? "host-absent" : "no-target";
+            return null;
+        }
         if (announcedWorld != 0)
         {
             source.ObserveWorldSyncEpoch(source.Id, announcedWorld);
             dest.ObserveWorldSyncEpoch(source.Id, announcedWorld);
+            if (fromHost || returning)
+            {
+                HostAbsentRules.TryReadRun(epochText, out Guid run);
+                source.NoteAnnouncement(announcedWorld, run);
+                if (_clientHandler.TryResumeHost(source)) BroadcastCombatRole();
+            }
         }
         dest.EnqueueSenderFact(downType, source.Id, body, HostStamp(source, senderTicks));
         return dest;
