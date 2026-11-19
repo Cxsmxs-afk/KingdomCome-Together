@@ -1,5 +1,7 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 using System.Buffers.Binary;
+using System.Collections;
+using System.Text;
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Reflection;
@@ -51,14 +53,56 @@ public sealed class JoinCalendarIntegrationTests
     public Task Menu_progress_cannot_renew_the_host_hold_before_the_calendar_receipt() =>
         RunAsync("A", "B", dropFirstSnapshot: false, JoinProbe.MenuProgress);
 
-    private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None)
+    [Theory]
+    [InlineData("A", false)]
+    [InlineData("A", true)]
+    [InlineData("B", false)]
+    [InlineData("B", true)]
+    public Task A_retired_join_cannot_cross_the_engine_HTTP_boundary(string host, bool hostLoss) =>
+        RunBoundaryAsync(host, "dispatch", hostLoss);
+
+    [Theory]
+    [InlineData("A", false)]
+    [InlineData("A", true)]
+    [InlineData("B", false)]
+    [InlineData("B", true)]
+    public Task A_retired_join_cannot_send_an_already_queued_ready(string host, bool hostLoss) =>
+        RunBoundaryAsync(host, "ready", hostLoss);
+
+    [Theory]
+    [InlineData("A", false)]
+    [InlineData("A", true)]
+    [InlineData("B", false)]
+    [InlineData("B", true)]
+    public Task A_late_engine_read_keeps_the_file_safe_and_cannot_make_an_aborted_join_ready(string host, bool hostLoss) =>
+        RunBoundaryAsync(host, "late-read", hostLoss);
+
+    [Fact]
+    public Task Guest_transport_loss_after_load_returns_to_the_own_world_only_after_the_engine_finishes() =>
+        RunAsync("A", "B", dropFirstSnapshot: false, boundary: new("late-read", HostLoss: false, GuestLoss: true));
+
+    [Theory]
+    [InlineData(3)]
+    [InlineData(4)]
+    public Task Targeted_join_loads_with_other_real_relay_peers_present(int players) =>
+        RunAsync(players == 3 ? "A" : "B", players == 3 ? "B" : "A", dropFirstSnapshot: false, extraPeers: players - 2);
+
+    private sealed record BoundaryProbe(string Edge, bool HostLoss, bool GuestLoss = false);
+
+    private static Task RunBoundaryAsync(string host, string edge, bool hostLoss) =>
+        RunAsync(host, host == "A" ? "B" : "A", dropFirstSnapshot: false, boundary: new(edge, hostLoss));
+
+    private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None,
+        BoundaryProbe? boundary = null, int extraPeers = 0)
     {
         using var fixture = new SaveFixture();
-        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(boundary is null ? 25 : 40));
         var ct = stop.Token;
         await using var relay = await ReplayRelay.StartAsync(ct);
         await using var hostPeer = await ReplayPeer.ConnectAsync(relay.Port, hostName, ct);
         await using var guestPeer = await ReplayPeer.ConnectAsync(relay.Port, guestName, ct);
+        await using var observerC = extraPeers >= 1 ? await ReplayPeer.ConnectAsync(relay.Port, "C", ct) : null;
+        await using var observerD = extraPeers >= 2 ? await ReplayPeer.ConnectAsync(relay.Port, "D", ct) : null;
         Assert.NotEqual(hostPeer.Id, guestPeer.Id);
         byte[] hello = Protocol.BuildLinkHelloUp(Protocol.LinkCapWorldSync);
         await hostPeer.SendAsync(hello, ct);
@@ -76,6 +120,9 @@ public sealed class JoinCalendarIntegrationTests
         await using var guestGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "guest.log"), fixture.GuestSaves, null, guestPipe.ObserveGameplayStarted);
         var host = CreateBridge(hostPeer.Id, true, hostLink, hostPipe.Pipe, hostGame.Transport, fixture.HostSaves, ct);
         var guest = CreateBridge(guestPeer.Id, false, guestLink, guestPipe.Pipe, guestGame.Transport, fixture.GuestSaves, ct);
+        guestGame.Transport.MainMenuShown += guestPipe.ObserveMainMenu;
+        guestGame.DeferJoinFileRead = boundary?.Edge == "late-read";
+        guestGame.DeferSaveLockReply = boundary?.Edge == "ready";
         hostGame.SaveWritten = path => Call(host, "OnSaveFileEvent", path);
         guestGame.Emit("wo124_where", "menu");
         hostGame.Emit("wo124_where", "world");
@@ -93,8 +140,8 @@ public sealed class JoinCalendarIntegrationTests
             await WaitAsync(() => Get<bool>(host, "_combatRoleApplyComplete"), "the host's relay-assigned combat role", ct);
             Assert.True(Get<bool>(host, "_isDamageAuthority"));
             await WaitAsync(() => (Get<ushort>(guest, "_w213Caps") & Protocol.LinkCapWorldSync) != 0
-                    && ((List<byte>)Call(host, "LivePartners")!).Contains(guestPeer.Id),
-                "the relay's world-sync capability and live guest", ct);
+                    && ((List<byte>)Call(host, "LivePartners")!).Count == 1 + extraPeers,
+                "the relay's world-sync capability and all live peers", ct);
             await InvokeAsync(host, "Wo124HostModeTickAsync");
             await InvokeAsync(host, "Wo206AnnounceAsync", "fixture", (byte?)guestPeer.Id);
             await WaitAsync(() => Get<bool>(guest, "_hostModeKnown") && Get<Wo206Epochs>(guest, "_w206").World != 0,
@@ -111,6 +158,12 @@ public sealed class JoinCalendarIntegrationTests
             guestLink.BeforeFirstOffer = () => atOffer.TrySetResult(
                 (Get<long>(guest, "_w200ClockIn"), Get<HostCalendarSample?>(guest, "_hostCalendarBootstrap")));
             if (probe == JoinProbe.Scope) guestLink.ProbeCalendarEpoch = Get<Wo206Epochs>(guest, "_w206").World;
+            if (boundary is not null)
+            {
+                await CheckAbortBoundaryAsync(boundary, fixture, host, guest, hostPeer, guestPeer, hostLink, guestLink,
+                    hostGame, guestGame, guestRead, ct);
+                return;
+            }
             await InvokeAsync(guest, "SendJoinRequestAsync");
             uint joinId = Get<uint>(guest, "_joinOutId");
             Assert.NotEqual(0u, joinId);
@@ -188,7 +241,13 @@ public sealed class JoinCalendarIntegrationTests
             AssertReady(await hostLink.Ready.WaitAsync(ct), guestPeer.Id, joinId);
             await WaitAsync(() => Get<object?>(host, "_hostJoin") is null && Get<string>(guest, "_joinUiState") == "in",
                 "the host finished the join and the guest entered the world", ct);
+            await guestGame.JoinedNotification.WaitAsync(ct);
             Assert.True(Get<bool>(guest, "_joinedWorld"));
+            foreach (var observer in new[] { observerC, observerD }.OfType<ReplayPeer>())
+            {
+                var observed = await observer.DrainAsync(ct);
+                Assert.DoesNotContain(observed, packet => packet.Type is Protocol.WorldOfferDown or Protocol.WorldChunkDown or Protocol.JoinerReadyDown);
+            }
         }
         finally
         {
@@ -201,6 +260,209 @@ public sealed class JoinCalendarIntegrationTests
                 Get<FileSystemWatcher?>(host, "_savesWatcher")?.Dispose();
                 Get<FileSystemWatcher?>(guest, "_savesWatcher")?.Dispose();
             }
+        }
+    }
+
+    private static async Task CheckAbortBoundaryAsync(BoundaryProbe probe, SaveFixture fixture,
+        GameBridge host, GameBridge guest, ReplayPeer hostPeer, ReplayPeer guestPeer, JoinWire hostLink, JoinWire guestLink,
+        JoinCalendarTestEngine hostGame, JoinCalendarTestEngine guestGame, Task guestRead, CancellationToken ct)
+    {
+        byte[] ownBefore = File.ReadAllBytes(fixture.GuestOwnSave);
+        using var dispatch = probe.Edge == "dispatch" ? new LoadPhaseBarrier() : null;
+        LinkWriter? writer = probe.Edge == "ready" ? new(new LinkScheduler(new LinkSchedOptions { Budget = false }),
+            new StreamLinkPath(guestLink)) : null;
+        using var writerStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        if (writer is not null)
+        {
+            Set(guest, "_w213Stream", guestLink);
+            Set(guest, "_w213Writer", writer);
+        }
+        var writerTask = writer?.RunAsync(writerStop.Token) ?? Task.CompletedTask;
+        try
+        {
+            await InvokeAsync(guest, "SendJoinRequestAsync");
+            uint joinId = Get<uint>(guest, "_joinOutId");
+            Assert.NotEqual(0u, joinId);
+            if (dispatch is not null)
+            {
+                await dispatch.Arrived.WaitAsync(ct);
+                await AbortThroughRelayAsync(probe, guest, hostPeer, guestPeer, guestLink, joinId, ct, waitForDuplicate: false);
+                dispatch.Release();
+                if (!probe.HostLoss)
+                    await WaitAsync(() => guestLink.Aborts.Count(id => id == joinId) >= 2, "the duplicate authenticated abort", ct);
+                await WaitAsync(() => guestGame.JoinLoadsIssued != 0 || Get<object?>(guest, "_jj") is null,
+                    "the retired load worker to reach its HTTP decision", ct);
+                Assert.Equal(0, guestGame.JoinLoadsIssued);
+            }
+            else if (writer is not null)
+            {
+                await guestGame.WaitForSaveLockAsync(ct);
+                var blocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var flushed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                byte[] before = PingMarker(2001), after = PingMarker(2002);
+                guestLink.BeforeWrite = async (frame, token) =>
+                {
+                    if (frame.Span.SequenceEqual(before))
+                    {
+                        blocked.TrySetResult();
+                        await release.Task.WaitAsync(token);
+                    }
+                    if (frame.Span.SequenceEqual(after)) flushed.TrySetResult();
+                };
+                try
+                {
+                    writer.Enqueue(before);
+                    await blocked.Task.WaitAsync(ct);
+                    guestGame.ReleaseSaveLock();
+                    await WaitAsync(() => HasQueuedReady(writer.Scheduler, joinId), "the Ready to queue while TCP is held", ct);
+                    await AbortThroughRelayAsync(probe, guest, hostPeer, guestPeer, guestLink, joinId, ct);
+                    writer.Enqueue(after);
+                    release.TrySetResult();
+                    await flushed.Task.WaitAsync(ct);
+                    Assert.DoesNotContain(joinId, guestLink.ReadySent);
+                }
+                finally { release.TrySetResult(); }
+            }
+            else
+            {
+                string file = await guestGame.WaitForJoinLoadAsync(ct);
+                byte[] placed = File.ReadAllBytes(file);
+                if (probe.GuestLoss)
+                {
+                    guestPeer.FinishSending();
+                    await guestRead.WaitAsync(ct);
+                    Set(guest, "_wo122Ct", new CancellationToken(canceled: true));
+                    guestGame.Transport.SaveLoadAccepted -= Handler<Action<string>>(guest, "Wo124OnSaveLoadAccepted");
+                    guestGame.Transport.LoadStarted -= Handler<Action>(guest, "Wo124OnLoadStarted");
+                    guestGame.Transport.LoadReconstructionStarted -= Handler<Action>(guest, "LoadSequenceOnReconstruction");
+                    guestGame.Transport.GameplayStarted -= Handler<Action>(guest, "Wo124OnGameplayStarted");
+                    guestGame.Transport.LoadFailedToMenu -= Handler<Action>(guest, "Wo124OnLoadFailedToMenu");
+                    await InvokeAsync(guest, "Wo123OnDisconnectAsync");
+                    await InvokeAsync(guest, "Wo124OnDisconnectAsync");
+                }
+                else await AbortThroughRelayAsync(probe, guest, hostPeer, guestPeer, guestLink, joinId, ct);
+                await WaitAsync(() => Get<object?>(guest, "_jj") is not { } join ||
+                    GetVisible<string>(join, "Phase") != "loading" ||
+                    GetVisible<TaskCompletionSource<bool>>(join, "Abandoned").Task.IsCompleted,
+                    "the submitted join to be retired before the engine reads it", ct);
+                Assert.Equal(placed, File.ReadAllBytes(file));
+                Assert.Equal(0, guestGame.JoinFilesRead);
+                Assert.Equal(0, guestGame.OwnLoadsIssued);
+                Assert.Empty(guestLink.ReadySent);
+                guestGame.CompleteJoinLoad();
+                Assert.Equal(1, guestGame.JoinFilesRead);
+                await guestGame.WaitForOwnLoadAsync(ct);
+                await WaitAsync(() => Get<object?>(guest, "_jj") is null && !Get<bool>(guest, "_joinedWorld") &&
+                    !Get<bool>(guest, "_leaveInProgress"),
+                    "the abandoned arrival to return to the guest's own world", ct);
+                if (!probe.HostLoss && !probe.GuestLoss)
+                    await RejoinAfterAbortAsync(fixture, host, guest, guestPeer.Id, joinId, hostGame, guestGame, hostLink,
+                        guestLink, ct);
+            }
+            Assert.DoesNotContain(joinId, guestLink.ReadySent);
+            Assert.DoesNotContain(joinId, hostLink.ReadyReceived);
+            Assert.Equal(ownBefore, File.ReadAllBytes(fixture.GuestOwnSave));
+        }
+        finally
+        {
+            dispatch?.Release();
+            writerStop.Cancel();
+            await writerTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    private static async Task AbortThroughRelayAsync(BoundaryProbe probe, GameBridge guest, ReplayPeer hostPeer,
+        ReplayPeer guestPeer, JoinWire guestLink, uint joinId, CancellationToken ct, bool waitForDuplicate = true)
+    {
+        Assert.NotNull(Get<object?>(guest, "_joinCalendarRequest"));
+        if (probe.HostLoss) hostPeer.FinishSending();
+        else
+        {
+            // The authenticated host's actual TCP stream emits the abort twice before the guest can continue.
+            byte[] frame = WorldReceiver.BuildAbort(guestPeer.Id, joinId, Protocol.JoinAbortHostCancel);
+            await hostPeer.SendAsync(frame, ct);
+            await hostPeer.SendAsync(frame, ct);
+        }
+        await WaitAsync(() => Get<object?>(guest, "_joinCalendarRequest") is null &&
+            (probe.HostLoss ? guestLink.Disconnected.Contains(hostPeer.Id) : guestLink.Aborts.Count(id => id == joinId) >= (waitForDuplicate ? 2 : 1)),
+            "the real reader to retire the host's join", ct);
+    }
+
+    private static async Task RejoinAfterAbortAsync(SaveFixture fixture, GameBridge host, GameBridge guest,
+        byte guestId, uint abortedJoinId, JoinCalendarTestEngine hostGame, JoinCalendarTestEngine guestGame,
+        JoinWire hostLink, JoinWire guestLink, CancellationToken ct)
+    {
+        hostGame.Emit("join_cancel", $"{abortedJoinId:x8}");
+        await WaitAsync(() => Get<object?>(host, "_hostJoin") is null, "the host to finish cancelling the first join", ct);
+        guestGame.DeferJoinFileRead = false;
+        guestGame.Feed("PlayVideoOnly 'main_menu_trosecko'");
+        guestGame.Emit("wo124_where", "menu");
+        var (freshHost, _) = WhsSaveTests.Pair();
+        freshHost.SaveTime = 1_790_000_001;
+        hostGame.NextHostSave = () => WhsSaveTests.File(freshHost);
+        await InvokeAsync(guest, "SendJoinRequestAsync");
+        uint rejoinId = Get<uint>(guest, "_joinOutId");
+        Assert.NotEqual(0u, rejoinId);
+        Assert.NotEqual(abortedJoinId, rejoinId);
+        await WaitAsync(() => hostLink.ReadyReceived.Contains(rejoinId) && Get<string>(guest, "_joinUiState") == "in" &&
+            Get<object?>(host, "_hostJoin") is null, "a new request to join and the host to accept its Ready", ct);
+        await guestGame.JoinedNotification.WaitAsync(ct);
+        Assert.Equal(1, guestLink.ReadySent.Count(id => id == rejoinId));
+        Assert.Equal(1, hostLink.ReadyReceived.Count(id => id == rejoinId));
+        Assert.Equal(2, guestGame.JoinLoadsIssued);
+        Assert.Equal(1, guestGame.OwnLoadsIssued);
+        Assert.True(File.Exists(fixture.HostLoadedSave));
+    }
+
+    private static byte[] PingMarker(long value)
+    {
+        byte[] body = new byte[Protocol.PingPayloadLen];
+        BinaryPrimitives.WriteInt64LittleEndian(body, value);
+        return ReplayPeer.Frame(Protocol.Ping, body);
+    }
+
+    private static bool HasQueuedReady(LinkScheduler scheduler, uint joinId)
+    {
+        lock (Get<object>(scheduler, "_lock"))
+            foreach (object entry in Get<IEnumerable>(scheduler, "_events"))
+            {
+                byte[] frame = GetVisible<byte[]>(entry, "Item1");
+                if (frame[0] == Protocol.JoinerReadyUp && ReadyUpId(frame) == joinId) return true;
+            }
+        return false;
+    }
+
+    private static uint ReadyUpId(ReadOnlySpan<byte> frame) => BinaryPrimitives.ReadUInt32LittleEndian(frame[4..]);
+
+    private static T GetVisible<T>(object instance, string field) =>
+        (T)instance.GetType().GetField(field)!.GetValue(instance)!;
+
+    /// <summary>The shipped Load transition is logged after preparing the command and before HTTP submission.</summary>
+    private sealed class LoadPhaseBarrier : TextWriter
+    {
+        private readonly TextWriter _previous = Console.Out;
+        private readonly ManualResetEventSlim _continue = new();
+        private readonly TaskCompletionSource _arrived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public LoadPhaseBarrier() => Console.SetOut(this);
+        public override Encoding Encoding => _previous.Encoding;
+        public Task Arrived => _arrived.Task;
+        public void Release() => _continue.Set();
+        public override void WriteLine(string? value)
+        {
+            if (value is not null && value.StartsWith("MP-LOAD-SEQUENCE role=joiner ", StringComparison.Ordinal) &&
+                value.EndsWith(" phase=Load link_hold=0", StringComparison.Ordinal) && _arrived.TrySetResult())
+                _continue.Wait(TimeSpan.FromSeconds(15));
+            _previous.WriteLine(value);
+        }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                Release();
+                Console.SetOut(_previous);
+            }
+            base.Dispose(disposing);
         }
     }
 
@@ -258,6 +520,8 @@ public sealed class JoinCalendarIntegrationTests
         game.LoadStarted += Handler<Action>(bridge, "Wo124OnLoadStarted");
         game.LoadReconstructionStarted += Handler<Action>(bridge, "LoadSequenceOnReconstruction");
         game.GameplayStarted += Handler<Action>(bridge, "Wo124OnGameplayStarted");
+        game.MainMenuShown += Handler<Action>(bridge, "Wo124OnMainMenuShown");
+        game.LoadFailedToMenu += Handler<Action>(bridge, "Wo124OnLoadFailedToMenu");
         return bridge;
     }
 
@@ -292,6 +556,7 @@ public sealed class JoinCalendarIntegrationTests
         public string HostSaves => Path.Combine(Root, "host-saves");
         public string GuestSaves => Path.Combine(Root, "guest-saves");
         public string HostLoadedSave => Path.Combine(HostSaves, "playline0", "save000.whs");
+        public string GuestOwnSave => Path.Combine(GuestSaves, "playline0", "save001.whs");
         public byte[] HostSave { get; }
 
         public SaveFixture()
@@ -312,7 +577,7 @@ public sealed class JoinCalendarIntegrationTests
             Directory.CreateDirectory(Path.Combine(HostSaves, "playline0"));
             Directory.CreateDirectory(Path.Combine(GuestSaves, "playline0"));
             File.WriteAllBytes(HostLoadedSave, HostSave);
-            File.WriteAllBytes(Path.Combine(GuestSaves, "playline0", "save001.whs"), WhsSaveTests.File(guest));
+            File.WriteAllBytes(GuestOwnSave, WhsSaveTests.File(guest));
             Assert.Single(GameBridge.ListOwnSaves(GuestSaves));
             Override("KCDMP_DATA_DIR", Root);
             Override("KCDMP_JOIN_SAVES_DIR", GuestSaves);
@@ -348,6 +613,11 @@ public sealed class JoinCalendarIntegrationTests
         public volatile uint ProbeCalendarEpoch;
         public Task<byte[]> Ready => _ready.Task;
         public Action? BeforeFirstOffer { get; set; }
+        public Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask>? BeforeWrite { get; set; }
+        public readonly ConcurrentQueue<uint> Aborts = new();
+        public readonly ConcurrentQueue<byte> Disconnected = new();
+        public readonly ConcurrentQueue<uint> ReadyReceived = new();
+        public readonly ConcurrentQueue<uint> ReadySent = new();
 
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
         {
@@ -365,7 +635,15 @@ public sealed class JoinCalendarIntegrationTests
                     await wire.ReadExactlyAsync(body, ct);
                     packet = new ReplayPacket(header[0], body);
                 }
-                if (packet.Type == Protocol.JoinerReadyDown) _ready.TrySetResult(packet.Payload);
+                if (packet.Type == Protocol.JoinerReadyDown)
+                {
+                    _ready.TrySetResult(packet.Payload);
+                    ReadyReceived.Enqueue(BinaryPrimitives.ReadUInt32LittleEndian(packet.Payload.AsSpan(2)));
+                }
+                if (packet.Type == Protocol.JoinAbortDown)
+                    Aborts.Enqueue(BinaryPrimitives.ReadUInt32LittleEndian(packet.Payload.AsSpan(2)));
+                if (packet.Type == Protocol.Disconnect && packet.Payload.Length == 1)
+                    Disconnected.Enqueue(packet.Payload[0]);
                 if (packet.Type == Protocol.WorldOfferDown)
                 {
                     BeforeFirstOffer?.Invoke();
@@ -416,8 +694,15 @@ public sealed class JoinCalendarIntegrationTests
 
         public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
             ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
-        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) => wire.WriteAsync(buffer, ct);
-        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) => wire.WriteAsync(buffer, offset, count, ct);
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            if (BeforeWrite is { } before) await before(buffer, ct);
+            await wire.WriteAsync(buffer, ct);
+            if (!buffer.IsEmpty && buffer.Span[0] == Protocol.JoinerReadyUp)
+                ReadySent.Enqueue(ReadyUpId(buffer.Span));
+        }
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
+            WriteAsync(buffer.AsMemory(offset, count), ct).AsTask();
         public override Task FlushAsync(CancellationToken ct) => wire.FlushAsync(ct);
         public override void Flush() => wire.Flush();
         public override bool CanRead => true;

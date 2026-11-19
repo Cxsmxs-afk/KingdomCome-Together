@@ -84,9 +84,15 @@ public partial class GameBridge
         public byte[]? SplicedSha;
         public WhsSave.PlayerSoul? Henry;          // the spliced file's Henry (= the source's, minus quest items)
         public DateTime LoadCmdUtc, LoadStartUtc, LoadGameUtc, GameplayUtc;
+        public volatile bool LoadDispatchInFlight;
+        public JoinEngineReceipt? EngineReceipt;
+        public int RemovalScheduled;
+        public readonly TaskCompletionSource DispatchEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public ulong LoadGeneration;
         public long CalendarGeneration;
         public long CalendarPipeRevision;
+        public bool CalendarVerified;
+        public bool ReadyHandoffStarted;
         public volatile string Phase = "preparing";
         public bool InWorld;                        // WO-125: an in-world rejoin (a host reload) or a join from the own world
         public bool Frozen;                         // WO-154 4.2: the load froze (busy, no CPU): the player is told to restart the game
@@ -165,12 +171,16 @@ public partial class GameBridge
     private async Task Wo124OnDisconnectAsync()
     {
         _hostModeKnown = false;
-        if (_jj is { } jj && jj.Phase is "loading" or "post-load")
-            Console.WriteLine($"MP-JOIN joiner: the relay connection dropped while join 0x{jj.JoinId:x8} was {jj.Phase}");
-        if ((_jj is not null || _rejoinPending) && W202("rejoin_recover")) Wo207ArmLinkRejoin(_jj?.JoinId ?? 0);   // WO-207 C.4
+        var join = _jj;
+        if ((join is not null || _rejoinPending) && W202("rejoin_recover")) Wo207ArmLinkRejoin(join?.JoinId ?? 0);   // WO-207 C.4
         if (LinkHeld) return;   // WO-211 A.1: let the link hold decide between reconnect and leave
-        if (_joinedWorld) await LeaveSharedWorldAsync("relay-lost", "Lost the connection to your host.");
-        else if (_jj is { Phase: "preparing" or "loading" } j2) await AbortJoinerJoinAsync(j2, Protocol.JoinAbortIo, "relay-lost", "Lost the connection to your host.", sendAbort: false);
+        const string message = "Lost the connection to your host.";
+        if (join is { Phase: "preparing" })
+            await AbortJoinerJoinAsync(join, Protocol.JoinAbortIo, "relay-lost", message, sendAbort: false);
+        else if (join is not null)
+            StartOrphanedJoinCleanup(join, "relay-lost", message);
+        else if (_joinedWorld)
+            await LeaveSharedWorldAsync("relay-lost", message);
     }
 
     private async Task Wo124LoopAsync(CancellationToken ct)
@@ -269,6 +279,7 @@ public partial class GameBridge
     /// <summary>"[CryAction] LoadGame: '...'" -- the save's data is being read (from the menu: after the level load).</summary>
     private void Wo124OnLoadStarted()
     {
+        if (_transport is LogTailGameTransport engine && EngineNoticeBelongsToAnotherJoin(engine.EngineReadSave)) return;
         _where = GameWhere.Loading;
         W160WorldGone();
         if (!LoadSequenceEnabled) Wo136OnLoadSeen("load");
@@ -278,7 +289,8 @@ public partial class GameBridge
             LoadSequenceBeginLoad();
             Wo136OnLoadSeen("load");
         }
-        if (_jj is { LoadStarted: not null } j && (!LoadSequenceEnabled || _worldLoad.IsCurrent(j.LoadGeneration)))
+        if (_jj is { LoadStarted: not null } j && (!LoadSequenceEnabled || _worldLoad.IsCurrent(j.LoadGeneration)) &&
+            (j.EngineReceipt is null || _transport is LogTailGameTransport tail && j.EngineReceipt.Matches(tail.EngineReadSave)))
         {
             if (j.LoadGameUtc == default) j.LoadGameUtc = DateTime.UtcNow;
         }
@@ -287,6 +299,7 @@ public partial class GameBridge
     /// <summary>"Loading saved game '...playlineN/x.whs'" -- the engine accepted a load (printed at once).</summary>
     private void Wo124OnSaveLoadAccepted(string display)
     {
+        if (_transport is LogTailGameTransport engine && EngineNoticeBelongsToAnotherJoin(engine.EngineAcceptedSave)) return;
         _where = GameWhere.Loading;
         W160WorldGone();
         if (!LoadSequenceEnabled) Wo136OnLoadSeen("accepted");
@@ -308,6 +321,7 @@ public partial class GameBridge
             return;
         }
         if (_jj is { LoadStarted: { } t } j && (!LoadSequenceEnabled || _worldLoad.IsCurrent(j.LoadGeneration)) &&
+            (j.EngineReceipt is null || _transport is LogTailGameTransport tail && j.EngineReceipt.Matches(tail.EngineAcceptedSave)) &&
             display.Equals($"playline{j.Playline}/{j.Name}.whs", StringComparison.OrdinalIgnoreCase))
         {
             if (LoadSequenceEnabled) Wo136OnLoadSeen("accepted");
@@ -411,6 +425,8 @@ public partial class GameBridge
     /// <summary>"Exiting to main menu because save game loading failed." -- the engine went back to the menu.</summary>
     private void Wo124OnLoadFailedToMenu()
     {
+        if (_transport is LogTailGameTransport engine && IgnoreEngineTerminal(engine)) return;
+        if (!OwnLoadExpected && _jj is { EngineReceipt: { } receipt } && !receipt.MatchesTerminal(loaded: false)) return;
         _where = GameWhere.Menu;
         LoadSequenceOnMenu();
         W160WorldGone();
@@ -446,8 +462,13 @@ public partial class GameBridge
         }
     }
 
-    private void Wo124OnGameplayStarted()
+    private void Wo124OnGameplayStarted() => Wo124OnGameplayStartedCore(confirmedByGameQuery: false);
+
+    private void Wo124OnGameplayStartedCore(bool confirmedByGameQuery)
     {
+        if (!confirmedByGameQuery && _transport is LogTailGameTransport engine && IgnoreEngineTerminal(engine)) return;
+        if (!confirmedByGameQuery && !OwnLoadExpected && _jj is { EngineReceipt: { } receipt } &&
+            !receipt.MatchesTerminal(loaded: true)) return;
         _where = GameWhere.World;
         var startedLoad = _worldLoad.Current;
         bool ownLoad = LoadSequenceEnabled ? startedLoad.OwnIntent == WorldLoadOwnIntent.ExpectedPrivate : _ownLoadExpected;
@@ -795,7 +816,18 @@ public partial class GameBridge
                 await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "clock-unavailable", "Your host's world clock could not be prepared.");
                 return;
             }
-            if (!await P5LoadGameCoreAsync(j.Playline, j.Name, "join-command", () => AuthorizeJoinCalendarLoad(j)))
+            bool loadIssued;
+            try
+            {
+                loadIssued = await P5LoadGameCoreAsync(j.Playline, j.Name, "join-command",
+                    () => AuthorizeJoinCalendarLoad(j, saves));
+            }
+            finally
+            {
+                j.LoadDispatchInFlight = false;
+                j.DispatchEnded.TrySetResult();
+            }
+            if (!loadIssued)
             {
                 if (Wo124JoinGone(j, "after load dispatch refusal")) return;
                 await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "authority-pending-unconfirmed", _p5LoadRefusal.Length > 0 ? _p5LoadRefusal : "The load safety gate could not be confirmed.");
@@ -855,17 +887,18 @@ public partial class GameBridge
         return File.Exists(p) ? p : null;
     }
 
-    /// <summary>Delete the transient file and report the engine cache without refreshing it during active play.</summary>
-    private bool AuthorizeJoinCalendarLoad(JoinerJoin join)
+    private bool AuthorizeJoinCalendarLoad(JoinerJoin join, string savesRoot)
     {
         lock (_joinGate)
         {
-            if (!JoinCalendarCurrent(join, join.CalendarGeneration) || !_hostCalendarArmed ||
-                join.CalendarPipeRevision != _combat.EdgeConnectionRevision)
+            if (join.Phase != "preparing" || !JoinCalendarActuatorCurrent(join) || !join.PlacedVerified ||
+                join.PlacedPath is not { } path)
             {
                 DropJoinCalendar(join.Host, join.JoinId, "load-dispatch-scope-retired");
                 return false;
             }
+            if (_transport is LogTailGameTransport tail) join.EngineReceipt = new(tail, _combat, path, savesRoot);
+            join.LoadDispatchInFlight = true;
             join.LoadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
             join.GameplayStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
             join.LoadFailed = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -877,6 +910,15 @@ public partial class GameBridge
         }
     }
 
+    private bool TryDeletePlacedJoinWorld(JoinerJoin join, string path)
+    {
+        if (!JoinSaveReadEnded(join)) return false;
+        if (join.PlacedVerified) return _retainedJoinWorlds.TryDelete(path, join);
+        File.Delete(path);
+        return !File.Exists(path);
+    }
+
+    /// <summary>Delete the transient file and report the engine cache without refreshing it during active play.</summary>
     private async Task RemovePlacedWorldAsync(JoinerJoin j, string why)
     {
         if (j.PlacedPath is not string p) return;
@@ -889,8 +931,7 @@ public partial class GameBridge
         bool gone = false;
         try
         {
-            if (j.PlacedVerified) gone = _retainedJoinWorlds.TryDelete(p, j);
-            else { File.Delete(p); gone = !File.Exists(p); }
+            gone = TryDeletePlacedJoinWorld(j, p);
         }
         catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(p)}: {ex.Message}"); }
         j.PlacedPath = gone ? null : p;
@@ -982,34 +1023,51 @@ public partial class GameBridge
         Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} step 4 beside host: {(placed is { Ok: true } ? "placed" : "refused or no fresh safe snapshot; keeps spliced spot")}");
 
         // 5. Ready
-        if (Wo124JoinGone(j, "before Ready") || j.Phase != "post-load") return;
-        uint readySeq = _joinReceivedSeq;
-        // Prepare ownership reception BEFORE Ready: the host may answer immediately.
-        if (j.WorldTag is string wt0) Wo134AfterReady(wt0);
-        if (!await SendJoinerReadyAsync("wo124"))
+        var request = Volatile.Read(ref _joinCalendarRequest);
+        if (request is null || !JoinReadyCurrent(j, request))
         {
-            await LeaveAfterFailedJoinAsync(j, Protocol.JoinAbortIo, "ready-failed", "Your host could not confirm the join.");
+            await FailReadyIfCurrentAsync();
             return;
         }
-        if (Wo124JoinGone(j, "after Ready") || j.Phase != "post-load") return;
-        if (j.WorldTag is string wt && j.SplicedParts is { } sp) Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, readySeq, j.HostWorldEpoch);   // WO-125: the join save's matched pair
-        JoinerJoin[] completed;
+        // Prepare ownership reception BEFORE Ready: the host may answer immediately.
+        if (j.WorldTag is string wt0) Wo134AfterReady(wt0);
+        if (!await SendJoinerReadyAsync(j, request))
+        {
+            await FailReadyIfCurrentAsync();
+            return;
+        }
+        JoinerJoin[]? completed = null;
         lock (_joinGate)
         {
-            if (!ReferenceEquals(_jj, j) || j.Phase != "post-load") return;
-            if (LoadSequenceEnabled && !_worldLoad.IsCurrent(j.LoadGeneration)) return;
-            j.Phase = "in";
-            SetJoinUi("in", "In your host's world.");
-            completed = _retainedJoinWorlds.End(joined: true, cancelled: false);
-            _jj = null;
-            LoadSequenceOnJoinReady();
+            if (JoinReadyCurrent(j, request))
+            {
+                j.Phase = "in";
+                _joinReceivedId = 0;
+                SetJoinUi("in", "In your host's world.");
+                completed = _retainedJoinWorlds.End(joined: true, cancelled: false);
+                _jj = null;
+                LoadSequenceOnJoinReady();
+            }
         }
+        if (completed is null)
+        {
+            await FailReadyIfCurrentAsync();
+            return;
+        }
+        if (j.WorldTag is string wt && j.SplicedParts is { } sp)
+            Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, j.WorldSavedSeq, j.HostWorldEpoch);
+        _ = Wo210AfterSkipAsync("join");
         await CleanupRetainedJoinWorldsAsync(completed, "join=in");
         T3AfterJoinedWorldCleanup();
         if (_wo122Stream is Stream markerStream) _ = P5AnnounceMarkersAsync(markerStream, _wo122Ct);
         try { await ExecLuaAsync("if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"Co-op: you are in your host's world.\") end"); }
         catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: joined notification failed: {ex.Message}"); }
         _ = Task.Delay(10000).ContinueWith(_ => { if (_joinUiState == "in") SetJoinUi("idle", ""); });
+
+        Task FailReadyIfCurrentAsync() =>
+            ReferenceEquals(_jj, j) && j.Phase == "post-load" && !j.Abandoned.Task.IsCompleted
+                ? LeaveAfterFailedJoinAsync(j, Protocol.JoinAbortIo, "ready-failed", "Your host could not confirm the join.")
+                : Task.CompletedTask;
     }
 
     private static double Dist(float[] a, float[] b) => Math.Sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
@@ -1194,17 +1252,24 @@ public partial class GameBridge
     /// newest save (the join's Henry source) is loaded. KCD2 1.5.5 has no safe
     /// exit to the main menu.
     /// </summary>
-    private async Task LeaveSharedWorldAsync(string why, string message)
+    private Task LeaveSharedWorldAsync(string why, string message) => LeaveSharedWorldCoreAsync(why, message, null);
+    private CancellationToken _joinEngineLifetime;
+
+    private async Task LeaveSharedWorldCoreAsync(string why, string message, JoinerJoin? expected)
     {
-        if (!_joinedWorld && _jj is null) return;
+        lock (_joinGate)
+        {
+            if (_leaveInProgress || (expected is not null && !ReferenceEquals(_jj, expected))) return;
+            if (!_joinedWorld && _jj is null) return;
+            _leaveInProgress = true;  // The private load must settle before another join.
+        }
         LoadSequenceOnExit();
         await ResetHostCalendarAsync("leave");
-        _leaveInProgress = true;           // WO-125: no join is asked until this leave's own load is in
         _newWorldLeavePending = false;
         _leaveSinceUtc = DateTime.UtcNow;
         // WO-184 B4: one final snapshot while this game is still in the host's world (paired with the newest host save it follows); a
         // leave that cannot take it says so plainly
-        string finalWhy = _joinedWorld ? await Wo184FinalSnapshotAsync("leave (" + why + ")") : "-";
+        string finalWhy = _joinedWorld && expected is null ? await Wo184FinalSnapshotAsync("leave (" + why + ")") : "-";
         if (finalWhy is not ("" or "-")) message += " " + Wo211Rules.SnapshotLostText(finalWhy);   // WO-211 A.2.4: never silent
         // WO-125 Phase 2: the target is recomputed now -- the newest own save whose playthrough is not the
         // host's (a hand-placed copy of the host's world is never "own"). None: the way back to the menu.
@@ -1213,29 +1278,59 @@ public partial class GameBridge
         // player's own newest save (his own quest items kept, the host world's left there), placed where he stood
         if (why == "relay-lost" && finalWhy == "" && src is not null && _joinedTag is string homeTag && W211Fix("drop_henry_home"))
             src = await Wo211SpliceHomeAsync(homeTag, src) ?? src;
-        SetJoinedWorld(false);
-        _jj = null;
-        _rewinding = false;
-        _rejoinPending = false;
+        lock (_joinGate)
+        {
+            if (expected is not null && !ReferenceEquals(_jj, expected)) return;
+            SetJoinedWorld(false);
+            _jj = null;
+            _rewinding = false;
+            _rejoinPending = false;
+        }
         await Wo122SetLockAsync(false, "left-shared-world");
         Wo144ReleaseClock("left-shared-world");   // WO-144 3.3: a clock standing with the host's never stays standing
         string full = src is null ? message : $"{message} Going back to your own game.";
         SetJoinUi("left", full, HostAuthorityFailure.JoinReason(why));
         Console.WriteLine($"MP-JOIN joiner: leaving the host's world ({why}) -> {(src is null ? "no own save (" + ownWhy + "): back to the main menu" : "loading " + src.Display)}");
         await ExecLuaAsync($"if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"{EscapeLua(full)}\") end");
+        using var returnLife = expected is null ? null : CancellationTokenSource.CreateLinkedTokenSource(_joinEngineLifetime);
+        bool relayClosed = expected is not null && why == "relay-lost";
         if (src is null)
         {
             await Task.Delay(4000);
-            if (!await Wo125ExitToMenuAsync(why)) { _leaveInProgress = false; SetJoinUi("left", message + " Quit the game to get back to the main menu.", HostAuthorityFailure.JoinReason(why)); }
+            if (!await Wo125ExitToMenuAsync(why, returnLife?.Token ?? default, relayClosed)) { _leaveInProgress = false; SetJoinUi("left", message + " Quit the game to get back to the main menu.", HostAuthorityFailure.JoinReason(why)); }
             return;
         }
         if (!await Wo177WaitQuietAsync("leave")) { _leaveInProgress = false; SetJoinUi("left", full + " " + Wo177Rules.GaveUpText); return; }   // WO-177 A5
         await Task.Delay(4000);
-        if (!await P5LoadGameAsync(src.Playline, src.Base, "leave-command"))
+        using var homeReceipt = relayClosed && _transport is LogTailGameTransport tail
+            ? new JoinEngineReceipt(tail, _combat, src.FullPath, Path.GetDirectoryName(Path.GetDirectoryName(src.FullPath))!)
+            : null;
+        if (!await P5LoadGameAsync(src.Playline, src.Base, "leave-command", returnLife?.Token ?? default))
         {
             _leaveInProgress = false;
             SetJoinUi("failed", _p5LoadRefusal.Length > 0 ? _p5LoadRefusal : "The load safety gate could not be confirmed.");
             return;
+        }
+        if (homeReceipt is not null)
+        {
+            // Relay teardown detaches the ordinary gameplay listeners. The
+            // private load still has its own engine, log and completion.
+            bool loaded;
+            try
+            {
+                loaded = await WaitForJoinReceiptAsync(homeReceipt.Terminal.Task,
+                    "MP-JOIN joiner: waiting for the private load to settle after the relay closed");
+            }
+            catch (OperationCanceledException) when (homeReceipt.Terminal.Task.IsCanceled)
+            {
+                _leaveInProgress = false;
+                return;
+            }
+            if (_leaveInProgress && OwnLoadExpected)
+            {
+                if (loaded) Wo124OnGameplayStartedCore(confirmedByGameQuery: true);
+                else Wo124OnLoadFailedToMenu();
+            }
         }
     }
 
@@ -1248,23 +1343,9 @@ public partial class GameBridge
             bool parked = WorldRecoveryEnabled && (LinkHeld || await Wo211TryHoldAsync("host-link-lost", sameRelay: true));
             _hostModeKnown = false;
             if (parked) return;
-            if (_joinedWorld) await LeaveSharedWorldAsync("host-left", "Your host left the game.");
-            else if (_jj is { Phase: "preparing" } j) await AbortJoinerJoinAsync(j, 0, "host-left", "Your host left the game.", sendAbort: false);
-            else if (_jj is { Phase: "loading" } jl)
-            {
-                await ResetHostCalendarAsync("orphaned-host-left");
-                // Mid-load: the file goes now; the world that arrives is left at Gameplay started.
-                Console.WriteLine($"MP-JOIN joiner: the host left during the load of join 0x{jl.JoinId:x8}");
-                jl.Phase = "orphaned";
-                _joinedSource ??= jl.Source;
-                SetJoinedWorld(true);
-                _ = Task.Run(async () =>
-                {
-                    if (jl.GameplayStarted is { } gs) await Task.WhenAny(gs.Task, Task.Delay(240000));
-                    await RemovePlacedWorldAsync(jl, "host-left");
-                    await LeaveSharedWorldAsync("host-left", "Your host left the game.");
-                });
-            }
+            if (_jj is { Phase: "preparing" } j) await AbortJoinerJoinAsync(j, 0, "host-left", "Your host left the game.", sendAbort: false);
+            else if (_jj is { } join) StartOrphanedJoinCleanup(join, "host-left", "Your host left the game.");
+            else if (_joinedWorld) await LeaveSharedWorldAsync("host-left", "Your host left the game.");
         }
     }
 
@@ -1279,41 +1360,81 @@ public partial class GameBridge
                 await AbortJoinerJoinAsync(j, 0, reason, $"Your host stopped the join ({reason}).", sendAbort: false);
                 break;
             case "loading":
-                // The world arriving is no longer the host's: leave it once it is up.
-                await ResetHostCalendarAsync("orphaned-host-abort");
-                j.Phase = "orphaned";
-                _joinedSource ??= j.Source;
-                _ = Task.Run(async () =>
-                {
-                    if (j.GameplayStarted is { } gs) await Task.WhenAny(gs.Task, Task.Delay(240000));
-                    if (_w154JoinPatient && !(j.GameplayStarted?.Task.IsCompleted ?? false))
-                    {
-                        // WO-154 4.2 (live L7): still loading -- or frozen. The file stays until no load can read it (it was
-                        // deleted here while the game was busy), and the world is left only once the game is in one.
-                        if (j.PlacedPath is string pp) Wo154RemovePlacedLater(j, pp);
-                        var t0 = DateTime.UtcNow;
-                        string w = "busy";
-                        while ((DateTime.UtcNow - t0).TotalSeconds < Wo154Rules.JoinLoadWatch.MaxWaitS && !j.Frozen
-                               && (w = await Wo154WhereNowAsync()) is not ("world" or "menu"))
-                            await Task.Delay(3000);
-                        Console.WriteLine($"MP-JOIN joiner: join 0x{joinId:x8} host-abort: the load {(w == "world" ? "came through after all -- leaving that world" : w == "menu" ? "ended at the main menu -- nothing to leave" : j.Frozen ? "froze -- the player is told to restart the game" : "never ended -- nothing left to do")}");
-                        if (w != "world")
-                        {
-                            if (w == "menu") SetJoinUi("failed", $"Your host stopped the join ({reason}).");
-                            return;
-                        }
-                    }
-                    SetJoinedWorld(true);
-                    await RemovePlacedWorldAsync(j, "host-abort");
-                    await LeaveSharedWorldAsync(reason, $"Your host stopped the join ({reason}).");
-                });
-                break;
-            default:
-                _joinReceivedId = 0;
-                await LeaveSharedWorldAsync(reason, $"Your host stopped the join ({reason}).");
+            case "post-load":
+                StartOrphanedJoinCleanup(j, reason, $"Your host stopped the join ({reason}).");
                 break;
         }
         return true;
+    }
+
+    private void StartOrphanedJoinCleanup(JoinerJoin join, string why, string message)
+    {
+        lock (_joinGate)
+        {
+            if (!ReferenceEquals(_jj, join) || join.Phase is not ("loading" or "post-load")) return;
+            join.Phase = "orphaned";
+            join.Abandoned.TrySetResult(true);
+            _retainedJoinWorlds.Cancel(join);
+        }
+
+        // The load can outlive the processor frame that received the abort.
+        using (ExecutionContext.SuppressFlow()) _ = Task.Run(() => FinishOrphanedJoinAsync(join, why, message));
+    }
+
+    private async Task FinishOrphanedJoinAsync(JoinerJoin join, string why, string message)
+    {
+        if (join.EngineReceipt is not { } receipt)
+        {
+            Console.WriteLine($"MP-JOIN joiner: join 0x{join.JoinId:x8}: no engine receipt for the aborted load; its file stays protected");
+            return;
+        }
+
+        try
+        {
+            await join.DispatchEnded.Task.WaitAsync(_joinEngineLifetime);
+            bool loaded = await WaitForJoinReceiptAsync(receipt.Terminal.Task,
+                $"MP-JOIN joiner: join 0x{join.JoinId:x8}: no terminal engine receipt yet; its file stays protected");
+            await RemovePlacedWorldAsync(join, why);
+            lock (_joinGate)
+            {
+                if (!ReferenceEquals(_jj, join) || join.Phase != "orphaned") return;
+                if (!loaded)
+                {
+                    SetJoinedWorld(false);
+                    _joinReceivedId = 0;
+                    _jj = null;
+                    SetJoinUi("aborted", message);
+                    return;
+                }
+            }
+            await LeaveSharedWorldCoreAsync(why, message, join);
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
+        {
+            Console.WriteLine($"MP-JOIN joiner: join 0x{join.JoinId:x8}: aborted load cleanup interrupted ({ex.GetType().Name})");
+            if (receipt.Terminal.Task.IsCanceled)
+            {
+                lock (_joinGate)
+                {
+                    if (!ReferenceEquals(_jj, join) || join.Phase != "orphaned") return;
+                    SetJoinedWorld(false);
+                    _joinReceivedId = 0;
+                    _jj = null;
+                    SetJoinUi("aborted", message);
+                }
+            }
+        }
+        finally { receipt.Dispose(); }
+    }
+
+    private async Task<bool> WaitForJoinReceiptAsync(Task<bool> receipt, string pending)
+    {
+        try { return await receipt.WaitAsync(TimeSpan.FromSeconds(Wo154Rules.JoinLoadWatch.MaxWaitS), _joinEngineLifetime); }
+        catch (TimeoutException)
+        {
+            Console.WriteLine(pending);
+            return await receipt.WaitAsync(_joinEngineLifetime);
+        }
     }
 
     /// <summary>The game is quitting ("CSystem::Quit invoked").</summary>

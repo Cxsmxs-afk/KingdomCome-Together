@@ -256,13 +256,11 @@ public class Wo154Tests
     [Fact]
     public void A_placed_world_file_goes_only_when_no_load_can_be_reading_it()
     {
-        Assert.True(Wo154Rules.PlacedFileMayGo(loadCommanded: false, gameplayStarted: false, loadFailed: false, where: "busy"));   // before the load
-        Assert.False(Wo154Rules.PlacedFileMayGo(true, false, false, "busy"));      // the field's delete at 02:17:50
-        Assert.False(Wo154Rules.PlacedFileMayGo(true, false, false, "loading"));
-        Assert.True(Wo154Rules.PlacedFileMayGo(true, false, false, "menu"));
-        Assert.True(Wo154Rules.PlacedFileMayGo(true, false, false, "world"));
-        Assert.True(Wo154Rules.PlacedFileMayGo(true, true, false, "busy"));        // past Gameplay started: the engine read it
-        Assert.True(Wo154Rules.PlacedFileMayGo(true, false, true, "busy"));        // the engine reported the failed load
+        Assert.True(Wo154Rules.PlacedFileMayGo(loadCommanded: false, dispatchInFlight: false, exactEngineReceipt: false));
+        Assert.False(Wo154Rules.PlacedFileMayGo(loadCommanded: true, dispatchInFlight: true, exactEngineReceipt: false));
+        Assert.False(Wo154Rules.PlacedFileMayGo(loadCommanded: true, dispatchInFlight: true, exactEngineReceipt: true));
+        Assert.False(Wo154Rules.PlacedFileMayGo(loadCommanded: true, dispatchInFlight: false, exactEngineReceipt: false));
+        Assert.True(Wo154Rules.PlacedFileMayGo(loadCommanded: true, dispatchInFlight: false, exactEngineReceipt: true));
     }
 
     [Fact]

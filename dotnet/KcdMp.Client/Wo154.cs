@@ -287,9 +287,9 @@ public static class Wo154Rules
 
     public const string FrozenLoadText = "Your game froze while loading your host's world (the game's own video player stopped at the loading screen; your own saves are untouched). Close the game - if it won't close, end it in Task Manager - then start it again and join again.";
 
-    /// <summary>Phase 4.2: a placed world file may go now -- no load was asked, or the engine is past it, or it answers from a menu or a world.</summary>
-    public static bool PlacedFileMayGo(bool loadCommanded, bool gameplayStarted, bool loadFailed, string where) =>
-        !loadCommanded || gameplayStarted || loadFailed || where is "menu" or "world";
+    /// <summary>After submission, only an exact terminal observation can retire a placed file, and dispatch must have returned.</summary>
+    public static bool PlacedFileMayGo(bool loadCommanded, bool dispatchInFlight, bool exactEngineReceipt) =>
+        !loadCommanded || !dispatchInFlight && exactEngineReceipt;
 
     /// <summary>Phase 3.4: a joiner's mp_unstuck asks the host to end every fight against his avatar (crime-ask kind 4).</summary>
     public static string EndFightsText(string why) => Wo139Text.IsWord(why) ? why : "unstuck";

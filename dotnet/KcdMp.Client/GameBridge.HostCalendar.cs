@@ -145,6 +145,10 @@ public partial class GameBridge
         && (!LoadSequenceEnabled || _worldLoad.Current.Generation == join.LoadGeneration)
         && generation == Interlocked.Read(ref _hostCalendarGeneration);
 
+    private bool JoinCalendarActuatorCurrent(JoinerJoin join) =>
+        HostCalendarOwned && JoinCalendarCurrent(join, join.CalendarGeneration) &&
+        join.CalendarPipeRevision == _combat.EdgeConnectionRevision;
+
     private void ClearJoinCalendarBootstrap()
     {
         lock (_hostCalendarLock)
@@ -157,22 +161,25 @@ public partial class GameBridge
         }
     }
 
-    private void RetireJoinCalendarAtRead(byte host, Stream stream, uint? joinId = null)
+    private void RetireJoinCalendarAtRead(byte? host, Stream stream, uint? joinId = null)
     {
         lock (_joinGate)
         {
-            if (_joinCalendarRequest is not { } request || request.Host != host || !ReferenceEquals(request.Link, stream) ||
+            if (_joinCalendarRequest is not { } request || host is byte source && request.Host != source || !ReferenceEquals(request.Link, stream) ||
                 joinId is uint aborted && request.JoinId != aborted) return;
             Volatile.Write(ref _joinCalendarRequest, null);
             ClearJoinCalendarBootstrap();
-            if (_jj is { Phase: "preparing" } active && active.JoinId == request.JoinId)
+            if (_jj is { } active && active.JoinId == request.JoinId && active.Host == request.Host)
+            {
                 active.Abandoned.TrySetResult(true);
+                if (_joinReceivedId == active.JoinId) _joinReceivedId = 0;
+            }
             if (joinId is not null && _joinRx is null && _joinOutId == request.JoinId)
             {
                 _joinOutId = 0;
                 SetJoinUi("aborted", "The host stopped the join.");
             }
-            Console.WriteLine($"MP-CALENDAR join 0x{request.JoinId:x8}: bootstrap retired reason={(joinId is null ? "host-left" : "host-abort")}");
+            Console.WriteLine($"MP-CALENDAR join 0x{request.JoinId:x8}: bootstrap retired reason={(host is null ? "relay-lost" : joinId is null ? "host-left" : "host-abort")}");
         }
     }
 
@@ -371,29 +378,33 @@ public partial class GameBridge
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token);
         using var scope = ProcessorFrameScope.Link(linked.Token);
         T3SideGuard(life);
-        if (!await PrepareHostAuthorityAsync(join, linked.Token)) return false;
+        if (!JoinCalendarActuatorCurrent(join) || !await PrepareHostAuthorityAsync(join, linked.Token)) return false;
         T3SideGuard(life);
-        long generation = Interlocked.Read(ref _hostCalendarGeneration);
         await _hostCalendarGate.WaitAsync(linked.Token);
         try
         {
             T3SideGuard(life);
-            if (!HostCalendarOwned || generation != Interlocked.Read(ref _hostCalendarGeneration) || !ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted) return false;
+            if (!JoinCalendarActuatorCurrent(join)) return false;
             CalendarReadback? r = null;
             for (int i = 0; i < 5; i++)
             {
+                if (!JoinCalendarActuatorCurrent(join)) return false;
                 r = await _combat.CalendarFollowAsync(3, ct: linked.Token);
                 T3SideGuard(life);
-                if (r is { Result: 1 } || generation != Interlocked.Read(ref _hostCalendarGeneration) || !ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted) break;
+                if (r is { Result: 1 }) break;
                 await Task.Delay(50, linked.Token);
                 T3SideGuard(life);
             }
-            if (r is not { Result: 1 } read || generation != Interlocked.Read(ref _hostCalendarGeneration) || !ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted) return false;
-            HostCalendarSample? host;
-            lock (_hostCalendarLock) host = _hostCalendar;
-            RebaseCalendarPoll(read.AfterMs, host?.Ratio ?? 0);
-            _hostCalendarResumeEpoch = _w206.World;
-            Console.WriteLine(FormattableString.Invariant($"MP-CALENDAR join 0x{join.JoinId:x8}: new-load pre-update latch verified calendar_ms={read.AfterMs} slews={_w200Slews}"));
+            lock (_joinGate)
+            {
+                if (r is not { Result: 1 } || !JoinCalendarActuatorCurrent(join) || join.Phase != "post-load") return false;
+                HostCalendarSample? host;
+                lock (_hostCalendarLock) host = _hostCalendar;
+                RebaseCalendarPoll(r.Value.AfterMs, host?.Ratio ?? 0);
+                _hostCalendarResumeEpoch = join.HostWorldEpoch;
+                join.CalendarVerified = true;
+            }
+            Console.WriteLine(FormattableString.Invariant($"MP-CALENDAR join 0x{join.JoinId:x8}: new-load pre-update latch verified calendar_ms={r.Value.AfterMs} slews={_w200Slews}"));
             return true;
         }
         finally { _hostCalendarGate.Release(); }
@@ -406,6 +417,7 @@ public partial class GameBridge
         var life = T3SideLease();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ProcessorFrameScope.CurrentToken, life.Token);
         using var scope = ProcessorFrameScope.Link(linked.Token);
+        lock (_joinGate)
         lock (_hostCalendarLock)
         {
             Interlocked.Increment(ref _hostCalendarGeneration);   // in-flight old samples cannot re-arm after this reset

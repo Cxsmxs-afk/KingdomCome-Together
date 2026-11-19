@@ -27,6 +27,11 @@ if ($Check -eq 'EndToEnd') {
         Host_loss_retires_the_join_before_the_guest_can_load = 2
         Host_does_not_offer_a_world_the_native_pipe_never_confirmed_as_held = 1
         Menu_progress_cannot_renew_the_host_hold_before_the_calendar_receipt = 1
+        A_retired_join_cannot_cross_the_engine_HTTP_boundary = 4
+        A_retired_join_cannot_send_an_already_queued_ready = 4
+        A_late_engine_read_keeps_the_file_safe_and_cannot_make_an_aborted_join_ready = 4
+        Guest_transport_loss_after_load_returns_to_the_own_world_only_after_the_engine_finishes = 1
+        Targeted_join_loads_with_other_real_relay_peers_present = 2
     }
     foreach ($case in $cases.Keys) {
         Invoke-KcdManagedTests $project "End-to-End-Join $case" $cases[$case] `
