@@ -36623,8 +36623,11 @@ do
             elseif not KCD2MP_W214HandScope then reason = "hand-owner-unavailable"
             else
                 local hand = KCD2MP_W214HandScope(id)
-                if handScope == "-" then
-                    if hand ~= nil or (KCD2MP.ghostWeaponDrawn and KCD2MP.ghostWeaponDrawn[id]) then reason = "newer-hand" end
+                -- The combat draw reaches Lua before WO-214 learns the class.
+                -- Empty slots can still belong to a draw already in progress.
+                if KCD2MP.ghostWeaponDrawn and KCD2MP.ghostWeaponDrawn[id] then reason = "draw-pending"
+                elseif handScope == "-" then
+                    if hand ~= nil then reason = "newer-hand" end
                 elseif not hand or hand.incarnation ~= incarnation or hand.scope ~= handScope then reason = "hand-scope"
                 elseif hand.drawn ~= false or hand.known ~= 3 or hand.left ~= "-" or hand.right ~= "-" then reason = "hand-pending"
                 end

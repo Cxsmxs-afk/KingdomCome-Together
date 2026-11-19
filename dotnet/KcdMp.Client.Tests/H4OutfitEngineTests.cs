@@ -54,6 +54,28 @@ public sealed class H4OutfitEngineTests
         Assert.True(game.Mutations > 0);
     }
 
+    [Theory]
+    [InlineData("equip")]
+    [InlineData("unequip")]
+    [InlineData("atomic")]
+    [InlineData("preset")]
+    public void Dispatched_combat_draw_defers_the_previous_holstered_outfit_until_confirmed_empty(string operation)
+    {
+        var game = new OutfitGame();
+        Action delayed = game.HandOff(operation, "00000001", "old", "0000000000000001");
+        game.Set("KCD2MP_GhostCombat('1', 0); assert(KCD2MP.ghostWeaponDrawn['1'])");
+        Assert.Null(game.Hand);   // GhostCombat waits for a weapon class before drawing into empty hands.
+
+        delayed();
+        Assert.Equal(0d, game.Mutations);
+
+        game.Set("KCD2MP_GhostCombat('1', 1); assert(not KCD2MP.ghostWeaponDrawn['1'])");
+        game.ChangeScope("00000001", "holstered", held: false, readable: true);
+        game.HandOff(operation, "00000001", "holstered", "0000000000000002")();
+        Assert.Equal(operation == "atomic" ? 3d : 1d, game.Mutations);
+        Assert.Equal(operation is "equip" or "atomic" ? Sword : null, game.Weapon);
+    }
+
     [Fact]
     public void Actual_empty_hands_do_not_override_a_pending_native_hand_confirmation()
     {
@@ -90,9 +112,11 @@ public sealed class H4OutfitEngineTests
         public OutfitGame()
         {
             _lua.DoString($$"""
-                KCD2MP = { ghosts = {}, w136 = { PRESET_BARE = "bare" }, w144 = { stats = {}, LIGHTS = {}, lightStats = { made = 0, dressed = 0, dressFail = 0 } } }
+                KCD2MP = { ghosts = {}, ghostWeaponDrawn = {}, w136 = { PRESET_BARE = "bare" }, w144 = { stats = {}, LIGHTS = {}, lightStats = { made = 0, dressed = 0, dressFail = 0 } } }
                 W214 = { hand = { } }
                 function mp_log() end
+                function KCD2MP_W214On() return true end
+                KCD2MP.w136.handClass = function(e, slot) return e.human:GetItemInHand(slot) end
                 function KCD2MP_EmitEvent() end
                 local bow = "{{Bow}}"
                 mutations = 0
@@ -148,6 +172,8 @@ public sealed class H4OutfitEngineTests
             string source = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Lua", "kdcmp.lua"));
             _lua.DoString(Function(source, "function KCD2MP_W136ClearPreset(", "\nend\n"));
             _lua.DoString(Function(source, "function KCD2MP_W144Equip(", "\nend\n"));
+            _lua.DoString(Function(source, "function KCD2MP_W214DrawWaits(", "\n    end\n"));
+            _lua.DoString(Function(source, "function KCD2MP_GhostCombat(", "\nend\n"));
             _lua.DoString(Function(source, "function KCD2MP_W202EquipAll(", "\n    end\n"));
             const string start = "-- ===== H4 Outfit engine fence =====";
             int fence = source.IndexOf(start, StringComparison.Ordinal);
