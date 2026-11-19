@@ -101,7 +101,7 @@ public partial class GameBridge
         _wo122Connected = false;
         _wo122Stream = null;
         // WO-211 A.1: a joiner holding in the host's world for the link keeps the lock (a save now would be a copy of the host's world)
-        if (_lockHeld && !LinkHeld) await Wo122SetLockAsync(false, "disconnect");
+        if (_lockHeld && !LinkHeld && !HostAbsentPause) await Wo122SetLockAsync(false, "disconnect");
         else if (_lockHeld) Console.WriteLine("MP-SAVELOCK kept through the link hold (WO-211 A.1): this game is still in the host's world");
         await Wo133OnDisconnectAsync();   // WO-133: the old quest layer is back outside a session
     }
@@ -148,8 +148,8 @@ public partial class GameBridge
     // host that announces it the lock is held only while this game's world IS
     // the host's (after a join). Without the announcement (an older host, the
     // WO-122 synthetic runs) it is held as WO-122 shipped it.
-    private bool Wo122WantLock() => JoinerSharedEffective && _wo122Connected && _combatRoleApplied && !_isDamageAuthority
-                                    && (!_hostModeKnown || _joinedWorld);
+    private bool Wo122WantLock() => HostAbsentPause || (_joinedWorld && LinkHeld) ||
+        (JoinerSharedEffective && _wo122Connected && _combatRoleApplied && !_isDamageAuthority && (!_hostModeKnown || _joinedWorld));
 
     private void Wo122OnGameplayStarted()
     {

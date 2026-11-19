@@ -1,6 +1,7 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+using System.Reflection;
 using System.Security.Cryptography;
 using KcdMp.Wire;
 
@@ -8,6 +9,8 @@ namespace KcdMp.Client.Tests;
 
 public sealed class HostAbsentPauseTests
 {
+    private const BindingFlags Instance = BindingFlags.NonPublic | BindingFlags.Instance;
+
     [Fact]
     public void A_joined_world_pauses_and_a_join_in_progress_aborts()
     {
@@ -48,14 +51,86 @@ public sealed class HostAbsentPauseTests
             Assert.Contains("host-absent", bridge.JoinStatusJson());
             Assert.Equal(Convert.ToHexString(SHA256.HashData(original)), Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))));
 
-            bridge.HostAbsentOnEpoch(99, run);
+            Assert.False(bridge.HostAbsentCanHearEpoch(99, run));
             Assert.True(bridge.HostAbsentPause);
-            bridge.HostAbsentOnEpoch(142, Guid.NewGuid());
+            Assert.False(bridge.HostAbsentCanHearEpoch(142, Guid.NewGuid()));
             Assert.True(bridge.HostAbsentPause);
-            bridge.HostAbsentOnEpoch(142, run);
+            Assert.True(bridge.HostAbsentCanHearEpoch(142, run));
+            Assert.True(bridge.HostAbsentPause);
+            Assert.True(bridge.CompleteHostAbsentResume(142, run));
             Assert.False(bridge.HostAbsentPause);
             Assert.Equal(Convert.ToHexString(SHA256.HashData(original)), Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))));
         }
         finally { File.Delete(path); }
     }
+
+    [Fact]
+    public async Task Returning_agent_announces_the_retained_world_before_relay_authority()
+    {
+        var bridge = new GameBridge(new ClientConfig { IsHosting = true });
+        using var relay = new MemoryStream();
+        using var lifetime = new CancellationTokenSource();
+        Set(bridge, "_loadSequenceRuntime", true);
+        Set(bridge, "_sharedWorld", true);
+        Set(bridge, "_combatRoleApplied", true);
+        Set(bridge, "_isDamageAuthority", true);
+        Set(bridge, "_wo122Stream", relay);
+        var world = Get<Wo206Epochs>(bridge, "_w206");
+        var sequence = Get<WorldLoadSequence>(bridge, "_worldLoad");
+        Assert.True(world.LearnWorld(142, 2));
+        Assert.True(sequence.TryBegin(0, WorldLoadStart.AdoptLoadedWorld, 142));
+        Invoke(bridge, "WorldReconnectHostLost", lifetime.Token);
+        Set(bridge, "_isDamageAuthority", false);
+
+        await (Task)Invoke(bridge, "Wo206AnnounceAsync", "peer", (byte?)7)!;
+
+        var bytes = relay.ToArray();
+        Assert.NotEmpty(bytes);
+        Assert.Equal(Protocol.W203Up, bytes[0]);
+        Assert.Equal(7, bytes[3]);
+        Assert.True(LootMsg.TryDecode(bytes.AsSpan(3 + Protocol.JoinHeaderLen), out var proof));
+        Assert.Equal(Protocol.W203Epoch, proof.Kind);
+        Assert.True(Wo206Rules.TryParseEpoch(proof.Text, out uint epoch, out _, out _));
+        Assert.Equal(142u, epoch);
+        Assert.True(HostAbsentRules.TryReadRun(proof.Text, out Guid run));
+        Assert.Equal(Get<Guid>(bridge, "_worldReconnectInstance"), run);
+        Assert.False(Get<bool>(bridge, "_isDamageAuthority"));
+        lifetime.Cancel();
+    }
+
+    [Fact]
+    public void Paused_joiner_keeps_the_save_lock_even_when_the_host_status_is_unknown()
+    {
+        var bridge = new GameBridge(new ClientConfig());
+        Set(bridge, "_joinedWorld", true);
+        Set(bridge, "_sharedWorld", false);
+        Set(bridge, "_wo122Connected", true);
+        Set(bridge, "_combatRoleApplied", true);
+        bridge.EnterHostAbsentPause("host-left");
+
+        Assert.Equal(true, Invoke(bridge, "Wo122WantLock"));
+    }
+
+    [Fact]
+    public void A_different_epoch_from_the_relay_cannot_change_the_held_world()
+    {
+        var bridge = new GameBridge(new ClientConfig());
+        var epochs = Get<Wo206Epochs>(bridge, "_w206");
+        Assert.True(epochs.LearnWorld(142, 2));
+        var run = Guid.NewGuid();
+        bridge.HostAbsentOnEpoch(142, run);
+        bridge.EnterHostAbsentPause("host-left");
+        Set(bridge, "_myGhostId", (byte)5);
+        string text = WorldReconnectFacts.EpochProof(Wo206Rules.EpochText(143, 2, "tick"), run, 9);
+        byte[] frame = new LootMsg(Protocol.W203Epoch, 0, text).BuildUp(Protocol.W203Up, 5);
+
+        Assert.Equal(true, Invoke(bridge, "Wo206TakeAtRead", (int)Protocol.W203Down, (byte[])[7, .. frame.AsSpan(3)]));
+
+        Assert.Equal(142u, epochs.World);
+        Assert.True(bridge.HostAbsentPause);
+    }
+
+    private static T Get<T>(GameBridge bridge, string field) => (T)typeof(GameBridge).GetField(field, Instance)!.GetValue(bridge)!;
+    private static void Set(GameBridge bridge, string field, object value) => typeof(GameBridge).GetField(field, Instance)!.SetValue(bridge, value);
+    private static object? Invoke(GameBridge bridge, string method, params object[] args) => typeof(GameBridge).GetMethod(method, Instance)!.Invoke(bridge, args);
 }

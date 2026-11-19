@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -205,8 +206,8 @@ public partial class ClientSession
 
     internal void NoteAnnouncement(uint world, Guid run)
     {
-        if (world != 0) AnnouncedWorldEpoch = world;
-        if (run != Guid.Empty) AnnouncedRunId = run;
+        AnnouncedWorldEpoch = world;
+        AnnouncedRunId = run;
     }
 
     /// <summary>WO-213 C.2: the client's LinkHello said it sends and takes state the unreliable way (and the relay agreed).</summary>
@@ -483,6 +484,17 @@ public partial class ClientSession
                 if (type == Protocol.Handshake || !Protocol.IsUpLenOk(type, payloadLen))
                 {
                     await DropFrameAsync(type, payloadLen, GateReason(type, payloadLen));
+                    continue;
+                }
+
+                // Keep transport, voice and clean session exits working. A
+                // Position may carry the host claim and W203 permits the exact
+                // resume proof in RouteJoin. Neither can move the paused world.
+                if (_clientHandler.HostAbsent &&
+                    type is not (Protocol.Ping or Protocol.ClockSyncUp or Protocol.PresentationClockUp or Protocol.LinkHelloUp or
+                        Protocol.Position or Protocol.W203Up or Protocol.VoiceUp or Protocol.SessionLeave))
+                {
+                    await DropFrameAsync(type, payloadLen, "host-absent");
                     continue;
                 }
 
@@ -1071,7 +1083,8 @@ public partial class ClientSession
                     if (dest is null)
                     {
                         _clientHandler.CountDrop((byte)type, why, Protocol.DropKeyHasKind(type) ? Protocol.JoinBodyKind(body) : -1);
-                        _logger.Warning("[join] {Kind} from '{Name}' (id={Id}) to {Target} dropped: {Why}.", jw.Name, Name, Id, body[0], why);
+                        if (!why.StartsWith("host-absent", StringComparison.Ordinal))
+                            _logger.Warning("[join] {Kind} from '{Name}' (id={Id}) to {Target} dropped: {Why}.", jw.Name, Name, Id, body[0], why);
                         continue;
                     }
                     bool carryHeld = type == Protocol.CarryUp && body.Length > Protocol.JoinHeaderLen && body[Protocol.JoinHeaderLen] == Protocol.CarryHeld;   // WO-148: every 2 s while carrying
@@ -1139,10 +1152,7 @@ public partial class ClientSession
                 bool claims = (flags & Protocol.PositionFlagHostClaim) != 0;
                 flags = (byte)(flags & ~Protocol.PositionFlagHostClaim);
                 if (claims && _clientHandler.HostAbsent && !_clientHandler.IsReturningHost(this))
-                {
-                    _logger.Information("MP-HOST-ABSENT claim refused name={Name} reason=not-the-host", Name);
                     claims = false;
-                }
                 if (claims != ClaimsHost)
                 {
                     ClaimsHost = claims;
@@ -1151,6 +1161,7 @@ public partial class ClientSession
                         Name, Id, Transport, claims ? "claims" : "no longer claims");
                     _broadcastService.BroadcastCombatRole();   // re-decides and logs MP-AUTHORITY-OWNER
                 }
+                if (_clientHandler.HostAbsent) continue;
                 // WO-101: everything after the flags byte is the tail -- body
                 // state (5) and/or the sender's ms (4, WO-118 follow-up), none
                 // on a 17-byte packet -- forwarded verbatim. The relay does not
@@ -1563,9 +1574,13 @@ public partial class ClientSession
         int kind = -1;
         if (payloadLen > 0)
         {
-            var skip = new byte[payloadLen];
-            await ReadExactAsync(skip);
-            if (Protocol.DropKeyHasKind(type)) kind = Protocol.JoinBodyKind(skip);
+            var skip = ArrayPool<byte>.Shared.Rent(payloadLen);
+            try
+            {
+                await ReadExactAsync(skip, payloadLen);
+                if (Protocol.DropKeyHasKind(type)) kind = Protocol.JoinBodyKind(skip.AsSpan(0, payloadLen));
+            }
+            finally { ArrayPool<byte>.Shared.Return(skip, clearArray: type == Protocol.WorldChunkUp); }
         }
         _clientHandler.CountDrop((byte)type, reason, kind);
     }

@@ -5,7 +5,7 @@ namespace KcdMp.Client;
 
 public partial class GameBridge
 {
-    private sealed record ReconnectHold(long Serial, WorldReconnectAttempt Attempt, PresentationSession? OldLink, bool NeedsBaseline);
+    private sealed record ReconnectHold(long Serial, WorldReconnectAttempt Attempt, PresentationSession? OldLink, bool NeedsBaseline, bool HostAbsent);
     private sealed record ReconnectReload(ReconnectHold Hold, WorldSyncScope Target);
     private sealed record ReconnectHost(long Serial, WorldReconnectAttempt Attempt, bool NeedsBaseline);
     private readonly object _worldReconnectGate = new();
@@ -15,11 +15,12 @@ public partial class GameBridge
     private ReconnectHold? _worldReconnectHold;
     private ReconnectReload? _worldReconnectReload;
     private ReconnectHost? _worldReconnectHost;
+    private WorldSyncScope? _worldReconnectHostReturn;
 
     private string WorldReconnectEpochProof(string text, uint world)
     {
         var s = _worldLoad.Current;
-        return WorldRecoveryEnabled && s is { Phase: WorldLoadPhase.Play, Generation: > 0 } && s.HostWorld == world
+        return s is { Phase: WorldLoadPhase.Play, Generation: > 0 } && s.HostWorld == world
             ? WorldReconnectFacts.EpochProof(text, _worldReconnectInstance, s.Generation) : text;
     }
 
@@ -34,7 +35,9 @@ public partial class GameBridge
         {
             var prior = _worldReconnectFacts.Proof;
             if (!_hostModeKnown || prior?.Source != _hostModeFrom || prior?.World != held.HostWorld) prior = null;
-            pending = new(serial, new(scope, prior, now), sameRelay ? null : _worldReconnectLink, WorldSyncEffective);
+            bool hostAbsent = HostAbsentPause;
+            pending = new(serial, new(scope, prior, now, waitForHost: hostAbsent), sameRelay ? null : _worldReconnectLink,
+                WorldSyncEffective, hostAbsent);
             _worldReconnectHold = pending;
             _worldReconnectReload = null;
             _worldReconnectFacts = new();
@@ -44,12 +47,15 @@ public partial class GameBridge
 
     private void WorldReconnectObserveAtRead(PresentationSession session, int type, byte[] payload)
     {
-        if (!WorldRecoveryEnabled || !ReferenceEquals(Volatile.Read(ref _presentationSession), session)) return;
-        if (type == Protocol.Disconnect && payload.Length == 1 && _joinedWorld && _hostModeKnown && payload[0] == _hostModeFrom)
+        if (!ReferenceEquals(Volatile.Read(ref _presentationSession), session)) return;
+        if (type == Protocol.Disconnect && payload.Length == 1 && _joinedWorld && _jj is null &&
+            _hostModeKnown && payload[0] == _hostModeFrom && !_leaveInProgress && !_gameQuitting)
         {
+            EnterHostAbsentPause("host-left");
             _ = WorldReconnectHoldPeerAsync();
             return;
         }
+        if (!WorldRecoveryEnabled) return;
         if (type is not (Protocol.JoinStatusDown or Protocol.W203Down)) return;
         lock (_worldReconnectGate)
         {
@@ -84,13 +90,13 @@ public partial class GameBridge
         PresentationSession link;
         lock (_worldReconnectGate)
         {
-            if (!WorldRecoveryEnabled || _worldReconnectHold is not { } h || _worldReconnectFacts.Proof is not { } p ||
+            if (!WorldRecoveryEnabled || _w211LeaveNow || _worldReconnectHold is not { } h || _worldReconnectFacts.Proof is not { } p ||
                 _worldReconnectLink is not { } l || !ReferenceEquals(Volatile.Read(ref _presentationSession), l) ||
                 l.Lifetime.IsCancellationRequested) return;
             (pending, proof, link) = (h, p, l);
         }
         var decision = pending.Attempt.Decide(_worldLoad.Current, proof, Environment.TickCount64);
-        if (decision == WorldReconnectDecision.DifferentWorld && (!T3HostWorldChanged || _w206.World != proof.World)) return;
+        if (decision == WorldReconnectDecision.DifferentWorld && (pending.HostAbsent || !T3HostWorldChanged || _w206.World != proof.World)) return;
         if (decision is WorldReconnectDecision.SameWorld or WorldReconnectDecision.DifferentWorld && pending.Attempt.TryClaim(decision))
             _ = WorldReconnectResolveAsync(pending, proof, link, decision);
     }
@@ -104,7 +110,7 @@ public partial class GameBridge
         {
             bool CurrentProof()
             {
-                lock (_worldReconnectGate) return WorldRecoveryEnabled && ReferenceEquals(_worldReconnectHold, pending) &&
+                lock (_worldReconnectGate) return WorldRecoveryEnabled && !_w211LeaveNow && ReferenceEquals(_worldReconnectHold, pending) &&
                     ReferenceEquals(Volatile.Read(ref _presentationSession), link) && !link.Lifetime.IsCancellationRequested &&
                     ReferenceEquals(_worldReconnectLink, link) && _worldReconnectFacts.Proof == proof;
             }
@@ -115,14 +121,27 @@ public partial class GameBridge
             if (!moved) return;
             if (same)
             {
+                if (pending.HostAbsent && _w211LeaveNow)
+                {
+                    WorldReconnectForget(pending);
+                    await LeaveSharedWorldAsync("host-left", "You left your partner's world.");
+                    return;
+                }
                 bool applied = await WorldReconnectConfirmUnparkAsync(pending, link);
                 long elapsed = pending.Attempt.Elapsed(Environment.TickCount64);
-                if (applied && CurrentProof() && elapsed <= WorldReconnectAttempt.WindowMs)
+                if (applied && CurrentProof() && (pending.HostAbsent || elapsed <= WorldReconnectAttempt.WindowMs))
                 {
+                    if (pending.HostAbsent) CompleteHostAbsentResume(proof.World, proof.Instance);
                     WorldReconnectFinish(pending, "same-world", elapsed, same: true, success: true);
                     Interlocked.Increment(ref _w211ResumedInPlace);
                     _ = ExecLuaAsync("KCD2MP_ShowNativeToast(\"Reconnected to your host.\")");
                     await Wo210AfterSkipAsync("reconnect");
+                }
+                else if (pending.HostAbsent)
+                {
+                    WorldReconnectForget(pending);
+                    if (HostAbsentPause && !_w211LeaveNow && !_leaveInProgress)
+                        await Wo211TryHoldAsync("host-return-unconfirmed", sameRelay: true);
                 }
                 else if (elapsed >= WorldReconnectAttempt.WindowMs) WorldReconnectFinish(pending, "timeout", elapsed, same: true, timeout: true);
                 else WorldReconnectForget(pending);
@@ -233,19 +252,30 @@ public partial class GameBridge
 
     private void WorldReconnectHostLost(CancellationToken lifetime)
     {
-        if (!WorldRecoveryEnabled || !_isDamageAuthority || !_sharedWorld) return;
+        if (!_isDamageAuthority || !_sharedWorld) return;
         var s = _worldLoad.Current;
         var scope = new WorldSyncScope(s.HostWorld, s.Generation);
         if (!scope.IsValid || s.Phase != WorldLoadPhase.Play || !_worldLoad.CanApply(s.Generation)) return;
         ReconnectHost pending;
         lock (_worldReconnectGate)
         {
-            if (_worldReconnectHost is not null) return;
+            _worldReconnectHostReturn = scope;
+            if (!WorldRecoveryEnabled || _worldReconnectHost is not null) return;
             pending = new(Interlocked.Increment(ref _w211HoldSerial), new(scope, null, Environment.TickCount64), WorldSyncEffective);
             _worldReconnectHost = pending;
         }
         WorldReconnectLog("host", pending.Serial, scope, "started", 0);
         _ = WorldReconnectHostDeadlineAsync(pending, lifetime);
+    }
+
+    private bool WorldReconnectCanAnnounceReturningHost()
+    {
+        if (!config.IsHosting || !_sharedWorld || _joinedWorld || _leaveInProgress || _gameQuitting) return false;
+        var state = _worldLoad.Current;
+        if (state.Phase != WorldLoadPhase.Play || !_worldLoad.CanApply(state.Generation) || _w206.World != state.HostWorld)
+            return false;
+        lock (_worldReconnectGate)
+            return _worldReconnectHostReturn is { } scope && scope == new WorldSyncScope(state.HostWorld, state.Generation);
     }
 
     private async Task WorldReconnectHostDeadlineAsync(ReconnectHost pending, CancellationToken lifetime)
@@ -258,7 +288,14 @@ public partial class GameBridge
     private void WorldReconnectHostRoleConfirmed()
     {
         ReconnectHost? pending;
-        lock (_worldReconnectGate) pending = _worldReconnectHost;
+        bool returned;
+        lock (_worldReconnectGate)
+        {
+            returned = _isDamageAuthority && _worldReconnectHostReturn is not null;
+            if (returned) _worldReconnectHostReturn = null;
+            pending = _worldReconnectHost;
+        }
+        if (returned) _ = Wo206AnnounceAsync("host-return");
         if (pending is null || !_isDamageAuthority || !_sharedWorld || !_combatRoleApplyComplete ||
             _wo121Stream is not { } stream || !pending.Attempt.TryClaim(WorldReconnectDecision.SameWorld)) return;
         _ = WorldReconnectHostReadyAsync(pending, stream, _wo121Ct);

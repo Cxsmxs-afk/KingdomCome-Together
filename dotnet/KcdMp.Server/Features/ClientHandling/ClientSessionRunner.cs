@@ -82,7 +82,6 @@ public sealed class ClientSessionRunner
 					client.Name ?? "(not ready)");
 			}
 
-			_clientHandler.NoteSessionHostLeft(client);
 			_clientHandler.RemoveClient(client);
 
 			// WO-38: a sleeper who disconnects mid-skip must not leave the
@@ -106,10 +105,8 @@ public sealed class ClientSessionRunner
 			if (client.IsReady)
 				_broadcastService.BroadcastDisconnect(client);
 
-			// WO-28: losing a client can move NPC->player damage
-			// authority -- it does whenever the holder is the one who
-			// left. Announced after RemoveClient above, so the role is
-			// recomputed over the set that actually remains.
+			// Role notices follow the disconnect and reflect the same
+			// authority decision, including the pause when the host left.
 			_broadcastService.BroadcastCombatRole();
 		}, CancellationToken.None);
 	}
