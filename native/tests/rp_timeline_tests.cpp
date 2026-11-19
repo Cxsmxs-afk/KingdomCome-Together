@@ -217,6 +217,14 @@ int rp_timeline_tests(int* passed) {
           timedGhost.render(local + 12120, newBodyLocal).ranged_held(),
           "a new held sample captured after the body boundary plays in the still-bound stream");
 
+    Track uncertainBinding;
+    auto futureHold = sample(base, 0);
+    futureHold.ranged = ranged::decode_state(active.data(), base);
+    check(uncertainBinding.push(futureHold, local + 20, base - 40) == Ingest::Accepted &&
+          uncertainBinding.render(local + 200).ranged_held() &&
+          !uncertainBinding.render(local + 200, local).ranged_held(),
+          "a tolerated future clock stamp just after binding cannot establish a new body hold");
+
     Track route;
     std::vector<uint64_t> actions, coordinatedSkew, untimedSkew;
     constexpr uint64_t actionEvery = 800;

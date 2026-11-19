@@ -189,8 +189,10 @@ public:
                 out.appliedHostMs = advance(before->hostMs, out.extrapMs);
             }
         }
-        // Keep the latest confirmed draw independently of the time limits for crouch, guard, and movement.
-        if (before->ranged.hostMs <= out.appliedHostMs && before->rangedLocalMs > rangedAfterLocalMs) {
+        // Keep ranged state independent of body freshness. At a new binding,
+        // ignore observations within the host clock's allowed future skew.
+        const uint64_t rangedCutoff = rangedAfterLocalMs ? advance(rangedAfterLocalMs, kFutureToleranceMs) : 0;
+        if (before->ranged.hostMs <= out.appliedHostMs && before->rangedLocalMs > rangedCutoff) {
             out.ranged = before->ranged;
             out.rangedStateHostMs = out.ranged.hostMs;
         }
