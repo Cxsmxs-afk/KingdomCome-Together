@@ -97,7 +97,7 @@ internal static class JoinAbortRegression
         Console.WriteLine("JOIN-ABORT-LIFECYCLE playline_reused=1 submitted_preserved=1");
 
         Console.WriteLine($"JOIN-ABORT-GATE attempts={Attempts} retained_slots={retainedSlots} own_save_unchanged=1");
-        return retainedSlots <= 1 && leftovers.Count <= 1 ? 0 : 1;
+        return retainedSlots == 0 ? 0 : 1;
 
         (object Join, string Path) Publish(uint id, int playline)
         {
@@ -112,7 +112,7 @@ internal static class JoinAbortRegression
             joinType.GetField("Name")!.SetValue(join, name);
             joinType.GetField("WorldTag")!.SetValue(join, hostTag);
             joinField.SetValue(bridge, join);
-            if (publish.Invoke(bridge, [join, savesRoot, Path.Combine(slot, name + ".part"), placed, placedBytes, hostTag]) is not true)
+            if (publish.Invoke(bridge, [join, savesRoot, placed, placedBytes, hostTag]) is not true)
                 throw new InvalidOperationException($"Join {id} could not publish its verified save");
             if (!File.ReadAllBytes(placed).AsSpan().SequenceEqual(placedBytes))
                 throw new InvalidOperationException($"Join {id} did not publish the fixture bytes");

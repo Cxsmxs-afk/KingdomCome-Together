@@ -97,8 +97,11 @@ public class Wo124Tests : IDisposable
         byte[] joinBytes = "join payload at the journal boundary"u8.ToArray();
         string marked = Path.Combine(_saves, "playline2", "mpworld227213e4.whs");
         string unmarked = Path.Combine(_saves, "playline2", "mpworld00000001.whs");
-        new JoinWorldJournal().Register(_saves, marked, "abc0123456", 0x227213e4, SHA256.HashData(joinBytes));
-        File.WriteAllBytes(marked, joinBytes);
+        var journal = new JoinWorldJournal();
+        byte[] joinSha = SHA256.HashData(joinBytes);
+        File.WriteAllBytes(journal.Register(_saves, marked, "abc0123456", 0x227213e4, joinSha), joinBytes);
+        journal.SealStage(_saves, marked, 0x227213e4, joinSha);
+        journal.Publish(_saves, marked, 0x227213e4, joinSha);
         File.WriteAllBytes(unmarked, joinBytes);
 
         const string saveVar = "KCDMP_JOIN_SAVES_DIR", dataVar = "KCDMP_DATA_DIR";
@@ -137,10 +140,12 @@ public class Wo124Tests : IDisposable
         byte[] world = "same simulated save content"u8.ToArray();
         byte[] digest = SHA256.HashData(world);
         var owner = new JoinWorldJournal();
-        owner.Register(_saves, live, "abc0123456", 2, digest);
-        owner.Register(_saves, loading, "def0123456", 3, digest);
-        File.WriteAllBytes(live, world);
-        File.WriteAllBytes(loading, world);
+        File.WriteAllBytes(owner.Register(_saves, live, "abc0123456", 2, digest), world);
+        owner.SealStage(_saves, live, 2, digest);
+        owner.Publish(_saves, live, 2, digest);
+        File.WriteAllBytes(owner.Register(_saves, loading, "def0123456", 3, digest), world);
+        owner.SealStage(_saves, loading, 3, digest);
+        owner.Publish(_saves, loading, 3, digest);
         Assert.True(owner.MarkLoadSubmitted(_saves, loading, 3, digest));
 
         Assert.Equal(0, new JoinWorldJournal().Sweep(_saves, path => path == live));

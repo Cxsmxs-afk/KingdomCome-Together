@@ -85,7 +85,7 @@ public partial class GameBridge
                                 if (++unrelatedWorldAnswers >= Wo154Rules.JoinLoadWatch.IdleAnswersToAbort) return false;
                                 break;
                             }
-                            Wo124OnGameplayStarted();
+                            Wo124OnGameplayStartedCore(confirmedByGameQuery: true);
                         }
                     }
                     Interlocked.Increment(ref _w154JoinWaitWorlds);
@@ -137,37 +137,36 @@ public partial class GameBridge
     private bool Wo154RemovePlacedLater(JoinerJoin j, string path)
     {
         if (!_retainedJoinWorlds.MayRemove(path, j)) return true;
-        bool commanded = j.LoadCmdUtc != default;
-        bool past = (j.GameplayStarted?.Task.IsCompleted ?? false) || (j.LoadFailed?.Task.IsCompleted ?? false);
-        if (!j.LoadDispatchInFlight && Wo154Rules.PlacedFileMayGo(commanded, past, false, "")) return false;
+        if (JoinSaveReadEnded(j)) return false;
+        if (Interlocked.Exchange(ref j.RemovalScheduled, 1) != 0) return true;
         Interlocked.Increment(ref _w154JoinDeferredRemovals);
-        int pl = j.Playline; string name = j.Name; uint id = j.JoinId;
-        Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: {SaveDisplay(path)} is kept until no load can be reading it");
-        _ = Task.Run(async () =>
-        {
-            var t0 = DateTime.UtcNow;
-            while ((DateTime.UtcNow - t0).TotalSeconds < Wo154Rules.JoinLoadWatch.MaxWaitS)
-            {
-                if (!j.LoadDispatchInFlight &&
-                    ((j.GameplayStarted?.Task.IsCompletedSuccessfully ?? false) || (j.LoadFailed?.Task.IsCompletedSuccessfully ?? false)))
-                {
-                    bool gone = false;
-                    try
-                    {
-                        gone = TryDeletePlacedJoinWorld(j, path);
-                    }
-                    catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(path)}: {ex.Message}"); }
-                    if (!gone) return;
-                    if (j.PlacedPath == path) j.PlacedPath = null;
-                    var after = await _combat.SaveListAsync(3, pl, name);
-                    Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: removed {SaveDisplay(path)} after the engine reported completion; cached listed={(after is null ? "?" : On(after.Listed))} (not refreshed)");
-                    return;
-                }
-                await Task.Delay(1000);
-            }
-            Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: {SaveDisplay(path)} kept -- no engine confirmation that the load has finished");
-        });
+        Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: {SaveDisplay(path)} is kept until no load can be reading it");
+        if (j.EngineReceipt is { } receipt) _ = WaitForJoinSaveReleaseAsync(j, path, receipt);
         return true;
+    }
+
+    private async Task WaitForJoinSaveReleaseAsync(JoinerJoin join, string path, JoinEngineReceipt receipt)
+    {
+        try
+        {
+            Task dispatch = join.LoadDispatchInFlight ? join.DispatchEnded.Task : Task.CompletedTask;
+            await Task.WhenAll(dispatch, receipt.Terminal.Task)
+                .WaitAsync(TimeSpan.FromSeconds(Wo154Rules.JoinLoadWatch.MaxWaitS));
+            if (TryDeletePlacedJoinWorld(join, path))
+            {
+                if (join.PlacedPath == path) join.PlacedPath = null;
+                Console.WriteLine($"MP-JOIN joiner: join 0x{join.JoinId:x8}: removed {SaveDisplay(path)} after the engine reported completion for that file");
+            }
+        }
+        catch (TimeoutException)
+        {
+            Console.WriteLine($"MP-JOIN joiner: join 0x{join.JoinId:x8}: {SaveDisplay(path)} kept -- no engine confirmation that the load has finished");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(path)}: {ex.GetType().Name}");
+        }
+        finally { receipt.Dispose(); }
     }
 
     // ---- Phase 4.1: the host's join bar through the engine's hold ----------------------------------------------------

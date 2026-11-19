@@ -87,6 +87,9 @@ public partial class GameBridge
         public WhsSave.PlayerSoul? Henry;          // the spliced file's Henry (= the source's, minus quest items)
         public DateTime LoadCmdUtc, LoadStartUtc, LoadGameUtc, GameplayUtc;
         public volatile bool LoadDispatchInFlight;
+        public JoinEngineReceipt? EngineReceipt;
+        public int RemovalScheduled;
+        public readonly TaskCompletionSource DispatchEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public ulong LoadGeneration;
         public long CalendarGeneration;
         public long CalendarPipeRevision;
@@ -252,6 +255,7 @@ public partial class GameBridge
     /// <summary>"[CryAction] LoadGame: '...'" -- the save's data is being read (from the menu: after the level load).</summary>
     private void Wo124OnLoadStarted()
     {
+        if (_transport is LogTailGameTransport engine && EngineNoticeBelongsToAnotherJoin(engine.EngineReadSave)) return;
         _where = GameWhere.Loading;
         W160WorldGone();
         if (!LoadSequenceEnabled) Wo136OnLoadSeen("load");
@@ -261,7 +265,8 @@ public partial class GameBridge
             LoadSequenceBeginLoad();
             Wo136OnLoadSeen("load");
         }
-        if (_jj is { LoadStarted: not null } j && (!LoadSequenceEnabled || _worldLoad.IsCurrent(j.LoadGeneration)))
+        if (_jj is { LoadStarted: not null } j && (!LoadSequenceEnabled || _worldLoad.IsCurrent(j.LoadGeneration)) &&
+            (j.EngineReceipt is null || _transport is LogTailGameTransport tail && j.EngineReceipt.Matches(tail.EngineReadSave)))
         {
             if (j.LoadGameUtc == default) j.LoadGameUtc = DateTime.UtcNow;
         }
@@ -270,6 +275,7 @@ public partial class GameBridge
     /// <summary>"Loading saved game '...playlineN/x.whs'" -- the engine accepted a load (printed at once).</summary>
     private void Wo124OnSaveLoadAccepted(string display)
     {
+        if (_transport is LogTailGameTransport engine && EngineNoticeBelongsToAnotherJoin(engine.EngineAcceptedSave)) return;
         _where = GameWhere.Loading;
         W160WorldGone();
         if (!LoadSequenceEnabled) Wo136OnLoadSeen("accepted");
@@ -291,6 +297,7 @@ public partial class GameBridge
             return;
         }
         if (_jj is { LoadStarted: { } t } j && (!LoadSequenceEnabled || _worldLoad.IsCurrent(j.LoadGeneration)) &&
+            (j.EngineReceipt is null || _transport is LogTailGameTransport tail && j.EngineReceipt.Matches(tail.EngineAcceptedSave)) &&
             display.Equals($"playline{j.Playline}/{j.Name}.whs", StringComparison.OrdinalIgnoreCase))
         {
             if (LoadSequenceEnabled) Wo136OnLoadSeen("accepted");
@@ -394,6 +401,8 @@ public partial class GameBridge
     /// <summary>"Exiting to main menu because save game loading failed." -- the engine went back to the menu.</summary>
     private void Wo124OnLoadFailedToMenu()
     {
+        if (_transport is LogTailGameTransport engine && EngineNoticeBelongsToAnotherJoin(engine.DispatchingTerminalSave)) return;
+        if (!OwnLoadExpected && _jj is { EngineReceipt: { } receipt } && !receipt.MatchesTerminal(loaded: false)) return;
         _where = GameWhere.Menu;
         LoadSequenceOnMenu();
         W160WorldGone();
@@ -429,8 +438,14 @@ public partial class GameBridge
         }
     }
 
-    private void Wo124OnGameplayStarted()
+    private void Wo124OnGameplayStarted() => Wo124OnGameplayStartedCore(confirmedByGameQuery: false);
+
+    private void Wo124OnGameplayStartedCore(bool confirmedByGameQuery)
     {
+        if (!confirmedByGameQuery && _transport is LogTailGameTransport engine &&
+            EngineNoticeBelongsToAnotherJoin(engine.DispatchingTerminalSave)) return;
+        if (!confirmedByGameQuery && !OwnLoadExpected && _jj is { EngineReceipt: { } receipt } &&
+            !receipt.MatchesTerminal(loaded: true)) return;
         _where = GameWhere.World;
         var startedLoad = _worldLoad.Current;
         bool ownLoad = LoadSequenceEnabled ? startedLoad.OwnIntent == WorldLoadOwnIntent.ExpectedPrivate : _ownLoadExpected;
@@ -720,9 +735,8 @@ public partial class GameBridge
             _lastWorldPlayline = j.Playline;
             j.Name = $"mpworld{j.JoinId:x8}";
             string dir = Path.Combine(saves, $"playline{j.Playline}");
-            string part = Path.Combine(dir, j.Name + ".part");
             string final = Path.Combine(dir, j.Name + ".whs");
-            if (!TryPublishJoinWorld(j, saves, part, final, res.File, reservationTag)) return;
+            if (!TryPublishJoinWorld(j, saves, final, res.File, reservationTag)) return;
             byte[] placedSha = j.SplicedSha ?? throw new InvalidOperationException("published join save has no checksum");
             var back = WhsSave.ReadShared(final);
             if (!SHA256.HashData(back).AsSpan().SequenceEqual(placedSha) || !WhsSave.Verify(back).Ok)
@@ -799,7 +813,11 @@ public partial class GameBridge
                 loadIssued = await P5LoadGameCoreAsync(j.Playline, j.Name, "join-command",
                     () => AuthorizeJoinCalendarLoad(j, saves, out ownershipRefused));
             }
-            finally { j.LoadDispatchInFlight = false; }
+            finally
+            {
+                j.LoadDispatchInFlight = false;
+                j.DispatchEnded.TrySetResult();
+            }
             if (!loadIssued)
             {
                 if (Wo124JoinGone(j, "after load dispatch refusal")) return;
@@ -867,7 +885,7 @@ public partial class GameBridge
         return File.Exists(p) ? p : null;
     }
 
-    private bool TryPublishJoinWorld(JoinerJoin j, string savesRoot, string part, string final, byte[] file, string worldTag)
+    private bool TryPublishJoinWorld(JoinerJoin j, string savesRoot, string final, byte[] file, string worldTag)
     {
         string directory = Path.GetDirectoryName(final)!;
         if ((File.GetAttributes(savesRoot) & FileAttributes.ReparsePoint) != 0)
@@ -876,9 +894,10 @@ public partial class GameBridge
         if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
             throw new IOException("the join playline is a reparse point");
         byte[] sha = SHA256.HashData(file);
-        bool reserved = false, created = false, moved = false;
+        bool reserved = false, moved = false;
         try
         {
+            string part;
             lock (_joinGate)
             {
                 if (!ReferenceEquals(_jj, j) || j.Abandoned.Task.IsCompleted)
@@ -886,15 +905,15 @@ public partial class GameBridge
                     Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: placement refused after attempt ended");
                     return false;
                 }
-                _joinWorldJournal.Register(savesRoot, final, worldTag, j.JoinId, sha);
+                part = _joinWorldJournal.Register(savesRoot, final, worldTag, j.JoinId, sha);
                 reserved = true;
             }
             using (var staged = new FileStream(part, FileMode.CreateNew, FileAccess.Write))
             {
-                created = true;
                 staged.Write(file);
                 staged.Flush(flushToDisk: true);
             }
+            _joinWorldJournal.SealStage(savesRoot, final, j.JoinId, sha);
             lock (_joinGate)
             {
                 if (!ReferenceEquals(_jj, j) || j.Abandoned.Task.IsCompleted)
@@ -902,7 +921,7 @@ public partial class GameBridge
                     Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: placement refused after attempt ended");
                     return false;
                 }
-                File.Move(part, final);
+                _joinWorldJournal.Publish(savesRoot, final, j.JoinId, sha);
                 moved = true;
                 j.SavesRoot = savesRoot;
                 j.PlacedPath = final;
@@ -913,16 +932,7 @@ public partial class GameBridge
         }
         finally
         {
-            if (reserved && !moved)
-                try
-                {
-                    if (created) File.Delete(part);
-                    if (!File.Exists(part)) _joinWorldJournal.TryDeleteOwned(savesRoot, final, j.JoinId, sha);
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8}: staging cleanup failed ({ex.GetType().Name})");
-                }
+            if (reserved && !moved) _joinWorldJournal.TryDeleteOwned(savesRoot, final, j.JoinId, sha);
         }
     }
 
@@ -933,6 +943,7 @@ public partial class GameBridge
             if (!ReferenceEquals(_jj, j) || j.Abandoned.Task.IsCompleted || j.Phase != "preparing") return false;
             if (!j.PlacedVerified || j.PlacedPath is not { } path || j.SplicedSha is not { } sha ||
                 !_joinWorldJournal.MarkLoadSubmitted(savesRoot, path, j.JoinId, sha)) return false;
+            if (_transport is LogTailGameTransport tail) j.EngineReceipt = new(tail, _combat, path, savesRoot);
             j.LoadDispatchInFlight = true;
             j.LoadCmdUtc = DateTime.UtcNow;
             j.Phase = "loading";
@@ -944,7 +955,7 @@ public partial class GameBridge
     }
 
     private bool TryDeletePlacedJoinWorld(JoinerJoin join, string path) =>
-        join.SavesRoot is { } root && join.SplicedSha is { } sha &&
+        JoinSaveReadEnded(join) && join.SavesRoot is { } root && join.SplicedSha is { } sha &&
         _retainedJoinWorlds.TryDelete(path, join, full => _joinWorldJournal.TryDeleteOwned(root, full, join.JoinId, sha));
 
     private bool AuthorizeJoinCalendarLoad(JoinerJoin join, string savesRoot, out bool ownershipRefused)

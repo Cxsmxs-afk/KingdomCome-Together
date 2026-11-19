@@ -20,8 +20,7 @@ public sealed class JoinWorldJournalTests
         string personal = Path.Combine(saves.Playline, "save001.whs");
         File.WriteAllBytes(unmarked, World); // Filename and bytes are insufficient without the marker.
         File.WriteAllBytes(personal, World);
-        Register(journal, saves, 1);
-        File.WriteAllBytes(owned, World);
+        Publish(journal, saves, 1);
 
         var restarted = new JoinWorldJournal();
         Assert.True(restarted.HasReservation(saves.Root, Tag));
@@ -38,8 +37,7 @@ public sealed class JoinWorldJournalTests
         using var saves = new TestSaves();
         var journal = new JoinWorldJournal();
         string owned = saves.JoinFile(1);
-        Register(journal, saves, 1);
-        File.WriteAllBytes(owned, World);
+        Publish(journal, saves, 1);
         Assert.True(journal.MarkLoadSubmitted(saves.Root, owned, 1, Sha));
 
         var restarted = new JoinWorldJournal();
@@ -58,7 +56,7 @@ public sealed class JoinWorldJournalTests
         var journal = new JoinWorldJournal();
         string owned = saves.JoinFile(1);
         byte[] changed = "a changed world"u8.ToArray();
-        Register(journal, saves, 1);
+        Publish(journal, saves, 1);
         File.WriteAllBytes(owned, changed);
 
         Assert.False(journal.MarkLoadSubmitted(saves.Root, owned, 1, Sha));
@@ -115,11 +113,10 @@ public sealed class JoinWorldJournalTests
         using var saves = new TestSaves();
         var journal = new JoinWorldJournal();
         string live = saves.JoinFile(1);
-        string part = Path.ChangeExtension(saves.JoinFile(2), ".part");
-        Register(journal, saves, 1);
-        journal.Register(saves.Root, saves.JoinFile(2), "otherworld", 2, Sha);
-        File.WriteAllBytes(live, World);
+        Publish(journal, saves, 1);
+        string part = journal.Register(saves.Root, saves.JoinFile(2), "otherworld", 2, Sha);
         File.WriteAllBytes(part, World);
+        journal.SealStage(saves.Root, saves.JoinFile(2), 2, Sha);
 
         Assert.Equal(1, journal.Sweep(saves.Root, file => file == live));
         Assert.False(File.Exists(part));
@@ -134,8 +131,7 @@ public sealed class JoinWorldJournalTests
         using var saves = new TestSaves();
         var journal = new JoinWorldJournal();
         string owned = saves.JoinFile(1);
-        Register(journal, saves, 1);
-        File.WriteAllBytes(owned, World);
+        Publish(journal, saves, 1);
         string path = Assert.Single(Directory.EnumerateFiles(Path.Combine(saves.Root, JoinWorldJournal.DirectoryName)));
         var document = JsonNode.Parse(File.ReadAllText(path))!.AsObject();
         Assert.True(document.Remove("LoadSubmitted"));
@@ -151,7 +147,8 @@ public sealed class JoinWorldJournalTests
         using var saves = new TestSaves();
         var journal = new JoinWorldJournal();
         string owned = saves.JoinFile(1);
-        Register(journal, saves, 1);
+        Publish(journal, saves, 1);
+        File.Delete(owned);
         Directory.CreateDirectory(owned);
         string personal = Path.Combine(owned, "personal.whs");
         File.WriteAllBytes(personal, World);
@@ -161,16 +158,166 @@ public sealed class JoinWorldJournalTests
         Assert.Equal(World, File.ReadAllBytes(personal));
     }
 
-    private static void Register(JoinWorldJournal journal, TestSaves saves, uint id) =>
+    [Fact]
+    public void Restart_reclaims_a_torn_private_stage_without_touching_the_visible_save()
+    {
+        using var saves = new TestSaves();
+        var journal = new JoinWorldJournal();
+        string visible = saves.JoinFile(1);
+        string part = Register(journal, saves, 1);
+        File.WriteAllBytes(part, World[..8]); // Stop between exclusive creation and durable sealing.
+        File.WriteAllBytes(visible, World); // Even identical visible bytes were never published by this reservation.
+
+        var restart = new JoinWorldJournal();
+        Assert.Equal(1, restart.Sweep(saves.Root, _ => false));
+        Assert.False(File.Exists(part));
+        Assert.Equal(World, File.ReadAllBytes(visible));
+        Assert.False(restart.HasReservation(saves.Root, Tag));
+        Register(restart, saves, 2); // The same world can reserve the same playline again.
+    }
+
+    [Fact]
+    public void A_replacement_between_identity_check_and_retirement_is_restored_without_deleting_it()
+    {
+        using var saves = new TestSaves();
+        string visible = saves.JoinFile(1);
+        string original = Path.Combine(saves.Playline, "original.whs");
+        byte[] foreign = "the player's replacement"u8.ToArray();
+        var journal = new JoinWorldJournal(path =>
+        {
+            Assert.Equal(visible, path);
+            File.Move(path, original);
+            File.WriteAllBytes(path, foreign);
+        });
+        Publish(journal, saves, 1);
+
+        Assert.False(journal.TryDeleteOwned(saves.Root, visible, 1, Sha));
+        Assert.Equal(foreign, File.ReadAllBytes(visible));
+        Assert.Equal(World, File.ReadAllBytes(original));
+        Assert.False(File.Exists(saves.RetiredFile(1)));
+    }
+
+    [Fact]
+    public void Restart_restores_a_foreign_file_left_in_quarantine()
+    {
+        using var saves = new TestSaves();
+        Publish(new JoinWorldJournal(), saves, 1);
+        string visible = saves.JoinFile(1), retired = saves.RetiredFile(1);
+        byte[] foreign = "the player's replacement"u8.ToArray();
+        byte[] newer = "another save now occupies the name"u8.ToArray();
+        File.Delete(visible);
+        File.WriteAllBytes(retired, foreign); // Stop just after capture, before verification can restore it.
+        File.WriteAllBytes(visible, newer);
+
+        var restart = new JoinWorldJournal();
+        Assert.Equal(0, restart.Sweep(saves.Root, _ => false));
+        Assert.Equal(newer, File.ReadAllBytes(visible));
+        Assert.Equal(foreign, File.ReadAllBytes(retired));
+        Assert.True(restart.HasReservation(saves.Root, Tag));
+        File.Move(visible, Path.Combine(saves.Playline, "newer.whs"));
+        Assert.Equal(0, restart.Sweep(saves.Root, _ => false));
+        Assert.Equal(foreign, File.ReadAllBytes(visible));
+        Assert.False(File.Exists(retired));
+    }
+
+    [Fact]
+    public void A_failed_publish_never_claims_an_identical_file_at_the_destination()
+    {
+        using var saves = new TestSaves();
+        var journal = new JoinWorldJournal();
+        string visible = saves.JoinFile(1), stage = Register(journal, saves, 1);
+        File.WriteAllBytes(stage, World);
+        journal.SealStage(saves.Root, visible, 1, Sha);
+        File.WriteAllBytes(visible, World);
+        Assert.Throws<IOException>(() => journal.Publish(saves.Root, visible, 1, Sha));
+
+        var restart = new JoinWorldJournal();
+        Assert.Equal(1, restart.Sweep(saves.Root, _ => false));
+        Assert.Equal(World, File.ReadAllBytes(visible));
+        Assert.False(File.Exists(stage));
+        Assert.False(restart.HasReservation(saves.Root, Tag));
+    }
+
+    [Fact]
+    public void A_replacement_with_identical_bytes_cannot_be_submitted_or_removed()
+    {
+        using var saves = new TestSaves();
+        var journal = new JoinWorldJournal();
+        Publish(journal, saves, 1);
+        string visible = saves.JoinFile(1);
+        string original = Path.Combine(saves.Playline, "original.whs");
+        File.Move(visible, original);
+        File.WriteAllBytes(visible, World);
+
+        Assert.False(journal.MarkLoadSubmitted(saves.Root, visible, 1, Sha));
+        Assert.False(journal.TryDeleteOwned(saves.Root, visible, 1, Sha));
+        Assert.Equal(World, File.ReadAllBytes(visible));
+        Assert.Equal(World, File.ReadAllBytes(original));
+    }
+
+    [Fact]
+    public void Legacy_stages_are_recovered_only_when_their_complete_bytes_match()
+    {
+        using var saves = new TestSaves();
+        Directory.CreateDirectory(saves.JournalDirectory);
+        for (uint id = 1; id <= 2; id++)
+        {
+            var marker = new JsonObject { ["Version"] = 1, ["WorldTag"] = Tag, ["Playline"] = 2, ["JoinId"] = id,
+                ["Sha256"] = Convert.ToHexString(Sha), ["LoadSubmitted"] = false };
+            File.WriteAllText(saves.MarkerFile(id), marker.ToJsonString());
+            File.WriteAllBytes(Path.ChangeExtension(saves.JoinFile(id), ".part"), id == 1 ? World : World[..8]);
+        }
+
+        var restart = new JoinWorldJournal();
+        Assert.Equal(1, restart.Sweep(saves.Root, _ => false));
+        Assert.False(File.Exists(saves.MarkerFile(1)));
+        Assert.Equal(World[..8], File.ReadAllBytes(Path.ChangeExtension(saves.JoinFile(2), ".part")));
+        Assert.True(File.Exists(saves.MarkerFile(2)));
+    }
+
+    [Fact]
+    public void Restart_retains_a_legacy_capture_without_durable_file_identity()
+    {
+        using var saves = new TestSaves();
+        Directory.CreateDirectory(saves.JournalDirectory);
+        var marker = new JsonObject { ["Version"] = 1, ["WorldTag"] = Tag, ["Playline"] = 2, ["JoinId"] = 1,
+            ["Sha256"] = Convert.ToHexString(Sha), ["LoadSubmitted"] = false };
+        File.WriteAllText(saves.MarkerFile(1), marker.ToJsonString());
+        string capture = saves.MarkerFile(1) + ".retired";
+        File.WriteAllBytes(capture, World);
+
+        var restart = new JoinWorldJournal();
+        Assert.Equal(0, restart.Sweep(saves.Root, _ => false));
+        Assert.Equal(World, File.ReadAllBytes(capture));
+        Assert.True(restart.HasReservation(saves.Root, Tag));
+    }
+
+    private static string Register(JoinWorldJournal journal, TestSaves saves, uint id) =>
         journal.Register(saves.Root, saves.JoinFile(id), Tag, id, Sha);
+
+    private static void Publish(JoinWorldJournal journal, TestSaves saves, uint id)
+    {
+        string path = saves.JoinFile(id);
+        File.WriteAllBytes(Register(journal, saves, id), World);
+        journal.SealStage(saves.Root, path, id, Sha);
+        journal.Publish(saves.Root, path, id, Sha);
+    }
 
     private sealed class TestSaves : IDisposable
     {
         public string Root { get; } = Directory.CreateTempSubdirectory("kcdmp-join-ownership-").FullName;
         public string Playline => Path.Combine(Root, "playline2");
+        public string JournalDirectory => Path.Combine(Root, JoinWorldJournal.DirectoryName);
 
         public TestSaves() => Directory.CreateDirectory(Playline);
         public string JoinFile(uint id) => Path.Combine(Playline, $"mpworld{id:x8}.whs");
+        public string MarkerFile(uint id) => Path.Combine(JournalDirectory, $"playline2-mpworld{id:x8}.json");
+        public string RetiredFile(uint id)
+        {
+            var marker = JsonNode.Parse(File.ReadAllText(MarkerFile(id)))!.AsObject();
+            var stageId = marker["StageId"]!.GetValue<Guid>();
+            return Path.Combine(JournalDirectory, $"{stageId:N}.retired");
+        }
         public void Dispose() => Directory.Delete(Root, recursive: true);
     }
 }

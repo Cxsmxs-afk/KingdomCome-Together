@@ -5,7 +5,7 @@ description: "Projektkarte für „Kingdom Come: Together“ (KCD2-Koop-Mod). Zu
 
 # kct-kontext — Was das Projekt ist, wie es gebaut ist, wo was liegt
 
-Stand: H19 auf dem H20-Commit `67cb67b`, Version `0.65.2` (`VERSION`), Protokoll `Protocol.Version = 10` (`dotnet/KcdMp.Protocol/Protocol.cs:800`). **Vor jeder Nutzung am aktuellen Tip nachprüfen.** Warum: Die Kette ist gestapelt, Zeilen wandern.
+Stand: H19 auf dem H20-Commit `df301015`, Version `0.65.2` (`VERSION`), Protokoll `Protocol.Version = 10` (`dotnet/KcdMp.Protocol/Protocol.cs:800`). **Vor jeder Nutzung am aktuellen Tip nachprüfen.** Warum: Die Kette ist gestapelt, Zeilen wandern.
 
 ## So nutzt du diese Karte
 1. Thema in der Tabelle „Thema → lesen“ suchen und **alle** genannten Dateien gründlich lesen, inklusive Aufrufer und Tests. Warum: passgenauer Code entsteht nur aus dem echten Kontext. Die Karte zeigt, wo du anfangen musst, sie ersetzt das Lesen nicht.
@@ -46,7 +46,7 @@ Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op 
 5. Der Bootstrap verlangt die Join-ID im Umschlag sowie die tatsächliche Sende-Epoche im Token und prüft sie gegen den bestätigten Host, die Relay-Verbindung und den aktiven Versuch. Bei der ersten Annahme zählt er `clock_in` und quittiert. Wiederholungen erhalten erneut eine Quittung. Gelesener Host-Verlust und Abbruch sperren diesen Ladevorgang. Vor dem Latch bestätigt der Agent die native Offer-Generation und bindet die Ladefreigabe an dieselbe DLL-Pipe. [Kalender](../../../dotnet/KcdMp.Client/GameBridge.HostCalendar.cs)
 6. Welt empfangen, verifizieren und platzieren (`playlineN/mpworld<joinId>.whs`), `_retainedJoinWorlds.Keep` (`GameBridge.Wo124.cs:739`).
 7. `PrepareHostCalendarAsync` wartet auf den passenden Snapshot und auf Abbruch oder Verbindungsende. Der native Latch wird vor dem Ladebefehl gesetzt und nach `Gameplay started` geprüft. Die Quittung des Kalenderempfangs ist vom späteren JoinerReady getrennt. [Abnahme](../../../docs/ABNAHME-H20.md)
-8. Abbruch: `AbortJoinerJoinAsync` beendet den Versuch und gibt seinen Dateilease unter demselben Lock wie Platzierung und Ladefreigabe frei. Das Journal verlangt bei der Löschung die exakte Datei und SHA-256. Eine ausstehende Ladeanforderung verlangt vor der Löschung einen Spielnachweis. Die Startbereinigung beschränkt sich auf zugeordnete temporäre Dateien ohne möglichen Ladeauftrag. [H19-Abnahme](../../../docs/ABNAHME-H19.md)
+8. Abbruch: `AbortJoinerJoinAsync` beendet den Versuch und gibt seinen Dateilease unter demselben Lock wie Platzierung und Ladefreigabe frei. Das Journal reserviert einen privaten Stage und prüft Dateiidentität und SHA-256 nach der Verschiebung in die Quarantäne. Eine ausstehende Ladeanforderung verlangt einen zur Datei und Spielinstanz passenden terminalen Engine-Nachweis. Die Startbereinigung beschränkt sich auf zugeordnete temporäre Dateien ohne möglichen Ladeauftrag. [H19-Abnahme](../../../docs/ABNAHME-H19.md)
 
 **WorldSync / Ladesequenz:** Phasen `Menu, Offer, Load, Reconstruct, Settle, Play, Exit` (`WorldLoadSequence.cs:4`). Bei aktivem WorldSync und außerhalb der Baseline-Anwendung ist `WorldSyncReady` im Menü falsch. `WorldSyncCurrent` schließt die Phasen `Menu`/`Exit` aus (`GameBridge.WorldSync.cs:35–43`). Alles, was vor dem Laden nötig ist, darf deshalb nicht hinter diesem Gate hängen.
 
