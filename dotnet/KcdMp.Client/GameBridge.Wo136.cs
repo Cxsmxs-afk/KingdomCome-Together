@@ -384,10 +384,10 @@ public partial class GameBridge
     /// preset's pieces (not inventory items). The engine's own way off: the empty
     /// preset; the target outfit is then applied over it.
     /// </summary>
-    private async Task Wo136ClearPresetAsync(byte ghostId, string why)
+    private async Task Wo136ClearPresetAsync(byte ghostId, string why, FigureOutfitStamp stamp)
     {
         Interlocked.Increment(ref _w136PresetClears);
-        await ExecLuaAsync($"if KCD2MP_W136ClearPreset then KCD2MP_W136ClearPreset(\"{ghostId}\", \"{why}\") end");
+        await ExecLuaAsync($"if KCD2MP_W136ClearPreset then KCD2MP_W136ClearPreset(\"{ghostId}\", \"{why}\", {stamp.LuaArguments}) end");
     }
 
     /// <summary>A refused class, named from the item table where it can be (the belt case).</summary>

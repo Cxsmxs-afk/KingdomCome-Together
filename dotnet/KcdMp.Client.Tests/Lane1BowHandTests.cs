@@ -289,7 +289,8 @@ public sealed class Lane1BowHandTests
                 await ReceiveFigureHandAsync(bridge, "v1|0|-");
                 await ReceiveFigureHandAsync(bridge, "v1|0|-");
                 string command = Assert.Single(game.Requests.Where(request => request.Contains($"KCD2MP_W214FigureHand(\"{Peer}\", false, \"-\"", StringComparison.Ordinal)));
-                Assert.Contains($"KCD2MP_GhostCombat(\"{Peer}\",{Protocol.CombatEventWeaponSheathed})", command.Replace(" ", ""));
+                Assert.DoesNotContain("KCD2MP_GhostCombat", command); // Lua holsters only after the scoped hand passes its check.
+                Assert.Contains("\"0000000000000002\"", command);
                 break;
         }
 
@@ -332,7 +333,7 @@ public sealed class Lane1BowHandTests
         Assert.Contains(game.Requests, request => request.Contains($"kcd2mp_{Peer}/EquipmentManager/EquippedArmorsByClassId", StringComparison.Ordinal));
         Assert.Contains(game.Requests, request => request.Contains($"kcd2mp_{Peer}/EquipmentManager/EquippedWeaponsByClassId", StringComparison.Ordinal));
         string equip = Assert.Single(game.Requests.Where(request => request.Contains("KCD2MP_W144Equip(", StringComparison.Ordinal)));
-        Assert.Contains($"KCD2MP_W144Equip(\"kcd2mp_{Peer}\",\"{Bow:D}\")", equip);
+        Assert.Contains($"KCD2MP_W144Equip(\"kcd2mp_{Peer}\",\"{Bow:D}\",", equip);
         Assert.DoesNotContain(Sword.ToString("D"), equip);
     }
 
@@ -409,15 +410,20 @@ public sealed class Lane1BowHandTests
         var bridge = await CreateHostAsync(link);
         Field("_transport").SetValue(bridge, transport);
         string ghost = Peer.ToString();
-        ((ConcurrentDictionary<string, uint>)Field("_ghostEntityIds").GetValue(bridge)!)[ghost] = 222;
+        Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE");
+        Assert.Equal(222u, ((ConcurrentDictionary<string, uint>)Field("_ghostEntityIds").GetValue(bridge)!)[ghost]);
+        Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE 012345");
         await ReceiveFigureHandAsync(bridge, $"v1|1|{Bow:D}");
         Assert.Equal(Bow, Assert.Single((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!));
+        Assert.Contains("\"000000DE\",\"0000000000000001\",\"012345\"", Assert.Single(game.Requests));
 
-        Call(bridge, "BumpGhostGeneration", ghost, "fixture rejoin");
+        Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE 012346");
 
         Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
         await (Task)Call(bridge, "Wo214PreDrawAsync", Peer, CancellationToken.None)!;
         Assert.Single(game.Requests);
+        await ReceiveFigureHandAsync(bridge, $"v1|1|{Sword:D}");
+        Assert.Contains("\"000000DE\",\"0000000000000002\",\"012346\"", game.Requests.Last());
     }
 
     [Fact]

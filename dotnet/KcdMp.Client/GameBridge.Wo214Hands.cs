@@ -22,7 +22,12 @@ public partial class GameBridge
     private const string BowHandEmptyCounter = "bow_hand_empty_while_drawn";
     // Retry at the former WO-214 hand cadence, after Lua's draw/holster checks can finish.
     private const int Wo214GameRequestIntervalMs = 10_000;
-    private readonly record struct FigureBody(uint Entity, int Generation);
+    private readonly record struct FigureBody(uint Entity, int Generation, uint LuaBirth);
+    private readonly record struct FigureOutfitStamp(FigureBody Body, long HandRevision)
+    {
+        public string LuaArguments => FormattableString.Invariant($"\"{Body.Entity:X8}\",\"{HandRevision:X16}\",\"{Body.LuaBirth:X6}\"");
+    }
+    private readonly ConcurrentDictionary<string, (uint Entity, uint Birth)> _w214FigureBirths = new();
     private sealed record FigureHand(bool Drawn, Guid? Cls, long AtMs, long ChangedAtMs, long RequestedAtMs,
         P6Context Context, long PeerSerial, FigureBody Body, long Revision, long? RangedMode = null);
     private sealed record OwnBow(P6Context Context, long Mode, BowHandProof Proof);
@@ -315,7 +320,31 @@ public partial class GameBridge
     private FigureBody Wo214FigureBody(byte src)
     {
         string id = src.ToString(CultureInfo.InvariantCulture);
-        return new(_ghostEntityIds.GetValueOrDefault(id), GhostGeneration(id));
+        uint entity = _ghostEntityIds.GetValueOrDefault(id);
+        var birth = _w214FigureBirths.GetValueOrDefault(id);
+        return new(entity, GhostGeneration(id), birth.Entity == entity ? birth.Birth : 0);
+    }
+
+    private bool Wo214NoteFigureBirth(string id, uint entity, uint birth)
+    {
+        if (birth == 0) return false;    // the legacy two-field report has no incarnation
+        var previous = _w214FigureBirths.GetValueOrDefault(id);
+        _w214FigureBirths[id] = (entity, birth);
+        return previous.Entity == entity && previous.Birth != 0 && previous.Birth != birth;
+    }
+
+    private FigureOutfitStamp Wo214OutfitStamp(byte src)
+    {
+        var body = Wo214FigureBody(src);
+        return new(body, _w214FigureHand.TryGetValue(src, out var hand) && hand.Body == body &&
+            Wo214HandCurrent(src, hand) ? hand.Revision : 0);
+    }
+
+    private bool Wo214OutfitCurrent(byte src, FigureOutfitStamp stamp)
+    {
+        if (Wo214OutfitStamp(src) == stamp) return true;
+        Console.WriteLine($"[appearance] ghost {src}: outfit superseded by a new body or hand");
+        return false;
     }
 
     private bool Wo214HandCurrent(byte src, FigureHand hand) =>
@@ -389,10 +418,9 @@ public partial class GameBridge
         if (hand.Drawn && hand.Cls is Guid gc && _swingCatalog.IsCompletedSuccessfully && _swingCatalog.Result is { } cat)
             oversized = cat.OversizedItemOf([gc]) is not null;
         Console.WriteLine($"WO214-HAND figure kcd2mp_{src} told drawn={(hand.Drawn ? 1 : 0)} cls={c}{(oversized ? " (oversized)" : "")}");
-        string sheathe = hand.Drawn ? "" :
-            $"if KCD2MP_GhostCombat then KCD2MP_GhostCombat(\"{src}\",{Protocol.CombatEventWeaponSheathed}) end; ";
-        return _transport.ExecuteNowAsync(sheathe +
-            $"if KCD2MP_W214FigureHand then KCD2MP_W214FigureHand(\"{src}\", {(hand.Drawn ? "true" : "false")}, \"{c}\", {(oversized ? "true" : "false")}) end", ct);
+        var stamp = new FigureOutfitStamp(hand.Body, hand.Revision);
+        return _transport.ExecuteNowAsync(
+            $"if KCD2MP_W214FigureHand then KCD2MP_W214FigureHand(\"{src}\", {(hand.Drawn ? "true" : "false")}, \"{c}\", {(oversized ? "true" : "false")}, {stamp.LuaArguments}) end", ct);
     }
 
     /// <summary>The mod's verdict on one figure ("w214_figure_hand": "&lt;id&gt; &lt;ok|fixed|failed&gt; &lt;how&gt;").</summary>
@@ -433,14 +461,16 @@ public partial class GameBridge
     {
         if (!W214On("figure_hands") || !_w214LastHeld.TryGetValue(ghostId, out var held) || held.Cls is not Guid cls ||
             !Wo214HandCurrent(ghostId, held)) return;
+        var stamp = Wo214OutfitStamp(ghostId);
         var beforeRead = _w214FigureHand.GetValueOrDefault(ghostId);
         string soul = $"kcd2mp_{ghostId}";
         var actual = await ReadGhostSetAsync(soul, ct);
         if (actual is null || actual.Contains(cls) || !W214On("figure_hands") ||
             !ReferenceEquals(_w214LastHeld.GetValueOrDefault(ghostId), held) ||
             !Wo214SameHandState(_w214FigureHand.GetValueOrDefault(ghostId), beforeRead) ||
+            Wo214OutfitStamp(ghostId) != stamp ||
             !Wo214HandCurrent(ghostId, held)) return;
-        try { await Wo144EquipOnGhostAsync(soul, cls, true, ct); }
+        try { await Wo144EquipOnGhostAsync(soul, cls, true, stamp, ct); }
         catch (Exception ex) { Console.WriteLine($"WO214-HAND figure {soul}: its partner's weapon {cls:D} was not put back before his draw ({ex.Message})"); return; }
         long k = Interlocked.Increment(ref _w214PreDraw);
         if (k <= 200 || k % 50 == 0)

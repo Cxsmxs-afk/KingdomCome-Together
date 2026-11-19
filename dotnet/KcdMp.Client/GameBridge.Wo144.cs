@@ -237,10 +237,17 @@ public partial class GameBridge
     /// came off when the avatar walked crouched (the whole outfit in one frame, observed); the mod
     /// equips an item of that class from the avatar's own inventory (made once if it has none).
     /// </summary>
-    private Task Wo144EquipOnGhostAsync(string soulName, Guid cls, bool createIfMissing, CancellationToken ct) =>
-        _w144Dress
-            ? _transport.ExecuteNowAsync($"if KCD2MP_W144Equip then KCD2MP_W144Equip(\"{soulName}\",\"{cls}\") end", ct)
+    private bool Wo144UseInventoryEquip => _w144Dress || W214On("figure_hands");
+
+    private Task Wo144EquipOnGhostAsync(string soulName, Guid cls, bool createIfMissing, FigureOutfitStamp stamp, CancellationToken ct) =>
+        Wo144UseInventoryEquip
+            ? _transport.ExecuteNowAsync($"if KCD2MP_W144Equip then KCD2MP_W144Equip(\"{soulName}\",\"{cls}\",{stamp.LuaArguments}) end", ct)
             : _transport.EquipItemOnGhostAsync(soulName, cls, createIfMissing, ct);
+
+    private Task Wo144UnequipOnGhostAsync(string soulName, Guid cls, FigureOutfitStamp stamp, CancellationToken ct) =>
+        Wo144UseInventoryEquip
+            ? _transport.ExecuteNowAsync($"if KCD2MP_W144Unequip then KCD2MP_W144Unequip(\"{soulName}\",\"{cls}\",{stamp.LuaArguments}) end", ct)
+            : _transport.UnequipItemOnGhostAsync(soulName, cls, ct);
 
     /// <summary>An outfit (or a read of what the avatar wears) without its lights: the torch sync owns those.</summary>
     private HashSet<Guid> Wo144WithoutLights(IEnumerable<Guid> classes) =>
@@ -255,7 +262,7 @@ public partial class GameBridge
         switch (f[0])
         {
             case "dress":
-                if (_w144Dress != on) Console.WriteLine($"MP-W144 mp_avatar_dress {f[1]} -- {(on ? "avatars wear pieces from their own inventory" : "avatars are dressed through REST EquipItem (0.42.0)")}");
+                if (_w144Dress != on) Console.WriteLine($"MP-W144 mp_avatar_dress {f[1]} -- {(on ? "avatars wear pieces from their own inventory" : "REST EquipItem requires figure_hands off")}");
                 _w144Dress = on;
                 break;
             case "lights":

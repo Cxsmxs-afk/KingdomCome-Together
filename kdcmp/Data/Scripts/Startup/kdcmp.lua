@@ -7932,9 +7932,14 @@ end
 -- sync); the agent clears again if an unremovable piece ever shows up.
 --   WO136-OUTFIT clear id=<n> why=<w> ok=<pcall>
 KCD2MP.w136.PRESET_BARE = "dc000004-0000-0000-0000-000000000000"
-function KCD2MP_W136ClearPreset(id, why)
+function KCD2MP_W136ClearPreset(id, why, body, revision, birth)
     local g = KCD2MP.ghosts and KCD2MP.ghosts[tostring(id)]
     local e = g and g.entity
+    if body then
+        e = KCD2MP_W214OutfitEntity(id, body, revision, birth)
+        if not e then return false end
+        if KCD2MP_W214On("figure_hands") and not KCD2MP_W214OutfitHandsClear(id, e) then return false end
+    end
     if not (e and e.actor) then mp_log("WO136-OUTFIT clear id=" .. tostring(id) .. " -- no avatar"); return false end
     local ok, err = pcall(function() e.actor:EquipClothingPreset(KCD2MP.w136.PRESET_BARE) end)
     mp_log(string.format("WO136-OUTFIT clear id=%s why=%s ok=%s%s -- the spawn preset is off; only the partner's own items are worn",
@@ -11565,6 +11570,24 @@ function KCD2MP_RemoveStaleGhostsForPlayer(identity, keepId)
     return #doomed
 end
 
+function KCD2MP_W214ReportGhostId(id, reattach, expectedEntity)
+    id = tostring(id)
+    local g = KCD2MP.ghosts[id]
+    if not (g and g.entity) then return false end
+    local hexid = string.match(tostring(g.entity.id), "(%x+)%s*$")
+    if not hexid then return false end
+    if expectedEntity and hexid:upper():gsub("^0+", "") ~= expectedEntity:gsub("^0+", "") then return false end
+    if reattach or not g.outfitBirth then
+        -- The token also changes when an Agent attaches to an existing ghost.
+        KCD2MP_W214GhostBirth = (KCD2MP_W214GhostBirth or 0) % 0xFFFFFF + 1
+        g.outfitBirth = string.format("%06X", KCD2MP_W214GhostBirth)
+        g.w214HandRevision, g.w214HandClass = nil, nil
+        if W214 and W214.hand then W214.hand.gen[id] = (W214.hand.gen[id] or 0) + 1 end
+    end
+    KCD2MP_EmitEvent("ghostid", id .. " " .. hexid .. " " .. g.outfitBirth)
+    return true
+end
+
 function KCD2MP_SpawnGhost(id, x, y, z, rotZ)
     if KCD2MP.ghosts[id] then
         KCD2MP_RemoveGhost(id)
@@ -11944,10 +11967,7 @@ function KCD2MP_SpawnGhost(id, x, y, z, rotZ)
     -- above 2^24 (WO-20/WO-40). Re-emitted naturally on every respawn because
     -- all spawns funnel through here, so the agent's cache self-heals after
     -- a save reload rebuilds the ghost bodies.
-    local hexid = string.match(tostring(entity.id), "(%x+)%s*$")
-    if hexid then
-        KCD2MP_EmitEvent("ghostid", tostring(id) .. " " .. hexid)
-    else
+    if not KCD2MP_W214ReportGhostId(id, false) then
         mp_log("SpawnGhost: could not extract entity id hex from " .. tostring(entity.id)
                .. " -- native swings unavailable for ghost " .. tostring(id))
     end
@@ -19710,10 +19730,16 @@ KCD2MP.w144.LIGHTS = {
 KCD2MP.w144.lightStats = KCD2MP.w144.lightStats or { took = 0, holstered = 0, dressed = 0, made = 0, dressFail = 0 }
 KCD2MP.w144.lightLogged = KCD2MP.w144.lightLogged or {}
 
-function KCD2MP_W144Equip(name, cls)
+function KCD2MP_W144Equip(name, cls, body, revision, birth)
     local w = KCD2MP.w144
     name, cls = tostring(name), tostring(cls)
-    local e = System.GetEntityByName(name)
+    local e
+    if body then
+        e = KCD2MP_W214OutfitEntity(name:match("^kcd2mp_(%d+)$"), body, revision, birth)
+        if not e then return false end
+    else
+        e = System.GetEntityByName(name)
+    end
     if not (e and e.inventory and e.actor) then mp_log("WO144-DRESS " .. name .. " " .. cls .. " -- no avatar"); return false end
     if w.lights and w.LIGHTS[cls] then return false end   -- a light is the torch sync's, never an outfit piece
     local it, how = nil, "own"
@@ -19733,6 +19759,16 @@ function KCD2MP_W144Equip(name, cls)
     if ok then w.lightStats.dressed = w.lightStats.dressed + 1 else w.lightStats.dressFail = w.lightStats.dressFail + 1 end
     mp_log(string.format("WO144-DRESS %s %s -> %s (%s) ok=%s", name, cls, tostring(it), how, tostring(ok)))
     return ok
+end
+
+function KCD2MP_W144Unequip(name, cls, body, revision, birth)
+    local id = tostring(name):match("^kcd2mp_(%d+)$")
+    local e = KCD2MP_W214OutfitEntity(id, body, revision, birth)
+    if not (e and e.inventory and e.actor) then return false end
+    local ok, item = pcall(function() return e.inventory:FindItem(cls) end)
+    if not ok or not item then return false end
+    if KCD2MP_W214On("figure_hands") and not KCD2MP_W214OutfitHandsClear(id, e, item, cls) then return false end
+    return pcall(function() e.actor:UnequipInventoryItem(item) end)
 end
 
 -- The agent asks which soul is the live avatar's: its entity GUID's four 16-bit parts, as the last
@@ -19874,7 +19910,7 @@ function KCD2MP_W144Set(key, arg)
     if v == "bad" then mp_log(cmd .. ": expected on|off, got '" .. tostring(arg) .. "'"); return false end
     if v ~= nil then w[key] = v end
     mp_log(string.format("WO144-SWITCH %s %s -- %s", cmd, w[key] and "on" or "off",
-        key == "dress" and (w[key] and "avatars wear pieces from their own inventory" or "avatars are dressed through REST EquipItem (0.42.0)")
+        key == "dress" and (w[key] and "avatars wear pieces from their own inventory" or "REST EquipItem requires figure_hands off")
                         or (w[key] and "an avatar holds a light only while its player does" or "avatars keep their own lights (0.42.0)")))
     KCD2MP_EmitEvent("w144", key .. " " .. (w[key] and "on" or "off"))
     return true
@@ -31209,7 +31245,7 @@ local ok, err = pcall(function()
     System.AddCCommand("mp_hit_knockdown", 'KCD2MP_W155SetHitKnockdown(%line)', "WO-155: a blow of an NPC or an animal knocks a player down (0.45.0); off = it only takes health and stamina (default off): mp_hit_knockdown on|off")
     System.AddCCommand("mp_ff_knockdown", 'KCD2MP_W155SetFfKnockdown(%line)', "WO-155: a friendly-fire hit knocks the victim down, never twice within 5 s; off = friendly fire never knocks down (default on): mp_ff_knockdown on|off")
     System.AddCCommand("mp_avatar_herbs", 'KCD2MP_SetAvatarHerbs(%line)', "WO-153/160: the partner's avatar bends and picks with a plain clip while its player gathers herbs (default ON; never the minigame's own fragment, which ended both 0.43.0 joiner crashes; off: the avatar stands): mp_avatar_herbs on|off")
-    System.AddCCommand("mp_avatar_dress", 'KCD2MP_SetAvatarDress(%line)', "WO-144: a partner's avatar wears pieces from its own inventory, equipped through the actor (default on; off = 0.42.0's REST EquipItem): mp_avatar_dress on|off")
+    System.AddCCommand("mp_avatar_dress", 'KCD2MP_SetAvatarDress(%line)', "WO-144: a partner's avatar wears pieces from its own inventory (default on; REST twin requires mp_figure_hands off): mp_avatar_dress on|off")
     System.AddCCommand("mp_show_animals", 'KCD2MP_SetShowAnimals(%line)', "WO-144: a horse or animal the host streams is shown here even where this world keeps it hidden (default on): mp_show_animals on|off")
     System.AddCCommand("mp_avatar_lights", 'KCD2MP_SetAvatarLights(%line)', "WO-144: a partner's avatar holds a light only while its player does -- its own NPC lamps and torches are taken out (default on): mp_avatar_lights on|off")
     System.AddCCommand("mp_activity2_status", "KCD2MP_W143Status()", "WO-143: hands, gaits, one-shots, minigames, looks (WO143-STATUS here, MP-W143 stats and the DLL's line in agent.log)")
@@ -34819,11 +34855,11 @@ do
 
     -- VI outfit_atomic: the partner's new pieces all go on in this one call (one frame), each through WO-144's own inventory equip;
     -- the agent takes off what is left over only after it. "cls1,cls2,..." in layer order (under-layers first).
-    function KCD2MP_W202EquipAll(name, list)
+    function KCD2MP_W202EquipAll(name, list, body, revision, birth)
         local n, ok = 0, 0
         for cls in string.gmatch(tostring(list or ""), "[^,]+") do
             n = n + 1
-            if KCD2MP_W144Equip(name, cls) then ok = ok + 1 end
+            if KCD2MP_W144Equip(name, cls, body, revision, birth) then ok = ok + 1 end
         end
         mp_log(string.format("WO202-OUTFIT %s: %d of %d piece(s) on in one frame (the old ones come off after)", tostring(name), ok, n))
         return ok
@@ -36442,6 +36478,49 @@ do
     --   WO214-HAND figure=<id> want=<class|-> held=<class|-> -> ok|fixed|failed <how> (<ms> ms)
     W214.hand = W214.hand or { sentDrawn = nil, sentCls = nil, sentAt = -1e9, drawSince = nil, gen = {}, stats = { sent = 0, ok = 0, fixed = 0, failed = 0 } }
 
+    local function w214BodyMatches(g, body, birth)
+        if not (g and g.entity and g.outfitBirth and g.outfitBirth == birth) then return false end
+        local hex = string.match(tostring(g.entity.id), "(%x+)%s*$")
+        return hex ~= nil and body ~= "00000000"
+            and hex:upper():gsub("^0+", "") == tostring(body):gsub("^0+", "")
+    end
+
+    local function w214OutfitRefused(id, reason)
+        W214.hand.outfitRefused = (W214.hand.outfitRefused or 0) + 1
+        local n = W214.hand.outfitRefused
+        if n <= 12 or n % 128 == 0 then
+            mp_log(string.format("MP-LANE1-BOW outfit refused peer=%s reason=%s n=%d", tostring(id), reason, n))
+        end
+    end
+
+    -- The outfit request may already be in the HTTP or Lua queue when the
+    -- hand changes. Recheck the stamp at the entry to the engine mutation.
+    function KCD2MP_W214OutfitEntity(id, body, revision, birth)
+        local g = KCD2MP.ghosts and KCD2MP.ghosts[tostring(id)]
+        if not w214BodyMatches(g, body, birth) then w214OutfitRefused(id, "old-body"); return nil end
+        if KCD2MP_W214On("figure_hands") and revision ~= (g.w214HandRevision or "0000000000000000") then
+            w214OutfitRefused(id, "old-hand")
+            return nil
+        end
+        return g.entity
+    end
+
+    function KCD2MP_W214OutfitHandsClear(id, e, item, cls)
+        local g = KCD2MP.ghosts[tostring(id)]
+        if g.w214HandClass and (not cls or g.w214HandClass == cls) then
+            w214OutfitRefused(id, "requested-hand")
+            return false
+        end
+        for slot = 0, 1 do
+            local ok, held = pcall(function() return e.human:GetItemInHand(slot) end)
+            if not ok or (held and (not item or held == item or KCD2MP.w136.handClass(e, slot) == cls)) then
+                w214OutfitRefused(id, "occupied-hand")
+                return false
+            end
+        end
+        return true
+    end
+
     function KCD2MP_W214OwnHandTick(now, drawn)
         if not KCD2MP_W214On("figure_hands") then return end
         if not (player and player.human and KCD2MP.w136 and KCD2MP.w136.handClass) then return end
@@ -36466,13 +36545,19 @@ do
     end
 
     -- the partner's hand (the agent: his W203 FigureHand row): his figure <id> here holds <cls> while <drawn>
-    function KCD2MP_W214FigureHand(id, drawn, cls, oversized)
+    function KCD2MP_W214FigureHand(id, drawn, cls, oversized, body, revision, birth)
         if not KCD2MP_W214On("figure_hands") then return false end   -- the twin: today's path (the outfit and DrawWeapon only)
         id = tostring(id); cls = tostring(cls or "-")
         local h = W214.hand
         local g = KCD2MP.ghosts and KCD2MP.ghosts[id]
         local e = g and g.entity
         if not (e and e.human and KCD2MP.w136 and KCD2MP.w136.handClass) then return false end
+        if body then
+            if not w214BodyMatches(g, body, birth) then w214OutfitRefused(id, "hand-old-body"); return false end
+            if g.w214HandRevision and revision < g.w214HandRevision then w214OutfitRefused(id, "hand-old-revision"); return false end
+            g.w214HandRevision = revision
+            g.w214HandClass = drawn and cls ~= "-" and cls or nil
+        end
         local gen = (h.gen[id] or 0) + 1   -- a newer message supersedes a check still running
         h.gen[id] = gen
         local t0 = os.clock()
@@ -36486,6 +36571,7 @@ do
             KCD2MP_EmitEvent("w214_figure_hand", id .. " " .. result .. " " .. how)
         end
         if not drawn then
+            if body and KCD2MP_GhostCombat then KCD2MP_GhostCombat(id, 1) end -- CombatEventWeaponSheathed
             -- the sheathe is the combat event's own (HolsterWeapon); a hand still full 1.5 s later, while sheathed, is put away
             Script.SetTimer(1500, function()
                 if not live() then return end
