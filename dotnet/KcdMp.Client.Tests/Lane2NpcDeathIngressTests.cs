@@ -164,6 +164,26 @@ public sealed class Lane2NpcDeathIngressTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Expired_poll_budget_is_stale_only_when_the_body_scope_was_retired(bool retireBinding)
+    {
+        await using var fixture = await Fixture.OpenAsync();
+        Task ingress = fixture.Ingress("fatal");
+        fixture.AssertBound(await fixture.ReadRequestAsync(), Eid);
+        if (retireBinding) fixture.Retire("eid-reuse");
+
+        // Keep the first real pipe request outstanding. A canceled local
+        // observer must classify its binding without sending another write.
+        var expected = retireBinding ? CombatPipe.NpcDeathReceipt.Stale : CombatPipe.NpcDeathReceipt.Uncertain;
+        Assert.Equal(expected, await fixture.ObserveWithExpiredBudgetAsync());
+        await fixture.ReplyAsync(1, 0x73);
+        await ingress.WaitAsync(fixture.Token);
+        Assert.False(fixture.Dead);
+        await fixture.AssertNoWriteAsync();
+    }
+
+    [Theory]
     [InlineData((byte)0x73)]
     [InlineData((byte)0x71)]
     [InlineData(null)]
@@ -319,6 +339,13 @@ public sealed class Lane2NpcDeathIngressTests
                 if (reason == "peer-reuse")
                     Method("P5PeerAtRead").Invoke(_bridge, [(int)Protocol.Name, new byte[] { Peer }]);
             }
+        }
+
+        public Task<CombatPipe.NpcDeathReceipt> ObserveWithExpiredBudgetAsync()
+        {
+            var attempts = (System.Collections.IDictionary)Field("_npcDeathAttempts").GetValue(_bridge)!;
+            return (Task<CombatPipe.NpcDeathReceipt>)Method("ObserveNpcDeathAsync").Invoke(_bridge,
+                [attempts[_soul], new CancellationToken(canceled: true), CombatPipe.NpcDeathIntent.Advance])!;
         }
 
         public Task Ingress(string route)
