@@ -2,6 +2,14 @@
 #pragma once
 #include <cstdint>
 namespace kcdmp::wo201ranged {
+// A verified empty pointer is idle. A failed guarded read supplies no phase.
+template<class Read, class Resolve>
+uint8_t read_step_phase(Read read, Resolve resolve) {
+    void* step = nullptr;
+    if (!read(&step)) return 255;
+    return step ? resolve(step) : 0;
+}
+
 #ifdef KCDMP_P6_CAPTURE_TEST
 struct TestBackend {
     uint64_t(*now)();uint64_t(*generation)();uint64_t(*epoch)();bool(*gameplay)();
