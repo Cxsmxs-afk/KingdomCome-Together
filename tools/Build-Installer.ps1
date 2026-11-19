@@ -192,7 +192,10 @@ if (-not $SkipPublish) {
     Write-Host "Relay round-trip gate (dotnet\KcdMp.Relay.Tests) ..."
     # Minimum counts from the accepted T5 Windows build (44383488125). Raise the
     # floors when adding tests. Explain any reduction in the package report.
-    Invoke-KcdManagedTests (Join-Path $root "dotnet\KcdMp.Relay.Tests\KcdMp.Relay.Tests.csproj") Relay 288
+    $relayTests = Join-Path $root "dotnet\KcdMp.Relay.Tests\KcdMp.Relay.Tests.csproj"
+    Invoke-KcdManagedTests $relayTests RelayDeathMarkerHandshake 5 `
+        -Filter 'FullyQualifiedName~KcdMp.Relay.Tests.P5DeathMarkerRelayTests.'
+    Invoke-KcdManagedTests $relayTests Relay 288
 
     # WO-102 Phase 7: the agent's unit tests (codecs, cadence stats, the
     # request/resync payloads) and the mod's synthetic authority suite run

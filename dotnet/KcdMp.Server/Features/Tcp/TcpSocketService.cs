@@ -23,6 +23,9 @@ public class TcpSocketService : BackgroundService
 	private readonly TcpBroadcastService _broadcastService;
 	private readonly SessionManager _sessions;
 	private readonly ClientSessionRunner _runner;
+	private readonly TaskCompletionSource<IPEndPoint> _boundEndpoint = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+	public Task<IPEndPoint> BoundEndpoint => _boundEndpoint.Task;
 
 	public TcpSocketService(ILogger logger, IConfiguration configuration,
 		ClientHandler clientHandler, TcpBroadcastService broadcastService,
@@ -54,9 +57,16 @@ public class TcpSocketService : BackgroundService
 	protected override async Task ExecuteAsync(CancellationToken cancellationToken)
 	{
 		var listener = new TcpListener(_bindAddress, _port);
-		listener.Start();
-		_logger.Information("TCP listener bound to {Address}:{Port}.", _bindAddress, _port);
-		_logger.Information("Listening on port {Port}...", _port);
+		try { listener.Start(); }
+		catch (Exception ex)
+		{
+			_boundEndpoint.TrySetException(ex);
+			throw;
+		}
+		var endpoint = (IPEndPoint)listener.LocalEndpoint;
+		_boundEndpoint.TrySetResult(endpoint);
+		_logger.Information("TCP listener bound to {Address}:{Port}.", endpoint.Address, endpoint.Port);
+		_logger.Information("Listening on port {Port}...", endpoint.Port);
 		_logger.Information("Waiting for clients to connect.");
 
 		// Pending invites nobody answers have to expire, or the invitee stays

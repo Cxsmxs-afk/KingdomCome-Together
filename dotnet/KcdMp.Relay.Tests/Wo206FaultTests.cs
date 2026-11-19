@@ -58,37 +58,23 @@ public sealed class FaultRelay : IAsyncDisposable
             r._planPath = Path.Combine(Path.GetTempPath(), $"wo206-plan-{Guid.NewGuid():N}.json");
             File.WriteAllText(r._planPath, planJson);
         }
-        r.App = await RelayPorts.BindAsync(async (tcp, http) =>
+        try
         {
-            r.TcpPort = tcp;
-            var args = new List<string>
-            {
-                "--port", tcp.ToString(),
-                "--Urls", $"http://127.0.0.1:{http}",
-                "--Serilog:WriteTo:1:Name", "Console",
-            };
-            if (option && r._planPath is not null) { args.Add(RelayFaultSwitch.Option); args.Add(r._planPath); }
+            string[] args = option && r._planPath is not null ? [RelayFaultSwitch.Option, r._planPath] : [];
             string? before = Environment.GetEnvironmentVariable(RelayFaultSwitch.EnvVar);
             Environment.SetEnvironmentVariable(RelayFaultSwitch.EnvVar, env ? "1" : null);
             WebApplication app;
-            try { app = Program.CreateApp([.. args]); }
+            try { app = RelayListeners.CreateApp(args); }
             finally { Environment.SetEnvironmentVariable(RelayFaultSwitch.EnvVar, before); }
-            try
-            {
-                await app.StartAsync();
-                return app;
-            }
-            catch
-            {
-                await app.DisposeAsync();
-                throw;
-            }
-        }, async app =>
+            r.TcpPort = (await RelayListeners.StartAsync(app)).Port;
+            r.App = app;
+            return r;
+        }
+        catch
         {
-            try { await app.StopAsync(); }
-            finally { await app.DisposeAsync(); }
-        });
-        return r;
+            if (r._planPath is not null) File.Delete(r._planPath);
+            throw;
+        }
     }
 
     public RelayFaults.RuleState Rule(string name) => Faults!.Rules.Single(x => x.Rule.Name == name);

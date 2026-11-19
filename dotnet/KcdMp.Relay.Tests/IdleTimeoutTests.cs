@@ -2,9 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
-using KcdMp.Server;
 using KcdMp.Wire;
-using Microsoft.AspNetCore.Builder;
 using Xunit;
 
 namespace KcdMp.Relay.Tests;
@@ -28,32 +26,9 @@ public class IdleTimeoutTests
     [Fact]
     public async Task Silent_peer_is_dropped_and_damage_authority_moves_to_the_survivor()
     {
-        int tcpPort = 0;
-        await using var app = await RelayPorts.BindAsync(async (tcp, http) =>
-        {
-            tcpPort = tcp;
-            var created = Program.CreateApp(new[]
-            {
-                "--port", tcp.ToString(),
-                "--Urls", $"http://127.0.0.1:{http}",
-                "--Serilog:WriteTo:1:Name", "Console",
-                "--Tcp:IdleTimeoutMs", "300",
-            });
-            try
-            {
-                await created.StartAsync();
-                return created;
-            }
-            catch
-            {
-                await created.DisposeAsync();
-                throw;
-            }
-        }, async created =>
-        {
-            try { await created.StopAsync(); }
-            finally { await created.DisposeAsync(); }
-        });
+        var relay = RelayListeners.CreateApp("--Tcp:IdleTimeoutMs", "300");
+        int tcpPort = (await RelayListeners.StartAsync(relay)).Port;
+        await using var app = relay;
 
         var a = await Peer.ConnectAsync(tcpPort, "alpha");
         var b = await Peer.ConnectAsync(tcpPort, "bravo");

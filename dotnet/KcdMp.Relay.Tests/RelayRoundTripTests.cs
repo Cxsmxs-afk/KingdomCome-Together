@@ -9,6 +9,7 @@ using System.Text;
 using KcdMp.Client;
 using KcdMp.Server;
 using KcdMp.Server.Features.ClientHandling;
+using KcdMp.Server.Features.Tcp;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -43,6 +44,8 @@ namespace KcdMp.Relay.Tests;
 /// <summary>One real relay, started once per test class, on free loopback ports.</summary>
 public sealed class RelayFixture : IAsyncLifetime
 {
+    private static int _nextFixture;
+    private readonly string _fixtureId = $"relay-{Interlocked.Increment(ref _nextFixture)}";
     public int TcpPort { get; private set; }
     private WebApplication? _app;
 
@@ -51,123 +54,68 @@ public sealed class RelayFixture : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        _app = await RelayPorts.BindAsync(async (tcp, http) =>
+        var app = RelayListeners.CreateApp();
+        var bound = await RelayListeners.StartAsync(app);
+        _app = app;
+        TcpPort = bound.Port;
+        try
         {
-            TcpPort = tcp;
-            var app = Program.CreateApp(new[]
+            var (probe, type, body) = await Peer.ConnectRawAsync(TcpPort, "fixture-probe", Protocol.ConnectionTestRelease,
+                Protocol.Version, _fixtureId);
+            await using (probe)
             {
-                "--port", tcp.ToString(),
-                "--Urls", $"http://127.0.0.1:{http}",
-                // Keep the relay's rolling file sink out of the test tree.
-                "--Serilog:WriteTo:1:Name", "Console",
-            });
-            try
-            {
-                await app.StartAsync();
-                return app;
+                Assert.True(type == Protocol.ReleaseVersionMismatch, probe.HandshakeFrame(type, body.Length));
+                var ready = ConnectionTestReply.Decode(body);
+                Assert.True(ready.Release == ReleaseVersionInfo.Wire && ready.Ready == 0 && !ready.HostConnected && ready.HasDetail,
+                    probe.HandshakeFrame(type, body.Length));
+                Console.WriteLine(probe.HandshakeFrame(type, body.Length));
             }
-            catch
-            {
-                await app.DisposeAsync();
-                throw;
-            }
-        }, StopAsync);
+        }
+        catch
+        {
+            await DisposeAsync();
+            throw;
+        }
     }
 
-    private static async Task StopAsync(WebApplication app)
-    {
-        try { await app.StopAsync(); }
-        finally { await app.DisposeAsync(); }
-    }
+    public Task<Peer> ConnectAsync(string name) => Peer.ConnectAsync(TcpPort, name, _fixtureId);
 
     public async Task DisposeAsync()
     {
-        if (_app is null) return;
-        await _app.StopAsync();
-        await _app.DisposeAsync();
+        var app = Interlocked.Exchange(ref _app, null);
+        if (app is null) return;
+        try { await app.StopAsync(); }
+        finally { await app.DisposeAsync(); }
     }
-
 }
 
-/// <summary>
-/// One process-wide bind for every in-process relay. <see cref="TcpListener.Start"/>
-/// sets <c>SO_REUSEADDR</c>, so two fixtures that sample the same free port can both
-/// bind it. A later handshake then reads EOF when the other listener closes.
-/// PR 44447771182 failed all five <c>P5DeathMarkerRelayTests</c> that way on the same
-/// tree that push run 44447734044 passed. The gate covers port selection through the
-/// first accepted connection; an address conflict retries, any other failure stops
-/// the app it started.
-/// </summary>
-internal static class RelayPorts
+/// <summary>Keep port selection and ownership in the real TCP and HTTP listeners.</summary>
+internal static class RelayListeners
 {
-    private static readonly SemaphoreSlim Gate = new(1, 1);
+    internal static WebApplication CreateApp(params string[] options) => Program.CreateApp([
+        "--port", "0",
+        "--Tcp:BindAddress", "127.0.0.1",
+        "--Urls", "http://127.0.0.1:0",
+        "--Serilog:WriteTo:1:Name", "Console",
+        .. options
+    ]);
 
-    internal static async Task<T> BindAsync<T>(Func<int, int, Task<T>> start, Func<T, Task> stop) where T : class
+    internal static async Task<IPEndPoint> StartAsync(WebApplication app)
     {
-        await Gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            Exception? last = null;
-            for (int attempt = 0; attempt < 8; attempt++)
-            {
-                int tcp = FreePort();
-                int http = FreePort();
-                T? running = null;
-                try
-                {
-                    running = await start(tcp, http).ConfigureAwait(false);
-                    await WaitForAcceptAsync(tcp).ConfigureAwait(false);
-                    return running;
-                }
-                catch (Exception ex)
-                {
-                    if (running is not null)
-                    {
-                        try { await stop(running).ConfigureAwait(false); }
-                        catch { /* the next attempt still has to be able to bind */ }
-                    }
-                    if (attempt == 7 || !IsAddressInUse(ex)) throw;
-                    last = ex;
-                }
-            }
-            throw new IOException("the relay did not bind a private loopback port", last);
+            await app.StartAsync();
+            var listener = app.Services.GetServices<IHostedService>().OfType<TcpSocketService>().Single();
+            var endpoint = await listener.BoundEndpoint.WaitAsync(TimeSpan.FromSeconds(10));
+            if (endpoint.Port <= 0 || !IPAddress.Loopback.Equals(endpoint.Address))
+                throw new InvalidOperationException("The test relay did not bind a TCP loopback endpoint.");
+            return endpoint;
         }
-        finally { Gate.Release(); }
-    }
-
-    private static async Task WaitForAcceptAsync(int port)
-    {
-        var deadline = DateTime.UtcNow.AddSeconds(10);
-        while (true)
+        catch
         {
-            try
-            {
-                using var probe = new TcpClient();
-                await probe.ConnectAsync(IPAddress.Loopback, port).ConfigureAwait(false);
-                return;
-            }
-            catch (SocketException) when (DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(50).ConfigureAwait(false);
-            }
+            await app.DisposeAsync();
+            throw;
         }
-    }
-
-    private static bool IsAddressInUse(Exception ex)
-    {
-        for (Exception? cursor = ex; cursor is not null; cursor = cursor.InnerException)
-            if (cursor is SocketException socket && socket.SocketErrorCode == SocketError.AddressAlreadyInUse)
-                return true;
-        return false;
-    }
-
-    private static int FreePort()
-    {
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
     }
 }
 
@@ -178,58 +126,67 @@ internal static class RelayPorts
 public sealed class Peer : IAsyncDisposable
 {
     private readonly TcpClient _tcp = new();
+    private readonly string _fixture;
     private NetworkStream _stream = null!;
+    private IPEndPoint _listener;
     public byte Id { get; private set; }
+
+    private Peer(int port, string fixture)
+    {
+        _fixture = fixture;
+        _listener = new IPEndPoint(IPAddress.Loopback, port);
+    }
 
     /// <summary>
     /// WO-110 R9/R15: the handshake with an arbitrary release string and name,
     /// returning the relay's FIRST reply (Ack, VersionMismatch, ServerFull or
     /// ReleaseVersionMismatch) instead of asserting it is an Ack.
     /// </summary>
-    public static async Task<(Peer Peer, byte Type, byte[] Payload)> ConnectRawAsync(int port, string name, string release, byte protocol)
+    public static async Task<(Peer Peer, byte Type, byte[] Payload)> ConnectRawAsync(int port, string name, string release, byte protocol,
+        string fixture = "unassigned")
     {
-        var p = new Peer();
-        await p._tcp.ConnectAsync(IPAddress.Loopback, port);
-        p._stream = p._tcp.GetStream();
-        var nameBytes = Encoding.UTF8.GetBytes(name);
-        var rel = Encoding.UTF8.GetBytes(release);
-        int len = 2 + nameBytes.Length + rel.Length;
-        var hs = new byte[3 + len];
-        hs[0] = Protocol.Handshake;
-        BinaryPrimitives.WriteUInt16LittleEndian(hs.AsSpan(1), (ushort)len);
-        hs[3] = protocol;
-        hs[4] = (byte)nameBytes.Length;
-        nameBytes.CopyTo(hs, 5);
-        rel.CopyTo(hs, 5 + nameBytes.Length);
-        await p._stream.WriteAsync(hs);
-        var (type, payload) = await p.ReadPacketAsync(TimeSpan.FromSeconds(5));
-        if (type == Protocol.Ack) p.Id = payload[0];
-        return (p, type, payload);
+        var peer = new Peer(port, fixture);
+        try
+        {
+            await peer._tcp.ConnectAsync(IPAddress.Loopback, port);
+            var remote = (IPEndPoint)peer._tcp.Client.RemoteEndPoint!;
+            peer._listener = remote.Address.IsIPv4MappedToIPv6 ? new IPEndPoint(remote.Address.MapToIPv4(), remote.Port) : remote;
+            peer._stream = peer._tcp.GetStream();
+            var nameBytes = Encoding.UTF8.GetBytes(name);
+            var rel = Encoding.UTF8.GetBytes(release);
+            int len = 2 + nameBytes.Length + rel.Length;
+            var hs = new byte[3 + len];
+            hs[0] = Protocol.Handshake;
+            BinaryPrimitives.WriteUInt16LittleEndian(hs.AsSpan(1), (ushort)len);
+            hs[3] = protocol;
+            hs[4] = (byte)nameBytes.Length;
+            nameBytes.CopyTo(hs, 5);
+            rel.CopyTo(hs, 5 + nameBytes.Length);
+            await peer._stream.WriteAsync(hs);
+            var (type, payload) = await peer.ReadPacketAsync(TimeSpan.FromSeconds(5), handshake: true);
+            if (type == Protocol.Ack)
+            {
+                Assert.True(payload.Length == 1, peer.HandshakeFrame(type, payload.Length));
+                peer.Id = payload[0];
+            }
+            return (peer, type, payload);
+        }
+        catch
+        {
+            await peer.DisposeAsync();
+            throw;
+        }
     }
 
-    public static async Task<Peer> ConnectAsync(int port, string name)
+    public static async Task<Peer> ConnectAsync(int port, string name, string fixture = "unassigned")
     {
-        var p = new Peer();
-        await p._tcp.ConnectAsync(IPAddress.Loopback, port);
-        p._stream = p._tcp.GetStream();
-
-        var nameBytes = Encoding.UTF8.GetBytes(name);
-        var rel = Encoding.UTF8.GetBytes(ReleaseVersionInfo.Wire);
-        int len = 2 + nameBytes.Length + rel.Length;
-        var hs = new byte[3 + len];
-        hs[0] = Protocol.Handshake;
-        BinaryPrimitives.WriteUInt16LittleEndian(hs.AsSpan(1), (ushort)len);
-        hs[3] = Protocol.Version;
-        hs[4] = (byte)nameBytes.Length;
-        nameBytes.CopyTo(hs, 5);
-        rel.CopyTo(hs, 5 + nameBytes.Length);
-        await p._stream.WriteAsync(hs);
-
-        var (type, payload) = await p.ReadPacketAsync(TimeSpan.FromSeconds(5));
-        Assert.Equal(Protocol.Ack, type);
-        p.Id = payload[0];
-        return p;
+        var (peer, type, payload) = await ConnectRawAsync(port, name, ReleaseVersionInfo.Wire, Protocol.Version, fixture);
+        if (type == Protocol.Ack) return peer;
+        await peer.DisposeAsync();
+        throw new InvalidDataException(peer.HandshakeFrame(type, payload.Length));
     }
+
+    internal string HandshakeFrame(byte type, int length) => DescribeRead("body", type, length, length, "none");
 
     public async Task SendRawAsync(byte[] packet)
     {
@@ -238,14 +195,16 @@ public sealed class Peer : IAsyncDisposable
     }
 
     /// <summary>Reads one framed packet: [type:1][len:2][payload].</summary>
-    public async Task<(byte Type, byte[] Payload)> ReadPacketAsync(TimeSpan timeout)
+    public Task<(byte Type, byte[] Payload)> ReadPacketAsync(TimeSpan timeout) => ReadPacketAsync(timeout, handshake: false);
+
+    private async Task<(byte Type, byte[] Payload)> ReadPacketAsync(TimeSpan timeout, bool handshake)
     {
         using var cts = new CancellationTokenSource(timeout);
         var header = new byte[3];
-        await ReadExactAsync(header, cts.Token);
+        await ReadExactAsync(header, cts.Token, handshake);
         int len = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1));
         var payload = new byte[len];
-        await ReadExactAsync(payload, cts.Token);
+        await ReadExactAsync(payload, cts.Token, handshake, header[0]);
         return (header[0], payload);
     }
 
@@ -273,16 +232,29 @@ public sealed class Peer : IAsyncDisposable
         catch (OperationCanceledException) { return true; }
     }
 
-    private async Task ReadExactAsync(byte[] buf, CancellationToken ct)
+    private async Task ReadExactAsync(byte[] buf, CancellationToken ct, bool handshake, byte? response = null)
     {
         int got = 0;
+        string Report(string close) => DescribeRead(response is null ? "header" : "body", response ?? (got > 0 ? buf[0] : null),
+            response is null ? null : buf.Length, got, close);
         while (got < buf.Length)
         {
-            int n = await _stream.ReadAsync(buf.AsMemory(got), ct);
-            if (n <= 0) throw new EndOfStreamException();
+            int n;
+            try { n = await _stream.ReadAsync(buf.AsMemory(got), ct); }
+            catch (OperationCanceledException) when (handshake) { throw new TimeoutException(Report("read-timeout")); }
+            catch (IOException ex) when (handshake)
+            {
+                string reason = ex.InnerException is SocketException socket ? socket.SocketErrorCode.ToString() : "read-io-error";
+                throw new IOException(Report(reason), ex);
+            }
+            if (n == 0) throw handshake ? new EndOfStreamException(Report("peer-eof")) : new EndOfStreamException();
             got += n;
         }
     }
+
+    private string DescribeRead(string stage, byte? response, int? length, int got, string close) =>
+        $"MP-RELAY-TEST-HANDSHAKE fixture={_fixture} listener={_listener} stage={stage} " +
+        $"reply={(response is byte value ? $"0x{value:X2}" : "unknown")} declared={length?.ToString() ?? "unknown"} received={got} close={close}";
 
     public ValueTask DisposeAsync()
     {

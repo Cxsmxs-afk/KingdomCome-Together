@@ -11,12 +11,15 @@ namespace KcdMp.Relay.Tests;
 // the field's phantom partner was a joiner's leftover connection that stayed
 // until its timeout while the host counted it as a second partner.
 // =============================================================================
-public class Wo144RelayTests : IClassFixture<RelayFixture>
+public class Wo144RelayTests : IAsyncLifetime
 {
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(5);
-    private readonly RelayFixture _relay;
-    public Wo144RelayTests(RelayFixture relay) => _relay = relay;
+    // Disposal closes the local socket before the relay's disconnect broadcast completes.
+    private readonly RelayFixture _relay = new();
     private ClientHandler Clients => _relay.Services.GetRequiredService<ClientHandler>();
+
+    public Task InitializeAsync() => _relay.InitializeAsync();
+    public Task DisposeAsync() => _relay.DisposeAsync();
 
     [Fact]
     public async Task A_second_connection_of_the_same_player_replaces_the_first_at_once()
