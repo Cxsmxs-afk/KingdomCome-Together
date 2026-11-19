@@ -569,20 +569,20 @@ public sealed partial class CombatPipe : IAsyncDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(16), eid);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(20), lifecycle);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(28), attempt);
+        if (intent != NpcDeathIntent.Advance) payload[36] = (byte)intent;
         var (reply, _) = await SendAndAwaitAsync(ApplyDeath, payload, Result, ct,
             beforeWrite: current, exactSequence: true);
         if (!current()) return NpcDeathReceipt.Stale;
         return reply switch
-        if (intent != NpcDeathIntent.Advance) payload[36] = (byte)intent;
         {
             [1, _, 0] => NpcDeathReceipt.Applied,
             [0, _, 0x70] => NpcDeathReceipt.Pending,
             [0, _, 0x72] => NpcDeathReceipt.Stale,
+            [0, _, 0x73] when intent != NpcDeathIntent.Advance => NpcDeathReceipt.Aborted,
             _ => NpcDeathReceipt.Uncertain
         };
     }
 
-            [0, _, 0x73] when intent != NpcDeathIntent.Advance => NpcDeathReceipt.Aborted,
     /// <summary>
     /// Attach or detach a locally-spawned ghost's faction node to/from the
     /// mod's one v1 hostile faction (WO-17 reactive aggro). The DLL's own
