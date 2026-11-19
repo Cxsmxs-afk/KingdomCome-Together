@@ -17,6 +17,7 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
     {
         await using var target = await _relay.ConnectAsync("ff-target");
         Assert.True(await EnableAsync(target));
+        await WaitForCapabilitiesAppliedAsync(target);
         byte oldId;
         ulong oldIncarnation;
         var contact = new PlayerHitV8(target.Id, 10, 7, 0, 0);
@@ -47,6 +48,7 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
         await using var modern = await _relay.ConnectAsync("ff-modern");
         await using var legacy = await _relay.ConnectAsync("ff-legacy");
         Assert.True(await EnableAsync(modern));
+        await WaitForCapabilitiesAppliedAsync(modern);
         await modern.SendRawAsync(new PlayerHitV8(legacy.Id, 10, 7, 0, 0).BuildUp(1, 1));
         await legacy.SendRawAsync(new PlayerHitV8(modern.Id, 10, 7, 0, 0).BuildUp());
         Assert.True(await legacy.NoneOfAsync(Protocol.PlayerHitV8Down, Quiet));
@@ -64,6 +66,7 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
     {
         await using var source = await _relay.ConnectAsync("ff-source");
         Assert.True(await EnableAsync(source));
+        await WaitForCapabilitiesAppliedAsync(source);
         byte oldId;
         ulong oldIncarnation;
         byte[] delayed;
@@ -100,6 +103,7 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
         await using var target = await _relay.ConnectAsync("ff-target");
         await using var source = await _relay.ConnectAsync("ff-source");
         Assert.True(await EnableAsync(target));
+        await WaitForCapabilitiesAppliedAsync(target);
         Assert.True(await EnableAsync(source));
         ulong recipient = await ReadPeerAsync(source, target.Id);
         var contact = new PlayerHitV8(target.Id, 10, 7, 0, 0);
@@ -119,8 +123,10 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
         await using var source = await _relay.ConnectAsync("ff-source");
         await using var target = await _relay.ConnectAsync("ff-target");
         Assert.True(await EnableAsync(target, caps));
+        await WaitForCapabilitiesAppliedAsync(target);
         Assert.True(await EnableAsync(source, caps));
-        ulong recipient = await ReadPeerAsync(source, target.Id);
+        var (recipient, initial) = await ReadLifeAsync(source, target.Id);
+        Assert.Equal(default, initial);
         var contact = new PlayerHitV8(target.Id, 10, 7, 0, 0);
         var oldLife = new PvpLifeState(1, 71);
         await target.SendRawAsync(oldLife.BuildUp());
@@ -156,6 +162,16 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
         var hello = await peer.ReadUntilAsync(Protocol.LinkHelloDown, Wait);
         return Protocol.TryParseLinkHello(hello, out _, out ushort caps, out _, out _) &&
             (caps & required) == required;
+    }
+
+    internal static async Task WaitForCapabilitiesAppliedAsync(Peer firstPeer)
+    {
+        // LinkHelloDown can arrive before the relay has announced its roster.
+        // The same reader answers Ping after that announcement completes.
+        var ping = new byte[Protocol.PingPayloadLen];
+        ping[0] = 0x5A;
+        await firstPeer.SendRawAsync([Protocol.Ping, Protocol.PingPayloadLen, 0, .. ping]);
+        Assert.Equal(ping, await firstPeer.ReadUntilAsync(Protocol.Pong, Wait));
     }
 
     private static async Task<ulong> ReadAsync(Peer target, byte source, ulong sequence, PlayerHitV8 wanted)

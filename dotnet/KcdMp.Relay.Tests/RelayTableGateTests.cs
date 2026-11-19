@@ -346,15 +346,18 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
             case Protocol.PvpLifeUp:
                 const ushort pvp = Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife;
                 await OpenPresentationAsync(host, pvp);
+                await FriendlyFireContactRelayTests.WaitForCapabilitiesAppliedAsync(host);
                 await OpenPresentationAsync(joiner, pvp);
-                await ArrivesAsync(joiner, Protocol.PvpPeerDown, Protocol.PvpPeerLifeLen, host.Id);
+                var initial = await ArrivesAsync(joiner, Protocol.PvpPeerDown, Protocol.PvpPeerLifeLen, host.Id);
+                Assert.True(Protocol.TryReadPvpPeer(initial, out _, out ulong incarnation, out var initialLife));
+                Assert.Equal(default, initialLife);
                 var life = new PvpLifeState(1, 1234);
                 var lifeUp = life.BuildUp();
                 Assert.Equal(len + 3, lifeUp.Length);
                 await host.SendRawAsync(lifeUp);
                 var roster = await ArrivesAsync(joiner, Protocol.PvpPeerDown, Protocol.PvpPeerLifeLen, host.Id);
-                Assert.True(Protocol.TryReadPvpPeer(roster, out _, out _, out var advertisedLife));
-                Assert.Equal(life, advertisedLife);
+                Assert.True(Protocol.TryReadPvpPeer(roster, out _, out ulong advertisedIncarnation, out var advertisedLife));
+                Assert.Equal((incarnation, life), (advertisedIncarnation, advertisedLife));
                 return;
             case Protocol.VoiceUp:
                 await host.SendRawAsync(Frame(up, b));
