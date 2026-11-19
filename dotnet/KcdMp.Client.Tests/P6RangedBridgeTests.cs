@@ -23,8 +23,9 @@ public sealed class P6RangedBridgeTests
     private static byte[] Wire(byte type, params byte[] p) => [type, (byte)p.Length, (byte)(p.Length >> 8), .. p];
     private static byte[] Down(byte kind, string text, byte peer = 1)
     { var up = new LootMsg(kind, 123, text).BuildUp(Protocol.W164Up, 0); return Wire(Protocol.W164Down, [peer, .. up[3..]]); }
-    private static byte[] TimedFire(byte peer) => PresentationTimeWire.Wrap(Protocol.W164Down,
-        Down(Protocol.W164RangedStep, Step().Encode(), peer).AsSpan(3), new PresentationStamp(1, (ulong)PresentationClock.NowMs(), 0));
+    private static byte[] TimedFire(byte peer) => TimedRanged(peer, Step());
+    private static byte[] TimedRanged(byte peer, RangedStepV2 step) => PresentationTimeWire.Wrap(Protocol.W164Down,
+        Down(Protocol.W164RangedStep, step.Encode(), peer).AsSpan(3), new PresentationStamp(1, (ulong)PresentationClock.NowMs(), 0));
     private static LootMsg Message(byte[] wire) { Assert.Equal(Protocol.W164Up, wire[0]); Assert.True(LootMsg.TryDecode(wire.AsSpan(3 + Protocol.JoinHeaderLen), out var msg)); return msg; }
     private static async Task<(byte Type, byte[] Body)> Read(Stream s)
     { using var stop = new CancellationTokenSource(3500); byte[] h = new byte[3]; await s.ReadExactlyAsync(h, stop.Token); byte[] b = new byte[BinaryPrimitives.ReadUInt16LittleEndian(h.AsSpan(1))]; await s.ReadExactlyAsync(b, stop.Token); return (h[0], b); }
@@ -339,6 +340,78 @@ public sealed class P6RangedBridgeTests
         quiet.Cancel();
         Assert.False(await followup);
         Assert.DoesNotContain(r.Game.Calls, x => x.Contains("W201Shot") || x.Contains("ApplyDamage") || x.Contains("CreateItem"));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_fire_read_for_the_old_body_cannot_bind_to_a_replacement_before_processing(bool host)
+    {
+        await using var r = await Rig.Create(host);
+        await r.StartTimedReceiveAsync();
+        r.Game.BlockHorse = true;
+        r.Http.BatchingEnabled = false;
+        long received = r.Link.ReadRequestedAfterBytes;
+        byte[] horse = Wire(Protocol.HorseInfoDown, r.Peer, 0);
+        r.Link.Feed(horse);
+        await r.Game.HorseEntered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+        byte[] fire = TimedFire(r.Peer);
+        r.Link.Feed(fire);
+        await Until(() => r.Link.ReadRequestedAfterBytes >= received + horse.Length + fire.Length);
+        Call(r.Bridge, "OnGameEvent", "ghostid", $"{r.Peer} df");
+        Assert.Equal(223u, Get<ConcurrentDictionary<string, uint>>(r.Bridge, "_ghostEntityIds")[r.Peer.ToString()]);
+        Assert.Equal(1, Get<ConcurrentDictionary<string, int>>(r.Bridge, "_ghostBodyGen")[r.Peer.ToString()]);
+
+        r.Link.Feed(Down(Protocol.W164RangedStep, "after-old-body", r.Peer));
+        r.Game.ReleaseHorse.TrySetResult();
+        using var quiet = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+        byte[] header = new byte[3];
+        Task<bool> nextRequest = ReadFrameHeaderAsync(r.Server, header, quiet.Token);
+        Task processed = Until(() => Count(r.Bridge, "ranged_malformed") == 1);
+        if (await Task.WhenAny(nextRequest, processed) == nextRequest && await nextRequest)
+        {
+            byte[] body = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
+            await r.Server.ReadExactlyAsync(body, quiet.Token);
+            await ReplyEdge(r.Server, body, EdgeOutcome.Completed, 1, 0, 0);
+            Assert.Fail($"A Fire read for body 222 reached the native writer after replacement: op=0x{body[5]:X2}, entity={BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(11))}.");
+        }
+        await processed;
+        quiet.Cancel();
+        Assert.False(await nextRequest);
+        Assert.Equal(1, Count(r.Bridge, "ranged_stale"));
+        Assert.Equal(0, Count(r.Bridge, "ranged_in"));
+    }
+
+    [Theory]
+    [InlineData(true, RangedWeaponKind.Bow)]
+    [InlineData(false, RangedWeaponKind.Crossbow)]
+    public async Task Actual_receive_requests_one_typed_fire_and_keeps_uncharging_separate_from_fire(bool host, RangedWeaponKind weapon)
+    {
+        await using var r = await Rig.Create(host);
+        await r.StartTimedReceiveAsync();
+        Guid itemClass = weapon == RangedWeaponKind.Bow ? Bow : Crossbow;
+        var fire = Step(seq: 10) with { Kind = weapon, ItemClass = itemClass };
+        byte[] first = TimedRanged(r.Peer, fire);
+        r.Link.Feed(first, first, TimedRanged(r.Peer, fire with { Epoch = fire.Epoch - 1, Sequence = 11 }),
+            TimedRanged(r.Peer, fire with { Sequence = 11, Phase = 5 }), first,
+            Down(Protocol.W164RangedStep, "after-uncharging", r.Peer));
+
+        foreach (byte phase in new byte[] { 3, 5 })
+        {
+            var request = await Read(r.Server);
+            Assert.Equal((byte)0x38, request.Type);
+            Assert.Equal((byte)0x40, request.Body[5]);
+            await ReplyEdge(r.Server, request.Body, EdgeOutcome.Completed, 1, 0, 0);
+            byte[] expected = [0x82, 1, (byte)weapon, phase, .. itemClass.ToByteArray()];
+            Assert.Equal(expected, request.Body[25..]);
+        }
+
+        await Until(() => Count(r.Bridge, "ranged_malformed") == 1);
+        Assert.Equal(2, Count(r.Bridge, "ranged_duplicate"));
+        Assert.Equal(1, Count(r.Bridge, "ranged_stale"));
+        Assert.Equal(2, Get<long>(r.Bridge, "_w201RangedDispatched"));
+        Assert.DoesNotContain(r.Game.Calls, call => call.Contains("W201Shot") || call.Contains("ApplyDamage"));
     }
 
     private static async Task<bool> ReadFrameHeaderAsync(Stream stream, byte[] header, CancellationToken ct)

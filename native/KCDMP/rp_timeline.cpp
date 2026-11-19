@@ -13,7 +13,9 @@ struct Body {
     uint32_t eid = 0;
     Frame display{};
     uint64_t poseCount = 0, late = 0, lastReport = 0;
+    uint64_t rangedHostMs = 0;
     uint32_t buffer = 0, extrap = 0;
+    uint8_t rangedBits = 0, rangedCharge = 0;
 };
 
 bool g_enabled = true;
@@ -42,11 +44,14 @@ Body& body_for(uint32_t eid, uint8_t peer) {
 
 void report(const Body& row, uint8_t peer) {
     logf("MP-RP-TIMELINE figure=kcd2mp_%u eid=0x%X scope=%llu connection=%llu buffer_ms=%u extrap_ms_max=%u "
-         "late_samples=%llu pose_n=%llu applied_host_ms=%llu target_host_ms=%llu",
+         "late_samples=%llu pose_n=%llu applied_host_ms=%llu target_host_ms=%llu "
+         "ranged_held=%u ranged_state_ms=%llu ranged_charge_known=%u ranged_charge=%u",
          static_cast<unsigned>(peer), row.eid, static_cast<unsigned long long>(row.display.lifecycle),
          static_cast<unsigned long long>(row.display.connection), row.buffer, row.extrap,
          static_cast<unsigned long long>(row.late), static_cast<unsigned long long>(row.poseCount),
-         static_cast<unsigned long long>(row.display.appliedHostMs), static_cast<unsigned long long>(row.display.targetHostMs));
+         static_cast<unsigned long long>(row.display.appliedHostMs), static_cast<unsigned long long>(row.display.targetHostMs),
+         (row.rangedBits & rangedaim::kHeldBit) ? 1u : 0u, static_cast<unsigned long long>(row.rangedHostMs),
+         (row.rangedBits & rangedaim::kChargeKnownBit) ? 1u : 0u, static_cast<unsigned>(row.rangedCharge));
 }
 
 bool same_receiver() {
@@ -91,6 +96,11 @@ void note_pose(uint32_t eid, uint8_t peer, const Output& sample) {
         ++row.poseCount;
         ++g_total.pose_n;
         row.display.appliedHostMs = sample.appliedHostMs;
+    }
+    if (sample.rangedStateHostMs && row.rangedHostMs != sample.rangedStateHostMs) {
+        row.rangedHostMs = sample.rangedStateHostMs;
+        row.rangedBits = sample.source.state[3];
+        row.rangedCharge = sample.source.state[7];
     }
     const uint64_t now = GetTickCount64();
     if (row.lastReport == 0 || now - row.lastReport >= 4000) {

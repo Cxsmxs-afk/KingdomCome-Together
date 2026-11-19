@@ -21,6 +21,8 @@ if [ "$label" = ci ]; then
 int holder_contract_tests(int* passed);
 int edge_lanes_tests(int* passed);
 int rp_timeline_tests(int* passed);
+int ranged_aim_tests(int* passed);
+int p6_capture_flow_tests(int* passed);
 int rp_timeline_action_tests(int* passed);
 int rp_controller_tests(int* passed);
 int rp_combat_tests(int* passed);
@@ -41,6 +43,8 @@ int main() {
     bool passed = run_tests("body owner contract", &holder_contract_tests);
     passed &= run_tests("modeled DLL lanes", &edge_lanes_tests);
     passed &= run_tests("modeled presentation clock", &rp_timeline_tests);
+    passed &= run_tests("bow aim hold", &ranged_aim_tests);
+    passed &= run_tests("ranged capture and scope", &p6_capture_flow_tests);
     passed &= run_tests("presentation action order", &rp_timeline_action_tests);
     passed &= run_tests("remote movement and relocation", &rp_controller_tests);
     passed &= run_tests("typed combat presentation", &rp_combat_tests);
@@ -52,9 +56,10 @@ int main() {
     return passed ? 0 : 1;
 }
 EOF
-    "${CXX:-c++}" -std=c++17 -I native/KCDMP "$native_tmp/main.cpp" \
+    "${CXX:-c++}" -std=c++17 -DKCDMP_P6_CAPTURE_TEST -I native/KCDMP "$native_tmp/main.cpp" \
+        native/tests/p6_capture_flow_tests.cpp native/KCDMP/wo201_ranged.cpp \
         native/tests/holder_contract_tests.cpp native/tests/edge_lanes_tests.cpp \
-        native/tests/rp_timeline_tests.cpp native/tests/rp_timeline_action_tests.cpp \
+        native/tests/rp_timeline_tests.cpp native/tests/ranged_aim_tests.cpp native/tests/rp_timeline_action_tests.cpp \
         native/tests/rp_controller_tests.cpp native/tests/rp_combat_tests.cpp \
         native/tests/rp_body_action_tests.cpp native/tests/visual_damage_tests.cpp native/tests/load_sequence_tests.cpp \
         native/tests/wo203_conv_tests.cpp native/tests/t3_recovery_stats_tests.cpp \

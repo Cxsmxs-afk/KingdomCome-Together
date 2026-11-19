@@ -20,10 +20,9 @@ namespace KcdMp.Wire;
 //
 //   1. BODY STATE 2 (Position/Ghost flag 0x10, 12 bytes). Supersedes the
 //      WO-100.5 0x04 block, which a v8 sender never sets and a v8 relay no
-//      longer accepts. Change-gated at the sender: present when any field
-//      differs from the last one sent, and at least every
-//      BodyState2HeartbeatMs while anything is non-zero, so a late joiner
-//      converges. Layout (LE):
+//      longer accepts. Movement and combat state keep their existing change
+//      gate. Ranged state rides positions already due for movement, another
+//      body field, or the normal position heartbeat. Layout (LE):
 //        [speedCm:u16]     planar speed of the sender's requested velocity, cm/s
 //        [moveDir:i8]      heading of that velocity minus the body's facing,
 //                          in 1/256 of a turn (1.40625 deg)
@@ -31,9 +30,9 @@ namespace KcdMp.Wire;
 //        [guardZone:u8]    WireZone
 //        [guardStance:u8]  WireGuardStance
 //        [atkZone:u8]      WireZone (the requested attack zone)
-//        [charge:u8]       ranged charge 0..255 (0 when no ranged weapon drawn)
-//        [aimYaw:i16]      ranged aim yaw, 1/10000 rad (0 when not aiming)
-//        [aimPitch:i16]    ranged aim pitch, 1/10000 rad
+//        [charge:u8]       ranged charge 0..255, meaningful with RangedChargeKnown
+//        [aimYaw:i16]      ranged aim yaw, 1/10000 rad, -32768 when held but unmeasured
+//        [aimPitch:i16]    ranged aim pitch, same encoding as aimYaw
 //      Tail order after the flags byte: [bodyState2:12 if 0x10][senderMs:4 if 0x08].
 //      Position lengths 17/21/29/33, Ghost 18/22/30/34 -- exact, never a range.
 //
@@ -80,7 +79,7 @@ public enum BodyState2Bits : byte
     BlockHeld = 0x02,
     /// <summary>Crouched (the state expansion's crouch desire).</summary>
     Crouched = 0x04,
-    /// <summary>A ranged weapon is drawn and aiming; charge/aim fields are meaningful.</summary>
+    /// <summary>A ranged weapon is held in a verified charging or aiming phase.</summary>
     RangedAim = 0x08,
     /// <summary>The sender is locked on an opponent (combat model opponent pointer set).</summary>
     Locked = 0x10,
@@ -89,6 +88,8 @@ public enum BodyState2Bits : byte
     /// <summary>WO-154: the sender's own body is down (its physics is no living entity: a knockdown's ragdoll, a
     /// knockout). The avatar falls, lies and stands up on this bit's edges.</summary>
     Downed = 0x40,
+    /// <summary>The ranged charge is a measured value. An absent measurement is distinct from a measured zero.</summary>
+    RangedChargeKnown = 0x80,
 }
 
 /// <summary>WO-121: the 12 replicated-state bytes (Position/Ghost flag 0x10).</summary>
@@ -97,6 +98,7 @@ public readonly record struct BodyState2(
     WireZone AtkZone, byte Charge, short AimYaw, short AimPitch)
 {
     public const int Len = 12;
+    public const short AimAngleUnavailable = short.MinValue;
 
     public float SpeedMps => SpeedCm / 100f;
     /// <summary>moveDir in radians, (-pi, pi].</summary>
