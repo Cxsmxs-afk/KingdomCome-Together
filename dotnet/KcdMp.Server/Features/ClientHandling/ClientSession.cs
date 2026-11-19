@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -198,6 +199,16 @@ public partial class ClientSession
     /// the session). Read by ClientHandler.PickAuthority; see ProtocolWo127.cs.
     /// </summary>
     public bool ClaimsHost { get; private set; }
+
+    /// <summary>The last world epoch and run this client announced. Zero and an empty guid mean "not announced".</summary>
+    public uint AnnouncedWorldEpoch { get; private set; }
+    public Guid AnnouncedRunId { get; private set; }
+
+    internal void NoteAnnouncement(uint world, Guid run)
+    {
+        AnnouncedWorldEpoch = world;
+        AnnouncedRunId = run;
+    }
 
     /// <summary>WO-213 C.2: the client's LinkHello said it sends and takes state the unreliable way (and the relay agreed).</summary>
     public bool LinkUnreliableState { get; internal set; }
@@ -476,6 +487,17 @@ public partial class ClientSession
                     continue;
                 }
 
+                // Keep transport, voice and clean session exits working. A
+                // Position may carry the host claim and W203 permits the exact
+                // resume proof in RouteJoin. Neither can move the paused world.
+                if (_clientHandler.HostAbsent &&
+                    type is not (Protocol.Ping or Protocol.ClockSyncUp or Protocol.PresentationClockUp or Protocol.LinkHelloUp or
+                        Protocol.Position or Protocol.W203Up or Protocol.VoiceUp or Protocol.SessionLeave))
+                {
+                    await DropFrameAsync(type, payloadLen, "host-absent");
+                    continue;
+                }
+
                 if (type == Protocol.Ping && payloadLen == 8)
                 {
                     // Ping → echo back as Pong with same 8-byte timestamp.
@@ -650,9 +672,10 @@ public partial class ClientSession
                     // cannot inject NPC damage into someone else's game.
                     if (!_clientHandler.IsDamageAuthority(this))
                     {
-                        _logger.Warning("[!] '{Name}' (id={Id}) sent PlayerHitUp without holding damage authority -- dropped.",
-                            Name, Id);
-                        _clientHandler.CountDrop(Protocol.PlayerHitUp, "not-host");   // WO-203 II.5: counted, not only a line
+                        string why = _clientHandler.HostAbsent ? "host-absent" : "not-host";
+                        _logger.Warning("[!] '{Name}' (id={Id}) sent PlayerHitUp without holding damage authority -- dropped ({Why}).",
+                            Name, Id, why);
+                        _clientHandler.CountDrop(Protocol.PlayerHitUp, why);
                         continue;
                     }
                     _broadcastService.RoutePlayerHit(this, body);
@@ -1060,7 +1083,8 @@ public partial class ClientSession
                     if (dest is null)
                     {
                         _clientHandler.CountDrop((byte)type, why, Protocol.DropKeyHasKind(type) ? Protocol.JoinBodyKind(body) : -1);
-                        _logger.Warning("[join] {Kind} from '{Name}' (id={Id}) to {Target} dropped: {Why}.", jw.Name, Name, Id, body[0], why);
+                        if (!why.StartsWith("host-absent", StringComparison.Ordinal))
+                            _logger.Warning("[join] {Kind} from '{Name}' (id={Id}) to {Target} dropped: {Why}.", jw.Name, Name, Id, body[0], why);
                         continue;
                     }
                     bool carryHeld = type == Protocol.CarryUp && body.Length > Protocol.JoinHeaderLen && body[Protocol.JoinHeaderLen] == Protocol.CarryHeld;   // WO-148: every 2 s while carrying
@@ -1083,8 +1107,9 @@ public partial class ClientSession
                     var ws = WorldSaved.TryDecode(body, down: false, out _);
                     if (!_clientHandler.IsDamageAuthority(this))
                     {
-                        _logger.Warning("[!] '{Name}' (id={Id}) sent WorldSaved without holding damage authority -- dropped.", Name, Id);
-                        _clientHandler.CountDrop(Protocol.WorldSavedUp, "not-host");   // WO-203 II.5: counted, not only a line
+                        string why = _clientHandler.HostAbsent ? "host-absent" : "not-host";
+                        _logger.Warning("[!] '{Name}' (id={Id}) sent WorldSaved without holding damage authority -- dropped ({Why}).", Name, Id, why);
+                        _clientHandler.CountDrop(Protocol.WorldSavedUp, why);
                         continue;
                     }
                     _logger.Information("[worldsave] '{Name}' (id={Id}) saved the world: seq {Seq} playline{Playline}/{File}.",
@@ -1126,13 +1151,17 @@ public partial class ClientSession
                 // receiver sees exactly what it saw before WO-127.
                 bool claims = (flags & Protocol.PositionFlagHostClaim) != 0;
                 flags = (byte)(flags & ~Protocol.PositionFlagHostClaim);
+                if (claims && _clientHandler.HostAbsent && !_clientHandler.IsReturningHost(this))
+                    claims = false;
                 if (claims != ClaimsHost)
                 {
                     ClaimsHost = claims;
+                    if (claims) _clientHandler.TryResumeHost(this);
                     _logger.Information("MP-HOST-CLAIM '{Name}' (id={Id}, {Transport}) {What} the session host.",
                         Name, Id, Transport, claims ? "claims" : "no longer claims");
                     _broadcastService.BroadcastCombatRole();   // re-decides and logs MP-AUTHORITY-OWNER
                 }
+                if (_clientHandler.HostAbsent) continue;
                 // WO-101: everything after the flags byte is the tail -- body
                 // state (5) and/or the sender's ms (4, WO-118 follow-up), none
                 // on a 17-byte packet -- forwarded verbatim. The relay does not
@@ -1545,9 +1574,13 @@ public partial class ClientSession
         int kind = -1;
         if (payloadLen > 0)
         {
-            var skip = new byte[payloadLen];
-            await ReadExactAsync(skip);
-            if (Protocol.DropKeyHasKind(type)) kind = Protocol.JoinBodyKind(skip);
+            var skip = ArrayPool<byte>.Shared.Rent(payloadLen);
+            try
+            {
+                await ReadExactAsync(skip, payloadLen);
+                if (Protocol.DropKeyHasKind(type)) kind = Protocol.JoinBodyKind(skip.AsSpan(0, payloadLen));
+            }
+            finally { ArrayPool<byte>.Shared.Return(skip, clearArray: type == Protocol.WorldChunkUp); }
         }
         _clientHandler.CountDrop((byte)type, reason, kind);
     }

@@ -4663,7 +4663,7 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private async Task ApplyCombatRoleAsync(bool isAuthority, CancellationToken ct)
     {
-        if (isAuthority && WorldRecoveryEnabled && _joinedWorld)
+        if (isAuthority && (HostAbsentPause || (WorldRecoveryEnabled && _joinedWorld)))
         {
             Console.WriteLine("MP-WORLD-RECONNECT role=joiner result=authority-deferred reason=shared-world");
             return;
@@ -5309,7 +5309,7 @@ public partial class GameBridge(ClientConfig config)
                 // WO-211 A.1.5: a partner in this world keeps its figure, marked reconnecting, for the hold's window (Wo211HostFigureTick)
                 if (!Wo211HoldFigure(ghostId, w211InWorld)) { try { await ExecLuaAsync($"KCD2MP_RemoveGhost(\"{ghostId}\")"); } catch { } }
                 await Wo123OnPeerGoneAsync(ghostId);   // WO-123: a joiner gone mid-join resumes the host
-                await Wo124OnPeerGoneAsync(ghostId);   // WO-124: the host gone -> the joiner leaves its world
+                await Wo124OnPeerGoneAsync(ghostId);   // WO-124: cancel an active join or hold an already joined world
                 Wo144AfterPeerGone(ghostId);           // WO-144: its name and per-partner rows go last (the handlers above read them)
             }
             else if (type == Protocol.VoiceDown && payloadLen == 1 + Protocol.VoiceFrameLen)

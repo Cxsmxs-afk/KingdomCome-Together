@@ -17,9 +17,8 @@ namespace KcdMp.Relay.Tests;
 // network vanishes silently -- cable pulled, hard crash -- leaves the relay's
 // read parked with neither signal. ClientSession sets NetworkStream.ReadTimeout
 // (Tcp:IdleTimeoutMs, TcpSocketService); this is the one test that proves an
-// idle connection is actually torn down and damage authority (Rule 2, the
-// lowest ready id) actually moves to whoever remains -- not just that the
-// field compiles.
+// idle connection is actually torn down and the selected host remains the
+// only rightful owner even when its connection times out.
 //
 // Runs its own relay (not RelayFixture's) so its idle timeout can be short
 // (300 ms) without shortening the 30 s production default or affecting any
@@ -28,7 +27,7 @@ namespace KcdMp.Relay.Tests;
 public class IdleTimeoutTests
 {
     [Fact]
-    public async Task Silent_peer_is_dropped_and_damage_authority_moves_to_the_survivor()
+    public async Task Silent_host_is_dropped_and_the_survivor_stays_without_damage_authority()
     {
         int tcpPort = FreePort();
         int httpPort = FreePort();
@@ -63,11 +62,12 @@ public class IdleTimeoutTests
             await Task.Delay(100);
         }
 
-        // Bravo is told it is now the authority -- the relay noticed alpha's
-        // read time out, tore the connection down, and re-ran Rule 2 over
-        // the set that remains, exactly as a clean disconnect would.
+        // Read the actual disconnect before the resulting role notice, so a
+        // previously queued "not the host" frame cannot satisfy the test.
+        var disconnected = await b.ReadUntilAsync(Protocol.Disconnect, TimeSpan.FromSeconds(2));
+        Assert.Equal(a.Id, disconnected[0]);
         var newRole = await b.ReadUntilAsync(Protocol.CombatRole, TimeSpan.FromSeconds(2));
-        Assert.Equal(1, newRole[0]);
+        Assert.Equal(0, newRole[0]);
 
         await a.DisposeAsync();
         await b.DisposeAsync();

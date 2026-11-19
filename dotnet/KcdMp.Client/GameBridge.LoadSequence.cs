@@ -126,7 +126,8 @@ public partial class GameBridge
         LoadSequenceChange(s => _worldLoad.TryAbort(s.Generation, s.Phase));
     }
 
-    private bool LoadSequenceTryHoldLink() => LoadSequenceChange(s => _worldLoad.TryHoldLink(s.Generation));
+    private bool LoadSequenceTryHoldLink(bool allowSettling = false) =>
+        LoadSequenceChange(s => _worldLoad.TryHoldLink(s.Generation, allowSettling));
 
     private bool LoadSequenceTryResumeLink(uint world, bool resumed, ulong expectedGeneration = 0, Func<bool>? proof = null) => LoadSequenceChange(s =>
     {
