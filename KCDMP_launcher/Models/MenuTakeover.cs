@@ -43,6 +43,7 @@ namespace KCDMP_launcher.Models
             {
                 case "newadv" when p.Length >= 5 && Styles.Contains(p[3]) && p[4] is "skip" or "watch":
                     return new(seq, "newadv", Style: p[3], Watch: p[4] == "watch");
+                case "role" when p.Length == 4 && seq > 0 && p[3] is "host" or "join": return new(seq, "role", Name: p[3]);
                 case "cancel": return new(seq, "cancel");
                 case "join" when p.Length >= 5 && p[3] == "fresh" && Styles.Contains(p[4]): return new(seq, "join", Join: "fresh", Style: p[4]);
                 case "join" when p.Length == 4 && p[3] == "bring": return new(seq, "join", Join: "bring");
@@ -103,27 +104,40 @@ namespace KCDMP_launcher.Models
         /// 2,100 encoded characters per call).
         /// </summary>
         public static string ModelCall(bool hosting, IReadOnlyList<WorldEntry> worlds, string hidden, WorldEntry? newAdv, string newWhy,
-                                       string joinState, bool bring, string bringMsg, IReadOnlyCollection<string>? styles = null, string joinStatus = "")
+                                       string joinState, bool bring, string bringMsg, IReadOnlyCollection<string>? styles = null, string joinStatus = "",
+                                       string roleStatus = "", long roleAck = 0)
         {
-            var b = new StringBuilder();
-            b.Append("role=").Append(Lua(hosting ? "host" : "join"));
-            b.Append(",saves={");
-            foreach (var w in worlds.Take(5))
-                b.Append("{pl=").Append(w.Playline.ToString(CultureInfo.InvariantCulture)).Append(",name=").Append(Lua(w.Name))
-                 .Append(",label=").Append(Lua(w.Label.Length > 48 ? w.Label[..48] : w.Label)).Append("},");
-            b.Append('}');
-            b.Append(",hidden=").Append(Lua(hidden));
-            if (newAdv is not null) b.Append(",newadv={pl=").Append(newAdv.Playline.ToString(CultureInfo.InvariantCulture)).Append(",name=").Append(Lua(newAdv.Name)).Append('}');
-            b.Append(",newwhy=").Append(Lua(newWhy));
-            b.Append(",join={state=").Append(Lua(joinState)).Append(",bring=").Append(bring ? "true" : "false").Append(",msg=").Append(Lua(bringMsg))
-             .Append(",status=").Append(Lua(joinStatus.Length > 120 ? joinStatus[..120] : joinStatus)).Append('}');
-            b.Append(",styles={");
-            foreach (var st in Styles) if (styles?.Contains(st) == true) b.Append(st).Append("=true,");
-            b.Append('}');
-            b.Append(",recapMin=").Append(RecapMinutes.ToString(CultureInfo.InvariantCulture));
-            string body = b.ToString();
-            string sig = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)))[..12].ToLowerInvariant();
-            return "if KCD2MP_W159Model then KCD2MP_W159Model({sig=" + Lua(sig) + "," + body + "}) end";
+            string model = Render(compact: false);
+            return Uri.EscapeDataString("#" + model).Length <= MaxEncoded ? model : Render(compact: true);
+
+            string Render(bool compact)
+            {
+                var b = new StringBuilder();
+                b.Append("role=").Append(Lua(hosting ? "host" : "join"));
+                if (roleAck > 0) b.Append(",roleAck=").Append(roleAck.ToString(CultureInfo.InvariantCulture));
+                if (roleStatus.Length > 0) b.Append(",roleStatus=").Append(Lua(compact ? "Check the launcher to change roles." : Clip(roleStatus, 120)));
+                b.Append(",saves={");
+                foreach (var w in worlds.Where(w => IsSaveName(w.Name)).Take(5))
+                    b.Append("{pl=").Append(w.Playline.ToString(CultureInfo.InvariantCulture)).Append(",name=").Append(Lua(w.Name))
+                     .Append(",label=").Append(Lua(compact ? Clip(w.Name, 16) : Clip(w.Label, 48))).Append("},");
+                b.Append('}');
+                b.Append(",hidden=").Append(Lua(compact ? "" : hidden));
+                if (newAdv is not null && IsSaveName(newAdv.Name))
+                    b.Append(",newadv={pl=").Append(newAdv.Playline.ToString(CultureInfo.InvariantCulture)).Append(",name=").Append(Lua(newAdv.Name)).Append('}');
+                b.Append(",newwhy=").Append(Lua(compact ? "" : newWhy));
+                b.Append(",join={state=").Append(Lua(joinState)).Append(",bring=").Append(bring ? "true" : "false")
+                 .Append(",msg=").Append(Lua(compact ? "" : bringMsg))
+                 .Append(",status=").Append(Lua(compact ? "" : Clip(joinStatus, 120))).Append('}');
+                b.Append(",styles={");
+                foreach (var st in Styles) if (styles?.Contains(st) == true) b.Append(st).Append("=true,");
+                b.Append('}');
+                b.Append(",recapMin=").Append(RecapMinutes.ToString(CultureInfo.InvariantCulture));
+                string body = b.ToString();
+                string sig = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)))[..12].ToLowerInvariant();
+                return "if KCD2MP_W159Model then KCD2MP_W159Model({sig=" + Lua(sig) + "," + body + "}) end";
+            }
+
+            static string Clip(string text, int limit) => text.Length > limit ? text[..limit] : text;
         }
 
         public const string TickCall = "if KCD2MP_W159Tick then KCD2MP_W159Tick() end";

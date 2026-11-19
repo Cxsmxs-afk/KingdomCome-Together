@@ -23,7 +23,7 @@
                     @* WO-127: Steam first -- a code works across networks with no port forwarding. *@
                     <div class="kcd-input-group">
                         <label class="kcd-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                            <input type="checkbox" checked="@AllowSteam" disabled="@SteamToggleLocked"
+                            <input type="checkbox" checked="@AllowSteam" disabled="@HostSettingsLocked"
                                    @onchange="e => OnAllowSteamChanged.InvokeAsync(e.Value is bool b && b)" />
                             Also allow Steam
                         </label>
@@ -40,7 +40,7 @@
                                 <div class="kcd-hint">Steam app: @SteamAppName (your friend's launcher must use the same one).</div>
                             }
                         }
-                        @if (SteamToggleLocked)
+                        @if (HostSettingsLocked)
                         {
                             <div class="kcd-hint">Stop hosting to change this.</div>
                         }
@@ -82,8 +82,8 @@
                 <div class="modal-actions">
                     @if (RelayRunning)
                     {
-                        <button class="kcd-btn primary" @onclick="OnLaunchAsHost">START GAME</button>
-                        <button class="kcd-btn danger" @onclick="OnStopRelay">STOP HOSTING</button>
+                        <button class="kcd-btn primary" disabled="@HostSettingsLocked" @onclick="OnLaunchAsHost">START GAME</button>
+                        <button class="kcd-btn danger" disabled="@HostSettingsLocked" @onclick="OnStopRelay">STOP HOSTING</button>
                     }
                     <button class="kcd-btn" @onclick="CloseModalAsync">CLOSE</button>
                 </div>
@@ -104,7 +104,7 @@
 
     // WO-127: Steam as a way in, beside the addresses.
     [Parameter] public bool AllowSteam { get; set; }
-    [Parameter] public bool SteamToggleLocked { get; set; }
+    [Parameter] public bool HostSettingsLocked { get; set; }
     [Parameter] public EventCallback<bool> OnAllowSteamChanged { get; set; }
     [Parameter] public string SteamState { get; set; } = "off";
     [Parameter] public string SteamMessage { get; set; } = "";

@@ -10,6 +10,7 @@
 --       prologue page (Skip on top, Watch with its length)
 --   (G) the game's own pages: no redraw while one is open; Back to the root redraws on the next tick
 --   (J) Join Game: the new-character default and its playstyle, waiting + Cancel, joining with the join's own line
+--   (S) the same session settings support both roles, with a matching launcher receipt before changing roles
 --   (D) disarm before a load; nothing sends input to the menu
 --   (P) the prologue's rendered cutscenes in the world: one after another through the movie player with the game's
 --       video sound setup, the player moving inside a video skips them all, a join waits ("prologue", minutes
@@ -124,7 +125,8 @@ do
     check("R5: no Modding Tools debug entry", not dbg)
     check("R6: Settings / Help / DLCs / Credits keep their own ids, enabled", find(p, "Settings") and not find(p, "Settings").off and find(p, "HelpOverlays") and find(p, "DLC") and find(p, "Credits"))
     check("R7: Quit in the bottom container", find(p, "Exit") and find(p, "Exit").cont == 1)
-    check("R8: the host's Start Game is enabled and selected; Join Game greyed", not find(p, "MP_StartGame").off and find(p, "MP_JoinGame").off and lastSel() == "MP_StartGame")
+    local start, join = find(p, "MP_StartGame"), find(p, "MP_JoinGame")
+    check("R8: both entries are enabled, with Start Game selected for the host", start and join and not start.off and not join.off and lastSel() == "MP_StartGame")
     check("R9: the disclaimer is on the selected entry", find(p, "MP_StartGame").tip:find("not affiliated", 1, true) ~= nil)
     check("R10: the game's own text keys", find(p, "Continue").text == "@ui_Continue" and find(p, "Exit").text == "@ui_Exit")
     local n = count("ClearAll")
@@ -242,7 +244,8 @@ do
         msg = "Your saves are from the regular game, not the Modding Tools." }, styles = { soldier = true, adviser = true, scout = true } })
     KCD2MP_W159Tick()
     local p = lastPage()
-    check("J1: the joiner's root: Join Game enabled and selected, Start Game greyed", not find(p, "MP_JoinGame").off and find(p, "MP_StartGame").off and lastSel() == "MP_JoinGame")
+    local start, join = find(p, "MP_StartGame"), find(p, "MP_JoinGame")
+    check("J1: both entries are enabled, with Join Game selected for the joiner", start and join and not start.off and not join.off and lastSel() == "MP_JoinGame")
     press("MP_JoinGame")
     p = lastPage()
     check("J2: no own save: Join with a new character first and selected", p[1].id == "MP_JoinFresh" and lastSel() == "MP_JoinFresh")
@@ -280,6 +283,89 @@ do
     check("J10: joining: one greyed line, no Cancel", #p == 1 and p[1].id == "MP_JoinWait" and p[1].text:find("Joining", 1, true))
     check("J10b: ...with the join's own status as its line", p[1].tip:find("watching the prologue", 1, true) ~= nil, p[1].tip)
     check("J11: no swallowed Lua errors", #ERRS == 0, ERRS[1])
+end
+
+-- (S) session roles on one configuration -------------------------------------------------------------------------------------
+do
+    local config = { saves = { { pl = 2, name = "autosave118", label = "Playline 2" } },
+        newadv = { pl = 3, name = "permanent002" }, styles = { soldier = true },
+        join = { state = "idle", bring = true } }
+    local signature = 0
+    local function push(role, ack, status)
+        signature = signature + 1
+        local model = { sig = "h22-" .. signature, role = role, roleAck = ack, roleStatus = status }
+        for key, value in pairs(config) do model[key] = value end
+        KCD2MP_W159Model(model)
+        KCD2MP_W159Tick()
+    end
+
+    press("Back")
+    push("host")
+    local before = #events("w159")
+    press("MP_JoinGame")
+    local seq = KCD2MP.evtSeq
+    local e = events("w159")
+    check("S1: hosting can request Join Game on the same settings", #e == before + 1 and e[#e] == "role join" and KCD2MP.w159.page == "root")
+    KCD2MP_W159Tick()
+    local p = lastPage()
+    local start, join = find(p, "MP_StartGame"), find(p, "MP_JoinGame")
+    check("S1b: both multiplayer buttons wait for the launcher receipt", start and join and start.off and join.off)
+    press("MP_JoinGame")
+    press("MP_JoinBring")
+    press("MP_Load_1")
+    press("Back")
+    check("S2: duplicate clicks and Escape leave one pending request", #events("w159") == before + 1 and KCD2MP.evtSeq == seq)
+    push("join", seq - 1)
+    check("S3: an old acknowledgement does not enter the Join page", KCD2MP.w159.page == "root")
+    push("join", seq)
+    local bring = find(lastPage(), "MP_JoinBring")
+    check("S4: the exact acknowledgement opens the Join page with the saved configuration", KCD2MP.w159.page == "join"
+        and bring and not bring.off)
+    local joinPress = #events("w159")
+    press("MP_JoinBring")
+    e = events("w159")
+    check("S4a: the accepted join role routes Join Bring to the launcher", #e == joinPress + 1 and e[#e] == "join bring"
+        and KCD2MP.w159.joinState == "waiting")
+    press("MP_JoinBring")
+    check("S4b: the waiting page rejects a late Join Bring callback", #events("w159") == joinPress + 1)
+    press("Back")
+    e = events("w159")
+    check("S4c: Escape cancels the waiting Join once and returns to root", #e == joinPress + 2 and e[#e] == "cancel"
+        and KCD2MP.w159.joinState == "idle" and KCD2MP.w159.page == "root")
+    press("Back")
+    press("MP_Load_1")
+    press("MP_JoinBring")
+    check("S4d: repeated Escape and stale page callbacks have no effect", #events("w159") == joinPress + 2
+        and KCD2MP.w159.page == "root")
+
+    KCD2MP_W159Tick()
+    before = #events("w159")
+    press("MP_StartGame")
+    seq = KCD2MP.evtSeq
+    e = events("w159")
+    check("S5: joining can request Start Game on the same settings", #e == before + 1 and e[#e] == "role host" and KCD2MP.w159.page == "root")
+    local reason = "Close the active session before hosting."
+    push("join", seq, reason)
+    p = lastPage()
+    local displayed = false
+    for _, b in ipairs(p) do
+        if tostring(b.text):find(reason, 1, true) or tostring(b.tip):find(reason, 1, true) then displayed = true end
+    end
+    check("S6: a rejected switch keeps the current root and explains it", KCD2MP.w159.page == "root" and displayed and lastSel() == "MP_JoinGame")
+    press("MP_StartGame")
+    seq = KCD2MP.evtSeq
+    push("host", seq)
+    local load = find(lastPage(), "MP_Load_1")
+    check("S7: a subsequent accepted request opens Start Game with the same world", KCD2MP.w159.page == "host"
+        and load and load.text == "Playline 2" and lastSel() == "MP_Load_1")
+    press("MP_Back")
+    before = #events("w159")
+    press("MP_StartGame")
+    check("S8: the current role opens its page without changing the session", KCD2MP.w159.page == "host" and #events("w159") == before)
+    press("MP_Load_1")
+    e = events("w159")
+    check("S8b: the accepted host role routes the original save to the launcher", #e == before + 1 and e[#e] == "load 2 autosave118")
+    check("S9: no swallowed Lua errors", #ERRS == 0, ERRS[1])
 end
 
 -- (D) disarm, recap ------------------------------------------------------------------------------------------------------------

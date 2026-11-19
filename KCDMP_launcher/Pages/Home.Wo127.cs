@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using KCDMP_launcher.Components.Shared;
 using KCDMP_launcher.Models;
 using KcdMp.Wire;
+using SessionRole = KCDMP_launcher.Models.SessionRole;
 using Serilog;
 
 namespace KCDMP_launcher.Pages
@@ -52,6 +53,8 @@ namespace KCDMP_launcher.Pages
         private bool messageAddressFallback;
         private bool messageReportBug;
         private string fallbackAddress = "";
+        private long messageRevision;
+        private long? diagnosticMessageRevision;
 
         // The agent's connection, in plain words
         private string connStatusLine = "";
@@ -77,9 +80,18 @@ namespace KCDMP_launcher.Pages
             $"--port {settings.HostPort}" +
             (settings.HostAllowSteam ? $" --steam true --steam-app {settings.SteamAppId}{SteamGameArg}" : "");
 
+        private bool HostSettingsLocked =>
+            launchPreparationBusy || roleSwitchBusy || roleGame is not null
+            || launchStage is not (LaunchStage.Idle or LaunchStage.Failed);
+
         /// <summary>"Also allow Steam" flipped in the Host window: restart the relay with the new choice.</summary>
         private async Task SetHostAllowSteamAsync(bool on)
         {
+            if (!showHostInfo || HostSettingsLocked)
+            {
+                Log.Information("MP-LAUNCH host settings change refused reason=stale-or-active-session");
+                return;
+            }
             if (settings.HostAllowSteam == on) return;
             settings.HostAllowSteam = on;
             WriteSettings("Also allow Steam", nameof(AppSettings.HostAllowSteam));   // WO-154: this key only
@@ -230,7 +242,7 @@ namespace KCDMP_launcher.Pages
             settings.LastSteamCode = code;
             showJoinSteam = false;
             Log.Information("Join through Steam (app {App})", settings.SteamAppId);
-            await LaunchGame(new ServerInfo { Name = "(Steam)", Ip = "", Port = 0, Ping = 0, SteamCode = code });
+            await LaunchJoinGame(new ServerInfo { Name = "(Steam)", Ip = "", Port = 0, Ping = 0, SteamCode = code });
         }
 
         // ------------------------------------------------------------ Test connection (address)
@@ -241,13 +253,18 @@ namespace KCDMP_launcher.Pages
         {
             if (AgentPathOrError() is not { } agent) return;
             ShowMessage("TESTING...", server.SteamCode is null ? "Reaching the host..." : "Reaching the host through Steam (up to 20 seconds)...", "");
+            long revision = messageRevision;
+            diagnosticMessageRevision = revision;
+            bool CurrentDiagnostic() => showMessage && revision == messageRevision;
             var (r, blocked) = await RunHelperAsync<TestConnectionData>(agent, server.SteamCode is null
                     ? $"--test-connection --host {server.Ip} --port {server.Port}"
                     : $"--test-connection --steam \"{server.SteamCode}\" --steam-app {settings.SteamAppId}{SteamGameArg}",
-                "TEST-CONNECTION", TimeSpan.FromSeconds(45));
-            if (blocked) return;   // WO-154: the blocked-file message replaced "TESTING..."
+                "TEST-CONNECTION", TimeSpan.FromSeconds(45), CurrentDiagnostic);
+            if (blocked || !CurrentDiagnostic()) return;
             var (msg, ok) = DescribeTest(r);
-            ShowMessage(ok ? "CONNECTION OK" : launching ? "CAN'T REACH THE HOST" : "CONNECTION TEST", msg, "");
+            if (ok && !launching) sessionRoles.RememberJoinTarget(server);
+            ShowMessage(ok ? "CONNECTION OK" : launching ? "CAN'T REACH THE HOST" : "CONNECTION TEST", msg, "",
+                roleTarget: ok && !launching ? sessionRoles.JoinTarget : null);
         }
 
         /// <summary>The one line the tester reads; the detail goes to the log only.</summary>
@@ -265,8 +282,11 @@ namespace KCDMP_launcher.Pages
             return ((msg + " " + r.Next).Trim(), ok);
         }
 
-        private void ShowMessage(string title, string text, string next, bool addressFallback = false, bool reportBug = false, bool launchAnyway = false)
+        private void ShowMessage(string title, string text, string next, bool addressFallback = false, bool reportBug = false, bool launchAnyway = false, ServerInfo? roleTarget = null)
         {
+            messageRevision++;
+            diagnosticMessageRevision = null;
+            directRoleTarget = roleTarget;
             messageTitle = title; messageText = text; messageNext = next; messageAddressFallback = addressFallback;
             messageReportBug = reportBug;   // WO-154: the blocked-file message offers Report a bug
             launchAnywayAvailable = launchAnyway;   // WO-157: and, for the mod's own files, LAUNCH ANYWAY
@@ -274,15 +294,21 @@ namespace KCDMP_launcher.Pages
             _ = InvokeAsync(StateHasChanged);
         }
 
+        private void DismissMessage()
+        {
+            messageRevision++;
+            diagnosticMessageRevision = null;
+            directRoleTarget = null;
+            showMessage = false;
+        }
+
         // ------------------------------------------------------------ the session agent
 
-        /// <summary>Starts the session agent for <paramref name="server"/> (address or Steam code), replacing any running one.</summary>
-        private void StartAgent(ServerInfo server)
+        /// <summary>Starts the agent for the selected role and transport.</summary>
+        private void StartAgent(SessionLaunchPlan plan, Process game)
         {
             string agentPath = ResolveAgainstLauncher(settings.AgentPath);
-            // WO-50: --hosting is also WO-127's host claim (the relay makes this agent
-            // the authority whatever order people connect in).
-            bool isHosting = hostedRelayProcess != null && !hostedRelayProcess.HasExited;
+            var server = plan.Server;
             string target = server.SteamCode is { } code
                 ? $"--steam \"{code}\" --steam-app {settings.SteamAppId}{SteamGameArg}"
                 : $"--host {server.Ip} --port {server.Port}";
@@ -294,7 +320,7 @@ namespace KCDMP_launcher.Pages
             var agentArgs = target +
                 " " + VoiceSetting.AgentFlag(settings.VoiceChatOn) +
                 " " + KeepAwakeSetting.AgentFlag(settings.KeepGameRunningInBackground) +   // WO-207 C.2
-                (isHosting ? " --hosting" : "");
+                plan.HostClaimArgument;
 
             var agentStartInfo = new ProcessStartInfo
             {
@@ -305,9 +331,10 @@ namespace KCDMP_launcher.Pages
             };
 
             StopExistingAgent();
-            agentProcess = StartChecked(agentStartInfo);   // WO-154: Windows refusing it is told plainly by the caller
-            Log.Information("Agent started via {Via}", server.SteamCode is null ? "address" : "Steam");
-            pendingServer = server;
+            agentProcess = StartChecked(agentStartInfo) ?? throw new InvalidOperationException("The session agent did not start.");
+            agentGameProcess = game;
+            Log.Information("Agent started via {Via} for role {Role}", server.SteamCode is null ? "address" : "Steam", plan.Hosting ? "host" : "join");
+            pendingPlan = plan;
             steamFallbackShown = false;
             versionPollCts?.Cancel();
             versionPollCts = new CancellationTokenSource();
@@ -353,6 +380,7 @@ namespace KCDMP_launcher.Pages
                 {
                     var cs = alive ? await NetService.GetConnectionStatusAsync(settings.VersionIpcPort) : null;
                     var js = alive ? await NetService.GetJoinStatusAsync(settings.VersionIpcPort) : null;
+                    if (ct.IsCancellationRequested || !ReferenceEquals(agent, agentProcess)) return;
                     // Steam failed: offer the address right here, in this same launch.
                     if (cs is { State: "failed", Via: "steam" } && !steamFallbackShown && cs.Kind != "Lost")
                     {
@@ -392,22 +420,23 @@ namespace KCDMP_launcher.Pages
         /// <summary>After a Steam failure: the same game, the agent restarted with the host's address.</summary>
         private async Task ConnectByAddressAfterSteamAsync()
         {
-            string text = fallbackAddress.Trim();
-            string host = text; int port = settings.HostPort;
-            int colon = text.LastIndexOf(':');
-            if (colon > 0 && text.IndexOf(':') == colon && int.TryParse(text[(colon + 1)..], out int p)) { host = text[..colon]; port = p; }
-            if (!NetService.ValidateServerAddress(host, showError: false) || port is <= 0 or > 65535)
+            if (!TryJoinAddress(fallbackAddress, out var server))
             {
                 ShowMessage("STEAM CONNECTION FAILED", "That address doesn't look right. Type it like 203.0.113.7:7778 or myhost.example.net:7778.", "", addressFallback: true);
                 return;
             }
             showMessage = false;
-            var server = new ServerInfo { Name = "(Address)", Ip = host, Port = port };
-            bool gameUp = agentProcess != null && launchStage == LaunchStage.Connected;
             try
             {
-                if (gameUp) StartAgent(server);
-                else await LaunchGame(server);
+                if (launchStage == LaunchStage.Connected && pendingPlan is { Role: SessionRole.Join, Server.SteamCode: not null }
+                    && pendingGameProcess is { HasExited: false } game && ReferenceEquals(agentGameProcess, game))
+                {
+                    var plan = sessionRoles.Select(SessionRole.Join, server)!;
+                    StartAgent(plan, game);
+                    sessionRoles.RememberJoinTarget(server);
+                }
+                else if (launchStage == LaunchStage.Idle) await LaunchJoinGame(server);
+                else Log.Information("MP-LAUNCH Steam fallback refused reason=no-current-steam-join");
             }
             catch (LaunchBlockedException lb) { ShowBlocked(lb.Block); }   // WO-154
             StateHasChanged();

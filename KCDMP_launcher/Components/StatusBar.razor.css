@@ -63,6 +63,13 @@
     display: inline-block;
 }
 
+button.status-btn {
+    border: 0;
+    background: transparent;
+    font: inherit;
+    color: inherit;
+}
+
     .status-btn:hover {
         color: var(--kcd-gold-bright);
         text-shadow: 0 0 8px rgba(255, 219, 115, 0.7);

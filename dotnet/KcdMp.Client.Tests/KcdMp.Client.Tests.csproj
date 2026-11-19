@@ -12,6 +12,7 @@
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="MoonSharp" Version="2.0.0" PrivateAssets="all" />
     <PackageReference Include="xunit" Version="2.5.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
   </ItemGroup>
@@ -20,6 +21,7 @@
     <Using Include="Xunit" />
     <Using Include="KcdMp.Client" />
     <None Update="Fixtures/Replay/*.kcdrec" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../kdcmp/Data/Scripts/Startup/kdcmp.lua" Link="Fixtures/Lua/kdcmp.lua" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
@@ -46,6 +48,7 @@
     <Compile Include="..\..\KCDMP_launcher\Models\ModSettingsReport.cs" Link="Launcher\ModSettingsReport.cs" />
     <!-- WO-159: the main menu's Start Game / Join Game (the model, the menu's choices, the joiner's words). -->
     <Compile Include="..\..\KCDMP_launcher\Models\MenuTakeover.cs" Link="Launcher\MenuTakeover.cs" />
+    <Compile Include="..\..\KCDMP_launcher\Models\LauncherSessionRole.cs" Link="Launcher\LauncherSessionRole.cs" />
     <!-- WO-175 S2: the rolling saves backups and their restore. -->
     <Compile Include="..\..\KCDMP_launcher\Models\Wo175Backup.cs" Link="Launcher\Wo175Backup.cs" />
   </ItemGroup>
