@@ -25,6 +25,14 @@ constexpr auto kNoticeWaitSlice = std::chrono::milliseconds(5);
 enum class Lane : uint8_t { Realtime = 1, Bulk = 2, Latest = 3 };
 enum class Status : uint8_t { Completed = 0, Busy = 1, Unsupported = 2, Superseded = 3, Invalid = 4, Faulted = 5, Pending = 6 };
 
+constexpr uint8_t typed_reply(uint8_t request) {
+    switch (request) {
+        case kProbe: return kProbeReply;
+        case kRangedHand: return kRangedHandReply;
+        default: return 0;
+    }
+}
+
 inline uint32_t read_u32(const uint8_t* b) {
     return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
 }

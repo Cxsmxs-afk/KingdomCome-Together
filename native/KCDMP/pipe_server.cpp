@@ -1988,7 +1988,7 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                     kRangedHandVersion, receipt.result, receipt.known};
                 std::copy(receipt.left.begin(), receipt.left.end(), out + 5);
                 std::copy(receipt.right.begin(), receipt.right.end(), out + 21);
-                send_frame(h, edgelanes::kRangedHandReply, out, sizeof out, generation);
+                send_frame(h, edgelanes::typed_reply(type), out, sizeof out, generation);
                 break;
             }
             case edgelanes::kProbe: {
@@ -2000,7 +2000,7 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                     edgelanes::put_u32(out + 2, nonce);
                     edgelanes::put_u32(out + 6, frames);
                 }
-                send_frame(h, edgelanes::kProbeReply, out, sizeof out, generation);
+                send_frame(h, edgelanes::typed_reply(type), out, sizeof out, generation);
                 break;
             }
             case kNpcHold: {
@@ -2539,6 +2539,7 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
 
 uint8_t direct_reply_type(uint8_t request) {
     if (wo218rules::batchable(request)) return wo218rules::reply_type(request);
+    if (const uint8_t reply = edgelanes::typed_reply(request)) return reply;
     switch (request) {
         case kPing: return kPong;
         case kResolveLuaClosure: return kClosureInfo;
@@ -2553,7 +2554,6 @@ uint8_t direct_reply_type(uint8_t request) {
         case kSaveList: return kSaveListReply;
         case kJoinGuard: return kJoinGuardReply;
         case kLeashSample: return kLeashReply;
-        case edgelanes::kProbe: return edgelanes::kProbeReply;
         default: return kResult;
     }
 }

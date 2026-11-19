@@ -11,6 +11,10 @@ int edge_lanes_tests(int* passed) {
         if (result) ++*passed;
         else { ++failures; std::fprintf(stderr, "edge lanes: %s\n", label); }
     };
+    check(typed_reply(kRangedHand) == 0xBB && !kcdmp::wo218rules::batchable(kRangedHand),
+          "ranged hand dispatch and the Edge reply capture agree on the nested response type");
+    check(typed_reply(kProbe) == kProbeReply && typed_reply(kCombatEvent) == 0,
+          "the existing probe keeps its typed response and combat events use the generic result");
     const auto request = [](uint32_t id, Lane lane, uint32_t key = 0, uint8_t type = 0x20) {
         Request out;
         out.id = id;
