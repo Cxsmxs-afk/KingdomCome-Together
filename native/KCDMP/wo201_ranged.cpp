@@ -234,7 +234,6 @@ void tick() {
         if (g_lastActor || g_lastSoul) {
             stream_reset(gen, epoch, true);
             g_waitForPhaseAfterReplacement = true;
-            logf("MP-BOW capture reset reason=body-change");
         }
         g_lastActor = actor;
         g_lastSoul = ps;
@@ -267,14 +266,15 @@ void tick() {
     if(gen!=generation()||epoch!=scope_epoch()||actor!=local_actor(&verifiedEid)||eid!=verifiedEid||ps!=player_soul()){
         stream_reset(generation(),0,true);return;
     }
-    if (draw.aim != g_aim.aim)
-        logf("MP-BOW capture held=%d phase=%s charge_known=%d charge=%u angles=unverified",
-             draw.aim ? 1 : 0, phase_name(phase), draw.charge ? 1 : 0, static_cast<unsigned>(draw.charge.value_or(0)));
     g_aim = draw;
     if (!newPhase) return;
     const uint8_t was=g_last;g_last=phase;g_haveLast=true;c_changes.fetch_add(1);
     if(!g_q.push(row)){stream_reset(gen,epoch,false);return;} // explicit resync; never silently drop only Fire/Leaving
-    if(phase==3||phase!=was)logf("WO201-RANGED local %s -> %s capture=%llu source=%u known=%u epoch=%llu",phase_name(was),phase_name(phase),static_cast<unsigned long long>(t),row.source,row.known,static_cast<unsigned long long>(epoch));
+    if (phase == rangedaim::Firing || phase != was)
+        logf("WO201-RANGED local %s -> %s capture=%llu source=%u known=%u epoch=%llu held=%d charge_known=%d charge=%u angles=unverified",
+             phase_name(was), phase_name(phase), static_cast<unsigned long long>(t), row.source, row.known,
+             static_cast<unsigned long long>(epoch), draw.aim ? 1 : 0, draw.charge ? 1 : 0,
+             static_cast<unsigned>(draw.charge.value_or(0)));
 }
 
 // v2 only: [op86][version2][on1][expected P1gen8] -> header18 + <=10 rows48.
