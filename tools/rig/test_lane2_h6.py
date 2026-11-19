@@ -56,6 +56,35 @@ class H6EvidenceTests(unittest.TestCase):
         self.assertEqual('grey', self.check(death_rows(29))['status'])
         self.assertEqual('grey', self.check(death_rows(tail_ms=59_999))['status'])
 
+    def test_pipe_abort_inside_the_tail_fails_even_when_frames_continue(self):
+        rows = death_rows()
+        rows.insert(-1, native_line(86_401_000, 'PIPE: agent disconnected'))
+        self.assertIn('native-pipe-disconnected-during-h6', self.check(rows)['red'])
+        shutdown = native_line(86_461_000, 'PIPE: agent disconnected')
+        self.assertEqual('green', self.check([*death_rows(), shutdown])['status'])
+
+    def test_thirty_deaths_cannot_be_combined_across_connections(self):
+        rows = death_rows()
+        split = next(i for i, row in enumerate(rows) if 'attempt=16 ' in row)
+        rows[split:] = [row.replace('connection=1', 'connection=2') for row in rows[split:]]
+        self.assertIn('h6-run-scope-changed', self.check(rows)['red'])
+
+    def test_uncertain_dispatch_can_only_close_on_the_same_single_dispatch(self):
+        rows = [row.replace('stage=death-pending', 'stage=apply-uncertain') if 'attempt=1 ' in row else row
+                for row in death_rows()]
+        self.assertEqual('green', self.check(rows)['status'])
+        dispatched = next(i for i, row in enumerate(rows) if 'attempt=1 ' in row and 'stage=death-dispatched' in row)
+        rows.insert(dispatched + 1, rows[dispatched])
+        self.assertIn('attempt-1-duplicate-terminal-or-dispatch', self.check(rows)['red'])
+
+    def test_a_confirmed_abort_is_separate_from_the_regular_thirty(self):
+        rows = death_rows()
+        first = next(i for i, row in enumerate(rows) if 'attempt=1 ' in row and 'stage=release-pending' in row)
+        rows[first + 1:first + 6] = [rows[first + 5].replace('stage=applied', 'stage=aborted-before-apply')]
+        report = self.check(rows)
+        self.assertIn('attempt-1-aborted-before-apply', report['red'])
+        self.assertEqual(29, len(report['qualified_deaths']))
+
     def test_ready_is_required_before_dispatch_and_isdead(self):
         rows = death_rows()
         ready = next(i for i, row in enumerate(rows) if 'attempt=1 ' in row and 'stage=ready' in row)
