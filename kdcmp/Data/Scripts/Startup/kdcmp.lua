@@ -11583,7 +11583,7 @@ function KCD2MP_W214ReportGhostId(id, agent, expectedEntity)
         g.outfitAgent = agent or nil
         KCD2MP_W214GhostBirth = (KCD2MP_W214GhostBirth or 0) % 0xFFFFFF + 1
         g.outfitBirth = string.format("%06X", KCD2MP_W214GhostBirth)
-        g.w214HandRevision, g.w214HandClass = nil, nil
+        g.w214HandRevision, g.w214HandClass, g.w214OutfitCuePending = nil, nil, nil
         if W214 and W214.hand then W214.hand.gen[id] = (W214.hand.gen[id] or 0) + 1 end
     end
     KCD2MP_EmitEvent("ghostid", id .. " " .. hexid .. " " .. g.outfitBirth)
@@ -13547,6 +13547,10 @@ function KCD2MP_GhostCombat(id, evt)
 
     if evt == 0 or evt == 1 then
         local wantDrawn = (evt == 0)
+        -- A draw cue can reach this body before its typed hand report.
+        if ghost.outfitBirth and (ghost.w214HandClass ~= nil) ~= wantDrawn then
+            ghost.w214OutfitCuePending = true
+        end
         local isDrawn = KCD2MP.ghostWeaponDrawn[id] and true or false
         if isDrawn == wantDrawn then return end   -- heartbeat re-emits land here
         KCD2MP.ghostWeaponDrawn[id] = wantDrawn or nil
@@ -13660,6 +13664,7 @@ function KCD2MP_GhostDrawItem(id, classGuid)
         end
     end)
     if drew then
+        if ghost.outfitBirth and not ghost.w214HandClass then ghost.w214OutfitCuePending = true end
         KCD2MP.ghostWeaponDrawn[id] = true
         mp_log("CombatViz: ghost " .. id .. " drew oversized item from inventory")
     else
@@ -36500,9 +36505,15 @@ do
     function KCD2MP_W214OutfitEntity(id, body, revision, birth)
         local g = KCD2MP.ghosts and KCD2MP.ghosts[tostring(id)]
         if not w214BodyMatches(g, body, birth) then w214OutfitRefused(id, "old-body"); return nil end
-        if KCD2MP_W214On("figure_hands") and revision ~= (g.w214HandRevision or "0000000000000000") then
-            w214OutfitRefused(id, "old-hand")
-            return nil
+        if KCD2MP_W214On("figure_hands") then
+            if revision ~= (g.w214HandRevision or "0000000000000000") then
+                w214OutfitRefused(id, "old-hand")
+                return nil
+            end
+            if g.w214OutfitCuePending then
+                w214OutfitRefused(id, "draw-pending")
+                return nil
+            end
         end
         return g.entity
     end
@@ -36557,6 +36568,11 @@ do
         if body then
             if not w214BodyMatches(g, body, birth) then w214OutfitRefused(id, "hand-old-body"); return false end
             if g.w214HandRevision and revision < g.w214HandRevision then w214OutfitRefused(id, "hand-old-revision"); return false end
+            if g.w214OutfitCuePending and revision == (g.w214HandRevision or "0000000000000000") then
+                w214OutfitRefused(id, "hand-cue-pending")
+                return false
+            end
+            g.w214OutfitCuePending = nil
             g.w214HandRevision = revision
             g.w214HandClass = drawn and cls ~= "-" and cls or nil
         end
