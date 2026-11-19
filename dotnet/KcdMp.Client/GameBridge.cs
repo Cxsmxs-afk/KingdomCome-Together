@@ -4865,7 +4865,14 @@ public partial class GameBridge(ClientConfig config)
                     payload = kept;
                 }
                 if (W202("ping_network") && Wo202TakeAtRead(type, payload)) continue;   // WO-202 III.2: the network's answers, never behind the queue
-                if (type == Protocol.Disconnect && payload.Length == 1) GuidedRunObserveLoss(stream, payload[0]);
+                if (type == Protocol.Disconnect && payload.Length == 1)
+                {
+                    GuidedRunObserveLoss(stream, payload[0]);
+                    RetireJoinCalendarAtRead(payload[0], stream);
+                }
+                if (type == Protocol.JoinAbortDown && Protocol.TrySplitJoinDown(payload, out byte abortSource, out byte abortTarget,
+                        out uint abortedJoin, out _) && abortTarget == _myGhostId)
+                    RetireJoinCalendarAtRead(abortSource, stream, abortedJoin);
                 WorldReconnectObserveAtRead(presentationSession, type, payload);
                 if (Wo206TakeAtRead(type, payload)) continue;   // WO-206 E: an epoch is known from the frame it arrives in, never behind the queue
                 uint stamp = Wo206StampAtRead(payload);         // WO-206 E: the world epoch this frame was sent under

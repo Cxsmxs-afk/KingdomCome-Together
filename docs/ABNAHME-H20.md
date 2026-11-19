@@ -27,6 +27,20 @@ Ein fünfter Test lässt während der echten Kalender-Wartephase sechs weitere S
 2. Für dieselbe Join-ID müssen Host- und Gast-Logs `snapshot=sent`, `bootstrap accepted`, `receipt=accepted`, `pre-update latch armed before load`, den Latch-Readback nach dem Laden und `reason=ready` zeigen. `clock_in` ist beim Gast mindestens 1. Bei verlorener Zustellung erscheint auch `snapshot=repeated`.
 3. Für den Owner-Nachweis beide frischen Mitschnitte mit `rp_owner_n>0` und `owner_violations=0` prüfen. Das Verhalten im Spiel und die Main-Thread-Kosten werden anhand von `FRAME`, `MAIN-COST`, `MP-W207-Q` und `MP-LINK` abgenommen.
 
+## Gegenproben zum Scope
+
+Auf dem lokalen Vorgänger `67cb67b` konnte ein verspätetes Paket vom bestätigten Host mit derselben Join-ID den Latch um 1.000 ms verfälschen. Der Reader prüfte die beim Lesen gelernte Welt-Epoche. Das Paket selbst enthielt nur die Join-ID. In einer separaten Probe vor dem Angebot blieb nach einem echten Relay-Disconnect die ausstehende Join-ID ungleich null. Ein nicht bestätigter Engine-Hold lieferte auf derselben Basis trotzdem ein Angebot, das der Gast erfolgreich lud. Der Progress-Test beobachtete außerdem, dass das WorldSync-Gate die Meldungen während des Host-Holds vollständig verwarf. [Kalender-Reader](../dotnet/KcdMp.Client/GameBridge.HostCalendar.cs) · [Relay-Proben](../dotnet/KcdMp.Client.Tests/JoinCalendarIntegrationTests.cs)
+
+Der eingefrorene `W164Clock` führt die Join-ID im Umschlag und die ursprüngliche Welt-Epoche im Token. Der Reader bindet Angebot, Cache und Quittung an den bei der Anfrage bestätigten Host und dieselbe Relay-Verbindung. Ein alter ungebundener Snapshot wird abgelehnt. Der Host muss den Engine-Hold und die tatsächlich stehende Uhr belegen. Fortschritt ist eine Join-Steuermeldung. Er kann den Hold erst verlängern, wenn der genaue Gast den Kalender für diesen Versuch quittiert hat. Gelesener Host-Abbruch und Host-Verlust sperren die Ladefreigabe. Der Gast bestätigt die native Offer-Generation vor dem Setzen des Latch und prüft die Pipe-Revision erneut beim Dispatch. [Sendeseite](../dotnet/KcdMp.Client/GameBridge.JoinCalendarHost.cs) · [Ladefreigabe](../dotnet/KcdMp.Client/GameBridge.Wo124.cs) · [Fortschritt](../dotnet/KcdMp.Client/GameBridge.Wo204.cs)
+
+Die fünf zusätzlichen Pflichtfälle prüfen alte oder doppelte Kalenderpakete, Host-Verlust vor Angebot und nach Transfer, einen nicht bestätigten Engine-Hold und Fortschrittsmeldungen vor Kalenderquittung. Die Paketprobe speist veränderte und duplizierte Kopien eines echten Relay-Frames unmittelbar vor dem produktiven Reader ein. Die Verlustprobe beendet die echte TCP-Senderichtung des Hosts. Spielkonsole und Engine-Log sowie die Antworten der DLL-Pipe sind Testgrenzen.
+
+```powershell
+pwsh -NoProfile -File tools/Test-JoinReadiness.ps1 -Check EndToEnd
+```
+
+Das Selbst-Review hat den bisherigen vierparametrigen Aufruf für private Ladepfade erhalten. Der bestehende Test für ein zeitversetzt verarbeitetes Angebot eröffnet den Versuch jetzt über den produktiven Anforderungspfad. Er prüft weiterhin, dass die Verdrängung durch eine neuere Welt-Epoche die Herkunft des Angebots unverändert lässt. Join-Freigabe und Host-Verlust verwenden denselben Zustandslock. Alte Welt- und Join-Nachrichten unterscheiden sich in den Meldungen `different-world` und `inactive-attempt`. Die zusätzliche native Offer-Bestätigung liegt einmalig im Ladepfad. Ihre Zeit und die Zeit bis zum echten Latch-Readback sind auf beiden PCs zu messen. Offen bleiben grüner Windows-Volllauf, exakter Build im Drop-in und die Abnahme mit derselben Join-ID auf beiden PCs.
+
 ## Löschliste und Leistungsbudget
 
 Das Cache-Schreiben des Join-Snapshots im Gameplay-Pfad und die lokale Fünf-Sekunden-Abbruchfrist entfallen. Der Host hält pro laufendem Versuch einen eingefrorenen Snapshot. Solange dessen Bestätigung aussteht, sendet er höchstens zwei Wiederholungen pro Sekunde an genau diesen Gast. Der Reader führt dafür keine Pipe- oder HTTP-Arbeit aus. Die Autorität für die Uhr bleibt bei der Host-Welt. Die echte Zwei-PC-Messung ist offen.

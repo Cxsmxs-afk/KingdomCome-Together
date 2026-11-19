@@ -12,6 +12,8 @@ public partial class GameBridge
     private readonly SemaphoreSlim _hostCalendarGate = new(1, 1);
     private readonly SemaphoreSlim _hostCalendarSendGate = new(1, 1);
     private readonly object _hostCalendarLock = new();
+    private sealed record JoinCalendarRequest(uint JoinId, byte Host, Stream Link);
+    private JoinCalendarRequest? _joinCalendarRequest;
     private HostCalendarSample? _hostCalendar;
     private HostCalendarSample? _hostCalendarBootstrap;
     private uint _hostCalendarBootstrapWorld;
@@ -51,6 +53,11 @@ public partial class GameBridge
                     Console.WriteLine($"MP-CALENDAR join 0x{joinId:x8}: snapshot send refused reason=retired-join");
                     return false;
                 }
+                if (!join.EngineHeld || clock.Ratio != 0)
+                {
+                    Console.WriteLine($"MP-CALENDAR join 0x{joinId:x8}: snapshot send refused reason=world-not-frozen");
+                    return false;
+                }
                 await SendHeldJoinCalendarAsync(join, text, linked.Token);
                 T3SideGuard(life);
                 return true;
@@ -88,7 +95,10 @@ public partial class GameBridge
             return true;
         }
         if (!TryParseHostCalendar(message.Text, out var sample)) return DropJoinCalendar(source, 0, "invalid-sample");
-        if (!sample.IsJoinSnapshot) return false;
+        if (!sample.IsJoinSnapshot) return joinId == 0 && sample.JoinId == 0
+            ? false
+            : DropJoinCalendar(source, joinId, "not-frozen");
+        if (joinId != sample.JoinId) return DropJoinCalendar(source, sample.JoinId, "wrong-attempt-envelope");
         if (target != _myGhostId) return DropJoinCalendar(source, sample.JoinId, "wrong-recipient");
 
         bool duplicate;
@@ -97,8 +107,10 @@ public partial class GameBridge
             if (ct.IsCancellationRequested || !ReferenceEquals(stream, _wo122Stream))
                 return DropJoinCalendar(source, sample.JoinId, "retired-link");
             if (!T3SideSource(source)) return DropJoinCalendar(source, sample.JoinId, "not-current-host");
-            if (frame.Stamp == 0 || frame.Stamp != _w206.World)
+            if (message.Tok == 0 || message.Tok != frame.Stamp || frame.Stamp != _w206.World)
                 return DropJoinCalendar(source, sample.JoinId, "different-world");
+            if (_joinCalendarRequest is not { } request || request.JoinId != sample.JoinId || request.Host != source ||
+                !ReferenceEquals(request.Link, stream)) return DropJoinCalendar(source, sample.JoinId, "inactive-attempt");
             var joining = _jj;
             bool active = joining is not null
                 ? joining.JoinId == sample.JoinId && joining.HostWorldEpoch == frame.Stamp && !joining.Abandoned.Task.IsCompleted
@@ -128,7 +140,41 @@ public partial class GameBridge
 
     private bool JoinCalendarCurrent(JoinerJoin join, long generation) =>
         ReferenceEquals(_jj, join) && !join.Abandoned.Task.IsCompleted && join.HostWorldEpoch == _w206.World
+        && Volatile.Read(ref _joinCalendarRequest) is { } request && request.JoinId == join.JoinId &&
+        request.Host == join.Host && ReferenceEquals(request.Link, _wo122Stream)
+        && (!LoadSequenceEnabled || _worldLoad.Current.Generation == join.LoadGeneration)
         && generation == Interlocked.Read(ref _hostCalendarGeneration);
+
+    private void ClearJoinCalendarBootstrap()
+    {
+        lock (_hostCalendarLock)
+        {
+            _hostCalendarBootstrap = null;
+            _hostCalendarBootstrapWorld = 0;
+            _hostCalendarBootstrapStream = null;
+            _hostCalendarChanged?.TrySetResult();
+            _hostCalendarChanged = null;
+        }
+    }
+
+    private void RetireJoinCalendarAtRead(byte host, Stream stream, uint? joinId = null)
+    {
+        lock (_joinGate)
+        {
+            if (_joinCalendarRequest is not { } request || request.Host != host || !ReferenceEquals(request.Link, stream) ||
+                joinId is uint aborted && request.JoinId != aborted) return;
+            Volatile.Write(ref _joinCalendarRequest, null);
+            ClearJoinCalendarBootstrap();
+            if (_jj is { Phase: "preparing" } active && active.JoinId == request.JoinId)
+                active.Abandoned.TrySetResult(true);
+            if (joinId is not null && _joinRx is null && _joinOutId == request.JoinId)
+            {
+                _joinOutId = 0;
+                SetJoinUi("aborted", "The host stopped the join.");
+            }
+            Console.WriteLine($"MP-CALENDAR join 0x{request.JoinId:x8}: bootstrap retired reason={(joinId is null ? "host-left" : "host-abort")}");
+        }
+    }
 
     private bool DropJoinCalendar(byte source, uint joinId, string reason)
     {
@@ -142,7 +188,9 @@ public partial class GameBridge
     {
         try
         {
-            if (!ReferenceEquals(stream, _wo122Stream) || world != _w206.World)
+            if (!ReferenceEquals(stream, _wo122Stream) || world != _w206.World ||
+                Volatile.Read(ref _joinCalendarRequest) is not { } request || request.JoinId != joinId || request.Host != host ||
+                !ReferenceEquals(request.Link, stream))
             {
                 DropJoinCalendar(host, joinId, "receipt-retired");
                 return;
@@ -281,6 +329,19 @@ public partial class GameBridge
         {
             T3SideGuard(life);
             if (!JoinCalendarCurrent(join, generation)) return false;
+            if (LoadSequenceEnabled)
+            {
+                var load = _worldLoad.Current;
+                if (load.Generation != join.LoadGeneration || load.Phase != WorldLoadPhase.Offer ||
+                    !await LoadSequenceSyncNativeAsync() || !JoinCalendarCurrent(join, generation) ||
+                    _worldLoad.Current is not { Phase: WorldLoadPhase.Offer } offer ||
+                    offer.HostWorld != join.HostWorldEpoch || offer.OwnIntentRevision != load.OwnIntentRevision)
+                {
+                    DropJoinCalendar(join.Host, join.JoinId, "native-offer-not-confirmed");
+                    return false;
+                }
+            }
+            long pipeRevision = _combat.EdgeConnectionRevision;
             var r = await _combat.CalendarFollowAsync(2, host.TargetMs(Environment.TickCount64), host.Ratio, linked.Token);
             T3SideGuard(life);
             if (r is not { Result: 1 or 2 })
@@ -288,7 +349,13 @@ public partial class GameBridge
                 Console.WriteLine($"MP-CALENDAR join 0x{join.JoinId:x8}: native calendar latch refused -- load not issued");
                 return false;
             }
-            if (!JoinCalendarCurrent(join, generation)) return false;
+            if (!JoinCalendarCurrent(join, generation) || pipeRevision != _combat.EdgeConnectionRevision)
+            {
+                DropJoinCalendar(join.Host, join.JoinId, "calendar-actuator-retired");
+                return false;
+            }
+            join.CalendarGeneration = generation;
+            join.CalendarPipeRevision = pipeRevision;
             _hostCalendarArmed = true;
             _reloadConvergeTarget = null;
             Console.WriteLine(FormattableString.Invariant($"MP-CALENDAR join 0x{join.JoinId:x8}: pre-update latch armed before load host_ms={host.TargetMs(Environment.TickCount64)} ratio={host.Ratio:F3}"));

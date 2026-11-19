@@ -14,6 +14,7 @@ public sealed class JoinCalendarIntegrationCollection { }
 public sealed class JoinCalendarIntegrationTests
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress }
 
     [Theory]
     [InlineData(false)]
@@ -29,9 +30,28 @@ public sealed class JoinCalendarIntegrationTests
 
     [Fact]
     public Task A_delayed_calendar_can_arrive_after_five_seconds_while_the_host_still_waits() =>
-        RunAsync("A", "B", dropFirstSnapshot: true, delaySnapshot: true);
+        RunAsync("A", "B", dropFirstSnapshot: true, JoinProbe.Delay);
 
-    private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, bool delaySnapshot = false)
+    [Fact]
+    public Task Authenticated_stale_calendar_cannot_arm_the_latch_and_duplicates_arm_it_once() =>
+        RunAsync("A", "B", dropFirstSnapshot: false, JoinProbe.Scope);
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task Host_loss_retires_the_join_before_the_guest_can_load(bool beforeOffer) =>
+        RunAsync("A", "B", dropFirstSnapshot: false,
+            beforeOffer ? JoinProbe.HostLossBeforeOffer : JoinProbe.HostLossWhileWaiting);
+
+    [Fact]
+    public Task Host_does_not_offer_a_world_the_native_pipe_never_confirmed_as_held() =>
+        RunAsync("A", "B", dropFirstSnapshot: false, JoinProbe.MissingHold);
+
+    [Fact]
+    public Task Menu_progress_cannot_renew_the_host_hold_before_the_calendar_receipt() =>
+        RunAsync("A", "B", dropFirstSnapshot: false, JoinProbe.MenuProgress);
+
+    private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None)
     {
         using var fixture = new SaveFixture();
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(25));
@@ -47,9 +67,10 @@ public sealed class JoinCalendarIntegrationTests
         var hostLink = new JoinWire(hostPeer.Wire, await hostPeer.DrainAsync(ct), dropFirstSnapshot: false);
         var guestLink = new JoinWire(guestPeer.Wire, await guestPeer.DrainAsync(ct), dropFirstSnapshot)
         {
-            WithholdFrozenSnapshots = delaySnapshot
+            WithholdFrozenSnapshots = probe is JoinProbe.Delay or JoinProbe.MenuProgress or JoinProbe.HostLossWhileWaiting,
+            WithholdWorldTransfer = probe == JoinProbe.HostLossBeforeOffer
         };
-        await using var hostPipe = new JoinCalendarTestPipe();
+        await using var hostPipe = new JoinCalendarTestPipe(refuseHold: probe == JoinProbe.MissingHold);
         await using var guestPipe = new JoinCalendarTestPipe();
         await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, fixture.HostSave, hostPipe.ObserveGameplayStarted);
         await using var guestGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "guest.log"), fixture.GuestSaves, null, guestPipe.ObserveGameplayStarted);
@@ -85,17 +106,50 @@ public sealed class JoinCalendarIntegrationTests
             Assert.False(Property<bool>(guest, "WorldSyncReady"));
             Assert.Equal(WorldLoadPhase.Menu, Get<WorldLoadSequence>(guest, "_worldLoad").Current.Phase);
 
-            var beforeOffer = new TaskCompletionSource<(long ClockIn, HostCalendarSample? Bootstrap)>(
+            var atOffer = new TaskCompletionSource<(long ClockIn, HostCalendarSample? Bootstrap)>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
-            guestLink.BeforeFirstOffer = () => beforeOffer.TrySetResult(
+            guestLink.BeforeFirstOffer = () => atOffer.TrySetResult(
                 (Get<long>(guest, "_w200ClockIn"), Get<HostCalendarSample?>(guest, "_hostCalendarBootstrap")));
+            if (probe == JoinProbe.Scope) guestLink.ProbeCalendarEpoch = Get<Wo206Epochs>(guest, "_w206").World;
             await InvokeAsync(guest, "SendJoinRequestAsync");
             uint joinId = Get<uint>(guest, "_joinOutId");
             Assert.NotEqual(0u, joinId);
-            if (delaySnapshot) await HoldPastOldCalendarDeadlineAsync(host, guest, hostGame, guestGame, hostPipe, guestLink, ct);
+            if (probe is JoinProbe.HostLossBeforeOffer or JoinProbe.HostLossWhileWaiting)
+            {
+                if (probe == JoinProbe.HostLossBeforeOffer) await atOffer.Task.WaitAsync(ct);
+                else await WaitForCalendarAsync(guest, ct);
+                hostPeer.FinishSending();
+                await WaitAsync(() => !Get<bool>(guest, "_hostModeKnown"), "the real relay's host departure", ct);
+                Assert.Equal(0u, Get<uint>(guest, "_joinOutId"));
+                Assert.Null(Get<HostCalendarSample?>(guest, "_hostCalendarBootstrap"));
+                Assert.False(guestPipe.ArmObserved.IsCompleted);
+                Assert.False(guestGame.LoadIssued.IsCompleted);
+                Assert.False(hostLink.Ready.IsCompleted);
+                return;
+            }
+            if (probe == JoinProbe.MissingHold)
+            {
+                Assert.Equal("clock-unavailable", await hostGame.Resumed.WaitAsync(ct));
+                Assert.False(atOffer.Task.IsCompleted);
+                Assert.Empty(guestLink.FrozenSnapshots);
+                Assert.False(guestPipe.ArmObserved.IsCompleted);
+                return;
+            }
+            if (probe == JoinProbe.MenuProgress)
+            {
+                await WaitForCalendarAsync(guest, ct);
+                Call(guest, "Wo204Tick", 0L);
+                var hostDrops = Get<ConcurrentDictionary<string, long>>(host, "_joinCalendarDrops");
+                await WaitAsync(() => hostDrops.ContainsKey("progress-before-calendar-receipt") ||
+                    Get<long>(host, "_w204JoinProgressIn") > 0, "the host's handling of the menu progress", ct);
+                Assert.Equal(0, Get<long>(host, "_w204JoinProgressIn"));
+                guestLink.WithholdFrozenSnapshots = false;
+            }
+            if (probe == JoinProbe.Delay)
+                await HoldPastOldCalendarDeadlineAsync(host, guest, hostGame, guestGame, hostPipe, guestLink, ct);
 
             string resumeReason = await hostGame.Resumed.WaitAsync(ct);
-            var (clockAtOffer, bootstrapAtOffer) = await beforeOffer.Task.WaitAsync(ct);
+            var (clockAtOffer, bootstrapAtOffer) = await atOffer.Task.WaitAsync(ct);
             Assert.NotEmpty(guestLink.FrozenSnapshots);
             Assert.All(guestLink.FrozenSnapshots, snapshot => Assert.Equal(joinId, snapshot.JoinId));
             Assert.True(resumeReason == "ready",
@@ -110,14 +164,22 @@ public sealed class JoinCalendarIntegrationTests
             Assert.True(hostPipe.SnapshotWhileHeld);
             Assert.Equal(guestLink.FrozenSnapshots.First().WorldMs, guestPipe.ArmedWorldMs);
             Assert.Equal(guestPipe.ArmedWorldMs, guestPipe.VerifiedWorldMs);
+            Assert.Equal(1, guestPipe.ArmRequests);
             Assert.True(Get<long>(guest, "_w200ClockIn") >= 1);
+            if (probe == JoinProbe.Scope)
+            {
+                Assert.Equal(1, clockAtOffer);
+                var drops = Get<ConcurrentDictionary<string, long>>(guest, "_joinCalendarDrops");
+                Assert.True(drops.ContainsKey("different-world"));
+                Assert.True(drops.ContainsKey("inactive-attempt"));
+            }
             if (dropFirstSnapshot)
             {
                 Assert.True(guestLink.DroppedFirstSnapshot);
                 Assert.True(guestLink.FrozenSnapshots.Count >= 2);
                 Assert.All(guestLink.FrozenSnapshots, snapshot => Assert.Equal(guestPipe.ArmedWorldMs, snapshot.WorldMs));
             }
-            else
+            else if (probe != JoinProbe.MenuProgress)
             {
                 Assert.True(clockAtOffer >= 1);
                 Assert.True(bootstrapAtOffer?.ReadyForJoin(Environment.TickCount64, joinId));
@@ -141,6 +203,10 @@ public sealed class JoinCalendarIntegrationTests
             }
         }
     }
+
+    private static Task WaitForCalendarAsync(GameBridge guest, CancellationToken ct) =>
+        WaitAsync(() => Get<TaskCompletionSource?>(guest, "_hostCalendarChanged") is not null,
+            "calendar wait after the complete world transfer", ct);
 
     private static async Task HoldPastOldCalendarDeadlineAsync(GameBridge host, GameBridge guest,
         JoinCalendarTestEngine hostGame, JoinCalendarTestEngine guestGame, JoinCalendarTestPipe hostPipe,
@@ -270,6 +336,7 @@ public sealed class JoinCalendarIntegrationTests
     private sealed class JoinWire(Stream wire, IReadOnlyList<ReplayPacket> initial, bool dropFirstSnapshot) : Stream
     {
         private readonly Queue<ReplayPacket> _initial = new(initial);
+        private readonly Queue<ReplayPacket> _injected = new();
         private readonly TaskCompletionSource<byte[]> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private ReadOnlyMemory<byte> _remaining;
         private int _dropped;
@@ -277,6 +344,8 @@ public sealed class JoinCalendarIntegrationTests
         public readonly ConcurrentQueue<HostCalendarSample> FrozenSnapshots = new();
         public bool DroppedFirstSnapshot => Volatile.Read(ref _dropped) != 0;
         public volatile bool WithholdFrozenSnapshots;
+        public bool WithholdWorldTransfer { get; init; }
+        public volatile uint ProbeCalendarEpoch;
         public Task<byte[]> Ready => _ready.Task;
         public Action? BeforeFirstOffer { get; set; }
 
@@ -285,7 +354,8 @@ public sealed class JoinCalendarIntegrationTests
             if (buffer.IsEmpty) return 0;
             while (_remaining.IsEmpty)
             {
-                if (!_initial.TryDequeue(out var packet))
+                bool replayed = _injected.TryDequeue(out var packet);
+                if (!replayed && !_initial.TryDequeue(out packet))
                 {
                     byte[] header = new byte[3];
                     int read = await wire.ReadAsync(header.AsMemory(0, 1), ct);
@@ -301,11 +371,22 @@ public sealed class JoinCalendarIntegrationTests
                     BeforeFirstOffer?.Invoke();
                     BeforeFirstOffer = null;
                 }
-                if (packet.Type == Protocol.W164Down && FrozenClock(packet.Payload) is { } sample)
+                if (WithholdWorldTransfer && packet.Type is Protocol.WorldOfferDown or Protocol.WorldChunkDown) continue;
+                if (!replayed && packet.Type == Protocol.W164Down && FrozenClock(packet.Payload) is { } sample)
                 {
                     FrozenSnapshots.Enqueue(sample);
                     bool firstDrop = dropFirstSnapshot && Interlocked.Exchange(ref _dropped, 1) == 0;
                     if (firstDrop || WithholdFrozenSnapshots) continue;
+                    if (ProbeCalendarEpoch != 0)
+                    {
+                        uint world = ProbeCalendarEpoch;
+                        ProbeCalendarEpoch = 0;
+                        _injected.Enqueue(CalendarWithScope(packet, sample.JoinId + 1, world, sample.WorldMs + 2000));
+                        _injected.Enqueue(CalendarWithScope(packet, sample.JoinId, world == 1 ? uint.MaxValue : world - 1, sample.WorldMs + 1000));
+                        _injected.Enqueue(packet);
+                        _injected.Enqueue(packet);
+                        continue;
+                    }
                 }
                 _remaining = ReplayPeer.Frame(packet.Type, packet.Payload);
             }
@@ -321,6 +402,16 @@ public sealed class JoinCalendarIntegrationTests
                 || !LootMsg.TryDecode(body, out var clock) || clock.Kind != Protocol.W164Clock) return null;
             return HostCalendar.TryParse(clock.Text, Environment.TickCount64, 0, false, 0, out var sample)
                 && sample.IsJoinSnapshot ? sample : null;
+        }
+
+        private static ReplayPacket CalendarWithScope(ReplayPacket original, uint joinId, uint world, long time)
+        {
+            byte source = original.Payload[0];
+            byte target = original.Payload[1];
+            var row = new LootMsg(Protocol.W164Clock, world, HostCalendar.Format(time, 0, 1, false, joinId));
+            byte[] framed = row.BuildUp(Protocol.W164Up, target);
+            BinaryPrimitives.WriteUInt32LittleEndian(framed.AsSpan(4), joinId);
+            return new ReplayPacket(Protocol.W164Down, [source, .. framed.AsSpan(3)]);
         }
 
         public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
