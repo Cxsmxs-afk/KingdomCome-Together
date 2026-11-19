@@ -340,9 +340,9 @@ void send_local_hit(const unsigned char guid[16], void* soul, float health_delta
 // WO-113: unsolicited respawn frames, written from the game thread under the
 // same write lock as LocalHit. A missing agent is logged by respawn.cpp's own
 // lines; here only a failed write is.
-void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what) {
+void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what, uint64_t expectedConnection = 0) {
     const uint64_t generation = g_connGen.load();
-    if (!g_connected || g_pipe == INVALID_HANDLE_VALUE) return;
+    if (!g_connected || (expectedConnection && generation + 1 != expectedConnection) || g_pipe == INVALID_HANDLE_VALUE) return;
     EnterCriticalSection(&g_write_lock);
     const bool sent = send_frame(g_pipe, type, body, len, generation);
     const DWORD err = sent ? 0 : GetLastError();
@@ -942,13 +942,10 @@ void send_local_action(uint8_t kind, uint8_t phase, int8_t ic, int8_t zone, int8
 }
 
 // WO-121: the local player's hit on a peer's avatar (main thread, hits::tick).
-void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material) {
-    BYTE body[14]{};
-    std::memcpy(body, &victimEid, 4);
-    std::memcpy(body + 4, &st, 4);
-    std::memcpy(body + 8, &hp, 4);
-    body[12] = flags; body[13] = material;
-    send_unsolicited(kPvpHitOut, body, sizeof(body), "PvpHit");
+void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material,
+                  const wo155rules::Observation& observation, uint64_t connection) {
+    const auto body = wo155rules::encode_notice(victimEid, st, hp, flags, material, observation);
+    send_unsolicited(kPvpHitOut, body.data(), static_cast<uint16_t>(body.size()), "PvpHit", connection);
 }
 
 // WO-210 E.2: the local player's blow on a copy, filtered here (main thread, wo210_hit's tick): the LocalHit frame with no numbers and
@@ -1471,17 +1468,29 @@ struct DeathBackend {
         return dead ? npcdeath::Life::Dead : npcdeath::Life::Alive;
     }
 
-    bool prepare(const DeathBody& body, const npcdeath::Request& request, uint64_t attempt) const {
+    npcdeath::Preparation prepare(const DeathBody& body, const npcdeath::Request& request, uint64_t attempt) const {
+        using Preparation = npcdeath::Preparation;
         const uint32_t eid = body.actions.eid;
-        if (!current(body, request, true) || !ready(body, attempt)) return false;
-        wo195::release(eid, "verified remote NPC death");
-        if (!current(body, request, true) || !ready(body, attempt)) return false;
-        hits::discard_from(eid, false);
-        uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
-        std::memcpy(payload + 2, &eid, sizeof eid);
-        uint8_t guard[32]{};
-        size_t used = 0;
-        return wo131::handle(payload, sizeof payload, guard, sizeof guard, &used) == wo131::kROk && used == 1 && guard[0] == 1;
+        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::Unchanged;
+        // WO195 can remove engagement, wish and motion holds. From its first
+        // call onward, a fault or refused readback cannot prove unchanged state.
+        KCDMP_FAULT_CALL(site, "pipe::npc_death/prepare");
+        try {
+            return fault::guarded_or(site, Preparation::Uncertain, [&] {
+                wo195::release(eid, "verified remote NPC death");
+                if (!current(body, request, true) || !ready(body, attempt) || !hits::discard_from(eid, false))
+                    return Preparation::Uncertain;
+                uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
+                std::memcpy(payload + 2, &eid, sizeof eid);
+                uint8_t guard[32]{};
+                size_t used = 0;
+                const auto result = wo131::handle(payload, sizeof payload, guard, sizeof guard, &used);
+                return result == wo131::kROk && used == 1 && guard[0] == 1 ? Preparation::Ready : Preparation::Uncertain;
+            });
+        } catch (...) {
+            report_tag(body, request, "prepare-exception");
+            return Preparation::Uncertain;
+        }
     }
 
     bool apply(const DeathBody& body, const npcdeath::Request& request) const {
@@ -1516,6 +1525,9 @@ struct DeathBackend {
             case npcdeath::Stage::ReleasePending: return report_tag(body, request, "release-pending");
             case npcdeath::Stage::ReleaseUncertain: return report_tag(body, request, "release-uncertain");
             case npcdeath::Stage::Ready: return report_tag(body, request, "ready");
+            case npcdeath::Stage::PrepareUnchanged: return report_tag(body, request, "prepare-unchanged");
+            case npcdeath::Stage::PrepareUncertain: return report_tag(body, request, "prepare-uncertain");
+            case npcdeath::Stage::PrepareObservedDead: return report_tag(body, request, "prepare-observed-dead");
             case npcdeath::Stage::DeathPending: return report_tag(body, request, "death-pending");
             case npcdeath::Stage::Applied: return report_tag(body, request, "applied");
             case npcdeath::Stage::Uncertain: return report_tag(body, request, "uncertain");

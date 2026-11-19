@@ -80,7 +80,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
     private const byte Wo121StatusReply  = 0x8A;
     private const byte AttributedReply   = 0x8B;   // [ok][seq][steps][attackerWuid:8][victimWuid:8]
     private const byte LocalAction       = 0x96;   // unsolicited, LocalActionFrame
-    private const byte PvpHitOut         = 0x97;   // unsolicited: [victimEid:4][stamina:4f][health:4f][flags][material]
+    private const byte PvpHitOut         = 0x97;   // unsolicited measured PvpHitNotice
     private const byte PvpLifeOut        = 0xBC;   // unsolicited: [nativeLifeProof:8]
     // WO-124: the joiner's side of the join (native/KCDMP/join_native.h, savelist.h)
     private const byte JoinPlace         = 0x1C;   // [hostX:4f][hostY:4f][hostZ:4f][dist:4f] -> 0x8C
@@ -156,10 +156,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
     public Func<LocalActionFrame, Task>? OnLocalAction { get; set; }
 
     /// <summary>WO-121: the local player hit a peer's avatar: victim eid, stamina, health (what the hit took), flags, material.</summary>
-    public Func<uint, float, float, byte, byte, Task>? OnPvpHit { get; set; }
+    internal Func<PvpHitNotice, Task>? OnPvpHit { get; set; }
     internal Func<Task>? OnPvpLifeChanged { get; set; }
     private ulong _pvpNativeLife;
     internal ulong PvpNativeLife => Volatile.Read(ref _pvpNativeLife);
+    internal bool PvpCaptureCurrent(PvpHitNotice notice) =>
+        notice.Origin is not null && notice.SourceLifeProof != 0 && notice.SourceLifeProof == PvpNativeLife &&
+        ReferenceEquals(Volatile.Read(ref _pipe), notice.Origin);
 
     /// <summary>WO-132: an NPC hit a peer's avatar (measured over the hit window, put back): victim eid, stamina, health, attacker eid, flags, attacker name.</summary>
     public Func<uint, float, float, uint, byte, string, Task>? OnNpcAvatarHit { get; set; }
@@ -582,7 +585,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             [1, _, 0] => NpcDeathReceipt.Applied,
             [0, _, 0x70] => NpcDeathReceipt.Pending,
             [0, _, 0x72] => NpcDeathReceipt.Stale,
-            [0, _, 0x73] when intent != NpcDeathIntent.Advance => NpcDeathReceipt.Aborted,
+            [0, _, 0x73] => NpcDeathReceipt.Aborted,
             _ => NpcDeathReceipt.Uncertain
         };
     }
@@ -2304,13 +2307,28 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     // Replies stay on the physical reader; callbacks can themselves need the
     // pipe or the relay. One FIFO worker retains unsolicited event order.
+    private const int MaxQueuedPvpNotices = 64;
+    private sealed class PvpNoticeBudget
+    {
+        public int Pending;
+        private long _nextLogTick;
+
+        public void NoteDrop(long now, string reason)
+        {
+            if (now < _nextLogTick) return;
+            _nextLogTick = now + 1000;
+            Console.WriteLine($"MP-FF dir=out stage=pipe result=dropped reason={reason}");
+        }
+    }
+
     private async Task ReadLoopAsync(NamedPipeClientStream myPipe, ChannelWriter<(byte Type, byte[] Body)> replies)
     {
-        var notices = Channel.CreateUnbounded<(byte Type, byte[] Body)>(new UnboundedChannelOptions
+        var notices = Channel.CreateUnbounded<(byte Type, byte[] Body, ulong ReadTick)>(new UnboundedChannelOptions
         {
             SingleReader = true, SingleWriter = true
         });
-        _ = RunDetached(() => ReadNoticesAsync(myPipe, notices.Reader));
+        var pvpBudget = new PvpNoticeBudget();
+        _ = RunDetached(() => ReadNoticesAsync(myPipe, notices.Reader, pvpBudget));
         try
         {
             while (myPipe.IsConnected)
@@ -2331,7 +2349,23 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 if (type == BatchReply) OnBatchReply(body);
                 else if (IsPipeNotice(type))
                 {
-                    if (!notices.Writer.TryWrite((type, body)))
+                    long readTick = 0;
+                    if (type == PvpHitOut)
+                    {
+                        readTick = Environment.TickCount64;
+                        if (body.Length != PvpHitNotice.Length)
+                        {
+                            pvpBudget.NoteDrop(readTick, "missing-native-capture");
+                            continue;
+                        }
+                        if (Interlocked.Increment(ref pvpBudget.Pending) > MaxQueuedPvpNotices)
+                        {
+                            Interlocked.Decrement(ref pvpBudget.Pending);
+                            pvpBudget.NoteDrop(readTick, "pvp-notice-backlog");
+                            continue;
+                        }
+                    }
+                    if (!notices.Writer.TryWrite((type, body, (ulong)readTick)))
                         throw new InvalidOperationException("The connection's notice queue has already closed.");
                 }
                 else if (!replies.TryWrite((type, body)))
@@ -2355,17 +2389,19 @@ public sealed partial class CombatPipe : IAsyncDisposable
         or LocalGrave or LocalAction or PvpHitOut or PvpLifeOut or NpcAvatarHit or NpcCombatOut or QuestChangeOut or NpcStreamOut or WorldOut
         or MenuOut or ActivityOut or ExtraOut or SleepOut or CrimeOut or DefenceOut or DiscardedHit or NpcDropped or NpcTraceDone;
 
-    private async Task ReadNoticesAsync(NamedPipeClientStream pipe, ChannelReader<(byte Type, byte[] Body)> notices)
+    private async Task ReadNoticesAsync(NamedPipeClientStream pipe,
+        ChannelReader<(byte Type, byte[] Body, ulong ReadTick)> notices, PvpNoticeBudget pvpBudget)
     {
-        await foreach (var (type, body) in notices.ReadAllAsync())
+        await foreach (var (type, body, readTick) in notices.ReadAllAsync())
         {
             if (!ReferenceEquals(_pipe, pipe)) return;
-            try { await DeliverNoticeAsync(type, body); }
+            try { await DeliverNoticeAsync(pipe, type, body, readTick); }
             catch (Exception ex) { Console.WriteLine($"[combat] notice 0x{type:X2} failed: {ex.GetType().Name}: {ex.Message}"); }
+            finally { if (type == PvpHitOut) Interlocked.Decrement(ref pvpBudget.Pending); }
         }
     }
 
-    private async Task DeliverNoticeAsync(byte type, byte[] body)
+    private async Task DeliverNoticeAsync(NamedPipeClientStream pipe, byte type, byte[] body, ulong readTick)
     {
         if (type == LocalHit && body.Length >= 24)
         {
@@ -2446,18 +2482,9 @@ public sealed partial class CombatPipe : IAsyncDisposable
         {
             if (OnPvpLifeChanged is { } h) await h();
         }
-        else if (type == PvpHitOut && body.Length == 14)
+        else if (type == PvpHitOut)
         {
-            if (OnPvpHit is { } h)
-            {
-                try
-                {
-                    await h(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)),
-                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
-                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12], body[13]);
-                }
-                catch (Exception ex) { Console.WriteLine($"[wo121] pvp hit not sent: {ex.Message}"); }
-            }
+            if (OnPvpHit is { } h) await h(PvpHitNotice.Read(body, readTick, pipe));
         }
         else if (type == NpcAvatarHit && body.Length >= 18 && body.Length == 18 + body[17])
         {
@@ -3022,6 +3049,26 @@ public sealed partial class CombatPipe : IAsyncDisposable
         // here could strand existing waiters or fault their finally blocks.
     }
 
+}
+
+/// <summary>A native measurement and its local monotonic timing. The measurement ID is scoped to the sender's native life.</summary>
+internal readonly record struct PvpHitNotice(uint VictimEid, float Stamina, float Health, byte Flags, byte Material,
+    ulong CapturedTick, ulong MeasuredTick, ulong SourceLifeProof, ulong MeasurementId, ulong ReadTick,
+    NamedPipeClientStream? Origin = null)
+{
+    internal const int Length = 14 + 4 * sizeof(ulong);
+    // The native watcher measures over 600 ms. Allow normal delivery plus bounded queue delay.
+    private const ulong CaptureBudgetMs = 2000;
+
+    internal bool FreshAt(ulong now) =>
+        CapturedTick != 0 && MeasuredTick >= CapturedTick && ReadTick >= MeasuredTick &&
+        now >= ReadTick && now - CapturedTick <= CaptureBudgetMs;
+
+    internal static PvpHitNotice Read(ReadOnlySpan<byte> bytes, ulong readTick, NamedPipeClientStream origin) =>
+        new(BinaryPrimitives.ReadUInt32LittleEndian(bytes), BinaryPrimitives.ReadSingleLittleEndian(bytes[4..]),
+            BinaryPrimitives.ReadSingleLittleEndian(bytes[8..]), bytes[12], bytes[13],
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes[14..]), BinaryPrimitives.ReadUInt64LittleEndian(bytes[22..]),
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes[30..]), BinaryPrimitives.ReadUInt64LittleEndian(bytes[38..]), readTick, origin);
 }
 
 

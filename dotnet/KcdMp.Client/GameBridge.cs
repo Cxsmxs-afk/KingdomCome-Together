@@ -4745,6 +4745,10 @@ public partial class GameBridge(ClientConfig config)
                 var pvpScope = pvpSession is not null && type is (Protocol.PlayerHitV8Down or Protocol.PvpPeerDown or Protocol.Disconnect)
                     ? new PvpFrameScope(pvpSession, Interlocked.Read(ref _p1Serial), Interlocked.Read(ref _t3InputLifeRevision),
                         Environment.TickCount64, type == Protocol.PlayerHitV8Down ? _combat.PvpNativeLife : 0)
+                    {
+                        RelayAtRead = type == Protocol.PlayerHitV8Down && payloadLen == PlayerHitV8.LifeDownLen
+                            ? PvpRelayTime(stream, Stopwatch.GetTimestamp()) : default
+                    }
                     : null;
                 long arrival   = Stopwatch.GetTimestamp();
                 var load = LoadSequenceCapture();
@@ -5138,7 +5142,7 @@ public partial class GameBridge(ClientConfig config)
             }
             else if (type == Protocol.PvpPeerDown)
             {
-                OnPvpPeer(payload, frame.PvpContact?.Session);
+                OnPvpPeer(payload, frame.PvpContact);
             }
             else if (type == Protocol.PlayerHitV8Down)
             {
@@ -6065,6 +6069,8 @@ public partial class GameBridge(ClientConfig config)
                 && rawId is > 0 and <= uint.MaxValue)
             {
                 uint? previousEntityId = _ghostEntityIds.TryGetValue(giParts[0], out uint prevId) ? prevId : null;
+                if (previousEntityId != (uint)rawId && byte.TryParse(giParts[0], out byte boundGhost))
+                    _wo121ContactSession?.NoteBodyBinding(boundGhost);
                 _ghostEntityIds[giParts[0]] = (uint)rawId;
                 // WO-100 Phase 4 item 1: a different id is a different body, so
                 // every event still in flight for the old one is now invalid.
@@ -7473,9 +7479,16 @@ public partial class GameBridge(ClientConfig config)
                 // that started under an already-spawned avatar never saw the
                 // spawn-time "ghostid" event; without an id, every v8 attack,
                 // block, dodge and jump for that avatar had nowhere to go.
-                if (npc.StartsWith("kcd2mp_", StringComparison.Ordinal) && byte.TryParse(npc.AsSpan(7), out byte bindGhost)
-                    && _ghostEntityIds.TryAdd(bindGhost.ToString(), eid))
-                    Console.WriteLine($"[wo121] ghost {bindGhost} entity id 0x{eid:X} learned from its native bind");
+                if (npc.StartsWith("kcd2mp_", StringComparison.Ordinal) && byte.TryParse(npc.AsSpan(7), out byte bindGhost))
+                {
+                    string ghost = bindGhost.ToString();
+                    if (!_ghostEntityIds.ContainsKey(ghost))
+                    {
+                        _wo121ContactSession?.NoteBodyBinding(bindGhost);
+                        if (_ghostEntityIds.TryAdd(ghost, eid))
+                            Console.WriteLine($"[wo121] ghost {bindGhost} entity id 0x{eid:X} learned from its native bind");
+                    }
+                }
                 NativeBindInOrder(async () =>
                 {
                     var (ok, reason) = await _combat.NpcBindAsync(true, eid, wuid, ax, ay, az, delayMs, npc,
@@ -8160,6 +8173,9 @@ public partial class GameBridge(ClientConfig config)
         long t0 = Stopwatch.GetTimestamp();
         await _tcpWriteLock.WaitAsync(ct);
         long t1 = Stopwatch.GetTimestamp();
+        bool pvpTiming = IsPvpLifeSend(packet);
+        long pvpTick = pvpTiming ? Environment.TickCount64 : 0;
+        byte pvpSource = pvpTiming ? _myGhostId : (byte)0;
         try
         {
             ProcessorFrameScope.ThrowIfAbandoned();
@@ -8171,6 +8187,7 @@ public partial class GameBridge(ClientConfig config)
             _tcpWriteLock.Release();
             Wo213NoteOut(packet, Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds, Stopwatch.GetElapsedTime(t1).TotalMilliseconds);   // WO-213 A.1/A.2
         }
+        if (pvpTiming) TracePvpSend(stream, pvpSource, packet, t1, pvpTick);
     }
 
     private static bool IntervalElapsed(ref long lastTimestamp, TimeSpan interval, long nowTimestamp)

@@ -50,7 +50,10 @@ public partial class GameBridge
     private Stream? _wo121Stream;
     private CancellationToken _wo121Ct;
     private volatile PvpContactSession? _wo121ContactSession;
-    private sealed record PvpFrameScope(PvpContactSession Session, long Lifecycle, long Life, long ReadTick, ulong NativeLife = 0);
+    private sealed record PvpFrameScope(PvpContactSession Session, long Lifecycle, long Life, long ReadTick, ulong NativeLife = 0)
+    {
+        public (long Ms, long Rtt) RelayAtRead { get; init; }
+    }
 
     private bool PvpRecipientCurrent(PvpFrameScope scope) =>
         ReferenceEquals(scope.Session, _wo121ContactSession) &&
@@ -63,8 +66,11 @@ public partial class GameBridge
         public Stream Relay { get; } = relay;
         private long _sent;
         private readonly (ulong Incarnation, PvpContactWindow Window)[] _received = new (ulong, PvpContactWindow)[256];
-        private readonly (ulong Incarnation, PvpLifeState Life, uint RetiredEntity, bool Detached)[] _targets =
-            new (ulong, PvpLifeState, uint, bool)[256];
+        private readonly (ulong Incarnation, PvpLifeState Life, uint RetiredEntity, bool Detached, ulong ObservedTick)[] _targets =
+            new (ulong, PvpLifeState, uint, bool, ulong)[256];
+        private readonly ulong[] _bodyBoundary = new ulong[256];
+        private ulong _measurementLife;
+        private PvpContactWindow _measurements;
         private PvpLifeState _localLife;
 
         public ulong Next() => (ulong)Interlocked.Increment(ref _sent);
@@ -80,25 +86,49 @@ public partial class GameBridge
             }
         }
 
-        public void NoteTarget(byte ghost, ulong incarnation, uint currentEntity, PvpLifeState life)
+        public bool TryClaimMeasurement(CombatPipe pipe, PvpHitNotice notice)
+        {
+            lock (_received)
+            {
+                if (!pipe.PvpCaptureCurrent(notice)) return false;
+                if (_measurementLife != notice.SourceLifeProof)
+                {
+                    _measurementLife = notice.SourceLifeProof;
+                    _measurements = default;
+                }
+                return _measurements.TryClaim(notice.MeasurementId);
+            }
+        }
+
+        public void NoteTarget(byte ghost, ulong incarnation, uint currentEntity, PvpLifeState life, ulong observedTick)
         {
             lock (_received)
             {
                 ref var target = ref _targets[ghost];
                 if (incarnation > target.Incarnation)
-                    target = (incarnation, life, target.Incarnation != 0 && !target.Detached ? currentEntity : 0, false);
+                    target = (incarnation, life, target.Incarnation != 0 && !target.Detached ? currentEntity : 0, false, observedTick);
                 else if (incarnation == target.Incarnation && life.Revision > target.Life.Revision)
+                {
                     target.Life = life;
+                    target.ObservedTick = Math.Max(target.ObservedTick, observedTick);
+                }
             }
         }
 
-        public (ulong Incarnation, ulong Proof) FindTarget(byte ghost, uint entity)
+        public (ulong Incarnation, ulong Proof, ulong ObservedTick) FindTarget(byte ghost, uint entity)
         {
             lock (_received)
             {
                 var target = _targets[ghost];
-                return entity != target.RetiredEntity ? (target.Incarnation, target.Life.Proof) : default;
+                return entity != target.RetiredEntity
+                    ? (target.Incarnation, target.Life.Proof, Math.Max(target.ObservedTick, _bodyBoundary[ghost]))
+                    : default;
             }
+        }
+
+        public void NoteBodyBinding(byte ghost)
+        {
+            lock (_received) _bodyBoundary[ghost] = (ulong)Environment.TickCount64;
         }
 
         public void NoteBodyDetached(byte ghost)
@@ -108,6 +138,7 @@ public partial class GameBridge
                 ref var target = ref _targets[ghost];
                 target.RetiredEntity = 0;
                 target.Detached = true;
+                _bodyBoundary[ghost] = (ulong)Environment.TickCount64;
             }
         }
 
@@ -396,9 +427,23 @@ public partial class GameBridge
         Console.WriteLine(FormattableString.Invariant($"MP-ACTION section=outbound kind={outKind} gen={_actionOut.Gen} {what} source_ms={ms}"));
     }
 
-    /// <summary>The local player hit a peer's avatar (0x97). The avatar kept nothing; the damage goes to its owner.</summary>
-    private async Task OnPvpHitAsync(uint victimEid, float stamina, float health, byte flags, byte material)
+    /// <summary>The native watcher measured contact on an avatar. The victim's game owns the effect.</summary>
+    private Task OnPvpHitAsync(PvpHitNotice hit) => SendPvpHitAsync(hit, diagnostic: false);
+
+    private Task SendDiagnosticPvpHitAsync(uint victimEid, float stamina, float health, byte flags)
     {
+        ulong now = (ulong)Environment.TickCount64;
+        return SendPvpHitAsync(new(victimEid, stamina, health, flags, 0, now, now, _combat.PvpNativeLife, 0, now),
+            diagnostic: true);
+    }
+
+    private async Task SendPvpHitAsync(PvpHitNotice hit, bool diagnostic)
+    {
+        uint victimEid = hit.VictimEid;
+        float stamina = hit.Stamina, health = hit.Health;
+        byte flags = hit.Flags;
+        ulong callbackTick = (ulong)Environment.TickCount64;
+        byte source = Volatile.Read(ref _myGhostId);
         byte? victim = null;
         foreach (var kv in _ghostEntityIds)
             if (kv.Value == victimEid && byte.TryParse(kv.Key, out byte gid)) { victim = gid; break; }
@@ -417,6 +462,21 @@ public partial class GameBridge
             Console.WriteLine(line + " result=dropped reason=contact-capability");
             return;
         }
+        bool sourceCurrent = diagnostic
+            ? hit.SourceLifeProof != 0 && hit.SourceLifeProof == _combat.PvpNativeLife
+            : _combat.PvpCaptureCurrent(hit);
+        if (!hit.FreshAt(callbackTick) || !sourceCurrent)
+        {
+            _w121FfOutDropped++;
+            Console.WriteLine(line + $" result=dropped reason=stale-native-capture measurement={hit.MeasurementId}");
+            return;
+        }
+        if (!diagnostic && !session.TryClaimMeasurement(_combat, hit))
+        {
+            _w121FfOutDropped++;
+            Console.WriteLine(line + $" result=dropped reason=measurement-stale-or-duplicate measurement={hit.MeasurementId}");
+            return;
+        }
         var recipient = session.FindTarget(vid, victimEid);
         if (recipient.Proof == 0 || !_ghostEntityIds.TryGetValue(vid.ToString(), out uint stillBound) || stillBound != victimEid)
         {
@@ -424,12 +484,18 @@ public partial class GameBridge
             Console.WriteLine(line + " result=dropped reason=recipient-life-unavailable");
             return;
         }
+        if (recipient.ObservedTick == 0 || hit.CapturedTick <= recipient.ObservedTick)
+        {
+            _w121FfOutDropped++;
+            Console.WriteLine(line + $" result=dropped reason=capture-before-recipient-life measurement={hit.MeasurementId} captured_tick={hit.CapturedTick} recipient_tick={recipient.ObservedTick}");
+            return;
+        }
         ulong contact = session.Next();
-        await WritePacketAsync(s, new PlayerHitV8(vid, stamina, health, flags, material)
+        await WritePacketAsync(s, new PlayerHitV8(vid, stamina, health, flags, hit.Material)
             .BuildUp(contact, recipient.Incarnation, recipient.Proof), _wo121Ct);
         _w121FfOut++;
         Wo155NoteFfSent(vid);   // WO-155: the knockdown this hit causes on his screen is the one his figure falls for here
-        Console.WriteLine(line + $" result=sent contact_seq={contact} recipient={recipient.Incarnation} recipient_life={recipient.Proof}");
+        Console.WriteLine(line + $" result=sent contact_seq={contact} recipient={recipient.Incarnation} recipient_life={recipient.Proof} source={source} measurement={hit.MeasurementId} captured_tick={hit.CapturedTick} measured_tick={hit.MeasuredTick} pipe_read_tick={hit.ReadTick} callback_tick={callbackTick} native_ms={hit.MeasuredTick - hit.CapturedTick} pipe_ms={hit.ReadTick - hit.MeasuredTick} queue_ms={callbackTick - hit.ReadTick}");
     }
 
     // =====================================================================
@@ -659,13 +725,13 @@ public partial class GameBridge
         }
     }
 
-    private void OnPvpPeer(byte[] frame, PvpContactSession? session)
+    private void OnPvpPeer(byte[] frame, PvpFrameScope? scope)
     {
-        if (session is null || !ReferenceEquals(session, _wo121ContactSession) ||
+        if (scope is null || !ReferenceEquals(scope.Session, _wo121ContactSession) ||
             (_w213Caps & Protocol.LinkCapPvpLife) == 0 || frame.Length != Protocol.PvpPeerLifeLen ||
             !Protocol.TryReadPvpPeer(frame, out byte ghost, out ulong incarnation, out var life)) return;
         _ghostEntityIds.TryGetValue(ghost.ToString(), out uint currentEntity);
-        session.NoteTarget(ghost, incarnation, currentEntity, life);
+        scope.Session.NoteTarget(ghost, incarnation, currentEntity, life, (ulong)scope.ReadTick);
     }
 
     /// <summary>0x45: a partner's friendly-fire hit on our Henry.</summary>
@@ -708,6 +774,7 @@ public partial class GameBridge
             Console.WriteLine(line + " result=recipient_retired reason=recipient-life" + contact);
             return;
         }
+        TracePvpRead(scope, attacker, sequence, recipientLife);
         var r = await _combat.ApplyPvpHitAsync(hit.Stamina, hit.Health, Wo155PvpFlags(hit.Flags), attacker, ct,
             recipientCurrent: () => _ffSession && hit.Victim == Volatile.Read(ref _myGhostId) &&
                 PvpRecipientCurrent(scope), sequence: sequence, incarnation: incarnation,

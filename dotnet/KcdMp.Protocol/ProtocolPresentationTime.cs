@@ -138,12 +138,20 @@ public sealed class PresentationClockClient
     public bool TryHostAt(long localArrivalMs, long relayToHostMs, out ulong hostMs)
     {
         hostMs = 0;
+        if (!TryRelayAt(localArrivalMs, out long relay, out _) ||
+            !PresentationClock.TryShift(relay, relayToHostMs, out long host)) return false;
+        hostMs = (ulong)host;
+        return true;
+    }
+
+    public bool TryRelayAt(long localArrivalMs, out long relayMs, out long roundTripMs)
+    {
+        relayMs = roundTripMs = 0;
         lock (_gate)
         {
             if (_sample is not { } sample || !sample.FreshClient(localArrivalMs) ||
-                !PresentationClock.TryShift(localArrivalMs, sample.ClientToRelayMs, out long relay) ||
-                !PresentationClock.TryShift(relay, relayToHostMs, out long host)) return false;
-            hostMs = (ulong)host;
+                !PresentationClock.TryShift(localArrivalMs, sample.ClientToRelayMs, out relayMs)) return false;
+            roundTripMs = sample.RoundTripMs;
             return true;
         }
     }
