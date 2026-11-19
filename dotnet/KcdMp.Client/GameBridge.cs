@@ -4745,6 +4745,10 @@ public partial class GameBridge(ClientConfig config)
                 var pvpScope = pvpSession is not null && type is (Protocol.PlayerHitV8Down or Protocol.PvpPeerDown or Protocol.Disconnect)
                     ? new PvpFrameScope(pvpSession, Interlocked.Read(ref _p1Serial), Interlocked.Read(ref _t3InputLifeRevision),
                         Environment.TickCount64, type == Protocol.PlayerHitV8Down ? _combat.PvpNativeLife : 0)
+                    {
+                        RelayAtRead = type == Protocol.PlayerHitV8Down && payloadLen == PlayerHitV8.LifeDownLen
+                            ? PvpRelayTime(stream, Stopwatch.GetTimestamp()) : default
+                    }
                     : null;
                 long arrival   = Stopwatch.GetTimestamp();
                 var load = LoadSequenceCapture();
@@ -8160,6 +8164,9 @@ public partial class GameBridge(ClientConfig config)
         long t0 = Stopwatch.GetTimestamp();
         await _tcpWriteLock.WaitAsync(ct);
         long t1 = Stopwatch.GetTimestamp();
+        bool pvpTiming = IsPvpLifeSend(packet);
+        long pvpTick = pvpTiming ? Environment.TickCount64 : 0;
+        byte pvpSource = pvpTiming ? _myGhostId : (byte)0;
         try
         {
             ProcessorFrameScope.ThrowIfAbandoned();
@@ -8171,6 +8178,7 @@ public partial class GameBridge(ClientConfig config)
             _tcpWriteLock.Release();
             Wo213NoteOut(packet, Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds, Stopwatch.GetElapsedTime(t1).TotalMilliseconds);   // WO-213 A.1/A.2
         }
+        if (pvpTiming) TracePvpSend(stream, pvpSource, packet, t1, pvpTick);
     }
 
     private static bool IntervalElapsed(ref long lastTimestamp, TimeSpan interval, long nowTimestamp)
