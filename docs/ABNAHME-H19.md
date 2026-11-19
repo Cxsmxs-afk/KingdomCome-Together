@@ -1,0 +1,28 @@
+# H19 · Join-Plätze nach einem Abbruch freigeben
+
+Im Auswertungsbericht vom 18. November 2026 meldete der Joiner um 22:28:33 Uhr (Berlin) `clock-unavailable: kept playline3/…` und nach der nächsten Anfrage denselben Befund für Playline 4. Um 22:29:45 Uhr meldete das Menü fünf belegte Plätze. Der alte Abbruchpfad rief die Bereinigung auf, ohne den eigenen Dateilease freizugeben. Der automatische Folgeversuch wählte anschließend den nächsten freien Platz. [Abbruch auf H20](https://github.com/Cxsmxs-afk/KingdomCome-Together/blob/df301015/dotnet/KcdMp.Client/GameBridge.Wo124.cs#L1149) · [Platzwahl](../dotnet/KcdMp.Client/Wo175Coop.cs)
+
+Der Join hat genau eine Reservierung für die vorübergehende Welt. Der Agent verknüpft Host- und Weltkennung, Join-ID, Pfad, Datei-Identität und SHA-256. Der vorbereitete Stand liegt zunächst unter einer eigenen ID im Journal. Erst nach vollständigem Schreiben, Verifizieren und Sichern der Veröffentlichungsabsicht verschiebt der Agent ihn ohne Überschreiben in die Playline. Beim Aufräumen verschiebt er die zu löschende Datei in Quarantäne und prüft die erfasste Datei und ihren Inhalt. Windows markiert genau diesen offenen Dateihandle zum Löschen. Linux leert genau den geprüften Handle und hinterlässt einen leeren Eintrag im privaten Journal. Eine fremde Ersatzdatei wird ohne Überschreiben zurückgelegt, sofern der ursprüngliche Pfad frei ist. Bei Konflikt bleibt sie gesichert. Mehrdeutige Altdateien bleiben erhalten. [Journal](../dotnet/KcdMp.Client/JoinWorldJournal.cs) · [Platzierung und Abbruch](../dotnet/KcdMp.Client/GameBridge.Wo124.cs)
+
+Vor einem möglichen Ladebefehl markiert der Agent die Datei für die Engine. Eine Bestätigung nach Abbruch gehört weiterhin zum alten Versuch. Erst die passende Folge aus Engine-Pfad und terminaler Spielmeldung derselben Spielinstanz gibt dessen Besitz frei. HTTP-Zustand, unpassender Pfad und abweichende Instanz lassen einen möglicherweise benutzten Stand geschützt. Nach einem Agent-Neustart kann der noch ausstehende Spielnachweis fehlen. Das Start-Sweep löscht solche Stände nicht. [Wartepfad](../dotnet/KcdMp.Client/GameBridge.Wo154Join.cs) · [Engine-Log](../dotnet/KcdMp.Client/LogTailGameTransport.cs)
+
+Ein Folgeversuch aus demselben Menü und mit derselben Verbindung, Welt und Charakterwahl braucht eine ausdrückliche neue Anfrage. Eine neue Welt-Epoche gibt die automatische Wahl wieder frei. NightCoop trennt Heimkampagne und besuchte Host-Welt. Seamless Co-op verwendet einen eigenen Spielstand-Namensraum. Hier gehören temporäre Join-Dateien dem jeweiligen Versuch und werden anhand dessen Belegs aufgeräumt. [NightCoop SDK](https://nightcoop.net/sdk/docs/concepts.md) · [Seamless Co-op FAQ](https://ersc-docs.github.io/faq/)
+
+## Nachweis
+
+```powershell
+pwsh -NoProfile -File tools/Test-JoinReadiness.ps1 -Check Abort
+```
+
+Der Ausgangsstand auf H20 meldete bei fünf echten Aufrufen des Abbruchpfads `retained_slots=5 own_save_unchanged=1`. Der strenge Aufruf war rot. Der ergänzte Relay-Test brach vor dem Fix nach einer bestätigten Platzierung und dem absichtlich verweigerten Kalender-Latch ab. Der Test fand die liegen gebliebene Datei.
+
+Die Korrektur erreicht `JOIN-ABORT-LIFECYCLE playline_reused=1 submitted_preserved=1` und `JOIN-ABORT-GATE attempts=5 retained_slots=0 own_save_unchanged=1`. Die Probe verwendete für alle fünf Versuche denselben Platz. Der getrennte Fall mit freigegebenem Ladeauftrag hielt die Datei geschützt. [Simulatorprobe](../tools/sim/KcdMp.Sim/JoinAbortRegression.cs) · [Relay-Test](../dotnet/KcdMp.Client.Tests/JoinCalendarIntegrationTests.Abort.cs)
+
+Auf dem ersten H19-Stand auf `df301015` prüften die Gegenproben einen Abbruch während des Stage-Schreibens, den Dateiaustausch zwischen Erstprüfung und Löschung und eine Engine-Bestätigung nach Abbruch. Das Pflicht-Gate verlangt null belegte Restslots sowie die einzelnen Rot→Grün-Fälle. Ein simuliertes Ergebnis mit einem Restslot wird als Fehler gewertet. [Pflicht-Gate](../tools/Test-JoinReadiness.ps1) · [Dateiprüfungen](../dotnet/KcdMp.Client.Tests/JoinWorldJournalTests.cs) · [Engine-Bestätigung](../dotnet/KcdMp.Client.Tests/JoinLateEngineReceiptTests.cs)
+
+## Selbst-Review und Spielabnahme
+
+- Der Abbruch setzt den Versuch unter demselben Lock außer Kraft, der Platzierung und Ladefreigabe schützt. Die Platzierung wird nach dem Schreiben erneut geprüft. Eine laufende Ladeanforderung sperrt das Löschen bis zum Spielnachweis.
+- Die Löschliste umfasst die öffentlich benannte Schreibdatei, die Löschung nach Prüfung allein über den ursprünglichen Pfad und den Rückschluss auf das Ende des Engine-Lesens aus einem allgemeinen Gameplay-Signal. Geänderte oder unmarkierte Altdateien bleiben erhalten. Der alte Namensfilter räumt keine `mpworld`-Dateien mehr weg.
+- Hashing, Journal und Löschung fallen beim Join oder beim Start an. Die Prüfung vor der HTTP-Übergabe läuft außerhalb der Sperre, die der Reader und der HTTP-Aufruf gemeinsam verwenden. Unter Windows bleibt der verifizierte Dateihandle bis zur Übergabe offen und verhindert den Austausch in dieser Zeit. Im Frame entsteht kein neues Datei-I/O und kein Polling.
+- Im Zwei-PC-Test fünf Abbrüche vor dem Ladebefehl mit manueller Wiederholung prüfen. Dieselbe Playline muss wieder frei werden. Die Agent-Zeile `deleted=on` muss zur abgebrochenen Join-ID gehören. Bei einem Abbruch während des Ladens bleibt die Datei bis zum Ende des Engine-Zugriffs sichtbar. Auf beiden PCs stehen die Messwerte für `rp_owner_n>0` und `owner_violations=0` noch aus.

@@ -5,7 +5,7 @@ description: "Projektkarte für „Kingdom Come: Together“ (KCD2-Koop-Mod). Zu
 
 # kct-kontext — Was das Projekt ist, wie es gebaut ist, wo was liegt
 
-Stand: H20 auf dem grünen H22-Commit `18d3dfd`, Version `0.65.2` (`VERSION`), Protokoll `Protocol.Version = 10` (`dotnet/KcdMp.Protocol/Protocol.cs:800`). **Vor jeder Nutzung am aktuellen Tip nachprüfen.** Warum: Die Kette ist gestapelt, Zeilen wandern.
+Stand: H19 auf dem H20-Commit `df301015`, Version `0.65.2` (`VERSION`), Protokoll `Protocol.Version = 10` (`dotnet/KcdMp.Protocol/Protocol.cs:800`). **Vor jeder Nutzung am aktuellen Tip nachprüfen.** Warum: Die Kette ist gestapelt, Zeilen wandern.
 
 ## So nutzt du diese Karte
 1. Thema in der Tabelle „Thema → lesen“ suchen und **alle** genannten Dateien gründlich lesen, inklusive Aufrufer und Tests. Warum: passgenauer Code entsteht nur aus dem echten Kontext. Die Karte zeigt, wo du anfangen musst, sie ersetzt das Lesen nicht.
@@ -46,7 +46,7 @@ Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op 
 5. Der Bootstrap verlangt die Join-ID im Umschlag sowie die tatsächliche Sende-Epoche im Token und prüft sie gegen den bestätigten Host, die Relay-Verbindung und den aktiven Versuch. Bei der ersten Annahme zählt er `clock_in` und quittiert. Wiederholungen erhalten erneut eine Quittung. Gelesener Host-Verlust und Abbruch sperren diesen Ladevorgang. Vor dem Latch bestätigt der Agent die native Offer-Generation und bindet die Ladefreigabe an dieselbe DLL-Pipe. [Kalender](../../../dotnet/KcdMp.Client/GameBridge.HostCalendar.cs)
 6. Welt empfangen, verifizieren und platzieren (`playlineN/mpworld<joinId>.whs`), `_retainedJoinWorlds.Keep` (`GameBridge.Wo124.cs:739`).
 7. `PrepareHostCalendarAsync` wartet auf den passenden Snapshot und auf Abbruch oder Verbindungsende. Der native Latch wird vor dem Ladebefehl gesetzt und nach `Gameplay started` geprüft. Die Quittung des Kalenderempfangs ist vom späteren JoinerReady getrennt. [Abnahme](../../../docs/ABNAHME-H20.md)
-8. Abbruch: `AbortJoinerJoinAsync` (`GameBridge.Wo124.cs:1131–1158`) → `RemovePlacedWorldAsync` lässt die Welt liegen, solange `MayRemove` nicht `Released` ist (`JoinWorldFiles.cs:25–28`, Log `GameBridge.Wo124.cs:867`). Auto-Retry nach `+30 s` (`:1149`) belegt die nächste Playline, bis „All five save slots are full“ (`Wo175Coop.cs:33`) → **H19**.
+8. Abbruch: `AbortJoinerJoinAsync` beendet den Versuch und gibt seinen Dateilease unter demselben Lock wie Platzierung und Ladefreigabe frei. Das Journal reserviert einen privaten Stage und prüft Dateiidentität und SHA-256 nach der Verschiebung in die Quarantäne. Eine ausstehende Ladeanforderung verlangt einen zur Datei und Spielinstanz passenden terminalen Engine-Nachweis. Die Startbereinigung beschränkt sich auf zugeordnete temporäre Dateien ohne möglichen Ladeauftrag. [H19-Abnahme](../../../docs/ABNAHME-H19.md)
 
 **WorldSync / Ladesequenz:** Phasen `Menu, Offer, Load, Reconstruct, Settle, Play, Exit` (`WorldLoadSequence.cs:4`). Bei aktivem WorldSync und außerhalb der Baseline-Anwendung ist `WorldSyncReady` im Menü falsch. `WorldSyncCurrent` schließt die Phasen `Menu`/`Exit` aus (`GameBridge.WorldSync.cs:35–43`). Alles, was vor dem Laden nötig ist, darf deshalb nicht hinter diesem Gate hängen.
 
@@ -74,7 +74,7 @@ Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op 
 ## Bekannte Fallen (Live-Test 18.11.2026, 22:09–22:40 Europe/Berlin)
 1. **Historischer Kalenderverlust:** Der Live-Test zeigte `MP-LINK in=w164:18` und `clock_in=0`. Der H20-Ende-zu-Ende-Test reproduziert auf `18d3dfd` die Ablehnung vor dem Cache in der `Menu`-Phase. Der Bootstrap-Pfad meldet jetzt Annahme und Ablehnungsgrund. [H20-Nachweis](../../../docs/ABNAHME-H20.md)
 2. **LoadScoped-Seitenkanäle in Phase Menu:** Alles, was vor dem Laden gebraucht wird (Uhr-Snapshot), darf nicht am WorldSync-Gate hängen.
-3. **Slot-Leck:** Ein Abbruch vor dem Laden gibt die Welt nicht frei, der Retry nimmt die nächste Playline.
+3. **Historisches Slot-Leck:** Auf H20 hinterlassen fünf Abbrüche vor dem Laden fünf belegte Plätze. H19 gibt die reservierten Plätze frei und unterbindet automatische Wiederholung für dieselbe Verbindung, Welt und Charakterwahl. [H19-Nachweis](../../../docs/ABNAHME-H19.md)
 4. **Fehlende Start-Saves:** Der Build war grün, aber `start saves installed: none`.
 5. **Rollen-Lock vor H22:** Der Launcher leitete die Startrolle aus dem Relay ab und graute im Menü die Gegenrolle aus. H22 wählt die Rolle pro Versuch und bestätigt Änderungen im Hauptmenü vor Lade- oder Join-Aktionen. Ein weiterlaufendes lokales Relay ändert die gewählte Join-Rolle nicht. Der Rollentausch auf zwei PCs bleibt offen.
 6. **Tests prüften Teile, nicht den Ablauf:** `HostCalendarTests` (Parse), `T3SideChannelsTests` (Decode/Queue), `T4BotRelayTests` (Relay). Keiner fuhr Host↔Joiner durch den echten Reader im Menü.

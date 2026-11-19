@@ -231,7 +231,7 @@ public partial class GameBridge
         P5LoadGameCoreAsync(playline, name, reason, null, ct);
 
     private async Task<bool> P5LoadGameCoreAsync(int playline, string name, string reason, Func<bool>? authorizeDispatch,
-        CancellationToken ct = default)
+        CancellationToken ct = default, Func<IDisposable?>? prepareDispatch = null)
     {
         if (ct == default) ct = _wo122Ct;
         bool own = reason is "leave-command" or "exit-to-menu";
@@ -277,6 +277,12 @@ public partial class GameBridge
 
             Task? Admit(Func<Task> send)
             {
+                if (dispatchLife.IsCancellationRequested) return null;
+                // Read and journal the file without holding the dispatch lock.
+                // Keep the checked handle open across the synchronous handoff.
+                using var verifiedSave = prepareDispatch?.Invoke();
+                if (prepareDispatch is not null && verifiedSave is null) return null;
+
                 // Read retirement uses the same gate. Only the synchronous
                 // transport handoff is in the critical section, never its wait.
                 lock (_joinGate)

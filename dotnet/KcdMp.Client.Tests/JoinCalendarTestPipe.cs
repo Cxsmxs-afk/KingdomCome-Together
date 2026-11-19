@@ -31,6 +31,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private ulong _loadGeneration, _lifecycleGeneration;
 
     public CombatPipe Pipe { get; }
+    public Action? BeforeCalendarArm { get; set; }
     public Task ArmObserved => _arm.Task;
     public int ArmRequests => Volatile.Read(ref _armRequests);
     public Task VerifyObserved => _verify.Task;
@@ -135,6 +136,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
                     break;
                 case 2:
                     Interlocked.Increment(ref _armRequests);
+                    BeforeCalendarArm?.Invoke();
                     if (!_failCalendarArm && !_gameplayStarted && worldMs is >= 0 and <= HostCalendar.MaxWorldMs)
                     {
                         _armedWorldMs = worldMs;
