@@ -3,6 +3,7 @@
 #include "../KCDMP/pose_ring.h"
 
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 int rp_timeline_tests(int* passed) {
@@ -52,6 +53,7 @@ int rp_timeline_tests(int* passed) {
     drawn.stateHostMs = drawn.hostMs;
     drawn.state[3] = 0x08 | 0x04;
     drawn.state[7] = 255;
+    drawn.ranged = kcdmp::rangedaim::decode_state(drawn.state.data(), drawn.stateHostMs);
     check(aim.push(drawn, local + 110, base + 110) == Ingest::Accepted, "aim track accepts the drawn pose");
     (void)aim.render(local + 190);
     const auto stillDrawn = aim.render(local + 5000);
@@ -60,6 +62,8 @@ int rp_timeline_tests(int* passed) {
           "a drawn bow survives a short gap without extending the crouch timestamp");
     auto ended = sample(base + 5000, 0.1f);
     ended.stateHostMs = ended.hostMs;
+    ended.state[9] = ended.state[11] = 0x80; // the unavailable-angle pair marks confirmed Off
+    ended.ranged = kcdmp::rangedaim::decode_state(ended.state.data(), ended.stateHostMs);
     check(aim.push(ended, local + 5010, base + 5010) == Ingest::Accepted, "the confirmed end is a newer sample");
     const auto down = aim.render(local + 5200);
     check(down.source.stateHostMs == ended.hostMs && down.rangedStateHostMs == ended.hostMs &&
@@ -68,6 +72,7 @@ int rp_timeline_tests(int* passed) {
     check(aim.push(staleHold, local + 5300, base + 5300) == Ingest::Late, "an older hold does not restore the draw");
     staleHold.hostMs = base + 5350;
     staleHold.stateHostMs = ended.stateHostMs;
+    staleHold.ranged.hostMs = ended.ranged.hostMs;
     check(aim.push(staleHold, local + 5360, base + 5360) == Ingest::Accepted &&
           !aim.render(local + 5550).ranged_held(),
           "a later position cannot replace a confirmed end with a different block at the same state stamp");
@@ -113,6 +118,104 @@ int rp_timeline_tests(int* passed) {
     check(!receive::decode(wire.data(), start - 1, pose, true), "truncated timed input refused");
     stamp(9, 0);
     check(!receive::decode(wire.data(), wire.size(), pose, true), "no fabricated timestamp enters timed playback");
+
+    // Send timed Ghost packets through the native decoder and the actual coalescing inbox before Track.
+    namespace ranged = kcdmp::rangedaim;
+    using State = std::array<uint8_t, receive::kStateBytes>;
+    const auto ranged_state = [](uint8_t bits, uint8_t charge, int16_t yaw, int16_t pitch) {
+        State body{};
+        body[3] = bits;
+        body[7] = charge;
+        body[8] = static_cast<uint8_t>(yaw);
+        body[9] = static_cast<uint8_t>(static_cast<uint16_t>(yaw) >> 8);
+        body[10] = static_cast<uint8_t>(pitch);
+        body[11] = static_cast<uint8_t>(static_cast<uint16_t>(pitch) >> 8);
+        return body;
+    };
+    constexpr uint8_t crouch = 0x04;
+    const auto active = ranged_state(ranged::kHeldBit | ranged::kChargeKnownBit | crouch, 96, -2300, 4100);
+    const auto turned = ranged_state(ranged::kHeldBit | ranged::kChargeKnownBit | crouch, 161, 6200, -8300);
+    const auto ordinary = ranged_state(crouch, 0, 0, 0);
+    const auto off = ranged_state(0, 0, ranged::kAngleUnavailable, ranged::kAngleUnavailable);
+    constexpr receive::Scope sameBody{6, 7, 101};
+    receive::Ring inbox(4);
+    Track timedGhost;
+    const auto enqueue = [&](uint64_t when, const State* state, float x = 0, uint64_t delay = 0) {
+        std::fill(wire.begin(), wire.end(), 0);
+        wire[0] = receive::kGhost;
+        stamp(1, local + when + delay); stamp(9, base + when); stamp(17, base + when + delay);
+        wire[start] = 1;
+        std::memcpy(wire.data() + start + 1, &x, sizeof x);
+        if (state) {
+            wire[start + 17] = 0x10;
+            std::copy(state->begin(), state->end(), wire.begin() + start + receive::kGhostFixed);
+        }
+        receive::Pose incoming;
+        const size_t bytes = start + receive::kGhostFixed + (state ? receive::kStateBytes : 0);
+        return receive::decode(wire.data(), bytes, incoming, true) &&
+               inbox.publish(incoming, sameBody) == receive::Put::Accepted;
+    };
+    const auto consume = [&](Ingest expected = Ingest::Accepted) {
+        const auto rows = inbox.drain(sameBody);
+        if (rows.size() != 1) return false;
+        const auto& incoming = rows.front();
+        auto decoded = sample(incoming.hostMs, incoming.x);
+        decoded.stateHostMs = incoming.stateHostMs;
+        decoded.state = incoming.state;
+        decoded.ranged = incoming.ranged;
+        return timedGhost.push(decoded, static_cast<uint64_t>(incoming.arrivalQpc), incoming.hostAtArrivalMs) ==
+               expected;
+    };
+    check(enqueue(0, &active) && consume() && enqueue(1000, &turned) && consume(),
+          "timed Ghost receiver reads active state and a later in-phase turn");
+    const auto turn = timedGhost.render(local + 1120);
+    const auto& turnRanged = turn.ranged;
+    check(turn.ranged_held() && turnRanged.charge == 161 && turnRanged.yaw == 6200 && turnRanged.pitch == -8300,
+          "timed Ghost receiver preserves measured charge and both signed angles in a turn");
+    check(enqueue(1900, &turned) && consume() && enqueue(2000, &turned, 0.2f) && consume(),
+          "timed Ghost receiver accepts the two movement samples before the gap");
+    const auto gap = timedGhost.render(local + 5000);
+    check(gap.ranged_held() && gap.rangedStateHostMs == base + 2000 &&
+          gap.extrapMs == 200 && gap.vx == 0.0f && !gap.source.stateHostMs,
+          "three-second delivery gap holds aim while movement exhausts and crouch expires");
+    bool resumed = true;
+    for (uint64_t when = 5000; when <= 10000; when += 1000) {
+        const bool accepted = enqueue(when, &turned, 0.4f) && consume();
+        resumed = resumed && accepted;
+    }
+    check(resumed && timedGhost.render(local + 10120).ranged_held(),
+          "confirmed draw reaches ten seconds in the same scope");
+
+    // Omit the first Off at 10500. A newer ordinary body update is not an Off observation.
+    check(enqueue(10800, &ordinary, 0.4f) && consume(), "ordinary body update reaches the timed receiver");
+    const auto beforeOff = timedGhost.render(local + 11000);
+    check(beforeOff.ranged_held() && beforeOff.rangedStateHostMs == base + 10000 &&
+          beforeOff.source.stateHostMs == base + 10800 && (beforeOff.source.state[3] & crouch),
+          "losing the first Off and receiving an ordinary body update preserves the draw and updates crouch");
+
+    check(enqueue(11100, &off, 0.4f) && enqueue(11130, &ordinary, 0.4f) && enqueue(11160, nullptr, 0.4f) && consume(),
+          "the raw inbox coalesces a repeated Off, an ordinary state, and a newer transform");
+    const auto released = timedGhost.render(local + 11300);
+    check(!released.ranged_held() && released.rangedStateHostMs == base + 11100 &&
+          released.source.stateHostMs == base + 11130 && (released.source.state[3] & crouch),
+          "the repeated Off clears using its original stamp even through ordinary state coalescing");
+
+    check(enqueue(10900, &turned) && consume(Ingest::Late), "older held Ghost reaches Track and is rejected as late");
+    const auto afterStale = timedGhost.render(local + 11450);
+    check(!afterStale.ranged_held() && afterStale.rangedStateHostMs == base + 11100,
+          "the older held sample cannot restore a draw after the repeated Off");
+
+    constexpr uint64_t newBodyLocal = local + 11600;
+    check(enqueue(11500, &active, 0.4f, 200) && consume() && enqueue(11710, &ordinary, 0.4f) && consume(),
+          "a held sample captured before the body replacement can arrive after it");
+    check(timedGhost.render(local + 11850).ranged_held(), "the same stream without a body boundary can still hold");
+    const auto rebound = timedGhost.render(local + 11850, newBodyLocal);
+    check(rebound.ready() && !rebound.ranged_held() && !rebound.rangedStateHostMs &&
+          rebound.source.stateHostMs == base + 11710 && (rebound.source.state[3] & crouch),
+          "the body boundary fences old capture time without clearing the new body's ordinary state");
+    check(enqueue(11860, &turned, 0.4f, 100) && consume() &&
+          timedGhost.render(local + 12120, newBodyLocal).ranged_held(),
+          "a new held sample captured after the body boundary plays in the still-bound stream");
 
     Track route;
     std::vector<uint64_t> actions, coordinatedSkew, untimedSkew;

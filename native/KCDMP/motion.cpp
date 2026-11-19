@@ -1971,14 +1971,17 @@ bool read_local_state2(State2* out, float facingYaw) {
     }
     // The 50 ms sampler owns this state. Copy it for this exact actor without another engine read.
     const auto aim = wo201ranged::sampled_aim(actor);
+    if (aim.observed) {
+        // The unused angle pair also distinguishes a confirmed release from a missing read.
+        out->aimYaw = rangedaim::kAngleUnavailable;
+        out->aimPitch = rangedaim::kAngleUnavailable;
+    }
     if (aim.aim) {
         out->bits |= kBitRanged;
         if (aim.charge) {
             out->bits |= rangedaim::kChargeKnownBit;
             out->charge = *aim.charge;
         }
-        out->aimYaw = rangedaim::kAngleUnavailable;
-        out->aimPitch = rangedaim::kAngleUnavailable;
     }
     return true;
 }

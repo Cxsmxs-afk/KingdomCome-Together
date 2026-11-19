@@ -20,17 +20,22 @@ public sealed class RangedAimHoldTests
         long time = Stopwatch.Frequency;
         var held = Drawn(127, 140, -60);
         var turn = Drawn(140, 400, -90);
+        var off = default(BodyState2) with
+        {
+            AimYaw = BodyState2.AimAngleUnavailable,
+            AimPitch = BodyState2.AimAngleUnavailable,
+        };
 
         Assert.Equal((held, true), Position(held, time, consume: true));
-        var turned = Position(turn, time + Stopwatch.Frequency / 20, consume: false);
+        var turned = Position(turn, time + Stopwatch.Frequency / 50, consume: false);
         Assert.False(turned.Due);
-        Assert.Equal(turn, Position(turn, time + Stopwatch.Frequency / 20, consume: true).State);
-        Assert.Equal(((BodyState2?)default(BodyState2), false), Position(default, time + Stopwatch.Frequency, consume: true));
+        Assert.Equal(turn, Position(turn, time + Stopwatch.Frequency / 50, consume: true).State);
+        Assert.Equal(((BodyState2?)off, true), Position(off, time + Stopwatch.Frequency, consume: true));
         for (int lost = 2; lost <= 5; ++lost)
         {
-            var repaired = Position(default, time + lost * Stopwatch.Frequency, consume: true);
-            Assert.False(repaired.Due);
-            Assert.Equal(default(BodyState2), repaired.State);
+            var repaired = Position(off, time + lost * Stopwatch.Frequency, consume: true);
+            Assert.True(repaired.Due);
+            Assert.Equal(off, repaired.State);
         }
 
         (BodyState2? State, bool Due) Position(BodyState2 state, long stamp, bool consume)

@@ -21,8 +21,8 @@ namespace KcdMp.Wire;
 //   1. BODY STATE 2 (Position/Ghost flag 0x10, 12 bytes). Supersedes the
 //      WO-100.5 0x04 block, which a v8 sender never sets and a v8 relay no
 //      longer accepts. Movement and combat state keep their existing change
-//      gate. Ranged state rides positions already due for movement, another
-//      body field, or the normal position heartbeat. Layout (LE):
+//      gate. A ranged edge, a paced aim update, or the BodyState2 heartbeat
+//      can also make a position due. Layout (LE):
 //        [speedCm:u16]     planar speed of the sender's requested velocity, cm/s
 //        [moveDir:i8]      heading of that velocity minus the body's facing,
 //                          in 1/256 of a turn (1.40625 deg)
@@ -33,6 +33,8 @@ namespace KcdMp.Wire;
 //        [charge:u8]       ranged charge 0..255, meaningful with RangedChargeKnown
 //        [aimYaw:i16]      ranged aim yaw, 1/10000 rad, -32768 when held but unmeasured
 //        [aimPitch:i16]    ranged aim pitch, same encoding as aimYaw
+//      With ranged bits clear and charge zero, an unavailable angle pair
+//      confirms Off. A plain state block supplies no ranged observation.
 //      Tail order after the flags byte: [bodyState2:12 if 0x10][senderMs:4 if 0x08].
 //      Position lengths 17/21/29/33, Ghost 18/22/30/34 -- exact, never a range.
 //
@@ -99,6 +101,12 @@ public readonly record struct BodyState2(
 {
     public const int Len = 12;
     public const short AimAngleUnavailable = short.MinValue;
+
+    public bool RangedHeld => (Bits & BodyState2Bits.RangedAim) != 0;
+    // An ordinary body block can lack a usable shooting read. Reserve the
+    // unused angle pair on a non-held, uncharged block for a confirmed release.
+    public bool RangedOff => (Bits & (BodyState2Bits.RangedAim | BodyState2Bits.RangedChargeKnown)) == 0 &&
+        Charge == 0 && AimYaw == AimAngleUnavailable && AimPitch == AimAngleUnavailable;
 
     public float SpeedMps => SpeedCm / 100f;
     /// <summary>moveDir in radians, (-pi, pi].</summary>
