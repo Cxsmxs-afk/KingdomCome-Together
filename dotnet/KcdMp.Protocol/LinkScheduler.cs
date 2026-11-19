@@ -188,6 +188,9 @@ public sealed class LinkSchedOptions
     public int[] BandPeriodMs = [33, 50, 100, 500];
 }
 
+/// <summary>Synchronously admits the start of a selected physical write. Null means retired before handoff.</summary>
+public delegate ValueTask? LinkWriteAdmission(Func<ValueTask> write);
+
 /// <summary>
 /// WO-213 C/D: one link's outbound order. Events (everything that is not a body's state) leave first, in order, complete -- never
 /// dropped, never merged. State waits in one slot per (kind, body): a newer one replaces it (C.1); a slot whose value is older than
@@ -200,12 +203,13 @@ public sealed class LinkScheduler
 {
     // Optional producer authority. Shared by all pieces of one original packet,
     // so a revoked multi-body packet is counted once, including after selection.
-    private sealed class Delivery(Func<bool> valid, Action? afterWrite, Func<byte[]>? prepare)
+    private sealed class Delivery(Func<bool> valid, Action? afterWrite, Func<byte[]>? prepare, LinkWriteAdmission? startWrite)
     {
         private int _counted;
         private int _written;
         public void Written() { if (Interlocked.Exchange(ref _written, 1) == 0) afterWrite?.Invoke(); }
         public Func<byte[]>? Prepare => prepare;
+        public LinkWriteAdmission? StartWrite => startWrite;
         public bool Allowed(LinkScheduler owner)
         {
             if (valid()) return true;
@@ -251,10 +255,12 @@ public sealed class LinkScheduler
     public int DirtySlots { get { lock (_lock) return _slots.Values.Count(s => s.Dirty); } }
 
     /// <summary>One whole frame (header included), from any thread.</summary>
-    public void Enqueue(byte[] frame, Func<bool>? stillValid = null, Action? afterWrite = null, Func<byte[]>? prepare = null)
+    public void Enqueue(byte[] frame, Func<bool>? stillValid = null, Action? afterWrite = null,
+        Func<byte[]>? prepare = null, LinkWriteAdmission? startWrite = null)
     {
-        if ((afterWrite is not null || prepare is not null) && frame.Length > 0 && LinkState.IsStateType(frame[0])) throw new ArgumentException("Physical receipts require a complete event frame", nameof(frame));
-        var delivery = stillValid is null && afterWrite is null && prepare is null ? null : new Delivery(stillValid ?? (() => true), afterWrite, prepare);
+        if ((afterWrite is not null || prepare is not null || startWrite is not null) && frame.Length > 0 && LinkState.IsStateType(frame[0])) throw new ArgumentException("Physical receipts require a complete event frame", nameof(frame));
+        var delivery = stillValid is null && afterWrite is null && prepare is null && startWrite is null
+            ? null : new Delivery(stillValid ?? (() => true), afterWrite, prepare, startWrite);
         if (!Allowed(delivery)) return; // a revoked replacement must not displace a live state
         long now = Stopwatch.GetTimestamp();
         lock (_lock)
@@ -300,8 +306,12 @@ public sealed class LinkScheduler
         => TryTake(budgetBytes, pendingBytes, out frame, out isState, out stillValid, out afterWrite, out _, eventsHeld);
 
     public bool TryTake(int budgetBytes, int pendingBytes, out byte[] frame, out bool isState, out Func<bool>? stillValid, out Action? afterWrite, out Func<byte[]>? prepare, bool eventsHeld = false)
+        => TryTake(budgetBytes, pendingBytes, out frame, out isState, out stillValid, out afterWrite, out prepare, out _, eventsHeld);
+
+    internal bool TryTake(int budgetBytes, int pendingBytes, out byte[] frame, out bool isState, out Func<bool>? stillValid,
+        out Action? afterWrite, out Func<byte[]>? prepare, out LinkWriteAdmission? startWrite, bool eventsHeld)
     {
-        stillValid = null; afterWrite = null; prepare = null;
+        stillValid = null; afterWrite = null; prepare = null; startWrite = null;
         long now = Stopwatch.GetTimestamp();
         frame = []; isState = false;
         lock (_lock)
@@ -336,6 +346,7 @@ public sealed class LinkScheduler
                 stillValid = e.Delivery is null ? null : () => Allowed(e.Delivery);
                 afterWrite = e.Delivery is null ? null : e.Delivery.Written;
                 prepare = e.Delivery?.Prepare;
+                startWrite = e.Delivery?.StartWrite;
                 return true;
             }
             if (_slots.Count == 0) return false;
@@ -455,10 +466,11 @@ public sealed class LinkWriter
     public ILinkPath Path => _path;
 
     /// <summary>One frame in (any thread); the writer wakes.</summary>
-    public void Enqueue(byte[] frame, Func<bool>? stillValid = null, Action? afterWrite = null, Func<byte[]>? prepare = null)
+    public void Enqueue(byte[] frame, Func<bool>? stillValid = null, Action? afterWrite = null,
+        Func<byte[]>? prepare = null, LinkWriteAdmission? startWrite = null)
     {
         if (Failed is { } f) throw new IOException("the link's writer stopped: " + f.Message, f);
-        _sched.Enqueue(frame, stillValid, afterWrite, prepare);
+        _sched.Enqueue(frame, stillValid, afterWrite, prepare, startWrite);
         if (_signal.CurrentCount == 0) _signal.Release();
     }
 
@@ -495,7 +507,8 @@ public sealed class LinkWriter
             // B with C: a state lane of its own -- the events wait here while their lane holds enough, so the pump is never stuck in an
             // event's send and the state goes beside a burst (the world's transfer) at its lane's share instead of after it
             bool eventsHeld = _path.StateOwnLane && st.Known && st.EventPendingBytes > _sched.Options.EventPendingCapBytes;
-            if (!_sched.TryTake(budget, st.Known ? st.PendingBytes : -1, out var frame, out bool isState, out var stillValid, out var afterWrite, out var prepare, eventsHeld)) return;
+            if (!_sched.TryTake(budget, st.Known ? st.PendingBytes : -1, out var frame, out bool isState,
+                out var stillValid, out var afterWrite, out var prepare, out var startWrite, eventsHeld)) return;
             if (stillValid is not null && !stillValid()) continue;
             if (Transform is { } t) frame = t(frame);   // D.3: the link's own encoding (the relay's compact NPC states)
             if (stillValid is not null && !stillValid()) continue;
@@ -509,11 +522,17 @@ public sealed class LinkWriter
                 frame = refreshed;
             }
             if (stillValid is not null && !stillValid()) continue;
-            await _path.SendAsync(frame, isState && _sched.Options.Unreliable, ct);
+            bool unreliable = isState && _sched.Options.Unreliable;
+            var write = startWrite is null ? _path.SendAsync(frame, unreliable, ct) : StartScopedWrite(startWrite, frame, unreliable, ct);
+            if (write is not { } admitted) continue;
+            await admitted;
             afterWrite?.Invoke(); // complete physical send, never queue acceptance / pre-send observer
             Written++; WrittenBytes += frame.Length;
         }
     }
+
+    private ValueTask? StartScopedWrite(LinkWriteAdmission startWrite, byte[] frame, bool unreliable, CancellationToken ct) =>
+        startWrite(() => _path.SendAsync(frame, unreliable, ct));
 
     public void Wake() { if (_signal.CurrentCount == 0) _signal.Release(); }
 }

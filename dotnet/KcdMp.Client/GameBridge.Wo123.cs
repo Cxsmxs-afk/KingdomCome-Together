@@ -237,8 +237,8 @@ public partial class GameBridge
             case "join_request":    // mp_join_request on the joiner
                 _ = SendJoinRequestAsync();
                 return;
-            case "join_ready":      // the next WO: the joiner loaded the world and is in it
-                _ = SendJoinerReadyAsync("mod");
+            case "join_ready":
+                Console.WriteLine("MP-JOIN joiner: ignored the unverified Lua Ready hint");
                 return;
         }
     }
@@ -260,7 +260,6 @@ public partial class GameBridge
                 if (_hostJoin is { } j && j.JoinId == joinId && j.Joiner == src)
                 {
                     j.Inbox.Writer.TryWrite(((byte)type, body));
-                    if (type == Protocol.JoinerReadyDown && _wo122Stream is Stream markerStream) _ = P5AnnounceMarkersAsync(markerStream, ct);
                 }
                 else Console.WriteLine($"MP-JOIN host: 0x{type:X2} for join 0x{joinId:x8} from ghost {src} -- no such join here, ignored");
                 return;
@@ -647,15 +646,21 @@ public partial class GameBridge
                         continue;
                     }
                 }
-                j.LastJoinerMsgMs = Environment.TickCount64;
                 if (msg.Type == Protocol.JoinerReadyDown)
                 {
                     uint seq = msg.Body.Length == 4 ? BinaryPrimitives.ReadUInt32LittleEndian(msg.Body) : 0;
-                    Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: {j.Partner} is ready (loaded worldsaved_seq={seq}, sent {sender.Offer.WorldSavedSeq}{(seq == sender.Offer.WorldSavedSeq ? "" : " -- MISMATCH")})");
+                    if (seq == 0 || seq != sender.Offer.WorldSavedSeq)
+                    {
+                        Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: Ready refused (loaded worldsaved_seq={seq}, sent {sender.Offer.WorldSavedSeq})");
+                        continue;
+                    }
+                    Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: {j.Partner} is ready (loaded worldsaved_seq={seq})");
+                    if (_wo122Stream is Stream markerStream) _ = P5AnnounceMarkersAsync(markerStream, _wo122Ct);
                     _ = Wo134SendLedgerAsync(j.Joiner);   // WO-134: this world's chest ledger (what the host took)
                     resumeReason = "ready";
                     return;
                 }
+                j.LastJoinerMsgMs = Environment.TickCount64;
                 if (msg.Type == Protocol.JoinAbortDown)
                 {
                     byte r = msg.Body.Length > 0 ? msg.Body[0] : (byte)0;
@@ -747,7 +752,7 @@ public partial class GameBridge
         JoinCalendarRequest request;
         lock (_joinGate)
         {
-            if (_joinRx is not null || _joinOutId != 0 || _jj is not null)
+            if (_joinRx is not null || _joinOutId != 0 || _jj is not null || _leaveInProgress)
             {
                 Console.WriteLine("MP-JOIN mp_join_request: a request or transfer is already running");
                 return;
@@ -806,20 +811,63 @@ public partial class GameBridge
         Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8} cancelled ({why}) -- staging deleted, the host resumes");
     }
 
-    /// <summary>The next WO calls this once the joiner has spliced, loaded and is in the world.</summary>
-    private async Task<bool> SendJoinerReadyAsync(string why)
+    private bool JoinReadyCurrent(JoinerJoin join, JoinCalendarRequest request) =>
+        ReferenceEquals(request, Volatile.Read(ref _joinCalendarRequest)) &&
+        join.CalendarVerified && JoinCalendarActuatorCurrent(join) && join.Phase == "post-load" &&
+        join.EngineReceipt?.MatchesTerminal(loaded: true) == true &&
+        join.WorldSavedSeq != 0 && _joinReceivedId == join.JoinId && _joinReceivedSeq == join.WorldSavedSeq &&
+        (!LoadSequenceEnabled || _worldLoad.Current is { Phase: WorldLoadPhase.Reconstruct } load &&
+            load.Generation == join.LoadGeneration && load.HostWorld == join.HostWorldEpoch);
+
+    /// <summary>Ready belongs to the verified attempt all the way through the physical relay writer.</summary>
+    private async Task<bool> SendJoinerReadyAsync(JoinerJoin join, JoinCalendarRequest request)
     {
-        if (_joinReceivedId == 0) { Console.WriteLine($"MP-JOIN joiner: ready ({why}) but no world was received -- not sent"); return false; }
+        var stream = request.Link;
+        var ct = _wo122Ct;
+        byte[] packet = WorldReceiver.BuildReady(join.JoinId, join.WorldSavedSeq, join.Host);
+        var sent = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        ValueTask? Admit(Func<ValueTask> send)
+        {
+            lock (_joinGate)
+            {
+                if (ct.IsCancellationRequested || !JoinReadyCurrent(join, request) || join.ReadyHandoffStarted)
+                {
+                    sent.TrySetResult(false);
+                    return null;
+                }
+                join.ReadyHandoffStarted = true;
+                return send();
+            }
+        }
+
         try
         {
-            await WriteJoinAsync(WorldReceiver.BuildReady(_joinReceivedId, _joinReceivedSeq));
-            Console.WriteLine($"MP-JOIN joiner: ready sent for join 0x{_joinReceivedId:x8} (worldsaved_seq={_joinReceivedSeq}, {why})");
-            _ = Wo210AfterSkipAsync("join");   // WO-210 A.4: the host's whole-body states afresh for this world
-            SetJoinUi("ready", "In the world.");
-            _joinReceivedId = 0;
+            if (_w213Writer is { } writer && ReferenceEquals(_w213Stream, stream))
+            {
+                writer.Enqueue(packet, afterWrite: () => sent.TrySetResult(true), startWrite: Admit);
+                Task completed = await Task.WhenAny(sent.Task, join.Abandoned.Task).WaitAsync(ct);
+                if (completed != sent.Task || !await sent.Task) return false;
+            }
+            else
+            {
+                await _tcpWriteLock.WaitAsync(ct);
+                try
+                {
+                    if (Admit(() => stream.WriteAsync(packet, ct)) is not { } physicalWrite) return false;
+                    await physicalWrite;
+                    if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
+                }
+                finally { _tcpWriteLock.Release(); }
+            }
+            Console.WriteLine($"MP-JOIN joiner: ready sent for join 0x{join.JoinId:x8} (worldsaved_seq={join.WorldSavedSeq}, wo124)");
             return true;
         }
-        catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: ready not sent: {ex.Message}"); return false; }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
+        {
+            Console.WriteLine($"MP-JOIN joiner: join 0x{join.JoinId:x8} ready write did not confirm: {ex.GetType().Name}");
+            return false;
+        }
     }
 
     private uint _joinReceivedId, _joinReceivedSeq;

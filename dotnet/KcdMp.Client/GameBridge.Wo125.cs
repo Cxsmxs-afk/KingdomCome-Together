@@ -815,11 +815,12 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- sweeps (agent start, before every join)
 
-    private static readonly Regex TransientAny = new(@"^mp(world|exit)[0-9a-f]{1,8}\.(whs|part)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex TransientExit = new(@"^mpexit[0-9a-f]{1,8}\.(whs|part)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     /// <summary>
     /// Move out every file the mod made or saw land in a playline: transient
-    /// mpworld/mpexit files, and every ledgered save that is still there. A
+    /// exit files and ledgered saves that are still there. Join worlds need
+    /// their exact owner's release, even after the agent has restarted. A
     /// save the player put there (e.g. a copy of a host world) is left alone
     /// and only logged. Returns how many files were moved.
     /// </summary>
@@ -833,7 +834,7 @@ public partial class GameBridge
             string dir = Path.Combine(saves, $"playline{pl}");
             if (!Directory.Exists(dir)) continue;
             foreach (var f in Directory.EnumerateFiles(dir))
-                if (TransientAny.IsMatch(Path.GetFileName(f)) && !_retainedJoinWorlds.Protects(f) && (_jj?.PlacedPath is not string keep || !string.Equals(keep, f, StringComparison.OrdinalIgnoreCase))
+                if (TransientExit.IsMatch(Path.GetFileName(f))
                     && _henry.MoveOut(f, $"a transient file of the mod ({why})")) n++;
         }
         foreach (var e in _henry.Ledger().Where(x => x.State != "done"))
@@ -899,7 +900,7 @@ public partial class GameBridge
     /// "Game load failed / OK" box (observed from inside a world). Nothing in it
     /// could ever load as a world.
     /// </summary>
-    private async Task<bool> Wo125ExitToMenuAsync(string why)
+    private async Task<bool> Wo125ExitToMenuAsync(string why, CancellationToken ct, bool relayClosed)
     {
         string? saves = ResolveSavesDirForJoin();
         int pl = _lastWorldPlayline >= 0 ? _lastWorldPlayline : 0;
@@ -924,7 +925,21 @@ public partial class GameBridge
                 Console.WriteLine("MP-HENRY exit cancelled: file moved out; cached list not refreshed");
                 return false;
             }
-            if (!await P5LoadGameAsync(pl, name, "exit-to-menu")) return false;
+            using var exitReceipt = relayClosed && _transport is LogTailGameTransport tail
+                ? new JoinEngineReceipt(tail, _combat, path, saves) : null;
+            if (!await P5LoadGameAsync(pl, name, "exit-to-menu", ct))
+            {
+                _henry.MoveOut(path, "exit load was not submitted");
+                return false;
+            }
+            if (exitReceipt is not null)
+            {
+                bool loaded = await WaitForJoinReceiptAsync(exitReceipt.Terminal.Task,
+                    "MP-HENRY waiting for the exit load to settle after the relay closed");
+                if (!loaded && _leaveInProgress && OwnLoadExpected) Wo124OnLoadFailedToMenu();
+                _henry.MoveOut(path, "exit load finished");
+                return !loaded;
+            }
             _ = Task.Run(async () =>
             {
                 for (int i = 0; i < 120 && _where != GameWhere.Menu; i++) await Task.Delay(1000);
@@ -938,6 +953,11 @@ public partial class GameBridge
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             Console.WriteLine($"MP-HENRY exit file failed: {ex.Message}");
+            return false;
+        }
+        catch (OperationCanceledException) when (relayClosed)
+        {
+            Console.WriteLine("MP-HENRY exit load interrupted; its file stays protected");
             return false;
         }
     }

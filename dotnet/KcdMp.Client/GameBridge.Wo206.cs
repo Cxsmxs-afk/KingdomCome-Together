@@ -50,7 +50,8 @@ public partial class GameBridge
         }
         if (W206Host) return true;   // a host never takes another machine's epochs
         if (LoadSequenceEnabled && _hostModeKnown && src != _hostModeFrom) return true;
-        bool changed = _w206.LearnWorld(world, join);
+        bool changed;
+        lock (_joinGate) changed = _w206.LearnWorld(world, join);
         LoadSequenceObserveHostWorld(world);
         if (changed) { T3TpInvalidate(); _ = ResetHostCalendarAsync("host-world-epoch"); }
         Wo206SyncPublic();

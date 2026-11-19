@@ -60,6 +60,11 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         }
     }
 
+    public void ObserveMainMenu()
+    {
+        lock (_calendar) _gameplayStarted = false;
+    }
+
     private async Task ServeAsync(string name, CancellationToken ct)
     {
         try
@@ -70,11 +75,13 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
                 await server.WaitForConnectionAsync(ct);
                 var header = new byte[3];
                 byte seq = 0;
-                while (await server.ReadAsync(header.AsMemory(0, 1), ct) != 0)
+                // The production client can close between writes. An incomplete
+                // message belongs to that connection and has no valid reply.
+                while (await server.ReadAtLeastAsync(header, header.Length, false, ct) == header.Length)
                 {
-                    await server.ReadExactlyAsync(header.AsMemory(1), ct);
                     var payload = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
-                    await server.ReadExactlyAsync(payload, ct);
+                    if (await server.ReadAtLeastAsync(payload, payload.Length, false, ct) != payload.Length)
+                        break;
                     var (type, body) = Reply(header[0], seq++, payload);
                     byte[] frame = [type, (byte)body.Length, (byte)(body.Length >> 8), .. body];
                     await server.WriteAsync(frame, ct);

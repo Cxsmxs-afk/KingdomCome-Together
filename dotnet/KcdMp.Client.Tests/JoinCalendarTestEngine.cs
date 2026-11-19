@@ -4,6 +4,7 @@
 using System.Net;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using System.Threading.Channels;
 
 namespace KcdMp.Client.Tests;
 
@@ -18,10 +19,18 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private readonly Action _gameplayStarted;
     private readonly EngineLine _feed;
     private readonly object _logGate = new();
+    private readonly Queue<string> _pendingJoinReads = new();
+    private readonly Queue<string> _pendingLockReplies = new();
+    private readonly Channel<string> _joinLoads = Channel.CreateUnbounded<string>();
+    private readonly Channel<string> _ownLoads = Channel.CreateUnbounded<string>();
+    private readonly Channel<string> _saveLockQueries = Channel.CreateUnbounded<string>();
     private readonly TaskCompletionSource<string> _loadIssued = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<string> _resumed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _joinedNotification = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _eventSequence;
+    private string _where = "menu";
     private string? _lastLoaded;
+    private int _joinLoadsIssued, _joinFilesRead, _ownLoadsIssued;
 
     public JoinCalendarTestEngine(string logPath, string saves, byte[]? hostSave, Action gameplayStarted)
     {
@@ -36,8 +45,28 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
 
     public LogTailGameTransport Transport { get; }
     public Action<string>? SaveWritten { get; set; }
+    public Func<byte[]>? NextHostSave { get; set; }
+    public bool DeferJoinFileRead { get; set; }
+    public bool DeferSaveLockReply { get; set; }
+    public int JoinLoadsIssued => Volatile.Read(ref _joinLoadsIssued);
+    public int JoinFilesRead => Volatile.Read(ref _joinFilesRead);
+    public int OwnLoadsIssued => Volatile.Read(ref _ownLoadsIssued);
     public Task<string> LoadIssued => _loadIssued.Task;
     public Task<string> Resumed => _resumed.Task;
+    public Task JoinedNotification => _joinedNotification.Task;
+    public Task<string> WaitForJoinLoadAsync(CancellationToken ct = default) => _joinLoads.Reader.ReadAsync(ct).AsTask();
+    public Task<string> WaitForOwnLoadAsync(CancellationToken ct = default) => _ownLoads.Reader.ReadAsync(ct).AsTask();
+    public Task<string> WaitForSaveLockAsync(CancellationToken ct = default) => _saveLockQueries.Reader.ReadAsync(ct).AsTask();
+
+    public void CompleteJoinLoad()
+    {
+        lock (_logGate) ReadLoadedFile(_pendingJoinReads.Dequeue(), joined: true);
+    }
+
+    public void ReleaseSaveLock()
+    {
+        lock (_logGate) Emit("wo124_reply", $"{_pendingLockReplies.Dequeue()} lock=held");
+    }
 
     public void Feed(string line)
     {
@@ -46,7 +75,11 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
 
     public void Emit(string name, string args)
     {
-        lock (_logGate) _feed($"[KCD2-MP-EVT] v1 {++_eventSequence} {name} {args}".AsSpan());
+        lock (_logGate)
+        {
+            if (name == "wo124_where") _where = args;
+            _feed($"[KCD2-MP-EVT] v1 {++_eventSequence} {name} {args}".AsSpan());
+        }
     }
 
     private void ConsoleCommand(string command)
@@ -54,44 +87,92 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         var pause = Regex.Match(command, """KCD2MP_JoinTry\("([0-9a-f]{8})",""");
         if (pause.Success) Emit("join_try", $"{pause.Groups[1].Value} paused 0");
 
-        if (_hostSave is not null && command.Contains("""KCD2MP_HostWorldSave("join",""", StringComparison.Ordinal))
+        if (command.Contains("""KCD2MP_HostWorldSave("join",""", StringComparison.Ordinal) &&
+            (NextHostSave?.Invoke() ?? _hostSave) is { } hostSave)
         {
             string path = Path.Combine(_saves, "playline0", "save001.whs");
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllBytes(path, _hostSave);
+            File.WriteAllBytes(path, hostSave);
             SaveWritten?.Invoke(path);
         }
 
         var load = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"(mpworld[0-9a-f]{8})","join-command"\)""");
-        if (load.Success)
-        {
-            string name = load.Groups[2].Value;
-            string path = Path.Combine(_saves, $"playline{load.Groups[1].Value}", name + ".whs");
-            Assert.True(File.Exists(path), $"The agent asked the engine to load a missing save: {name}.");
-            _lastLoaded = name;
-            _loadIssued.TrySetResult(path);
-            Feed($"Loading saved game '{path}'");
-            Feed($"[CryAction] LoadGame: '{path}'");
-            Feed("Sending concept notification 'EntityModuleOnPostLoadGame'");
-            _gameplayStarted();
-            Feed("Gameplay started");
-        }
+        if (load.Success) AcceptLoad(load, joined: true);
+        var ownLoad = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"([A-Za-z0-9_]+)","leave-command"\)""");
+        if (ownLoad.Success) AcceptLoad(ownLoad, joined: false);
 
-        var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry)\("([0-9a-f]{8})"\)""");
-        if (query.Success)
-        {
-            string reply = query.Groups[1].Value switch
-            {
-                "KCD2MP_Wo125LastLoaded" => "last=" + _lastLoaded,
-                "KCD2MP_Wo124Lock" => "lock=held",
-                // WhsSaveTests.Pair's guest has 151 saved money units and six apples. The quest letter is stripped.
-                _ => "money=15.10 items=0a0a0a0a-0000-0000-0000-00000000a001:6"
-            };
-            Emit("wo124_reply", $"{query.Groups[2].Value} {reply}");
-        }
+        var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry|KCD2MP_W154Where)\("([0-9a-f]{8})"\)""");
+        if (query.Success) AnswerQuery(query.Groups[1].Value, query.Groups[2].Value);
+
+        var quiet = Regex.Match(command, """KCD2MP_W177LoadQuiet\("([a-z-]+)"\)""");
+        if (quiet.Success) Emit("w177_load_quiet", $"{quiet.Groups[1].Value} ok");
 
         var resume = Regex.Match(command, """KCD2MP_JoinResume\("[0-9a-f]{8}",\s*"([^"]+)"\)""");
         if (resume.Success) _resumed.TrySetResult(resume.Groups[1].Value);
+        if (command.Contains("Co-op: you are in your host's world.", StringComparison.Ordinal))
+            _joinedNotification.TrySetResult();
+    }
+
+    private void AcceptLoad(Match load, bool joined)
+    {
+        string name = load.Groups[2].Value;
+        string path = Path.Combine(_saves, $"playline{load.Groups[1].Value}", name + ".whs");
+        lock (_logGate)
+        {
+            Assert.True(File.Exists(path), $"The agent asked the engine to load a missing save: {name}.");
+            _where = "loading";
+            Feed($"Loading saved game '{path}'");
+            if (joined)
+            {
+                bool defer = DeferJoinFileRead;
+                Interlocked.Increment(ref _joinLoadsIssued);
+                if (defer) _pendingJoinReads.Enqueue(path);
+                _loadIssued.TrySetResult(path);
+                _joinLoads.Writer.TryWrite(path);
+                if (!defer) ReadLoadedFile(path, joined: true);
+            }
+            else
+            {
+                Interlocked.Increment(ref _ownLoadsIssued);
+                ReadLoadedFile(path, joined: false);
+                _ownLoads.Writer.TryWrite(path);
+            }
+        }
+    }
+
+    private void ReadLoadedFile(string path, bool joined)
+    {
+        Assert.NotEmpty(File.ReadAllBytes(path));
+        _lastLoaded = Path.GetFileNameWithoutExtension(path);
+        if (joined) Interlocked.Increment(ref _joinFilesRead);
+        Feed($"[CryAction] LoadGame: '{path}'");
+        Feed("Sending concept notification 'EntityModuleOnPostLoadGame'");
+        _gameplayStarted();
+        _where = "world";
+        Feed("Gameplay started");
+    }
+
+    private void AnswerQuery(string query, string token)
+    {
+        lock (_logGate)
+        {
+            if (query == "KCD2MP_Wo124Lock" && DeferSaveLockReply)
+            {
+                _pendingLockReplies.Enqueue(token);
+                _saveLockQueries.Writer.TryWrite(token);
+                return;
+            }
+
+            string reply = query switch
+            {
+                "KCD2MP_Wo125LastLoaded" => "last=" + _lastLoaded,
+                "KCD2MP_Wo124Lock" => "lock=held",
+                "KCD2MP_W154Where" => _where,
+                // WhsSaveTests.Pair's guest has 151 saved money units and six apples. The quest letter is stripped.
+                _ => "money=15.10 items=0a0a0a0a-0000-0000-0000-00000000a001:6"
+            };
+            Emit("wo124_reply", $"{token} {reply}");
+        }
     }
 
     public ValueTask DisposeAsync() => Transport.DisposeAsync();

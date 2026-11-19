@@ -880,18 +880,40 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     /// straight away even while a menu has focus and Script.SetTimer is
     /// frozen.
     /// </summary>
-    public Task ExecuteNowAsync(string lua, CancellationToken ct = default)
+    private string? PrepareImmediateLua(string lua)
     {
-        ProcessorFrameScope.ThrowIfAbandoned();
-        ct.ThrowIfCancellationRequested();
         int enc = LuaCommandBudget.EncodedLength(lua) + LuaCommandBudget.WrapperEncodedChars;
         if (enc > MaxBatchChars)
         {
             OversizeDropped++;
             Console.WriteLine($"MP-BATCH-DROP reason=oversize-now encoded={enc} budget={MaxBatchChars} total={OversizeDropped} first=\"{(lua.Length > 100 ? lua[..100] + "..." : lua)}\"");
-            return Task.CompletedTask;
+            return null;
         }
-        return SendNowAsync($"pcall(function() {lua} end)", ct);
+        return $"pcall(function() {lua} end)";
+    }
+
+    public Task ExecuteNowAsync(string lua, CancellationToken ct = default)
+    {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        ct.ThrowIfCancellationRequested();
+        return PrepareImmediateLua(lua) is { } command ? SendNowAsync(command, ct) : Task.CompletedTask;
+    }
+
+    /// <summary>Prepare the HTTP request before letting the caller serialize its actual handoff with retirement.</summary>
+    internal async Task<bool> ExecuteAdmittedNowAsync(string lua, Func<Func<Task>, Task?> admit, CancellationToken ct)
+    {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        if (PrepareImmediateLua(lua) is not { } command) return false;
+        string query = Uri.EscapeDataString("#" + command);
+        string url = $"{gameApiBase}/api/System/Console/ExecuteString?command={query}";
+        using var link = ProcessorFrameScope.Link(ct);
+        link.Token.ThrowIfCancellationRequested();
+        Task? write = admit(() => _http.GetStringAsync(url, link.Token));
+        if (write is null) return false;
+        await write;
+        link.Token.ThrowIfCancellationRequested();
+        ProcessorFrameScope.ThrowIfAbandoned();
+        return true;
     }
 
     public async ValueTask DisposeAsync()

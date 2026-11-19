@@ -1132,6 +1132,7 @@ public partial class GameBridge(ClientConfig config)
     public async Task RunAsync(CancellationToken ct = default)
     {
         _guidedRunLifetime = ct;
+        _joinEngineLifetime = ct;
         _loadSequenceRuntime = true;
         var http = new HttpGameTransport(config.GameApiBase) { RetryBatches = config.BatchRetryEnabled };   // WO-153 3
         await http.StartAsync(ct);
@@ -4700,6 +4701,7 @@ public partial class GameBridge(ClientConfig config)
         void StopReceive()
         {
             if (Interlocked.Exchange(ref stopped, 1) != 0) return;
+            RetireJoinCalendarAtRead(null, stream);
             P6EndReceive(stream, ct);
             WorldSyncStop(stream);
             T3TpEndReceive(tpConnection);
@@ -4793,7 +4795,8 @@ public partial class GameBridge(ClientConfig config)
                     GuidedRunObserveLoss(stream, payload[0]);
                     RetireJoinCalendarAtRead(payload[0], stream);
                 }
-                if (type == Protocol.JoinAbortDown && Protocol.TrySplitJoinDown(payload, out byte abortSource, out byte abortTarget,
+                if (type == Protocol.JoinAbortDown && payload.Length == 2 + Protocol.JoinHeaderLen &&
+                    Protocol.TrySplitJoinDown(payload, out byte abortSource, out byte abortTarget,
                         out uint abortedJoin, out _) && abortTarget == _myGhostId)
                     RetireJoinCalendarAtRead(abortSource, stream, abortedJoin);
                 WorldReconnectObserveAtRead(presentationSession, type, payload);
