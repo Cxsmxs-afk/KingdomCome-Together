@@ -992,7 +992,17 @@ public partial class GameBridge
     {
         if (!ReferenceEquals(_jj, join) || join.Abandoned.Task.IsCompleted || join.Phase != "preparing" ||
             !join.PlacedVerified || join.PlacedPath != path) return false;
-        if (_transport is LogTailGameTransport tail) join.EngineReceipt = new(tail, _combat, path, savesRoot);
+        if (_transport is LogTailGameTransport tail)
+        {
+            var receipt = new JoinEngineReceipt(tail, _combat, path, savesRoot);
+            if (join.Character?.Scoped is { } character && !character.RetainForEngine(join, receipt))
+            {
+                receipt.Dispose();
+                return false;
+            }
+            join.EngineReceipt = receipt;
+        }
+        else if (join.Character?.Scoped is not null) return false;
         join.LoadDispatchInFlight = true;
         join.LoadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         join.GameplayStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);

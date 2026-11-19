@@ -11,6 +11,7 @@ namespace KcdMp.Client.Tests;
 /// WhsSaveTests' builder): a fresh joiner, one who hosted the same start save, one with only regular-game saves, one
 /// with his own Modding Tools save -- and two hosts of one start save kept apart on a joiner.
 /// </summary>
+[Collection("Join calendar integration")]
 public class Wo157WorldTests : IDisposable
 {
     private const uint StartSeed = 0x5717;   // synthetic: the start save every group was given
@@ -36,6 +37,59 @@ public class Wo157WorldTests : IDisposable
     private HenryStore Store() => new(Path.Combine(_root, "henry"));
 
     private static WhsSave.PlayerInfo Who(GameBridge.OwnSave s) => WhsSave.PlayerOf(WhsSave.Inflate(File.ReadAllBytes(s.Save.FullPath)).Raw);
+
+    [Fact]
+    public void A_retained_guest_save_is_not_used_for_Bring_in_another_host_world_after_restart()
+    {
+        Put("playline0", "permanent001.whs", OwnSeed, 100);
+        Put("playline1", "quicksave001.whs", StartSeed, 200);
+        string original = Path.Combine(Saves, "playline0", "permanent001.whs");
+        string retained = Path.Combine(Saves, "playline1", "quicksave001.whs");
+        byte[] originalBytes = File.ReadAllBytes(original);
+        byte[] retainedBytes = File.ReadAllBytes(retained);
+        var store = Store();
+        Directory.CreateDirectory(store.Root);
+        File.WriteAllText(Path.Combine(store.Root, "ledger.json"), System.Text.Json.JsonSerializer.Serialize(new[]
+        {
+            new { Playline = 1, File = "quicksave001.whs", Md5 = WhsSave.Verify(retainedBytes).Md5,
+                EngineProfileId = LocalStartCheckpointStore.ProfileId(_root), Kind = "scoped-guest", State = "retained" }
+        }));
+
+        var bridge = new GameBridge(new ClientConfig());
+        const System.Reflection.BindingFlags members = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        var type = typeof(GameBridge);
+        type.GetField("_henry", members)!.SetValue(bridge, Store());
+        type.GetField("_peerSeedKnown", members)!.SetValue(bridge, true);
+        type.GetField("_peerSeed", members)!.SetValue(bridge, 0x7777u);
+        var select = type.GetMethod("Wo125SourceFor", members)!;
+        var newest = type.GetMethod("Wo125NewestOwn", members)!;
+        GameBridge.HenrySource? Pick(string option) =>
+            select.Invoke(bridge, [option, null, null]) is { } choice
+                ? (GameBridge.HenrySource?)choice.GetType().GetProperty("Save")!.GetValue(choice) : null;
+
+        const string savesVariable = "KCDMP_JOIN_SAVES_DIR";
+        string? previous = Environment.GetEnvironmentVariable(savesVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(savesVariable, Saves);
+            Assert.Equal(original, Pick("bring")?.FullPath);
+            Assert.Null(Pick("playline1/quicksave001"));
+            Assert.Equal(original, ((GameBridge.HenrySource?)newest.Invoke(bridge, [null]))?.FullPath);
+            Store().LedgerAdd(new HenryStore.LedgerEntry { Playline = 1, File = "quicksave001.whs" });
+            Assert.Equal(0, bridge.Wo125Sweep("filter proof"));
+            Assert.Equal(originalBytes, File.ReadAllBytes(original));
+            Assert.Equal(retainedBytes, File.ReadAllBytes(retained));
+
+            Put("playline1", "quicksave001.whs", 900, 300);
+            Assert.Equal(retained, Pick("bring")?.FullPath); // the unrelated replacement stays eligible
+            byte[] replacement = File.ReadAllBytes(retained);
+            type.GetMethod("Wo125RecordScopedGuestSave", members)!.Invoke(bridge, [retained, WhsSave.Verify(replacement).Md5]);
+            Assert.Equal(original, Pick("bring")?.FullPath);
+            Assert.Equal(replacement, File.ReadAllBytes(retained));
+            Assert.Equal(originalBytes, File.ReadAllBytes(original));
+        }
+        finally { Environment.SetEnvironmentVariable(savesVariable, previous); }
+    }
 
     /// <summary>What a first join offers, the way the agent decides it: (the no-save reason, Bring, a new character).</summary>
     private (string Reason, bool Bring, bool Fresh) Offer(uint hostSeed, string hostBuild, Func<uint, bool>? hostedHere)

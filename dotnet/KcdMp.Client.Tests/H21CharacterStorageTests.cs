@@ -1,4 +1,5 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+using System.Reflection;
 using System.Security.Cryptography;
 
 namespace KcdMp.Client.Tests;
@@ -208,6 +209,89 @@ public sealed class H21CharacterStorageTests : IDisposable
         File.Delete(next);
         Assert.True(Catalog(profile).TryFind(identity.CharacterId, out _));
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Reader_retirement_keeps_the_character_lease_only_for_the_exact_engine_read(bool submitted)
+    {
+        const uint joinId = 177;
+        const byte host = 3;
+        var start = Checkpoint("first-profile", 1, "fighter", strength: 110);
+        string profile = start.Proof.EngineProfileId;
+        var catalog = Catalog(profile);
+        var character = Register(catalog, start, "Henry");
+        using var selectedLease = Assert.IsAssignableFrom<IDisposable>(catalog.TryLease(character.CharacterId, character.Revision));
+        await using var pipe = new JoinCalendarTestPipe();
+        string saves = Path.Combine(_root, "first-profile", "saves");
+        await using var engine = new JoinCalendarTestEngine(Path.Combine(_root, "engine.log"), saves, null, pipe.ObserveGameplayStarted);
+        using var link = new MemoryStream();
+        var bridge = new GameBridge(new ClientConfig());
+        Set(bridge, "_transport", engine.Transport);
+        Set(bridge, "_combat", pipe.Pipe);
+        Set(bridge, "_wo122Stream", link);
+        var home = new GameBridge.HenryChoice("fresh", Parts(start.Proof), null, "checkpoint");
+        object selected = Make("SelectedCharacter", character, catalog, selectedLease, home);
+        object intent = Make("JoinCharacterIntent", "character:" + character.CharacterId.ToString("N"), null, World);
+        object selection = Make("JoinCharacterSelection", intent, 421u, ToolsBuild, home, selected);
+        object request = Make("JoinCalendarRequest", joinId, host, link);
+        request.GetType().GetProperty("Character")!.SetValue(request, selection);
+        Set(bridge, "_joinCalendarRequest", request);
+
+        string staged = Path.Combine(saves, "playline0", "mpworld000000b1.whs");
+        object joining = Make("JoinerJoin");
+        Set(joining, "JoinId", joinId);
+        Set(joining, "Host", host);
+        Set(joining, "Character", selection);
+        Set(joining, "PlacedPath", staged);
+        Set(joining, "PlacedVerified", true);
+        Set(bridge, "_jj", joining);
+        if (submitted) Assert.Equal(true, Call(bridge, "TryBeginJoinLoad", joining, saves, staged));
+
+        Call(bridge, "RetireJoinCalendarAtRead", host, link, joinId);
+        Assert.True(((TaskCompletionSource<bool>)Field(joining, "Abandoned").GetValue(joining)!).Task.IsCompleted);
+        if (!submitted)
+        {
+            Assert.True(Catalog(profile).TryDelete(start.Store, character.CharacterId, true, out string beforeDispatch), beforeDispatch);
+            return;
+        }
+
+        Assert.False(Catalog(profile).TryDelete(start.Store, character.CharacterId, true, out string inFlight));
+        Assert.Equal("character-active-or-reserved", inFlight);
+        CompleteEngineLoad(engine, Path.Combine(saves, "playline0", "mpworld000000c2.whs"));
+        Assert.False(Catalog(profile).TryDelete(start.Store, character.CharacterId, true, out string unrelated));
+        Assert.Equal("character-active-or-reserved", unrelated);
+        CompleteEngineLoad(engine, staged);
+        Assert.False(Catalog(profile).TryDelete(start.Store, character.CharacterId, true, out string transportStillOwns));
+        Assert.Equal("character-active-or-reserved", transportStillOwns);
+
+        Set(joining, "LoadDispatchInFlight", false);
+        ((TaskCompletionSource)Field(joining, "DispatchEnded").GetValue(joining)!).TrySetResult();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        while (!Catalog(profile).TryDelete(start.Store, character.CharacterId, true, out _))
+            await Task.Delay(10, timeout.Token);
+        Assert.Equal(start.Proof.Sha256, Hash(File.ReadAllBytes(start.EngineOriginal)));
+    }
+
+    private static void CompleteEngineLoad(JoinCalendarTestEngine engine, string path)
+    {
+        engine.Feed($"Loading saved game '{path}'");
+        engine.Feed($"[CryAction] LoadGame: '{path}'");
+        engine.Feed("Sending concept notification 'EntityModuleOnPostLoadGame'");
+        engine.Feed("Gameplay started");
+    }
+
+    private static object Make(string nested, params object?[] args) =>
+        Activator.CreateInstance(typeof(GameBridge).GetNestedType(nested, BindingFlags.NonPublic)!,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, args, null)!;
+
+    private static FieldInfo Field(object owner, string name) =>
+        owner.GetType().GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!;
+
+    private static void Set(object owner, string name, object value) => Field(owner, name).SetValue(owner, value);
+
+    private static object? Call(GameBridge owner, string name, params object[] args) =>
+        typeof(GameBridge).GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(owner, args);
 
     private HenryStore Store() => new(Snapshots, log: _ => { });
     private HenryCharacterCatalog Catalog(string engineProfileId) => new(Catalogue, engineProfileId, log: _ => { });

@@ -5,7 +5,52 @@ namespace KcdMp.Client;
 
 public partial class GameBridge
 {
-    private sealed record SelectedCharacter(HenryCharacterEntry Entry, HenryCharacterCatalog Catalog, IDisposable Lease, HenryChoice Home);
+    private sealed class SelectedCharacter(HenryCharacterEntry entry, HenryCharacterCatalog catalog, IDisposable lease, HenryChoice home)
+    {
+        public HenryCharacterEntry Entry { get; } = entry;
+        public HenryCharacterCatalog Catalog { get; } = catalog;
+        public HenryChoice Home { get; } = home;
+        private readonly object _leaseGate = new();
+        private int _engineReads;
+        private bool _releaseRequested;
+
+        public bool RetainForEngine(JoinerJoin join, JoinEngineReceipt receipt)
+        {
+            lock (_leaseGate)
+            {
+                if (_releaseRequested) return false;
+                _engineReads++;
+            }
+            _ = ReleaseAfterEngineAsync(join, receipt);
+            return true;
+        }
+
+        public void Release()
+        {
+            lock (_leaseGate)
+            {
+                if (_releaseRequested) return;
+                _releaseRequested = true;
+                if (_engineReads != 0) return;
+            }
+            lease.Dispose();
+        }
+
+        private async Task ReleaseAfterEngineAsync(JoinerJoin join, JoinEngineReceipt receipt)
+        {
+            // Use the same handoff and terminal proof as the retained world file.
+            // An abort, a closed relay, or a timed-out HTTP request is not that proof.
+            await join.DispatchEnded.Task;
+            try { await receipt.Terminal.Task; }
+            catch (OperationCanceledException) when (receipt.Terminal.Task.IsCanceled) { }   // the observed game quit ends the read
+            lock (_leaseGate)
+            {
+                _engineReads--;
+                if (!_releaseRequested || _engineReads != 0) return;
+            }
+            lease.Dispose();
+        }
+    }
     private sealed record JoinedCharacter(SelectedCharacter Selection, HenryCharacterScope Scope);
     private JoinedCharacter? _joinedCharacter;
 
@@ -48,7 +93,7 @@ public partial class GameBridge
     private void ReleasePendingCharacter(JoinCharacterSelection? pending)
     {
         if (pending?.Scoped is { } selection && !ReferenceEquals(Volatile.Read(ref _joinedCharacter)?.Selection, selection))
-            selection.Lease.Dispose();
+            selection.Release();
     }
 
     private bool TryBindJoinCharacter(JoinerJoin join, string worldTag, string saveMd5)
@@ -75,6 +120,6 @@ public partial class GameBridge
     private void ReleaseJoinedCharacter()
     {
         var selected = Interlocked.Exchange(ref _joinedCharacter, null);
-        selected?.Selection.Lease.Dispose();
+        selected?.Selection.Release();
     }
 }

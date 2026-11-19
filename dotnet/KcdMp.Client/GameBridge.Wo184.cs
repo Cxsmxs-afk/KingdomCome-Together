@@ -454,8 +454,8 @@ public partial class GameBridge
         var v = WhsSave.Verify(bytes);
         if (character is null)
             _henry.LedgerSet(led.Id, e => { e.File = Path.GetFileName(path); e.Md5 = v.Md5; e.State = "written"; });
-        else
-            _henry.LedgerSet(led.Id, e => e.State = "done");
+        else if (v.Ok)
+            Wo125RecordScopedGuestSave(path, v.Md5);
         string? storeWhy = null;
         WhsSave.HenryParts? parts = null;
         if (!v.Ok) storeWhy = "the snapshot does not verify: " + v.Reason;

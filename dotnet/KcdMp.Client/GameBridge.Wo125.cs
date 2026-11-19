@@ -459,7 +459,7 @@ public partial class GameBridge
     {
         if (ResolveSavesDirForJoin() is not string saves) return "no-saves";
         int all = ListOwnSaves(saves).Count;
-        var own = OwnSaves(saves, HostSeedForOwn(), null, Wo157HostedSeed);
+        var own = Wo125OwnSaves(saves, HostSeedForOwn());
         var builds = own.Select(s => WhsSave.ReadBuildFromFile(s.Save.FullPath)).ToList();
         int same = host is null ? own.Count : builds.Count(b => Wo135Rules.SameBuild(b, host));
         int regular = builds.Count(Wo154Rules.IsRegularGameBuild);
@@ -470,7 +470,7 @@ public partial class GameBridge
     private string? Wo135NewestHenryBuild()
     {
         if (ResolveSavesDirForJoin() is not string saves) return null;
-        foreach (var s in OwnSaves(saves, HostSeedForOwn(), null, Wo157HostedSeed))
+        foreach (var s in Wo125OwnSaves(saves, HostSeedForOwn()))
             if (WhsSave.ReadBuildFromFile(s.Save.FullPath) is string b) return b;
         return null;
     }
@@ -494,16 +494,27 @@ public partial class GameBridge
     /// own. Each skip is logged (a warning: the file is left where it is).
     /// WO-157: unless <paramref name="hostedHere"/> says this install hosted that world itself -- two hosts of
     /// the same start save share its seed, and the one who hosted it first then had "only copies of the host's
-    /// world" and could not join the other. The copies a join makes never stay in the playlines (the transient
-    /// world file is deleted, saves made while joined are moved out), so what is left there is his own play.
+    /// world" and could not join the other. Scoped guest saves with no cleanup receipt are retained and
+    /// excluded by their exact observed file and content identity.
     /// </summary>
     public static List<OwnSave> OwnSaves(string saves, uint? hostSeed, Action<string>? log = null, Func<uint, bool>? hostedHere = null)
+        => OwnSaves(saves, hostSeed, log, hostedHere, null);
+
+    private List<OwnSave> Wo125OwnSaves(string saves, uint? hostSeed, Action<string>? log = null)
+        => OwnSaves(saves, hostSeed, log, Wo157HostedSeed, Wo125ScopedGuestSaveFilter(saves));
+
+    private Func<HenrySource, bool>? Wo125ScopedGuestSaveFilter(string saves)
+        => TryCheckpointProfile(saves, out _, out string profile) ? _henry.ScopedGuestSaveFilter(profile) : null;
+
+    private static List<OwnSave> OwnSaves(string saves, uint? hostSeed, Action<string>? log, Func<uint, bool>? hostedHere,
+        Func<HenrySource, bool>? retainedGuestSave)
     {
         var o = new List<OwnSave>();
         var skipped = new List<string>();
         bool ownWorld = hostSeed is uint h0 && hostedHere?.Invoke(h0) == true;
         foreach (var s in ListOwnSaves(saves))
         {
+            if (retainedGuestSave?.Invoke(s) == true) continue;
             uint? seed = WhsSave.ReadSeedFromFile(s.FullPath);
             if (hostSeed is uint hs && seed == hs && !ownWorld)
             {
@@ -532,7 +543,7 @@ public partial class GameBridge
         why = "";
         if (TestNoOwnSave) { why = "KCDMP_TEST_NO_OWN_SAVE=1 (test: no own save)"; Console.WriteLine("MP-HENRY TEST KCDMP_TEST_NO_OWN_SAVE=1 -- acting as if this player had no save of their own"); return null; }
         if (ResolveSavesDirForJoin() is not string saves) { why = "no saves folder"; return null; }
-        var own = OwnSaves(saves, HostSeedForOwn(), l => Console.WriteLine(l), Wo157HostedSeed);
+        var own = Wo125OwnSaves(saves, HostSeedForOwn(), Console.WriteLine);
         // WO-147: only a save this game can load -- of the build of the world it runs. The live run's leave picked a
         // newer build's save (the retail game shares the saves folder): "needs newer game", and the joiner stayed.
         if (Wo135TargetBuild() is string build) own = SameBuildSaves(own, build, l => Console.WriteLine(l));
@@ -556,7 +567,7 @@ public partial class GameBridge
         if (TestNoOwnSave || ResolveSavesDirForJoin() is not string saves)
             return (Wo125NewestOwn(out string w0), w0);
         var selected = await SaveListMaintenance.FindOwnAsync(
-            OwnSaves(saves, HostSeedForOwn(), l => Console.WriteLine(l), Wo157HostedSeed),
+            Wo125OwnSaves(saves, HostSeedForOwn(), Console.WriteLine),
             s =>
             {
                 var v = WhsSave.VerifyFile(s.Save.FullPath);
@@ -660,6 +671,11 @@ public partial class GameBridge
                 return null;
             }
             var src = new HenrySource(int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture), f, full, ReadSaveTime(full) ?? 0);
+            if (Wo125ScopedGuestSaveFilter(saves)?.Invoke(src) == true)
+            {
+                why = "That save was written while playing in a host's run. Choose a personal save.";
+                return null;
+            }
             if (build is not null && WhsSave.ReadBuildFromFile(full) is var fb && !Wo135Rules.SameBuild(fb, build))
             {
                 why = Wo135Rules.WrongBuildMessage(fb, build);
@@ -668,7 +684,7 @@ public partial class GameBridge
             }
             return TryHenrySave(src, WhsSave.HenryParts.OriginSave, "bring", out why, requirePristine: false);
         }
-        var own = OwnSaves(saves, hostSeed, l => Console.WriteLine(l), Wo157HostedSeed);
+        var own = Wo125OwnSaves(saves, hostSeed, Console.WriteLine);
         // WO-135: a save from another game build is skipped (logged once per file), before it is even read.
         var same = build is null ? own : SameBuildSaves(own, build, l => Console.WriteLine(l));
         if (choice == "bring")
@@ -912,6 +928,8 @@ public partial class GameBridge
     private bool Wo125OnJoinerSaveObserved(string path, string md5)
     {
         var id = WorldSaved.ParsePath(path);
+        if (_joinedWorld && Volatile.Read(ref _joinedCharacter) is not null)
+            Wo125RecordScopedGuestSave(path, md5);
         lock (_snapGate)
         {
             if (_snapWait is { } w && ReferenceEquals(w.Character, Volatile.Read(ref _joinedCharacter)) &&
@@ -939,6 +957,13 @@ public partial class GameBridge
         return true;
     }
 
+    private void Wo125RecordScopedGuestSave(string path, string md5)
+    {
+        if (ResolveSavesDirForJoin() is not string saves || H21EngineSavePath(saves, path) is not string reported ||
+            WorldSaved.ParsePath(reported) is not { } save || !TryCheckpointProfile(saves, out _, out string profile)) return;
+        _henry.RecordScopedGuestSave(profile, save.Playline, Path.GetFileName(reported), md5);
+    }
+
     // ---------------------------------------------------------------- sweeps (agent start, before every join)
 
     private readonly JoinWorldJournal _joinWorldJournal = new();
@@ -955,6 +980,9 @@ public partial class GameBridge
         if (saves is null) return 0;
         saves = Path.GetFullPath(saves);
         if (!_joinWorldJournal.CanSweepPath(saves, directory: true)) return 0;
+        var scopedGuestSave = Wo125ScopedGuestSaveFilter(saves);
+        bool IsScopedGuestSave(int playline, string file) =>
+            scopedGuestSave?.Invoke(new(playline, Path.GetFileName(file), file, 0)) == true;
         int n = 0;
         if (why == "agent start")
         {
@@ -976,7 +1004,7 @@ public partial class GameBridge
                     && !_retainedJoinWorlds.Protects(f) && (_jj?.PlacedPath is not string keep || !string.Equals(keep, f, StringComparison.OrdinalIgnoreCase))
                     && _henry.MoveOut(f, $"a transient file of the mod ({why})")) n++;
         }
-        foreach (var e in _henry.Ledger().Where(x => x.State != "done"))
+        foreach (var e in _henry.Ledger().Where(x => x.State != "done" && x.Kind != "scoped-guest"))
         {
             string dir = Path.Combine(saves, $"playline{e.Playline}");
             bool exists = Directory.Exists(dir);
@@ -987,7 +1015,7 @@ public partial class GameBridge
             if (e.File is string f && File.Exists(Path.Combine(dir, f)))
             {
                 string p = Path.Combine(dir, f);
-                if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p)) continue;
+                if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p) || IsScopedGuestSave(e.Playline, p)) continue;
                 var v = WhsSave.VerifyFile(p);
                 if (e.Md5 is null || string.Equals(v.Md5, e.Md5, StringComparison.OrdinalIgnoreCase))
                 { if (_henry.MoveOut(p, $"a {e.Kind} save the mod made or saw while joined ({why})")) n++; else done = false; }
@@ -999,7 +1027,7 @@ public partial class GameBridge
                 // the host's world (its seed) that landed in that playline within two minutes of the request.
                 foreach (var p in Directory.EnumerateFiles(dir, "*.whs"))
                 {
-                    if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p)) continue;
+                    if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p) || IsScopedGuestSave(e.Playline, p)) continue;
                     var t = File.GetLastWriteTimeUtc(p);
                     if (t < e.SinceUtc || t > e.SinceUtc.AddMinutes(2) || WorldSaved.ParsePath(p) is null) continue;
                     if (WhsSave.ReadSeedFromFile(p) is uint s && WhsSave.SeedTag(s) == _henry.BaseTagOf(e.WorldTag))
