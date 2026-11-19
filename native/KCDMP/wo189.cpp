@@ -635,6 +635,13 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
         case kOpProfile: {
             if (len < 2 || cap < 5) return wo163::kRBadRequest;
             const uint8_t sub = body[1];
+            if (sub == 5) {   // a load: every handle this DLL took points into the world that is gone -- forgotten, never released
+                const size_t k = g_handles.size();
+                g_handles.clear();
+                if (k) logf("WO189-PROFILE a load: %zu handle(s) of this DLL forgotten (never released into a new world)", k);
+                out[0] = static_cast<uint8_t>(k > 255 ? 255 : k); *outLen = 1;
+                return wo163::kROk;
+            }
             void* mgr = profile_manager();
             if (sub == 1) {   // list the active ones
                 if (len != 4) return wo163::kRBadRequest;
@@ -658,13 +665,6 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
                 }
                 std::memcpy(out, &total, 2); std::memcpy(out + 2, &next, 2);
                 *outLen = at;
-                return wo163::kROk;
-            }
-            if (sub == 5) {   // a load: every handle this DLL took points into the world that is gone -- forgotten, never released
-                const size_t k = g_handles.size();
-                g_handles.clear();
-                if (k) logf("WO189-PROFILE a load: %zu handle(s) of this DLL forgotten (never released into a new world)", k);
-                out[0] = static_cast<uint8_t>(k > 255 ? 255 : k); *outLen = 1;
                 return wo163::kROk;
             }
             if (len < 3 || len != 3u + body[2]) return wo163::kRBadRequest;
