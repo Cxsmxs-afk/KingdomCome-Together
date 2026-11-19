@@ -255,7 +255,7 @@ public partial class GameBridge
             // WO-155 live check: this player's friendly-fire hit on that avatar, as the DLL's 0x97 frame reports one
             // (sent to the relay, noted as the cause of the knockdown that follows on his screen)
             float hpv = float.Parse(p[2], CultureInfo.InvariantCulture), stv = float.Parse(p[3], CultureInfo.InvariantCulture);
-            await OnPvpHitAsync(ffEid, stv, hpv, p.Length > 4 && p[4] == "unarmed" ? PlayerHitV8.FlagUnarmed : (byte)0, 0);
+            await SendDiagnosticPvpHitAsync(ffEid, stv, hpv, p.Length > 4 && p[4] == "unarmed" ? PlayerHitV8.FlagUnarmed : (byte)0);
             Console.WriteLine($"MP-W154 check: friendly-fire hit on ghost {p[1]}: hp={hpv} st={stv} (the same path as a real hit)");
         }
         else Console.WriteLine("MP-W154 check: hostfight <w154_npc> [secs] | hostfight off | pursue <w154_npc> <ghost> on|off | ffhit <ghost> <hp> <st> [unarmed] | where | status");

@@ -34,7 +34,7 @@ uint64_t now_ms() {
 }
 uint64_t g_values[p4rules::kFields]{};
 std::atomic<uint64_t> g_until{0}, g_recGen{0}, g_recWuid{0}, g_reset{0}, g_lifeEdge{0};
-std::atomic<uint64_t> g_pvpLifeRevision{1};
+std::atomic<uint64_t> g_pvpLifeRevision{1}, g_pvpSalt{0};
 std::atomic<bool> g_pvpBound{false};
 std::atomic<uintptr_t> g_recSoul{0};
 p4rules::Landing g_landing;
@@ -75,8 +75,7 @@ uint64_t generation() { return wo216::lifecycle_generation(); }
 bool gameplay() { return wo216::lifecycle_gameplay(); }
 bool ready_context(Context c) { return p4rules::fresh(c, now_ms(), generation(), gameplay(), g_lifeEdge.load()); }
 uint64_t life_edge_tick(){return g_lifeEdge.load();}
-uint64_t pvp_life_proof() {
-    if (!g_pvpBound.load(std::memory_order_acquire) || !gameplay()) return 0;
+static uint64_t prepare_pvp_salt() {
     // A DLL restart on the same relay link must never restart a previous proof.
     static const uint64_t salt = []() noexcept -> uint64_t {
         try {
@@ -84,6 +83,11 @@ uint64_t pvp_life_proof() {
             return (static_cast<uint64_t>(random()) << 32) | random();
         } catch (...) { return 0; }
     }();
+    return salt;
+}
+uint64_t pvp_life_proof() {
+    if (!g_pvpBound.load(std::memory_order_acquire) || !gameplay()) return 0;
+    const uint64_t salt = g_pvpSalt.load(std::memory_order_relaxed);
     return salt ? salt ^ g_pvpLifeRevision.load(std::memory_order_acquire) : 0;
 }
 bool pvp_body_matches(void* soul, uint64_t wuid) {
@@ -215,6 +219,9 @@ void tick() {
     void* soul = canonical(rttr::read_player_soul()); const uint64_t wuid = own_wuid();
     if (g_observedSoul && (soul != g_observedSoul || wuid != g_observedWuid)) { g_until.store(0); note_life_edge("player-identity"); g_hitAt = 0; }
     g_observedSoul = soul; g_observedWuid = wuid;
+    // Warm the process salt here before combat hooks can observe a bound life.
+    if (soul && wuid && !g_pvpBound.load(std::memory_order_relaxed))
+        g_pvpSalt.store(prepare_pvp_salt(), std::memory_order_relaxed);
     g_pvpBound.store(soul && wuid, std::memory_order_release);
     float pos[3]{}; const bool posKnown = actions::player_position(pos);
     bool dead = false; const bool deadKnown = soul && rttr::soul_bool(soul, "IsDead", &dead);
