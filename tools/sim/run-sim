@@ -57,12 +57,12 @@ int main() {
 }
 EOF
     "${CXX:-c++}" -std=c++17 -DKCDMP_P6_CAPTURE_TEST -I native/KCDMP "$native_tmp/main.cpp" \
+        native/tests/p6_capture_flow_tests.cpp native/KCDMP/wo201_ranged.cpp \
         native/tests/holder_contract_tests.cpp native/tests/edge_lanes_tests.cpp \
         native/tests/rp_timeline_tests.cpp native/tests/ranged_aim_tests.cpp native/tests/rp_timeline_action_tests.cpp \
         native/tests/rp_controller_tests.cpp native/tests/rp_combat_tests.cpp \
         native/tests/rp_body_action_tests.cpp native/tests/visual_damage_tests.cpp native/tests/load_sequence_tests.cpp \
         native/tests/wo203_conv_tests.cpp native/tests/t3_recovery_stats_tests.cpp \
-        native/tests/p6_capture_flow_tests.cpp native/KCDMP/wo201_ranged.cpp \
         -o "$native_tmp/native-contracts"
     if ! native_result="$("$native_tmp/native-contracts")"; then
         printf '%s\n' "$native_result" >&2
