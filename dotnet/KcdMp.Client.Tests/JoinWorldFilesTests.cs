@@ -34,6 +34,12 @@ public sealed class JoinWorldFilesTests : IDisposable
         return Task.CompletedTask;
     }
 
+    private static bool DeleteOwnedFile(string path)
+    {
+        File.Delete(path);
+        return true;
+    }
+
     [Fact]
     public async Task Timeout_then_missing_then_listed_reuses_the_verified_file_and_find_only_queries()
     {
@@ -186,7 +192,7 @@ public sealed class JoinWorldFilesTests : IDisposable
         Assert.Empty(files.End(joined: false, cancelled: false));
         Assert.True(files.Protects(path));
         Assert.False(files.MayRemove(path, owner));
-        Assert.False(files.TryDelete(path, owner));
+        Assert.False(files.TryDelete(path, owner, DeleteOwnedFile));
         Assert.True(File.Exists(path));
     }
 
@@ -211,10 +217,10 @@ public sealed class JoinWorldFilesTests : IDisposable
         Assert.True(files.MayRemove(b, second));
         Assert.True(files.Protects(a)); // Sweep protection lasts until actual deletion.
         Assert.True(files.Protects(b));
-        Assert.True(files.TryDelete(a, first));
+        Assert.True(files.TryDelete(a, first, DeleteOwnedFile));
         Assert.False(File.Exists(a));
         Assert.False(files.Protects(a));
-        Assert.True(files.TryDelete(b, second));
+        Assert.True(files.TryDelete(b, second, DeleteOwnedFile));
         Assert.False(File.Exists(b));
         Assert.False(files.Protects(b));
     }
@@ -231,13 +237,13 @@ public sealed class JoinWorldFilesTests : IDisposable
         Assert.True(files.MayRemove(path, oldJoin));
         files.Keep(path, newJoin);
         Assert.False(files.MayRemove(path, oldJoin));
-        Assert.False(files.TryDelete(path, oldJoin));
+        Assert.False(files.TryDelete(path, oldJoin, DeleteOwnedFile));
         Assert.False(files.MayRemove(path, newJoin));
         Assert.True(files.Protects(path));
         Assert.True(File.Exists(path));
         files.End(joined: true, cancelled: false);
-        Assert.False(files.TryDelete(path, oldJoin));
-        Assert.True(files.TryDelete(path, newJoin));
+        Assert.False(files.TryDelete(path, oldJoin, DeleteOwnedFile));
+        Assert.True(files.TryDelete(path, newJoin, DeleteOwnedFile));
     }
 
     [Fact]
@@ -257,10 +263,10 @@ public sealed class JoinWorldFilesTests : IDisposable
 
         Assert.True(files.MayRemove(latePath, cancelledJoin));
         Assert.True(files.Protects(latePath));
-        Assert.True(files.TryDelete(latePath, cancelledJoin));
+        Assert.True(files.TryDelete(latePath, cancelledJoin, DeleteOwnedFile));
         Assert.False(File.Exists(latePath));
         Assert.False(files.MayRemove(nextPath, nextJoin));
-        Assert.False(files.TryDelete(nextPath, nextJoin));
+        Assert.False(files.TryDelete(nextPath, nextJoin, DeleteOwnedFile));
         Assert.True(files.Protects(nextPath));
         Assert.True(File.Exists(nextPath));
     }
@@ -282,12 +288,12 @@ public sealed class JoinWorldFilesTests : IDisposable
 
         Assert.False(files.MayRemove(path, oldJoin));
         Assert.False(files.MayRemove(path, newJoin));
-        Assert.False(files.TryDelete(path, oldJoin));
-        Assert.False(files.TryDelete(path, newJoin));
+        Assert.False(files.TryDelete(path, oldJoin, DeleteOwnedFile));
+        Assert.False(files.TryDelete(path, newJoin, DeleteOwnedFile));
         Assert.True(files.Protects(path));
         Assert.Equal(digest, SHA256.HashData(File.ReadAllBytes(path)));
         files.Cancel(newJoin);
-        Assert.True(files.TryDelete(path, newJoin));
+        Assert.True(files.TryDelete(path, newJoin, DeleteOwnedFile));
         Assert.False(File.Exists(path));
     }
 
@@ -301,13 +307,13 @@ public sealed class JoinWorldFilesTests : IDisposable
         Directory.CreateDirectory(path);
         files.Keep(path, owner);
         files.End(joined: true, cancelled: false);
-        var error = Record.Exception(() => files.TryDelete(path, owner));
+        var error = Record.Exception(() => files.TryDelete(path, owner, DeleteOwnedFile));
         Assert.True(error is IOException or UnauthorizedAccessException);
         Assert.True(files.Protects(path));
         Assert.True(files.MayRemove(path, owner));
         Assert.True(Directory.Exists(path));
         Directory.Delete(path);
-        Assert.True(files.TryDelete(path, owner));
+        Assert.True(files.TryDelete(path, owner, DeleteOwnedFile));
         Assert.False(files.Protects(path));
     }
 }

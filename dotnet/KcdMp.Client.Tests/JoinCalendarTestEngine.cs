@@ -15,7 +15,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private delegate void EngineLine(ReadOnlySpan<char> line);
 
     private readonly string _saves;
-    private readonly byte[]? _hostSave;
+    private readonly Func<int, byte[]>? _hostSave;
     private readonly Action _gameplayStarted;
     private readonly EngineLine _feed;
     private readonly object _logGate = new();
@@ -28,11 +28,12 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private readonly TaskCompletionSource<string> _resumed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _joinedNotification = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _eventSequence;
+    private int _saveIndex;
     private string _where = "menu";
     private string? _lastLoaded;
     private int _joinLoadsIssued, _joinFilesRead, _ownLoadsIssued;
 
-    public JoinCalendarTestEngine(string logPath, string saves, byte[]? hostSave, Action gameplayStarted)
+    public JoinCalendarTestEngine(string logPath, string saves, Func<int, byte[]>? hostSave, Action gameplayStarted)
     {
         _saves = saves;
         _hostSave = hostSave;
@@ -45,7 +46,6 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
 
     public LogTailGameTransport Transport { get; }
     public Action<string>? SaveWritten { get; set; }
-    public Func<byte[]>? NextHostSave { get; set; }
     public bool DeferJoinFileRead { get; set; }
     public bool DeferSaveLockReply { get; set; }
     public int JoinLoadsIssued => Volatile.Read(ref _joinLoadsIssued);
@@ -87,12 +87,13 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         var pause = Regex.Match(command, """KCD2MP_JoinTry\("([0-9a-f]{8})",""");
         if (pause.Success) Emit("join_try", $"{pause.Groups[1].Value} paused 0");
 
-        if (command.Contains("""KCD2MP_HostWorldSave("join",""", StringComparison.Ordinal) &&
-            (NextHostSave?.Invoke() ?? _hostSave) is { } hostSave)
+        if (_hostSave is { } hostSave &&
+            command.Contains("""KCD2MP_HostWorldSave("join",""", StringComparison.Ordinal))
         {
-            string path = Path.Combine(_saves, "playline0", "save001.whs");
+            int index = Interlocked.Increment(ref _saveIndex);
+            string path = Path.Combine(_saves, "playline0", FormattableString.Invariant($"save{index:D3}.whs"));
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllBytes(path, hostSave);
+            File.WriteAllBytes(path, hostSave(index));
             SaveWritten?.Invoke(path);
         }
 

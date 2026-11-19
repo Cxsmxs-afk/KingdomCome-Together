@@ -13,10 +13,10 @@ namespace KcdMp.Client.Tests;
 public sealed class JoinCalendarIntegrationCollection { }
 
 [Collection("Join calendar integration")]
-public sealed class JoinCalendarIntegrationTests
+public sealed partial class JoinCalendarIntegrationTests
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
-    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress }
+    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts }
 
     [Theory]
     [InlineData(false)]
@@ -115,8 +115,8 @@ public sealed class JoinCalendarIntegrationTests
             WithholdWorldTransfer = probe == JoinProbe.HostLossBeforeOffer
         };
         await using var hostPipe = new JoinCalendarTestPipe(refuseHold: probe == JoinProbe.MissingHold);
-        await using var guestPipe = new JoinCalendarTestPipe();
-        await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, fixture.HostSave, hostPipe.ObserveGameplayStarted);
+        await using var guestPipe = new JoinCalendarTestPipe(failCalendarArm: probe == JoinProbe.RepeatAborts);
+        await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, fixture.MakeHostSave, hostPipe.ObserveGameplayStarted);
         await using var guestGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "guest.log"), fixture.GuestSaves, null, guestPipe.ObserveGameplayStarted);
         var host = CreateBridge(hostPeer.Id, true, hostLink, hostPipe.Pipe, hostGame.Transport, fixture.HostSaves, ct);
         var guest = CreateBridge(guestPeer.Id, false, guestLink, guestPipe.Pipe, guestGame.Transport, fixture.GuestSaves, ct);
@@ -152,6 +152,12 @@ public sealed class JoinCalendarIntegrationTests
             Assert.True(Property<bool>(guest, "WorldSyncEffective"));
             Assert.False(Property<bool>(guest, "WorldSyncReady"));
             Assert.Equal(WorldLoadPhase.Menu, Get<WorldLoadSequence>(guest, "_worldLoad").Current.Phase);
+
+            if (probe == JoinProbe.RepeatAborts)
+            {
+                await CheckFailedJoinRetriesAsync(fixture, host, guest, guestPeer.Id, guestPipe, guestGame, ct);
+                return;
+            }
 
             var atOffer = new TaskCompletionSource<(long ClockIn, HostCalendarSample? Bootstrap)>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
@@ -323,6 +329,9 @@ public sealed class JoinCalendarIntegrationTests
                     Assert.DoesNotContain(joinId, guestLink.ReadySent);
                 }
                 finally { release.TrySetResult(); }
+                // Retirement of the Ready send and retirement of the loaded file are
+                // independent. The real return begins only after the journal cleanup.
+                await WaitForAbandonedArrivalAsync(guest, guestGame, ct);
             }
             else
             {
@@ -352,10 +361,7 @@ public sealed class JoinCalendarIntegrationTests
                 Assert.Empty(guestLink.ReadySent);
                 guestGame.CompleteJoinLoad();
                 Assert.Equal(1, guestGame.JoinFilesRead);
-                await guestGame.WaitForOwnLoadAsync(ct);
-                await WaitAsync(() => Get<object?>(guest, "_jj") is null && !Get<bool>(guest, "_joinedWorld") &&
-                    !Get<bool>(guest, "_leaveInProgress"),
-                    "the abandoned arrival to return to the guest's own world", ct);
+                await WaitForAbandonedArrivalAsync(guest, guestGame, ct);
                 if (!probe.HostLoss && !probe.GuestLoss)
                     await RejoinAfterAbortAsync(fixture, host, guest, guestPeer.Id, joinId, hostGame, guestGame, hostLink,
                         guestLink, ct);
@@ -370,6 +376,15 @@ public sealed class JoinCalendarIntegrationTests
             writerStop.Cancel();
             await writerTask.WaitAsync(TimeSpan.FromSeconds(5));
         }
+    }
+
+    private static async Task WaitForAbandonedArrivalAsync(GameBridge guest, JoinCalendarTestEngine guestGame,
+        CancellationToken ct)
+    {
+        await guestGame.WaitForOwnLoadAsync(ct);
+        await WaitAsync(() => Get<object?>(guest, "_jj") is null && !Get<bool>(guest, "_joinedWorld") &&
+            !Get<bool>(guest, "_leaveInProgress"),
+            "the abandoned arrival to return to the guest's own world", ct);
     }
 
     private static async Task AbortThroughRelayAsync(BoundaryProbe probe, GameBridge guest, ReplayPeer hostPeer,
@@ -398,9 +413,6 @@ public sealed class JoinCalendarIntegrationTests
         guestGame.DeferJoinFileRead = false;
         guestGame.Feed("PlayVideoOnly 'main_menu_trosecko'");
         guestGame.Emit("wo124_where", "menu");
-        var (freshHost, _) = WhsSaveTests.Pair();
-        freshHost.SaveTime = 1_790_000_001;
-        hostGame.NextHostSave = () => WhsSaveTests.File(freshHost);
         await InvokeAsync(guest, "SendJoinRequestAsync");
         uint rejoinId = Get<uint>(guest, "_joinOutId");
         Assert.NotEqual(0u, rejoinId);
@@ -557,7 +569,6 @@ public sealed class JoinCalendarIntegrationTests
         public string GuestSaves => Path.Combine(Root, "guest-saves");
         public string HostLoadedSave => Path.Combine(HostSaves, "playline0", "save000.whs");
         public string GuestOwnSave => Path.Combine(GuestSaves, "playline0", "save001.whs");
-        public byte[] HostSave { get; }
 
         public SaveFixture()
         {
@@ -570,18 +581,24 @@ public sealed class JoinCalendarIntegrationTests
                 item.Write($"""<database><MiscItem Id="{questItem}" Name="loveLetter" IsQuestItem="true"/></database>""");
             }
 
-            var (host, guest) = WhsSaveTests.Pair();
+            var (_, guest) = WhsSaveTests.Pair();
             guest.Seed++;
             guest.SaveTime = 1_790_000_000;
-            HostSave = WhsSaveTests.File(host);
             Directory.CreateDirectory(Path.Combine(HostSaves, "playline0"));
             Directory.CreateDirectory(Path.Combine(GuestSaves, "playline0"));
-            File.WriteAllBytes(HostLoadedSave, HostSave);
+            File.WriteAllBytes(HostLoadedSave, MakeHostSave(0));
             File.WriteAllBytes(GuestOwnSave, WhsSaveTests.File(guest));
             Assert.Single(GameBridge.ListOwnSaves(GuestSaves));
             Override("KCDMP_DATA_DIR", Root);
             Override("KCDMP_JOIN_SAVES_DIR", GuestSaves);
             Override("KCD2MP_INSTALL", install);
+        }
+
+        public byte[] MakeHostSave(int sequence)
+        {
+            var (host, _) = WhsSaveTests.Pair();
+            host.SaveTime = 1_790_000_000 + sequence;
+            return WhsSaveTests.File(host);
         }
 
         private void Override(string name, string value)
