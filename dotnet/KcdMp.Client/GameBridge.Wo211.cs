@@ -96,6 +96,7 @@ public partial class GameBridge
     private long _w211HoldSerial;
     private readonly SemaphoreSlim _w211HoldUi = new(1);
     private long _w211Holds, _w211ResumedInPlace, _w211ResumedRejoin, _w211HoldLeaves, _w211LeaveAsked, _w211SnapAfterDrop;
+    private const int HostAbsentHoldRenewMs = 40_000, HostAbsentHoldRetryMs = 5_000;
 
     /// <summary>The reconnect loop's gap (GameBridge.RunLoopAsync): growing while a hold runs, the agent's own 3 s otherwise.</summary>
     private int Wo211ReconnectDelayMs()
@@ -169,7 +170,7 @@ public partial class GameBridge
     private async Task Wo211HoldLoopAsync(long serial, bool typedPause)
     {
         int lastShown = -1;
-        long renewNativeAt = Environment.TickCount64 + 40_000;
+        long renewNativeAt = Environment.TickCount64 + HostAbsentHoldRenewMs;
         long renewSaveAt = Environment.TickCount64 + 8_000;
         while (serial == Interlocked.Read(ref _w211HoldSerial) && LinkHeld)
         {
@@ -183,11 +184,8 @@ public partial class GameBridge
                 (int)((recovery.Remaining(now) + 999) / 1000);
             if (HostAbsentPause && !_w211LeaveNow)
             {
-                if (now >= renewNativeAt)
-                {
-                    renewNativeAt = now + 40_000;
-                    if (typedPause || _w211EngineHeld) await Wo211RenewHostAbsentHoldAsync(serial);
-                }
+                if (typedPause || _w211EngineHeld)
+                    renewNativeAt = await Wo211AdvanceHostAbsentHoldAsync(serial, now, renewNativeAt);
                 if (!_wo122Connected && now >= renewSaveAt)
                 {
                     renewSaveAt = now + 8_000;
@@ -216,22 +214,30 @@ public partial class GameBridge
         await Wo211TellLinkUiAsync(serial, on: false);
     }
 
-    private async Task Wo211RenewHostAbsentHoldAsync(long serial)
+    private async ValueTask<long> Wo211AdvanceHostAbsentHoldAsync(long serial, long now, long renewAt)
     {
+        if (now < renewAt) return renewAt;
         // Serialize the renewal with the ordinary typed native publication. A release
         // that raced the renewal is sent after it, so this cannot re-park the player.
         await _loadSequencePublish.WaitAsync();
         try
         {
-            if (serial != Interlocked.Read(ref _w211HoldSerial) || !HostAbsentPause || !LinkHeld) return;
-            if (await _combat.Wo151JoinHoldAsync(true, Wo211Rules.HoldWindowS + 20) != true)
-                Console.WriteLine($"MP-HOST-ABSENT hold-renewal=unconfirmed epoch={_w211HoldEpoch}");
+            if (serial != Interlocked.Read(ref _w211HoldSerial) || !HostAbsentPause || !LinkHeld) return renewAt;
+            if (await _combat.Wo151JoinHoldAsync(true, Wo211Rules.HoldWindowS + 20) == true)
+            {
+                Console.WriteLine($"MP-HOST-ABSENT hold-renewal=confirmed epoch={_w211HoldEpoch}");
+                return now + HostAbsentHoldRenewMs;
+            }
+            Console.WriteLine($"MP-HOST-ABSENT hold-renewal=unconfirmed epoch={_w211HoldEpoch}");
         }
         catch (Exception ex) when (ex is IOException or OperationCanceledException or InvalidOperationException)
         {
             Console.WriteLine($"MP-HOST-ABSENT hold-renewal=unconfirmed reason={ex.GetType().Name}");
         }
         finally { _loadSequencePublish.Release(); }
+        // Two normal intervals can exceed the native 80-second lease once the
+        // hold loop or the pipe runs late. Retry a failed renewal within it.
+        return now + HostAbsentHoldRetryMs;
     }
 
     private async Task<bool> Wo211EndHoldAsync(long serial, uint world, bool resumed, string why, bool leaving = false,

@@ -94,13 +94,19 @@ public sealed partial class JoinCalendarIntegrationTests
     public Task Host_departure_parks_the_loaded_world_and_preserves_the_personal_save(int players) =>
         RunAsync("A", "B", dropFirstSnapshot: false, extraPeers: players - 2, pauseAfterJoin: true);
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public Task Whole_relay_EOF_keeps_the_private_return_pending_until_the_gameplay_confirmation(bool worldRecovery) =>
+        RunAsync("A", "B", dropFirstSnapshot: false, relayEofWorldRecovery: worldRecovery);
+
     private sealed record BoundaryProbe(string Edge, bool HostLoss, bool GuestLoss = false);
 
     private static Task RunBoundaryAsync(string host, string edge, bool hostLoss) =>
         RunAsync(host, host == "A" ? "B" : "A", dropFirstSnapshot: false, boundary: new(edge, hostLoss));
 
     private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None,
-        BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false)
+        BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false, bool? relayEofWorldRecovery = null)
     {
         using var fixture = new SaveFixture();
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(boundary is null ? 25 : 40));
@@ -126,7 +132,7 @@ public sealed partial class JoinCalendarIntegrationTests
         await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, fixture.MakeHostSave, hostPipe.ObserveGameplayStarted);
         await using var guestGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "guest.log"), fixture.GuestSaves, null, guestPipe.ObserveGameplayStarted);
         var host = CreateBridge(hostPeer.Id, true, hostLink, hostPipe.Pipe, hostGame.Transport, fixture.HostSaves, ct);
-        var guest = CreateBridge(guestPeer.Id, false, guestLink, guestPipe.Pipe, guestGame.Transport, fixture.GuestSaves, ct);
+        var guest = CreateBridge(guestPeer.Id, false, guestLink, guestPipe.Pipe, guestGame.Transport, fixture.GuestSaves, ct, relay.Port);
         guestGame.Transport.MainMenuShown += guestPipe.ObserveMainMenu;
         guestGame.DeferJoinFileRead = boundary?.Edge == "late-read";
         guestGame.DeferSaveLockReply = boundary?.Edge == "ready";
@@ -261,6 +267,8 @@ public sealed partial class JoinCalendarIntegrationTests
                 var observed = await observer.DrainAsync(ct);
                 Assert.DoesNotContain(observed, packet => packet.Type is Protocol.WorldOfferDown or Protocol.WorldChunkDown or Protocol.JoinerReadyDown);
             }
+            if (relayEofWorldRecovery is bool worldRecovery)
+                await CheckClosedRelayAsync(relay, fixture.GuestOwnSave, guest, guestLink, guestGame, guestPipe, guestRead, worldRecovery, ct);
             if (pauseAfterJoin)
             {
                 byte[] ownBefore = File.ReadAllBytes(fixture.GuestOwnSave);
@@ -306,7 +314,7 @@ public sealed partial class JoinCalendarIntegrationTests
         }
         finally
         {
-            if (pauseAfterJoin) Call(guest, "LoadSequenceOnExit");
+            if (pauseAfterJoin || relayEofWorldRecovery is not null) Call(guest, "LoadSequenceOnExit");
             stop.Cancel();
             await InvokeAsync(host, "Wo123OnDisconnectAsync");
             await InvokeAsync(guest, "Wo123OnDisconnectAsync");
@@ -317,6 +325,73 @@ public sealed partial class JoinCalendarIntegrationTests
                 Get<FileSystemWatcher?>(guest, "_savesWatcher")?.Dispose();
             }
         }
+    }
+
+    private static async Task CheckClosedRelayAsync(ReplayRelay relay, string ownSave, GameBridge guest, JoinWire guestLink,
+        JoinCalendarTestEngine engine, JoinCalendarTestPipe pipe, Task guestRead, bool worldRecovery, CancellationToken ct)
+    {
+        byte[] ownBefore = File.ReadAllBytes(ownSave);
+        if (!worldRecovery) Get<ConcurrentDictionary<string, bool>>(guest, "_w221On")["world_recovery"] = false;
+        Assert.Equal(worldRecovery, Property<bool>(guest, "WorldRecoveryEnabled"));
+        await WaitAsync(() =>
+        {
+            Call(guest, "LoadSequenceTick");
+            return Get<WorldLoadSequence>(guest, "_worldLoad").Current.Phase == WorldLoadPhase.Play;
+        }, "the guest's world to enter Play before closing the relay", ct);
+
+        await relay.StopAsync(gracefulEof: true);
+        await guestRead.WaitAsync(ct);
+        Assert.True(guestLink.EndOfStreamObserved);
+        Assert.Empty(guestLink.Disconnected);
+        Assert.False(guest.HostAbsentPause);
+        Assert.True(await (Task<bool>)Call(guest, "Wo211TryHoldAsync", "relay-lost", false)!);
+        await pipe.HoldObserved.WaitAsync(ct);
+        Assert.True(Property<bool>(guest, "LinkHeld"));
+        Assert.True((bool)Call(guest, "Wo122WantLock")!);
+        Assert.False(Get<bool>(guest, "_isDamageAuthority"));
+
+        // Mirror the shipped teardown: its ordinary gameplay subscriptions are gone,
+        // but the independent private-return receipt still has to see the engine.
+        Set(guest, "_wo122Ct", new CancellationToken(canceled: true));
+        DetachEngineLoadEvents(guest, engine.Transport);
+        await InvokeAsync(guest, "Wo122OnDisconnectAsync");
+        await InvokeAsync(guest, "Wo123OnDisconnectAsync");
+        await InvokeAsync(guest, "Wo124OnDisconnectAsync");
+        Assert.True(Property<bool>(guest, "LinkHeld"));
+        Assert.Equal(0, engine.OwnLoadsIssued);
+
+        await InvokeAsync(guest, "ConnectAndRunAsync", ct);
+        Assert.Contains("\"kind\":\"Refused\"", AgentConnectionStatus.Json());
+        Assert.Contains("\"fatal\":false", AgentConnectionStatus.Json());
+        Console.WriteLine($"relay_eof=1 host_disconnect=0 holding=1 reconnect=refused fatal=0 world_recovery={(worldRecovery ? 1 : 0)}");
+
+        // Advance only the elapsed duration. The productive hold loop decides on
+        // timeout and issues the home load through the ordinary game transport.
+        engine.DeferOwnFileRead = true;
+        long serial = Get<long>(guest, "_w211HoldSerial");
+        var attempt = (WorldReconnectAttempt?)Call(guest, "WorldReconnectPending", serial);
+        if (worldRecovery)
+        {
+            Assert.NotNull(attempt);
+            Set(attempt, "_startedMs", Environment.TickCount64 - WorldReconnectAttempt.WindowMs - 1);
+        }
+        else
+        {
+            Assert.Null(attempt);
+            Set(guest, "_w211HoldSinceUtc", DateTime.UtcNow.AddSeconds(-Wo211Rules.HoldWindowS - 1));
+        }
+        Assert.Equal(ownSave, await engine.WaitForOwnLoadAsync(ct));
+        Assert.True(Get<bool>(guest, "_leaveInProgress"));
+        Assert.Equal(ownBefore, File.ReadAllBytes(ownSave));
+        engine.CompleteOwnLoad();
+        using var confirmed = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        confirmed.CancelAfter(TimeSpan.FromSeconds(4));
+        await WaitAsync(() => !Get<bool>(guest, "_leaveInProgress"), "the confirmed private load to clear leave after relay EOF", confirmed.Token);
+        Assert.False(Get<bool>(guest, "_joinedWorld"));
+        Assert.Equal(1, engine.JoinLoadsIssued);
+        Assert.Equal(1, engine.OwnLoadsIssued);
+        Assert.Equal(ownBefore, File.ReadAllBytes(ownSave));
+        Console.WriteLine($"relay_eof_reconnect_end=own_gameplay join_loads=1 own_loads=1 own_save_unchanged=1 world_recovery={(worldRecovery ? 1 : 0)}");
     }
 
     private static async Task CheckReturningHostAsync(int port, string hostName, GameBridge host, GameBridge guest, byte guestId,
@@ -419,11 +494,7 @@ public sealed partial class JoinCalendarIntegrationTests
                     guestPeer.FinishSending();
                     await guestRead.WaitAsync(ct);
                     Set(guest, "_wo122Ct", new CancellationToken(canceled: true));
-                    guestGame.Transport.SaveLoadAccepted -= Handler<Action<string>>(guest, "Wo124OnSaveLoadAccepted");
-                    guestGame.Transport.LoadStarted -= Handler<Action>(guest, "Wo124OnLoadStarted");
-                    guestGame.Transport.LoadReconstructionStarted -= Handler<Action>(guest, "LoadSequenceOnReconstruction");
-                    guestGame.Transport.GameplayStarted -= Handler<Action>(guest, "Wo124OnGameplayStarted");
-                    guestGame.Transport.LoadFailedToMenu -= Handler<Action>(guest, "Wo124OnLoadFailedToMenu");
+                    DetachEngineLoadEvents(guest, guestGame.Transport);
                     await InvokeAsync(guest, "Wo123OnDisconnectAsync");
                     await InvokeAsync(guest, "Wo124OnDisconnectAsync");
                 }
@@ -590,9 +661,9 @@ public sealed partial class JoinCalendarIntegrationTests
     }
 
     private static GameBridge CreateBridge(byte id, bool hosting, Stream relay, CombatPipe pipe,
-        LogTailGameTransport game, string saves, CancellationToken ct)
+        LogTailGameTransport game, string saves, CancellationToken ct, int relayPort = 7778)
     {
-        var bridge = new GameBridge(new ClientConfig { IsHosting = hosting });
+        var bridge = new GameBridge(new ClientConfig { IsHosting = hosting, ServerHost = "127.0.0.1", ServerPort = relayPort });
         Set(bridge, "_myGhostId", id);
         Set(bridge, "_combat", pipe);
         Set(bridge, "_transport", game);
@@ -612,6 +683,15 @@ public sealed partial class JoinCalendarIntegrationTests
         game.MainMenuShown += Handler<Action>(bridge, "Wo124OnMainMenuShown");
         game.LoadFailedToMenu += Handler<Action>(bridge, "Wo124OnLoadFailedToMenu");
         return bridge;
+    }
+
+    private static void DetachEngineLoadEvents(GameBridge guest, LogTailGameTransport engine)
+    {
+        engine.SaveLoadAccepted -= Handler<Action<string>>(guest, "Wo124OnSaveLoadAccepted");
+        engine.LoadStarted -= Handler<Action>(guest, "Wo124OnLoadStarted");
+        engine.LoadReconstructionStarted -= Handler<Action>(guest, "LoadSequenceOnReconstruction");
+        engine.GameplayStarted -= Handler<Action>(guest, "Wo124OnGameplayStarted");
+        engine.LoadFailedToMenu -= Handler<Action>(guest, "Wo124OnLoadFailedToMenu");
     }
 
     private static T Handler<T>(GameBridge b, string name) where T : Delegate =>
@@ -702,6 +782,7 @@ public sealed partial class JoinCalendarIntegrationTests
 
         public readonly ConcurrentQueue<HostCalendarSample> FrozenSnapshots = new();
         public bool DroppedFirstSnapshot => Volatile.Read(ref _dropped) != 0;
+        public bool EndOfStreamObserved { get; private set; }
         public volatile bool WithholdFrozenSnapshots;
         public bool WithholdWorldTransfer { get; init; }
         public volatile uint ProbeCalendarEpoch;
@@ -723,7 +804,11 @@ public sealed partial class JoinCalendarIntegrationTests
                 {
                     byte[] header = new byte[3];
                     int read = await wire.ReadAsync(header.AsMemory(0, 1), ct);
-                    if (read == 0) return 0;
+                    if (read == 0)
+                    {
+                        EndOfStreamObserved = true;
+                        return 0;
+                    }
                     await wire.ReadExactlyAsync(header.AsMemory(1), ct);
                     byte[] body = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
                     await wire.ReadExactlyAsync(body, ct);

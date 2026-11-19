@@ -130,6 +130,43 @@ public sealed class HostAbsentPauseTests
         Assert.True(bridge.HostAbsentPause);
     }
 
+    [Fact]
+    public async Task One_refused_native_renewal_keeps_the_same_pause_beyond_two_intervals()
+    {
+        long now = 0;
+        await using var native = new JoinCalendarTestPipe(nativeClock: () => Interlocked.Read(ref now), refusedRenewals: 1);
+        await using var engine = new JoinCalendarTestEngine(Path.Combine(Path.GetTempPath(), $"kct-host-hold-{Guid.NewGuid():N}.log"),
+            Path.GetTempPath(), null, native.ObserveGameplayStarted);
+        var bridge = new GameBridge(new ClientConfig());
+        Set(bridge, "_combat", native.Pipe);
+        Set(bridge, "_transport", engine.Transport);
+        Set(bridge, "_loadSequenceRuntime", true);
+        Set(bridge, "_joinedWorld", true);
+        var sequence = Get<WorldLoadSequence>(bridge, "_worldLoad");
+        Assert.True(sequence.TryBegin(0, WorldLoadStart.AdoptLoadedWorld, 142));
+        bridge.EnterHostAbsentPause("host-left");
+        Assert.Equal(true, Invoke(bridge, "LoadSequenceTryHoldLink", false));
+        Assert.True(await (Task<bool>)Invoke(bridge, "LoadSequenceSyncNativeAsync", true)!);
+        Assert.True(native.NativePauseEffective);
+
+        long serial = Get<long>(bridge, "_w211HoldSerial");
+        long due = 40_000;
+        foreach (long tick in new long[] { 41_000, 46_000, 80_001, 90_000, 101_000 })
+        {
+            Interlocked.Exchange(ref now, tick);
+            Assert.True(native.NativePauseEffective, $"the native pause expired at {tick} ms before the scheduled renew at {due} ms");
+            due = await (ValueTask<long>)Invoke(bridge, "Wo211AdvanceHostAbsentHoldAsync", serial, tick, due)!;
+        }
+        Assert.Equal(3, native.RenewalAttempts);
+        Assert.Equal(1, native.PauseStarts);
+
+        Assert.Equal(true, Invoke(bridge, "LoadSequenceTryResumeLink", 142u, true, 0ul, null!));
+        Assert.True(await (Task<bool>)Invoke(bridge, "LoadSequenceSyncNativeAsync", false)!);
+        await native.ReleaseObserved.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(native.NativePauseEffective);
+        Console.WriteLine("host_pause_duration_ms=101000 renew_attempts=3 renew_refused=1 pause_starts=1 released=1");
+    }
+
     private static T Get<T>(GameBridge bridge, string field) => (T)typeof(GameBridge).GetField(field, Instance)!.GetValue(bridge)!;
     private static void Set(GameBridge bridge, string field, object value) => typeof(GameBridge).GetField(field, Instance)!.SetValue(bridge, value);
     private static object? Invoke(GameBridge bridge, string method, params object[] args) => typeof(GameBridge).GetMethod(method, Instance)!.Invoke(bridge, args);

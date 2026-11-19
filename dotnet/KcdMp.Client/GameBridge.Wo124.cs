@@ -1411,7 +1411,8 @@ public partial class GameBridge
         SetJoinUi("left", full, HostAuthorityFailure.JoinReason(why));
         Console.WriteLine($"MP-JOIN joiner: leaving the host's world ({why}) -> {(src is null ? "no own save (" + ownWhy + "): back to the main menu" : "loading " + src.Display)}");
         await ExecLuaAsync($"if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"{EscapeLua(full)}\") end");
-        bool relayClosed = expected is not null && why == "relay-lost" || hostAbsent && !_wo122Connected;
+        bool relayClosed = (expected is not null && why == "relay-lost") ||
+            (!_wo122Connected && (hostAbsent || why == "relay-lost"));
         using var returnLife = expected is not null || relayClosed ? CancellationTokenSource.CreateLinkedTokenSource(_joinEngineLifetime) : null;
         if (src is null)
         {

@@ -17,6 +17,11 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private readonly bool _failCalendarArm;
     private readonly bool _failCalendarVerify;
     private readonly bool _refuseHold;
+    private readonly Func<long>? _nativeClock;
+    private int _refusedRenewals;
+    private int _renewalAttempts;
+    private int _pauseStarts;
+    private long _pauseDeadline;
     private readonly TaskCompletionSource _arm = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _verify = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _hold = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -37,15 +42,22 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     public Task VerifyObserved => _verify.Task;
     public Task HoldObserved => _hold.Task;
     public Task ReleaseObserved => _release.Task;
+    public int RenewalAttempts => Volatile.Read(ref _renewalAttempts);
+    public int PauseStarts => Volatile.Read(ref _pauseStarts);
+    public bool NativePauseEffective => Volatile.Read(ref _held) &&
+        (_nativeClock is null || _nativeClock() <= Interlocked.Read(ref _pauseDeadline));
     public bool SnapshotWhileHeld => Volatile.Read(ref _snapshotWhileHeld) != 0;
     public long? ArmedWorldMs { get { lock (_calendar) return _armedWorldMs; } }
     public long? VerifiedWorldMs { get { lock (_calendar) return _verifiedWorldMs; } }
 
-    public JoinCalendarTestPipe(bool failCalendarArm = false, bool failCalendarVerify = false, bool refuseHold = false)
+    public JoinCalendarTestPipe(bool failCalendarArm = false, bool failCalendarVerify = false, bool refuseHold = false,
+        Func<long>? nativeClock = null, int refusedRenewals = 0)
     {
         _failCalendarArm = failCalendarArm;
         _failCalendarVerify = failCalendarVerify;
         _refuseHold = refuseHold;
+        _nativeClock = nativeClock;
+        _refusedRenewals = refusedRenewals;
         string name = $"h20-calendar-{Guid.NewGuid():N}";
         Pipe = new CombatPipe(name);
         _serverLoop = ServeAsync(name, _stop.Token);
@@ -104,7 +116,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         0x1E => (0x8E, [1, seq, 1, 1, 1]),
         0x26 when request is [9] => (Wo140Reply, CalendarSnapshot(seq)),
         0x26 when request is [10, ..] && request.Length == 18 => (Wo140Reply, CalendarFollow(seq, request)),
-        0x2A when request is [8, _, _, _] => (Wo151Reply, JoinHold(seq, request[1] != 0)),
+        0x2A when request is [8, _, _, _] => (Wo151Reply, JoinHold(seq, request)),
         0x2B when request.Length > 0 => (Wo163Reply, Wo163(seq, request)),
         _ => (Result, [0, seq, (byte)PipeReason.UnknownCommand]),
     };
@@ -159,16 +171,31 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         return body;
     }
 
-    private byte[] JoinHold(byte seq, bool held)
+    private byte[] JoinHold(byte seq, ReadOnlySpan<byte> request)
     {
-        SetHold(held);
+        bool held = request[1] != 0;
+        if (held && _nativeClock is not null)
+        {
+            Interlocked.Increment(ref _renewalAttempts);
+            if (_refusedRenewals > 0)
+            {
+                --_refusedRenewals;
+                return [0, seq, 8, 0, (byte)(NativePauseEffective ? 1 : 0)];
+            }
+        }
+        SetHold(held, BinaryPrimitives.ReadUInt16LittleEndian(request[2..]));
         return [1, seq, 8, 0, (byte)(held ? 1 : 0)];
     }
 
-    private void SetHold(bool held)
+    private void SetHold(bool held, ushort seconds)
     {
+        if (held && _nativeClock is not null)
+        {
+            if (!NativePauseEffective) Interlocked.Increment(ref _pauseStarts);
+            Interlocked.Exchange(ref _pauseDeadline, _nativeClock() + seconds * 1000L);
+        }
         if (_held == held) return;
-        _held = held;
+        Volatile.Write(ref _held, held);
         if (held) _hold.TrySetResult();
         else _release.TrySetResult();
     }
@@ -192,11 +219,11 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
             _loadPhase = request[1];
             _loadFlags = request[2];
             _loadGeneration = BinaryPrimitives.ReadUInt64LittleEndian(request[5..]);
-            SetHold((_loadFlags & 3) != 0 && !_refuseHold);
+            SetHold((_loadFlags & 3) != 0 && !_refuseHold, BinaryPrimitives.ReadUInt16LittleEndian(request[3..]));
         }
         byte[] body = ReplyBody(seq, request[0], 14);
         body[4] = _loadPhase;
-        body[5] = (byte)(_loadFlags | (((_loadFlags & 3) == 0 || _held) ? 0x80 : 0));
+        body[5] = (byte)(_loadFlags | (((_loadFlags & 3) == 0 || NativePauseEffective) ? 0x80 : 0));
         BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(6), _loadGeneration);
         request[13..17].CopyTo(body.AsSpan(14));
         return body;

@@ -99,7 +99,8 @@ internal sealed class WorldReconnectAttempt(WorldSyncScope scope, WorldReconnect
 {
     public const int WindowMs = 30_000;
     public WorldSyncScope Scope { get; } = scope;
-    public long Elapsed(long nowMs) => Math.Max(0, nowMs - startedMs);
+    private readonly long _startedMs = startedMs;
+    public long Elapsed(long nowMs) => Math.Max(0, nowMs - _startedMs);
     public long Remaining(long nowMs) => waitForHost ? WindowMs : Math.Max(0, WindowMs - Elapsed(nowMs));
     private int _claimed;
 

@@ -20,6 +20,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private readonly EngineLine _feed;
     private readonly object _logGate = new();
     private readonly Queue<string> _pendingJoinReads = new();
+    private readonly Queue<string> _pendingOwnReads = new();
     private readonly Queue<string> _pendingLockReplies = new();
     private readonly Channel<string> _joinLoads = Channel.CreateUnbounded<string>();
     private readonly Channel<string> _ownLoads = Channel.CreateUnbounded<string>();
@@ -47,6 +48,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public LogTailGameTransport Transport { get; }
     public Action<string>? SaveWritten { get; set; }
     public bool DeferJoinFileRead { get; set; }
+    public bool DeferOwnFileRead { get; set; }
     public bool DeferSaveLockReply { get; set; }
     public int JoinLoadsIssued => Volatile.Read(ref _joinLoadsIssued);
     public int JoinFilesRead => Volatile.Read(ref _joinFilesRead);
@@ -61,6 +63,11 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public void CompleteJoinLoad()
     {
         lock (_logGate) ReadLoadedFile(_pendingJoinReads.Dequeue(), joined: true);
+    }
+
+    public void CompleteOwnLoad()
+    {
+        lock (_logGate) ReadLoadedFile(_pendingOwnReads.Dequeue(), joined: false);
     }
 
     public void ReleaseSaveLock()
@@ -135,7 +142,8 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
             else
             {
                 Interlocked.Increment(ref _ownLoadsIssued);
-                ReadLoadedFile(path, joined: false);
+                if (DeferOwnFileRead) _pendingOwnReads.Enqueue(path);
+                else ReadLoadedFile(path, joined: false);
                 _ownLoads.Writer.TryWrite(path);
             }
         }
