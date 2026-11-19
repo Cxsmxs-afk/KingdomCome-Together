@@ -93,6 +93,7 @@ struct Observation {
     void* actor;
     uint64_t deadline;
     Pending action;
+    bool livePose = false;
 };
 
 bool g_enabled = false;
@@ -208,6 +209,13 @@ rptimeline::Frame matched_frame(uint32_t eid, uint8_t peer) {
     return frame.lifecycle == g_scope.lifecycle && frame.connection == g_scope.connection ? frame : rptimeline::Frame{};
 }
 
+std::optional<npcdrive::PartnerPose> matched_live_pose(uint32_t eid, const Body& body) {
+    const auto pose = npcdrive::partner_pose(eid, body.peer, body.entity);
+    if (!(Scope{pose.lifecycle, pose.connection, pose.life, pose.load} == g_scope) || pose.ageMs > kPoseWaitMs)
+        return std::nullopt;
+    return pose;
+}
+
 Body* lookup_body(uint32_t eid, uint8_t peer, void* entity, void* actor) {
     auto it = g_bodies.find(eid);
     if (it != g_bodies.end() && (it->second.entity != entity || it->second.peer != peer || it->second.actor != actor)) {
@@ -236,7 +244,7 @@ bool ready_to_dispatch(const rpcombat::Event& event) {
     return wo143::rp_ranged_available(event.eid, event.itemClass.data());
 }
 
-void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, uint64_t now) {
+void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, bool livePose, uint64_t now) {
     const auto& typed = *action.typed;
     const auto& event = typed.wire;
     if (!(scope_now() == g_scope) || g_observing.size() >= kMaxPending ||
@@ -247,7 +255,7 @@ void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, uint64
     const uint64_t token = ++g_nextToken;
     const uint64_t watchMs = event.kind == rpcombat::kKo ? kKoWatchMs : kWatchMs;
     // Providers may confirm synchronously. Publish the observation before any native call.
-    g_observing.emplace(token, Observation{eid, body.peer, body.entity, body.actor, now + watchMs, action});
+    g_observing.emplace(token, Observation{eid, body.peer, body.entity, body.actor, now + watchMs, action, livePose});
     bool watching = false;
     const char* refused = "engine-refused";
     if (event.kind == rpcombat::kKo) {
@@ -266,8 +274,7 @@ void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, uint64
     const bool row = rpcombat::uses_row(event.kind);
     if (watching) {
         if (g_observing.find(token) != g_observing.end()) {
-            // The bounded current-target alternative uses this same row, ID and provider once.
-            const char* reason = timed ? "timed" : row ? "guarded-current-target" : "missing-current-pose";
+            const char* reason = livePose ? "guarded-live-pose" : timed ? "timed" : row ? "guarded-current-target" : "missing-current-pose";
             report(eid, body.peer, action, "queued", 0, reason, Dispatch::Submitted);
         }
     } else if (g_observing.erase(token) != 0) {
@@ -382,6 +389,9 @@ Receipt submit_combat(const uint8_t* bytes, size_t size, Scope received, uint64_
     const auto frame = matched_frame(eid, event.peer);
     if (!wo216::lifecycle_gameplay() && !frame.appliedHostMs && !recovering) return Blocked;
     body->typedRecent.observe_target(frame.targetHostMs);
+    if (!frame.targetHostMs && rpcombat::uses_row(event.kind)) {
+        if (const auto pose = matched_live_pose(eid, *body)) body->typedRecent.observe_target(pose->sourceHostMs);
+    }
     if (body->typedRecent.full()) return recovering ? Unavailable : Blocked;
     Typed typed{event, {}};
     if (rpcombat::uses_row(event.kind)) {
@@ -457,7 +467,10 @@ void tick() {
         const bool timed = due(next.hostMs, frame.appliedHostMs, frame.targetHostMs);
         auto schedule = rpcombat::Schedule::Run;
         const char* expiry = "missing-current-clock";
+        bool livePose = false;
         if (next.typed) {
+            const auto& event = next.typed->wire;
+            const bool row = rpcombat::uses_row(event.kind);
             const bool recovery = wake(next) && wo131::rp_knockout_wake_pending(eid);
             schedule = rpcombat::schedule(next.hostMs, frame.appliedHostMs, frame.targetHostMs, next.readMs, now, recovery);
             if ((!g_enabled || !g_remoteCombat) && !recovery) {
@@ -465,6 +478,19 @@ void tick() {
                 expiry = "combat-mode-changed";
             } else if (schedule == rpcombat::Schedule::Expire && rpcombat::stale(next.hostMs, frame.targetHostMs)) {
                 expiry = "stale-replay";
+            } else if (schedule == rpcombat::Schedule::Expire && !frame.targetHostMs && row) {
+                // The timed wait is over and no provider has been called. Only a
+                // recent pose of this binding can authorize the same typed request.
+                const auto pose = matched_live_pose(eid, body);
+                if (pose) body.typedRecent.observe_target(pose->sourceHostMs);
+                if (body.typedRecent.too_old(rpcombat::key(event))) {
+                    expiry = "stale-replay";
+                } else if (elapsed(next.readMs, now) > rpcombat::kReplayMs) {
+                    expiry = "stale-reader-age";
+                } else if (pose) {
+                    schedule = rpcombat::Schedule::Run;
+                    livePose = true;
+                }
             }
             if (schedule == rpcombat::Schedule::Wait) continue;
         } else if (g_enabled && !timed && !waited(next.readMs, now)) continue;
@@ -473,7 +499,7 @@ void tick() {
         --g_pending;
         if (action.typed) {
             if (schedule == rpcombat::Schedule::Expire) settle(eid, body.peer, action, Dispatch::NotStarted, "expired", expiry);
-            else dispatch_typed(eid, body, std::move(action), timed, now);
+            else dispatch_typed(eid, body, std::move(action), timed, livePose, now);
             continue;
         }
         const uint64_t token = ++g_nextToken;
@@ -510,7 +536,8 @@ void observed(uint64_t token, bool installed) {
         g_actionLag.add(static_cast<uint32_t>(ms));
         if (entry.action.kind == rpcombat::kKo) g_koLag.add(static_cast<uint32_t>(ms));
     }
-    settle(entry.eid, entry.peer, entry.action, Dispatch::Installed, "installed", shown ? "-" : "missing-current-pose", shown);
+    const char* reason = entry.livePose ? "guarded-live-pose" : shown ? "-" : "missing-current-pose";
+    settle(entry.eid, entry.peer, entry.action, Dispatch::Installed, "installed", reason, shown);
 }
 
 static rpcombat::Counts combat_snapshot() {

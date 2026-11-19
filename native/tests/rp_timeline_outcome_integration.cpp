@@ -26,6 +26,8 @@ int body, actor;
 struct Simulation {
     Scope scope{7, 3, 2, 0};
     uint64_t now = kReadMs, applied = 0, target = 0, token = 0;
+    npcdrive::PartnerPose pose;
+    uint8_t kind = rpcombat::kSwing;
     bool mode = true, protectedVisual = true;
     rttr::SwingResult providerResult = rttr::SwingResult::Ok;
     unsigned typedCalls = 0, legacyCalls = 0;
@@ -36,36 +38,42 @@ auto row_wire() {
     std::array<uint8_t, rpcombat::kRegistrationHeader + 1> bytes{};
     bytes[0] = kPeer;
     loadsequence::write_le(bytes.data() + 1, kEid, 4);
-    bytes[5] = rpcombat::kSwing;
+    bytes[5] = sim.kind;
     loadsequence::write_le(bytes.data() + 6, kRow, 4);
     bytes.back() = 'a';
     return bytes;
 }
 
-auto action_wire() {
+auto action_wire(uint64_t hostMs, uint16_t sequence) {
     std::array<uint8_t, rpcombat::kActionHeader + 4> bytes{};
     bytes[0] = kPeer;
     loadsequence::write_le(bytes.data() + 1, kEid, 4);
-    loadsequence::write_le(bytes.data() + 5, kHostMs, 8);
-    loadsequence::write_le(bytes.data() + 13, kSequence, 2);
-    bytes[15] = rpcombat::kSwing;
+    loadsequence::write_le(bytes.data() + 5, hostMs, 8);
+    loadsequence::write_le(bytes.data() + 13, sequence, 2);
+    bytes[15] = sim.kind;
     bytes[16] = timelineactions::kCommit;
     loadsequence::write_le(bytes.data() + rpcombat::kActionHeader, kRow, 4);
     return bytes;
 }
 
-auto submit(Scope received = sim.scope) {
-    const auto bytes = action_wire();
-    return timelineactions::submit_combat(bytes.data(), bytes.size(), received, kReadMs);
+auto submit(Scope received = sim.scope, uint64_t readMs = kReadMs, uint64_t hostMs = kHostMs,
+            uint16_t sequence = kSequence) {
+    const auto bytes = action_wire(hostMs, sequence);
+    return timelineactions::submit_combat(bytes.data(), bytes.size(), received, readMs);
 }
 
-bool begin(bool admit = true) {
+bool begin(bool admit = true, uint8_t kind = rpcombat::kSwing) {
     timelineactions::reset();
     sim = {};
+    sim.kind = kind;
     timelineactions::configure(true);
     const auto row = row_wire();
     return timelineactions::register_combat(row.data(), row.size(), sim.scope) == timelineactions::Accepted &&
         (!admit || submit() == timelineactions::Accepted);
+}
+
+void pose_pulse(uint64_t ageMs = 0, uint64_t hostMs = kHostMs) {
+    sim.pose = {sim.scope.lifecycle, sim.scope.connection, sim.scope.life, sim.scope.load, ageMs, hostMs};
 }
 
 unsigned logs_with(const char* result, const char* reason, const char* dispatch, const char* terminal = "1") {
@@ -110,6 +118,9 @@ void* actor_of(uint32_t eid) { return eid == kEid ? &actor : nullptr; }
 }
 namespace kcdmp::npcdrive {
 bool is_bound_eid(uint32_t eid) { return eid == kEid; }
+PartnerPose partner_pose(uint32_t eid, uint8_t peer, void* entity) {
+    return eid == kEid && peer == kPeer && entity == &body ? sim.pose : PartnerPose{};
+}
 }
 namespace kcdmp::loadsequence {
 uint64_t stamp() { return sim.scope.load; }
@@ -188,6 +199,124 @@ int rp_timeline_outcome_integration(int* passed) {
     check(sim.typedCalls == 0 && logs_with("expired", "missing-current-clock", "not-started") == 1 && terminal_logs() == 1,
           "missing clock has one pre-dispatch terminal outcome");
     check(submit() == Accepted && sim.typedCalls == 0, "lost accept ACK cannot replay an expired action");
+
+    check(begin(), "admit action for a live pose without a target");
+    sim.now += kPoseWaitMs - 1;
+    pose_pulse();
+    tick();
+    check(sim.typedCalls == 0, "live pose keeps the normal target wait");
+    ++sim.now;
+    pose_pulse(1);
+    tick();
+    check(sim.typedCalls == 1 && logs_with("queued", "guarded-live-pose", "submitted", "0") == 1 && terminal_logs() == 0,
+          "missing target plus current pose submits exactly one typed request");
+    observed(sim.token, true);
+    observed(sim.token, true);
+    check(submit() == Accepted && sim.typedCalls == 1 && sim.legacyCalls == 0 &&
+          logs_with("installed", "guarded-live-pose", "installed") == 1 && terminal_logs() == 1,
+          "lost ACK and duplicate confirmation cannot replay the no-target request");
+
+    check(begin(), "admit action for a current untimed pose");
+    sim.now += kPoseWaitMs;
+    pose_pulse(0, 0);
+    tick();
+    check(sim.typedCalls == 1 && logs_with("queued", "guarded-live-pose", "submitted", "0") == 1,
+          "unstamped movement can prove a live pose without inventing a target clock");
+
+    check(begin(), "admit action with only an old pose");
+    sim.now += kPoseWaitMs;
+    pose_pulse(kPoseWaitMs + 1);
+    tick();
+    check(sim.typedCalls == 0 && logs_with("expired", "missing-current-clock", "not-started") == 1,
+          "old pose does not authorize no-target playback");
+
+    check(begin(), "admit action with a known behind target");
+    sim.now += kPoseWaitMs;
+    sim.target = kHostMs - 1;
+    pose_pulse();
+    tick();
+    check(sim.typedCalls == 0 && logs_with("expired", "missing-current-clock", "not-started") == 1,
+          "live pose does not override a known target that has not reached the action");
+
+    check(begin(), "admit action with a replay-stale stamp and no target");
+    sim.now += kPoseWaitMs;
+    pose_pulse(0, kHostMs + kcdmp::rpcombat::kReplayMs + 1);
+    tick();
+    check(sim.typedCalls == 0 && logs_with("expired", "stale-replay", "not-started") == 1,
+          "a recent stamped pose rejects stale replay even without a target");
+
+    check(begin(false), "register row for repeated live poses without a target");
+    bool admitted = true;
+    constexpr uint16_t actionCount = 300;
+    for (uint16_t i = 0; i < actionCount; ++i) {
+        const uint64_t hostMs = kHostMs + static_cast<uint64_t>(i) * kPoseWaitMs;
+        pose_pulse(0, hostMs);
+        admitted &= submit(sim.scope, sim.now, hostMs, kSequence + i) == Accepted;
+        sim.now += kPoseWaitMs;
+        pose_pulse(0, hostMs);
+        tick();
+        observed(sim.token, true);
+    }
+    check(admitted && sim.typedCalls == actionCount && sim.legacyCalls == 0 &&
+          kcdmp::rpcombat::snapshot().actions_played == actionCount,
+          "stamped ingress advances bounded receipts with no target over 300 actions");
+    pose_pulse(0, 0);
+    check(submit(sim.scope, sim.now) == Blocked && sim.typedCalls == actionCount,
+          "target and pose stamp loss cannot reopen a retired action ID");
+
+    check(begin(), "admit action with an old-life pose");
+    sim.now += kPoseWaitMs;
+    pose_pulse();
+    --sim.pose.life;
+    tick();
+    check(sim.typedCalls == 0 && logs_with("expired", "missing-current-clock", "not-started") == 1,
+          "pose from an old local life cannot authorize playback in the current scope");
+
+    check(begin(), "admit action before life change without a target");
+    sim.now += kPoseWaitMs;
+    ++sim.scope.life;
+    pose_pulse();
+    tick();
+    check(sim.typedCalls == 0 && logs_with("expired", "life-edge-changed", "not-started") == 1 && terminal_logs() == 1,
+          "new life pose does not release the old scope's action");
+
+    check(begin(), "admit action before protection is lost without a target");
+    sim.now += kPoseWaitMs;
+    pose_pulse();
+    sim.protectedVisual = false;
+    tick();
+    check(sim.typedCalls == 0 && sim.legacyCalls == 0 && logs_with("refused", "runtime-gate", "not-started") == 1,
+          "no-target playback rechecks visual damage protection before provider entry");
+
+    check(begin(), "admit action before a long scheduler stall without a target");
+    sim.now += kcdmp::rpcombat::kReplayMs + 1;
+    pose_pulse();
+    tick();
+    check(sim.typedCalls == 0 && logs_with("expired", "stale-reader-age", "not-started") == 1,
+          "a current pose after a stall does not revive an old pending action");
+
+    check(begin(), "admit action for a provider fault without a target");
+    sim.now += kPoseWaitMs;
+    pose_pulse();
+    sim.providerResult = kcdmp::rttr::SwingResult::QueueFaulted;
+    tick();
+    sim.target = sim.applied = kHostMs;
+    check(submit() == Accepted, "ambiguous no-target dispatch keeps its receipt when target returns");
+    tick();
+    observed(sim.token, true);
+    check(sim.typedCalls == 1 && sim.legacyCalls == 0 &&
+          logs_with("unconfirmed", "queue-faulted", "uncertain") == 1 && terminal_logs() == 1,
+          "uncertain no-target provider result permits no second playback");
+
+    check(begin(true, kcdmp::rpcombat::kBlock), "admit mapped ordinary block for H16 regression");
+    sim.now += kPoseWaitMs;
+    pose_pulse();
+    tick();
+    observed(sim.token, true);
+    check(sim.typedCalls == 1 && sim.legacyCalls == 0 &&
+          logs_with("queued", "guarded-live-pose", "submitted", "0") == 1 &&
+          logs_with("installed", "guarded-live-pose", "installed") == 1 && terminal_logs() == 1,
+          "ordinary block uses the same protected no-target provider exactly once");
 
     check(begin(), "admit action for watch");
     sim.target = sim.applied = kHostMs;

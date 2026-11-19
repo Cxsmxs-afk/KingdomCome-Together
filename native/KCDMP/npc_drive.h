@@ -181,6 +181,14 @@ int bound_bodies(BoundBody* out, int max);
 // WO-210 E.6: this writer drives the body (a copy of the host's NPC, a partner's figure). Main thread.
 bool is_bound_eid(uint32_t eid);
 
+// Latest accepted pose for the exact partner binding, with native ingress
+// scope and age. A zero connection means there is no pose for this binding.
+struct PartnerPose {
+    uint64_t lifecycle = 0, connection = 0, life = 0, load = 0;
+    uint64_t ageMs = 0, sourceHostMs = 0;
+};
+PartnerPose partner_pose(uint32_t eid, uint8_t peer, void* entity);
+
 // WO-131 1b: is a hit on this name's local body a hit on the host's NPC? Main
 // thread. bound = this DLL drives the body; ageS = seconds since the newest
 // accepted sample (-1 none); distM = the body's current position to that
