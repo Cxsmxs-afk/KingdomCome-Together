@@ -59,10 +59,14 @@ public partial class ClientSession
     private (long Query, long Received, long Sent) _presentationProbe;
     private PresentationClockSample? _presentationClock;
     private volatile bool _linkPresentationTime, _linkPresentationCombat;
-    private volatile bool _linkPvpContact;
+    private volatile bool _linkPvpContact, _linkPvpLife;
+    private sealed record PvpLifeAdvert(PvpLifeState State);
+    private volatile PvpLifeAdvert? _pvpLife;
     private static long s_nextPvpIncarnation;
     private PvpContactWindow _pvpContacts;
     internal bool LinkPvpContact => _linkPvpContact;
+    internal bool LinkPvpLife => _linkPvpLife;
+    private PvpLifeState PvpLife => _pvpLife?.State ?? default;
     internal ulong PvpIncarnation { get; private set; }
 
     private readonly record struct QueuedWrite(byte[]? Packet, byte? GhostId, string? NpcKey = null, long Ts = 0);
@@ -106,7 +110,8 @@ public partial class ClientSession
         (ushort)((W213Switch.TwinOff("link_sched") ? 0 : Protocol.LinkCapLatestWins)
                | (W213Switch.TwinOff("link_sched") || W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
                | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc)
-               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapWorldSync | Protocol.LinkCapPvpContact
+               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapWorldSync
+               | Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife
                | (W213Switch.TwinOff("world_recovery") ? 0 : Protocol.LinkCapWorldRecovery));
 
     private void OnLinkHello(byte[] hello)
@@ -115,6 +120,8 @@ public partial class ClientSession
         ushort both = (ushort)(caps & RelayLinkCaps);
         // Once enabled the link keeps its contact identity until disconnect.
         if (_linkPvpContact) both |= Protocol.LinkCapPvpContact;
+        if (_linkPvpLife) both |= Protocol.LinkCapPvpLife;
+        if ((both & Protocol.LinkCapPvpContact) == 0) both &= unchecked((ushort)~Protocol.LinkCapPvpLife);
         if ((both & Protocol.LinkCapWorldSync) == 0) both &= unchecked((ushort)~Protocol.LinkCapWorldRecovery);
         var path = _conn.Path;
         byte transport = _conn.Steam is not null ? Protocol.LinkTransportSteam : path is { Transport: "shaped" } ? Protocol.LinkTransportShaped : Protocol.LinkTransportTcp;
@@ -140,9 +147,11 @@ public partial class ClientSession
         _logger.Information("MP-LINK hello client={Id} version={Version} asked=0x{Asked:X4} both=0x{Both:X4} transport={Transport} rate={Rate}",
             Id, version, caps, both, Protocol.LinkTransportName(transport), rate);
         EnqueueRaw(Protocol.BuildLinkHelloDown(both, transport, rate));
-        if (!_linkPvpContact && (both & Protocol.LinkCapPvpContact) != 0)
+        bool contact = (both & Protocol.LinkCapPvpContact) != 0, life = (both & Protocol.LinkCapPvpLife) != 0;
+        if (contact != _linkPvpContact || life != _linkPvpLife)
         {
-            _linkPvpContact = true;
+            _linkPvpContact = contact;
+            _linkPvpLife = life;
             _broadcastService.AnnouncePvpPeers(this);
         }
     }
@@ -917,12 +926,26 @@ public partial class ClientSession
                 // broadcast), never authority-gated -- any player can hit any
                 // player. Whether friendly fire is on is decided at both ends
                 // (the host's lever), not here.
+                if (type == Protocol.PvpLifeUp)
+                {
+                    var body = new byte[PvpLifeState.Length];
+                    await ReadExactAsync(body);
+                    var life = PvpLifeState.Read(body);
+                    if (!LinkPvpLife || life.Revision <= PvpLife.Revision)
+                        _clientHandler.CountDrop(Protocol.PvpLifeUp, "pvp-life-stale-or-unavailable");
+                    else
+                    {
+                        _pvpLife = new(life);
+                        _broadcastService.BroadcastPvpLife(this);
+                    }
+                    continue;
+                }
                 if (type == Protocol.PlayerHitV8Up)
                 {
                     var body = new byte[payloadLen];
                     await ReadExactAsync(body);
-                    bool identified = payloadLen == PlayerHitV8.IdentifiedUpLen;
-                    if (identified != LinkPvpContact)
+                    bool identified = payloadLen >= PlayerHitV8.IdentifiedUpLen;
+                    if (identified != LinkPvpContact || (payloadLen == PlayerHitV8.LifeUpLen) != LinkPvpLife)
                     {
                         _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-contact-capability");
                         continue;
@@ -1472,16 +1495,26 @@ public partial class ClientSession
     /// </summary>
     public void EnqueuePlayerHitV8(ClientSession attacker, byte[] upstreamBody)
     {
-        bool identified = upstreamBody.Length == PlayerHitV8.IdentifiedUpLen;
+        bool identified = upstreamBody.Length >= PlayerHitV8.IdentifiedUpLen;
+        bool lifeBound = upstreamBody.Length == PlayerHitV8.LifeUpLen;
         // A mixed-capability pair cannot forward an identified contact or strip its ID.
-        if (identified != LinkPvpContact) return;
+        if (identified != LinkPvpContact || lifeBound != LinkPvpLife) return;
         if (identified &&
             BinaryPrimitives.ReadUInt64LittleEndian(upstreamBody.AsSpan(PlayerHitV8.UpLen + sizeof(ulong))) != PvpIncarnation)
         {
             _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-recipient-retired");
             return;
         }
-        var payload = new byte[identified ? PlayerHitV8.IdentifiedDownLen : PlayerHitV8.DownLen];
+        if (lifeBound)
+        {
+            ulong proof = BinaryPrimitives.ReadUInt64LittleEndian(upstreamBody.AsSpan(PlayerHitV8.IdentifiedUpLen));
+            if (proof == 0 || proof != PvpLife.Proof)
+            {
+                _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-recipient-life");
+                return;
+            }
+        }
+        var payload = new byte[1 + upstreamBody.Length];
         payload[0] = attacker.Id;
         upstreamBody.CopyTo(payload, 1);
         if (identified)
@@ -1491,9 +1524,11 @@ public partial class ClientSession
 
     internal void EnqueuePvpPeer(ClientSession peer)
     {
-        var payload = new byte[Protocol.PvpPeerLen];
+        bool lifeBound = LinkPvpLife && peer.LinkPvpLife;
+        var payload = new byte[lifeBound ? Protocol.PvpPeerLifeLen : Protocol.PvpPeerLen];
         payload[0] = peer.Id;
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(1), peer.PvpIncarnation);
+        if (lifeBound) peer.PvpLife.Write(payload.AsSpan(Protocol.PvpPeerLen));
         EnqueueRaw(BuildPacket(Protocol.PvpPeerDown, payload));
     }
 

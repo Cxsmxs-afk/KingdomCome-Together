@@ -782,16 +782,20 @@ AttribResult apply_attributed_ex(const uint8_t* body, size_t len, bool rawDamage
 wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules::Recipient recipient,
                                   uint64_t readTick, uint8_t sequence) {
     using wo155rules::HitResult;
-    if (len != 10 && len != 34) return HitResult::Refused;
+    if (len != 10 && len != 34 && len != 42) return HitResult::Refused;
     uint64_t contactSequence = 0, incarnation = 0;
     uint64_t ingressTick = readTick;
-    if (len == 34) {
+    if (len >= 34) {
         std::memcpy(&contactSequence, body + 10, 8);
         std::memcpy(&incarnation, body + 18, 8);
         std::memcpy(&ingressTick, body + 26, 8);
         // Environment.TickCount64 and GetTickCount64 share the Windows boot clock.
         if (!contactSequence || !incarnation || !ingressTick || ingressTick > readTick)
             return HitResult::Refused;
+    }
+    if (len == 42) {
+        std::memcpy(&recipient.proof, body + 34, 8);
+        if (!recipient.proof) return HitResult::Refused;
     }
     float st = 0, hp = 0;
     std::memcpy(&st, body, 4); std::memcpy(&hp, body + 4, 4);
@@ -800,7 +804,7 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
     if (!std::isfinite(st) || !std::isfinite(hp) || st < 0 || hp < 0) return HitResult::Refused;
     const auto recipientCurrent = [&] {
         return recipient.matches({p4::generation(), p4::life_edge_tick(),
-                                  pipe::observation_connection(), p4::gameplay()}, ingressTick);
+                                  pipe::observation_connection(), p4::gameplay(), p4::pvp_life_proof()}, ingressTick);
     };
     if (!recipientCurrent()) return HitResult::RecipientRetired;
     void* player = rttr::read_player_soul();
@@ -809,13 +813,19 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
     void* entity = identify();
     const uint64_t wuid = entity ? actions::entity_wuid(entity) : 0;
     const uint32_t eid = entity ? engine::entity_id(entity) : 0;
+    if (recipient.proof && !p4::pvp_body_matches(player, wuid)) return HitResult::RecipientRetired;
+    const auto bodyCurrent = [&] {
+        return rttr::read_player_soul() == player &&
+            (!recipient.proof || (entity && identify() == entity &&
+                                  p4::pvp_body_matches(player, actions::entity_wuid(entity))));
+    };
     float hpBefore = 0, stBefore = 0, hpAfter = 0, stAfter = 0;
     const auto readVitals = [player](float& health, float& stamina) {
         return rttr::soul_state(player, "health", &health) && rttr::soul_state(player, "stamina", &stamina);
     };
     const bool beforeKnown = wuid && readVitals(hpBefore, stBefore);
     // A stale recipient cannot consume protection or reach either of the damage overloads.
-    if (!recipientCurrent()) return HitResult::RecipientRetired;
+    if (!recipientCurrent() || (recipient.proof && !bodyCurrent())) return HitResult::RecipientRetired;
     const bool protectedPlayer = p4::protected_player(player);
     if (protectedPlayer) {
         logf("T3-RECOVERY hit=Pvp decision=protected_consumed applied_hp=0 applied_st=0 peer=%u", attacker);
@@ -840,7 +850,7 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
     bool viaOld = false;
     bool hintSent = false;
     auto outcome = wo155rules::dispatch(protectedPlayer, suppress, [&](bool suppressReaction) {
-        if (recipientRetired || !recipientCurrent() || rttr::read_player_soul() != player) {
+        if (recipientRetired || !recipientCurrent() || !bodyCurrent()) {
             recipientRetired = true;
             return rttr::DamageInvocation::NotInvoked;
         }
@@ -875,15 +885,17 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
         outcome == HitResult::DispatchUnconfirmed ? "dispatch_unconfirmed" :
         acknowledged ? "acknowledged" : "refused";
     if (measured) {
-        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X hp_before=%.4f hp_after=%.4f st_before=%.4f st_after=%.4f contact=%llu/%llu",
+        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X hp_before=%.4f hp_after=%.4f st_before=%.4f st_after=%.4f contact=%llu/%llu recipient_life=%llu",
              status, attacker, sequence, static_cast<unsigned long long>(recipient.generation),
              static_cast<unsigned long long>(recipient.life), eid, hpBefore, hpAfter, stBefore, stAfter,
-             static_cast<unsigned long long>(incarnation), static_cast<unsigned long long>(contactSequence));
+             static_cast<unsigned long long>(incarnation), static_cast<unsigned long long>(contactSequence),
+             static_cast<unsigned long long>(recipient.proof));
     } else {
-        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X vitals=unavailable contact=%llu/%llu",
+        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X vitals=unavailable contact=%llu/%llu recipient_life=%llu",
              status, attacker, sequence, static_cast<unsigned long long>(recipient.generation),
              static_cast<unsigned long long>(recipient.life), eid,
-             static_cast<unsigned long long>(incarnation), static_cast<unsigned long long>(contactSequence));
+             static_cast<unsigned long long>(incarnation), static_cast<unsigned long long>(contactSequence),
+             static_cast<unsigned long long>(recipient.proof));
     }
     if (!protectedPlayer) {
         logf("WO121-HITS friendly-fire hit on the player: hp -%.2f st -%.2f unarmed=%d from ghost %u -> %s",
@@ -1055,6 +1067,7 @@ void mark_player_hit(uint32_t victimEid) {
 }
 
 void tick() {
+    pipe::publish_pvp_life();
     p6::tick(); // contact measurements precede the legacy health sampler
     // The player's WUID for the hook (a load changes the entity, not the id,
     // but it is cheap to keep fresh).

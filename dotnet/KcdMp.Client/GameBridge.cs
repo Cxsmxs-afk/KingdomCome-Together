@@ -4755,7 +4755,7 @@ public partial class GameBridge(ClientConfig config)
                 ct.ThrowIfCancellationRequested();
                 var pvpScope = pvpSession is not null && type is (Protocol.PlayerHitV8Down or Protocol.PvpPeerDown or Protocol.Disconnect)
                     ? new PvpFrameScope(pvpSession, Interlocked.Read(ref _p1Serial), Interlocked.Read(ref _t3InputLifeRevision),
-                        Environment.TickCount64)
+                        Environment.TickCount64, type == Protocol.PlayerHitV8Down ? _combat.PvpNativeLife : 0)
                     : null;
                 long arrival   = Stopwatch.GetTimestamp();
                 var load = LoadSequenceCapture();

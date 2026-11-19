@@ -258,6 +258,7 @@ constexpr uint8_t kAvatarEvent        = 0x17;   // [kind:1][eid:4]
 constexpr uint8_t kHitsConfig         = 0x18;   // [ff][attribution][pvpHook]
 constexpr uint8_t kAttributedDamage   = 0x19;   // [guid:16][st:4f][hp:4f][flags][attackerEid:4][nameLen][name] -> 0x8B
 constexpr uint8_t kApplyPvpHit        = 0x1A;   // [st:4f][hp:4f][flags][attackerGhost]
+constexpr uint8_t kPvpLifeOut         = 0xBC;   // unsolicited local recipient proof [u64]
 constexpr uint8_t kWo121Status        = 0x1B;   // -> 0x8A [ok][seq][text]
 constexpr uint8_t kWo121StatusReply   = 0x8A;
 constexpr uint8_t kAttributedReply    = 0x8B;   // [ok][seq][steps][attackerWuid:8][victimWuid:8]
@@ -376,5 +377,6 @@ void stop();
 /// Whether an agent is currently connected.
 bool connected();
 uint64_t observation_connection(); // zero disconnected, otherwise stable for the current pipe
+void publish_pvp_life(); // game tick, emits only when proof or pipe changes
 
 } // namespace kcdmp::pipe
