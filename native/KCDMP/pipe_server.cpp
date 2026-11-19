@@ -1952,20 +1952,20 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
             // (engine reads) is marshalled onto the main thread.
             case kNpcSamples: {
                 const uint8_t r = npcdrive::on_samples(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp});
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp, incoming.readerLife});
                 if (r != npcdrive::kOk) logf("PIPE: NpcSamples refused (%s, %u bytes)", npcdrive::reason_name(r), len);
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
             case edgelanes::kRawPose: {
                 const uint8_t r = t_edgeReply ? npcdrive::on_raw_pose(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp}) : npcdrive::kBadRequest;
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp, incoming.readerLife}) : npcdrive::kBadRequest;
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
             case edgelanes::kTimedPose: {
                 const uint8_t r = t_edgeReply ? npcdrive::on_timed_pose(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp}) : npcdrive::kBadRequest;
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp, incoming.readerLife}) : npcdrive::kBadRequest;
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }

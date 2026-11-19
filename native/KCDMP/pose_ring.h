@@ -161,6 +161,7 @@ struct Pose {
     uint32_t senderMs = 0;
     int64_t arrivalQpc = 0, firstByteQpc = 0, stateQpc = 0;
     uint64_t hostMs = 0, hostAtArrivalMs = 0, stateHostMs = 0;
+    uint64_t readerLife = 0;
     std::array<uint8_t, kStateBytes> state{};
     bool ghost() const { return kind == kGhost; }
 };
