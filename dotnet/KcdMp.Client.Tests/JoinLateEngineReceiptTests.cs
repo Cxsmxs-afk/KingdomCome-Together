@@ -25,9 +25,11 @@ public sealed class JoinLateEngineReceiptTests
         fixture.ReadAndComplete(retired.Path);
 
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        while (File.Exists(retired.Path) && !deadline.IsCancellationRequested) await Task.Delay(10);
+        while (fixture.HasReservation(retired) && !deadline.IsCancellationRequested) await Task.Delay(10);
+        Assert.False(fixture.HasReservation(retired), "The exact engine receipt did not release the retired attempt's reservation.");
         Assert.False(File.Exists(retired.Path), "The exactly consumed retired file still occupies its playline.");
         Assert.Same(replacement.Join, fixture.ActiveJoin);
+        Assert.True(fixture.HasReservation(replacement));
         Assert.Equal(placeBefore, fixture.Place);
         Assert.False(fixture.HasGameplayReceipt(replacement));
         Assert.Equal(Fixture.SaveBytes, File.ReadAllBytes(replacement.Path));
@@ -35,7 +37,9 @@ public sealed class JoinLateEngineReceiptTests
 
         fixture.ReadAndComplete(retired.Path);
         Assert.False(File.Exists(retired.Path));
+        Assert.False(fixture.HasReservation(retired));
         Assert.Same(replacement.Join, fixture.ActiveJoin);
+        Assert.True(fixture.HasReservation(replacement));
         Assert.False(fixture.HasGameplayReceipt(replacement));
         Assert.Equal(Fixture.SaveBytes, File.ReadAllBytes(replacement.Path));
         Assert.Equal(Fixture.SaveBytes, File.ReadAllBytes(fixture.PersonalSave));
@@ -153,6 +157,12 @@ public sealed class JoinLateEngineReceiptTests
 
         public bool HasEngineTerminal((object Join, string Path) attempt) =>
             EngineReceiptTask(attempt)?.IsCompletedSuccessfully == true;
+
+        public bool HasReservation((object Join, string Path) attempt)
+        {
+            var journal = (JoinWorldJournal)Field(_bridge, "_joinWorldJournal", Private).GetValue(_bridge)!;
+            return journal.HasReservation(Saves, (string)Field(attempt.Join, "WorldTag").GetValue(attempt.Join)!);
+        }
 
         public Task<bool>? EngineReceiptTask((object Join, string Path) attempt) =>
             Field(attempt.Join, "EngineReceipt").GetValue(attempt.Join) is { } receipt

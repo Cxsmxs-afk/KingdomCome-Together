@@ -329,6 +329,9 @@ public sealed partial class JoinCalendarIntegrationTests
                     Assert.DoesNotContain(joinId, guestLink.ReadySent);
                 }
                 finally { release.TrySetResult(); }
+                // Retirement of the Ready send and retirement of the loaded file are
+                // independent. The real return begins only after the journal cleanup.
+                await WaitForAbandonedArrivalAsync(guest, guestGame, ct);
             }
             else
             {
@@ -358,10 +361,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Empty(guestLink.ReadySent);
                 guestGame.CompleteJoinLoad();
                 Assert.Equal(1, guestGame.JoinFilesRead);
-                await guestGame.WaitForOwnLoadAsync(ct);
-                await WaitAsync(() => Get<object?>(guest, "_jj") is null && !Get<bool>(guest, "_joinedWorld") &&
-                    !Get<bool>(guest, "_leaveInProgress"),
-                    "the abandoned arrival to return to the guest's own world", ct);
+                await WaitForAbandonedArrivalAsync(guest, guestGame, ct);
                 if (!probe.HostLoss && !probe.GuestLoss)
                     await RejoinAfterAbortAsync(fixture, host, guest, guestPeer.Id, joinId, hostGame, guestGame, hostLink,
                         guestLink, ct);
@@ -376,6 +376,15 @@ public sealed partial class JoinCalendarIntegrationTests
             writerStop.Cancel();
             await writerTask.WaitAsync(TimeSpan.FromSeconds(5));
         }
+    }
+
+    private static async Task WaitForAbandonedArrivalAsync(GameBridge guest, JoinCalendarTestEngine guestGame,
+        CancellationToken ct)
+    {
+        await guestGame.WaitForOwnLoadAsync(ct);
+        await WaitAsync(() => Get<object?>(guest, "_jj") is null && !Get<bool>(guest, "_joinedWorld") &&
+            !Get<bool>(guest, "_leaveInProgress"),
+            "the abandoned arrival to return to the guest's own world", ct);
     }
 
     private static async Task AbortThroughRelayAsync(BoundaryProbe probe, GameBridge guest, ReplayPeer hostPeer,
