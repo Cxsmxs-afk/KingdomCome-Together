@@ -169,7 +169,8 @@ public sealed class H4OutfitEngineTests
                 inventory['{{Sword}}'] = '{{Sword}}'
                 """);
 
-            string source = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Lua", "kdcmp.lua"));
+            string source = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Lua", "kdcmp.lua"))
+                .ReplaceLineEndings("\n");
             _lua.DoString(Function(source, "function KCD2MP_W136ClearPreset(", "\nend\n"));
             _lua.DoString(Function(source, "function KCD2MP_W144Equip(", "\nend\n"));
             _lua.DoString(Function(source, "function KCD2MP_W214DrawWaits(", "\n    end\n"));
