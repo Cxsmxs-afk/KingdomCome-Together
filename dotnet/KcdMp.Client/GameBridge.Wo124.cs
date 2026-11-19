@@ -79,7 +79,7 @@ public partial class GameBridge
         public JoinRetryBlock? RetryScope;
         public HenrySource? Source;
         public string? SavesRoot;
-        public string? PlacedPath;
+        public string? PlacedPath;   // the reserved destination, verified separately after publication
         public bool PlacedVerified;
         public int Playline;
         public string Name = "";
@@ -921,6 +921,7 @@ public partial class GameBridge
                     return false;
                 }
                 _joinWorldJournal.Register(savesRoot, final, worldTag, j.JoinId, sha);
+                j.PlacedPath = final;
                 reserved = true;
             }
             using (var staged = _joinWorldJournal.CreateStage(savesRoot, final, j.JoinId, sha))
@@ -939,7 +940,6 @@ public partial class GameBridge
                 _joinWorldJournal.Publish(savesRoot, final, j.JoinId, sha);
                 moved = true;
                 j.SavesRoot = savesRoot;
-                j.PlacedPath = final;
                 j.SplicedSha = sha;
                 _retainedJoinWorlds.Keep(final, j);
                 return true;
@@ -947,7 +947,11 @@ public partial class GameBridge
         }
         finally
         {
-            if (reserved && !moved) _joinWorldJournal.TryDeleteOwned(savesRoot, final, j.JoinId, sha);
+            if (reserved && !moved)
+            {
+                _joinWorldJournal.TryDeleteOwned(savesRoot, final, j.JoinId, sha);
+                lock (_joinGate) j.PlacedPath = null;
+            }
         }
     }
 

@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using KcdMp.Wire;
@@ -154,6 +155,47 @@ public class Wo124Tests : IDisposable
         Assert.Equal(0, new JoinWorldJournal().Sweep(_saves, path => path == live));
         Assert.Equal(world, File.ReadAllBytes(live));
         Assert.Equal(world, File.ReadAllBytes(loading));
+    }
+
+    [Fact]
+    public void Reconnect_sweep_preserves_the_active_placement_then_recovers_it_after_abandonment()
+    {
+        string playline = Path.Combine(_saves, "playline2");
+        Directory.CreateDirectory(playline);
+        string destination = Path.Combine(playline, "mpworld00000004.whs");
+        const string worldTag = "abc0123456";
+        byte[] world = "synthetic world with an unfinished write"u8.ToArray();
+        byte[] sha = SHA256.HashData(world);
+        var journal = new JoinWorldJournal();
+        string part = journal.Register(_saves, destination, worldTag, 4, sha);
+        using (var stage = journal.CreateStage(_saves, destination, 4, sha)) stage.Write(world[..9]);
+
+        string? previousSaves = Environment.GetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR");
+        string? previousData = Environment.GetEnvironmentVariable("KCDMP_DATA_DIR");
+        try
+        {
+            Environment.SetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR", _saves);
+            Environment.SetEnvironmentVariable("KCDMP_DATA_DIR", Path.Combine(_saves, "data"));
+            var bridge = new GameBridge(new ClientConfig());
+            var active = typeof(GameBridge).GetField("_jj", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var join = Activator.CreateInstance(active.FieldType, nonPublic: true)!;
+            active.FieldType.GetField("PlacedPath")!.SetValue(join, destination);
+            active.SetValue(bridge, join);
+
+            Assert.Equal(0, bridge.Wo125Sweep("agent start"));
+            Assert.Equal(world[..9], File.ReadAllBytes(part));
+            Assert.True(journal.HasReservation(_saves, worldTag));
+
+            active.SetValue(bridge, null);
+            Assert.Equal(1, bridge.Wo125Sweep("agent start"));
+            Assert.False(journal.HasReservation(_saves, worldTag));
+            Assert.False(File.Exists(destination));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR", previousSaves);
+            Environment.SetEnvironmentVariable("KCDMP_DATA_DIR", previousData);
+        }
     }
 
     // ---------------------------------------------------------------- Phase 4: the Henry check

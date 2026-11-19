@@ -22,6 +22,11 @@ public sealed class JoinWorldFiles<T> where T : class
         lock (_gate) return _files.ContainsKey(Path.GetFullPath(path));
     }
 
+    public HashSet<string> ProtectedPaths()
+    {
+        lock (_gate) return new(_files.Keys, _files.Comparer);
+    }
+
     public bool MayRemove(string path, T owner)
     {
         lock (_gate) return _files.TryGetValue(Path.GetFullPath(path), out var e) && ReferenceEquals(e.Owner, owner) && e.Released;

@@ -829,7 +829,18 @@ public partial class GameBridge
         if (saves is null) return 0;
         saves = Path.GetFullPath(saves);
         if (!_joinWorldJournal.CanSweepPath(saves, directory: true)) return 0;
-        int n = why == "agent start" ? _joinWorldJournal.Sweep(saves, _retainedJoinWorlds.Protects) : 0;
+        int n = 0;
+        if (why == "agent start")
+        {
+            // Reserve/publish takes the same join gate. Copy the live leases
+            // before entering the journal so its sweep cannot invert cleanup's lock order.
+            lock (_joinGate)
+            {
+                var protectedPaths = _retainedJoinWorlds.ProtectedPaths();
+                if (_jj?.PlacedPath is string pending) protectedPaths.Add(pending);
+                n = _joinWorldJournal.Sweep(saves, protectedPaths.Contains);
+            }
+        }
         for (int pl = 0; pl <= 4; pl++)
         {
             string dir = Path.Combine(saves, $"playline{pl}");
