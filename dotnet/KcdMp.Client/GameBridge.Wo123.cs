@@ -1004,36 +1004,127 @@ public partial class GameBridge
             _joinRxLastDecile = decile;
             Console.WriteLine(FormattableString.Invariant($"MP-JOIN joiner: receiving {rx.Received}/{rx.Offer.Size} B ({rx.Percent:F0}%) eta_s={_joinUiEtaS:F1}"));
         }
-        if (res is WorldReceiver.ChunkResult.AckDue or WorldReceiver.ChunkResult.Complete)
-            await WriteJoinAsync(rx.BuildAck());
-        if (res != WorldReceiver.ChunkResult.Complete) return;
+        if (res != WorldReceiver.ChunkResult.Complete)
+        {
+            if (res == WorldReceiver.ChunkResult.AckDue) await WriteJoinAsync(rx.BuildAck());
+            return;
+        }
 
+        var run = rx.Offer.Run;
+        JoinCalendarRequest? transferRequest = null;
+        if (run is not null && Volatile.Read(ref _joinCalendarRequest) is { } request && request.JoinId == joinId &&
+            request.Host == host && ReferenceEquals(request.Link, _wo122Stream))
+            transferRequest = request;
+        if (run is null) await WriteJoinAsync(rx.BuildAck());
+        else if (transferRequest is not null && !await TryWriteRunTransferAsync(rx, transferRequest, rx.BuildAck())) return;
+
+        if (run is { } scoped && !RunTransferCurrent(rx, transferRequest, scoped))
+        {
+            await RetireRunTransferAsync(rx, transferRequest);
+            return;
+        }
         var (ok, reason, fwhy) = rx.Finish();
-        _joinRx = null;
+        if (run is { } finished && !RunTransferCurrent(rx, transferRequest, finished))
+        {
+            await RetireRunTransferAsync(rx, transferRequest);
+            return;
+        }
         if (!ok)
         {
+            _joinRx = null;
             SetJoinUi("failed", "The world arrived damaged -- the join was stopped.");
             Console.WriteLine($"MP-JOIN joiner: join 0x{joinId:x8} REJECTED: {fwhy} -- deleted, aborting ({Protocol.JoinAbortName(reason)})");
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, reason)); } catch { }
             return;
         }
-        if (rx.Offer.Run is { } run && (!H21GuestOfferRunCurrent(host, rx.HostWorldEpoch, run) ||
-            Volatile.Read(ref _joinCalendarRequest) is not { } request || request.JoinId != joinId || request.Host != host ||
-            !ReferenceEquals(request.Link, _wo122Stream)))
+        if (run is { } completed)
         {
-            DropJoinCalendar(host, joinId, "completed-run-transfer-retired");
+            if (!await TryWriteRunTransferAsync(rx, transferRequest!, rx.BuildDone())) return;
+            lock (_joinGate)
+            {
+                if (RunTransferCurrent(rx, transferRequest, completed))
+                {
+                    _joinRx = null;
+                    CompleteWorldTransfer(rx, secs);
+                    return;
+                }
+            }
+            await RetireRunTransferAsync(rx, transferRequest);
             return;
         }
+
+        _joinRx = null;
         if (LoadSequenceEnabled && JoinerSharedEffective) LoadSequenceBeginOffer(joinId, rx.HostWorldEpoch);
         await WriteJoinAsync(rx.BuildDone());
-        _joinReceivedId = joinId;
+        CompleteWorldTransfer(rx, secs);
+    }
+
+    private void CompleteWorldTransfer(WorldReceiver rx, double secs)
+    {
+        _joinReceivedId = rx.JoinId;
         _joinReceivedSeq = rx.Offer.WorldSavedSeq;
         _joinReceivedMd5 = rx.Offer.Md5;   // WO-125: the join save's md5, the key of its matched pair
         _joinOutId = 0;
         SetJoinUi("received", "World received. Loading...");
         Console.WriteLine(FormattableString.Invariant(
-            $"MP-JOIN joiner: join 0x{joinId:x8} received {rx.Received} B in {secs:F2} s -- sha256 ok, WhsSave.Verify ok, md5 = the offer's -> <data>/join-staging/{Path.GetFileName(rx.FinalPath)}"));
-        _ = Wo124OnWorldReceivedAsync(joinId, host, rx.FinalPath, rx.Offer.WorldSavedSeq, rx.HostWorldEpoch, rx.Offer.Run);   // WO-124: splice, place, load -- off the frame loop (a load takes ~50 s)
+            $"MP-JOIN joiner: join 0x{rx.JoinId:x8} received {rx.Received} B in {secs:F2} s -- sha256 ok, WhsSave.Verify ok, md5 = the offer's -> <data>/join-staging/{Path.GetFileName(rx.FinalPath)}"));
+        _ = Wo124OnWorldReceivedAsync(rx.JoinId, rx.Host, rx.FinalPath, rx.Offer.WorldSavedSeq, rx.HostWorldEpoch, rx.Offer.Run);   // WO-124: splice, place, load -- off the frame loop (a load takes ~50 s)
+    }
+
+    private bool RunTransferCurrent(WorldReceiver rx, JoinCalendarRequest? request, WorldRunOffer run) =>
+        ReferenceEquals(_joinRx, rx) && _joinOutId == rx.JoinId && request is not null &&
+        ReferenceEquals(Volatile.Read(ref _joinCalendarRequest), request) && ReferenceEquals(_wo122Stream, request.Link) &&
+        H21GuestOfferRunCurrent(rx.Host, rx.HostWorldEpoch, run);
+
+    private async Task<bool> TryWriteRunTransferAsync(WorldReceiver rx, JoinCalendarRequest request, byte[] packet)
+    {
+        try
+        {
+            await WritePacketAsync(request.Link, packet, _wo122Ct);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
+        {
+            Console.WriteLine($"MP-JOIN joiner: transfer 0x{rx.JoinId:x8} write did not confirm ({ex.GetType().Name})");
+            await RetireRunTransferAsync(rx, request);
+            return false;
+        }
+    }
+
+    private async Task RetireRunTransferAsync(WorldReceiver rx, JoinCalendarRequest? request)
+    {
+        Stream? notify = null;
+        CancellationToken relayToken = default;
+        lock (_joinGate)
+        {
+            if (ReferenceEquals(_joinRx, rx)) _joinRx = null;
+            // The transfer's staging names are keyed by join id. A replacement can own them already.
+            if (_joinRx?.JoinId != rx.JoinId)
+            {
+                rx.Abort();
+                var active = _joinCalendarRequest;
+                if (active is null ? _joinOutId == rx.JoinId : ReferenceEquals(active, request))
+                {
+                    if (active is not null && ReferenceEquals(active.Link, _wo122Stream))
+                    {
+                        notify = active.Link;
+                        relayToken = _wo122Ct;
+                    }
+                    ClearJoinCharacterRequest();
+                    ClearJoinCalendarBootstrap();
+                    if (_joinOutId == rx.JoinId) _joinOutId = 0;
+                    SetJoinUi("aborted", "Your host changed worlds during the transfer.", "world-changed");
+                    Wo202RejoinFailed("world-changed");
+                }
+            }
+        }
+        DropJoinCalendar(rx.Host, rx.JoinId, "completed-run-transfer-retired");
+        if (notify is null) return;
+        try { await WritePacketAsync(notify, WorldReceiver.BuildAbort(rx.Host, rx.JoinId, Protocol.JoinAbortWorldChanged), relayToken); }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
+        {
+            Console.WriteLine($"MP-JOIN joiner: stale transfer 0x{rx.JoinId:x8} abort not sent ({ex.GetType().Name})");
+        }
     }
 
     private void SetJoinUi(string state, string message, string reason = "", bool canFresh = false)
