@@ -13,6 +13,17 @@ public sealed class Lane2DeathReleaseTests
     private const uint CurrentEid = 0x11223344, OldEngageEid = 0x55667788;
     private const BindingFlags PrivateInstance = BindingFlags.NonPublic | BindingFlags.Instance;
 
+    [Fact]
+    public async Task An_unbound_death_is_not_treated_as_a_released_copy()
+    {
+        var bridge = new GameBridge(new ClientConfig());
+        Task release = (Task)typeof(GameBridge).GetMethod("Wo195OnCopyDeathAsync", PrivateInstance)!
+            .Invoke(bridge, [Npc, "owner-death"])!;
+        await release;
+        bool dead = (bool)typeof(GameBridge).GetMethod("Wo195IsDead", PrivateInstance)!.Invoke(bridge, [Npc])!;
+        Assert.False(dead);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

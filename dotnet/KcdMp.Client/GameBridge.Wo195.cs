@@ -166,6 +166,13 @@ public partial class GameBridge
         long life = Interlocked.Read(ref _npcDeathLife);
         var mark = new Wo195DeathMark(Environment.TickCount64, life, Wo195CaptureBody(npc, life));
         string path = Wo195Rules.PathTag(via);
+        if (mark.Body is null)
+        {
+            // No soul binding means the native release never ran. Do not leave a mark:
+            // Wo195IsDead would otherwise treat the missing body as a completed release.
+            Console.WriteLine($"MP-LANE2-H6 npc={npc} path={path} release=unconfirmed reason=no-current-soul-binding");
+            return;
+        }
         if (!_w195Dead.TryAdd(npc, mark))
         {
             if (!_w195Dead.TryGetValue(npc, out var existing) || (existing.Life == life && existing.Body == mark.Body) ||
@@ -175,11 +182,7 @@ public partial class GameBridge
                 return;
             }
         }
-        if (mark.Body is not { } body)
-        {
-            Console.WriteLine($"MP-LANE2-H6 npc={npc} path={path} release=unconfirmed reason=no-current-soul-binding");
-            return;
-        }
+        var body = mark.Body.Value;
         bool Current() => _w195Dead.TryGetValue(npc, out var current) && ReferenceEquals(mark, current) && Wo195BodyCurrent(npc, body);
         if (!Current())
         {
