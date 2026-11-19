@@ -1,7 +1,10 @@
 # Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 # GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 # content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import scen_lane2_melee as lane
 
@@ -84,6 +87,103 @@ class Lane2EvidenceTests(unittest.TestCase):
         self.assertEqual({'status': 'red', 'delta': 3}, lane.unavailable_evidence(before, after, 'joiner', True))
         for start, end, stable in ((before, after, False), ({}, after, True), (before, {}, True), (after, before, True)):
             self.assertEqual({'status': 'grey', 'delta': None}, lane.unavailable_evidence(start, end, 'joiner', stable))
+
+    def test_regular_exercise_fails_on_fresh_provider_unavailable_for_both_receivers(self):
+        class Copy:
+            def __init__(self, index, log, native):
+                self.id = str(index)
+                self.alog = 'agent'
+                self.port = 1
+                self.agent = [f'Connected! Assigned id={index} (protocol 10)', *log]
+                self.native = native
+
+            def ask(self, *_): return 'on'
+            def pos(self): return (0.0, 0.0, 0.0)
+            def size(self, _): return 1
+            def lines(self, path, offset): return (self.agent if path == 'agent' else self.native)[offset:]
+
+        healthy = dict.fromkeys(lane.combat.TOTALS, 0)
+        healthy.update(rp_owner_n=5, rp_action_confirmed_n=5, rp_actions_played=5, rp_actions_in=5)
+        baseline = {role: dict(healthy, **{lane.MELEE_UNAVAILABLE: 0}) for role in ('host', 'joiner')}
+        unavailable = ('MP-RP-MELEE-ROW peer=2 kind=Attack seq=9 source_ms=88 table=combat_action_attack '
+                       'result=unavailable reason=typed-provider-unavailable')
+        io = SimpleNamespace(pair=SimpleNamespace(state=lambda: {}, POOR_NETWORK='', collect=lambda *_a, **_k: {}),
+                             procs=SimpleNamespace(matches=lambda _: True), rig=SimpleNamespace(say=lambda *_: None), Copy=Copy)
+        args = SimpleNamespace(netz='normal', bandit='bandit', expect_unavailable=False)
+        for sender, receiver in (('host', 'joiner'), ('joiner', 'host')):
+            with self.subTest(receiver=receiver), tempfile.TemporaryDirectory() as path:
+                totals = {role: dict(row) for role, row in baseline.items()}
+                totals[receiver]['dmg_double_blocked'] = 1
+                totals[receiver][lane.MELEE_UNAVAILABLE] = 1
+                remote = Copy(1, [*self.agent, unavailable], ['ignored', *self.native])
+                source = Copy(2, [], [])
+                pair = dict(a=source, b=remote) if sender == 'host' else dict(a=remote, b=source)
+                with patch.object(lane, 'network_evidence', return_value={}), \
+                     patch.object(lane, 'mark_native', return_value={'native': 1}), \
+                     patch.object(lane, 'fresh_stats', side_effect=[baseline, totals]), \
+                     patch.object(lane.combat, 'player_fight', return_value=[dict(self.stages[0], nearby=True)]), \
+                     patch.object(lane, 'recoil_stage', return_value={'station': 'recoil', 'required_kinds': [], 'source_actions': []}):
+                    ok, why, _ = lane.exercise(io, SimpleNamespace(dir=path, **pair), args, sender)
+                self.assertFalse(ok)
+                self.assertEqual('melee-presentation-unavailable', why)
+
+    def test_negative_unavailable_requires_one_real_receipt_and_rejects_fallback(self):
+        stage = {'source_actions': [{'kind': 1, 'source_ms': 10}]}
+        marker = ('MP-RP-MELEE-ROW peer=2 kind=Attack seq=4 source_ms=10 table=combat_action_attack '
+                  'result=unavailable reason=typed-provider-unavailable')
+        submit = ('MP-RP-TIMELINE-IN peer=2 kind=1 phase=1 seq=4 source_ms=10 event_host_ms=115 '
+                  'result=unavailable reason=typed-provider-unavailable')
+        receipts = lane.unavailable_receipts([marker, submit, marker.replace('peer=2', 'peer=3')], 2)
+        self.assertEqual(1, len(receipts))
+        observed = lane.negative_unavailable_evidence([stage], receipts, [marker, submit], [['FRAME']], 2, True)
+        self.assertEqual(('green', 1), (observed['status'], observed['count']))
+        unknown = lane.negative_unavailable_evidence([stage], receipts, [marker], [], 2, True)
+        self.assertEqual('grey', unknown['status'])
+        fallback = 'MP-ACTION section=inbound ghost=2 kind=Attack seq=4 dispatch=swing-queued rsid=5'
+        self.assertEqual('red', lane.negative_unavailable_evidence([stage], receipts, [marker, fallback], [['FRAME']], 2, True)['status'])
+        native = 'MP-RP-COMBAT-ACTION peer=2 eid=0x1B kind=1 seq=4 event_host_ms=115 result=installed'
+        self.assertEqual('red', lane.negative_unavailable_evidence([stage], receipts, [marker], [[native]], 2, True)['status'])
+
+    def test_live_vitals_require_fresh_identity_and_keep_raw_values(self):
+        before = 'scope=7 phase=before target=partner eid=0x1B hp=85.5 st=42.5 dead=0 ko=0 game_s=10 x=0 y=1 z=2'
+        after = 'scope=7 phase=after target=partner eid=0x1B hp=80.0 st=18.5 dead=0 ko=0 game_s=10.5 x=0 y=1 z=2'
+        first = lane.parse_vitals(before, '7', 'before', 'partner')
+        second = lane.parse_vitals(after, '7', 'after', 'partner')
+        self.assertEqual(before, first['raw'])
+        self.assertEqual({'partner': dict(hp=5.5, st=24.0, window_game_s=0.5)},
+                         lane.window_deltas({'partner': first}, {'partner': second}))
+        self.assertEqual({}, lane.window_deltas({'partner': first}, {'partner': dict(second, eid=5)}))
+        self.assertEqual({}, lane.window_deltas({'partner': first}, {'partner': dict(second, game_s=9.0)}))
+        self.assertIsNone(lane.parse_vitals(after, '8', 'after', 'partner'))
+        self.assertIsNone(lane.parse_vitals(after.replace('hp=80.0', 'hp=nan'), '7', 'after', 'partner'))
+
+    def test_live_contact_separates_protected_zero_from_damage_apply(self):
+        sender = 'MP-FF dir=out victim_eid=0x31 ghost=1 hp=4.00 st=5.00 unarmed=0 missile=0 session=on result=sent'
+        receiver = 'MP-FF dir=in attacker=2 victim=1 hp=4.00 st=5.00 unarmed=0 missile=0 material=0 session=on result=applied reason=ok'
+        sent, received = lane.partner_contacts([sender, sender.replace('ghost=1', 'ghost=4')], [receiver], 2, 1)
+        self.assertEqual(([sender], [receiver]), (sent, received))
+        guard = 'T3-RECOVERY hit=Pvp decision=protected_consumed applied_hp=0 applied_st=0 peer=2'
+        applied = 'WO121-HITS friendly-fire hit on the player: hp -4.00 st -5.00 unarmed=0 from ghost 2 -> applied'
+        for result in ('applied', 'acknowledged'):
+            reply = receiver.replace('result=applied', f'result={result}')
+            sent, received = lane.partner_contacts([sender], [reply], 2, 1)
+            self.assertEqual(([sender], [reply]), (sent, received))
+            self.assertEqual('partner-damage-apply-unmeasured', lane.case_signal('partner-hit', {}, {}, sent, received, [], [], [], 2))
+            self.assertEqual('partner-application-observed', lane.case_signal('partner-hit', {}, {}, sent, received, [], [], [applied], 2))
+        protected_reply = receiver.replace('result=applied', 'result=protected_consumed')
+        sent, received = lane.partner_contacts([sender], [protected_reply], 2, 1)
+        self.assertEqual(([sender], [protected_reply]), (sent, received))
+        self.assertEqual('protected-consumed-zero', lane.case_signal('protected', {}, {}, sent, received, [guard], [], [], 2))
+        self.assertEqual('protection-unmeasured', lane.case_signal('protected', {}, {}, sent, received, [guard], [], [applied], 2))
+        self.assertEqual('protected-instead-of-applied', lane.case_signal('partner-hit', {}, {}, sent, received, [], [], [], 2))
+
+    def test_npc_contact_uses_the_hosts_engine_and_target_identity(self):
+        local = 'WO176-HOSTHIT victim=0x1B outcome=blocked rec=[blk 1 second 0 pb 0 broken 0]'
+        remote = 'MP-W173 hit npc=bandit by_ghost=2 applied=engine verdict=hit reaction=engine seq=8'
+        self.assertEqual([('blocked', local)], lane.authority_contacts('host', 1, 'bandit', 0x1B, [remote], [local]))
+        self.assertEqual([], lane.authority_contacts('host', 1, 'bandit', 0x1C, [remote], [local]))
+        self.assertEqual([('hit', remote)], lane.authority_contacts('joiner', 2, 'bandit', 0x1B, [remote], [local]))
+        self.assertEqual([], lane.authority_contacts('joiner', 3, 'bandit', 0x1B, [remote], [local]))
 
 
 if __name__ == '__main__':

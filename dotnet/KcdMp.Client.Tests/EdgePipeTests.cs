@@ -126,12 +126,25 @@ public sealed class EdgePipeTests
 
         public Task<bool> Apply(ActionKind kind, string table, byte flags, ushort seq, CancellationToken ct)
         {
+            int actionType = table switch
+            {
+                "combat_action_block" => ActionRowCatalog.ActionBlock,
+                "combat_action_perfect_block" => ActionRowCatalog.ActionPerfectBlock,
+                _ => -1
+            };
+            return ApplyRow(kind, new(table, "Combat", "tags", 0, 0, 0, ActionType: actionType), flags, seq, ct);
+        }
+
+        public Task<bool> ApplyRow(ActionKind kind, ActionRowCatalog.Row row, byte flags, ushort seq, CancellationToken ct)
+        {
             var action = new InboundAction(Peer, kind, seq, ActionPhase.Commit, default, [70, 0, 0, 0]);
-            var row = new ActionRowCatalog.Row(table, "Combat", "tags", 0, 0, 0);
             return (Task<bool>)Schedule.Invoke(bridge, [action, Entity, row, flags, stamp, ct])!;
         }
 
         public void Rebind() => ((ConcurrentDictionary<string, int>)Field("_ghostBodyGen").GetValue(bridge)!)["2"] = 1;
+
+        public void SetTypedCombat(bool enabled) =>
+            ((ConcurrentDictionary<string, bool>)Field("_w221On").GetValue(bridge)!)["rp_combat"] = enabled;
 
         public void DisableModes()
         {
@@ -142,6 +155,45 @@ public sealed class EdgePipeTests
         public Task<PresentationCombatAdmission> Knockout(bool down, bool recovery, CancellationToken ct, Func<bool>? ready = null) =>
             (Task<PresentationCombatAdmission>)Submit.Invoke(bridge,
                 [Peer, Entity, stamp, (ushort)62, (byte)0x81, new byte[] { down ? (byte)1 : (byte)0 }, ct, 0u, ready, recovery])!;
+    }
+
+    [Theory]
+    [InlineData("combat_action_block", ActionRowCatalog.ActionPerfectBlock, 0)]
+    [InlineData("combat_action_perfect_block", -1, RowEvent.FlagPerfect)]
+    [InlineData("combat_action_perfect_block", 23, RowEvent.FlagPerfect)]
+    [InlineData("combat_action_perfect_block", ActionRowCatalog.ActionPerfectBlock, 0)]
+    [InlineData("combat_action_perfect_block", 55, 0)]
+    [InlineData("combat_action_perfect_block", 62, 0)]
+    public async Task Presentation_combat_drops_unproven_defence_through_the_real_row_scheduler(string table, int actionType, byte flags)
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        var unproven = new ActionRowCatalog.Row(table, "UnprovenDefence", "tags", 0, 0, 0, ActionType: actionType);
+        var rejected = harness.ApplyRow(ActionKind.BlockImpulse, unproven, flags, 12, conn.Token);
+        var firstRequest = conn.Read(Request);
+        if (await Task.WhenAny(rejected, firstRequest) == firstRequest)
+        {
+            byte[] unexpected = await firstRequest;
+            await conn.Respond(Id(unexpected), EdgeOutcome.Completed, 0x81, [0, 0, 3]);
+            Assert.Fail($"Unproven defence {table}:{actionType} flags={flags} wrote pipe operation 0x{unexpected[5]:X2}");
+        }
+        Assert.True(await rejected);
+
+        // The next unflagged ordinary block still takes the original typed path.
+        var ordinary = new ActionRowCatalog.Row("combat_action_block", "CombatBlockGen", "tags", 0, 0, 0, ActionType: ActionRowCatalog.ActionBlockBroken);
+        var accepted = harness.ApplyRow(ActionKind.BlockImpulse, ordinary, 0, 13, conn.Token);
+        byte[] registration = await firstRequest;
+        Assert.Equal(0x3F, registration[5]);
+        Assert.Equal((byte)ActionKind.BlockImpulse, registration[15]);
+        Assert.Equal("CombatBlockGen, tags", Encoding.UTF8.GetString(registration.AsSpan(20)));
+        await conn.Respond(Id(registration), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        byte[] request = await conn.Read(Request);
+        Assert.Equal(0x40, request[5]);
+        Assert.Equal((byte)ActionKind.BlockImpulse, request[25]);
+        Assert.Equal(13, BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(23)));
+        await conn.Respond(Id(request), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        Assert.True(await accepted);
     }
 
     [Theory]
@@ -206,17 +258,29 @@ public sealed class EdgePipeTests
         var nextRequest = await conn.Read(Request);
         Assert.Equal(43, BinaryPrimitives.ReadUInt16LittleEndian(nextRequest.AsSpan(23)));
         await conn.Respond(Id(nextRequest), EdgeOutcome.Unsupported);
-        var old = await conn.Read(Request);
-        Assert.Equal(0x3B, old[5]);
-        await conn.Respond(Id(old), EdgeOutcome.Completed, 0x81, [0, 0, 1]);
-        Assert.False(await next);
+        Assert.True(await next);
 
-        var legacy = harness.Apply(ActionKind.BlockImpulse, "combat_action_block", 0, 44, conn.Token);
-        var legacyRequest = await conn.Read(Request);
-        Assert.Equal(0x3B, legacyRequest[5]);
-        Assert.Equal(44, BinaryPrimitives.ReadUInt16LittleEndian(legacyRequest.AsSpan(23)));
-        await conn.Respond(Id(legacyRequest), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
-        Assert.True(await legacy);
+        var following = harness.Apply(ActionKind.BlockImpulse, "combat_action_block", 0, 44, conn.Token);
+        var followingRequest = await conn.Read(Request);
+        Assert.Equal(0x40, followingRequest[5]);
+        Assert.Equal(44, BinaryPrimitives.ReadUInt16LittleEndian(followingRequest.AsSpan(23)));
+        await conn.Respond(Id(followingRequest), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        Assert.True(await following);
+    }
+
+    [Fact]
+    public async Task Presentation_combat_does_not_release_a_legacy_retry_after_the_typed_owner_takes_over()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        harness.SetTypedCombat(false);
+        var action = harness.Apply(ActionKind.Attack, "combat_action_attack", 0, 45, conn.Token);
+        var legacy = await conn.Read(Request);
+        Assert.Equal(0x3B, legacy[5]);
+        harness.SetTypedCombat(true);
+        await conn.Respond(Id(legacy), EdgeOutcome.Unsupported);
+        Assert.True(await action);
     }
 
     [Fact]

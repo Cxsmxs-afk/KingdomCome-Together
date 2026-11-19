@@ -29,6 +29,7 @@ int visual_damage_tests(int* passed);
 int load_sequence_tests(int* passed);
 int wo203_conv_tests(int* passed);
 int t3_recovery_stats_tests(int* passed);
+int h6_combat_action_tests(int* passed);
 
 bool run_tests(const char* name, int (*suite)(int*)) {
     int passed = 0;
@@ -49,6 +50,7 @@ int main() {
     passed &= run_tests("world load scope and frame fence", &load_sequence_tests);
     passed &= run_tests("ordered dialog votes and apply receipts", &wo203_conv_tests);
     passed &= run_tests("scoped recovery and reconnect diagnostics", &t3_recovery_stats_tests);
+    passed &= run_tests("combat action incarnation and retirement", &h6_combat_action_tests);
     return passed ? 0 : 1;
 }
 EOF
@@ -58,6 +60,7 @@ EOF
         native/tests/rp_controller_tests.cpp native/tests/rp_combat_tests.cpp \
         native/tests/rp_body_action_tests.cpp native/tests/visual_damage_tests.cpp native/tests/load_sequence_tests.cpp \
         native/tests/wo203_conv_tests.cpp native/tests/t3_recovery_stats_tests.cpp \
+        native/tests/h6_combat_action_tests.cpp \
         -o "$native_tmp/native-contracts"
     if ! native_result="$("$native_tmp/native-contracts")"; then
         printf '%s\n' "$native_result" >&2
@@ -65,6 +68,7 @@ EOF
     fi
     printf '%s\n' "$native_result"
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_rpcombat.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_lane2_melee.py'
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_load_sequence.py'
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_s3_events.py'
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_s3_recovery.py'

@@ -20,7 +20,9 @@ public sealed class Lane2MeleeTests
     [InlineData(ActionKind.Attack, "combat_action_attack", 0, 1, -1)]
     [InlineData(ActionKind.Attack, "combat_action_attack", AttackEvent.FlagCombo, 1, -1)]
     [InlineData(ActionKind.BlockImpulse, "combat_action_block", 0, 6, 6)]
-    [InlineData(ActionKind.BlockImpulse, "combat_action_perfect_block", Wo187Rules.NativeFlagPerfect, 0x83, 14)]
+    [InlineData(ActionKind.BlockImpulse, "combat_action_block", 0, 6, 8)]
+    [InlineData(ActionKind.BlockImpulse, "combat_action_block", 0, 6, -1)]
+    [InlineData(ActionKind.BlockImpulse, "combat_action_perfect_block", RowEvent.FlagPerfect, 0x83, 14)]
     [InlineData(ActionKind.Dodge, "combat_action_dodge", 0, 7, -1)]
     [InlineData(ActionKind.AvatarHit, "combat_action_hit", 0, 0x84, -1)]
     [InlineData(ActionKind.AvatarRecoil, "combat_action_failed_attack", 0, 0x85, -1)]
@@ -61,35 +63,59 @@ public sealed class Lane2MeleeTests
     }
 
     [Theory]
-    [InlineData(55)]
-    [InlineData(62)]
-    public async Task A_master_strike_is_consumed_without_playing_the_perfect_block(int actionType)
+    [InlineData(55, 0)]
+    [InlineData(62, 0)]
+    [InlineData(55, RowEvent.FlagPerfect)]
+    [InlineData(62, RowEvent.FlagPerfect)]
+    public async Task A_master_strike_is_consumed_without_playing_the_perfect_block(int actionType, byte flags)
     {
         const string table = "combat_action_perfect_block";
-        Assert.Equal((byte)0, GameBridge.PresentationMeleeKind(ActionKind.BlockImpulse, table, Wo187Rules.NativeFlagPerfect, actionType));
-        Assert.True(await Schedule(typedPresentation: false, ActionKind.BlockImpulse, table, Wo187Rules.NativeFlagPerfect, actionType));
-        Assert.False(await Schedule(typedPresentation: false, ActionKind.BlockImpulse, table, Wo187Rules.NativeFlagPerfect, 14));
+        Assert.Equal((byte)0, GameBridge.PresentationMeleeKind(ActionKind.BlockImpulse, table, flags, actionType));
+        Assert.True(await Schedule(typedPresentation: false, ActionKind.BlockImpulse, table, flags, actionType));
+        Assert.False(await Schedule(typedPresentation: false, ActionKind.BlockImpulse, table, RowEvent.FlagPerfect, 14));
     }
 
     [Theory]
-    [InlineData(ActionKind.Attack, "combat_action_attack", 0)]
-    [InlineData(ActionKind.BlockImpulse, "combat_action_perfect_block", Wo187Rules.NativeFlagPerfect)]
-    [InlineData(ActionKind.AvatarHit, "combat_action_hit", 0)]
-    [InlineData(ActionKind.AvatarRecoil, "combat_action_failed_attack", 0)]
-    public async Task Typed_melee_consumes_rows_when_the_clock_is_missing_or_from_an_inactive_session(ActionKind kind, string table, byte flags)
+    [InlineData("combat_action_perfect_block", ActionRowCatalog.ActionPerfectBlock, 0, "result=refused reason=perfect-block-flag-missing")]
+    [InlineData("combat_action_perfect_block", 23, RowEvent.FlagPerfect, "result=refused reason=defence-row-context-unverified")]
+    [InlineData("combat_action_perfect_block", 55, 0, "result=grey reason=counter-engine-entry-unverified")]
+    [InlineData("combat_action_perfect_block", 62, 0, "result=grey reason=counter-engine-entry-unverified")]
+    [InlineData("combat_action_sync_attack", -1, 0, "result=grey reason=paired-engine-entry-unverified")]
+    public async Task An_unproven_defence_reports_its_disposition_even_when_the_flag_is_missing(string table, int actionType, byte flags, string disposition)
     {
-        Assert.True(await Schedule(typedPresentation: true, kind, table, flags));
-        Assert.True(await Schedule(typedPresentation: true, kind, table, flags, retiredClock: true));
-        Assert.False(await Schedule(typedPresentation: false, kind, table, flags));
+        using var output = new StringWriter();
+        var original = Console.Out;
+        Console.SetOut(output);
+        try
+        {
+            Assert.True(await Schedule(typedPresentation: false, ActionKind.BlockImpulse, table, flags, actionType));
+        }
+        finally
+        {
+            Console.SetOut(original);
+        }
+        Assert.Contains(disposition, output.ToString());
+    }
+
+    [Theory]
+    [InlineData(ActionKind.Attack, "combat_action_attack", 0, -1)]
+    [InlineData(ActionKind.BlockImpulse, "combat_action_perfect_block", RowEvent.FlagPerfect, 14)]
+    [InlineData(ActionKind.AvatarHit, "combat_action_hit", 0, -1)]
+    [InlineData(ActionKind.AvatarRecoil, "combat_action_failed_attack", 0, -1)]
+    public async Task Typed_melee_consumes_rows_when_the_clock_is_missing_or_from_an_inactive_session(ActionKind kind, string table, byte flags, int actionType)
+    {
+        Assert.True(await Schedule(typedPresentation: true, kind, table, flags, actionType));
+        Assert.True(await Schedule(typedPresentation: true, kind, table, flags, actionType, retiredClock: true));
+        Assert.False(await Schedule(typedPresentation: false, kind, table, flags, actionType));
     }
 
     [Fact]
-    public void An_unsupported_request_can_use_legacy_playback_but_uncertain_receipts_cannot()
+    public void An_active_typed_melee_owner_consumes_unsupported_and_uncertain_replies()
     {
         Assert.Equal(PresentationCombatAdmission.Accepted, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Completed, [1, 0, 0])));
         Assert.Equal(PresentationCombatAdmission.Suppressed, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Unavailable, [])));
         Assert.Equal(PresentationCombatAdmission.Suppressed, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Ambiguous, [])));
-        Assert.Equal(PresentationCombatAdmission.Fallback, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Unsupported, [])));
+        Assert.Equal(PresentationCombatAdmission.Suppressed, GameBridge.PresentationMeleeAdmission(new(EdgeOutcome.Unsupported, [])));
     }
 
     [Fact]
