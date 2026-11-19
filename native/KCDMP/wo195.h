@@ -19,8 +19,9 @@
 // Pipe ops in the WO-163 family (0x2B -> 0xAC), main thread:
 //   54 Status -> text
 //   55 Config [deadRelease:1] (255 = unchanged) -> [deadRelease:1]
-//   56 Release [eid:4] -> [held:1 (wo195rules::kHeld*)][combatMode:1][living:1]   (0/1, 255 = unreadable)
-//   57 Check   [eid:4] | [0:4][nameLen:1][name] -> [dead:1][combatMode:1][living:1][fightHeld:1]   (living 1 = still a living entity:
+//   56 Release [eid:4][localSoulGuid:16][lifecycleGeneration:8] -> [held:1 (wo195rules::kHeld*)][combatMode:1][living:1]
+//   57 Check   [release scope] | [eid:4] | [0:4][nameLen:1][name] -> [dead:1][combatMode:1][living:1][fightHeld:1]
+//              0/1, 255 = unreadable. Living 1 = still a living entity:
 //              a copy killed by the mod's ApplyDeath gets no death reaction and stays upright, frozen in the dead action's first pose)
 #pragma once
 #include <cstddef>

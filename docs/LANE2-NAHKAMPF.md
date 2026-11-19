@@ -1,6 +1,14 @@
 # Lane 2 · Nahkampf am Partner
 
-## N1 · Schwung, Block, Parade und Trefferreaktion
+## Übergabe auf H22
+
+`codex/lane2-melee-kct-h22` stapelt den Fünf-Dateien-Diff aus #47 auf `18d3dfd6` (`codex/fix-session-role`). `a23dec8d` enthält die unveränderte Übernahme. Die folgenden N1/N2-Abschnitte dokumentieren den historischen Stand von #47 einschließlich seines damaligen Drop-ins. Der Hauptchat stellt den gemeinsamen Spielkandidaten zusammen.
+
+Im H22-Nachzug bleibt die typisierte Nahkampfwiedergabe bei aktivem `rp_combat` der einzige Wiedergabepfad. Eine Pipe-Quittung mit `Accepted` bedeutet Einreihung. `installed` ist der anschließende native Nachweis. Der Rig wertet eine neu gemeldete Nichtverfügbarkeit im Soll-Lauf als Fehler. `--expect-unavailable` erfasst separat einen vorbereiteten Negativfall. `--combat-case` führt durch isolierte Kampfbeobachtungen mit einem HP-/Ausdauerfenster am tatsächlichen Ziel. Dieses Fenster kann einen atomaren, autoritativen Trefferbeleg nur ergänzen. [Agent-Zulassung](../dotnet/KcdMp.Client/GameBridge.PresentationCombat.cs) · [Lane-Rig](../tools/rig/scen_lane2_melee.py)
+
+Für H6 prüft WO195 bei der Freigabe die konkrete Körperbindung und den Lebens-Scope. Eine Stop-Anforderung mit noch ausstehendem Endstatus bleibt unbestätigt. Gemeinsame Todespfade einschließlich GUID-Fallback und die Vorab-Registrierung vor `QueueAction` benötigen den Hauptchat. Der erweiterte Kampftest braucht diese Übergabe und einen realen Zwei-PC-Lauf. [WO195](../dotnet/KcdMp.Client/GameBridge.Wo195.cs) · [Native Aktionslebensdauer](../native/KCDMP/combat_actions.cpp)
+
+## N1 · Historischer Stand von #47
 
 `codex/lane2-nahkampf-swings` setzt auf `5fc9133e` auf. Die Korrektur auf `codex/lane2-nahkampf-swings-fix` baut auf `2727cfb0` auf. `Attack` aus der Tabelle `combat_action_attack` bleibt auch mit `FlagCombo` ein Schwung (`1`) auf der Angreiferfigur. Block (`6`), perfekter Block (`0x83`), Trefferreaktion (`0x84`) und Rückstoß (`0x85`) gehen als getrennte Typen an den nativen Zeilen-Owner. Eine unpassende Kombination von Aktion und Tabelle wird vor dem Routing als `kind-table-mismatch` abgewiesen.
 

@@ -11,22 +11,65 @@
 // waiting or running on that body's action controller then faults in the game's own code the next time the controller runs it
 // (minutes later, when the player comes back to the body).
 //
-// The rule: no combat action of ours outlives its body's combat part. Every action we queue is recorded here with its actor; at
-// the engine's own release point, before the combat part goes, each one is stopped the engine's own way (Mannequin's
-// IAction::Stop) and its two unguarded callbacks are taken out (the object's vftable pointer is set to a copy whose slots 14, 17
-// and 18 do nothing), so nothing of it can read the combat part again -- whichever way the body went: an unbind, a hide, the
-// joiner's own pool or layer, a death, a rebind, the end of a session.
+// Track the physical actor, entity, combat part and lifecycle for every owned action. While that proof is current, a game-thread
+// retirement can request Mannequin's IAction::Stop. The engine's release hook can also silence verified callbacks before giving the
+// combat part back. When either operation is uncertain, retain the reference in quarantine instead of guessing that teardown is safe.
 #include <cstdint>
+#include "wo167_rules.h"
 
 namespace kcdmp::combatactions {
+
+struct BodyProof {
+    uint32_t eid = 0;
+    void* actor = nullptr;
+    void* entity = nullptr;
+    void* combat = nullptr;
+    uint64_t lifecycle = 0;
+    uint64_t load = 0;
+};
+
+namespace detail {
+
+inline bool known_body(const BodyProof& body) {
+    return body.eid && body.actor && body.entity && body.lifecycle;
+}
+
+inline bool same_body(const BodyProof& recorded, const BodyProof& releasing) {
+    return known_body(recorded) && known_body(releasing) && recorded.actor == releasing.actor &&
+        recorded.entity == releasing.entity && recorded.combat == releasing.combat &&
+        recorded.lifecycle == releasing.lifecycle && recorded.load == releasing.load;
+}
+
+enum class Retirement : uint8_t { Active, StopRequested, Finished, Quarantined };
+
+inline bool observe_finished(Retirement& state, bool actionKnown, uint32_t status) {
+    if (actionKnown && status == wo167rules::kStatusFinished) state = Retirement::Finished;
+    return state == Retirement::Finished;
+}
+
+template <class Quiet, class Stop>
+bool retire(Retirement& state, bool actionKnown, uint32_t status, bool canStop, Quiet quiet, Stop stop) {
+    if (state != Retirement::Active) return state != Retirement::Quarantined;
+    if (observe_finished(state, actionKnown, status)) return true;
+    if (actionKnown && status < wo167rules::kStatusFinished && quiet() && canStop && stop()) state = Retirement::StopRequested;
+    else state = Retirement::Quarantined;
+    return state != Retirement::Quarantined;
+}
+
+} // namespace detail
 
 // Main thread, right after C_CombatAnimActionManager::QueueAction took the action: one reference of ours is added.
 void track(uint32_t eid, void* actor, void* action, bool movesBody = false);
 // True while a tracked combat one-shot still occupies the engine's pose controller.
 bool body_pose_holds(uint32_t eid);
 
-// Any thread. Every recorded action of this body (or of every body) is ended; returns how many.
+// Main thread. Resolve both engine indexes, then verify the proof again before a write. A known actor may have no combat part.
+BodyProof observe_body(uint32_t eid);
+// Exact actions confirmed finished, or -1 for a pending stop, unknown identity or incomplete tracking.
+int end_for_body(const BodyProof& body, const char* why);
+// Legacy ABI. An EID-only request has no body proof and cannot end a tracked action.
 int end_for_entity(uint32_t eid, const char* why);
+// Any thread. Request bounded main-thread retirement of entries already tracked. No work is ended inline.
 int end_all(const char* why);
 
 bool armed();
