@@ -837,7 +837,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 origin.Seed = 122;
                 origin.Skills = [(17, 1500), (23, 900), (24, 600), (19, 10)];
                 byte[] bytes = WhsSaveTests.File(origin);
-                string path = Path.Combine(GuestSaves, file + ".whs");
+                string path = Path.Combine(GuestSaves, "playline2", "autosave002.whs");
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 File.WriteAllBytes(path, bytes);
                 var receipt = new LocalStartCheckpointStore.EngineSaveReceipt(reservation!.CreationId, process, profile, build, "fighter", file,
