@@ -128,15 +128,17 @@ uint8_t read_phase(void* actor) {
     if (!rd(exp, kExpMain, &main)) return 255;
     if (!main) return 0;
     if (!is_a(main, g_vftMain)) return 255;
-    void* step = nullptr;
-    if (!rd(main, kMainStep, &step) || !step) return 0;
-    void* vp = nullptr;
-    if (!rd(step, 0, &vp)) return 255;
-    for (const auto& s : g_steps) if (s.vft && vp == static_cast<const void*>(s.vft)) return s.phase;
-    static uint32_t s_unknown = 0;
-    if (vp && s_unknown++ < 5)
-        logf("WO201-RANGED step class not in the bow/crossbow list (vt=%p) -- a bow step this build names differently [n=%u]", vp, s_unknown);
-    return 255; // unknown RTTI is unreadable, never a proved idle/none
+    return read_step_phase(
+        [main](void** step) { return rd(main, kMainStep, step); },
+        [](void* step) -> uint8_t {
+            void* vp = nullptr;
+            if (!rd(step, 0, &vp)) return 255;
+            for (const auto& s : g_steps) if (s.vft && vp == static_cast<const void*>(s.vft)) return s.phase;
+            static uint32_t s_unknown = 0;
+            if (vp && s_unknown++ < 5)
+                logf("WO201-RANGED step class not in the bow/crossbow list (vt=%p) -- a bow step this build names differently [n=%u]", vp, s_unknown);
+            return 255; // unknown RTTI is unreadable, never a proved idle/none
+        });
 }
 
 #endif
