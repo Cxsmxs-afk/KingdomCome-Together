@@ -101,5 +101,41 @@ public sealed class Lane2DeathReleaseTests
         Assert.False(Dead());
     }
 
+    [Fact]
+    public async Task A_rejected_native_release_does_not_leave_the_current_body_marked_dead()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        string pipeName = "lane2-release-nack-" + Guid.NewGuid().ToString("N");
+        using var wire = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        await using var pipe = new CombatPipe(pipeName);
+        Task connected = wire.WaitForConnectionAsync(deadline.Token);
+        Assert.True(await pipe.EnsureConnectedAsync(deadline.Token));
+        await connected;
+
+        var bridge = new GameBridge(new ClientConfig());
+        var lifecycle = new HostAuthorityLifecycle((phase, generation, _) =>
+            Task.FromResult<HostAuthorityLifecycle.Ack?>(new(true, phase, false, false, generation, 0)));
+        Assert.True(await lifecycle.PendingAsync(enabled: false, newLoad: false, ct: deadline.Token));
+        Assert.True(await lifecycle.GameplayAsync(lifecycle.Current.Generation, deadline.Token));
+        Field("_combat").SetValue(bridge, pipe);
+        Field("_p1Lifecycle").SetValue(bridge, lifecycle);
+        Field("_where").SetValue(bridge, Enum.Parse(Field("_where").FieldType, "World"));
+        var entities = (ConcurrentDictionary<string, uint>)Field("_npcEntityIds").GetValue(bridge)!;
+        entities[Npc] = CurrentEid;
+        var souls = (ConcurrentDictionary<string, (uint Eid, Guid Guid)>)Field("_copySoulGuid").GetValue(bridge)!;
+        souls[Npc] = (CurrentEid, Guid.NewGuid());
+
+        Task release = (Task)typeof(GameBridge).GetMethod("Wo195OnCopyDeathAsync", PrivateInstance)!
+            .Invoke(bridge, [Npc, "owner-death"])!;
+        bool Dead() => (bool)typeof(GameBridge).GetMethod("Wo195IsDead", PrivateInstance)!.Invoke(bridge, [Npc])!;
+        byte[] header = new byte[3];
+        await wire.ReadExactlyAsync(header, deadline.Token);
+        await wire.ReadExactlyAsync(new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))], deadline.Token);
+        Assert.True(Dead());
+        await wire.WriteAsync(new byte[] { 0xAC, 7, 0, 0, 40, Protocol.Wo195OpRelease, 1, 0, 0, 0 }, deadline.Token);
+        await release.WaitAsync(deadline.Token);
+        Assert.False(Dead());
+    }
+
     private static FieldInfo Field(string name) => typeof(GameBridge).GetField(name, PrivateInstance)!;
 }
