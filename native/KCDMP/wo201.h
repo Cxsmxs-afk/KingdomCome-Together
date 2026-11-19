@@ -55,11 +55,14 @@ int status_text(char* out, int n);
 void* speak_fn();   // WO-203 I.3c: C_ActorSpeakMan::Speak as the engine runs it (the original past the capture once that is armed)
 } // namespace kcdmp::wo201speech
 
+namespace kcdmp::rangedaim { struct Block; }
+
 namespace kcdmp::wo201ranged {
 void t3_counts(uint64_t out[6]); // O(1) cached diagnostics, no engine reads
 void install();
 void tick();
 void on_pipe_closed();
+rangedaim::Block sampled_aim(const void* actor);  // Main thread, exact current actor only.
 uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen);
 int status_text(char* out, int n);
 } // namespace kcdmp::wo201ranged

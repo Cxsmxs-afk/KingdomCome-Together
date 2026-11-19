@@ -61,7 +61,7 @@ public partial class GameBridge
     // The v8 state-block change gate (sender).
     private BodyState2? _st2LastSent;
     private long _st2LastSentTs;
-    private int _st2OffBeats;
+    private bool _st2SawAim;
 
     // Whether the local DLL captures committed attacks (Wo121Status) -- when it
     // does, the Lua "combat swing" cue (0x2C) is not sent: the v8 Attack event
@@ -77,7 +77,7 @@ public partial class GameBridge
         _wo121Stream = stream;
         _wo121Ct = ct;
         _st2LastSent = null;
-        _st2OffBeats = 0;
+        _st2SawAim = false;
         _combat.OnLocalAction = OnLocalActionAsync;
         _combat.OnPvpHit = OnPvpHitAsync;
         _ = PushWo121ConfigAsync(ct);
@@ -234,33 +234,27 @@ public partial class GameBridge
         due = false;
         if (nat?.State2 is not BodyState2 c) return null;
         c = Wo136WithTorch(c);   // WO-136 Phase 5: the torch in the hand rides the state block
+        const BodyState2Bits ranged = BodyState2Bits.RangedAim | BodyState2Bits.RangedChargeKnown;
         bool changed = _st2LastSent is not BodyState2 l
             || Math.Abs(l.SpeedCm - c.SpeedCm) >= 10 || Math.Abs(l.MoveDir - c.MoveDir) >= 3
-            || l.Bits != c.Bits || l.GuardZone != c.GuardZone || l.GuardStance != c.GuardStance || l.AtkZone != c.AtkZone
-            || l.Charge != c.Charge || l.AimYaw != c.AimYaw || l.AimPitch != c.AimPitch
+            || ((l.Bits ^ c.Bits) & ~ranged) != 0 || l.GuardZone != c.GuardZone || l.GuardStance != c.GuardStance || l.AtkZone != c.AtkZone
             || (c.SpeedCm == 0 && l.SpeedCm != 0);
-        bool nonZero = c.SpeedCm != 0 || c.Bits != BodyState2Bits.None;
+        bool nonZero = c.SpeedCm != 0 || (c.Bits & ~ranged) != BodyState2Bits.None;
         bool elapsed = Stopwatch.GetElapsedTime(_st2LastSentTs, nowTs).TotalMilliseconds >= Protocol.BodyState2HeartbeatMs;
-        bool hb = nonZero && elapsed;
-        // A lost "bow down" packet is repaired by one heartbeat of the confirmed end. An unreadable gap never produces that end:
-        // the native block keeps the last draw, so this stays a held aim.
-        bool endBeat = _st2OffBeats > 0 && Wo201Rules.ConfirmedOff(c) && elapsed;
-        due = changed || hb || endBeat;
-        if (!due) return null;
-        if (consume)
-        {
-            if ((c.Bits & BodyState2Bits.RangedAim) != 0) _st2OffBeats = 0;
-            bool ended = _st2LastSent is BodyState2 prev && !Wo201Rules.ConfirmedOff(prev) && Wo201Rules.ConfirmedOff(c);
-            if (ended) _st2OffBeats = 1;
-            else if (endBeat && _st2OffBeats > 0) _st2OffBeats--;
-            if ((c.Bits & BodyState2Bits.RangedAim) != 0 && (_st2LastSent is not BodyState2 before || Wo201Rules.AimChanged(before, c)))
-                Console.WriteLine(FormattableString.Invariant(
-                    $"MP-BOW aim bit=1 charge={c.Charge} yaw={c.AimYaw} pitch={c.AimPitch} source=state2 angles={(c.AimYaw == 0 && c.AimPitch == 0 ? "unverified" : "state2")}"));
-            if (ended)
-                Console.WriteLine("MP-BOW aim ended bit=0 charge=0 source=state2");
-            _st2LastSent = c;
-            _st2LastSentTs = nowTs;
-        }
+        due = changed || (nonZero && elapsed);
+        // A position the caller was already going to send carries changed aim values and repeats
+        // the last stance. Continued idle heartbeats also repair a lost or superseded confirmed end.
+        if (!consume) return due ? c : null;
+        bool held = (c.Bits & BodyState2Bits.RangedAim) != 0;
+        bool wasHeld = _st2LastSent is BodyState2 last && (last.Bits & BodyState2Bits.RangedAim) != 0;
+        bool aimChanged = _st2LastSent is BodyState2 prior && Wo201Rules.AimChanged(prior, c);
+        if (!due && !aimChanged && !(_st2SawAim && elapsed)) return null;
+        if (held != wasHeld)
+            Console.WriteLine(FormattableString.Invariant(
+                $"MP-BOW send held={(held ? 1 : 0)} charge_known={((c.Bits & BodyState2Bits.RangedChargeKnown) != 0 ? 1 : 0)} charge={c.Charge} angles={(held && c.AimYaw != BodyState2.AimAngleUnavailable && c.AimPitch != BodyState2.AimAngleUnavailable ? "measured" : "unavailable")}"));
+        _st2SawAim |= held;
+        _st2LastSent = c;
+        _st2LastSentTs = nowTs;
         return c;
     }
 

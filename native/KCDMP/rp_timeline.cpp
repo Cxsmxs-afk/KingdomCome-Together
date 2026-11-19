@@ -14,6 +14,7 @@ struct Body {
     Frame display{};
     uint64_t poseCount = 0, late = 0, lastReport = 0;
     uint32_t buffer = 0, extrap = 0;
+    bool rangedHeld = false;
 };
 
 bool g_enabled = true;
@@ -91,6 +92,13 @@ void note_pose(uint32_t eid, uint8_t peer, const Output& sample) {
         ++row.poseCount;
         ++g_total.pose_n;
         row.display.appliedHostMs = sample.appliedHostMs;
+    }
+    if (sample.rangedStateHostMs && row.rangedHeld != sample.ranged_held()) {
+        row.rangedHeld = sample.ranged_held();
+        const auto& state = sample.source.state;
+        logf("MP-BOW timeline peer=%u eid=0x%X held=%d state_ms=%llu charge_known=%d charge=%u",
+             static_cast<unsigned>(peer), eid, row.rangedHeld ? 1 : 0, static_cast<unsigned long long>(sample.rangedStateHostMs),
+             (state[3] & rangedaim::kChargeKnownBit) ? 1 : 0, static_cast<unsigned>(state[7]));
     }
     const uint64_t now = GetTickCount64();
     if (row.lastReport == 0 || now - row.lastReport >= 4000) {

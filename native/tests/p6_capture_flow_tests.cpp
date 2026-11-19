@@ -2,24 +2,28 @@
 #include "wo201.h"
 #include "p6_capture.h"
 #include "p6_rules.h"
+#include "ranged_aim.h"
 #include <array>
 #include <cstdio>
 #include <cstring>
 namespace {
 uint64_t clockMs=1000,gen=1,life=11;
-bool playable=true,hasActor=true,hasSoul=true,changeDuringHand=false;
+bool playable=true,hasActor=true,hasSoul=true,changeDuringHand=false,changedBody=false;
+bool chargeReadable=false;
+float playerCharge=0;
 uint8_t phase=0,known=3,left=0x11,right=0;
-int actorObject=0,soulObject=0,passedCount=0,failedCount=0;
+int actorObject=0,otherActor=0,soulObject=0,passedCount=0,failedCount=0;
 #define C6(c,label) do{if(c)++passedCount;else{++failedCount;std::printf("FAIL P6 capture %d: %s\n",__LINE__,label);}}while(false)
 uint64_t now(){return clockMs;}uint64_t generation(){return gen;}uint64_t epoch(){return life;}bool gameplay(){return playable;}
-void* actor(uint32_t* eid){*eid=hasActor?44:0;return hasActor?&actorObject:nullptr;}
+void* actor(uint32_t* eid){*eid=hasActor?44:0;return hasActor?(changedBody?&otherActor:&actorObject):nullptr;}
 void* soul(){return hasSoul?&soulObject:nullptr;}
 uint8_t readPhase(void*){return phase;}
+bool readCharge(void*,float* charge,float* min,float* max){*charge=playerCharge;*min=0;*max=1;return chargeReadable;}
 uint8_t hands(uint32_t,uint8_t* l,uint8_t* r){std::memset(l,0,16);std::memset(r,0,16);l[0]=left;r[0]=right;if(changeDuringHand)++life;return known;}
 struct Reply {uint8_t code=255;size_t size=0;std::array<uint8_t,512> b{};};
 Reply poll(bool on=true,uint64_t expected=0){uint8_t b[11]={86,2,uint8_t(on?1:0)};kcdmp::p6rules::put64(b+3,expected?expected:gen);Reply r;r.code=kcdmp::wo201ranged::handle(b,sizeof b,r.b.data(),r.b.size(),&r.size);return r;}
 void step(uint8_t p,uint64_t ms=50){phase=p;clockMs+=ms;kcdmp::wo201ranged::tick();}
-void reset(){clockMs=1000;gen=1;life=11;playable=hasActor=hasSoul=true;changeDuringHand=false;phase=0;known=3;left=0x11;right=0;kcdmp::wo201ranged::set_test_backend({now,generation,epoch,gameplay,actor,soul,readPhase,hands});kcdmp::wo201ranged::reset_for_tests();C6(poll().code==0,"current gameplay enables native v2 capture");}
+void reset(){clockMs=1000;gen=1;life=11;playable=hasActor=hasSoul=true;changeDuringHand=changedBody=chargeReadable=false;playerCharge=0;phase=0;known=3;left=0x11;right=0;kcdmp::wo201ranged::set_test_backend({now,generation,epoch,gameplay,actor,soul,readPhase,hands,readCharge});kcdmp::wo201ranged::reset_for_tests();C6(poll().code==0,"current gameplay enables native v2 capture");}
 }
 namespace kcdmp::wo201ranged {void test_trace(const char*,...){} }
 int p6_capture_flow_tests(int* passed){
@@ -51,6 +55,29 @@ int p6_capture_flow_tests(int* passed){
     reset();changeDuringHand=true;step(3);r=poll();C6(r.b[1]==0,"life change during engine hand read cannot publish stale capture");
     reset();step(3);playable=false;r=poll();C6(r.code!=0,"no gameplay proof cannot drain old capture");
     on_pipe_closed();playable=true;tick();r=poll();C6(r.b[1]==0,"pipe close invalidates prior presentation queue");
+    namespace aim = kcdmp::rangedaim;
+    reset();step(aim::Charging);step(aim::Unreadable);
+    C6(sampled_aim(&actorObject).aim,"unreadable step on same body keeps the last draw");
+    changedBody=true;step(aim::Unreadable);
+    C6(!sampled_aim(&otherActor).aim&&poll().b[1]==0,"an unreadable replacement actor cannot publish the retired body's draw or phase rows");
+    reset();for(unsigned i=0;i<33;++i)step(uint8_t(i%2+1));
+    C6(sampled_aim(&actorObject).aim,"event queue overflow is not a confirmed draw end");
+    reset();step(aim::Firing);changedBody=true;step(aim::Firing);r=poll();
+    C6(r.b[1]==0,"a replacement discards queued fire and does not restart its inherited firing phase");
+    step(aim::None);step(aim::Firing);r=poll();
+    C6(r.b[1]==2 && r.b[18]==aim::None && r.b[66]==aim::Firing,"a new shot after replacement and confirmed idle is captured once");
+    reset();chargeReadable=true;playerCharge=0;step(aim::Charging);
+    C6(sampled_aim(&actorObject).charge==0,"zero is exported when actually measured");
+    playerCharge=.75f;step(aim::Charging,25);
+    C6(sampled_aim(&actorObject).charge==0,"measurement cadence remains 50 ms");
+    step(aim::Charging,25);
+    C6(sampled_aim(&actorObject).charge==191&&poll().b[1]==1,"in-phase measured charge updates without queuing a second phase");
+    chargeReadable=false;step(aim::Charging);step(aim::Aiming);
+    C6(sampled_aim(&actorObject).charge==191,"unreadable charge and subsequent aim retain the measured value for this draw");
+    step(aim::Uncharging);
+    r=poll();
+    C6(!sampled_aim(&actorObject).aim&&!sampled_aim(&actorObject).charge&&
+       r.b[1]==2&&r.b[18]==aim::Aiming&&r.b[66]==aim::Uncharging,"abort clears the draw and has no Fire phase");
     if(passed)*passed=passedCount;
     return failedCount;
 }

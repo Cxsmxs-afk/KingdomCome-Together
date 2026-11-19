@@ -7,7 +7,7 @@ add_executable(KCDMP_NativeTests wo129_gait_tests.cpp walk_holder_tests.cpp pose
 target_include_directories(KCDMP_NativeTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../KCDMP)
 target_sources(KCDMP_NativeTests PRIVATE rp_measure_tests.cpp holder_contract_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE edge_lanes_tests.cpp)
-target_sources(KCDMP_NativeTests PRIVATE rp_timeline_tests.cpp rp_timeline_action_tests.cpp)
+target_sources(KCDMP_NativeTests PRIVATE rp_timeline_tests.cpp rp_timeline_action_tests.cpp ranged_aim_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE rp_controller_tests.cpp motion_remote_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE rp_combat_tests.cpp rp_body_action_tests.cpp load_sequence_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE edge_console_tests.cpp visual_damage_tests.cpp)

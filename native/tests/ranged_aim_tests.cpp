@@ -11,19 +11,19 @@ int ranged_aim_tests(int* passed) {
         else { ++failures; std::fprintf(stderr, "ranged aim: %s\n", label); }
     };
     Block held{};
-    check(apply(Unreadable, &held) == Edge::Ignored && !held.aim && held.charge == 0, "an unreadable sample does not invent a zero draw");
-    check(apply(Aiming, &held) == Edge::Held && held.aim && held.charge == 255, "aiming publishes a full phase charge");
-    Block stuck = held;
-    check(apply(Unreadable, &held) == Edge::Ignored && held.aim && held.charge == stuck.charge, "an unreadable gap keeps the held aim");
-    check(apply(Charging, &held) == Edge::Held && held.charge == 128, "charging is a separate half charge");
-    check(apply(Reloading, &held) == Edge::Ended && !held.aim && held.confirmedEnd, "crossbow reload is not a held aim");
-    check(apply(Aiming, &held) == Edge::Held && held.aim, "a new aim after reload is a new hold");
-    check(apply(None, &held) == Edge::Ended && !held.aim && held.charge == 0 && held.yaw == 0, "a readable none is the confirmed end");
-    check(apply(None, &held) == Edge::Same && held.confirmedEnd, "a second none does not count as a new end");
-    check(!restore_after_end(1000, 900), "an older hold packet does not restore the pose");
-    check(restore_after_end(1000, 1001), "a newer sample after the end is eligible");
-    publish(Aiming);
-    check(published() == Aiming, "the published phase is the one the body block reads");
-    publish(None);
+    check(apply({}, held) == Edge::Ignored && !held.aim && !held.charge, "an unreadable sample does not invent a zero draw");
+    check(apply({Aiming, {}}, held) == Edge::Held && held.aim && !held.charge, "unmeasured aim does not invent full charge");
+    check(apply({Charging, 128}, held) == Edge::Held && held.charge == 128, "measured charge is used instead of phase");
+    check(apply({}, held) == Edge::Ignored && held.aim && held.charge == 128, "an unreadable gap keeps the held aim");
+    check(apply({Aiming, {}}, held) == Edge::Same && held.charge == 128, "the last measurement carries into the aim phase");
+    check(apply({Reloading, {}}, held) == Edge::Ended && !held.aim && !held.charge, "crossbow reload is not a held aim");
+    check(apply({Aiming, {}}, held) == Edge::Held && held.aim && !held.charge, "a new aim cannot borrow the last draw's charge");
+    check(apply({None, {}}, held) == Edge::Ended && !held.aim, "a readable none is the confirmed end");
+    check(apply({None, {}}, held) == Edge::Same, "a second none does not count as a new end");
+    check(quantize_charge(0, 0, 1) == 0 && quantize_charge(.5f, .25f, .75f) == 128 && quantize_charge(1, 0, 1) == 255,
+          "bounded real values round to wire charge, including a genuine zero");
+    check(!quantize_charge(-.1f, 0, 1) && !quantize_charge(.5f, .5f, .5f) &&
+          !quantize_charge(std::numeric_limits<float>::quiet_NaN(), 0, 1),
+          "invalid measurement never becomes zero");
     return failures;
 }
