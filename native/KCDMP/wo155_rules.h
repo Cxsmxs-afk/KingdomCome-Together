@@ -2,7 +2,10 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #pragma once
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include "damage_invocation.h"
 // WO-155: the engine-free rule of the friendly-fire knockdown window (hits.cpp). native/tests/wo155_rules_tests.cpp
 // pins it.
@@ -14,6 +17,28 @@
 // second fall).
 
 namespace kcdmp::wo155rules {
+
+// Native local-pipe notice 0x97. Times share the Windows boot clock with the
+// Agent. The native life and measurement identifier bind the observed event.
+struct Observation {
+    uint64_t capturedTick = 0, measuredTick = 0, sourceLifeProof = 0, measurementId = 0;
+};
+
+constexpr size_t kNoticeBytes = 46;
+inline std::array<uint8_t, kNoticeBytes> encode_notice(uint32_t victim, float stamina, float health,
+                                                      uint8_t flags, uint8_t material, const Observation& observation) {
+    std::array<uint8_t, kNoticeBytes> body{};
+    std::memcpy(body.data(), &victim, 4);
+    std::memcpy(body.data() + 4, &stamina, 4);
+    std::memcpy(body.data() + 8, &health, 4);
+    body[12] = flags;
+    body[13] = material;
+    std::memcpy(body.data() + 14, &observation.capturedTick, 8);
+    std::memcpy(body.data() + 22, &observation.measuredTick, 8);
+    std::memcpy(body.data() + 30, &observation.sourceLifeProof, 8);
+    std::memcpy(body.data() + 38, &observation.measurementId, 8);
+    return body;
+}
 
 struct Recipient {
     uint64_t generation;

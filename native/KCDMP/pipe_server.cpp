@@ -340,9 +340,9 @@ void send_local_hit(const unsigned char guid[16], void* soul, float health_delta
 // WO-113: unsolicited respawn frames, written from the game thread under the
 // same write lock as LocalHit. A missing agent is logged by respawn.cpp's own
 // lines; here only a failed write is.
-void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what) {
+void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what, uint64_t expectedConnection = 0) {
     const uint64_t generation = g_connGen.load();
-    if (!g_connected || g_pipe == INVALID_HANDLE_VALUE) return;
+    if (!g_connected || (expectedConnection && generation + 1 != expectedConnection) || g_pipe == INVALID_HANDLE_VALUE) return;
     EnterCriticalSection(&g_write_lock);
     const bool sent = send_frame(g_pipe, type, body, len, generation);
     const DWORD err = sent ? 0 : GetLastError();
@@ -943,13 +943,10 @@ void send_local_action(uint8_t kind, uint8_t phase, int8_t ic, int8_t zone, int8
 }
 
 // WO-121: the local player's hit on a peer's avatar (main thread, hits::tick).
-void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material) {
-    BYTE body[14]{};
-    std::memcpy(body, &victimEid, 4);
-    std::memcpy(body + 4, &st, 4);
-    std::memcpy(body + 8, &hp, 4);
-    body[12] = flags; body[13] = material;
-    send_unsolicited(kPvpHitOut, body, sizeof(body), "PvpHit");
+void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material,
+                  const wo155rules::Observation& observation, uint64_t connection) {
+    const auto body = wo155rules::encode_notice(victimEid, st, hp, flags, material, observation);
+    send_unsolicited(kPvpHitOut, body.data(), static_cast<uint16_t>(body.size()), "PvpHit", connection);
 }
 
 // WO-210 E.2: the local player's blow on a copy, filtered here (main thread, wo210_hit's tick): the LocalHit frame with no numbers and

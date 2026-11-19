@@ -5161,7 +5161,7 @@ public partial class GameBridge(ClientConfig config)
             }
             else if (type == Protocol.PvpPeerDown)
             {
-                OnPvpPeer(payload, frame.PvpContact?.Session);
+                OnPvpPeer(payload, frame.PvpContact);
             }
             else if (type == Protocol.PlayerHitV8Down)
             {
@@ -6094,6 +6094,8 @@ public partial class GameBridge(ClientConfig config)
             {
                 uint? previousEntityId = _ghostEntityIds.TryGetValue(giParts[0], out uint prevId) ? prevId : null;
                 bool incarnationChanged = Wo214NoteFigureBirth(giParts[0], (uint)rawId, birth);
+                if ((previousEntityId != (uint)rawId || incarnationChanged) && byte.TryParse(giParts[0], out byte boundGhost))
+                    _wo121ContactSession?.NoteBodyBinding(boundGhost);
                 _ghostEntityIds[giParts[0]] = (uint)rawId;
                 // WO-100 Phase 4 item 1: a different id is a different body, so
                 // every event still in flight for the old one is now invalid.
@@ -7506,8 +7508,12 @@ public partial class GameBridge(ClientConfig config)
                 if (npc.StartsWith("kcd2mp_", StringComparison.Ordinal) && byte.TryParse(npc.AsSpan(7), out byte bindGhost))
                 {
                     nativeGhost = bindGhost.ToString(CultureInfo.InvariantCulture);
-                    if (_ghostEntityIds.TryAdd(nativeGhost, eid))
-                        Console.WriteLine($"[wo121] ghost {bindGhost} entity id 0x{eid:X} learned from its native bind");
+                    if (!_ghostEntityIds.ContainsKey(nativeGhost))
+                    {
+                        _wo121ContactSession?.NoteBodyBinding(bindGhost);
+                        if (_ghostEntityIds.TryAdd(nativeGhost, eid))
+                            Console.WriteLine($"[wo121] ghost {bindGhost} entity id 0x{eid:X} learned from its native bind");
+                    }
                 }
                 NativeBindInOrder(async () =>
                 {

@@ -75,7 +75,8 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
 bool hit_by_player(void* soul, double withinS);
 
 // A local-player hit on an avatar, for the agent (pipe frame 0x97).
-using PvpFn = void (*)(uint32_t victimEid, float stamina, float health, uint8_t flags, uint8_t material);
+using PvpFn = void (*)(uint32_t victimEid, float stamina, float health, uint8_t flags, uint8_t material,
+                      const wo155rules::Observation& observation, uint64_t connection);
 void set_pvp_callback(PvpFn fn);
 
 // WO-132: an NPC's hit on an avatar, measured over the watch window and put
