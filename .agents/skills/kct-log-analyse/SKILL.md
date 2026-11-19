@@ -54,6 +54,7 @@ Ziel: Jede Aussage über den Spieltest stützt sich auf **Logzeile + Datei:Zeile
 | `MP-T3-STATS origin=agent role=…` | Prozessorwerte ohne `section`, weitere Werte mit `section=load`, `section=events` oder `section=recovery` | `dotnet/KcdMp.Client/GameBridge.T3.cs:280–284`, `dotnet/KcdMp.Client/GameBridge.WorldRecoveryStats.cs:94` |
 | `MP-W207-Q lag_ms= waiting= …` | Rückstand der Verarbeitungs-Queue mit Partner etwa jede Sekunde, `MP-W207-QK` mit Details alle 10 s. | `dotnet/KcdMp.Client/GameBridge.Wo207.cs:27–38` |
 | `FRAME window_s=60 … frame_ms_worst= ours_us_max= ours_us_p95=` | Frame-Kosten der Mod (DLL, immer an) | `native/KCDMP/frame_meter.h:74–81`, `native/KCDMP/main_thread.cpp:75–86` |
+| `MP-H14-DRIVE … state=quarantined … attempts=`, `WO221-DRIVE end … proof=` | Bei derselben EID zählen `stop-accepted`, `new-controller` oder `entity-removed` als bestätigte Freigabe. Beim nächsten gültigen Bewegungsframe den aktiven Owner und die sichtbare Pose prüfen. | `native/KCDMP/body_drive.cpp`, `native/KCDMP/holder_rules.h` |
 | `[version] ghost N is on release …` | Release des Partners | `GameBridge.cs:5241` |
 Such die Zeile mit `rg -n "<fester Textteil>"` im zum Log gehörigen Build. Fehlt ihr Codebeleg, kennzeichne die Zuordnung als unbelegt. Logtext kann aus einem älteren Build stammen.
 

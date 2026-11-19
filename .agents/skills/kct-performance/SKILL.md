@@ -44,6 +44,8 @@ H6 benutzt pro Todesversuch den vorhandenen Main-Pipe-Pfad. Der Tracker prüft e
 | Sim-Bericht `sim.md`, `sim.json` (Ausgabeordner von run-sim) | `tools/sim/run-sim ci /tmp/kct-sim --timeline both` | 2/3/4 Spieler, Profile good/typical/bad/awful. Die `Feel`-Grenzen gelten für die 2-Spieler-Zeilen `typical`, `bad` und `awful`. `typical` prüft u. a. Höhe p95 < 10 cm, < 1 Bruch/min, Treffer-/Dialog-p95 ≤ 150 ms und maximal 1 ms über `before` (`tools/sim/KcdMp.Sim/Feel.cs:43–53`). |
 | Frame-Rate-Soak | Unter Windows mit Spiel und Wegwerfsave gemäß `tools/perf/README.md`. `python tools/perf/soak.py check` prüft den vorhandenen Nachweis beim öffentlichen Release-Build (`tools/Build-Installer.ps1:157–160`). | FPS mit vs. ohne Mod, sofern der Vergleich enthalten ist. |
 
+H14 prüft pro Frame höchstens zwei offene Controller-Freigaben. Je Controller-Anforderung gibt es bis zu zwei Stoppaufrufe mit mindestens 100 ms Abstand. In Quarantäne liegen mindestens 500 ms zwischen Prüfversuchen. Miss die Wiederaufnahme mit dem nächsten gültigen Bewegungsframe sowie `owner_violations`, `FRAME` und bei einem Ausreißer `MAIN-COST`.
+
 Live-Beispiel 18.11.2026, 22:10:29 Europe/Berlin (Freund-PC, native Log): `frame_ms_worst=1017.3 ours_us_max=981641 ours_us_p95=3950`. Im Fenster erreichte die DLL-Hook-Zeit knapp 982 ms, ihr p95 rund 4 ms. Das Maximum des gesamten Frames und das Hook-Maximum können aus unterschiedlichen Frames stammen. Das 2-ms-Pipe-Budget gilt für einen Teil der gemessenen Arbeit. Die Ursache ist **unbelegt**. Ein Kandidat ist der enginegebundene Vollscan vor dem Load (`docs/PAKET-D-FRAME-BUDGET.md`). Mit `mp_main_cost on` belegen, bevor gefixt wird.
 
 ## 5. Pflicht-Check für jeden Diff (Bericht-Feld „Performance“)
