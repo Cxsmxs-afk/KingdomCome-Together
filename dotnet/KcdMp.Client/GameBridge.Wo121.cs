@@ -61,6 +61,7 @@ public partial class GameBridge
     // The v8 state-block change gate (sender).
     private BodyState2? _st2LastSent;
     private long _st2LastSentTs;
+    private int _st2OffBeats;
 
     // Whether the local DLL captures committed attacks (Wo121Status) -- when it
     // does, the Lua "combat swing" cue (0x2C) is not sent: the v8 Attack event
@@ -76,6 +77,7 @@ public partial class GameBridge
         _wo121Stream = stream;
         _wo121Ct = ct;
         _st2LastSent = null;
+        _st2OffBeats = 0;
         _combat.OnLocalAction = OnLocalActionAsync;
         _combat.OnPvpHit = OnPvpHitAsync;
         _ = PushWo121ConfigAsync(ct);
@@ -235,12 +237,30 @@ public partial class GameBridge
         bool changed = _st2LastSent is not BodyState2 l
             || Math.Abs(l.SpeedCm - c.SpeedCm) >= 10 || Math.Abs(l.MoveDir - c.MoveDir) >= 3
             || l.Bits != c.Bits || l.GuardZone != c.GuardZone || l.GuardStance != c.GuardStance || l.AtkZone != c.AtkZone
+            || l.Charge != c.Charge || l.AimYaw != c.AimYaw || l.AimPitch != c.AimPitch
             || (c.SpeedCm == 0 && l.SpeedCm != 0);
         bool nonZero = c.SpeedCm != 0 || c.Bits != BodyState2Bits.None;
-        bool hb = nonZero && Stopwatch.GetElapsedTime(_st2LastSentTs, nowTs).TotalMilliseconds >= Protocol.BodyState2HeartbeatMs;
-        due = changed || hb;
+        bool elapsed = Stopwatch.GetElapsedTime(_st2LastSentTs, nowTs).TotalMilliseconds >= Protocol.BodyState2HeartbeatMs;
+        bool hb = nonZero && elapsed;
+        // A lost "bow down" packet is repaired by one heartbeat of the confirmed end. An unreadable gap never produces that end:
+        // the native block keeps the last draw, so this stays a held aim.
+        bool endBeat = _st2OffBeats > 0 && Wo201Rules.ConfirmedOff(c) && elapsed;
+        due = changed || hb || endBeat;
         if (!due) return null;
-        if (consume) { _st2LastSent = c; _st2LastSentTs = nowTs; }
+        if (consume)
+        {
+            if ((c.Bits & BodyState2Bits.RangedAim) != 0) _st2OffBeats = 0;
+            bool ended = _st2LastSent is BodyState2 prev && !Wo201Rules.ConfirmedOff(prev) && Wo201Rules.ConfirmedOff(c);
+            if (ended) _st2OffBeats = 1;
+            else if (endBeat && _st2OffBeats > 0) _st2OffBeats--;
+            if ((c.Bits & BodyState2Bits.RangedAim) != 0 && (_st2LastSent is not BodyState2 before || Wo201Rules.AimChanged(before, c)))
+                Console.WriteLine(FormattableString.Invariant(
+                    $"MP-BOW aim bit=1 charge={c.Charge} yaw={c.AimYaw} pitch={c.AimPitch} source=state2 angles={(c.AimYaw == 0 && c.AimPitch == 0 ? "unverified" : "state2")}"));
+            if (ended)
+                Console.WriteLine("MP-BOW aim ended bit=0 charge=0 source=state2");
+            _st2LastSent = c;
+            _st2LastSentTs = nowTs;
+        }
         return c;
     }
 
