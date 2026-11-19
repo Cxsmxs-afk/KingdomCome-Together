@@ -36,6 +36,7 @@ size_t console_execute_slot(const char** why);
 
 // IEntity helpers (null / false when unavailable).
 void*       entity_by_id(uint32_t id);
+bool        try_entity_by_id(uint32_t id, void** entity); // a successful lookup may prove absence
 void*       entity_by_guid(uint64_t guid);
 uint32_t    entity_id(void* e);
 uint64_t    entity_guid(void* e);

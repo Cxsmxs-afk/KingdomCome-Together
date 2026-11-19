@@ -2124,6 +2124,7 @@ void tick() {
                 di.figure = figure; di.beast = p.beast; di.parented = parented; di.human = p.human; di.physics = !p.noPhys; di.fight = ri.fight;
                 di.now = now;
                 const bodydrive::Out dv = bodydrive::frame(di);
+                if (dv == bodydrive::Out::Draining) { ++it; continue; }
                 if (dv == bodydrive::Out::Driven) {
                     p.haveLast = false;
                     p.havePrev = false;

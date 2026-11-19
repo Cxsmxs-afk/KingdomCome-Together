@@ -21,6 +21,7 @@
 // logs ten lines a second for it.
 #include "load_sequence.h"
 #include "body_drive.h"
+#include "body_drive_retirement.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -40,6 +41,7 @@
 #include "gait_logic.h"
 #include "holders.h"
 #include "log.h"
+#include "main_thread.h"
 #include "motion.h"
 #include "npc_drive.h"
 #include "respawn_actions.h"
@@ -54,7 +56,7 @@ namespace {
 
 constexpr size_t kActorController = 0x1E8, kActorGetController = 0x228, kActorLodByte = 0xAE2;
 constexpr uint8_t kActorLodBit = 0x40;
-constexpr size_t kCtlActor = 0x08, kCtlState = 0x10;
+constexpr size_t kCtlActor = 0x08;
 constexpr size_t kReqFlags = 0x00, kReqBodyTarget = 0x20, kReqDesiredSpeed = 0x38, kReqTargetSpeed = 0x3C, kReqDistToEnd = 0x44,
                  kReqMoveTarget = 0x58, kReqPseudoSpeed = 0x108, kReqDefaultOne = 0x194, kReqSize = 0x200;
 constexpr uint64_t kHasSpeed = 1ull << 2, kHasMove = 1ull << 4, kHasPseudo = 1ull << 12, kHasBody = 1ull << 15;
@@ -74,6 +76,7 @@ constexpr float kDeadM = 0.03f;
 constexpr double kNoMoveS = 0.6, kNoMoveRestS = 5.0;   // asked to walk and not moving this long: the writer's for the rest time
 constexpr float kNoMoveWantMps = 0.5f, kNoMoveBodyMps = 0.10f;
 constexpr double kWindowS = 10.0, kSnapEveryS = 2.0;
+constexpr unsigned kRetirementChecksPerFrame = 2;
 // score2: a few bodies were driven for minutes 2 to 4 m from their place (the request steers straight at the place: a wall, a table
 // or a door between the body and its NPC's way is not walked round), and fell 8 m behind again and again -- every one a flip. A
 // driven body further than kLoseM from its place for kLoseS is given back to the writer (its blend brings it in) and is taken up
@@ -116,8 +119,7 @@ struct Drv {
     uint32_t eid = 0;
     void* ent = nullptr;
     std::string name;
-    bool active = false;        // a request of ours stands on its controller
-    bool walking = false;       // the last request had a move target
+    ControllerRequest request;
     double lastAt = 0, snapAt = -1e9, logAt = -1e9;
     float prev[3]{};
     bool havePrev = false;
@@ -139,6 +141,8 @@ struct Drv {
 std::unordered_map<uint32_t, Drv> g_drv;
 std::atomic<uint32_t> c_frames{0}, c_snaps{0}, c_arrives{0}, c_ends{0}, c_lodFrames{0}, c_noMove{0}, c_restFrames{0}, c_standFrames{0}, c_famEnds{0}, c_famFrames{0}, c_lost{0}, c_lostFrames{0}, c_snapRests{0};
 std::atomic<uint32_t> g_drivenNow{0};
+uint64_t g_retirementFrame = 0;
+unsigned g_retirementChecks = 0;
 float g_cam[3]{};          // this machine's player, read once a frame (tick)
 bool g_camOk = false;
 double g_lastFrameAt = -1e9;   // when a body was last asked for (frame()): the host never asks
@@ -168,10 +172,12 @@ void* controller_of(void* actor) {
 
 // One request to the body's controller. walking: a move target `to` at `mps` (class `cls`), `endM` to the path's end; standing: no
 // move target, no speed. Returns false when the body has no controller of the checked kind.
-bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float cls, float endM, double now,
+bool send(Drv& d, ControllerBinding binding, bool walking, const float to[3], float mps, float cls, float endM, double now,
           const float* face = nullptr, bool* attempted = nullptr) {
-    void* ctl = controller_of(actor);
-    if (!ctl) return false;
+    const bool taking = walking || face != nullptr;
+    const uint64_t loadStamp = loadsequence::stamp();
+    if (!binding.complete() || (taking && (!d.request.may_drive(binding, loadStamp) ||
+        !loadsequence::allowed(loadStamp, loadStamp, loadsequence::Access::Live)))) return false;
     alignas(16) uint8_t req[kReqSize];
     std::memset(req, 0, sizeof req);
     const float one = 1.0f;
@@ -197,9 +203,6 @@ bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float
     // the outgoing driver's last operation, so it never claims a new owner.
     using holders::Holder;
     const Holder current = holders::of(d.eid);
-    const bool taking = walking || face != nullptr;
-    const uint64_t loadStamp = loadsequence::stamp();
-    if (taking && !loadsequence::allowed(loadStamp, loadStamp, loadsequence::Access::Live)) return false;
     if (taking && (current == Holder::None || current == Holder::Writer || current == Holder::Figure || current == Holder::Driver) &&
         !holders::handover(d.eid, d.name.c_str(), Holder::Driver, now)) return false;
     const auto claim = taking ? holders::Claim::Held : holders::Claim::Release;
@@ -208,18 +211,14 @@ bool send(Drv& d, void* actor, bool walking, const float to[3], float mps, float
     if (!permit || (taking && !loadsequence::allows(loadStamp, loadsequence::Access::Live))) return false;
     bool ok = false;
     if (attempted) *attempted = true;
-    if (taking) d.active = true;   // a fault can follow a partial request merge
-    if (!call_request(g_fnRequest, ctl, req, &ok)) {
-        if (taking) permit.wrote();   // the controller may have merged part of the request before the fault
+    if (taking) { d.request.binding = binding; d.request.loadStamp = loadStamp; }
+    if (!call_request(g_fnRequest, binding.controller, req, &ok)) {
+        permit.wrote();   // a fault can follow a partial request merge
         g_armed = false; g_why = "RequestMovement faulted";
         logf("WO221-DRIVE RequestMovement FAULTED on %s: new requests disabled; an existing request must end before writing", d.name.c_str());
         return false;
     }
     permit.wrote();
-    // Even a declined movement request may have changed controller fields.
-    // Keep its claim until we have sent the matching stop successfully.
-    d.active = taking || !ok;
-    d.walking = walking;
     return ok;
 }
 
@@ -242,16 +241,47 @@ void flush(Drv& d, double now) {
 }
 
 bool end_request(Drv& d, const char* why) {
-    if (!d.active) return true;
-    if (engine::entity_by_id(d.eid) == d.ent) {
-        void* actor = motion::actor_of(d.eid);
-        const float to[3]{};
-        if (!actor || !send(d, actor, false, to, 0.0f, 0.0f, 0.0f, npcdrive::now_s())) return false;
+    auto& request = d.request;
+    if (!request.active()) return true;
+    const double now = npcdrive::now_s();
+    request.draining = true;
+    if (now < request.nextCheck) return false;
+    if (!request.ownerFenced && !(request.ownerFenced = holders::begin_drain(d.eid, holders::Holder::Driver))) {
+        request.defer(now, RetirementCheck::Wait);
+        if (!request.reported) logf("MP-H14-DRIVE eid=0x%X state=quarantined reason=holder-unverified attempts=%u", d.eid, request.stopCalls);
+        request.reported = true;
+        return false;
     }
-    holders::engine_stopped(d.eid, holders::Holder::Driver);
-    d.active = false; d.walking = false; d.havePrev = false; d.wantPrev = 0.0f; d.noMoveSince = 0;
+    const uint64_t frame = main_thread::frame_count();
+    if (frame != g_retirementFrame) { g_retirementFrame = frame; g_retirementChecks = 0; }
+    if (g_retirementChecks >= kRetirementChecksPerFrame) return false;
+    ++g_retirementChecks;
+
+    const auto loadStamp = loadsequence::stamp();
+    void* entity = nullptr;
+    const bool readable = engine::try_entity_by_id(d.eid, &entity);
+    void* actor = entity ? motion::actor_of(d.eid) : nullptr;
+    const ControllerBinding current{entity, actor, controller_of(actor)};
+    const auto check = request.observe(readable, current, loadsequence::allows(loadStamp, loadsequence::Access::Live));
+    bool stopped = check == RetirementCheck::Removed || check == RetirementCheck::Replaced;
+    if (check == RetirementCheck::Stop) {
+        const float to[3]{};
+        bool attempted = false;
+        stopped = send(d, current, false, to, 0.0f, 0.0f, 0.0f, now, nullptr, &attempted);
+        if (attempted) ++request.stopCalls;
+    }
+    request.defer(now, check);
+    if (!request.reported && (check == RetirementCheck::Wait || (!stopped && request.stopCalls == ControllerRequest::kMaxStops))) {
+        logf("MP-H14-DRIVE eid=0x%X state=quarantined reason=%s attempts=%u", d.eid,
+             request.stopCalls == ControllerRequest::kMaxStops ? "stop-unconfirmed" : "controller-unverified", request.stopCalls);
+        request.reported = true;
+    }
+    if (!stopped || !holders::engine_stopped(d.eid, holders::Holder::Driver)) return false;
+    request = {};
+    d.havePrev = false; d.wantPrev = 0.0f; d.noMoveSince = 0;
     const uint32_t k = c_ends.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (k <= 60 || k % 500 == 0) logf("WO221-DRIVE end npc=%s why=%s: its request ends (no move target, no speed) [n=%u]", d.name.c_str(), why, k);
+    if (k <= 60 || k % 500 == 0) logf("WO221-DRIVE end npc=%s why=%s proof=%s [n=%u]", d.name.c_str(), why,
+         check == RetirementCheck::Replaced ? "new-controller" : check == RetirementCheck::Removed ? "entity-removed" : "stop-accepted", k);
     return true;
 }
 
@@ -293,19 +323,22 @@ void install() {
 }
 
 void tick() {
-    if (!g_armed.load(std::memory_order_relaxed)) return;
+    if (!g_armed.load(std::memory_order_relaxed) && g_drv.empty()) return;
     const double now = npcdrive::now_s();
     if (g_drv.empty() && now - g_lastFrameAt > 1.0) { g_camOk = false; g_drivenNow.store(0, std::memory_order_relaxed); return; }   // nothing to drive (the host: always)
-    g_camOk = g_lodKnown && actions::player_position(g_cam);
+    g_camOk = g_armed.load(std::memory_order_relaxed) && g_lodKnown && actions::player_position(g_cam);
     // bodies no frame asked for (unbound, switched off, held): their request ends, their window closes
     uint32_t active = 0;
     for (auto it = g_drv.begin(); it != g_drv.end();) {
         Drv& d = it->second;
-        if (now - d.lastAt > 0.5) {
-            if (!end_request(d, "no frame")) { ++active; ++it; continue; }
+        const bool stale = now - d.lastAt > 0.5;
+        if ((d.request.draining || stale) && !end_request(d, stale ? "no frame" : "handover pending")) {
+            ++active; ++it; continue;
+        }
+        if (stale) {
             flush(d, now);
             it = g_drv.erase(it);
-        } else { if (d.active) ++active; ++it; }
+        } else { if (d.request.active()) ++active; ++it; }
     }
     g_drivenNow.store(active, std::memory_order_relaxed);
 }
@@ -341,13 +374,14 @@ Remote remote_frame(const RemoteIn& in, float observed[3]) {
         d = Drv{};
         d.eid = in.eid; d.ent = in.ent; d.name = in.name; d.remote = true;
     }
+    if (d.request.draining) return writer();
     const double dt = d.lastAt > 0.0 ? in.now - d.lastAt : 0.0;
     const float moved = d.havePrev ? rpctrl::distance(d.prev, observed) : 0.f;
-    if (d.active && d.havePrev && dt >= 0.001 && dt <= 0.250)
+    if (d.request.active() && d.havePrev && dt >= 0.001 && dt <= 0.250)
         rpctrl::observed(in.eid, in.peer, static_cast<uint64_t>(std::round(dt * 1000.0)),
                          rpctrl::pull(moved, d.wantPrev, dt));
     if (in.now < d.restUntil) return writer();
-    if (d.active && d.havePrev && dt >= 0.001 && dt <= 0.250 && d.wantPrev >= 0.5f &&
+    if (d.request.active() && d.havePrev && dt >= 0.001 && dt <= 0.250 && d.wantPrev >= 0.5f &&
         moved / static_cast<float>(dt) < 0.10f) {
         if (!d.noMoveSince) d.noMoveSince = in.now;
         else if (in.now - d.noMoveSince >= 0.65) {
@@ -358,7 +392,7 @@ Remote remote_frame(const RemoteIn& in, float observed[3]) {
     const auto plan = rpctrl::movement(observed, in.pose, in.vx, in.vy,
                                       (std::clamp)(in.pace, 0.f, 6.5f), in.crouch, d.wantPrev, dt);
     bool attempted = false;
-    const bool accepted = send(d, actor, plan.walking, plan.move, plan.speed, plan.gait, plan.endM, in.now,
+    const bool accepted = send(d, {in.ent, actor, controller_of(actor)}, plan.walking, plan.move, plan.speed, plan.gait, plan.endM, in.now,
                                plan.face, &attempted);
     if (attempted) rpctrl::request(in.eid, in.peer, accepted, static_cast<unsigned>(plan.gait));
     if (!accepted) {
@@ -396,7 +430,14 @@ Out frame(const In& in) {
     }
     const float hostMps = in.mps > 0.0f ? in.mps : 0.0f;
     auto found = g_drv.find(in.eid);
-    const bool wasActive = found != g_drv.end() && found->second.active;
+    if (found != g_drv.end() && (found->second.ent != in.ent || found->second.remote)) {
+        if (!end_request(found->second, "NPC controller identity")) return Out::Draining;
+        g_drv.erase(found);
+        found = g_drv.end();
+    }
+    if (found != g_drv.end() && found->second.request.draining)
+        return end_request(found->second, "NPC handover pending") ? Out::Writer : Out::Draining;
+    const bool wasActive = found != g_drv.end() && found->second.request.active();
     // C.1: the host NPC walks or runs by its own animation line, not by its speed alone -- an NPC at work shifts about at a walker's
     // slowest speed (score1: the smithy fell from 86 to 57 % in place with every such body driven); the idle that follows a walk is
     // the arrival's, anything else ends the drive
@@ -408,7 +449,7 @@ Out frame(const In& in) {
         const bool rest = hf == static_cast<uint8_t>(wo208rules::Fam::Idle) || hf == static_cast<uint8_t>(wo208rules::Fam::Empty);
         if (!loco && !(wasActive && rest)) {
             if (wasActive) {
-                if (!end_request(found->second, "its host NPC took up something else")) return Out::Driven;
+                if (!end_request(found->second, "its host NPC took up something else")) return Out::Draining;
                 c_famEnds.fetch_add(1, std::memory_order_relaxed);
                 return Out::Arrive;
             }
@@ -434,7 +475,7 @@ Out frame(const In& in) {
         const bool walkOn = wasActive ? (g_k.arrive ? (err > kArriveM || (!caughtUp && err > 0.15f)) : err > 0.15f) : (err > kRewalkM && err <= kSnapM);
         if (!walkOn) {
             if (wasActive) {
-                if (!end_request(found->second, "arrived")) return Out::Driven;
+                if (!end_request(found->second, "arrived")) return Out::Draining;
                 c_arrives.fetch_add(1, std::memory_order_relaxed);
                 return Out::Arrive;
             }
@@ -449,12 +490,12 @@ Out frame(const In& in) {
         if (err > kRetakeM) { d.lastAt = now; c_lostFrames.fetch_add(1, std::memory_order_relaxed); return Out::Writer; }
         d.lost = false;
     }
-    if (d.active && err > kLoseM && err <= kSnapM) {
+    if (d.request.active() && err > kLoseM && err <= kSnapM) {
         if (d.farSince == 0) { d.farSince = now; d.farErr = err; }
         else if (now - d.farSince >= kLoseS && d.farErr - err >= kCloseInM) { d.farSince = now; d.farErr = err; }   // it is getting there: left to walk in
         else if (now - d.farSince >= kLoseS) {
             d.farSince = 0; d.lost = true;
-            if (!end_request(d, "off its NPC's way")) return Out::Driven;
+            if (!end_request(d, "off its NPC's way")) return Out::Draining;
             const uint32_t k = c_lost.fetch_add(1, std::memory_order_relaxed) + 1;
             if (k <= 100 || k % 100 == 0)
                 logf("WO221-DRIVE npc=%s is %.2f m from its place and came no nearer in %.1f s of walking at it: the writer brings it in, the driver takes it up again on its NPC's way [n=%u]",
@@ -537,7 +578,7 @@ Out frame(const In& in) {
     float cls = (std::max)(1.0f, gait::speed_class(hostMps >= kStandMps ? hostMps : want));
     if (hostMps >= kStandMps && err > kCatchUpM && cls < 3.0f) cls += 1.0f;
     // asked to walk and not moving: something is in the way, or the engine does not run this body after all -- the writer's for a while
-    if (g_k.nomove && d.active && dt > 0.0 && dt < 0.25) {
+    if (g_k.nomove && d.request.active() && dt > 0.0 && dt < 0.25) {
         if (d.wantPrev >= kNoMoveWantMps && d.spd < kNoMoveBodyMps) {
             if (d.noMoveSince == 0) d.noMoveSince = now;
             else if (now - d.noMoveSince >= kNoMoveS) {
@@ -545,7 +586,7 @@ Out frame(const In& in) {
                 d.restUntil = now + d.restS;
                 const double rested = d.restS;
                 d.restS = (std::min)(40.0, d.restS * 2.0);
-                if (!end_request(d, "asked to walk and does not move")) return Out::Driven;
+                if (!end_request(d, "asked to walk and does not move")) return Out::Draining;
                 const uint32_t k = c_noMove.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (k <= 100 || k % 100 == 0)
                     logf("WO221-DRIVE npc=%s was asked to walk for %.1f s and does not move (%.2f m from its place): the writer's for %.0f s [n=%u]",
@@ -555,7 +596,7 @@ Out frame(const In& in) {
         } else { d.noMoveSince = 0; if (d.spd >= 0.5f) d.restS = kNoMoveRestS; }
     }
     d.wantPrev = want;
-    if (!send(d, actor, true, to, want, cls, endM, now)) return Out::Writer;
+    if (!send(d, {in.ent, actor, controller_of(actor)}, true, to, want, cls, endM, now)) return Out::Writer;
     c_frames.fetch_add(1, std::memory_order_relaxed);
     // the window
     ++d.frames;
@@ -582,7 +623,7 @@ bool release(uint32_t eid, const char* why) {
 
 bool driven(uint32_t eid) {
     auto it = g_drv.find(eid);
-    return it != g_drv.end() && it->second.active;
+    return it != g_drv.end() && it->second.request.active();
 }
 
 } // namespace kcdmp::bodydrive

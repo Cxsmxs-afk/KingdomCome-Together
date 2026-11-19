@@ -204,9 +204,17 @@ size_t console_execute_slot(const char** why) {
 }
 
 void* entity_by_id(uint32_t id) {
+    void* e = nullptr;
+    return try_entity_by_id(id, &e) ? e : nullptr;
+}
+
+bool try_entity_by_id(uint32_t id, void** entity) {
+    *entity = nullptr;
     void* es = entity_system(); void* e = nullptr;
-    if (!es || !id || !vcall(KCDMP_SITE_CALL("engine::entity_by_id/GetEntity"), es, kEsGetEntity, &e, id)) return nullptr;
-    return is_a(e, g_vftEntity) ? e : nullptr;
+    if (!es || !id || !vcall(KCDMP_SITE_CALL("engine::entity_by_id/GetEntity"), es, kEsGetEntity, &e, id)) return false;
+    if (e && !is_a(e, g_vftEntity)) return false;
+    *entity = e;
+    return true;
 }
 
 void* entity_by_guid(uint64_t guid) {
