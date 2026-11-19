@@ -167,11 +167,13 @@ public sealed class WorldLoadSequence
         return true;
     }
 
-    public bool TryHoldLink(ulong generation)
+    public bool TryHoldLink(ulong generation, bool allowSettling = false)
     {
         lock (_gate)
         {
-            if (!IsPlaying(generation) || PrivateIntent || _linkHeld) return false;
+            bool mayHold = IsPlaying(generation) ||
+                (allowSettling && generation != 0 && generation == _generation && _phase == WorldLoadPhase.Settle);
+            if (!mayHold || PrivateIntent || _linkHeld) return false;
             _linkHeld = true;
             return true;
         }

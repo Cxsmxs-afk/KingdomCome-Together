@@ -32,13 +32,9 @@ public class ClientHandler
 	// than 256 total connections without ever handing out a live-colliding id.
 	//
 	// WO-110 R4 (docs/WO-109-audit.md R4): LOWEST FREE ID FIRST, not FIFO.
-	// Damage/NPC authority is "the lowest ready id" (DamageAuthority below).
-	// With a FIFO pool a host-agent reconnect got a NEW id from the back of
-	// the queue (0 -> 2), so the joiner (1) became the authority for the rest
-	// of the session: NPC ownership, the pause side, the damage rule and
-	// weather silently inverted. A sorted pool hands a reconnecting client
-	// its old id back (nothing else can have taken it: only a new connection
-	// allocates, and it takes the lowest free), so authority stays put.
+	// Reuse low ids for deterministic initial authority and stable actor
+	// slots. A returning host keeps authority by matching its world and
+	// run, so a different free id doesn't change the owner.
 	private readonly SortedSet<byte> _freeIds = new(Enumerable.Range(0, 256).Select(i => (byte)i));
 	private byte? _lastAuthorityId;   // WO-110 R4: for the MP-AUTHORITY-OWNER change log
 	private ClientSession? _presentationHost;
@@ -209,9 +205,18 @@ public class ClientHandler
 	{
 		lock (_lock)
 		{
+			if (_absentHost is null && _readyClients.Count > 1 && _readyClients.Contains(client)
+				&& ReferenceEquals(PickAuthority(out _), client))
+			{
+				_absentHost = new HostLease(client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
+				_logger.Information("MP-HOST-ABSENT pause epoch={Epoch} run={Run} ready={Ready}",
+					client.AnnouncedWorldEpoch, client.AnnouncedRunId, _readyClients.Count - 1);
+			}
 			_clients.Remove(client);
+			if (ReferenceEquals(_sessionHost, client)) _sessionHost = null;
 			if (_readyClients.Remove(client))
 				_freeIds.Add(client.Id);
+			if (_readyClients.Count == 0) _absentHost = null;
 		}
 	}
 
@@ -268,12 +273,9 @@ public class ClientHandler
 	}
 
 	/// <summary>The host who left this session, or null while they are still here. Tests read it; logs do not print the identity key.</summary>
-	public HostLease? AbsentHost
-	{
-		get { lock (_lock) return _absentHost; }
-	}
-
-	private HostLease? _absentHost;
+	public HostLease? AbsentHost => _absentHost;
+	private volatile HostLease? _absentHost;
+	private ClientSession? _sessionHost;
 
 	internal (ClientSession? Host, ulong Epoch) PresentationAnchor()
 	{
@@ -310,34 +312,21 @@ public class ClientHandler
 	/// loopback (RelayConnection), so a Steam joiner can never take rule 1
 	/// from the host's own agent.
 	/// </summary>
-	public bool HostAbsent
-	{
-		get { lock (_lock) return _absentHost is not null; }
-	}
+	public bool HostAbsent => _absentHost is not null;
 
-	/// <summary>Call before <see cref="RemoveClient"/> so the leaving client is still the authority this method reads.</summary>
-	public void NoteSessionHostLeft(ClientSession client)
+	public bool IsReturningHost(ClientSession client) =>
+		_absentHost is { } left && string.Equals(left.IdentityKey, client.IdentityKey, StringComparison.Ordinal)
+		&& string.Equals(left.Name, client.Name, StringComparison.Ordinal);
+
+	public bool ObserveHostAnnouncement(ClientSession client, uint world, Guid run)
 	{
 		lock (_lock)
 		{
-			int others = 0;
-			foreach (var ready in _readyClients)
-				if (!ReferenceEquals(ready, client)) others++;
-			if (others == 0) { _absentHost = null; return; }
-			if (_absentHost is not null) return;
-			bool host = client.ClaimsHost || ReferenceEquals(PickAuthority(out _), client);
-			if (!host) return;
-			_absentHost = new HostLease(client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
-			_logger.Information("MP-HOST-ABSENT paused name={Name} epoch={Epoch} run={Run} ready={Ready}",
-				client.Name ?? "-", client.AnnouncedWorldEpoch, client.AnnouncedRunId, others);
+			if (!ReferenceEquals(PickAuthority(out _), client)) return false;
+			client.NoteAnnouncement(world, run);
+			if (run != Guid.Empty) _sessionHost = client;
+			return true;
 		}
-	}
-
-	public bool IsReturningHost(ClientSession client)
-	{
-		lock (_lock) return _absentHost is { } left
-			&& string.Equals(left.IdentityKey, client.IdentityKey, StringComparison.Ordinal)
-			&& string.Equals(left.Name, client.Name, StringComparison.Ordinal);
 	}
 
 	/// <summary>Clears the pause only when this connected client is the same player and brings the same world epoch and run.</summary>
@@ -345,7 +334,7 @@ public class ClientHandler
 	{
 		lock (_lock)
 		{
-			if (_absentHost is not { } left || !client.ClaimsHost) return false;
+			if (_absentHost is not { } left || !client.ClaimsHost || !_readyClients.Contains(client)) return false;
 			if (!HostAbsentRules.SameReturn(left, client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId))
 			{
 				if (client.AnnouncedWorldEpoch != 0 || client.AnnouncedRunId != Guid.Empty)
@@ -353,9 +342,10 @@ public class ClientHandler
 						client.Name ?? "-", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
 				return false;
 			}
+			_sessionHost = client;
 			_absentHost = null;
-			_logger.Information("MP-HOST-ABSENT resumed name={Name} epoch={Epoch} run={Run}",
-				client.Name ?? "-", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
+			_logger.Information("MP-HOST-ABSENT resume epoch={Epoch} run={Run}",
+				client.AnnouncedWorldEpoch, client.AnnouncedRunId);
 			return true;
 		}
 	}
@@ -363,6 +353,7 @@ public class ClientHandler
 	private ClientSession? PickAuthority(out string reason)
 	{
 		if (_absentHost is not null) { reason = "host-absent"; return null; }
+		if (_sessionHost is not null) { reason = "session-host"; return _sessionHost; }
 		var claimants = new List<ClientSession>();
 		foreach (var c in _clients)
 			if (c.IsReady && c.ClaimsHost) claimants.Add(c);
@@ -390,7 +381,7 @@ public class ClientHandler
 	public bool HasHostConnected()
 	{
 		lock (_lock)
-			return _clients.Any(c => c.IsReady && (c.ClaimsHost || c.IsLoopback));
+			return _absentHost is null && _clients.Any(c => c.IsReady && (c.ClaimsHost || c.IsLoopback));
 	}
 
 	// WO-127: the last release a joiner was refused for, for the host's launcher

@@ -87,13 +87,20 @@ public sealed partial class JoinCalendarIntegrationTests
     public Task Targeted_join_loads_with_other_real_relay_peers_present(int players) =>
         RunAsync(players == 3 ? "A" : "B", players == 3 ? "B" : "A", dropFirstSnapshot: false, extraPeers: players - 2);
 
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public Task Host_departure_parks_the_loaded_world_and_preserves_the_personal_save(int players) =>
+        RunAsync("A", "B", dropFirstSnapshot: false, extraPeers: players - 2, pauseAfterJoin: true);
+
     private sealed record BoundaryProbe(string Edge, bool HostLoss, bool GuestLoss = false);
 
     private static Task RunBoundaryAsync(string host, string edge, bool hostLoss) =>
         RunAsync(host, host == "A" ? "B" : "A", dropFirstSnapshot: false, boundary: new(edge, hostLoss));
 
     private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None,
-        BoundaryProbe? boundary = null, int extraPeers = 0)
+        BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false)
     {
         using var fixture = new SaveFixture();
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(boundary is null ? 25 : 40));
@@ -254,9 +261,52 @@ public sealed partial class JoinCalendarIntegrationTests
                 var observed = await observer.DrainAsync(ct);
                 Assert.DoesNotContain(observed, packet => packet.Type is Protocol.WorldOfferDown or Protocol.WorldChunkDown or Protocol.JoinerReadyDown);
             }
+            if (pauseAfterJoin)
+            {
+                byte[] ownBefore = File.ReadAllBytes(fixture.GuestOwnSave);
+                // The basic host absence contract must hold without the optional
+                // fast world baseline/recovery path.
+                Get<ConcurrentDictionary<string, bool>>(guest, "_w221On")["world_recovery"] = false;
+                if (extraPeers == 1)
+                {
+                    await WaitAsync(() =>
+                    {
+                        Call(guest, "LoadSequenceTick");
+                        return Get<WorldLoadSequence>(guest, "_worldLoad").Current.Phase == WorldLoadPhase.Play;
+                    }, "the guest's loaded world to settle before the host returns", ct);
+                }
+                hostPeer.FinishSending();
+                await WaitAsync(() => guest.HostAbsentPause && !Get<bool>(guest, "_hostModeKnown"),
+                    "the real relay's host departure and the guest's pause", ct);
+                Assert.True(Property<bool>(guest, "LinkHeld"));
+                await guestPipe.HoldObserved.WaitAsync(ct);
+                Assert.True(Get<bool>(guest, "_joinedWorld"));
+                Assert.False(Get<bool>(guest, "_isDamageAuthority"));
+                Assert.True((bool)Call(guest, "Wo122WantLock")!);
+                Assert.Equal(0, guestGame.OwnLoadsIssued);
+                Assert.Equal(ownBefore, File.ReadAllBytes(fixture.GuestOwnSave));
+                if (extraPeers == 0)
+                {
+                    guestGame.Emit("w211_leave", "fixture");
+                    await WaitAsync(() => guestGame.OwnLoadsIssued == 1 && !guest.HostAbsentPause &&
+                            !Get<bool>(guest, "_joinedWorld") && !Get<bool>(guest, "_leaveInProgress"),
+                        "the explicit leave and the confirmed private game load", ct);
+                    Assert.Equal(1, guestGame.OwnLoadsIssued);
+                    Assert.Equal(ownBefore, File.ReadAllBytes(fixture.GuestOwnSave));
+                }
+                else if (extraPeers == 1)
+                {
+                    await hostRead.WaitAsync(ct);
+                    await CheckReturningHostAsync(relay.Port, hostName, host, guest, guestPeer.Id, guestPipe, ct);
+                    Assert.Equal(1, guestGame.JoinLoadsIssued);
+                    Assert.Equal(0, guestGame.OwnLoadsIssued);
+                    Assert.Equal(ownBefore, File.ReadAllBytes(fixture.GuestOwnSave));
+                }
+            }
         }
         finally
         {
+            if (pauseAfterJoin) Call(guest, "LoadSequenceOnExit");
             stop.Cancel();
             await InvokeAsync(host, "Wo123OnDisconnectAsync");
             await InvokeAsync(guest, "Wo123OnDisconnectAsync");
@@ -267,6 +317,33 @@ public sealed partial class JoinCalendarIntegrationTests
                 Get<FileSystemWatcher?>(guest, "_savesWatcher")?.Dispose();
             }
         }
+    }
+
+    private static async Task CheckReturningHostAsync(int port, string hostName, GameBridge host, GameBridge guest, byte guestId,
+        JoinCalendarTestPipe guestPipe, CancellationToken ct)
+    {
+        Call(host, "WorldReconnectHostLost", ct);
+        await using var returned = await ReplayPeer.ConnectAsync(port, hostName, ct);
+        var link = new JoinWire(returned.Wire, await returned.DrainAsync(ct), dropFirstSnapshot: false);
+        Set(host, "_myGhostId", returned.Id);
+        Set(host, "_wo122Stream", link);
+        Set(host, "_combatRoleApplied", false);
+        Set(host, "_combatRoleApplyComplete", false);
+        Set(host, "_isDamageAuthority", false);
+        var reader = InvokeAsync(host, "ReceiveLoopAsync", link, ct);
+        await WaitAsync(() => Get<bool>(host, "_combatRoleApplyComplete"), "the returning host's provisional relay role", ct);
+        Assert.False(Get<bool>(host, "_isDamageAuthority"));
+        byte[] position = new byte[Protocol.PositionPayloadLen];
+        position[16] = Protocol.PositionFlagHostClaim;
+        await returned.SendAsync(ReplayPeer.Frame(Protocol.Position, position), ct);
+        await InvokeAsync(host, "Wo206AnnounceAsync", "fixture-return", (byte?)guestId);
+        await WaitAsync(() => Get<bool>(host, "_isDamageAuthority") && !guest.HostAbsentPause && !Property<bool>(guest, "LinkHeld"),
+            "the same host's accepted epoch and the guest's release in place", ct);
+        await guestPipe.ReleaseObserved.WaitAsync(ct);
+        Assert.True(Get<bool>(guest, "_joinedWorld"));
+        Assert.False(Get<bool>(guest, "_isDamageAuthority"));
+        returned.FinishSending();
+        await reader.WaitAsync(ct);
     }
 
     private static async Task CheckAbortBoundaryAsync(BoundaryProbe probe, SaveFixture fixture,
@@ -515,7 +592,7 @@ public sealed partial class JoinCalendarIntegrationTests
     private static GameBridge CreateBridge(byte id, bool hosting, Stream relay, CombatPipe pipe,
         LogTailGameTransport game, string saves, CancellationToken ct)
     {
-        var bridge = new GameBridge(new ClientConfig());
+        var bridge = new GameBridge(new ClientConfig { IsHosting = hosting });
         Set(bridge, "_myGhostId", id);
         Set(bridge, "_combat", pipe);
         Set(bridge, "_transport", game);

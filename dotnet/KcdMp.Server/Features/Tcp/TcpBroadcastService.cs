@@ -11,13 +11,14 @@ namespace KcdMp.Server.Features.Tcp;
 /// <summary>
 /// Service class that handles TCP broadcasts.
 ///
-/// No lock of its own: <see cref="ClientHandler.GetClients"/> already returns a
-/// snapshot taken under the handler's lock, which is the only shared state here.
+/// Client snapshots come from <see cref="ClientHandler.GetClients"/>.
+/// Authority announcements are serialized across connection changes.
 /// </summary>
 public class TcpBroadcastService
 {
     private readonly bool _echo;
     private readonly ClientHandler _clientHandler;
+    private readonly object _combatRoleBroadcast = new();
 
     public TcpBroadcastService(IConfiguration configuration, ClientHandler clientHandler)
     {
@@ -319,18 +320,34 @@ public class TcpBroadcastService
         uint senderTicks = 0)
     {
         why = "";
-        bool fromHost = _clientHandler.IsDamageAuthority(source);
-        bool returning = _clientHandler.IsReturningHost(source);
         uint announcedWorld = 0;
-        string? epochText = null;
+        Guid announcedRun = Guid.Empty;
         if (downType == Protocol.W203Down && body.Length > Protocol.JoinHeaderLen && body[Protocol.JoinHeaderLen] == Protocol.W203Epoch)
         {
             if (!LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var epoch) ||
                 !TryWorldEpochDirection(epoch.Text, out from, out announcedWorld))
             { why = "invalid-world-epoch"; return null; }
-            epochText = epoch.Text;
+            if (announcedWorld != 0) HostAbsentRules.TryReadRun(epoch.Text, out announcedRun);
         }
         byte target = body[0];
+        if (_clientHandler.AbsentHost is { } held)
+        {
+            // Only a matching declaration from the returning host can cross
+            // the paused relay. Refused epochs must never update a peer's world.
+            if (announcedWorld == 0 || Find(target) is not { } peer || ReferenceEquals(peer, source))
+            { why = "host-absent"; return null; }
+            if (!HostAbsentRules.SameReturn(held, source.IdentityKey, source.Name ?? "", announcedWorld, announcedRun))
+            {
+                if (_clientHandler.IsReturningHost(source)) source.NoteAnnouncement(0, Guid.Empty);
+                why = "host-absent-wrong-world";
+                return null;
+            }
+            source.NoteAnnouncement(announcedWorld, announcedRun);
+            if (!_clientHandler.TryResumeHost(source))
+            { why = "host-absent-awaiting-claim"; return null; }
+            BroadcastCombatRole();
+        }
+        bool fromHost = _clientHandler.IsDamageAuthority(source);
         ClientSession? dest = null;
         switch (from)
         {
@@ -341,9 +358,7 @@ public class TcpBroadcastService
                 if (target != KcdMp.Wire.Protocol.JoinTargetHost && target != dest.Id) { why = "target-not-host"; return null; }
                 break;
             case KcdMp.Wire.Protocol.JoinFrom.Host:
-                // A returning host may announce the paused world's epoch before the relay hands authority back.
-                // Every other host-only row still waits until that epoch and run match.
-                if (!fromHost && !(returning && announcedWorld != 0)) { why = "not-the-host"; return null; }
+                if (!fromHost) { why = "not-the-host"; return null; }
                 dest = Find(target);
                 break;
             default:
@@ -357,14 +372,10 @@ public class TcpBroadcastService
         }
         if (announcedWorld != 0)
         {
+            if (!_clientHandler.ObserveHostAnnouncement(source, announcedWorld, announcedRun))
+            { why = "not-the-host"; return null; }
             source.ObserveWorldSyncEpoch(source.Id, announcedWorld);
             dest.ObserveWorldSyncEpoch(source.Id, announcedWorld);
-            if (fromHost || returning)
-            {
-                HostAbsentRules.TryReadRun(epochText, out Guid run);
-                source.NoteAnnouncement(announcedWorld, run);
-                if (_clientHandler.TryResumeHost(source)) BroadcastCombatRole();
-            }
         }
         dest.EnqueueSenderFact(downType, source.Id, body, HostStamp(source, senderTicks));
         return dest;
@@ -448,10 +459,13 @@ public class TcpBroadcastService
     /// </summary>
     public void BroadcastCombatRole()
     {
-        _clientHandler.LogAuthorityDecision("combat-role");   // WO-110 R4: MP-AUTHORITY-OWNER on every decision
-        var authority = _clientHandler.DamageAuthority;
-        foreach (var target in _clientHandler.GetClients().Where(c => c.IsReady))
-            target.EnqueueCombatRole(ReferenceEquals(target, authority));
+        lock (_combatRoleBroadcast)
+        {
+            _clientHandler.LogAuthorityDecision("combat-role");
+            var authority = _clientHandler.DamageAuthority;
+            foreach (var target in _clientHandler.GetClients().Where(c => c.IsReady))
+                target.EnqueueCombatRole(ReferenceEquals(target, authority));
+        }
     }
 
     /// <summary>

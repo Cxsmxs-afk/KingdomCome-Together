@@ -9,7 +9,7 @@ namespace KcdMp.Wire;
 /// The host who left, remembered so only that same player and the same world can resume it.
 /// The identity key stays in memory. Logs name the player, the epoch and the run, never the key.
 /// </summary>
-public readonly record struct HostLease(string IdentityKey, string Name, uint WorldEpoch, Guid RunId);
+public sealed record HostLease(string IdentityKey, string Name, uint WorldEpoch, Guid RunId);
 
 /// <summary>
 /// NightCoop keeps the host's world as the only world. KCD2 has no headless simulation, so a departed
@@ -17,16 +17,10 @@ public readonly record struct HostLease(string IdentityKey, string Name, uint Wo
 /// </summary>
 public static class HostAbsentRules
 {
-    public static bool SameReturn(HostLease left, string identity, string name, uint epoch, Guid run)
-    {
-        if (string.IsNullOrEmpty(left.IdentityKey) || !string.Equals(left.IdentityKey, identity, StringComparison.Ordinal)) return false;
-        if (!string.Equals(left.Name, name, StringComparison.Ordinal)) return false;
-        if (left.WorldEpoch != 0 && epoch != left.WorldEpoch) return false;
-        if (left.RunId != Guid.Empty && run != left.RunId) return false;
-        if (left.WorldEpoch != 0 && epoch == 0) return false;
-        if (left.RunId != Guid.Empty && run == Guid.Empty) return false;
-        return true;
-    }
+    public static bool SameReturn(HostLease left, string identity, string name, uint epoch, Guid run) =>
+        !string.IsNullOrEmpty(left.IdentityKey) && string.Equals(left.IdentityKey, identity, StringComparison.Ordinal)
+        && string.Equals(left.Name, name, StringComparison.Ordinal)
+        && epoch != 0 && epoch == left.WorldEpoch && run != Guid.Empty && run == left.RunId;
 
     public static bool MayWritePersonalSave(bool hostAbsent) => !hostAbsent;
 

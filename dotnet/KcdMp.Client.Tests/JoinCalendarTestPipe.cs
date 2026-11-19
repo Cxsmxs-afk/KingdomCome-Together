@@ -192,11 +192,11 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
             _loadPhase = request[1];
             _loadFlags = request[2];
             _loadGeneration = BinaryPrimitives.ReadUInt64LittleEndian(request[5..]);
-            SetHold((_loadFlags & 2) != 0 && !_refuseHold);
+            SetHold((_loadFlags & 3) != 0 && !_refuseHold);
         }
         byte[] body = ReplyBody(seq, request[0], 14);
         body[4] = _loadPhase;
-        body[5] = (byte)(_loadFlags | (((_loadFlags & 2) == 0 || _held) ? 0x80 : 0));
+        body[5] = (byte)(_loadFlags | (((_loadFlags & 3) == 0 || _held) ? 0x80 : 0));
         BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(6), _loadGeneration);
         request[13..17].CopyTo(body.AsSpan(14));
         return body;
