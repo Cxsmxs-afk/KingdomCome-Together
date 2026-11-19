@@ -67,7 +67,13 @@ public partial class GameBridge
             case "w211_leave":       // A.1: the player chose "Leave the host's world" in the co-op menu during a link hold
                 Interlocked.Increment(ref _w211LeaveAsked);
                 Console.WriteLine($"WO211-LINK the player asked to leave{(LinkHeld ? " during the hold" : " (no hold runs: nothing to do)")}");
-                if (LinkHeld) _w211LeaveNow = true;
+                if (LinkHeld || _hostAbsentPause) _w211LeaveNow = true;
+                if (_hostAbsentPause && !LinkHeld)
+                {
+                    _hostAbsentPause = false;
+                    Console.WriteLine("MP-HOST-ABSENT leave epoch=" + _hostAbsentEpoch + " reason=player");
+                    _ = LeaveSharedWorldAsync("player-left", "You left your partner's world.");
+                }
                 return;
             case "w211_fly":         // E: the mod refused the debug flight (or a tester's mp_allow_fly let it)
                 if (arg?.StartsWith("refused", StringComparison.Ordinal) == true) Interlocked.Increment(ref _w211FlyRefused);
@@ -167,6 +173,7 @@ public partial class GameBridge
             int window = recovery is null ? Wo211Rules.HoldWindowS : WorldReconnectAttempt.WindowMs / 1000;
             int left = recovery is null ? window - (int)(DateTime.UtcNow - _w211HoldSinceUtc).TotalSeconds :
                 (int)((recovery.Remaining(now) + 999) / 1000);
+            if (_hostAbsentPause && !_w211LeaveNow) continue;
             if (_w211LeaveNow || left <= 0)
             {
                 if (recovery is not null && !WorldReconnectTimeout(serial, _w211LeaveNow)) continue;

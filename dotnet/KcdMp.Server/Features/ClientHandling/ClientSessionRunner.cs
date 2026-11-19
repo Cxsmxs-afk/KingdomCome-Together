@@ -82,6 +82,7 @@ public sealed class ClientSessionRunner
 					client.Name ?? "(not ready)");
 			}
 
+			_clientHandler.NoteSessionHostLeft(client);
 			_clientHandler.RemoveClient(client);
 
 			// WO-38: a sleeper who disconnects mid-skip must not leave the

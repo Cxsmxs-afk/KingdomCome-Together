@@ -254,13 +254,10 @@ public class ClientHandler
 	/// N peers produce N independent damage streams for one conceptual fight
 	/// and the damage multiplies by N -- see Protocol's 0x21 documentation.
 	///
-	/// Defined as the lowest-id ready client. That is the session host in
-	/// practice (the host's own agent connects to its local relay first), but
-	/// it is deliberately defined on the connection set rather than on who
-	/// started the relay process, because the relay cannot observe the latter
-	/// and because it must keep having an answer after the host leaves.
-	/// Derived on read from state the handler already keeps -- no world state
-	/// is introduced here.
+	/// While the host is connected, one declared claim wins, otherwise the single
+	/// loopback client, otherwise the lowest ready id. When that host leaves and
+	/// other players are still here, nobody replaces them: the world pauses.
+	/// Derived on read from state the handler already keeps.
 	/// </summary>
 	public ClientSession? DamageAuthority
 	{
@@ -269,6 +266,14 @@ public class ClientHandler
 			lock (_lock) return PickAuthority(out _);
 		}
 	}
+
+	/// <summary>The host who left this session, or null while they are still here. Tests read it; logs do not print the identity key.</summary>
+	public HostLease? AbsentHost
+	{
+		get { lock (_lock) return _absentHost; }
+	}
+
+	private HostLease? _absentHost;
 
 	internal (ClientSession? Host, ulong Epoch) PresentationAnchor()
 	{
@@ -305,8 +310,59 @@ public class ClientHandler
 	/// loopback (RelayConnection), so a Steam joiner can never take rule 1
 	/// from the host's own agent.
 	/// </summary>
+	public bool HostAbsent
+	{
+		get { lock (_lock) return _absentHost is not null; }
+	}
+
+	/// <summary>Call before <see cref="RemoveClient"/> so the leaving client is still the authority this method reads.</summary>
+	public void NoteSessionHostLeft(ClientSession client)
+	{
+		lock (_lock)
+		{
+			int others = 0;
+			foreach (var ready in _readyClients)
+				if (!ReferenceEquals(ready, client)) others++;
+			if (others == 0) { _absentHost = null; return; }
+			if (_absentHost is not null) return;
+			bool host = client.ClaimsHost || ReferenceEquals(PickAuthority(out _), client);
+			if (!host) return;
+			_absentHost = new HostLease(client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
+			_logger.Information("MP-HOST-ABSENT paused name={Name} epoch={Epoch} run={Run} ready={Ready}",
+				client.Name ?? "-", client.AnnouncedWorldEpoch, client.AnnouncedRunId, others);
+		}
+	}
+
+	public bool IsReturningHost(ClientSession client)
+	{
+		lock (_lock) return _absentHost is { } left
+			&& string.Equals(left.IdentityKey, client.IdentityKey, StringComparison.Ordinal)
+			&& string.Equals(left.Name, client.Name, StringComparison.Ordinal);
+	}
+
+	/// <summary>Clears the pause only when this connected client is the same player and brings the same world epoch and run.</summary>
+	public bool TryResumeHost(ClientSession client)
+	{
+		lock (_lock)
+		{
+			if (_absentHost is not { } left || !client.ClaimsHost) return false;
+			if (!HostAbsentRules.SameReturn(left, client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId))
+			{
+				if (client.AnnouncedWorldEpoch != 0 || client.AnnouncedRunId != Guid.Empty)
+					_logger.Information("MP-HOST-ABSENT resume=refused name={Name} epoch={Epoch} run={Run}",
+						client.Name ?? "-", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
+				return false;
+			}
+			_absentHost = null;
+			_logger.Information("MP-HOST-ABSENT resumed name={Name} epoch={Epoch} run={Run}",
+				client.Name ?? "-", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
+			return true;
+		}
+	}
+
 	private ClientSession? PickAuthority(out string reason)
 	{
+		if (_absentHost is not null) { reason = "host-absent"; return null; }
 		var claimants = new List<ClientSession>();
 		foreach (var c in _clients)
 			if (c.IsReady && c.ClaimsHost) claimants.Add(c);
