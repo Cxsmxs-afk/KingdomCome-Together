@@ -21,6 +21,7 @@
       3. Every guarded call in the file names a site (KCDMP_FAULT_CALL/READ,
          KCDMP_SITE_CALL/READ or a fault::Site object) -- counted, as a sanity check
          that the scan saw the conversion at all.
+      4. Forgetting our old profile handles returns before any profile manager lookup.
 
     Comments are ignored (a // line may name __try). Run by native\Build-Native.ps1 before
     every build and by tools\Build-Installer.ps1 with the other static checks.
@@ -88,8 +89,20 @@ $rawTry = @()
 $rawBuild = @()
 $sites = 0
 $guards = 0
+$forgetBeforeResolve = $false
 foreach ($f in $files) {
     $code = Get-CodeLines $f.FullName
+    if ($f.Name -eq 'wo189.cpp') {
+        $profile = [regex]::Match(($code.Text -join [Environment]::NewLine),
+            '(?ms)^\s*case\s+kOpProfile\s*:\s*\{(?<block>.*?)^\s*case\s+').Groups['block'].Value
+        $forget = [regex]::Match($profile, '\bif\s*\(\s*sub\s*==\s*5\s*\)\s*\{[^{}]*\}')
+        $resolve = [regex]::Matches($profile, '\bprofile_manager\s*\(')
+        $forgetBeforeResolve = (
+            $forget.Success -and $resolve.Count -eq 1 -and
+            ($resolve[0].Index -ge ($forget.Index + $forget.Length)) -and
+            $forget.Value -match '\breturn\s+wo163::kROk\s*;'
+        )
+    }
     foreach ($l in $code) {
         if ($l.Text -match '\b__try\b' -and $f.Name -ne 'fault_guard.h') { $rawTry += "$($f.Name):$($l.N)  $($l.Text.Trim())" }
         if ($l.Text -match '\bbuild_argument\s*\(') { $rawBuild += "$($f.Name):$($l.N)  $($l.Text.Trim())" }
@@ -105,6 +118,7 @@ Check ($rawBuild.Count -eq 0) "no build_argument( anywhere (a reflection argumen
 foreach ($r in $rawBuild) { Write-Host "        build_argument: $r" -ForegroundColor Red }
 Check ($sites -ge 280) "the guards name their sites ($sites site declarations, $guards guarded calls)"
 Check ($guards -ge 250) "the guarded calls are there ($guards)"
+Check $forgetBeforeResolve 'ProfileForget_skips_engine_profile_resolution'
 
 $h = Join-Path $NativeDir 'fault_guard.h'
 $hc = if (Test-Path $h) { [System.IO.File]::ReadAllText($h) } else { '' }
