@@ -23,7 +23,7 @@ Zahlen am H0-Stand `6c8a63e` geprüft. Am aktuellen Tip erneut prüfen.
 5. **Logs gedrosselt:** pro Grund höchstens einmal pro Fenster, Zähler statt Zeile pro Ereignis. Warum: Logging im Hot Path kostet selbst Frames (der DLL-Log läuft im Spielprozess).
 6. **Gedrosselte Engine-Aufrufe:** pro Frame so wenige Engine-Calls wie möglich, Ergebnisse cachen, wenn die Engine das erlaubt, und nie einen Vollscan pro Frame (Beispiel `UpdateSaveGameDescriptions`, `docs/PAKET-D-FRAME-BUDGET.md`).
 
-H6 benutzt pro Todesversuch den vorhandenen Main-Pipe-Pfad. Der Tracker prüft einen Actor-Bucket. Ausstehende Versuche bleiben am selben Körper und werden mit 40 ms Abstand höchstens eine Sekunde lang beobachtet. Der Release-Hook läuft ohne wartendes Lock oder `Stop`-Aufruf. `FRAME ours_us_p95` bleibt das Live-Gate.
+H6 benutzt pro Todesversuch den vorhandenen Main-Pipe-Pfad. Der Tracker prüft einen Actor-Bucket. Die Nachbeobachtung läuft im Abstand von 40 ms bis zu 2,5 Sekunden. Für den einmaligen Abbruchnachweis folgen höchstens 500 ms. Nach unklarem Apply liest derselbe Versuch nur den Engine-Zustand. Der Release-Hook läuft ohne wartendes Lock oder `Stop`-Aufruf. `FRAME ours_us_p95` bleibt das Live-Gate.
 
 ## 3. Netz: Rate, Bandbreite, Latenz
 - **Zustand = latest wins pro Körper** (`dotnet/KcdMp.Protocol/LinkScheduler.cs`), Ereignisse zuverlässig und geordnet. Zustände nicht in die zuverlässige Queue legen. Warum: Veraltete Positionen nachzuliefern erzeugt Gummiband-Effekte.

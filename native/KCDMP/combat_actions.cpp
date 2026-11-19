@@ -701,6 +701,22 @@ bool release_ready(const BodyProof& body, uint64_t attempt) {
         !has_tracking_gap(bucket, body.actor) && detail::same_body(body, observe_actor(body.actor));
 }
 
+bool abort_release(const BodyProof& body, uint64_t attempt) {
+    if (!attempt || !on_main() || !detail::same_body(body, observe_body(body.eid))) return false;
+    auto& bucket = bucket_for(body.actor);
+    std::unique_lock lock(bucket.gate, std::try_to_lock);
+    if (!lock) return false;
+    auto* life = find_life(bucket, body.actor);
+    if (!life || !detail::same_body(body, observe_actor(body.actor))) return false;
+    if (!body_fenced(*life, body)) return true;
+    if (life->attempt != attempt) return false;
+    life->fenced = {};
+    life->attempt = 0;
+    life->ready = false;
+    life->receipt = ReleaseReceipt::Stale;
+    return true;
+}
+
 int end_for_body(const BodyProof& body, const char* why) {
     if (!wo221::on(wo221::kBitCombatActionEnd)) return 0;
     return retire_for_body(body, why) == ReleaseReceipt::Ready ? 0 : -1;

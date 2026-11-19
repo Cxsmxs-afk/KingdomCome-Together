@@ -20,6 +20,7 @@
 //     0x01 ApplyDamage  [guid:16][stamina:4f][health:4f][flags:1]   (25)
 //     0x02 ApplyDeath   [guid:16][eid:4][native life:8][attempt:8]      (36)
 //          Zero EID resolves the current actor through the Soul WUID. Pending polls retain the same attempt.
+//          Optional byte 37 selects read-only observation (1) or pre-apply abort (2).
 //     0x03 Ping         []                       -> replies 0x83
 //     0x04 SetFactionHostile [guid:16][hostile:1]                   (17)
 //     0x05 ResolveLuaClosure [closureAddr:8]      -> replies 0x84   (8)
