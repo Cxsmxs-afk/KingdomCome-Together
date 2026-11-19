@@ -436,7 +436,7 @@ uint8_t do_real_hit(const uint8_t* body, size_t len, uint8_t* out, size_t cap, s
         if (capSt < st) c_capped.fetch_add(1);
         ar = hits::apply_attributed_ex(ab, alen, true, capSt, true);
         applied = (ar.steps & 1) ? 2 : 0;
-        stApplied = capSt; hpApplied = hp;
+        stApplied = ar.staminaSubmitted; hpApplied = ar.healthSubmitted;
         c_fallback.fetch_add(1);
         c_fb[static_cast<uint8_t>(fb) & 15]++;
         p.capSt = capSt;

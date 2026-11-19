@@ -1070,13 +1070,6 @@ uint64_t lifecycle_observation_stamp() { return g_observationStamp.load(std::mem
 bool decisions_blocked() { return authority_active() && g_decisionGate.load(); }
 uint64_t p5_corpses_visible() { return g_p5World.load() == lifecycle_generation() ? g_p5Visible.load() : 0; }
 uint64_t p5_corpse_hidden_blocked() { return g_p5Blocked.load(); }
-void p5_copy_dead_soul(void* soul) {
-    void* canonicalSoul = soul ? buffs::as_c_soul(soul) : nullptr;
-    const uintptr_t wanted = reinterpret_cast<uintptr_t>(canonicalSoul ? canonicalSoul : soul);
-    if (!wanted) return;
-    // Cached tracked identities only: never enumerate or query every world soul.
-    for (const auto& item : g_bodies) if (item.second.corpse.identity.soul == wanted) { p5_copy_dead(item.first); return; }
-}
 void p5_copy_dead(uint32_t eid) {
     void* e = engine::entity_by_id(eid);
     const char* name = e ? engine::entity_name(e) : nullptr;

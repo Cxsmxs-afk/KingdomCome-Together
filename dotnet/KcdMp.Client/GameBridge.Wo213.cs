@@ -241,7 +241,7 @@ public partial class GameBridge
     private LinkWriter? _w213Writer;
     private Stream? _w213Stream;
     private CancellationTokenSource? _w213WriterCts;
-    private ushort _w213Caps;
+    private volatile ushort _w213Caps;
 
     /// <summary>
     /// After the Ack: B's settings on a Steam link (the send rate, no Nagle, two lanes: events and state), the scheduler (C) as this
@@ -261,7 +261,12 @@ public partial class GameBridge
             catch (Exception ex) { Console.WriteLine($"MP-LINK steam-config not applied: {ex.GetType().Name}: {ex.Message}"); }
         }
         else if (link.Steam is not null) Console.WriteLine("MP-LINK steam-config left at Steam's own (the twin: steam_cfg off)");
-        if (W213Switch.TwinOff("link_sched")) { Console.WriteLine("MP-LINK scheduler OFF (the twin: link_sched) -- every frame written in order as before"); return; }
+        if (W213Switch.TwinOff("link_sched"))
+        {
+            Console.WriteLine("MP-LINK scheduler OFF (the twin: link_sched) -- every frame written in order as before");
+            _ = Wo213AdvertisePvpContactAsync(stream);
+            return;
+        }
         ILinkPath path = link.Steam is { } s2 ? new SteamLinkPath(s2) : new StreamLinkPath(stream);
         if (_sessionRecorder is { } recorder) path = new RecordingRelayPath(path, recorder);
         var sched = new LinkScheduler(new LinkSchedOptions { Budget = !W213Switch.TwinOff("link_budget") });
@@ -277,13 +282,23 @@ public partial class GameBridge
         }
         if (ExecutionContext.IsFlowSuppressed()) _ = Task.Run(RunWriter);
         else { using (ExecutionContext.SuppressFlow()) _ = Task.Run(RunWriter); }
-        ushort caps = (ushort)(Protocol.LinkCapLatestWins | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat
+        ushort caps = (ushort)(Protocol.LinkCapLatestWins | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapPvpContact
                      | (LoadSequenceEnabled && W221On("baseline_events") ? Protocol.LinkCapWorldSync : 0)
                      | (WorldRecoveryEnabled && W221On("baseline_events") ? Protocol.LinkCapWorldRecovery : 0)
                      | (W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
                      | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc));
         w.Enqueue(Protocol.BuildLinkHelloUp(caps));
         Console.WriteLine($"MP-LINK scheduler on (via={path.Transport}, unreliable possible={(path.CanSendUnreliable ? 1 : 0)}); hello sent caps=0x{caps:X4}");
+    }
+
+    private async Task Wo213AdvertisePvpContactAsync(Stream stream)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try { await WritePacketAsync(stream, Protocol.BuildLinkHelloUp(Protocol.LinkCapPvpContact), deadline.Token); }
+        catch (Exception e) when (e is IOException or OperationCanceledException or ObjectDisposedException)
+        {
+            Console.WriteLine($"MP-LINK pvp contact hello failed reason={e.GetType().Name}");
+        }
     }
 
     private void Wo213StopWriter()

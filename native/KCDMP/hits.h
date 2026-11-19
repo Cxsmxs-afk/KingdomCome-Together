@@ -35,6 +35,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "wo155_rules.h"
 
 namespace kcdmp::hits {
 
@@ -47,17 +48,26 @@ uint8_t on_config(const uint8_t* body, size_t len);
 void note_avatar(uint32_t eid, void* soul, bool on);
 bool avatar_known(uint32_t eid); // cached registered avatar identity
 
-struct AttribResult { bool ok = false; uint8_t steps = 0; uint8_t reason = 0; uint64_t attackerWuid = 0, victimWuid = 0; };
+struct AttribResult {
+    bool ok = false;
+    uint8_t steps = 0, reason = 0;
+    uint64_t attackerWuid = 0, victimWuid = 0;
+    float staminaSubmitted = 0, healthSubmitted = 0;
+};
 // 0x19, main thread: [guid:16][st:4f][hp:4f][flags:1][attackerEid:4][nameLen:1][name]
 AttribResult apply_attributed(const uint8_t* body, size_t len);
 // WO-173 (main thread), the same body: rawDamage = the TakeDamage step runs (false: the engine already applied the blow -- only the
 // victim-side history, the skirmish and, with threat, WO-136's avatar-hit threat run; steps bit 0 then means "the engine applied it");
 // stCap >= 0 caps the stamina of the raw step (the capped fallback); threat = WO-136's note_threat (the substitute for a hit the engine
 // cannot perceive).
-AttribResult apply_attributed_ex(const uint8_t* body, size_t len, bool rawDamage, float stCap, bool threat);
+enum class RawDamageAuthority { ReplicatedMelee, OwnerMeasuredMissile };
+AttribResult apply_attributed_ex(const uint8_t* body, size_t len, bool rawDamage, float stCap, bool threat,
+    RawDamageAuthority authority = RawDamageAuthority::ReplicatedMelee);
 
-// 0x1A, main thread: [st:4f][hp:4f][flags:1][attackerGhost:1]
-bool apply_pvp_hit(const uint8_t* body, size_t len);
+// 0x1A, main thread: [st:4f][hp:4f][flags:1][attackerGhost:1], then on an
+// identified contact [sequence:8][sourceIncarnation:8][localRelayReadTick:8].
+wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules::Recipient recipient,
+                                  uint64_t readTick, uint8_t sequence);
 
 // For the pipe's LocalHit (main thread): did the local player hit this soul
 // in the last `withinS` seconds?

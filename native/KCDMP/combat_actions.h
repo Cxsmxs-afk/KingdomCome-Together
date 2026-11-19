@@ -26,6 +26,17 @@ struct BodyProof {
     void* combat = nullptr;
     uint64_t lifecycle = 0;
     uint64_t load = 0;
+    uint64_t combatRevision = 0;
+    uint64_t queueEpoch = 0;
+};
+
+enum class ReleaseReceipt : uint8_t { Ready = 1, Pending = 2, Uncertain = 3, Stale = 4 };
+enum class QueueResult : uint8_t { Refused, Submitted, Uncertain };
+
+struct QueueTicket {
+    BodyProof body;
+    void* action = nullptr;
+    uint64_t serial = 0;
 };
 
 namespace detail {
@@ -37,7 +48,20 @@ inline bool known_body(const BodyProof& body) {
 inline bool same_body(const BodyProof& recorded, const BodyProof& releasing) {
     return known_body(recorded) && known_body(releasing) && recorded.actor == releasing.actor &&
         recorded.entity == releasing.entity && recorded.combat == releasing.combat &&
-        recorded.lifecycle == releasing.lifecycle && recorded.load == releasing.load;
+        recorded.lifecycle == releasing.lifecycle && recorded.load == releasing.load &&
+        recorded.combatRevision == releasing.combatRevision && recorded.queueEpoch == releasing.queueEpoch;
+}
+
+// The engine gets the only queue call after the owned reference is published. The call can synchronously release the body.
+template <class Reserve, class Begin, class Call, class Settle>
+QueueResult submit(Reserve reserve, Begin begin, Call call, Settle settle) {
+    const QueueTicket ticket = reserve();
+    if (!ticket.serial) return QueueResult::Refused;
+    if (!begin(ticket)) {
+        settle(ticket, QueueResult::Refused);
+        return QueueResult::Refused;
+    }
+    return settle(ticket, call() ? QueueResult::Submitted : QueueResult::Uncertain);
 }
 
 enum class Retirement : uint8_t { Active, StopRequested, Finished, Quarantined };
@@ -58,13 +82,18 @@ bool retire(Retirement& state, bool actionKnown, uint32_t status, bool canStop, 
 
 } // namespace detail
 
-// Main thread, right after C_CombatAnimActionManager::QueueAction took the action: one reference of ours is added.
-void track(uint32_t eid, void* actor, void* action, bool movesBody = false);
+// Main only. Publish one owned reference before the engine may call its release hook, then recheck the exact ticket before calling.
+QueueTicket reserve_queue(const BodyProof& body, void* action, bool movesBody);
+bool begin_queue(const QueueTicket& ticket);
+QueueResult settle_queue(const QueueTicket& ticket, QueueResult result);
 // True while a tracked combat one-shot still occupies the engine's pose controller.
 bool body_pose_holds(uint32_t eid);
 
 // Main thread. Resolve both engine indexes, then verify the proof again before a write. A known actor may have no combat part.
 BodyProof observe_body(uint32_t eid);
+// A nonzero attempt fences this physical body against new queues. Pending can only be re-observed with the same body/attempt.
+ReleaseReceipt retire_for_body(const BodyProof& body, const char* why, uint64_t attempt = 0);
+bool release_ready(const BodyProof& body, uint64_t attempt);
 // Exact actions confirmed finished, or -1 for a pending stop, unknown identity or incomplete tracking.
 int end_for_body(const BodyProof& body, const char* why);
 // Legacy ABI. An EID-only request has no body proof and cannot end a tracked action.

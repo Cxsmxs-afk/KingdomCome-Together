@@ -18,7 +18,8 @@
 //
 //   agent -> DLL
 //     0x01 ApplyDamage  [guid:16][stamina:4f][health:4f][flags:1]   (25)
-//     0x02 ApplyDeath   [guid:16]                                   (16)
+//     0x02 ApplyDeath   [guid:16][eid:4][native life:8][attempt:8]      (36)
+//          Zero EID resolves the current actor through the Soul WUID. Pending polls retain the same attempt.
 //     0x03 Ping         []                       -> replies 0x83
 //     0x04 SetFactionHostile [guid:16][hostile:1]                   (17)
 //     0x05 ResolveLuaClosure [closureAddr:8]      -> replies 0x84   (8)
@@ -347,7 +348,7 @@ constexpr uint8_t kPvpHitOut          = 0x97;   // unsolicited: [victimEid:4][st
 
 constexpr int kGuidLen                  = 16;
 constexpr int kApplyDamageLen           = kGuidLen + 4 + 4 + 1;
-constexpr int kApplyDeathLen            = kGuidLen;
+constexpr int kApplyDeathLen            = kGuidLen + 4 + 8 + 8;
 constexpr int kSetFactionHostileLen     = kGuidLen + 1;
 constexpr int kResolveLuaClosureLen     = 8;
 constexpr int kGhostSwingMinLen         = 4 + 1;      // entityId + at least one spec byte

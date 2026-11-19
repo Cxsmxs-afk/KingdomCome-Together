@@ -60,7 +60,7 @@ public static class Wo195Rules
         : via.Contains("FATAL", StringComparison.Ordinal) ? "0x31-fatal"
         : via.Contains("resync", StringComparison.Ordinal) ? "0x27-resync"
         : via.Contains("0x27", StringComparison.Ordinal) ? "0x27-transition"
-        : via == "local-fatal" ? "local-fatal" : "other";
+        : via is "local-fatal" or "guid-fallback" or "bench-kill" or "w217-corpse" ? via : "other";
 
     /// <summary>The WO195-RELEASE answer's held mask (native wo195_rules.h kHeld*) as text.</summary>
     public const byte HeldEngage = 0x01, HeldGuard = 0x02, HeldWish = 0x04, HeldPin = 0x08, HeldCombat = 0x10;

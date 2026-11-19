@@ -54,6 +54,16 @@ public enum PipeReason : byte
     UnknownCommand = 18,
     /// <summary>WO-214 D.2: the copy's animation owner (WO-208) shows its actions -- the row was not played (0.64.0 said EngineRefused).</summary>
     OwnerOwns = 19,
+    /// <summary>The native load fence refused the old request.</summary>
+    LoadRefused = 20,
+    /// <summary>The PvP recipient consumed the contact while protected. The damage call was skipped.</summary>
+    PvpProtectedConsumed = 21,
+    /// <summary>The PvP damage call may have run, but its outcome is unconfirmed.</summary>
+    PvpDispatchUnconfirmed = 22,
+    /// <summary>The PvP request lost the recipient it was read for before the damage call.</summary>
+    PvpRecipientRetired = 23,
+    /// <summary>The PvP damage call acknowledged and the same soul showed a HP or stamina decrease.</summary>
+    PvpEffectObserved = 24,
 
     // ---- agent-side reasons. Deliberately above the native range so the two
     // vocabularies can never collide as either side grows. ----
@@ -101,6 +111,11 @@ public readonly record struct PipeResult(bool Ok, PipeReason Reason)
         PipeReason.CtorFailed          => "ctor-failed",
         PipeReason.EngineRefused       => "engine-refused",
         PipeReason.OwnerOwns           => "owner-owns",
+        PipeReason.LoadRefused         => "load-refused",
+        PipeReason.PvpProtectedConsumed => "pvp-protected-consumed",
+        PipeReason.PvpDispatchUnconfirmed => "pvp-dispatch-unconfirmed",
+        PipeReason.PvpRecipientRetired  => "pvp-recipient-retired",
+        PipeReason.PvpEffectObserved    => "pvp-effect-observed",
         PipeReason.Timeout             => "dll-timeout",
         PipeReason.NotConnected        => "not-connected",
         PipeReason.NoAnswer            => "no-answer",

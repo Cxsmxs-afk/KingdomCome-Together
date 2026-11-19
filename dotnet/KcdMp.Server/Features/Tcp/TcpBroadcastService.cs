@@ -395,9 +395,19 @@ public class TcpBroadcastService
         foreach (var target in _clientHandler.GetClients())
             if (target.IsReady && target.Id == victimId)
             {
-                target.EnqueuePlayerHitV8(source.Id, body);
+                target.EnqueuePlayerHitV8(source, body);
                 return;
             }
+    }
+
+    internal void AnnouncePvpPeers(ClientSession source)
+    {
+        foreach (var peer in Others(source))
+        {
+            if (!peer.LinkPvpContact) continue;
+            source.EnqueuePvpPeer(peer);
+            peer.EnqueuePvpPeer(source);
+        }
     }
 
     /// <summary>

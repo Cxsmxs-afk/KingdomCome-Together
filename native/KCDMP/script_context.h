@@ -81,6 +81,9 @@ void probe_contexts_watch();
 // verified by reading it back.
 bool apply_isolation(const unsigned char guid[16], bool on);
 
+// The existing script-context entity key of a canonical actor soul. Main thread, 0 when unreadable.
+uint64_t soul_wuid(void* soul);
+
 // WO-113: set (`on`) or clear one entity context on a soul, refcount-aware:
 // nothing is written when it already reads in the requested state, so a caller
 // that only clears what it set itself never removes someone else's count.

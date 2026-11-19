@@ -33,11 +33,12 @@
 #include "npc_drive.h"
 #include "respawn.h"
 #include "p4.h"
+#include "pipe_server.h"
 #include "respawn_actions.h"
 #include "rttr_abi.h"
+#include "npc_death_release.h"
 #include "wo136.h"
 #include "wo139.h"
-#include "wo155_rules.h"
 
 namespace kcdmp::hits {
 namespace {
@@ -680,25 +681,34 @@ VisualDamageStats visual_damage_stats() {
 
 AttribResult apply_attributed(const uint8_t* body, size_t len) { return apply_attributed_ex(body, len, true, -1.0f, true); }
 
-AttribResult apply_attributed_ex(const uint8_t* body, size_t len, bool rawDamage, float stCap, bool threat) {
+AttribResult apply_attributed_ex(const uint8_t* body, size_t len, bool rawDamage, float stCap, bool threat,
+                                 RawDamageAuthority authority) {
     AttribResult r{};
     if (len < 16 + 4 + 4 + 1 + 4 + 1 || len != static_cast<size_t>(30 + body[29])) { r.reason = 8; return r; }
     float st = 0, hp = 0; uint32_t avatarEid = 0;
     std::memcpy(&st, body + 16, 4); std::memcpy(&hp, body + 20, 4); std::memcpy(&avatarEid, body + 25, 4);
     std::string name(reinterpret_cast<const char*>(body + 30), body[29]);
-    if (!std::isfinite(st) || !std::isfinite(hp)) { r.reason = 8; return r; }
+    if (!std::isfinite(st) || !std::isfinite(hp) || st < 0.0f || hp < 0.0f) { r.reason = 8; return r; }
     if (stCap >= 0.0f && st > stCap) st = stCap;   // WO-173: the capped fallback
     // WO-176 (A1): a quest's arranged fight (by its context; WO-174's name list is the second net) never takes a figure's blow -- nothing of
     // it is routed into that fight (no damage, no history, no skirmish, no threat); reason 9 tells the agent, which tells the joiner once
-    {
-        const uint32_t keid = name.empty() ? 0 : eid_by_name(name);
-        if (keid && scene_owned_eid(keid, "wo121-attributed")) { r.reason = 9; c_attribKept.fetch_add(1); return r; }
-    }
+    const uint32_t veid = name.empty() ? 0 : eid_by_name(name);
+    if (veid && scene_owned_eid(veid, "wo121-attributed")) { r.reason = 9; c_attribKept.fetch_add(1); return r; }
     void* victimSoulR = rttr::find_soul_by_guid(body);   // the RTTR Soul (TakeDamage)
     void* avatarActor = actor_by_eid(avatarEid);
     void* avatarSoul = soul_of_actor(avatarActor);
     if (!victimSoulR) { r.reason = 3; return r; }
     if (!avatarSoul) { r.reason = 4; return r; }
+    if (rawDamage && authority == RawDamageAuthority::ReplicatedMelee) {
+        void* named = buffs::as_c_soul(soul_of_actor(veid ? actor_by_eid(veid) : nullptr));
+        void* victim = buffs::as_c_soul(victimSoulR);
+        float before = -1.0f;
+        if (!named || named != victim || !rttr::soul_state(victim, "health", &before) ||
+            !npcdeath::nonlethal_health(hp, before, hp)) {
+            r.reason = 3;
+            return r;
+        }
+    }
     void* avatarEnt = engine::entity_by_id(avatarEid);
     r.attackerWuid = avatarEnt ? actions::entity_wuid(avatarEnt) : 0;
     // 1. damage with the avatar as the attacker (WO-173: skipped when the engine's hit processor already applied this blow)
@@ -707,7 +717,9 @@ AttribResult apply_attributed_ex(const uint8_t* body, size_t len, bool rawDamage
         rttr::note_remote_damage(body, hp);   // the LocalHit observer must not report the engine's drop as ours either
     } else if (rttr::apply_damage_soul(victimSoulR, st, hp, buffs::as_c_soul(avatarSoul) ? buffs::as_c_soul(avatarSoul) : avatarSoul)) {
         r.steps |= 1;
-        if (!name.empty()) note_applied_damage(eid_by_name(name), st, hp);   // WO-170: never put back with a dropped figure blow
+        r.staminaSubmitted = st;
+        r.healthSubmitted = hp;
+        if (veid) note_applied_damage(veid, st, hp);   // WO-170: never put back with a dropped figure blow
         // The plain path's echo guard: without it the LocalHit observer
         // reported this remote hit as ours and sent it back out (session 7).
         rttr::note_remote_damage(body, hp);
@@ -716,7 +728,6 @@ AttribResult apply_attributed_ex(const uint8_t* body, size_t len, bool rawDamage
     if (!g_attribArmed) { r.ok = (r.steps & 1) != 0; r.reason = 5; return r; }
     // The victim's own actor/soul (the path the probe proved for the history
     // writer and the skirmish), by name -- one walk per NPC, cached.
-    const uint32_t veid = name.empty() ? 0 : eid_by_name(name);
     void* victimEnt = veid ? engine::entity_by_id(veid) : nullptr;
     void* victimActor = veid ? actor_by_eid(veid) : nullptr;
     void* victimSoulA = soul_of_actor(victimActor);
@@ -768,40 +779,119 @@ AttribResult apply_attributed_ex(const uint8_t* body, size_t len, bool rawDamage
     return r;
 }
 
-bool apply_pvp_hit(const uint8_t* body, size_t len) {
-    if (len != 10) return false;
+wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules::Recipient recipient,
+                                  uint64_t readTick, uint8_t sequence) {
+    using wo155rules::HitResult;
+    if (len != 10 && len != 34) return HitResult::Refused;
+    uint64_t contactSequence = 0, incarnation = 0;
+    uint64_t ingressTick = readTick;
+    if (len == 34) {
+        std::memcpy(&contactSequence, body + 10, 8);
+        std::memcpy(&incarnation, body + 18, 8);
+        std::memcpy(&ingressTick, body + 26, 8);
+        // Environment.TickCount64 and GetTickCount64 share the Windows boot clock.
+        if (!contactSequence || !incarnation || !ingressTick || ingressTick > readTick)
+            return HitResult::Refused;
+    }
     float st = 0, hp = 0;
     std::memcpy(&st, body, 4); std::memcpy(&hp, body + 4, 4);
     const uint8_t flags = body[8], attacker = body[9];
     constexpr uint8_t kPvpNoKnockdown = 0x80;   // WO-155: the agent's mp_ff_knockdown off (a pipe bit, not a wire flag)
-    if (!std::isfinite(st) || !std::isfinite(hp) || st < 0 || hp < 0) return false;
+    if (!std::isfinite(st) || !std::isfinite(hp) || st < 0 || hp < 0) return HitResult::Refused;
+    const auto recipientCurrent = [&] {
+        return recipient.matches({p4::generation(), p4::life_edge_tick(),
+                                  pipe::observation_connection(), p4::gameplay()}, ingressTick);
+    };
+    if (!recipientCurrent()) return HitResult::RecipientRetired;
     void* player = rttr::read_player_soul();
-    if (!player) return false;
-    if (p4::protected_player(player)) {
+    if (!player) return HitResult::Refused;
+    const auto identify = [] { return engine::entity_by_id(0x7777); };
+    void* entity = identify();
+    const uint64_t wuid = entity ? actions::entity_wuid(entity) : 0;
+    const uint32_t eid = entity ? engine::entity_id(entity) : 0;
+    float hpBefore = 0, stBefore = 0, hpAfter = 0, stAfter = 0;
+    const auto readVitals = [player](float& health, float& stamina) {
+        return rttr::soul_state(player, "health", &health) && rttr::soul_state(player, "stamina", &stamina);
+    };
+    const bool beforeKnown = wuid && readVitals(hpBefore, stBefore);
+    // A stale recipient cannot consume protection or reach either of the damage overloads.
+    if (!recipientCurrent()) return HitResult::RecipientRetired;
+    const bool protectedPlayer = p4::protected_player(player);
+    if (protectedPlayer) {
         logf("T3-RECOVERY hit=Pvp decision=protected_consumed applied_hp=0 applied_st=0 peer=%u", attacker);
-        return true;
     }
-    // The unarmed hint goes in FIRST: the damage below may be the one that
-    // floors Henry, and the classifier runs off the next sample.
-    respawn::note_pvp_hit((flags & 0x01) != 0, attacker);
     // WO-155: friendly fire keeps knocking the victim down (the game's scripted hit), but never twice in a row:
     // while he is on the ground, and for 5 s after the hit that knocked him down, the damage goes in through the
     // four-argument call with SuppressHitReaction (health and stamina exact, no second fall). The agent's
     // kPvpNoKnockdown (mp_ff_knockdown off) suppresses every one.
     static kcdmp::wo155rules::FfWindow s_ffWin;
+    static uint64_t s_ffWorld = 0, s_ffVictim = 0;
+    if (s_ffWorld != recipient.generation || s_ffVictim != wuid) {
+        s_ffWin = {};
+        s_ffWorld = recipient.generation;
+        s_ffVictim = wuid;
+    }
     const bool noKnock = (flags & kPvpNoKnockdown) != 0;
     const bool downNow = kcdmp::motion::local_down_now();
-    const bool suppress = noKnock || s_ffWin.suppress(npcdrive::now_s(), downNow, kcdmp::motion::local_last_down_edge_s());
-    bool ok = suppress && rttr::apply_damage_soul_ex(player, st, hp, nullptr, 1);
+    auto window = s_ffWin;
+    const bool suppress = !protectedPlayer &&
+        (noKnock || window.suppress(npcdrive::now_s(), downNow, kcdmp::motion::local_last_down_edge_s()));
+    bool recipientRetired = false;
     bool viaOld = false;
-    if (!ok) { ok = rttr::apply_damage_soul(player, st, hp, nullptr); viaOld = suppress; }   // no attacker: naming one starts fights
-    c_pvpIn.fetch_add(1);
-    if (ok) { note_applied_damage(g_playerEid.load(std::memory_order_relaxed), st, hp); p4::note_damage(player, hp, "Pvp", attacker); }   // WO-170: never put back with a dropped figure blow
-    logf("WO121-HITS friendly-fire hit on the player: hp -%.2f st -%.2f unarmed=%d from ghost %u -> %s",
-         hp, st, (flags & 1) ? 1 : 0, attacker, ok ? "applied" : "FAILED");
-    logf("WO155-FF knockdown=%s%s", noKnock ? "off(mp_ff_knockdown)" : downNow ? "no(he is down)" : suppress ? "no(inside the 5 s window)" : "allowed",
-         viaOld ? " -- the four-argument call is not available: the old call ran" : "");
-    return ok;
+    bool hintSent = false;
+    auto outcome = wo155rules::dispatch(protectedPlayer, suppress, [&](bool suppressReaction) {
+        if (recipientRetired || !recipientCurrent() || rttr::read_player_soul() != player) {
+            recipientRetired = true;
+            return rttr::DamageInvocation::NotInvoked;
+        }
+        // The hint precedes damage because the engine may floor Henry within this call.
+        if (!hintSent) {
+            respawn::note_pvp_hit((flags & 0x01) != 0, attacker);
+            hintSent = true;
+        }
+        viaOld = suppress && !suppressReaction;
+        return rttr::invoke_damage_soul(player, st, hp, nullptr, suppressReaction ? 1 : -1);
+    });
+    if (recipientRetired) return HitResult::RecipientRetired;
+    if (outcome != HitResult::ProtectedConsumed) {
+        c_pvpIn.fetch_add(1);
+        if (outcome != HitResult::Refused) s_ffWin = window;
+    }
+    void* afterEntity = beforeKnown ? identify() : nullptr;
+    // Match the recipient identity even if this hit itself changed its life state.
+    const bool measured = afterEntity && afterEntity == entity && actions::entity_wuid(afterEntity) == wuid &&
+        p4::generation() == recipient.generation && rttr::read_player_soul() == player &&
+        readVitals(hpAfter, stAfter);
+    const bool acknowledged = outcome == HitResult::Acknowledged;
+    if (acknowledged) {
+        // Preserve the existing figure-watch correction until the engine confirms
+        // whether TakeDamage can complete its numeric effect on a later frame.
+        note_applied_damage(eid, st, hp);
+        p4::note_damage(player, hp, "Pvp", attacker);
+        if (measured && (hpAfter < hpBefore || stAfter < stBefore)) outcome = HitResult::EffectObserved;
+    }
+    const char* status = outcome == HitResult::EffectObserved ? "observed" :
+        outcome == HitResult::ProtectedConsumed ? "protected_consumed" :
+        outcome == HitResult::DispatchUnconfirmed ? "dispatch_unconfirmed" :
+        acknowledged ? "acknowledged" : "refused";
+    if (measured) {
+        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X hp_before=%.4f hp_after=%.4f st_before=%.4f st_after=%.4f contact=%llu/%llu",
+             status, attacker, sequence, static_cast<unsigned long long>(recipient.generation),
+             static_cast<unsigned long long>(recipient.life), eid, hpBefore, hpAfter, stBefore, stAfter,
+             static_cast<unsigned long long>(incarnation), static_cast<unsigned long long>(contactSequence));
+    } else {
+        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X vitals=unavailable contact=%llu/%llu",
+             status, attacker, sequence, static_cast<unsigned long long>(recipient.generation),
+             static_cast<unsigned long long>(recipient.life), eid,
+             static_cast<unsigned long long>(incarnation), static_cast<unsigned long long>(contactSequence));
+    }
+    if (!protectedPlayer) {
+        logf("WO121-HITS friendly-fire hit on the player: hp -%.2f st -%.2f unarmed=%d from ghost %u -> %s",
+             hp, st, (flags & 1) ? 1 : 0, attacker, acknowledged ? "acknowledged" : status);
+        logf("WO155-FF knockdown=%s%s", noKnock ? "off(mp_ff_knockdown)" : downNow ? "no(he is down)" : suppress ? "no(inside the 5 s window)" : "allowed",
+             viaOld ? " -- fallback selected after a verified pre-invoke refusal" : "");
+    }
+    return outcome;
 }
 
 bool hit_by_player(void* soul, double withinS) {

@@ -5,10 +5,13 @@
 
 int h6_combat_action_tests(int* passed) {
     using kcdmp::combatactions::BodyProof;
+    using kcdmp::combatactions::QueueResult;
+    using kcdmp::combatactions::QueueTicket;
     using kcdmp::combatactions::detail::Retirement;
     using kcdmp::combatactions::detail::observe_finished;
     using kcdmp::combatactions::detail::retire;
     using kcdmp::combatactions::detail::same_body;
+    using kcdmp::combatactions::detail::submit;
     using namespace kcdmp::wo167rules;
     int failed = 0;
     const auto check = [&](bool result, const char* name) {
@@ -31,6 +34,12 @@ int h6_combat_action_tests(int* passed) {
     auto samePointersDifferentEid = body;
     samePointersDifferentEid.eid = 18;
     check(same_body(body, samePointersDifferentEid), "the EID is not the identity of the proved actor and combat component");
+    auto released = body;
+    ++released.combatRevision;
+    check(!same_body(body, released), "an LOD release fences the same addresses in the same world");
+    auto disconnected = body;
+    ++disconnected.queueEpoch;
+    check(!same_body(body, disconnected), "disconnect fences the same addresses and lifecycle");
 
     Retirement pending = Retirement::Active;
     int quieted = 0, stopped = 0;
@@ -62,5 +71,29 @@ int h6_combat_action_tests(int* passed) {
     check(!retire(stopFailed, true, kStatusPending, true, quiet, [&] { ++stopped; return false; }) &&
           stopFailed == Retirement::Quarantined && quieted == 3 && stopped == 2,
           "even successfully silenced callbacks do not prove a failed Stop");
+
+    int action = 0;
+    const QueueTicket ticket{body, &action, 1};
+    unsigned phase = 0, calls = 0;
+    const auto invoke = [&] { ++calls; return true; };
+    const auto identity = [](const QueueTicket&, QueueResult value) { return value; };
+    check(submit([] { return QueueTicket{}; }, [](const QueueTicket&) { return true; }, invoke, identity) == QueueResult::Refused && !calls,
+          "failure to publish an owned reference prevents the engine call");
+    check(submit([&] { return ticket; }, [](const QueueTicket&) { return false; }, invoke,
+          [&](const QueueTicket&, QueueResult value) { ++phase; return value; }) == QueueResult::Refused && !calls && phase == 1,
+          "failed pre-dispatch proof settles the unsubmitted reservation without issuing QueueAction");
+
+    bool releaseSawReservation = false;
+    const auto result = submit([&] { phase = 2; return ticket; },
+        [&](const QueueTicket& queued) { return phase == 2 && queued.serial == ticket.serial; },
+        [&] { releaseSawReservation = phase == 2; ++calls; phase = 3; return true; },
+        [&](const QueueTicket&, QueueResult attempted) {
+            return attempted == QueueResult::Submitted && phase == 3 ? QueueResult::Uncertain : attempted;
+        });
+    check(result == QueueResult::Uncertain && releaseSawReservation && calls == 1,
+          "a synchronous release sees the published action and cannot synthesize an acknowledgement or repeat the call");
+    check(submit([&] { return ticket; }, [](const QueueTicket&) { return true; },
+          [&] { ++calls; return false; }, identity) == QueueResult::Uncertain && calls == 2,
+          "an engine fault retains uncertain ownership and never retries");
     return failed;
 }

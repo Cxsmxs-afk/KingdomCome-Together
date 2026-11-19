@@ -544,9 +544,8 @@ namespace KcdMp.Wire;
 ///                      flags bit 0: suppressHitReaction (as 0x12)
 ///                      flags bit 1: FATAL (WO-86) -- the sender's copy of this
 ///                                   NPC is dead. The receiver applies the
-///                                   carried damage as usual and then kills
-///                                   its own copy (the idempotent ApplyDeath
-///                                   pipe command 0x14/0x15 were built for).
+///                                   fatal damage is applied once through
+///                                   its body-scoped ApplyDeath request.
 ///
 /// WO-86: death was never on the wire for NPCs. 0x14/0x15 (WO-4) exist with
 /// a relay route and a receiver, but no client ever sent one -- the DLL's
@@ -1475,10 +1474,8 @@ public static partial class Protocol
 
     /// <summary>
     /// NpcDamage flag (WO-86): the sender's copy of the named NPC is DEAD.
-    /// The receiver applies the carried damage, then ApplyDeath on its own
-    /// copy (idempotent -- an already-dead copy is left alone). See the 0x30
-    /// block in the file header for why this is a flag on 0x30 and not the
-    /// guid-addressed 0x14.
+    /// The carried delta is diagnostic on a fatal report. The receiver uses
+    /// one body-scoped ApplyDeath request after confirmed action retirement.
     /// </summary>
     public const byte NpcDamageFlagFatal = 0x02;
 
