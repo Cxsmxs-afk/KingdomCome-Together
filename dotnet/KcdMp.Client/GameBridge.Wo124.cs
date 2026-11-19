@@ -45,6 +45,11 @@ public partial class GameBridge
     private volatile bool _hostSharedWorld;
     private volatile bool _hostModeKnown;
     private volatile byte _hostModeFrom = 0xFF;
+    private bool _hostAbsentPause;
+    private uint _hostAbsentEpoch;
+    private Guid _hostAbsentRun;
+    private Guid _hostAbsentLastRun;
+    internal bool HostAbsentPause => _hostAbsentPause;
     private readonly ConcurrentDictionary<byte, bool> _modeTold = new();
     private DateTime _modeBroadcastUtc = DateTime.MinValue;
     private bool _modeEverShared;
@@ -1342,11 +1347,59 @@ public partial class GameBridge
         {
             bool parked = WorldRecoveryEnabled && (LinkHeld || await Wo211TryHoldAsync("host-link-lost", sameRelay: true));
             _hostModeKnown = false;
+            switch (HostAbsentRules.OnHostGone(_joinedWorld, _jj is { Phase: "preparing" }, _jj?.Phase is "loading" or "post-load"))
+            {
+                case HostAbsentRules.GoneAction.AbortJoin when _jj is { Phase: "preparing" } j:
+                    await AbortJoinerJoinAsync(j, 0, "host-left", "Your host left the game.", sendAbort: false);
+                    break;
+                case HostAbsentRules.GoneAction.AbortJoin when _jj is { } join:
+                    StartOrphanedJoinCleanup(join, "host-left", "Your host left the game.");
+                    break;
+                case HostAbsentRules.GoneAction.Pause:
+                    EnterHostAbsentPause("host-left");
+                    break;
+            }
             if (parked) return;
-            if (_jj is { Phase: "preparing" } j) await AbortJoinerJoinAsync(j, 0, "host-left", "Your host left the game.", sendAbort: false);
-            else if (_jj is { } join) StartOrphanedJoinCleanup(join, "host-left", "Your host left the game.");
-            else if (_joinedWorld) await LeaveSharedWorldAsync("host-left", "Your host left the game.");
         }
+    }
+
+    /// <summary>
+    /// The host's client is gone and this game is already in that world. Stay there. Do not load or rewrite the personal save.
+    /// The same world epoch and run resume it; an explicit leave is the only way out.
+    /// </summary>
+    internal void EnterHostAbsentPause(string why)
+    {
+        if (_hostAbsentPause) return;
+        _hostAbsentPause = true;
+        _hostAbsentEpoch = _w206.World;
+        _hostAbsentRun = _hostAbsentLastRun;
+        const string message = "Your host left. This world is paused until they return to the same world, or you leave.";
+        SetJoinUi("host-absent", message, "host-left");
+        Console.WriteLine($"MP-HOST-ABSENT paused why={why} epoch={_hostAbsentEpoch} run={_hostAbsentRun:N} save=locked");
+        if (_transport is null) return;
+        _ = Wo122SetLockAsync(true, "host-absent");
+        try { _ = ExecLuaAsync($"if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"{EscapeLua(message)}\") end"); }
+        catch (Exception ex) { Console.WriteLine($"MP-HOST-ABSENT notice failed: {ex.GetType().Name}"); }
+    }
+
+    internal void HostAbsentOnEpoch(uint world, Guid run)
+    {
+        if (run != Guid.Empty) _hostAbsentLastRun = run;
+        if (!_hostAbsentPause) return;
+        uint pausedEpoch = _hostAbsentEpoch;
+        Guid pausedRun = _hostAbsentRun;
+        bool same = pausedEpoch != 0 && world == pausedEpoch && (pausedRun == Guid.Empty || run == pausedRun);
+        if (!same || world == 0)
+        {
+            Console.WriteLine($"MP-HOST-ABSENT resume=refused epoch={pausedEpoch}->{world} run={pausedRun:N}->{run:N}");
+            return;
+        }
+        _hostAbsentPause = false;
+        SetJoinUi("playing", "Your host is back. The world continues.", "host-returned");
+        Console.WriteLine($"MP-HOST-ABSENT resumed epoch={world} run={(run == Guid.Empty ? pausedRun : run):N}");
+        if (_transport is not null)
+            try { _ = ExecLuaAsync("if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"Your host is back.\") end"); }
+            catch (Exception ex) { Console.WriteLine($"MP-HOST-ABSENT resume notice failed: {ex.GetType().Name}"); }
     }
 
     /// <summary>The host aborted a join this machine is running (its safety timeout, a reload, a cancel).</summary>
