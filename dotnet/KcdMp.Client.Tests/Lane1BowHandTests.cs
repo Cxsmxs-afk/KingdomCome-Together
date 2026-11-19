@@ -401,6 +401,45 @@ public sealed class Lane1BowHandTests
     }
 
     [Fact]
+    public async Task Reusing_an_entity_id_for_a_new_body_retires_its_old_hand_revision()
+    {
+        await using var link = new MemoryStream();
+        using var game = new GameCalls();
+        await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
+        var bridge = await CreateHostAsync(link);
+        Field("_transport").SetValue(bridge, transport);
+        string ghost = Peer.ToString();
+        ((ConcurrentDictionary<string, uint>)Field("_ghostEntityIds").GetValue(bridge)!)[ghost] = 222;
+        await ReceiveFigureHandAsync(bridge, $"v1|1|{Bow:D}");
+        Assert.Equal(Bow, Assert.Single((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!));
+
+        Call(bridge, "BumpGhostGeneration", ghost, "fixture rejoin");
+
+        Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
+        await (Task)Call(bridge, "Wo214PreDrawAsync", Peer, CancellationToken.None)!;
+        Assert.Single(game.Requests);
+    }
+
+    [Fact]
+    public async Task A_holster_read_for_the_previous_body_is_never_applied_to_the_new_body()
+    {
+        await using var link = new MemoryStream();
+        using var game = new GameCalls();
+        await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
+        var bridge = await CreateHostAsync(link);
+        Field("_transport").SetValue(bridge, transport);
+        string ghost = Peer.ToString();
+        ((ConcurrentDictionary<string, uint>)Field("_ghostEntityIds").GetValue(bridge)!)[ghost] = 222;
+        byte[] holster = HandPayload(10, "v1|0|-");
+        Call(bridge, "P6NoteVisualAtRead", (int)Protocol.W203Down, holster);
+        Call(bridge, "BumpGhostGeneration", ghost, "fixture rejoin");
+
+        await (Task)Call(bridge, "Wo203OnSideFrameAsync", Peer, holster[(1 + Protocol.JoinHeaderLen)..])!;
+
+        Assert.Empty(game.Requests);
+    }
+
+    [Fact]
     public async Task A_stalled_writer_keeps_only_one_repeat_of_the_sheathed_state_per_peer()
     {
         await using var link = new MemoryStream();
@@ -536,7 +575,7 @@ public sealed class Lane1BowHandTests
     {
         var serial = (long)Call(bridge, "P6PeerAtRead", (int)Protocol.W164Down, new byte[] { Peer })!;
         Assert.NotEqual(0, serial);
-        return (Task)Call(bridge, "Wo214OnRangedBowHandAsync", Peer, Bow, Call(bridge, "P6GetContext"),
+        return (Task)Call(bridge, "Wo214OnRangedHandAsync", Peer, Bow, Call(bridge, "P6GetContext"),
             0L, serial, capturedAt, (Func<bool>)(() => true), CancellationToken.None)!;
     }
 
