@@ -32,6 +32,7 @@ int wo203_conv_tests(int* passed);
 int t3_recovery_stats_tests(int* passed);
 int h6_combat_action_tests(int* passed);
 int npc_death_release_tests(int* passed);
+int wo155_rules_tests(int* passed);
 
 bool run_tests(const char* name, int (*suite)(int*)) {
     int passed = 0;
@@ -55,6 +56,7 @@ int main() {
     passed &= run_tests("scoped recovery and reconnect diagnostics", &t3_recovery_stats_tests);
     passed &= run_tests("combat action incarnation and retirement", &h6_combat_action_tests);
     passed &= run_tests("native NPC death boundary (engine doubles)", &npc_death_release_tests);
+    passed &= run_tests("friendly-fire measurement windows and life scope", &wo155_rules_tests);
     return passed ? 0 : 1;
 }
 EOF
@@ -66,7 +68,7 @@ EOF
         native/tests/rp_body_action_tests.cpp native/tests/visual_damage_tests.cpp native/tests/load_sequence_tests.cpp \
         native/tests/wo203_conv_tests.cpp native/tests/t3_recovery_stats_tests.cpp \
         native/tests/h6_combat_action_tests.cpp \
-        native/tests/npc_death_release_tests.cpp \
+        native/tests/npc_death_release_tests.cpp native/tests/wo155_rules_tests.cpp \
         -o "$native_tmp/native-contracts"
     if ! native_result="$("$native_tmp/native-contracts")"; then
         printf '%s\n' "$native_result" >&2
