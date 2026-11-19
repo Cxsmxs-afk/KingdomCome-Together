@@ -24,7 +24,12 @@ public partial class GameBridge
     private long _p6VisualSerial;
     private long _p6VisualModeSerial, _p6VisualModeAtTick;
     private void P6VisualModeChanged()
-    { Interlocked.Exchange(ref _p6VisualModeAtTick, Environment.TickCount64); Interlocked.Increment(ref _p6VisualModeSerial); }
+    {
+        long now = Environment.TickCount64;
+        Interlocked.Exchange(ref _p6VisualModeAtTick, now);
+        Interlocked.Increment(ref _p6VisualModeSerial);
+        Wo214ResetOwnBow("mode", now);
+    }
     private readonly SemaphoreSlim _p6PollGate = new(1, 1);
     private RangedItemCatalog? _p6Catalog;
     private Task<RangedItemCatalog?>? _p6CatalogTask;
@@ -56,6 +61,7 @@ public partial class GameBridge
     { lock (_p6StateGate) { if (ReferenceEquals(_p6ReceiveStream, stream) && _p6ReceiveToken == ct) { _p6ReceiveStream = null; P6Invalidate(); } } }
     private void P6NoteVisualAtRead(int type, byte[] payload)
     {
+        if (type == Protocol.W203Down) Wo214NoteHandAtRead(payload);
         if (type == Protocol.ConvDown || (type == Protocol.W164Down && payload.Length > 6 && payload[6] == Protocol.W164SceneBus))
             Interlocked.Increment(ref _p6VisualSerial);
     }
@@ -64,7 +70,11 @@ public partial class GameBridge
         lock (_p6StateGate)
         {
             var old = _p6Context; _p6Context = null; _p6RemoteSteps.Clear();
-            if (old is not null) _ = old.Stop.CancelAsync(); // retained token must still cancel queued writer rows
+            if (old is not null)
+            {
+                _ = old.Stop.CancelAsync(); // retained token must still cancel queued writer rows
+                Wo214ResetOwnBow("session", Environment.TickCount64);
+            }
         }
     }
     private async Task<RangedItemCatalog?> P6CatalogAsync()
@@ -89,13 +99,15 @@ public partial class GameBridge
     private void Wo201RangedTick()
     {
         if (!_w201Connected) { P6Invalidate(); return; }
+        var context = P6GetContext();
+        if (context is not null) Wo214HandHeartbeat(context);
         if (!W201("figure_ranged"))
         {
-            if (Interlocked.Exchange(ref _p6CaptureWasOn, 0) == 1 && P6GetContext() is { } offContext) _ = P6CaptureOffAsync(offContext);
+            if (Interlocked.Exchange(ref _p6CaptureWasOn, 0) == 1 && context is not null) _ = P6CaptureOffAsync(context);
             return; // presentation off never disables real contact evidence/Host acceptance
         }
         Interlocked.Exchange(ref _p6CaptureWasOn, 1);
-        if (_localDowned || Environment.TickCount64 < _w201RangedRetryAtMs || P6GetContext() is not { } context) return;
+        if (_localDowned || Environment.TickCount64 < _w201RangedRetryAtMs || context is null) return;
         _ = Wo201RangedPollAsync(context);
     }
     private async Task P6CaptureOffAsync(P6Context context)
@@ -125,6 +137,7 @@ public partial class GameBridge
                     if (age < 0 || age > Protocol.RangedCaptureMaxAgeMs || unchecked((long)row.CapturedTick) <= Interlocked.Read(ref _p6VisualModeAtTick)) { T3Increment("ranged_stale"); continue; }
                     uint sourceMs = unchecked((uint)(PresentationClock.NowMs() - age));
                     var weapon = catalog?.Classify(row) ?? default;
+                    Wo214ObserveOwnRangedHand(context, visualMode, row, weapon.Kind, weapon.ItemClass);
                     if (weapon.Kind == RangedWeaponKind.Unknown) T3Increment("ranged_capture_kind_unknown");
                     int written = 0;
                     void AfterWrite()
@@ -132,6 +145,11 @@ public partial class GameBridge
                         if (Interlocked.Exchange(ref written, 1) != 0) return;
                         T3Increment("ranged_out"); Interlocked.Increment(ref _w201RangedOut);
                         Console.WriteLine($"WO201-RANGED out {Wo201Rules.RangedPhaseName(row.Phase)} weapon={weapon.Kind} item={weapon.ItemClass:D} seq={row.Sequence} epoch={reply.Epoch}");
+                        if (W214On("figure_hands") && weapon.Kind == RangedWeaponKind.Bow && weapon.ItemClass != Guid.Empty)
+                        {
+                            T3Increment(BowHandEmptyCounter, 0);
+                            Console.WriteLine(FormattableString.Invariant($"MP-LANE1-BOW out cls={weapon.ItemClass:D} source=native phase={row.Phase} capture_ms={row.CapturedTick}"));
+                        }
                     }
                     foreach (byte peer in Wo134Peers())
                     {
@@ -150,12 +168,9 @@ public partial class GameBridge
         catch (Exception ex) { T3Increment("ranged_poll_refused"); Console.WriteLine($"P6 ranged poll: {ex.GetType().Name}"); }
         finally { _p6PollGate.Release(); }
     }
-    private async Task<bool> P6SendAsync(P6Context context, byte target, byte kind, string text, Func<bool> extra,
+    private Task<bool> P6SendAsync(P6Context context, byte target, byte kind, string text, Func<bool> extra,
         CancellationToken ct, Action? afterWrite = null, Func<string>? textAtWrite = null, uint presentationSenderMs = 0)
     {
-        var lease = ProcessorFrameScope.Capture();
-        bool Current() => !ct.IsCancellationRequested && lease?.IsAbandoned != true && P6Current(context) && extra();
-        if (!Current()) return false;
         uint token = Interlocked.Increment(ref _w137Tok);
         byte[] Build(string value)
         {
@@ -163,11 +178,19 @@ public partial class GameBridge
             return (_w213Caps & Protocol.LinkCapPresentationCombat) == 0 ? packet :
                 PresentationTimeWire.StampCombatUp(packet, presentationSenderMs);
         }
-        byte[] packet = Build(text);
         void Written() { T3Increment("ranged_peer_tx"); afterWrite?.Invoke(); }
+        return P6WriteAsync(context, Build(text), extra, ct, Written, textAtWrite is null ? null : () => Build(textAtWrite()));
+    }
+
+    private async Task<bool> P6WriteAsync(P6Context context, byte[] packet, Func<bool> extra, CancellationToken ct,
+        Action written, Func<byte[]>? packetAtWrite = null)
+    {
+        var lease = ProcessorFrameScope.Capture();
+        bool Current() => !ct.IsCancellationRequested && lease?.IsAbandoned != true && P6Current(context) && extra();
+        if (!Current()) return false;
         try
         {
-            if (_w213Writer is { } writer && ReferenceEquals(context.Stream, _w213Stream)) writer.Enqueue(packet, Current, Written, textAtWrite is null ? null : () => Build(textAtWrite()));
+            if (_w213Writer is { } writer && ReferenceEquals(context.Stream, _w213Stream)) writer.Enqueue(packet, Current, written, packetAtWrite);
             else
             {
                 using var frame = ProcessorFrameScope.Link(ct); using var linked = CancellationTokenSource.CreateLinkedTokenSource(frame.Token, context.Cancellation);
@@ -175,11 +198,11 @@ public partial class GameBridge
                 try
                 {
                     if (!Current()) return false;
-                    if (textAtWrite is not null) packet = Build(textAtWrite());
+                    if (packetAtWrite is not null) packet = packetAtWrite();
                     if (!Current()) return false;
                     await context.Stream.WriteAsync(packet, linked.Token);
                     if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
-                    Written();
+                    written();
                 }
                 finally { _tcpWriteLock.Release(); }
             }
@@ -230,18 +253,23 @@ public partial class GameBridge
         if (!P6Current(context) || !P6PeerCurrent(src, frame.P6PeerSerial)) return;
         if (step.Kind == RangedWeaponKind.Unknown || catalog?.Kind(step.ItemClass) != step.Kind)
         { T3Increment("ranged_kind_unknown"); return; }
-        // No guessed Aim/Charge animation and no broad BodyStop that could abort a scene.
-        string fragment = Wo201Rules.RangedFragment(step.Phase);
-        if (fragment.Length == 0) { T3Increment("ranged_phase_unrenderable"); return; }
-        // The old goatsfoot/medium reload is not proof for all crossbow subclasses.
-        if (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4) { T3Increment("ranged_phase_unrenderable"); return; }
-        string tags = step.Kind == RangedWeaponKind.Bow ? "l_bow" : "l_crossbow";
         bool Current() => P6Current(context) && W201("figure_ranged") && P6PeerCurrent(src, frame.P6PeerSerial) &&
             frame.P6ModeSerial == Interlocked.Read(ref _p6VisualModeSerial) &&
             frame.P6VisualSerial == Interlocked.Read(ref _p6VisualSerial) && (!_w179Remote.TryGetValue(src, out var scene) || (scene.Ended && !scene.CopyPlaying && scene.Landing != 1)) &&
             _p6RemoteSteps.TryGetValue(src, out var latest) && latest == (frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence) &&
             Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds + step.AgeMs <= Protocol.RangedCaptureMaxAgeMs;
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, _p5Peers[src].Token);
+        if (!_p5Peers.TryGetValue(src, out var peer) || peer.Serial != frame.P6PeerSerial) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, peer.Token);
+        long capturedAt = Environment.TickCount64 - step.AgeMs - (long)Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds;
+        if (step.Kind == RangedWeaponKind.Bow && BowHandProof.IsDrawnPhase(step.Phase))
+            await Wo214OnRangedBowHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, capturedAt, Current, linked.Token);
+        else if (step.Kind == RangedWeaponKind.Crossbow && !linked.IsCancellationRequested && Current())
+            Wo214OnOtherRangedHand(src, step.ItemClass, capturedAt);
+        // Charge and Aim still lack a verified animation entry. Crossbow reload tags vary by subclass.
+        string fragment = Wo201Rules.RangedFragment(step.Phase);
+        if (fragment.Length == 0 || (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4))
+        { T3Increment("ranged_phase_unrenderable"); return; }
+        string tags = step.Kind == RangedWeaponKind.Bow ? "l_bow" : "l_crossbow";
         if (frame.Presentation.SampleMs != 0 && W221On("rp_combat") &&
             _ghostEntityIds.TryGetValue(src.ToString(System.Globalization.CultureInfo.InvariantCulture), out uint eid))
         {
