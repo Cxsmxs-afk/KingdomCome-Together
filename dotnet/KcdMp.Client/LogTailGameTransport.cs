@@ -385,6 +385,15 @@ public sealed class LogTailGameTransport : IGameTransport
     /// </summary>
     public event Action? LoadStarted;
 
+    internal readonly record struct EngineSaveTerminal(string Path, long Incarnation, bool Loaded);
+    internal event Action<EngineSaveTerminal>? EngineSaveFinished;
+    private long _engineLogIncarnation = 1;
+    private string? _engineAcceptedSave, _engineReadSave;
+    internal long EngineLogIncarnation => Interlocked.Read(ref _engineLogIncarnation);
+    internal string? EngineAcceptedSave => _engineAcceptedSave;
+    internal string? EngineReadSave => _engineReadSave;
+    internal string? DispatchingTerminalSave { get; private set; }
+
     /// <summary>WO-124: "CSystem::Quit invoked ..." -- the game is ending its process (the menu's Quit, System.Quit()).</summary>
     public event Action? GameQuit;
 
@@ -688,6 +697,7 @@ public sealed class LogTailGameTransport : IGameTransport
     private void ProcessPauseMarkers(ReadOnlySpan<char> line)
     {
         bool before = AggregatePaused;
+        if (line.StartsWith("Log Started at ", StringComparison.Ordinal)) NewEngineLogIncarnation();
 
         // ESC/system pause menu: confirmed live, isolated
         // (docs/WO-11-findings.md addendum) -- MenuOpen pairs with the RTPC
@@ -838,21 +848,24 @@ public sealed class LogTailGameTransport : IGameTransport
             }
         }
 
-        if (LoadStarted is not null && line.StartsWith("[CryAction] LoadGame: '", StringComparison.Ordinal))
+        const string readSave = "[CryAction] LoadGame: '";
+        if ((LoadStarted is not null || EngineSaveFinished is not null) && line.StartsWith(readSave, StringComparison.Ordinal))
         {
-            try { LoadStarted.Invoke(); }
+            _engineReadSave = QuotedEngineSave(line[readSave.Length..]);
+            _engineAcceptedSave = _engineReadSave;
+            try { LoadStarted?.Invoke(); }
             catch (Exception ex) { Console.WriteLine($"[join] load-started handler threw: {ex.Message}"); }
         }
 
-        if (SaveLoadAccepted is not null && line.StartsWith("Loading saved game '", StringComparison.Ordinal))
+        const string acceptSave = "Loading saved game '";
+        if ((SaveLoadAccepted is not null || EngineSaveFinished is not null) && line.StartsWith(acceptSave, StringComparison.Ordinal))
         {
-            var rest = line[20..];
-            int q = rest.IndexOf('\'');
-            if (q > 0)
+            _engineAcceptedSave = QuotedEngineSave(line[acceptSave.Length..]);
+            if (!string.Equals(_engineAcceptedSave, _engineReadSave, StringComparison.OrdinalIgnoreCase)) _engineReadSave = null;
+            if (_engineAcceptedSave is { } path)
             {
-                var path = rest[..q].ToString().Replace('\\', '/');
                 int pl = path.LastIndexOf("/playline", StringComparison.Ordinal);
-                try { SaveLoadAccepted.Invoke(pl >= 0 ? path[(pl + 1)..] : path); }
+                try { SaveLoadAccepted?.Invoke(pl >= 0 ? path[(pl + 1)..] : path); }
                 catch (Exception ex) { Console.WriteLine($"[join] save-load handler threw: {ex.Message}"); }
             }
         }
@@ -861,11 +874,9 @@ public sealed class LogTailGameTransport : IGameTransport
             try { MainMenuShown.Invoke(); }
             catch (Exception ex) { Console.WriteLine($"[join] main-menu handler threw: {ex.Message}"); }
         }
-        if (LoadFailedToMenu is not null && line.StartsWith("Exiting to main menu because save game loading failed", StringComparison.Ordinal))
-        {
-            try { LoadFailedToMenu.Invoke(); }
-            catch (Exception ex) { Console.WriteLine($"[join] load-failed handler threw: {ex.Message}"); }
-        }
+        if ((LoadFailedToMenu is not null || EngineSaveFinished is not null) &&
+            line.StartsWith("Exiting to main menu because save game loading failed", StringComparison.Ordinal))
+            ReportEngineSaveTerminal(loaded: false, LoadFailedToMenu);
 
         if (QuestLine is not null && QuestLinePasses(line))
         {
@@ -882,17 +893,16 @@ public sealed class LogTailGameTransport : IGameTransport
             }
         }
 
-        if (GameQuit is not null && line.StartsWith("CSystem::Quit invoked", StringComparison.Ordinal))
+        if (line.StartsWith("CSystem::Quit invoked", StringComparison.Ordinal))
         {
-            try { GameQuit.Invoke(); }
+            NewEngineLogIncarnation();
+            try { GameQuit?.Invoke(); }
             catch (Exception ex) { Console.WriteLine($"[join] quit handler threw: {ex.Message}"); }
         }
 
-        if (GameplayStarted is not null && line.Length < 40 && line.StartsWith("Gameplay started", StringComparison.Ordinal))
-        {
-            try { GameplayStarted.Invoke(); }
-            catch (Exception ex) { Console.WriteLine($"[worldsave] gameplay-started handler threw: {ex.Message}"); }
-        }
+        if ((GameplayStarted is not null || EngineSaveFinished is not null) && line.Length < 40 &&
+            line.StartsWith("Gameplay started", StringComparison.Ordinal))
+            ReportEngineSaveTerminal(loaded: true, GameplayStarted);
 
         // WO-98 Phase 7: "[KCD2-MP] MOD INIT" (the second of the mod's two
         // init lines; the first is "=== MOD INIT ===" and does not match).
@@ -938,6 +948,32 @@ public sealed class LogTailGameTransport : IGameTransport
         _lastStoryMarker = marker;
         try { StoryBeatDetected?.Invoke(marker); }
         catch (Exception ex) { Console.WriteLine($"[story] handler threw: {ex.Message}"); }
+    }
+
+    private static string? QuotedEngineSave(ReadOnlySpan<char> afterOpenQuote)
+    {
+        int closeQuote = afterOpenQuote.IndexOf('\'');
+        return closeQuote > 0 ? afterOpenQuote[..closeQuote].ToString().Replace('\\', '/') : null;
+    }
+
+    private void NewEngineLogIncarnation()
+    {
+        _engineAcceptedSave = _engineReadSave = null;
+        Interlocked.Increment(ref _engineLogIncarnation);
+    }
+
+    private void ReportEngineSaveTerminal(bool loaded, Action? observed)
+    {
+        string? path = loaded ? _engineReadSave : _engineReadSave ?? _engineAcceptedSave;
+        _engineAcceptedSave = _engineReadSave = null;
+        DispatchingTerminalSave = path;
+        try
+        {
+            if (path is not null) EngineSaveFinished?.Invoke(new(path, EngineLogIncarnation, loaded));
+            observed?.Invoke();
+        }
+        catch (Exception ex) { Console.WriteLine($"[join] engine save terminal handler threw: {ex.GetType().Name}"); }
+        finally { DispatchingTerminalSave = null; }
     }
 
     private string? _lastStoryMarker;
@@ -995,6 +1031,7 @@ public sealed class LogTailGameTransport : IGameTransport
                         fs = new FileStream(_logPath, FileMode.Open, FileAccess.Read,
                             FileShare.ReadWrite | FileShare.Delete);
                         fs.Seek(0, SeekOrigin.End); // only new lines matter
+                        NewEngineLogIncarnation();
                         partial.Clear();
                         decoder.Reset();
                     }
@@ -1011,6 +1048,7 @@ public sealed class LogTailGameTransport : IGameTransport
                 {
                     if (fs.Length < fs.Position)
                     {
+                        NewEngineLogIncarnation();
                         fs.Dispose();
                         fs = null;
                         continue;
@@ -1018,6 +1056,7 @@ public sealed class LogTailGameTransport : IGameTransport
                 }
                 catch
                 {
+                    NewEngineLogIncarnation();
                     fs.Dispose();
                     fs = null;
                     continue;

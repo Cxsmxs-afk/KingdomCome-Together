@@ -815,47 +815,54 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- sweeps (agent start, before every join)
 
-    private static readonly Regex TransientAny = new(@"^mp(world|exit)[0-9a-f]{1,8}\.(whs|part)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private readonly JoinWorldJournal _joinWorldJournal = new();
+    private static readonly Regex TransientExit = new(@"^mpexit[0-9a-f]{1,8}\.(whs|part)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     /// <summary>
-    /// Move out every file the mod made or saw land in a playline: transient
-    /// mpworld/mpexit files, and every ledgered save that is still there. A
-    /// save the player put there (e.g. a copy of a host world) is left alone
-    /// and only logged. Returns how many files were moved.
+    /// Remove journaled pre-load join copies at startup, and move out transient
+    /// exit files and ledgered saves. A join-looking name alone never authorizes
+    /// moving or deleting a save. Returns how many files left the playlines.
     /// </summary>
     internal int Wo125Sweep(string why)
     {
         string? saves = ResolveSavesDirForJoin();
         if (saves is null) return 0;
-        int n = 0;
+        saves = Path.GetFullPath(saves);
+        if (!_joinWorldJournal.CanSweepPath(saves, directory: true)) return 0;
+        int n = why == "agent start" ? _joinWorldJournal.Sweep(saves, _retainedJoinWorlds.Protects) : 0;
         for (int pl = 0; pl <= 4; pl++)
         {
             string dir = Path.Combine(saves, $"playline{pl}");
-            if (!Directory.Exists(dir)) continue;
+            if (!_joinWorldJournal.CanSweepPath(dir, directory: true)) continue;
             foreach (var f in Directory.EnumerateFiles(dir))
-                if (TransientAny.IsMatch(Path.GetFileName(f)) && !_retainedJoinWorlds.Protects(f) && (_jj?.PlacedPath is not string keep || !string.Equals(keep, f, StringComparison.OrdinalIgnoreCase))
+                if (TransientExit.IsMatch(Path.GetFileName(f)) && _joinWorldJournal.CanSweepPath(f, directory: false)
+                    && !_retainedJoinWorlds.Protects(f) && (_jj?.PlacedPath is not string keep || !string.Equals(keep, f, StringComparison.OrdinalIgnoreCase))
                     && _henry.MoveOut(f, $"a transient file of the mod ({why})")) n++;
         }
         foreach (var e in _henry.Ledger().Where(x => x.State != "done"))
         {
             string dir = Path.Combine(saves, $"playline{e.Playline}");
+            bool exists = Directory.Exists(dir);
+            if (exists && (e.Playline is < 0 or > 4 || !_joinWorldJournal.CanSweepPath(dir, directory: true))) continue;
+            if (e.File is string ledgered && (!string.Equals(ledgered, Path.GetFileName(ledgered), StringComparison.Ordinal) ||
+                ledgered.StartsWith("mpworld", StringComparison.OrdinalIgnoreCase))) continue;
             bool done = true;
             if (e.File is string f && File.Exists(Path.Combine(dir, f)))
             {
                 string p = Path.Combine(dir, f);
-                if (_retainedJoinWorlds.Protects(p)) continue;
+                if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p)) continue;
                 var v = WhsSave.VerifyFile(p);
                 if (e.Md5 is null || string.Equals(v.Md5, e.Md5, StringComparison.OrdinalIgnoreCase))
                 { if (_henry.MoveOut(p, $"a {e.Kind} save the mod made or saw while joined ({why})")) n++; else done = false; }
                 else Console.WriteLine($"MP-HENRY sweep: {SaveDisplay(p)} changed since it was ledgered (a save of the player's own now) -- left alone");
             }
-            else if (e.File is null && Directory.Exists(dir))
+            else if (e.File is null && exists)
             {
                 // A snapshot whose file was never seen (a crash between the request and the file): a save of
                 // the host's world (its seed) that landed in that playline within two minutes of the request.
                 foreach (var p in Directory.EnumerateFiles(dir, "*.whs"))
                 {
-                    if (_retainedJoinWorlds.Protects(p)) continue;
+                    if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p)) continue;
                     var t = File.GetLastWriteTimeUtc(p);
                     if (t < e.SinceUtc || t > e.SinceUtc.AddMinutes(2) || WorldSaved.ParsePath(p) is null) continue;
                     if (WhsSave.ReadSeedFromFile(p) is uint s && WhsSave.SeedTag(s) == _henry.BaseTagOf(e.WorldTag))
@@ -874,7 +881,7 @@ public partial class GameBridge
                     copies.Add(s.Display);
         if (copies.Count > 0)
             Console.WriteLine($"MP-HENRY sweep WARNING {copies.Count} save(s) have the playthrough seed of a host world this player joined -- not saves the mod made (left alone), never used as this player's own: {string.Join(", ", copies.Take(6))}{(copies.Count > 6 ? ", ..." : "")}");
-        Console.WriteLine($"MP-HENRY sweep ({why}): {n} file(s) moved out of the playlines");
+        Console.WriteLine($"MP-HENRY sweep ({why}): {n} file(s) removed from the playlines");
         return n;
     }
 

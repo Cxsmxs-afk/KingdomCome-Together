@@ -14,16 +14,17 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private delegate void EngineLine(ReadOnlySpan<char> line);
 
     private readonly string _saves;
-    private readonly byte[]? _hostSave;
+    private readonly Func<int, byte[]>? _hostSave;
     private readonly Action _gameplayStarted;
     private readonly EngineLine _feed;
     private readonly object _logGate = new();
     private readonly TaskCompletionSource<string> _loadIssued = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<string> _resumed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _eventSequence;
+    private int _saveIndex;
     private string? _lastLoaded;
 
-    public JoinCalendarTestEngine(string logPath, string saves, byte[]? hostSave, Action gameplayStarted)
+    public JoinCalendarTestEngine(string logPath, string saves, Func<int, byte[]>? hostSave, Action gameplayStarted)
     {
         _saves = saves;
         _hostSave = hostSave;
@@ -56,9 +57,10 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
 
         if (_hostSave is not null && command.Contains("""KCD2MP_HostWorldSave("join",""", StringComparison.Ordinal))
         {
-            string path = Path.Combine(_saves, "playline0", "save001.whs");
+            int index = Interlocked.Increment(ref _saveIndex);
+            string path = Path.Combine(_saves, "playline0", FormattableString.Invariant($"save{index:D3}.whs"));
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllBytes(path, _hostSave);
+            File.WriteAllBytes(path, _hostSave(index));
             SaveWritten?.Invoke(path);
         }
 
