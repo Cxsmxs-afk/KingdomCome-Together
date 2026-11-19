@@ -174,7 +174,9 @@ public:
                 out.appliedHostMs = advance(before->hostMs, out.extrapMs);
             }
         }
-        if (out.source.stateHostMs > out.appliedHostMs || out.targetHostMs - out.source.stateHostMs >= kStateFreshMs)
+        // A drawn bow stays until a newer sample confirms it is down. Movement freshness still drops crouch and the other bits.
+        const bool rangedHeld = out.source.stateHostMs != 0 && (out.source.state[3] & 0x08) != 0;
+        if (!rangedHeld && (out.source.stateHostMs > out.appliedHostMs || out.targetHostMs - out.source.stateHostMs >= kStateFreshMs))
             out.source.stateHostMs = 0;
         return out;
     }

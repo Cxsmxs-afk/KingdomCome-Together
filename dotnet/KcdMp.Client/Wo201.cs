@@ -38,6 +38,17 @@ public static class Wo201Rules
         | (on("oneshot_tick_cap") ? 4 : 0) | (on("copy_no_idle_turn") ? 8 : 0));
 
     // ---- B11: the crossbow and bow steps shown on the figure ----
+    public static bool AimChanged(BodyState2 last, BodyState2 now) =>
+        last.Charge != now.Charge || last.AimYaw != now.AimYaw || last.AimPitch != now.AimPitch
+        || ((last.Bits ^ now.Bits) & BodyState2Bits.RangedAim) != 0;
+
+    /// <summary>A readable idle: the draw bit, the phase charge and both angles are clear. An unreadable sample never builds this.</summary>
+    public static bool ConfirmedOff(BodyState2 state) =>
+        (state.Bits & BodyState2Bits.RangedAim) == 0 && state.Charge == 0 && state.AimYaw == 0 && state.AimPitch == 0;
+
+    /// <summary>Charging and aiming are the held draw. Reload is the crossbow's own step, not a drawn bow.</summary>
+    public static bool IsHeldDraw(byte phase) => phase is 1 or 2;
+
     public static string RangedPhaseName(byte p) => p switch
     {
         0 => "none", 1 => "charging", 2 => "aiming", 3 => "firing", 4 => "reloading", 5 => "uncharging", 6 => "leaving", _ => "?",

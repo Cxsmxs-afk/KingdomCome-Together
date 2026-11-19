@@ -10,6 +10,7 @@
 // checked against its RTTI vtable that frame. A change of step is queued for the agent (op 86), which shows it on this player's figure
 // on the partner's screen (an animation of the game's own fragments: never a shot of the figure's own -- no projectile).  WO201-RANGED.
 #include "wo201.h"
+#include "ranged_aim.h"
 #include "p6_capture.h"
 #include "p6_rules.h"
 #include "wo163.h"
@@ -76,6 +77,7 @@ void stream_reset(uint64_t gen,uint64_t scope,bool identity){
     if(++g_streamEpoch==0)++g_streamEpoch;
     g_q.reset(gen,g_streamEpoch);g_haveLast=false;g_lastEpoch=scope;
     if(identity){g_lastSoul=nullptr;g_lastActor=nullptr;g_holderOk=false;}
+    kcdmp::rangedaim::publish(kcdmp::rangedaim::None);
 }
 
 #ifndef KCDMP_P6_CAPTURE_TEST
@@ -209,6 +211,7 @@ void tick() {
     g_lastRead=t;
     const uint8_t phase=phase_of(actor);c_reads.fetch_add(1);
     if(phase==255){c_unreadable.fetch_add(1);return;}
+    kcdmp::rangedaim::publish(phase);
     p6rules::Capture row;row.phase=phase;row.tick=t;
     const uint8_t known=hand_guids(eid,&row);row.known=known;row.source=known==3?1:0;
     // No later poll enriches these GUIDs. Unknown remains unknown forever.
