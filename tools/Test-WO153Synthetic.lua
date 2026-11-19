@@ -506,6 +506,68 @@ do
     noErrs("H4")
 end
 
+-- H4: a new stamped holster intent can arrive before the actual hold ends.
+do
+    local id, name, body = "8", "kcd2mp_8", "01FFAA08"
+    local oldRevision, holsterRevision = "0000000000000001", "0000000000000002"
+    local bow = "11111111-1111-1111-1111-111111111111"
+    local sword = "22222222-2222-2222-2222-222222222222"
+    local function stamp(revision) return string.rep("0", 48) .. revision end
+    local oldIM = ItemManager
+    ItemManager = { GetItem = function(it) if it ~= 0 then return { class = it } end end }
+    for _, operation in ipairs({"Equip", "Atomic"}) do
+        for slot = 0, 1 do
+            local held, mutations, holsters = nil, 0, 0
+            local ghost = mkEntity(name, 0, 0, 0)
+            ghost.id = "0x" .. body
+            ghost.inventory = { FindItem = function(_, cls) return cls end }
+            local canReadHands = true
+            ghost.human.GetItemInHand = function(_, which)
+                if not canReadHands then error("hand unreadable") end
+                if which == slot then return held end
+            end
+            ghost.human.HolsterWeapon = function() holsters = holsters + 1 end
+            ghost.actor.EquipInventoryItem = function(_, it) mutations, held = mutations + 1, it end
+            ENTS[name] = ghost
+            KCD2MP.ghosts[id] = { entity = ghost }
+            KCD2MP.ghostWeaponDrawn[id] = nil
+            assert(KCD2MP_W214ReportGhostId(id))
+            local birth = KCD2MP.ghosts[id].outfitBirth
+            assert(KCD2MP_W214FigureHand(id, false, "-", false, body, oldRevision, birth, stamp(oldRevision)))
+            table.remove(TIMERS).f()
+            KCD2MP_GhostCombat(id, 0)
+            assert(KCD2MP.ghosts[id].w214OutfitCuePending)
+            held = bow
+            local before = #LOG
+            assert(KCD2MP_W214FigureHand(id, false, "-", false, body, holsterRevision, birth, stamp(holsterRevision)))
+            local label = "H4 actual holster pending: " .. operation .. " slot=" .. slot
+            check(label .. " sent once without changing actual hand", holsters == 1 and held == bow and
+                  countEvt("w214_figure_hand", id .. " ok empty", before) == 0)
+            local function apply(revision)
+                if operation == "Equip" then return KCD2MP_W144Equip(name, sword, body, revision, birth) end
+                return KCD2MP_W202EquipAll(name, sword, body, revision, birth) == 1
+            end
+            check(label .. " rejects old revision", not apply(oldRevision) and held == bow and mutations == 0)
+            check(label .. " current revision cannot displace still-held class",
+                  not apply(holsterRevision) and held == bow and mutations == 0,
+                  "mutations=" .. mutations .. " actual=" .. tostring(held))
+            local beforeRead = mutations
+            canReadHands = false
+            check(label .. " cannot treat an unreadable hand as empty", not apply(holsterRevision) and mutations == beforeRead,
+                  "mutations=" .. (mutations - beforeRead))
+            canReadHands = true
+            held = slot == 1 and 0 or nil
+            table.remove(TIMERS).f()
+            local beforeCurrent = mutations
+            check(label .. " converges after actual empty observation",
+                  countEvt("w214_figure_hand", id .. " ok empty " .. birth .. " " .. stamp(holsterRevision), before) == 1
+                  and apply(holsterRevision) and mutations == beforeCurrent + 1 and held == sword,
+                  "mutations=" .. (mutations - beforeCurrent) .. " actual=" .. tostring(held))
+        end
+    end
+    ENTS[name], KCD2MP.ghosts[id], KCD2MP.ghostWeaponDrawn[id], ItemManager = nil, nil, nil, oldIM
+end
+
 -- (C) the tester pages' marker words are registered (typing an unregistered one printed "unknown command") ------------------
 do
     local words = { "carry_alive", "crime", "death", "dog", "door", "door2", "ff", "fight_same", "forge", "herbs", "hostfight", "quiet",

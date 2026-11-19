@@ -36510,7 +36510,10 @@ do
                 w214OutfitRefused(id, "old-hand")
                 return nil
             end
-            if g.w214OutfitCuePending then
+            if g.w214OutfitCuePending == "holster" then
+                if not KCD2MP_W214OutfitHandsClear(id, g.entity) then return nil end
+                g.w214OutfitCuePending = nil
+            elseif g.w214OutfitCuePending then
                 w214OutfitRefused(id, "draw-pending")
                 return nil
             end
@@ -36526,7 +36529,8 @@ do
         end
         for slot = 0, 1 do
             local ok, held = pcall(function() return e.human:GetItemInHand(slot) end)
-            if not ok or (held and (not item or held == item or KCD2MP.w136.handClass(e, slot) == cls)) then
+            local occupied = held and held ~= 0 and tostring(held) ~= "userdata: 0000000000000000"
+            if not ok or (occupied and (not item or held == item or KCD2MP.w136.handClass(e, slot) == cls)) then
                 w214OutfitRefused(id, "occupied-hand")
                 return false
             end
@@ -36570,11 +36574,14 @@ do
         if body then
             if not w214BodyMatches(g, body, birth) then w214OutfitRefused(id, "hand-old-body"); return false end
             if g.w214HandRevision and revision < g.w214HandRevision then w214OutfitRefused(id, "hand-old-revision"); return false end
-            if g.w214OutfitCuePending and revision == (g.w214HandRevision or "0000000000000000") then
+            if g.w214OutfitCuePending == true and revision == (g.w214HandRevision or "0000000000000000") then
                 w214OutfitRefused(id, "hand-cue-pending")
                 return false
             end
-            g.w214OutfitCuePending = nil
+            -- A new Holster stamp supersedes the cue. Outfit work still has to
+            -- wait for the engine's hands to become empty after the request.
+            local awaitHolster = not drawn and (g.w214OutfitCuePending or g.w214HandClass)
+            g.w214OutfitCuePending = awaitHolster and "holster" or nil
             g.w214HandRevision = revision
             g.w214HandClass = drawn and cls ~= "-" and cls or nil
         end
