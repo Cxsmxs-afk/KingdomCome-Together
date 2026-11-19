@@ -4,6 +4,7 @@
 // WO-121 -- movement and combat on native-written bodies. See motion.h.
 #include "motion.h"
 #include "ranged_aim.h"
+#include "wo201.h"
 #include "wo131.h"
 #include "motion_remote_rules.h"
 #include "wo178.h"
@@ -1968,21 +1969,17 @@ bool read_local_state2(State2* out, float facingYaw) {
             if (rd(model, kModelOpponent, &opp) && opp) out->bits |= kBitLocked;
         }
     }
-    // The shooting step is sampled on its own 50 ms tick. An unreadable step leaves this block as it was.
-    // Charge is that phase, not a measured draw percent. Angles have no verified source in this build.
-    static kcdmp::rangedaim::Block aim{};
-    static kcdmp::rangedaim::Edge lastEdge = kcdmp::rangedaim::Edge::Same;
-    const auto edge = kcdmp::rangedaim::apply(kcdmp::rangedaim::published(), &aim);
-    if (aim.aim) out->bits |= kBitRanged;
-    out->charge = aim.charge;
-    out->aimYaw = aim.yaw;
-    out->aimPitch = aim.pitch;
-    if (edge != lastEdge && edge == kcdmp::rangedaim::Edge::Held)
-        logf("MP-BOW aim phase=%s charge=%u yaw=%d pitch=%d source=phase angles=unverified",
-             aim.charge == 255 ? "aiming" : "charging", aim.charge, aim.yaw, aim.pitch);
-    if (edge != lastEdge && edge == kcdmp::rangedaim::Edge::Ended)
-        logf("MP-BOW aim ended charge=0 yaw=0 pitch=0 source=phase");
-    lastEdge = edge;
+    // The 50 ms sampler owns this state. Copy it for this exact actor without another engine read.
+    const auto aim = wo201ranged::sampled_aim(actor);
+    if (aim.aim) {
+        out->bits |= kBitRanged;
+        if (aim.charge) {
+            out->bits |= rangedaim::kChargeKnownBit;
+            out->charge = *aim.charge;
+        }
+        out->aimYaw = rangedaim::kAngleUnavailable;
+        out->aimPitch = rangedaim::kAngleUnavailable;
+    }
     return true;
 }
 

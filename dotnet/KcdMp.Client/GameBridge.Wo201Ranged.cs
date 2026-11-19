@@ -223,7 +223,6 @@ public partial class GameBridge
         if (type != Protocol.W164Down || !Protocol.TrySplitJoinDown(payload, out source, out _, out _, out var body) || !LootMsg.TryDecode(body, out message)) return false;
         return message.Kind is Protocol.W164RangedStep or Protocol.W164MeasuredMissile || (message.Kind == Protocol.W164RealHit && message.Text.StartsWith("m1|", StringComparison.Ordinal));
     }
-    private static bool P6Frame(int type, byte[] payload) => P6Message(type, payload, out _, out _);
     // Consumes only these kinds before generic catchup/hold logic, preserving the original reader receipts.
     private async Task<bool> P6TryProcessFrameAsync(InFrame frame, CancellationToken ct)
     {
@@ -241,6 +240,13 @@ public partial class GameBridge
         if (!RangedStepV2.TryDecode(message.Text, out var step)) { T3Increment("ranged_malformed"); return; }
         if (frame.Stamp == 0 || frame.Stamp != step.World || context.World != step.World ||
             Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds + step.AgeMs > Protocol.RangedCaptureMaxAgeMs) { T3Increment("ranged_stale"); return; }
+        var body = frame.P6RangedBody;
+        if (body.Entity == 0 || body != Wo214FigureBody(src))
+        {
+            T3Increment("ranged_stale");
+            Wo201RangedRefused(src, step, body.Entity == 0 ? "no-body-at-read" : "old-body-at-read");
+            return;
+        }
         if (_p6RemoteSteps.TryGetValue(src, out var last) && last.Peer == frame.P6PeerSerial)
         {
             if (step.Generation < last.Gen || (step.Generation == last.Gen && step.Epoch < last.Epoch)) { T3Increment("ranged_stale"); return; }
@@ -249,7 +255,6 @@ public partial class GameBridge
         if (last.Gen != step.Generation || last.Epoch != step.Epoch || last.Peer != frame.P6PeerSerial) T3Increment("ranged_stream_reset");
         _p6RemoteSteps[src] = (frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence);
         T3Increment("ranged_in"); Interlocked.Increment(ref _w201RangedIn);
-        var body = Wo214FigureBody(src);
         var catalog = await P6CatalogAsync();
         if (!P6Current(context) || !P6PeerCurrent(src, frame.P6PeerSerial)) return;
         if (step.Kind == RangedWeaponKind.Unknown || catalog?.Kind(step.ItemClass) != step.Kind)
@@ -271,7 +276,7 @@ public partial class GameBridge
         if (Wo201Rules.RangedFragment(step.Phase).Length == 0 || (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4))
         { T3Increment("ranged_phase_unrenderable"); return; }
 
-        if (frame.Presentation.SampleMs == 0 || !W221On("rp_combat") || body.Entity == 0)
+        if (frame.Presentation.SampleMs == 0 || !W221On("rp_combat"))
         {
             Wo201RangedRefused(src, step, "typed-route-unavailable");
             return;

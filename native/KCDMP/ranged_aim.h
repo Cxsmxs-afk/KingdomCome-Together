@@ -2,15 +2,16 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #pragma once
-// The bow/crossbow aim that rides the existing 12-byte body block.
-// Phase 255 (the step reader failed) must not become a drawn-or-idle zero.
-// Charge here is the already-read shooting phase, not a measured draw percent:
-// aiming is full, charging is half. Yaw and pitch stay at the last verified
-// sample; this build has no verified angle source, so they stay 0 and the log says so.
-#include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <limits>
+#include <optional>
 
 namespace kcdmp::rangedaim {
+
+constexpr uint8_t kHeldBit = 0x08;
+constexpr uint8_t kChargeKnownBit = 0x80;
+constexpr int16_t kAngleUnavailable = (std::numeric_limits<int16_t>::min)();
 
 enum Phase : uint8_t {
     None = 0, Charging = 1, Aiming = 2, Firing = 3, Reloading = 4,
@@ -19,43 +20,28 @@ enum Phase : uint8_t {
 
 enum class Edge : uint8_t { Same, Held, Ended, Ignored };
 
-struct Block {
-    bool aim = false;
-    uint8_t charge = 0;
-    int16_t yaw = 0;
-    int16_t pitch = 0;
-    bool confirmedEnd = false;
-};
+struct Block { bool aim = false; std::optional<uint8_t> charge; };
+struct Sample { uint8_t phase = Unreadable; std::optional<uint8_t> charge; };
 
 inline bool is_hold_phase(uint8_t phase) { return phase == Charging || phase == Aiming; }
 
-inline Edge apply(uint8_t phase, Block* held) {
-    if (!held || phase == Unreadable) return Edge::Ignored;
-    if (is_hold_phase(phase)) {
-        const uint8_t charge = phase == Aiming ? 255 : 128;
-        const bool changed = !held->aim || held->charge != charge;
-        held->aim = true;
-        held->charge = charge;
-        held->confirmedEnd = false;
+inline std::optional<uint8_t> quantize_charge(float charge, float min, float max) {
+    if (!std::isfinite(charge) || !std::isfinite(min) || !std::isfinite(max) ||
+        min < 0 || max > 1 || max <= min || charge < min || charge > max) return std::nullopt;
+    return static_cast<uint8_t>(std::lround((charge - min) / (max - min) * 255.f));
+}
+
+inline Edge apply(const Sample& sample, Block& held) {
+    if (sample.phase == Unreadable) return Edge::Ignored;
+    if (is_hold_phase(sample.phase)) {
+        const auto charge = sample.charge ? sample.charge : held.charge;
+        const bool changed = !held.aim || held.charge != charge;
+        held = {true, charge};
         return changed ? Edge::Held : Edge::Same;
     }
-    if (!held->aim && held->charge == 0) return Edge::Same;
-    held->aim = false;
-    held->charge = 0;
-    held->yaw = 0;
-    held->pitch = 0;
-    held->confirmedEnd = true;
+    if (!held.aim) return Edge::Same;
+    held = {};
     return Edge::Ended;
 }
-
-inline bool restore_after_end(uint64_t endStamp, uint64_t packetStamp) { return packetStamp > endStamp; }
-
-inline std::atomic<uint8_t>& slot() {
-    static std::atomic<uint8_t> phase{None};
-    return phase;
-}
-
-inline void publish(uint8_t phase) { slot().store(phase, std::memory_order_release); }
-inline uint8_t published() { return slot().load(std::memory_order_acquire); }
 
 } // namespace kcdmp::rangedaim

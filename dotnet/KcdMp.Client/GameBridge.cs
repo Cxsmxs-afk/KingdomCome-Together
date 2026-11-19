@@ -4736,6 +4736,7 @@ public partial class GameBridge(ClientConfig config)
         public long P6VisualSerial { get; init; }
         public bool P6Ready { get; init; }
         public long P6ModeSerial { get; init; }
+        public FigureBody P6RangedBody { get; init; }
     }
 
     /// <summary>
@@ -4842,7 +4843,10 @@ public partial class GameBridge(ClientConfig config)
                 long p6Serial = type == Protocol.W164Down ? Interlocked.Read(ref _p1Serial) : 0, p6Life = type == Protocol.W164Down ? Interlocked.Read(ref _t3InputLifeRevision) : 0;
                 long p6ModeSerial = type == Protocol.W164Down ? Interlocked.Read(ref _p6VisualModeSerial) : 0;
                 bool p6Ready = p6State is { Confirmed: true, GameplaySent: true } && !_p1Loading && P5LoadedWorld != 0 && !_leaveInProgress;
-                bool p6Frame = P6Frame(type, payload);
+                bool p6Frame = P6Message(type, payload, out byte p6Source, out var p6Message);
+                // Capture the target before the processor's wait. A respawn can replace it without changing the peer or world.
+                FigureBody p6RangedBody = p6Frame && p6Message.Kind == Protocol.W164RangedStep
+                    ? Wo214FigureBody(p6Source) : default;
                 long p6Deadline = p6Frame ? p6ReadTick + Protocol.MeasuredMissileApplyBudgetMs : 0;
                 long markerPeer = P5PeerAtRead(type, payload);
                 P6NoteVisualAtRead(type, payload);
@@ -4885,7 +4889,7 @@ public partial class GameBridge(ClientConfig config)
                     Wo207Queue(frames.Writer, inFrame with
                     {
                         P6Generation = p6State.Generation, P6Serial = p6Serial, P6Life = p6Life,
-                        P6PeerSerial = P6PeerAtRead(type, payload), P6Deadline = p6Deadline,
+                        P6PeerSerial = P6PeerAtRead(type, payload), P6Deadline = p6Deadline, P6RangedBody = p6RangedBody,
                         P6VisualSerial = Interlocked.Read(ref _p6VisualSerial), P6Ready = p6Ready, P6ModeSerial = p6ModeSerial,
                         Presentation = presentation
                     }, type);

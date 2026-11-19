@@ -68,6 +68,7 @@ int rp_measure_tests(int* passed);
 int holder_contract_tests(int* passed);
 int edge_lanes_tests(int* passed);
 int rp_timeline_tests(int* passed);
+int ranged_aim_tests(int* passed);
 int rp_timeline_action_tests(int* passed);
 int rp_controller_tests(int* passed);
 int rp_combat_tests(int* passed);
@@ -484,6 +485,7 @@ int main() {
     { int pp = 0; const int pf = holder_contract_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = edge_lanes_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_timeline_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = ranged_aim_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_timeline_action_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_controller_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_combat_tests(&pp); g_pass += pp; g_fail += pf; }

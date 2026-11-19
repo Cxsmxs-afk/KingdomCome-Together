@@ -2,6 +2,7 @@
 #pragma once
 
 #include "walk_holder.h"
+#include "ranged_aim.h"
 
 #include <algorithm>
 #include <array>
@@ -37,10 +38,12 @@ struct Sample {
 
 struct Output {
     uint64_t targetHostMs = 0, appliedHostMs = 0;
+    uint64_t rangedStateHostMs = 0;
     uint32_t bufferMs = 0, extrapMs = 0;
     float x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, vz = 0;
     Sample source;
     bool ready() const { return appliedHostMs != 0; }
+    bool ranged_held() const { return rangedStateHostMs && (source.state[3] & rangedaim::kHeldBit) != 0; }
 };
 
 enum class Ingest { Rejected, Accepted, Late, Restarted };
@@ -112,7 +115,7 @@ public:
         if (sample.stateHostMs > sample.hostMs) sample.stateHostMs = 0;
         if (size_) {
             const auto& previous = samples_[size_ - 1];
-            if (sample.stateHostMs < previous.stateHostMs) {
+            if (previous.stateHostMs && sample.stateHostMs <= previous.stateHostMs) {
                 sample.stateHostMs = previous.stateHostMs;
                 sample.state = previous.state;
             }
@@ -174,9 +177,9 @@ public:
                 out.appliedHostMs = advance(before->hostMs, out.extrapMs);
             }
         }
-        // A drawn bow stays until a newer sample confirms it is down. Movement freshness still drops crouch and the other bits.
-        const bool rangedHeld = out.source.stateHostMs != 0 && (out.source.state[3] & 0x08) != 0;
-        if (!rangedHeld && (out.source.stateHostMs > out.appliedHostMs || out.targetHostMs - out.source.stateHostMs >= kStateFreshMs))
+        // Keep the latest confirmed draw independently of the time limits for crouch, guard, and movement.
+        if (out.source.stateHostMs <= out.appliedHostMs) out.rangedStateHostMs = out.source.stateHostMs;
+        if (out.source.stateHostMs > out.appliedHostMs || out.targetHostMs - out.source.stateHostMs >= kStateFreshMs)
             out.source.stateHostMs = 0;
         return out;
     }
