@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -58,6 +59,11 @@ public partial class ClientSession
     private (long Query, long Received, long Sent) _presentationProbe;
     private PresentationClockSample? _presentationClock;
     private volatile bool _linkPresentationTime, _linkPresentationCombat;
+    private volatile bool _linkPvpContact;
+    private static long s_nextPvpIncarnation;
+    private PvpContactWindow _pvpContacts;
+    internal bool LinkPvpContact => _linkPvpContact;
+    internal ulong PvpIncarnation { get; private set; }
 
     private readonly record struct QueuedWrite(byte[]? Packet, byte? GhostId, string? NpcKey = null, long Ts = 0);
 
@@ -100,13 +106,15 @@ public partial class ClientSession
         (ushort)((W213Switch.TwinOff("link_sched") ? 0 : Protocol.LinkCapLatestWins)
                | (W213Switch.TwinOff("link_sched") || W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
                | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc)
-               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapWorldSync
+               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapWorldSync | Protocol.LinkCapPvpContact
                | (W213Switch.TwinOff("world_recovery") ? 0 : Protocol.LinkCapWorldRecovery));
 
     private void OnLinkHello(byte[] hello)
     {
         Protocol.TryParseLinkHello(hello, out byte version, out ushort caps, out _, out _);
         ushort both = (ushort)(caps & RelayLinkCaps);
+        // Once enabled the link keeps its contact identity until disconnect.
+        if (_linkPvpContact) both |= Protocol.LinkCapPvpContact;
         if ((both & Protocol.LinkCapWorldSync) == 0) both &= unchecked((ushort)~Protocol.LinkCapWorldRecovery);
         var path = _conn.Path;
         byte transport = _conn.Steam is not null ? Protocol.LinkTransportSteam : path is { Transport: "shaped" } ? Protocol.LinkTransportShaped : Protocol.LinkTransportTcp;
@@ -132,6 +140,11 @@ public partial class ClientSession
         _logger.Information("MP-LINK hello client={Id} version={Version} asked=0x{Asked:X4} both=0x{Both:X4} transport={Transport} rate={Rate}",
             Id, version, caps, both, Protocol.LinkTransportName(transport), rate);
         EnqueueRaw(Protocol.BuildLinkHelloDown(both, transport, rate));
+        if (!_linkPvpContact && (both & Protocol.LinkCapPvpContact) != 0)
+        {
+            _linkPvpContact = true;
+            _broadcastService.AnnouncePvpPeers(this);
+        }
     }
 
     internal bool TryPresentationClock(long now, out PresentationClockSample sample)
@@ -198,6 +211,16 @@ public partial class ClientSession
     /// the session). Read by ClientHandler.PickAuthority; see ProtocolWo127.cs.
     /// </summary>
     public bool ClaimsHost { get; private set; }
+
+    /// <summary>The last world epoch and run this client announced. Zero and an empty guid mean "not announced".</summary>
+    public uint AnnouncedWorldEpoch { get; private set; }
+    public Guid AnnouncedRunId { get; private set; }
+
+    internal void NoteAnnouncement(uint world, Guid run)
+    {
+        AnnouncedWorldEpoch = world;
+        AnnouncedRunId = run;
+    }
 
     /// <summary>WO-213 C.2: the client's LinkHello said it sends and takes state the unreliable way (and the relay agreed).</summary>
     public bool LinkUnreliableState { get; internal set; }
@@ -412,6 +435,7 @@ public partial class ClientSession
             // and expects 0xFF -- dropped the connection ("Expected Ack, got
             // packet type ..."). The write queue is FIFO, so first-queued is
             // first-sent. Id is already assigned (TryMarkReady above).
+            PvpIncarnation = (ulong)Interlocked.Increment(ref s_nextPvpIncarnation);
             EnqueueRaw(BuildPacket(Protocol.Ack, [Id]));
             Name = name;
 
@@ -473,6 +497,17 @@ public partial class ClientSession
                 if (type == Protocol.Handshake || !Protocol.IsUpLenOk(type, payloadLen))
                 {
                     await DropFrameAsync(type, payloadLen, GateReason(type, payloadLen));
+                    continue;
+                }
+
+                // Keep transport, voice and clean session exits working. A
+                // Position may carry the host claim and W203 permits the exact
+                // resume proof in RouteJoin. Neither can move the paused world.
+                if (_clientHandler.HostAbsent &&
+                    type is not (Protocol.Ping or Protocol.ClockSyncUp or Protocol.PresentationClockUp or Protocol.LinkHelloUp or
+                        Protocol.Position or Protocol.W203Up or Protocol.VoiceUp or Protocol.SessionLeave))
+                {
+                    await DropFrameAsync(type, payloadLen, "host-absent");
                     continue;
                 }
 
@@ -650,9 +685,10 @@ public partial class ClientSession
                     // cannot inject NPC damage into someone else's game.
                     if (!_clientHandler.IsDamageAuthority(this))
                     {
-                        _logger.Warning("[!] '{Name}' (id={Id}) sent PlayerHitUp without holding damage authority -- dropped.",
-                            Name, Id);
-                        _clientHandler.CountDrop(Protocol.PlayerHitUp, "not-host");   // WO-203 II.5: counted, not only a line
+                        string why = _clientHandler.HostAbsent ? "host-absent" : "not-host";
+                        _logger.Warning("[!] '{Name}' (id={Id}) sent PlayerHitUp without holding damage authority -- dropped ({Why}).",
+                            Name, Id, why);
+                        _clientHandler.CountDrop(Protocol.PlayerHitUp, why);
                         continue;
                     }
                     _broadcastService.RoutePlayerHit(this, body);
@@ -881,10 +917,21 @@ public partial class ClientSession
                 // broadcast), never authority-gated -- any player can hit any
                 // player. Whether friendly fire is on is decided at both ends
                 // (the host's lever), not here.
-                if (type == Protocol.PlayerHitV8Up && payloadLen == PlayerHitV8.UpLen)
+                if (type == Protocol.PlayerHitV8Up)
                 {
-                    var body = new byte[PlayerHitV8.UpLen];
+                    var body = new byte[payloadLen];
                     await ReadExactAsync(body);
+                    bool identified = payloadLen == PlayerHitV8.IdentifiedUpLen;
+                    if (identified != LinkPvpContact)
+                    {
+                        _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-contact-capability");
+                        continue;
+                    }
+                    if (identified && !_pvpContacts.TryClaim(BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(PlayerHitV8.UpLen))))
+                    {
+                        _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-contact-stale-or-duplicate");
+                        continue;
+                    }
                     _broadcastService.RoutePlayerHitV8(this, body);
                     continue;
                 }
@@ -1060,7 +1107,8 @@ public partial class ClientSession
                     if (dest is null)
                     {
                         _clientHandler.CountDrop((byte)type, why, Protocol.DropKeyHasKind(type) ? Protocol.JoinBodyKind(body) : -1);
-                        _logger.Warning("[join] {Kind} from '{Name}' (id={Id}) to {Target} dropped: {Why}.", jw.Name, Name, Id, body[0], why);
+                        if (!why.StartsWith("host-absent", StringComparison.Ordinal))
+                            _logger.Warning("[join] {Kind} from '{Name}' (id={Id}) to {Target} dropped: {Why}.", jw.Name, Name, Id, body[0], why);
                         continue;
                     }
                     bool carryHeld = type == Protocol.CarryUp && body.Length > Protocol.JoinHeaderLen && body[Protocol.JoinHeaderLen] == Protocol.CarryHeld;   // WO-148: every 2 s while carrying
@@ -1083,8 +1131,9 @@ public partial class ClientSession
                     var ws = WorldSaved.TryDecode(body, down: false, out _);
                     if (!_clientHandler.IsDamageAuthority(this))
                     {
-                        _logger.Warning("[!] '{Name}' (id={Id}) sent WorldSaved without holding damage authority -- dropped.", Name, Id);
-                        _clientHandler.CountDrop(Protocol.WorldSavedUp, "not-host");   // WO-203 II.5: counted, not only a line
+                        string why = _clientHandler.HostAbsent ? "host-absent" : "not-host";
+                        _logger.Warning("[!] '{Name}' (id={Id}) sent WorldSaved without holding damage authority -- dropped ({Why}).", Name, Id, why);
+                        _clientHandler.CountDrop(Protocol.WorldSavedUp, why);
                         continue;
                     }
                     _logger.Information("[worldsave] '{Name}' (id={Id}) saved the world: seq {Seq} playline{Playline}/{File}.",
@@ -1126,13 +1175,17 @@ public partial class ClientSession
                 // receiver sees exactly what it saw before WO-127.
                 bool claims = (flags & Protocol.PositionFlagHostClaim) != 0;
                 flags = (byte)(flags & ~Protocol.PositionFlagHostClaim);
+                if (claims && _clientHandler.HostAbsent && !_clientHandler.IsReturningHost(this))
+                    claims = false;
                 if (claims != ClaimsHost)
                 {
                     ClaimsHost = claims;
+                    if (claims) _clientHandler.TryResumeHost(this);
                     _logger.Information("MP-HOST-CLAIM '{Name}' (id={Id}, {Transport}) {What} the session host.",
                         Name, Id, Transport, claims ? "claims" : "no longer claims");
                     _broadcastService.BroadcastCombatRole();   // re-decides and logs MP-AUTHORITY-OWNER
                 }
+                if (_clientHandler.HostAbsent) continue;
                 // WO-101: everything after the flags byte is the tail -- body
                 // state (5) and/or the sender's ms (4, WO-118 follow-up), none
                 // on a 17-byte packet -- forwarded verbatim. The relay does not
@@ -1417,12 +1470,31 @@ public partial class ClientSession
     /// upstream body verbatim (victim id included -- the receiver checks it is
     /// itself).
     /// </summary>
-    public void EnqueuePlayerHitV8(byte attackerId, byte[] upstreamBody)
+    public void EnqueuePlayerHitV8(ClientSession attacker, byte[] upstreamBody)
     {
-        var payload = new byte[PlayerHitV8.DownLen];
-        payload[0] = attackerId;
-        Buffer.BlockCopy(upstreamBody, 0, payload, 1, PlayerHitV8.UpLen);
+        bool identified = upstreamBody.Length == PlayerHitV8.IdentifiedUpLen;
+        // A mixed-capability pair cannot forward an identified contact or strip its ID.
+        if (identified != LinkPvpContact) return;
+        if (identified &&
+            BinaryPrimitives.ReadUInt64LittleEndian(upstreamBody.AsSpan(PlayerHitV8.UpLen + sizeof(ulong))) != PvpIncarnation)
+        {
+            _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-recipient-retired");
+            return;
+        }
+        var payload = new byte[identified ? PlayerHitV8.IdentifiedDownLen : PlayerHitV8.DownLen];
+        payload[0] = attacker.Id;
+        upstreamBody.CopyTo(payload, 1);
+        if (identified)
+            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(PlayerHitV8.DownLen + sizeof(ulong)), attacker.PvpIncarnation);
         EnqueueRaw(BuildPacket(Protocol.PlayerHitV8Down, payload));
+    }
+
+    internal void EnqueuePvpPeer(ClientSession peer)
+    {
+        var payload = new byte[Protocol.PvpPeerLen];
+        payload[0] = peer.Id;
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(1), peer.PvpIncarnation);
+        EnqueueRaw(BuildPacket(Protocol.PvpPeerDown, payload));
     }
 
     /// <summary>Thread-safe: enqueue a PlayerDeathDown (0x24). Idempotent at the receiver.</summary>
@@ -1545,9 +1617,13 @@ public partial class ClientSession
         int kind = -1;
         if (payloadLen > 0)
         {
-            var skip = new byte[payloadLen];
-            await ReadExactAsync(skip);
-            if (Protocol.DropKeyHasKind(type)) kind = Protocol.JoinBodyKind(skip);
+            var skip = ArrayPool<byte>.Shared.Rent(payloadLen);
+            try
+            {
+                await ReadExactAsync(skip, payloadLen);
+                if (Protocol.DropKeyHasKind(type)) kind = Protocol.JoinBodyKind(skip.AsSpan(0, payloadLen));
+            }
+            finally { ArrayPool<byte>.Shared.Return(skip, clearArray: type == Protocol.WorldChunkUp); }
         }
         _clientHandler.CountDrop((byte)type, reason, kind);
     }

@@ -2,6 +2,8 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using KcdMp.Wire;
 
@@ -13,6 +15,7 @@ namespace KcdMp.Client.Tests;
 /// No real save anywhere: every real header carries the writing machine's
 /// account name.
 /// </summary>
+[Collection("Join calendar integration")]
 public class Wo124Tests : IDisposable
 {
     private readonly string _saves = Path.Combine(Path.GetTempPath(), "kcdmp-wo124-" + Guid.NewGuid().ToString("N"));
@@ -85,31 +88,114 @@ public class Wo124Tests : IDisposable
     // ---------------------------------------------------------------- Phase 3: the transient file
 
     [Fact]
-    public void Sweep_removes_every_transient_world_and_nothing_else()
+    public void Startup_sweep_removes_the_marked_join_world_and_preserves_unmarked_files()
     {
-        string keep = Header("playline2", "quicksave022.whs", 10);
-        string a = Header("playline2", "mpworld227213e4.whs", 11);
-        string b = Header("playline0", "mpworld00000001.part", null);
-        string c = Header("playline4", "mpworldabc.whs", 12);
-        string d = Header("playline1 - Copy", "mpworld1.whs", 13);   // not a playline: not ours to touch
-        string e = Header("playline2", "mpworldnothex.whs", 14);     // not the join's name shape
+        string personal = Header("playline2", "quicksave022.whs", 10);
+        byte[] ownBytes = File.ReadAllBytes(personal);
+        string oldExit = Header("playline2", "mpexit01020304.whs", 11);
+        byte[] exitBytes = File.ReadAllBytes(oldExit);
+        string copiedFolder = Header("playline1 - Copy", "mpworld227213e4.whs", 12);
+        byte[] joinBytes = "join payload at the journal boundary"u8.ToArray();
+        string marked = Path.Combine(_saves, "playline2", "mpworld227213e4.whs");
+        string unmarked = Path.Combine(_saves, "playline2", "mpworld00000001.whs");
+        var journal = new JoinWorldJournal();
+        byte[] joinSha = SHA256.HashData(joinBytes);
+        journal.Register(_saves, marked, "abc0123456", 0x227213e4, joinSha);
+        using (var stage = journal.CreateStage(_saves, marked, 0x227213e4, joinSha)) stage.Write(joinBytes);
+        journal.SealStage(_saves, marked, 0x227213e4, joinSha);
+        journal.Publish(_saves, marked, 0x227213e4, joinSha);
+        File.WriteAllBytes(unmarked, joinBytes);
 
-        int n = GameBridge.SweepTransientWorlds(_saves, keep: null);
-        Assert.Equal(3, n);
-        Assert.True(File.Exists(keep));
-        Assert.False(File.Exists(a));
-        Assert.False(File.Exists(b));
-        Assert.False(File.Exists(c));
-        Assert.True(File.Exists(d));
-        Assert.True(File.Exists(e));
+        const string saveVar = "KCDMP_JOIN_SAVES_DIR", dataVar = "KCDMP_DATA_DIR";
+        string? oldSaves = Environment.GetEnvironmentVariable(saveVar), oldData = Environment.GetEnvironmentVariable(dataVar);
+        string data = Path.Combine(_saves, "data");
+        try
+        {
+            Environment.SetEnvironmentVariable(saveVar, _saves);
+            Environment.SetEnvironmentVariable(dataVar, data);
+            var restarted = new GameBridge(new ClientConfig());
+            Assert.Equal(1, restarted.Wo125Sweep("before a join")); // Legacy mpexit handling still runs.
+            Assert.True(File.Exists(marked));
+            Assert.Equal(1, restarted.Wo125Sweep("agent start"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(saveVar, oldSaves);
+            Environment.SetEnvironmentVariable(dataVar, oldData);
+        }
+        Assert.False(File.Exists(marked));
+        Assert.Equal(ownBytes, File.ReadAllBytes(personal));
+        Assert.Equal(joinBytes, File.ReadAllBytes(unmarked));
+        Assert.True(File.Exists(copiedFolder));
+        Assert.False(File.Exists(oldExit));
+        string sweptExit = Assert.Single(Directory.EnumerateFiles(Path.Combine(data, "henry", "swept")));
+        Assert.Equal(exitBytes, File.ReadAllBytes(sweptExit));
     }
 
     [Fact]
-    public void Sweep_keeps_the_file_it_is_told_to_keep()
+    public void Startup_sweep_keeps_a_live_owner_and_a_copy_the_engine_may_be_reading()
     {
-        string a = Header("playline2", "mpworld00000002.whs", 11);
-        Assert.Equal(0, GameBridge.SweepTransientWorlds(_saves, keep: a));
-        Assert.True(File.Exists(a));
+        string playline = Path.Combine(_saves, "playline2");
+        Directory.CreateDirectory(playline);
+        string live = Path.Combine(playline, "mpworld00000002.whs");
+        string loading = Path.Combine(playline, "mpworld00000003.whs");
+        byte[] world = "same simulated save content"u8.ToArray();
+        byte[] digest = SHA256.HashData(world);
+        var owner = new JoinWorldJournal();
+        owner.Register(_saves, live, "abc0123456", 2, digest);
+        using (var stage = owner.CreateStage(_saves, live, 2, digest)) stage.Write(world);
+        owner.SealStage(_saves, live, 2, digest);
+        owner.Publish(_saves, live, 2, digest);
+        owner.Register(_saves, loading, "def0123456", 3, digest);
+        using (var stage = owner.CreateStage(_saves, loading, 3, digest)) stage.Write(world);
+        owner.SealStage(_saves, loading, 3, digest);
+        owner.Publish(_saves, loading, 3, digest);
+        Assert.True(owner.MarkLoadSubmitted(_saves, loading, 3, digest));
+
+        Assert.Equal(0, new JoinWorldJournal().Sweep(_saves, path => path == live));
+        Assert.Equal(world, File.ReadAllBytes(live));
+        Assert.Equal(world, File.ReadAllBytes(loading));
+    }
+
+    [Fact]
+    public void Reconnect_sweep_preserves_the_active_placement_then_recovers_it_after_abandonment()
+    {
+        string playline = Path.Combine(_saves, "playline2");
+        Directory.CreateDirectory(playline);
+        string destination = Path.Combine(playline, "mpworld00000004.whs");
+        const string worldTag = "abc0123456";
+        byte[] world = "synthetic world with an unfinished write"u8.ToArray();
+        byte[] sha = SHA256.HashData(world);
+        var journal = new JoinWorldJournal();
+        string part = journal.Register(_saves, destination, worldTag, 4, sha);
+        using (var stage = journal.CreateStage(_saves, destination, 4, sha)) stage.Write(world[..9]);
+
+        string? previousSaves = Environment.GetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR");
+        string? previousData = Environment.GetEnvironmentVariable("KCDMP_DATA_DIR");
+        try
+        {
+            Environment.SetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR", _saves);
+            Environment.SetEnvironmentVariable("KCDMP_DATA_DIR", Path.Combine(_saves, "data"));
+            var bridge = new GameBridge(new ClientConfig());
+            var active = typeof(GameBridge).GetField("_jj", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var join = Activator.CreateInstance(active.FieldType, nonPublic: true)!;
+            active.FieldType.GetField("PlacedPath")!.SetValue(join, destination);
+            active.SetValue(bridge, join);
+
+            Assert.Equal(0, bridge.Wo125Sweep("agent start"));
+            Assert.Equal(world[..9], File.ReadAllBytes(part));
+            Assert.True(journal.HasReservation(_saves, worldTag));
+
+            active.SetValue(bridge, null);
+            Assert.Equal(1, bridge.Wo125Sweep("agent start"));
+            Assert.False(journal.HasReservation(_saves, worldTag));
+            Assert.False(File.Exists(destination));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR", previousSaves);
+            Environment.SetEnvironmentVariable("KCDMP_DATA_DIR", previousData);
+        }
     }
 
     // ---------------------------------------------------------------- Phase 4: the Henry check

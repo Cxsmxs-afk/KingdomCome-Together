@@ -236,15 +236,15 @@ public sealed class WorldReceiver : IDisposable
     public static byte[] BuildAbort(byte target, uint joinId, byte reason) =>
         Protocol.BuildJoinUp(Protocol.JoinAbortUp, target, joinId, [reason]);
 
-    public static byte[] BuildReady(uint joinId, uint worldSavedSeq)
+    public static byte[] BuildReady(uint joinId, uint worldSavedSeq, byte host = Protocol.JoinTargetHost)
     {
         var b = new byte[4];
         BinaryPrimitives.WriteUInt32LittleEndian(b, worldSavedSeq);
-        return Protocol.BuildJoinUp(Protocol.JoinerReadyUp, Protocol.JoinTargetHost, joinId, b);
+        return Protocol.BuildJoinUp(Protocol.JoinerReadyUp, host, joinId, b);
     }
 
-    public static byte[] BuildRequest(uint joinId, byte flags = 0) =>
-        Protocol.BuildJoinUp(Protocol.JoinRequestUp, Protocol.JoinTargetHost, joinId, [flags]);
+    public static byte[] BuildRequest(uint joinId, byte flags = 0, byte host = Protocol.JoinTargetHost) =>
+        Protocol.BuildJoinUp(Protocol.JoinRequestUp, host, joinId, [flags]);
 
     public void Dispose()
     {

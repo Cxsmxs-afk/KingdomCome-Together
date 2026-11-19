@@ -44,8 +44,7 @@ public class Program
 	/// the loopback round-trip gate (dotnet/KcdMp.Relay.Tests) hosts
 	/// in-process, so the test exercises the REAL ClientSession /
 	/// TcpBroadcastService code path over a real socket, not a copy of it.
-	/// Pass "--port", "0"-free values only: TcpSocketService binds the port
-	/// it is given.
+	/// With port zero, TcpSocketService reports the actual OS-assigned endpoint.
 	/// </summary>
 	public static WebApplication CreateApp(string[] args)
 	{

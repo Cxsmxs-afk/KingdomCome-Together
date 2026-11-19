@@ -70,9 +70,13 @@ public class Wo195Tests
     public void Every_death_path_and_every_hold_is_hooked()
     {
         string gb = Src("GameBridge.cs");
-        int rel = gb.IndexOf("await Wo195OnCopyDeathAsync(npcName, via);", StringComparison.Ordinal);
-        int apply = gb.IndexOf("applied = await _combat.ApplyDeathAsync(lg, ct);", StringComparison.Ordinal);
-        Assert.True(rel > 0 && apply > rel, "the release runs before the apply (the copy is marked dead before the engine kills it)");
+        string dispatch = Src("GameBridge.NpcDeathDispatch.cs");
+        Assert.Contains("ApplyRemoteNpcDeathAsync(ndName, null, ndSource, \"0x31 FATAL\"", gb);
+        Assert.Contains("ApplyRemoteNpcDeathAsync(npcName, null, nsrc, \"0x27 dead transition\"", gb);
+        Assert.Contains("ApplyOwnedNpcDeathAsync(null, new Guid(payload.AsSpan(1, 16)), sourceId,", gb);
+        Assert.Contains("result = await ObserveNpcDeathAsync(attempt, ct);", dispatch);
+        Assert.Contains("receipt == Receipt.Applied", dispatch);
+        Assert.DoesNotContain("_combat.ApplyDeathAsync(", gb);
         // F2: a local copy's health reading cannot release/kill it on a
         // second path. Only the host's death enters the release above.
         Assert.DoesNotContain("Wo195OnLocalFatal(", gb);

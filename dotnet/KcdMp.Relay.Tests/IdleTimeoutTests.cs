@@ -2,11 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
-using System.Net;
-using System.Net.Sockets;
-using KcdMp.Server;
 using KcdMp.Wire;
-using Microsoft.AspNetCore.Builder;
 using Xunit;
 
 namespace KcdMp.Relay.Tests;
@@ -17,9 +13,8 @@ namespace KcdMp.Relay.Tests;
 // network vanishes silently -- cable pulled, hard crash -- leaves the relay's
 // read parked with neither signal. ClientSession sets NetworkStream.ReadTimeout
 // (Tcp:IdleTimeoutMs, TcpSocketService); this is the one test that proves an
-// idle connection is actually torn down and damage authority (Rule 2, the
-// lowest ready id) actually moves to whoever remains -- not just that the
-// field compiles.
+// idle connection is actually torn down and the selected host remains the
+// only rightful owner even when its connection times out.
 //
 // Runs its own relay (not RelayFixture's) so its idle timeout can be short
 // (300 ms) without shortening the 30 s production default or affecting any
@@ -28,19 +23,11 @@ namespace KcdMp.Relay.Tests;
 public class IdleTimeoutTests
 {
     [Fact]
-    public async Task Silent_peer_is_dropped_and_damage_authority_moves_to_the_survivor()
+    public async Task Silent_host_is_dropped_and_the_survivor_stays_without_damage_authority()
     {
-        int tcpPort = FreePort();
-        int httpPort = FreePort();
-        await using var app = Program.CreateApp(new[]
-        {
-            "--port", tcpPort.ToString(),
-            "--Urls", $"http://127.0.0.1:{httpPort}",
-            "--Serilog:WriteTo:1:Name", "Console",
-            "--Tcp:IdleTimeoutMs", "300",
-        });
-        await app.StartAsync();
-        await WaitForBindAsync(tcpPort);
+        var relay = RelayListeners.CreateApp("--Tcp:IdleTimeoutMs", "300");
+        int tcpPort = (await RelayListeners.StartAsync(relay)).Port;
+        await using var app = relay;
 
         var a = await Peer.ConnectAsync(tcpPort, "alpha");
         var b = await Peer.ConnectAsync(tcpPort, "bravo");
@@ -63,33 +50,16 @@ public class IdleTimeoutTests
             await Task.Delay(100);
         }
 
-        // Bravo is told it is now the authority -- the relay noticed alpha's
-        // read time out, tore the connection down, and re-ran Rule 2 over
-        // the set that remains, exactly as a clean disconnect would.
+        // Read the actual disconnect before the resulting role notice, so a
+        // previously queued "not the host" frame cannot satisfy the test.
+        var disconnected = await b.ReadUntilAsync(Protocol.Disconnect, TimeSpan.FromSeconds(2));
+        Assert.Equal(a.Id, disconnected[0]);
         var newRole = await b.ReadUntilAsync(Protocol.CombatRole, TimeSpan.FromSeconds(2));
-        Assert.Equal(1, newRole[0]);
+        Assert.Equal(0, newRole[0]);
 
         await a.DisposeAsync();
         await b.DisposeAsync();
         await app.StopAsync();
-    }
-
-    private static async Task WaitForBindAsync(int port)
-    {
-        var deadline = DateTime.UtcNow.AddSeconds(10);
-        while (true)
-        {
-            try
-            {
-                using var probe = new TcpClient();
-                await probe.ConnectAsync(IPAddress.Loopback, port);
-                return;
-            }
-            catch (SocketException) when (DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(50);
-            }
-        }
     }
 
     private static byte[] BuildPing()
@@ -99,14 +69,5 @@ public class IdleTimeoutTests
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(1), 8);
         BinaryPrimitives.WriteInt64LittleEndian(packet.AsSpan(3), DateTime.UtcNow.Ticks);
         return packet;
-    }
-
-    private static int FreePort()
-    {
-        var l = new TcpListener(IPAddress.Loopback, 0);
-        l.Start();
-        int port = ((IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
     }
 }

@@ -93,6 +93,7 @@ public sealed class EdgePipeTests
         private const BindingFlags Instance = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
         private static readonly MethodInfo Schedule = typeof(GameBridge).GetMethod("TrySchedulePresentationRowAsync", Instance)!;
         private static readonly MethodInfo Submit = typeof(GameBridge).GetMethod("TrySubmitPresentationCombatAsync", Instance)!;
+        private static readonly MethodInfo Dispatch = typeof(GameBridge).GetMethod("DispatchWo121ActionAsync", Instance)!;
 
         private static FieldInfo Field(string name) => typeof(GameBridge).GetField(name, Instance)!;
         private static Type Nested(string name) => typeof(GameBridge).GetNestedType(name, BindingFlags.NonPublic)!;
@@ -126,12 +127,33 @@ public sealed class EdgePipeTests
 
         public Task<bool> Apply(ActionKind kind, string table, byte flags, ushort seq, CancellationToken ct)
         {
+            int actionType = table switch
+            {
+                "combat_action_block" => ActionRowCatalog.ActionBlock,
+                "combat_action_perfect_block" => ActionRowCatalog.ActionPerfectBlock,
+                _ => -1
+            };
+            return ApplyRow(kind, new(table, "Combat", "tags", 0, 0, 0, ActionType: actionType), flags, seq, ct);
+        }
+
+        public Task<bool> ApplyRow(ActionKind kind, ActionRowCatalog.Row row, byte flags, ushort seq, CancellationToken ct)
+        {
             var action = new InboundAction(Peer, kind, seq, ActionPhase.Commit, default, [70, 0, 0, 0]);
-            var row = new ActionRowCatalog.Row(table, "Combat", "tags", 0, 0, 0);
             return (Task<bool>)Schedule.Invoke(bridge, [action, Entity, row, flags, stamp, ct])!;
         }
 
+        public Task<bool> DispatchBlock(ActionRowCatalog catalog, Guid row, ushort seq, CancellationToken ct, string name = "")
+        {
+            Field("_rowCatalog").SetValue(bridge, Task.FromResult<ActionRowCatalog?>(catalog));
+            var action = new InboundAction(Peer, ActionKind.BlockImpulse, seq, ActionPhase.Commit, default,
+                new RowEvent(70, 0, row, name).ToBytes());
+            return (Task<bool>)Dispatch.Invoke(bridge, [action, ct, stamp])!;
+        }
+
         public void Rebind() => ((ConcurrentDictionary<string, int>)Field("_ghostBodyGen").GetValue(bridge)!)["2"] = 1;
+
+        public void SetTypedCombat(bool enabled) =>
+            ((ConcurrentDictionary<string, bool>)Field("_w221On").GetValue(bridge)!)["rp_combat"] = enabled;
 
         public void DisableModes()
         {
@@ -142,6 +164,146 @@ public sealed class EdgePipeTests
         public Task<PresentationCombatAdmission> Knockout(bool down, bool recovery, CancellationToken ct, Func<bool>? ready = null) =>
             (Task<PresentationCombatAdmission>)Submit.Invoke(bridge,
                 [Peer, Entity, stamp, (ushort)62, (byte)0x81, new byte[] { down ? (byte)1 : (byte)0 }, ct, 0u, ready, recovery])!;
+    }
+
+    private static readonly ActionRowCatalog.Row CapturedPerfectBlock = new("combat_action_perfect_block", "CombatBlockPerfectGen",
+        "l_noShield+r_shortSwords+player+rightGuard+eZ1+dZ1+oppMale", 1, -1, -1, ActionRowCatalog.ActionPerfectBlock,
+        ActorClass: 1578932418, WeaponR: 2, WeaponL: 0);
+
+    private static readonly ActionRowCatalog.Row AuthoredOrdinaryBlock = CapturedPerfectBlock with
+    {
+        Table = "combat_action_block", Fragment = "CombatBlockGen", Tags = "r_shortSwords+l_noShield+player+sZ1+eZ1+dZ1+oppMale",
+        ActionType = ActionRowCatalog.ActionBlock
+    };
+
+    [Fact]
+    public async Task Unflagged_perfect_block_with_exact_player_context_uses_an_authored_ordinary_block()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        var perfectId = Guid.NewGuid();
+        var catalog = ActionRowCatalog.FromRows([(perfectId, CapturedPerfectBlock), (Guid.NewGuid(), AuthoredOrdinaryBlock)]);
+        var play = harness.DispatchBlock(catalog, perfectId, 12, conn.Token);
+        var firstRequest = conn.Read(Request);
+        Assert.Same(firstRequest, await Task.WhenAny(play, firstRequest));
+        var registration = await firstRequest;
+        Assert.Equal(0x3F, registration[5]);
+        Assert.Equal((byte)ActionKind.BlockImpulse, registration[15]);
+        Assert.Equal(AuthoredOrdinaryBlock.Spec, Encoding.UTF8.GetString(registration.AsSpan(20)));
+        await conn.Respond(Id(registration), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+
+        var request = await conn.Read(Request);
+        Assert.Equal(0x40, request[5]);
+        Assert.Equal(registration[16..20], request[27..]);
+        Assert.Equal(1150ul, BinaryPrimitives.ReadUInt64LittleEndian(request.AsSpan(15)));
+        Assert.Equal(12, BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(23)));
+        Assert.Equal((byte)ActionKind.BlockImpulse, request[25]);
+        await conn.Respond(Id(request), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        Assert.True(await play);
+    }
+
+    [Theory]
+    [InlineData("missing-actor")]
+    [InlineData("wrong-actor")]
+    [InlineData("missing-left-weapon")]
+    [InlineData("reversed-weapon-ids")]
+    [InlineData("wrong-hand-tags")]
+    [InlineData("conflicting-hand-tags")]
+    [InlineData("missing-zone")]
+    [InlineData("conflicting-zone")]
+    [InlineData("npc-only")]
+    [InlineData("npc-pair")]
+    [InlineData("npc-wire")]
+    [InlineData("other-opponent")]
+    [InlineData("broken-block")]
+    [InlineData("sync-source")]
+    [InlineData("sync-candidate")]
+    [InlineData("counter-55")]
+    [InlineData("counter-62")]
+    [InlineData("ambiguous")]
+    public async Task Unflagged_perfect_block_without_exact_authored_context_does_not_request_a_pose(string mismatch)
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        var perfect = mismatch switch
+        {
+            "missing-actor" => CapturedPerfectBlock with { ActorClass = 0 },
+            "missing-zone" => CapturedPerfectBlock with { Zone = -1 },
+            "npc-pair" => CapturedPerfectBlock with { Tags = CapturedPerfectBlock.Tags.Replace("+player", "", StringComparison.Ordinal) },
+            "sync-source" => CapturedPerfectBlock with { Fragment = "CombatBlockPerfectSyncGen" },
+            "counter-55" => CapturedPerfectBlock with { ActionType = 55 },
+            "counter-62" => CapturedPerfectBlock with { ActionType = 62 },
+            _ => CapturedPerfectBlock
+        };
+        var ordinary = mismatch switch
+        {
+            "wrong-actor" => AuthoredOrdinaryBlock with { ActorClass = 20967892 },
+            "missing-left-weapon" => AuthoredOrdinaryBlock with { WeaponL = -1 },
+            "reversed-weapon-ids" => AuthoredOrdinaryBlock with { WeaponL = 2, WeaponR = 0 },
+            "wrong-hand-tags" => AuthoredOrdinaryBlock with { Tags = AuthoredOrdinaryBlock.Tags.Replace("l_noShield", "l_shield", StringComparison.Ordinal) },
+            "conflicting-hand-tags" => AuthoredOrdinaryBlock with { Tags = AuthoredOrdinaryBlock.Tags + "+l_shield" },
+            "conflicting-zone" => AuthoredOrdinaryBlock with { Zone = 2 },
+            "npc-only" or "npc-pair" => AuthoredOrdinaryBlock with { Tags = AuthoredOrdinaryBlock.Tags.Replace("+player", "", StringComparison.Ordinal) },
+            "other-opponent" => AuthoredOrdinaryBlock with { Tags = AuthoredOrdinaryBlock.Tags.Replace("oppMale", "oppFemale", StringComparison.Ordinal) },
+            "broken-block" => AuthoredOrdinaryBlock with { ActionType = ActionRowCatalog.ActionBlockBroken },
+            "sync-candidate" => AuthoredOrdinaryBlock with { ComboId = "combo", ComboStep = 1 },
+            _ => AuthoredOrdinaryBlock
+        };
+        var perfectId = Guid.NewGuid();
+        var rows = new List<(Guid, ActionRowCatalog.Row)> { (perfectId, perfect), (Guid.NewGuid(), ordinary) };
+        if (mismatch == "ambiguous")
+            rows.Add((Guid.NewGuid(), ordinary with { Tags = ordinary.Tags.Replace("sZ1", "sZ2", StringComparison.Ordinal) }));
+        var rejected = harness.DispatchBlock(ActionRowCatalog.FromRows(rows), perfectId, 12, conn.Token,
+            mismatch == "npc-wire" ? "guard" : "");
+        var firstRequest = conn.Read(Request);
+        if (await Task.WhenAny(rejected, firstRequest) == firstRequest)
+        {
+            var unexpected = await firstRequest;
+            await conn.Respond(Id(unexpected), EdgeOutcome.Completed, 0x81, [0, 0, 3]);
+            Assert.Fail($"Defense mismatch {mismatch} wrote pipe operation 0x{unexpected[5]:X2}");
+        }
+        Assert.True(await rejected);
+    }
+
+    [Theory]
+    [InlineData("combat_action_block", ActionRowCatalog.ActionPerfectBlock, 0)]
+    [InlineData("combat_action_perfect_block", -1, RowEvent.FlagPerfect)]
+    [InlineData("combat_action_perfect_block", 23, RowEvent.FlagPerfect)]
+    [InlineData("combat_action_perfect_block", ActionRowCatalog.ActionPerfectBlock, 0)]
+    [InlineData("combat_action_perfect_block", 55, 0)]
+    [InlineData("combat_action_perfect_block", 62, 0)]
+    public async Task Presentation_combat_drops_unproven_defence_through_the_real_row_scheduler(string table, int actionType, byte flags)
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        var unproven = new ActionRowCatalog.Row(table, "UnprovenDefence", "tags", 0, 0, 0, ActionType: actionType);
+        var rejected = harness.ApplyRow(ActionKind.BlockImpulse, unproven, flags, 12, conn.Token);
+        var firstRequest = conn.Read(Request);
+        if (await Task.WhenAny(rejected, firstRequest) == firstRequest)
+        {
+            byte[] unexpected = await firstRequest;
+            await conn.Respond(Id(unexpected), EdgeOutcome.Completed, 0x81, [0, 0, 3]);
+            Assert.Fail($"Unproven defence {table}:{actionType} flags={flags} wrote pipe operation 0x{unexpected[5]:X2}");
+        }
+        Assert.True(await rejected);
+
+        // The next unflagged ordinary block still takes the original typed path.
+        var ordinary = new ActionRowCatalog.Row("combat_action_block", "CombatBlockGen", "tags", 0, 0, 0, ActionType: ActionRowCatalog.ActionBlockBroken);
+        var accepted = harness.ApplyRow(ActionKind.BlockImpulse, ordinary, 0, 13, conn.Token);
+        byte[] registration = await firstRequest;
+        Assert.Equal(0x3F, registration[5]);
+        Assert.Equal((byte)ActionKind.BlockImpulse, registration[15]);
+        Assert.Equal("CombatBlockGen, tags", Encoding.UTF8.GetString(registration.AsSpan(20)));
+        await conn.Respond(Id(registration), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        byte[] request = await conn.Read(Request);
+        Assert.Equal(0x40, request[5]);
+        Assert.Equal((byte)ActionKind.BlockImpulse, request[25]);
+        Assert.Equal(13, BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(23)));
+        await conn.Respond(Id(request), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        Assert.True(await accepted);
     }
 
     [Theory]
@@ -206,17 +368,29 @@ public sealed class EdgePipeTests
         var nextRequest = await conn.Read(Request);
         Assert.Equal(43, BinaryPrimitives.ReadUInt16LittleEndian(nextRequest.AsSpan(23)));
         await conn.Respond(Id(nextRequest), EdgeOutcome.Unsupported);
-        var old = await conn.Read(Request);
-        Assert.Equal(0x3B, old[5]);
-        await conn.Respond(Id(old), EdgeOutcome.Completed, 0x81, [0, 0, 1]);
-        Assert.False(await next);
+        Assert.True(await next);
 
-        var legacy = harness.Apply(ActionKind.BlockImpulse, "combat_action_block", 0, 44, conn.Token);
-        var legacyRequest = await conn.Read(Request);
-        Assert.Equal(0x3B, legacyRequest[5]);
-        Assert.Equal(44, BinaryPrimitives.ReadUInt16LittleEndian(legacyRequest.AsSpan(23)));
-        await conn.Respond(Id(legacyRequest), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
-        Assert.True(await legacy);
+        var following = harness.Apply(ActionKind.BlockImpulse, "combat_action_block", 0, 44, conn.Token);
+        var followingRequest = await conn.Read(Request);
+        Assert.Equal(0x40, followingRequest[5]);
+        Assert.Equal(44, BinaryPrimitives.ReadUInt16LittleEndian(followingRequest.AsSpan(23)));
+        await conn.Respond(Id(followingRequest), EdgeOutcome.Completed, 0x81, [1, 0, 0]);
+        Assert.True(await following);
+    }
+
+    [Fact]
+    public async Task Presentation_combat_does_not_release_a_legacy_retry_after_the_typed_owner_takes_over()
+    {
+        await using var conn = new Connection();
+        await conn.Connect();
+        var harness = await PresentationCombatHarness.CreateAsync(conn);
+        harness.SetTypedCombat(false);
+        var action = harness.Apply(ActionKind.Attack, "combat_action_attack", 0, 45, conn.Token);
+        var legacy = await conn.Read(Request);
+        Assert.Equal(0x3B, legacy[5]);
+        harness.SetTypedCombat(true);
+        await conn.Respond(Id(legacy), EdgeOutcome.Unsupported);
+        Assert.True(await action);
     }
 
     [Fact]

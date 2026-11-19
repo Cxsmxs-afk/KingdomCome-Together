@@ -19,6 +19,9 @@ try {
         $path = $entry.FullName.Replace('\', '/')
         if ($entries.ContainsKey($path)) { throw "Duplicate drop-in entry: $path" }
         $entries[$path] = $entry
+        if ($ExpectMissingStartSaves -and $path -like '*.whs') {
+            throw 'A code-only drop-in contains a save file.'
+        }
         if ($path -like 'KingdomComeTogether/start-save/*.whs') {
             if ($path -notmatch '^KingdomComeTogether/start-save/(soldier|adviser|scout)/[^/:]+\.whs$') {
                 throw "Invalid start save drop-in entry: $path"

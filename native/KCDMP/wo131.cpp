@@ -370,7 +370,7 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             c_guardOn.fetch_add(1);
             present = buffs::has(cs, guard_guid()) > 0;
             break;
-        case kGuardOff:
+        case kGuardOff: {
             if (tracked) {
                 report_ko(eid, typed->second, false);
                 if (typed->second.ownsHolster) toggle_holster(eid, cs, false, nullptr);
@@ -381,8 +381,12 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             buffs::remove_all(cs, guard_guid());
             if (k) buffs::remove_all(cs, k->ko);
             c_guardOff.fetch_add(1);
-            present = buffs::has(cs, guard_guid()) <= 0;
+            const int guard = buffs::has(cs, guard_guid());
+            const int knockout = k ? buffs::has(cs, k->ko) : 0;
+            if (guard < 0 || knockout < 0) { c_fail.fetch_add(1); return kRFailed; }
+            present = guard == 0 && knockout == 0;
             break;
+        }
         case kGuardKnockout:
         case kGuardWake: {
             if (tracked) return kRFailed;  // a typed KO owns the guard swap through physical get-up

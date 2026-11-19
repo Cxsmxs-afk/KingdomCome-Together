@@ -280,18 +280,20 @@ public partial class GameBridge
     private void Wo136NoteNpcFlags(string npc, byte flags)
     {
         if ((flags & Protocol.NpcStateFlagNotHuman) != 0) _w141Animals[npc] = true;   // WO-141: its attack rows are an animal's
+        bool dead = (flags & Protocol.NpcStateFlagDead) != 0;
         bool down = Wo136Rules.Down(flags);
         bool was = _w136HostDown.TryGetValue(npc, out bool d0) && d0;
         _w136HostDown[npc] = down;
         // WO-172 C1: the host's dead bit stops this copy's rows at once (the Lua's w172_dead follows ~50 ms later: one row slipped through live)
-        if ((flags & Protocol.NpcStateFlagDead) != 0 && _w172DeadWins) _w172Dead[npc] = Environment.TickCount64;
-        if (down && !was && _w132Engaged.TryRemove(npc, out var eg))
+        if (dead && _w172DeadWins) _w172Dead[npc] = Environment.TickCount64;
+        // Death owns its exact native engagement and action release. KO remains a distinct transition.
+        if (!dead && down && !was && _w132Engaged.TryRemove(npc, out var eg))
         {
             Interlocked.Increment(ref _w136KoReleased);
             _ = Task.Run(async () =>
             {
                 var r = await _combat.Wo132EngageAsync(false, eg.Eid, default);
-                Console.WriteLine($"MP-W136 {npc}: the host's NPC is {((flags & Protocol.NpcStateFlagDead) != 0 ? "dead" : "knocked out")} -> the engagement ends FIRST ({(r.Ok ? "released" : "reason " + r.Reason)}), then the copy goes down (WO-135's knockout mode)");
+                Console.WriteLine($"MP-W136 {npc}: the host's NPC is knocked out -> the engagement ends FIRST ({(r.Ok ? "released" : "reason " + r.Reason)}), then the copy goes down (WO-135's knockout mode)");
             });
         }
     }
@@ -382,10 +384,10 @@ public partial class GameBridge
     /// preset's pieces (not inventory items). The engine's own way off: the empty
     /// preset; the target outfit is then applied over it.
     /// </summary>
-    private async Task Wo136ClearPresetAsync(byte ghostId, string why)
+    private async Task Wo136ClearPresetAsync(byte ghostId, string why, FigureOutfitStamp stamp)
     {
         Interlocked.Increment(ref _w136PresetClears);
-        await ExecLuaAsync($"if KCD2MP_W136ClearPreset then KCD2MP_W136ClearPreset(\"{ghostId}\", \"{why}\") end");
+        await ExecLuaAsync($"if KCD2MP_W136ClearPreset then KCD2MP_W136ClearPreset(\"{ghostId}\", \"{why}\", {stamp.LuaArguments}) end");
     }
 
     /// <summary>A refused class, named from the item table where it can be (the belt case).</summary>

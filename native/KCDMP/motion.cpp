@@ -3,6 +3,8 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // WO-121 -- movement and combat on native-written bodies. See motion.h.
 #include "motion.h"
+#include "ranged_aim.h"
+#include "wo201.h"
 #include "wo131.h"
 #include "motion_remote_rules.h"
 #include "wo178.h"
@@ -1966,6 +1968,17 @@ bool read_local_state2(State2* out, float facingYaw) {
             if (rd(model, kModelBlockMax, &blk) && blk) out->bits |= kBitBlock;
             if (rd(model, kModelOpponent, &opp) && opp) out->bits |= kBitLocked;
         }
+    }
+    // The 50 ms sampler owns this state. Copy it for this exact actor without another engine read.
+    const auto aim = wo201ranged::sampled_aim(actor);
+    if (aim.aim) {
+        out->bits |= kBitRanged;
+        if (aim.charge) {
+            out->bits |= rangedaim::kChargeKnownBit;
+            out->charge = *aim.charge;
+        }
+        out->aimYaw = rangedaim::kAngleUnavailable;
+        out->aimPitch = rangedaim::kAngleUnavailable;
     }
     return true;
 }

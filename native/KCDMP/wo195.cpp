@@ -7,14 +7,17 @@
 #include "wo163.h"
 #include "wo195_rules.h"
 
+#include "buffs.h"
 #include "engine.h"
 #include "hits.h"
 #include "log.h"
 #include "motion.h"
 #include "npc_drive.h"
+#include "rttr_abi.h"
 #include "wo132.h"
 #include "wo172.h"
 #include "wo187.h"
+#include "wo216.h"
 
 #include <atomic>
 #include <cstdio>
@@ -32,6 +35,21 @@ std::atomic<bool> g_on{true};                  // mp_dead_release (the agent's s
 std::unordered_set<std::string> g_said;        // "eid|what" said once (main thread)
 std::atomic<uint32_t> c_refusedHold{0}, c_refusedWish{0}, c_refusedGuard{0}, c_refusedEngage{0}, c_refusedOther{0}, c_releases{0},
     c_releasedEngage{0}, c_releasedGuard{0}, c_releasedWish{0}, c_releasedPin{0}, c_releasedCombat{0}, c_asked{0}, c_checks{0};
+constexpr size_t kScopedBodySize = 1 + sizeof(uint32_t) + 16 + sizeof(uint64_t);
+
+bool scoped_body(const uint8_t* request, uint32_t eid) {
+    uint64_t lifecycle = 0;
+    std::memcpy(&lifecycle, request + 21, sizeof lifecycle);
+    if (!eid || !lifecycle || lifecycle != wo216::lifecycle_generation() || !wo216::lifecycle_gameplay()) return false;
+    void* soul = hits::soul_of_eid(eid);
+    if (!soul) return false;
+    void* canonical = buffs::as_c_soul(soul);
+    unsigned char guid[16]{};
+    constexpr unsigned char noGuid[16]{};
+    return rttr::soul_guid(canonical ? canonical : soul, guid) && std::memcmp(guid, noGuid, sizeof guid) != 0 &&
+           std::memcmp(guid, request + 5, sizeof guid) == 0 &&
+           lifecycle == wo216::lifecycle_generation() && wo216::lifecycle_gameplay();
+}
 
 const char* name_of(uint32_t eid) {
     void* e = engine::entity_by_id(eid);
@@ -114,28 +132,31 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
             return wo163::kROk;
         }
         case kOpRelease: {
-            // [op][eid:4] -> [held][combatMode][living]
-            if (len != 5 || cap < 3) return wo163::kRBadRequest;
+            if (len != kScopedBodySize || cap < 3) return wo163::kRBadRequest;
             uint32_t eid = 0;
             std::memcpy(&eid, body + 1, 4);
-            if (!eid || !engine::entity_by_id(eid)) return wo163::kRNoActor;
             c_asked.fetch_add(1);
-            // WO-221 A: the body's recorded combat actions end before its death (the death takes its combat part apart without the
-            // release call the mechanism hooks)
-            combatactions::end_for_entity(eid, "its death is applied next");
+            if (!scoped_body(body, eid)) return wo163::kRNoActor;
+            const auto proof = combatactions::observe_body(eid);
+            // A queued action may never follow a recycled EID into another actor's combat controller.
+            if (combatactions::end_for_body(proof, "its death is applied next") < 0) return wo163::kRFailed;
+            if (!combatactions::detail::same_body(proof, combatactions::observe_body(eid)) || !scoped_body(body, eid))
+                return wo163::kRNoActor;
             out[0] = on() ? release(eid, "the agent: a death applied") : 0;
             read_body(eid, &out[1], &out[2]);
             *outLen = 3;
             return wo163::kROk;
         }
         case kOpCheck: {
-            // [op][eid:4] -> [dead][combatMode][living][fightHeld]; eid 0 + [nameLen:1][name] = by name (any body, a vanilla one too)
+            // The scoped form is used for corpse follow-up. Read-only diagnostics also accept EID or name.
             if (len < 5 || cap < 4) return wo163::kRBadRequest;
             uint32_t eid = 0;
             std::memcpy(&eid, body + 1, 4);
             if (!eid && len >= 7 && len == 6u + body[5] && body[5] <= 63) {
                 const std::string nm(reinterpret_cast<const char*>(body + 6), body[5]);
                 eid = hits::eid_of_name(nm.c_str());
+            } else if (eid && len == kScopedBodySize) {
+                if (!scoped_body(body, eid)) return wo163::kRNoActor;
             } else if (len != 5) return wo163::kRBadRequest;
             if (!eid || !engine::entity_by_id(eid)) return wo163::kRNoActor;
             c_checks.fetch_add(1);

@@ -11,13 +11,14 @@ namespace KcdMp.Server.Features.Tcp;
 /// <summary>
 /// Service class that handles TCP broadcasts.
 ///
-/// No lock of its own: <see cref="ClientHandler.GetClients"/> already returns a
-/// snapshot taken under the handler's lock, which is the only shared state here.
+/// Client snapshots come from <see cref="ClientHandler.GetClients"/>.
+/// Authority announcements are serialized across connection changes.
 /// </summary>
 public class TcpBroadcastService
 {
     private readonly bool _echo;
     private readonly ClientHandler _clientHandler;
+    private readonly object _combatRoleBroadcast = new();
 
     public TcpBroadcastService(IConfiguration configuration, ClientHandler clientHandler)
     {
@@ -319,15 +320,34 @@ public class TcpBroadcastService
         uint senderTicks = 0)
     {
         why = "";
-        bool fromHost = _clientHandler.IsDamageAuthority(source);
         uint announcedWorld = 0;
+        Guid announcedRun = Guid.Empty;
         if (downType == Protocol.W203Down && body.Length > Protocol.JoinHeaderLen && body[Protocol.JoinHeaderLen] == Protocol.W203Epoch)
         {
             if (!LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var epoch) ||
                 !TryWorldEpochDirection(epoch.Text, out from, out announcedWorld))
             { why = "invalid-world-epoch"; return null; }
+            if (announcedWorld != 0) HostAbsentRules.TryReadRun(epoch.Text, out announcedRun);
         }
         byte target = body[0];
+        if (_clientHandler.AbsentHost is { } held)
+        {
+            // Only a matching declaration from the returning host can cross
+            // the paused relay. Refused epochs must never update a peer's world.
+            if (announcedWorld == 0 || Find(target) is not { } peer || ReferenceEquals(peer, source))
+            { why = "host-absent"; return null; }
+            if (!HostAbsentRules.SameReturn(held, source.IdentityKey, source.Name ?? "", announcedWorld, announcedRun))
+            {
+                if (_clientHandler.IsReturningHost(source)) source.NoteAnnouncement(0, Guid.Empty);
+                why = "host-absent-wrong-world";
+                return null;
+            }
+            source.NoteAnnouncement(announcedWorld, announcedRun);
+            if (!_clientHandler.TryResumeHost(source))
+            { why = "host-absent-awaiting-claim"; return null; }
+            BroadcastCombatRole();
+        }
+        bool fromHost = _clientHandler.IsDamageAuthority(source);
         ClientSession? dest = null;
         switch (from)
         {
@@ -345,9 +365,15 @@ public class TcpBroadcastService
                 dest = target == KcdMp.Wire.Protocol.JoinTargetHost ? _clientHandler.DamageAuthority : Find(target);
                 break;
         }
-        if (dest is null || ReferenceEquals(dest, source)) { why = "no-target"; return null; }
+        if (dest is null || ReferenceEquals(dest, source))
+        {
+            why = dest is null && _clientHandler.HostAbsent ? "host-absent" : "no-target";
+            return null;
+        }
         if (announcedWorld != 0)
         {
+            if (!_clientHandler.ObserveHostAnnouncement(source, announcedWorld, announcedRun))
+            { why = "not-the-host"; return null; }
             source.ObserveWorldSyncEpoch(source.Id, announcedWorld);
             dest.ObserveWorldSyncEpoch(source.Id, announcedWorld);
         }
@@ -395,9 +421,19 @@ public class TcpBroadcastService
         foreach (var target in _clientHandler.GetClients())
             if (target.IsReady && target.Id == victimId)
             {
-                target.EnqueuePlayerHitV8(source.Id, body);
+                target.EnqueuePlayerHitV8(source, body);
                 return;
             }
+    }
+
+    internal void AnnouncePvpPeers(ClientSession source)
+    {
+        foreach (var peer in Others(source))
+        {
+            if (!peer.LinkPvpContact) continue;
+            source.EnqueuePvpPeer(peer);
+            peer.EnqueuePvpPeer(source);
+        }
     }
 
     /// <summary>
@@ -423,10 +459,13 @@ public class TcpBroadcastService
     /// </summary>
     public void BroadcastCombatRole()
     {
-        _clientHandler.LogAuthorityDecision("combat-role");   // WO-110 R4: MP-AUTHORITY-OWNER on every decision
-        var authority = _clientHandler.DamageAuthority;
-        foreach (var target in _clientHandler.GetClients().Where(c => c.IsReady))
-            target.EnqueueCombatRole(ReferenceEquals(target, authority));
+        lock (_combatRoleBroadcast)
+        {
+            _clientHandler.LogAuthorityDecision("combat-role");
+            var authority = _clientHandler.DamageAuthority;
+            foreach (var target in _clientHandler.GetClients().Where(c => c.IsReady))
+                target.EnqueueCombatRole(ReferenceEquals(target, authority));
+        }
     }
 
     /// <summary>

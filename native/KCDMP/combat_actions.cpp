@@ -4,6 +4,8 @@
 // The lifetime of the combat animation actions this mod queues (combat_actions.h).
 #include "combat_actions.h"
 #include "combat_swing.h"
+#include "load_sequence.h"
+#include "motion.h"
 #include "wo221.h"
 #include "wo203.h"
 #include "wo216.h"
@@ -16,11 +18,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
-#include <vector>
 
 namespace kcdmp::combatactions {
 
@@ -32,6 +35,7 @@ namespace {
 // path (slot 0x528 and its two overrides) and by the actor's shutdown.
 constexpr size_t kActorVtReleaseCombat = 0xB60;
 constexpr size_t kActorCombatActor = 0x300;
+constexpr size_t kActorEid = 0x30;         // C_Actor::entity id, checked in motion.cpp
 constexpr size_t kActorEntity = 0x38;      // the actor's entity (read in SetMonsterLOD: mov rdx,[r14+38h])
 // C_CombatAnimAction (CombatModule, RTTI .?AVC_CombatAnimAction@combatmodule@wh@@): +0x28 status (0 none, 1 pending, 2 installed,
 // 3 exiting, 4 finished), +0x58 reference count, +0x9C its body's entity id; vftable slot 14 (+0x70, "fragment started"), slot 17
@@ -39,32 +43,111 @@ constexpr size_t kActorEntity = 0x38;      // the actor's entity (read in SetMon
 constexpr size_t kActStatus = 0x28, kActRefs = 0x58;
 constexpr size_t kSlotStarted = 14, kSlotEnding = 17, kSlotEvent18 = 18, kSlotDelete = 23;
 constexpr size_t kVtCopy = 48;          // slots copied into the quiet vftable (the class has 29; the rest is never called)
-constexpr size_t kMaxTracked = 16384;
-constexpr double kEndedKeepS = 60.0;    // an ended (stopped, quiet) action that never finished is forgotten after this, our reference kept
-constexpr double kDoneKeepS = 30.0;     // a finished action is forgotten after this
+constexpr size_t kBuckets = 256, kBucketSize = 64, kSweepReads = 8, kReleaseStops = 8;
+constexpr uint64_t kDoneKeepMs = 30000;
+constexpr uint64_t kWatchMs = static_cast<uint64_t>(wo167rules::kWatchS * 1000);
+using detail::Retirement;
+enum class QueueStage : uint8_t { Reserved, InFlight, Settled };
 
 struct Entry {
-    uint32_t eid = 0;
-    void* actor = nullptr;
+    BodyProof body;
     void* action = nullptr;
-    double t0 = 0;
-    bool ended = false;
-    double endedAt = 0;
+    uint64_t trackedAt = 0, epoch = 0;
+    Retirement retirement = Retirement::Active;
     bool movesBody = false;
-    uint64_t bodyScope = 0;
+    uint64_t serial = 0;
+    QueueStage queue = QueueStage::Reserved;
 };
 
-std::mutex g_mu;
-std::vector<Entry> g_tracked;
-std::atomic<bool> g_armed{false};
+// The engine may reenter a release while Stop is on the stack. Never wait and never recursively acquire this gate.
+struct BucketGate {
+    std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    bool try_lock() { return !busy.test_and_set(std::memory_order_acquire); }
+    void unlock() { busy.clear(std::memory_order_release); }
+};
+
+struct ActorLife {
+    std::atomic<void*> actor{nullptr};
+    std::atomic<uint64_t> revision{0};
+    BodyProof fenced;
+    uint64_t attempt = 0;
+    bool ready = false;
+    ReleaseReceipt receipt = ReleaseReceipt::Stale;
+};
+
+struct Bucket {
+    BucketGate gate;
+    std::array<Entry, kBucketSize> entries;
+    std::array<ActorLife, kBucketSize> lives;
+    std::atomic<size_t> lifeCount{0};
+    std::atomic<unsigned> releaseDepth{0};
+    std::atomic<uintptr_t> untrackedActor{0};
+};
+
+std::array<Bucket, kBuckets> g_buckets;
+std::atomic<bool> g_armed{false}, g_releaseOn{false}, g_unscopedGap{false};
+std::atomic<uint64_t> g_epoch{1};
+uint64_t g_nextQueue = 0;  // Main only
 void* const* g_actionVft = nullptr;      // the engine's own
 void* g_quiet[1 + kVtCopy] = {};         // [0] = the engine's RTTI locator (vftable[-1]); [1..] = the quiet copy
 using ReleaseFn = void (*)(void*);
 ReleaseFn g_origRelease = nullptr;
-std::atomic<uint32_t> c_withPart{0}, c_tracked{0}, c_hook{0}, c_ended{0}, c_stopped{0}, c_quieted{0}, c_explicit{0}, c_forgotten{0}, c_offMain{0}, c_orphans{0};
-DWORD g_mainTid = 0;
+std::atomic<uint32_t> c_withPart{0}, c_tracked{0}, c_live{0}, c_hook{0}, c_stopped{0}, c_ended{0}, c_quieted{0}, c_explicit{0},
+    c_forgotten{0}, c_offMain{0}, c_quarantined{0}, c_hookBusy{0}, c_noProof{0}, c_full{0}, c_retireScopes{0}, c_quietOnly{0},
+    c_trackingGap{0}, c_finishPending{0}, c_queueRefused{0}, c_queueUncertain{0}, c_queueMissingHook{0};
+std::atomic<DWORD> g_mainTid{0};
 
-double now_s() { LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f); return double(q.QuadPart) / double(f.QuadPart); }
+Bucket& bucket_for(const void* actor) {
+    const auto address = reinterpret_cast<uintptr_t>(actor);
+    return g_buckets[((address >> 4) ^ (address >> 12) ^ (address >> 24)) & (kBuckets - 1)];
+}
+
+ActorLife* find_life(Bucket& bucket, void* actor) {
+    const auto count = bucket.lifeCount.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i)
+        if (bucket.lives[i].actor.load(std::memory_order_relaxed) == actor) return &bucket.lives[i];
+    return nullptr;
+}
+
+ActorLife* ensure_life(Bucket& bucket, void* actor) {
+    if (auto* existing = find_life(bucket, actor)) return existing;
+    std::unique_lock lock(bucket.gate, std::try_to_lock);
+    if (!lock || bucket.releaseDepth.load(std::memory_order_acquire)) return nullptr;
+    if (auto* existing = find_life(bucket, actor)) return existing;
+    const auto index = bucket.lifeCount.load(std::memory_order_relaxed);
+    if (index == bucket.lives.size()) return nullptr;
+    // A slot is never recycled for another pointer. The hook can use its revision without a lock or ABA.
+    auto& life = bucket.lives[index];
+    life.actor.store(actor, std::memory_order_relaxed);
+    bucket.lifeCount.store(index + 1, std::memory_order_release);
+    return &life;
+}
+
+constexpr uintptr_t kUntrackedCollision = 1;
+
+void note_tracking_gap(void* actor) {
+    c_trackingGap.fetch_add(1, std::memory_order_relaxed);
+    if (!actor) { g_unscopedGap.store(true, std::memory_order_release); return; }
+    auto& suspect = bucket_for(actor).untrackedActor;
+    const auto address = reinterpret_cast<uintptr_t>(actor);
+    uintptr_t empty = 0;
+    // Keep evidence of an untracked action until process exit. If two failed actors share a bucket the bucket is unconfirmed.
+    if (!suspect.compare_exchange_strong(empty, address, std::memory_order_acq_rel) && empty != address)
+        suspect.store(kUntrackedCollision, std::memory_order_release);
+}
+
+bool has_tracking_gap(const Bucket& bucket, void* actor) {
+    const auto suspect = bucket.untrackedActor.load(std::memory_order_acquire);
+    return g_unscopedGap.load(std::memory_order_acquire) || suspect == kUntrackedCollision ||
+        suspect == reinterpret_cast<uintptr_t>(actor);
+}
+
+bool on_main() { return GetCurrentThreadId() == g_mainTid.load(std::memory_order_relaxed); }
+
+void note_main_thread() {
+    DWORD unknown = 0;
+    g_mainTid.compare_exchange_strong(unknown, GetCurrentThreadId(), std::memory_order_relaxed);
+}
 
 void quiet_slot(void*) {}   // what the three callbacks become: nothing is read, nothing is called
 
@@ -76,21 +159,67 @@ bool rd_ptr(const void* p, size_t off, void** out) {
     KCDMP_FAULT_READ(site, "combat_actions::rd_ptr");
     return fault::guarded(site, [&] { *out = *reinterpret_cast<void* const*>(static_cast<const char*>(p) + off); });
 }
+
+BodyProof observe_actor_raw(void* actor, uint64_t revision) {
+    if (!actor) return {};
+    BodyProof proof{};
+    proof.actor = actor;
+    proof.lifecycle = wo216::lifecycle_observation_stamp();
+    proof.load = loadsequence::stamp();
+    proof.combatRevision = revision;
+    proof.queueEpoch = g_epoch.load(std::memory_order_acquire);
+    if (!rd_u32(actor, kActorEid, &proof.eid) || !rd_ptr(actor, kActorEntity, &proof.entity) ||
+        !rd_ptr(actor, kActorCombatActor, &proof.combat) || !detail::known_body(proof) ||
+        proof.lifecycle != wo216::lifecycle_observation_stamp() || proof.load != loadsequence::stamp() ||
+        proof.queueEpoch != g_epoch.load(std::memory_order_acquire)) return {};
+    return proof;
+}
+
+BodyProof observe_actor(void* actor) {
+    if (!actor) return {};
+    auto& bucket = bucket_for(actor);
+    if (bucket.releaseDepth.load(std::memory_order_acquire)) return {};
+    auto* life = find_life(bucket, actor);
+    if (!life) return {};
+    const auto revision = life->revision.load(std::memory_order_acquire);
+    const BodyProof proof = observe_actor_raw(actor, revision);
+    return !bucket.releaseDepth.load(std::memory_order_acquire) && revision == life->revision.load(std::memory_order_acquire)
+        ? proof : BodyProof{};
+}
 bool add_ref(void* action) {
     KCDMP_FAULT_READ(site, "combat_actions::add_ref");
-    return fault::guarded(site, [&] { InterlockedIncrement(reinterpret_cast<volatile LONG*>(static_cast<char*>(action) + kActRefs)); });
+    bool added = false;
+    return fault::guarded(site, [&] {
+        const void* table = *reinterpret_cast<void**>(action);
+        if (!g_actionVft || (table != g_actionVft && table != &g_quiet[1])) return;
+        auto* refs = reinterpret_cast<volatile LONG*>(static_cast<char*>(action) + kActRefs);
+        LONG count = InterlockedCompareExchange(refs, 0, 0);
+        for (int attempt = 0; attempt < 4 && count > 0 && count < (std::numeric_limits<LONG>::max)(); ++attempt) {
+            const LONG previous = InterlockedCompareExchange(refs, count + 1, count);
+            if (previous == count) { added = true; return; }
+            count = previous;
+        }
+    }) && added;
 }
 // the controller's own way of giving a reference back (CryAction: lock xadd [+0x58], -1; at zero the action's slot 23)
-bool drop_ref(void* action) {
+bool drop_ref(void* action, bool unsubmitted = false) {
     KCDMP_FAULT_READ(site, "combat_actions::drop_ref");
     LONG left = 1;
     void** vt = nullptr;
+    bool released = false;
     if (!fault::guarded(site, [&] {
-            left = InterlockedDecrement(reinterpret_cast<volatile LONG*>(static_cast<char*>(action) + kActRefs));
             vt = *reinterpret_cast<void***>(action);
-        })) return false;
+            if (vt != g_actionVft && vt != &g_quiet[1]) return;
+            const auto state = *reinterpret_cast<const uint32_t*>(static_cast<const char*>(action) + kActStatus);
+            if (state != wo167rules::kStatusFinished && !(unsubmitted && state == wo167rules::kStatusNone)) return;
+            auto* refs = reinterpret_cast<volatile LONG*>(static_cast<char*>(action) + kActRefs);
+            const LONG count = InterlockedCompareExchange(refs, 0, 0);
+            if (count <= 0 || InterlockedCompareExchange(refs, count - 1, count) != count) return;
+            left = count - 1;
+            released = true;
+        }) || !released) return false;
     // the action's own delete frees memory (the allocator's lock): a plain call, never under the fault guard
-    if (left <= 0 && vt) reinterpret_cast<void (*)(void*)>(vt[kSlotDelete])(action);
+    if (left == 0) reinterpret_cast<void (*)(void*)>(vt[kSlotDelete])(action);
     return true;
 }
 bool set_vft(void* action) {
@@ -99,66 +228,147 @@ bool set_vft(void* action) {
     fault::guarded(site, [&] {
         void** slot = reinterpret_cast<void**>(action);
         // only an object that still carries the engine's own vftable (never a freed or re-used block)
-        done = InterlockedCompareExchangePointer(slot, static_cast<void*>(&g_quiet[1]), const_cast<void*>(static_cast<const void*>(g_actionVft))) ==
-               static_cast<const void*>(g_actionVft);
+        void* quiet = &g_quiet[1];
+        void* original = const_cast<void*>(static_cast<const void*>(g_actionVft));
+        const auto previous = InterlockedCompareExchangePointer(slot, quiet, original);
+        done = previous == original || previous == quiet;
+        if (previous == original) c_quieted.fetch_add(1, std::memory_order_relaxed);
     });
     return done;
 }
 
-// One recorded action ended (g_mu held). The stop is the engine's own (flags Stopping | BlendOut: a waiting action is never
-// installed, a running one is blended out by its controller's next update); the quiet vftable closes the time until that update.
-void end_entry(Entry& e, int* stopped, int* quieted) {
-    if (e.ended) return;
-    e.ended = true;
-    e.endedAt = now_s();
-    uint32_t st = 0;
-    if (rd_u32(e.action, kActStatus, &st) && st >= 1 && st <= 3 && rttr::stop_action(e.action)) { ++*stopped; c_stopped.fetch_add(1); }
-    if (g_armed.load() && set_vft(e.action)) { ++*quieted; c_quieted.fetch_add(1); }
-    c_ended.fetch_add(1);
+bool read_status(void* action, uint32_t* status) {
+    void* table = nullptr;
+    return g_armed.load(std::memory_order_acquire) && rd_ptr(action, 0, &table) &&
+        (table == g_actionVft || table == &g_quiet[1]) && rd_u32(action, kActStatus, status) && *status <= 4;
 }
 
-int end_where(uint32_t eid, void* actor, bool all, const char* why) {
-    int n = 0, stopped = 0, quieted = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_mu);
-        for (Entry& e : g_tracked) {
-            if (e.ended) continue;
-            if (!all && !((eid && e.eid == eid) || (actor && e.actor == actor))) continue;
-            if (!eid) eid = e.eid;
-            end_entry(e, &stopped, &quieted);
-            ++n;
+void quarantine(Entry& entry) {
+    if (entry.retirement == Retirement::Quarantined) return;
+    entry.retirement = Retirement::Quarantined;
+    c_quarantined.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool note_finished(Entry& entry, bool actionKnown, uint32_t status) {
+    if (entry.retirement == Retirement::Finished) return true;
+    if (!detail::observe_finished(entry.retirement, actionKnown, status)) return false;
+    c_ended.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// Called only for the recorded physical body and owned action. A verified quiet table closes callbacks before Stop,
+// but quiet alone is no stop receipt. An unreadable status or unexpected table is never written through.
+bool end_entry(Entry& entry, bool canStop) {
+    if (entry.body.lifecycle != wo216::lifecycle_observation_stamp() || entry.body.load != loadsequence::stamp()) {
+        quarantine(entry);
+        return false;
+    }
+    if (entry.retirement == Retirement::Finished) return true;
+    uint32_t status = 0;
+    const bool actionKnown = read_status(entry.action, &status);
+    if (note_finished(entry, actionKnown, status)) return true;
+    if (entry.retirement != Retirement::Active) return false;
+    const bool requested = detail::retire(entry.retirement, actionKnown, status, canStop,
+        [&] {
+            const bool quiet = set_vft(entry.action);
+            if (quiet && !canStop) c_quietOnly.fetch_add(1, std::memory_order_relaxed);
+            return quiet;
+        }, [&] {
+            if (!rttr::stop_action(entry.action)) return false;
+            c_stopped.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        });
+    if (!requested) c_quarantined.fetch_add(1, std::memory_order_relaxed);
+    else c_finishPending.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+struct ReleaseEvidence { unsigned waiting = 0, active = 0; };
+
+ReleaseReceipt end_matching(Bucket& bucket, const BodyProof& proof, bool canStop, ReleaseEvidence* evidence = nullptr) {
+    bool pending = false, uncertain = false;
+    size_t stops = 0;
+    const auto* life = canStop ? find_life(bucket, proof.actor) : nullptr;
+    // Stop can reenter the release hook. Before the first engine call, silence every exact unfinished action in this batch.
+    if (canStop) for (auto& entry : bucket.entries) {
+        if (!entry.action || !detail::same_body(entry.body, proof) || entry.retirement == Retirement::Finished) continue;
+        uint32_t status = 0;
+        const bool readable = read_status(entry.action, &status);
+        if (evidence && readable) {
+            if (status == wo167rules::kStatusPending || status == wo167rules::kStatusNone) ++evidence->waiting;
+            else if (status == wo167rules::kStatusInstalled || status == wo167rules::kStatusExiting) ++evidence->active;
         }
+        if (entry.queue != QueueStage::Settled || entry.retirement != Retirement::Active) continue;
+        if (!readable) quarantine(entry);
+        else if (status == wo167rules::kStatusFinished) note_finished(entry, true, status);
+        else if (!set_vft(entry.action)) quarantine(entry);
     }
-    if (n) {
-        static std::atomic<uint32_t> s_lines{0};
-        const uint32_t k = s_lines.fetch_add(1) + 1;
-        if (k <= 400 || k % 100 == 0)
-            logf("WO221-ACTEND eid=0x%X actions=%d stopped=%d quiet=%d why=%s%s [n=%u]", all ? 0u : eid, n, stopped, quieted, why,
-                 GetCurrentThreadId() == g_mainTid ? "" : " (not the main thread)", k);
+    for (auto& entry : bucket.entries) {
+        if (!entry.action || entry.body.actor != proof.actor) continue;
+        BodyProof matching = proof;
+        if (!canStop) matching.queueEpoch = entry.body.queueEpoch;  // engine hook owns the physical release, even on disconnect
+        if (!detail::same_body(entry.body, matching)) {
+            // An older incarnation on this address is untouched, but it prevents claiming that teardown is complete.
+            if (entry.retirement != Retirement::Finished) uncertain = true;
+            continue;
+        }
+        if (canStop && entry.queue != QueueStage::Settled && entry.retirement == Retirement::Active) {
+            pending = true;
+            continue;
+        }
+        if (canStop && entry.retirement != Retirement::Finished && (!life || bucket.releaseDepth.load(std::memory_order_acquire) ||
+            life->revision.load(std::memory_order_acquire) != proof.combatRevision ||
+            g_epoch.load(std::memory_order_acquire) != proof.queueEpoch ||
+            wo216::lifecycle_observation_stamp() != proof.lifecycle || loadsequence::stamp() != proof.load)) {
+            quarantine(entry);
+            return ReleaseReceipt::Stale;
+        }
+        if (canStop && entry.retirement == Retirement::Active) {
+            if (stops == kReleaseStops) { pending = true; continue; }
+            ++stops;
+        }
+        if (end_entry(entry, canStop)) continue;
+        if (entry.retirement == Retirement::StopRequested) pending = true;
+        else uncertain = true;
     }
-    return n;
+    return uncertain ? ReleaseReceipt::Uncertain : pending ? ReleaseReceipt::Pending : ReleaseReceipt::Ready;
 }
 
 // C_Actor::ReleaseCombatActor, every vftable's slot: ours first (while the combat part is still there), then the engine's own.
 void hk_release_combat_actor(void* actor) {
     c_hook.fetch_add(1, std::memory_order_relaxed);
-    if (GetCurrentThreadId() != g_mainTid) c_offMain.fetch_add(1, std::memory_order_relaxed);
-    void* ca = nullptr;
-    const bool has = rd_ptr(actor, kActorCombatActor, &ca) && ca;
-    if (has) {
-        // the bench's view of when the engine does this (the first calls, then every 500th): the body by its entity (C_Actor +0x38)
-        const uint32_t k = c_withPart.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (k <= 150 || k % 500 == 0) {
-            void* ent = nullptr;
-            const char* nm = rd_ptr(actor, kActorEntity, &ent) && ent ? engine::entity_name(ent) : nullptr;
-            char name[64] = "?";
-            if (nm) { KCDMP_FAULT_READ(site, "combat_actions::name"); fault::guarded(site, [&] { strncpy_s(name, nm, _TRUNCATE); }); }
-            logf("WO221-ACTEND the engine gives %s's combat part back%s [n=%u]", name, GetCurrentThreadId() == g_mainTid ? "" : " (not the main thread)", k);
+    const bool main = on_main();
+    if (!main) c_offMain.fetch_add(1, std::memory_order_relaxed);
+    if (!actor || !g_armed.load(std::memory_order_acquire)) { g_origRelease(actor); return; }
+    {
+        auto& bucket = bucket_for(actor);
+        bucket.releaseDepth.fetch_add(1, std::memory_order_acq_rel);
+        if (auto* life = find_life(bucket, actor)) {
+            const auto oldRevision = life->revision.fetch_add(1, std::memory_order_acq_rel);
+            // Already-owned actions still need protection after a diagnostic switch changes.
+            if (c_live.load(std::memory_order_relaxed)) {
+                std::unique_lock lock(bucket.gate, std::try_to_lock);
+                if (!lock) c_hookBusy.fetch_add(1, std::memory_order_relaxed);
+                else {
+                    const BodyProof proof = observe_actor_raw(actor, oldRevision);
+                    if (proof.combat) {
+                        c_withPart.fetch_add(1, std::memory_order_relaxed);
+                        // The hook suppresses verified callbacks only. It calls neither Stop nor a blocking registry operation.
+                        end_matching(bucket, proof, false);
+                    } else if (!detail::known_body(proof)) c_noProof.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
-        // nothing to release means nothing of ours can be reading it either
-        if (wo221::on(wo221::kBitCombatActionEnd)) end_where(0, actor, false, "the engine gives the body's combat part back");
+        g_origRelease(actor);
+        bucket.releaseDepth.fetch_sub(1, std::memory_order_release);
     }
-    g_origRelease(actor);
+}
+
+bool actor_release_hooked(void* actor) {
+    void* table = nullptr;
+    void* release = nullptr;
+    return actor && rd_ptr(actor, 0, &table) && table && rd_ptr(table, kActorVtReleaseCombat, &release) &&
+        release == reinterpret_cast<void*>(&hk_release_combat_actor);
 }
 
 void fail(const char* why) { logf("WO221-ACTEND NOT ARMED: %s -- 0.65.0's behaviour (an action of ours can outlive its body's combat part)", why); }
@@ -201,6 +411,7 @@ void install() {
     // every vftable that carries the release (C_Actor and the classes derived from it) gets ours in that slot
     anchor::Range rdata{};
     if (!anchor::section(em, ".rdata", &rdata)) { fail("EntityModule .rdata not found"); return; }
+    g_releaseOn.store(wo221::on(wo221::kBitCombatActionEnd), std::memory_order_relaxed);
     g_origRelease = reinterpret_cast<ReleaseFn>(const_cast<void*>(rel));
     int slots = 0, failed = 0;
     for (const uint8_t* p = rdata.begin; p + 8 <= rdata.end; p += 8) {
@@ -219,50 +430,99 @@ void install() {
     g_armed = true;
     char d[128]{};
     anchor::describe(rel, d, sizeof d);
-    logf("WO221-ACTEND armed: ReleaseCombatActor=%s in %d vftable slot(s)%s; the quiet vftable has slots 14, 17, 18 silenced -- every combat "
-         "action of ours is recorded and ended before its body's combat part goes (mp_combat_action_end %s)",
+    logf("WO221-ACTEND armed: ReleaseCombatActor=%s in %d vftable slot(s)%s; hooks silence verified callbacks 14, 17, 18 before release; "
+         "uncertain actions remain referenced (mp_combat_action_end %s)",
          d, slots, failed ? " (some slots could not be written)" : "", wo221::on(wo221::kBitCombatActionEnd) ? "on" : "off");
 }
 
-// Main thread, once a second: finished actions are forgotten (our reference given back).
+bool scope_current(const BodyProof& body, uint64_t lifecycle, uint64_t load) {
+    return body.lifecycle == lifecycle && body.load == load;
+}
+
+void forget(Entry& entry) {
+    entry = {};
+    c_live.fetch_sub(1, std::memory_order_relaxed);
+    c_forgotten.fetch_add(1, std::memory_order_relaxed);
+}
+
+void forget_unconfirmed(Entry& entry) {
+    if (entry.retirement != Retirement::Finished) {
+        quarantine(entry);
+        note_tracking_gap(entry.body.actor);
+    }
+    forget(entry);  // retain the reference when the previous world's queue is not known to be done
+}
+
+Entry* ticket_entry(Bucket& bucket, const QueueTicket& ticket) {
+    for (auto& entry : bucket.entries)
+        if (entry.serial == ticket.serial && entry.action == ticket.action) return &entry;
+    return nullptr;
+}
+
+bool body_fenced(const ActorLife& life, const BodyProof& body) {
+    return life.attempt && detail::same_body(life.fenced, body);
+}
+
+// Main: one fixed bucket per frame, with a separate ceiling for guarded engine lookups and Stop calls.
+// Session/load edges only advance a cutoff; they never iterate tracked actions from the pipe thread.
 void tick() {
-    if (!g_mainTid) g_mainTid = GetCurrentThreadId();   // the frame hook's thread (install runs on the injector's)
-    static double s_last = 0;
-    const double now = now_s();
-    if (now - s_last < 1.0) return;
-    s_last = now;
-    std::vector<void*> done;
+    note_main_thread();
+    g_releaseOn.store(wo221::on(wo221::kBitCombatActionEnd), std::memory_order_relaxed);
+    if (!c_live.load(std::memory_order_relaxed)) return;
+    const uint64_t lifecycle = wo216::lifecycle_observation_stamp(), load = loadsequence::stamp();
+    const uint64_t epoch = g_epoch.load(std::memory_order_acquire), now = GetTickCount64();
+    static size_t next = 0;
+    auto& bucket = g_buckets[next++ & (kBuckets - 1)];
+    struct FinishedAction { void* actor; void* action; };
+    std::array<FinishedAction, kSweepReads> done{};
+    size_t reads = 0, finished = 0;
     {
-        std::lock_guard<std::mutex> lock(g_mu);
-        for (size_t i = 0; i < g_tracked.size();) {
-            Entry& e = g_tracked[i];
-            uint32_t st = 1;
-            const bool readable = rd_u32(e.action, kActStatus, &st);
-            // Our reference goes back only for a finished action (status none or finished: its controller is through with it).
-            // Never for a waiting or running one, whatever its count says: rm3-d4 -- "only this table holds it" (count <= 1) was
-            // true of two waiting installs the controller's queue still walked; the drop deleted them and the next walk ran into the
-            // freed blocks. A record that was ended (its body's combat part went: stopped and quiet) and did not finish within
-            // kEndedKeepS is forgotten with our reference KEPT: the action stays allocated (0x1A8 bytes), nothing can run into it.
-            const bool finished = readable && (st == 0 || st == 4) && now - e.t0 > kDoneKeepS;
-            const bool left = readable && !finished && e.ended && now - e.endedAt > kEndedKeepS;
-            if (left) c_orphans.fetch_add(1, std::memory_order_relaxed);
-            if (!readable || finished || left) {
-                if (finished) done.push_back(e.action);
-                g_tracked[i] = g_tracked.back();
-                g_tracked.pop_back();
-                c_forgotten.fetch_add(1, std::memory_order_relaxed);
-            } else ++i;
+        std::unique_lock lock(bucket.gate, std::try_to_lock);
+        if (!lock) return;
+        for (auto& entry : bucket.entries) {
+            if (!entry.action) continue;
+            if (!scope_current(entry.body, lifecycle, load)) {
+                forget_unconfirmed(entry);
+                continue;
+            }
+            if (reads == kSweepReads || (entry.epoch == epoch && now - entry.trackedAt < kDoneKeepMs)) continue;
+            ++reads;
+            BodyProof current = observe_body(entry.body.eid);
+            current.queueEpoch = entry.body.queueEpoch; // disconnect blocks admission, even while the old bodies are being swept
+            if (!detail::same_body(entry.body, current)) {
+                forget_unconfirmed(entry);
+                continue;
+            }
+            if (entry.epoch != epoch) {
+                end_entry(entry, true);
+                entry.epoch = epoch;
+            }
+            if (now - entry.trackedAt < kDoneKeepMs) continue;
+            uint32_t status = 0;
+            if (!read_status(entry.action, &status)) quarantine(entry);
+            else if (status == wo167rules::kStatusFinished) {
+                note_finished(entry, true, status);
+                // Status None can still belong to the controller's queue. Only its explicit Finished status can give our ref back.
+                done[finished++] = {entry.body.actor, entry.action};
+                forget(entry);
+            }
         }
     }
-    for (void* a : done) drop_ref(a);
+    for (size_t i = 0; i < finished; ++i) {
+        if (drop_ref(done[i].action)) continue;
+        c_quarantined.fetch_add(1, std::memory_order_relaxed);
+        note_tracking_gap(done[i].actor);
+    }
 }
 
 int status(char* out, int n) {
-    size_t live = 0;
-    { std::lock_guard<std::mutex> lock(g_mu); live = g_tracked.size(); }
-    return std::snprintf(out, static_cast<size_t>(n), "armed=%d on=%d recorded=%u live=%zu forgotten=%u (ref_kept=%u) release_calls=%u with_part=%u (off_main=%u) ended=%u stopped=%u quiet=%u explicit=%u",
-                         g_armed.load() ? 1 : 0, wo221::on(wo221::kBitCombatActionEnd) ? 1 : 0, c_tracked.load(), live, c_forgotten.load(), c_orphans.load(), c_hook.load(),
-                         c_withPart.load(), c_offMain.load(), c_ended.load(), c_stopped.load(), c_quieted.load(), c_explicit.load());
+    return std::snprintf(out, static_cast<size_t>(n), "armed=%d on=%d recorded=%u live=%u forgotten=%u release_calls=%u with_part=%u "
+                         "off_main=%u stopped=%u ended=%u quiet=%u explicit=%u quarantined=%u hook_busy=%u no_body_proof=%u bucket_full=%u "
+                         "retire_scopes=%u quiet_without_stop=%u tracking_gap=%u finish_pending=%u queue_refused=%u queue_uncertain=%u queue_no_release_hook=%u",
+                         g_armed.load() ? 1 : 0, g_releaseOn.load() ? 1 : 0, c_tracked.load(), c_live.load(), c_forgotten.load(), c_hook.load(),
+                         c_withPart.load(), c_offMain.load(), c_stopped.load(), c_ended.load(), c_quieted.load(), c_explicit.load(), c_quarantined.load(),
+                         c_hookBusy.load(), c_noProof.load(), c_full.load(), c_retireScopes.load(), c_quietOnly.load(),
+                         c_trackingGap.load(), c_finishPending.load(), c_queueRefused.load(), c_queueUncertain.load(), c_queueMissingHook.load());
 }
 
 const bool kReg = wo203::reg_install("combat_actions", &install) && wo203::reg_tick("combat_actions", &tick) && wo221::add_status("combat_actions", &status);
@@ -271,62 +531,192 @@ const bool kReg = wo203::reg_install("combat_actions", &install) && wo203::reg_t
 
 bool armed() { return g_armed.load(); }
 
-void track(uint32_t eid, void* actor, void* action, bool movesBody) {
-    if (!action || !(wo221::on(wo221::kBitCombatActionEnd) || (movesBody && holders::on()))) return;
-    if (!add_ref(action)) return;
-    c_tracked.fetch_add(1, std::memory_order_relaxed);
-    void* evicted = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_mu);
-        if (g_tracked.size() >= kMaxTracked) {   // the oldest record is ended (stopped, quiet) and forgotten -- our reference kept (never a delete here)
-            int s = 0, q = 0;
-            end_entry(g_tracked.front(), &s, &q);
-            c_orphans.fetch_add(1, std::memory_order_relaxed);
-            g_tracked.front() = g_tracked.back();
-            g_tracked.pop_back();
-        }
-        g_tracked.push_back(Entry{eid, actor, action, now_s(), false, 0.0, movesBody, wo216::lifecycle_observation_stamp()});
+BodyProof observe_body(uint32_t eid) {
+    if (!eid) return {};
+    void* actor = motion::actor_of(eid);
+    if (!actor || !ensure_life(bucket_for(actor), actor)) return {};
+    const BodyProof body = observe_actor(actor);
+    if (body.eid != eid || engine::entity_by_id(eid) != body.entity ||
+        !scope_current(body, wo216::lifecycle_observation_stamp(), loadsequence::stamp())) return {};
+    return body;
+}
+
+QueueTicket reserve_queue(const BodyProof& body, void* action, bool movesBody) {
+    const auto refuse = [] { c_queueRefused.fetch_add(1, std::memory_order_relaxed); return QueueTicket{}; };
+    if (!action || !body.combat || !g_armed.load(std::memory_order_acquire) ||
+        !detail::same_body(body, observe_body(body.eid))) return refuse();
+    note_main_thread();
+    if (!on_main()) return refuse();
+    auto& bucket = bucket_for(body.actor);
+    std::unique_lock lock(bucket.gate, std::try_to_lock);
+    if (!lock) return refuse();
+    const auto* life = find_life(bucket, body.actor);
+    if (!life || !detail::same_body(body, observe_actor(body.actor)) || body_fenced(*life, body)) return refuse();
+    if (!actor_release_hooked(body.actor)) {
+        c_queueMissingHook.fetch_add(1, std::memory_order_relaxed);
+        return refuse();
     }
-    if (evicted) drop_ref(evicted);
+    Entry* free = nullptr;
+    for (auto& entry : bucket.entries) {
+        if (entry.action == action) return refuse();
+        if (!entry.action && !free) free = &entry;
+    }
+    if (!free) {
+        c_full.fetch_add(1, std::memory_order_relaxed);
+        return refuse();
+    }
+    if (!add_ref(action)) return refuse();
+    const auto serial = ++g_nextQueue;
+    *free = {body, action, GetTickCount64(), body.queueEpoch, Retirement::Active, movesBody, serial};
+    c_tracked.fetch_add(1, std::memory_order_relaxed);
+    c_live.fetch_add(1, std::memory_order_relaxed);
+    return {body, action, serial};
+}
+
+bool begin_queue(const QueueTicket& ticket) {
+    auto& bucket = bucket_for(ticket.body.actor);
+    std::unique_lock lock(bucket.gate, std::try_to_lock);
+    if (!lock) return false;
+    const auto* life = find_life(bucket, ticket.body.actor);
+    if (!life || !detail::same_body(ticket.body, observe_actor(ticket.body.actor)) || body_fenced(*life, ticket.body) ||
+        !actor_release_hooked(ticket.body.actor))
+        return false;
+    auto* entry = ticket_entry(bucket, ticket);
+    if (!entry || entry->queue != QueueStage::Reserved || entry->retirement != Retirement::Active) return false;
+    entry->queue = QueueStage::InFlight;
+    return true;
+}
+
+QueueResult settle_queue(const QueueTicket& ticket, QueueResult result) {
+    auto& bucket = bucket_for(ticket.body.actor);
+    bool release = false;
+    {
+        std::unique_lock lock(bucket.gate, std::try_to_lock);
+        auto* entry = lock ? ticket_entry(bucket, ticket) : nullptr;
+        if (!entry) {
+            if (result == QueueResult::Refused) {
+                c_queueRefused.fetch_add(1, std::memory_order_relaxed);
+                return result;
+            }
+            note_tracking_gap(ticket.body.actor);
+            c_queueUncertain.fetch_add(1, std::memory_order_relaxed);
+            return QueueResult::Uncertain;
+        }
+        if (result == QueueResult::Refused && entry->queue == QueueStage::Reserved) {
+            c_queueRefused.fetch_add(1, std::memory_order_relaxed);
+            forget(*entry);
+            release = true;
+        } else if (result == QueueResult::Submitted && entry->queue == QueueStage::InFlight &&
+                   entry->retirement == Retirement::Active && detail::same_body(ticket.body, observe_actor(ticket.body.actor))) {
+            entry->queue = QueueStage::Settled;
+            return result;
+        } else {
+            // QueueAction may have installed before reentry or a fault. The ledger's reference stays and the event is never retried.
+            entry->queue = QueueStage::Settled;
+            uint32_t status = 0;
+            if (entry->retirement != Retirement::Finished && read_status(entry->action, &status) &&
+                status != wo167rules::kStatusFinished) set_vft(entry->action);
+            quarantine(*entry);
+            c_queueUncertain.fetch_add(1, std::memory_order_relaxed);
+            return QueueResult::Uncertain;
+        }
+    }
+    if (release && !drop_ref(ticket.action, true)) c_quarantined.fetch_add(1, std::memory_order_relaxed);
+    return result;
 }
 
 bool body_pose_holds(uint32_t eid) {
-    if (!eid) return false;
-    std::lock_guard<std::mutex> lock(g_mu);
-    const double now = now_s();
-    const auto scope = wo216::lifecycle_observation_stamp();
-    for (Entry& e : g_tracked) {
-        if (e.eid != eid || !e.movesBody || e.bodyScope != scope) continue;
+    if (!c_live.load(std::memory_order_relaxed)) return false;
+    const BodyProof body = observe_body(eid);
+    if (!body.combat) return false;
+    auto& bucket = bucket_for(body.actor);
+    std::unique_lock lock(bucket.gate, std::try_to_lock);
+    if (!lock) return true;  // the current holder retries when the engine's release observation is through
+    if (!detail::same_body(body, observe_actor(body.actor))) return false;
+    const auto now = GetTickCount64();
+    for (auto& entry : bucket.entries) {
+        if (!entry.action || !entry.movesBody || !detail::same_body(entry.body, body)) continue;
         uint32_t status = 0;
-        if (!rd_u32(e.action, kActStatus, &status)) continue;
+        if (!read_status(entry.action, &status)) { quarantine(entry); return true; }
         if (status == wo167rules::kStatusInstalled || status == wo167rules::kStatusExiting) return true;
-        if (status == wo167rules::kStatusPending) {
-            // A request the engine has not installed in the swing watch's window must stop
-            // before the next owner takes the body; it must not start late over its movement.
-            if (!e.ended && now - e.t0 >= wo167rules::kWatchS) {
-                int stopped = 0, quieted = 0;
-                end_entry(e, &stopped, &quieted);
-            }
+        if (status == wo167rules::kStatusPending || status == wo167rules::kStatusNone) {
+            if (now - entry.trackedAt < kWatchMs) return true;
+            if (entry.retirement == Retirement::Active) end_entry(entry, true);
+            // A queued action may already be entering the controller when Stop arrives. Hold until it is observed out.
             return true;
         }
-        if (status == wo167rules::kStatusNone && now - e.t0 < wo167rules::kWatchS) return true;
-        e.movesBody = false;
+        entry.movesBody = false;
     }
     return false;
 }
 
-int end_for_entity(uint32_t eid, const char* why) {
-    if (!eid || !wo221::on(wo221::kBitCombatActionEnd)) return 0;
-    const int n = end_where(eid, nullptr, false, why);
-    if (n) c_explicit.fetch_add(static_cast<uint32_t>(n), std::memory_order_relaxed);
-    return n;
+ReleaseReceipt retire_for_body(const BodyProof& body, const char* why, uint64_t attempt) {
+    if (!on_main() || !detail::known_body(body) || !detail::same_body(body, observe_body(body.eid))) {
+        const auto count = c_noProof.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 4 || count % 256 == 0) logf("WO221-ACTEND eid=0x%X result=quarantined reason=body-identity-unproven why=%s", body.eid, why);
+        return ReleaseReceipt::Stale;
+    }
+    auto& bucket = bucket_for(body.actor);
+    ReleaseEvidence evidence;
+    bool report = false;
+    ReleaseReceipt receipt = ReleaseReceipt::Uncertain;
+    {
+        std::unique_lock lock(bucket.gate, std::try_to_lock);
+        if (!lock) return ReleaseReceipt::Uncertain;
+        auto* life = find_life(bucket, body.actor);
+        if (!life) return ReleaseReceipt::Uncertain;
+        if (!detail::same_body(body, observe_actor(body.actor))) return ReleaseReceipt::Stale;
+        if (attempt) {
+            if (body_fenced(*life, body) && life->attempt != attempt) return ReleaseReceipt::Uncertain;
+            if (!body_fenced(*life, body)) {
+                life->fenced = body;
+                life->attempt = attempt;
+                life->ready = false;
+                life->receipt = ReleaseReceipt::Stale;
+                report = true;
+            }
+        }
+        receipt = end_matching(bucket, body, true, report ? &evidence : nullptr);
+        if (has_tracking_gap(bucket, body.actor)) receipt = ReleaseReceipt::Uncertain;
+        if (!detail::same_body(body, observe_actor(body.actor))) receipt = ReleaseReceipt::Stale;
+        if (attempt) {
+            report = report || life->receipt != receipt;
+            if (!life->ready && receipt == ReleaseReceipt::Ready) c_explicit.fetch_add(1, std::memory_order_relaxed);
+            life->ready = receipt == ReleaseReceipt::Ready;
+            life->receipt = receipt;
+        }
+    }
+    if (report) logf("WO221-ACTEND eid=0x%X attempt=%llu receipt=%u waiting=%u active=%u why=%s", body.eid,
+                     static_cast<unsigned long long>(attempt), static_cast<unsigned>(receipt), evidence.waiting, evidence.active, why);
+    return receipt;
 }
 
-int end_all(const char* why) {
+bool release_ready(const BodyProof& body, uint64_t attempt) {
+    if (!attempt || !on_main() || !detail::known_body(body) || !detail::same_body(body, observe_body(body.eid))) return false;
+    auto& bucket = bucket_for(body.actor);
+    std::unique_lock lock(bucket.gate, std::try_to_lock);
+    if (!lock) return false;
+    const auto* life = find_life(bucket, body.actor);
+    return life && life->ready && life->attempt == attempt && body_fenced(*life, body) &&
+        !has_tracking_gap(bucket, body.actor) && detail::same_body(body, observe_actor(body.actor));
+}
+
+int end_for_body(const BodyProof& body, const char* why) {
     if (!wo221::on(wo221::kBitCombatActionEnd)) return 0;
-    const int n = end_where(0, nullptr, true, why);
-    if (n) c_explicit.fetch_add(static_cast<uint32_t>(n), std::memory_order_relaxed);
-    return n;
+    return retire_for_body(body, why) == ReleaseReceipt::Ready ? 0 : -1;
+}
+
+int end_for_entity(uint32_t eid, const char* why) {
+    if (!eid || !wo221::on(wo221::kBitCombatActionEnd)) return 0;
+    const auto count = c_noProof.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 4 || count % 256 == 0) logf("WO221-ACTEND eid=0x%X result=refused reason=eid-without-body-proof why=%s", eid, why);
+    return -1;
+}
+
+int end_all(const char*) {
+    g_epoch.fetch_add(1, std::memory_order_acq_rel);
+    c_retireScopes.fetch_add(1, std::memory_order_relaxed);
+    return 0;
 }
 
 } // namespace kcdmp::combatactions

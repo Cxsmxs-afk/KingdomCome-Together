@@ -95,17 +95,18 @@ internal sealed class WorldReconnectFacts
 
 internal enum WorldReconnectDecision { Waiting, SameWorld, DifferentWorld, Timeout }
 
-internal sealed class WorldReconnectAttempt(WorldSyncScope scope, WorldReconnectProof? original, long startedMs)
+internal sealed class WorldReconnectAttempt(WorldSyncScope scope, WorldReconnectProof? original, long startedMs, bool waitForHost = false)
 {
     public const int WindowMs = 30_000;
     public WorldSyncScope Scope { get; } = scope;
-    public long Elapsed(long nowMs) => Math.Max(0, nowMs - startedMs);
-    public long Remaining(long nowMs) => Math.Max(0, WindowMs - Elapsed(nowMs));
+    private readonly long _startedMs = startedMs;
+    public long Elapsed(long nowMs) => Math.Max(0, nowMs - _startedMs);
+    public long Remaining(long nowMs) => waitForHost ? WindowMs : Math.Max(0, WindowMs - Elapsed(nowMs));
     private int _claimed;
 
     public WorldReconnectDecision Decide(WorldLoadSnapshot held, WorldReconnectProof? fresh, long nowMs)
     {
-        if (Elapsed(nowMs) > WindowMs) return WorldReconnectDecision.Timeout;
+        if (!waitForHost && Elapsed(nowMs) > WindowMs) return WorldReconnectDecision.Timeout;
         if (held.Generation != Scope.Generation || held.HostWorld != Scope.HostWorld || held.Phase != WorldLoadPhase.Play || !held.LinkHeld ||
             original is not { } before || fresh is not { } after || before.World != Scope.HostWorld || !before.SameAuthority(after))
             return WorldReconnectDecision.Waiting;

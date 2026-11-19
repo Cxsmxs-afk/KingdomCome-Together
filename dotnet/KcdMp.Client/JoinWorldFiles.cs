@@ -3,8 +3,8 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 namespace KcdMp.Client;
 
-/// <summary>A verified world survives failed attempts. Only join=in or the player's cancel authorizes removal.
-/// Authorization still protects it from sweeps until the engine has finished reading it and cleanup succeeds.</summary>
+/// <summary>A placed world has one attempt owner. Release authorizes cleanup, with engine-read safety and
+/// the on-disk ownership check still required before removal.</summary>
 public sealed class JoinWorldFiles<T> where T : class
 {
     private sealed record Entry(T Owner, bool Released);
@@ -20,6 +20,11 @@ public sealed class JoinWorldFiles<T> where T : class
     public bool Protects(string path)
     {
         lock (_gate) return _files.ContainsKey(Path.GetFullPath(path));
+    }
+
+    public HashSet<string> ProtectedPaths()
+    {
+        lock (_gate) return new(_files.Keys, _files.Comparer);
     }
 
     public bool MayRemove(string path, T owner)
@@ -45,14 +50,17 @@ public sealed class JoinWorldFiles<T> where T : class
                 _files[path] = _files[path] with { Released = true };
     }
 
-    /// <summary>A stale cleanup cannot delete a newer lease of the same path. Failed deletion keeps sweep protection.</summary>
-    public bool TryDelete(string path, T owner)
+    /// <summary>
+    /// A stale cleanup cannot delete a newer lease of the same path. The caller removes the
+    /// verified file. This lease never deletes by path: a refused or failed removal keeps sweep protection.
+    /// </summary>
+    public bool TryDelete(string path, T owner, Func<string, bool> removeOwned)
     {
         lock (_gate)
         {
             string full = Path.GetFullPath(path);
             if (!_files.TryGetValue(full, out var e) || !ReferenceEquals(e.Owner, owner) || !e.Released) return false;
-            File.Delete(full);
+            if (!removeOwned(full)) return false;
             _files.Remove(full);
             return true;
         }

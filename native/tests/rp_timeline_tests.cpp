@@ -46,6 +46,31 @@ int rp_timeline_tests(int* passed) {
           held.x == longHeld.x && held.z == longHeld.z && longHeld.appliedHostMs == held.appliedHostMs,
           "endpoint is stationary beyond 200 ms");
     check(!longHeld.source.stateHostMs, "old stance inputs age out while position holds");
+    Track aim;
+    check(aim.push(sample(base, 0), local, base) == Ingest::Accepted, "aim track accepts its first pose");
+    auto drawn = sample(base + 100, 0.2f);
+    drawn.stateHostMs = drawn.hostMs;
+    drawn.state[3] = 0x08 | 0x04;
+    drawn.state[7] = 255;
+    check(aim.push(drawn, local + 110, base + 110) == Ingest::Accepted, "aim track accepts the drawn pose");
+    (void)aim.render(local + 190);
+    const auto stillDrawn = aim.render(local + 5000);
+    check(!stillDrawn.source.stateHostMs && stillDrawn.ranged_held() && stillDrawn.rangedStateHostMs == drawn.hostMs &&
+          stillDrawn.source.state[7] == 255,
+          "a drawn bow survives a short gap without extending the crouch timestamp");
+    auto ended = sample(base + 5000, 0.1f);
+    ended.stateHostMs = ended.hostMs;
+    check(aim.push(ended, local + 5010, base + 5010) == Ingest::Accepted, "the confirmed end is a newer sample");
+    const auto down = aim.render(local + 5200);
+    check(down.source.stateHostMs == ended.hostMs && down.rangedStateHostMs == ended.hostMs &&
+          !down.ranged_held(), "the newer sample clears the draw");
+    auto staleHold = drawn;
+    check(aim.push(staleHold, local + 5300, base + 5300) == Ingest::Late, "an older hold does not restore the draw");
+    staleHold.hostMs = base + 5350;
+    staleHold.stateHostMs = ended.stateHostMs;
+    check(aim.push(staleHold, local + 5360, base + 5360) == Ingest::Accepted &&
+          !aim.render(local + 5550).ranged_held(),
+          "a later position cannot replace a confirmed end with a different block at the same state stamp");
     check(track.push(sample(base + 150, 0.3f), local + 5010, base + 5010) == Ingest::Late &&
           track.render(local + 5015).targetHostMs >= longHeld.targetHostMs, "late correction never rewinds the host cursor");
     check(track.push(sample(base * 2, 4), local + 5100, base * 2) == Ingest::Restarted &&

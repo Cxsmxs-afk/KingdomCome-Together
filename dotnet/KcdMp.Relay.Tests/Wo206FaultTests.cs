@@ -52,37 +52,28 @@ public sealed class FaultRelay : IAsyncDisposable
     /// </summary>
     public static async Task<FaultRelay> StartAsync(string? planJson, bool env = true, bool option = true)
     {
-        var r = new FaultRelay { TcpPort = FreePort() };
-        int httpPort = FreePort();
-        var args = new List<string>
-        {
-            "--port", r.TcpPort.ToString(),
-            "--Urls", $"http://127.0.0.1:{httpPort}",
-            "--Serilog:WriteTo:1:Name", "Console",
-        };
+        var r = new FaultRelay();
         if (planJson is not null)
         {
             r._planPath = Path.Combine(Path.GetTempPath(), $"wo206-plan-{Guid.NewGuid():N}.json");
             File.WriteAllText(r._planPath, planJson);
-            if (option) { args.Add(RelayFaultSwitch.Option); args.Add(r._planPath); }
         }
-
-        string? before = Environment.GetEnvironmentVariable(RelayFaultSwitch.EnvVar);
-        Environment.SetEnvironmentVariable(RelayFaultSwitch.EnvVar, env ? "1" : null);
-        try { r.App = Program.CreateApp([.. args]); }
-        finally { Environment.SetEnvironmentVariable(RelayFaultSwitch.EnvVar, before); }
-
-        await r.App.StartAsync();
-        var deadline = DateTime.UtcNow.AddSeconds(10);
-        while (true)
+        try
         {
-            try
-            {
-                using var probe = new TcpClient();
-                await probe.ConnectAsync(IPAddress.Loopback, r.TcpPort);
-                return r;
-            }
-            catch (SocketException) when (DateTime.UtcNow < deadline) { await Task.Delay(50); }
+            string[] args = option && r._planPath is not null ? [RelayFaultSwitch.Option, r._planPath] : [];
+            string? before = Environment.GetEnvironmentVariable(RelayFaultSwitch.EnvVar);
+            Environment.SetEnvironmentVariable(RelayFaultSwitch.EnvVar, env ? "1" : null);
+            WebApplication app;
+            try { app = RelayListeners.CreateApp(args); }
+            finally { Environment.SetEnvironmentVariable(RelayFaultSwitch.EnvVar, before); }
+            r.TcpPort = (await RelayListeners.StartAsync(app)).Port;
+            r.App = app;
+            return r;
+        }
+        catch
+        {
+            if (r._planPath is not null) File.Delete(r._planPath);
+            throw;
         }
     }
 
@@ -104,14 +95,6 @@ public sealed class FaultRelay : IAsyncDisposable
         if (_planPath is not null) try { File.Delete(_planPath); } catch { }
     }
 
-    private static int FreePort()
-    {
-        var l = new TcpListener(IPAddress.Loopback, 0);
-        l.Start();
-        int port = ((IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
-    }
 }
 
 [Collection(Wo206FaultCollection.Name)]

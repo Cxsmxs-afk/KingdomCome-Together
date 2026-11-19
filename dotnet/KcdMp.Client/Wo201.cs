@@ -38,6 +38,10 @@ public static class Wo201Rules
         | (on("oneshot_tick_cap") ? 4 : 0) | (on("copy_no_idle_turn") ? 8 : 0));
 
     // ---- B11: the crossbow and bow steps shown on the figure ----
+    public static bool AimChanged(BodyState2 last, BodyState2 now) =>
+        last.Charge != now.Charge || last.AimYaw != now.AimYaw || last.AimPitch != now.AimPitch
+        || ((last.Bits ^ now.Bits) & (BodyState2Bits.RangedAim | BodyState2Bits.RangedChargeKnown)) != 0;
+
     public static string RangedPhaseName(byte p) => p switch
     {
         0 => "none", 1 => "charging", 2 => "aiming", 3 => "firing", 4 => "reloading", 5 => "uncharging", 6 => "leaving", _ => "?",

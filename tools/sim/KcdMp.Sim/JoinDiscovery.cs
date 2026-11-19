@@ -78,7 +78,7 @@ public static class JoinDiscovery
         {
             operations.Add(op);
             Check(files.Protects(path), "discovery lost sweep protection");
-            Check(!files.MayRemove(path, owner) && !files.TryDelete(path, owner), "discovery deleted the placed world");
+            Check(!files.MayRemove(path, owner) && !files.TryDelete(path, owner, DeleteOwnedFile), "discovery deleted the placed world");
             Check(files.End(joined: false, cancelled: false).Length == 0, "failed list authorized cleanup");
             Check(SHA256.HashData(File.ReadAllBytes(path)).AsSpan().SequenceEqual(sha), "discovery changed the placed file");
             calls++;
@@ -89,10 +89,10 @@ public static class JoinDiscovery
         Check(listed is { Listed: true } && listed.ContinuePlayline == playline && listed.ContinueName == name, "discovery did not find the same world");
         Check(calls == scenario.Unreadable + scenario.Missing + 1, "unexpected number of discovery attempts");
         Check(operations[0] == 1 && operations.Skip(1).Take(scenario.Unreadable).All(op => op == 3), "a timed-out rescan was followed by another full rescan");
-        Check(File.Exists(path) && !files.TryDelete(path, owner), "GameplayStarted alone must not release the world");
+        Check(File.Exists(path) && !files.TryDelete(path, owner, DeleteOwnedFile), "GameplayStarted alone must not release the world");
         Check(files.End(joined: true, cancelled: false).Single() == owner, "join=in did not authorize its world");
         Check(files.Protects(path), "authorized cleanup lost protection before deletion");
-        Check(files.TryDelete(path, owner) && !File.Exists(path) && !files.Protects(path), "join=in cleanup failed");
+        Check(files.TryDelete(path, owner, DeleteOwnedFile) && !File.Exists(path) && !files.Protects(path), "join=in cleanup failed");
 
         // No usable list ever arrives: bounded retries resume the host, but retain the verified file.
         await File.WriteAllBytesAsync(path, bytes);
@@ -104,7 +104,7 @@ public static class JoinDiscovery
             return Task.FromResult<CombatPipe.SaveListReport?>(null);
         }, () => true, delay: NoDelay);
         Check(missing is null && exhausted == JoinSaveList.MaxAttempts, "unreadable discovery was not bounded");
-        Check(files.End(joined: false, cancelled: false).Length == 0 && !files.TryDelete(path, owner)
+        Check(files.End(joined: false, cancelled: false).Length == 0 && !files.TryDelete(path, owner, DeleteOwnedFile)
               && File.Exists(path) && files.Protects(path), "exhausted discovery removed the retry source");
 
         // A late successful reply after the player cancels cannot start a load.
@@ -116,10 +116,16 @@ public static class JoinDiscovery
             active = false;
             return Task.FromResult<CombatPipe.SaveListReport?>(new(true, 0, 1, playline, playline, 0, name));
         }, () => active, delay: NoDelay);
-        Check(cancelled is null && cancelledCalls == 1 && File.Exists(path) && !files.TryDelete(path, owner), "late list survived cancellation or deleted its source");
+        Check(cancelled is null && cancelledCalls == 1 && File.Exists(path) && !files.TryDelete(path, owner, DeleteOwnedFile), "late list survived cancellation or deleted its source");
         files.End(joined: false, cancelled: true);
-        Check(files.Protects(path) && files.TryDelete(path, owner) && !File.Exists(path), "player cancel cleanup failed");
+        Check(files.Protects(path) && files.TryDelete(path, owner, DeleteOwnedFile) && !File.Exists(path), "player cancel cleanup failed");
         return calls;
+    }
+
+    private static bool DeleteOwnedFile(string path)
+    {
+        File.Delete(path);
+        return true;
     }
 
     private static Task NoDelay(TimeSpan _, CancellationToken ct)

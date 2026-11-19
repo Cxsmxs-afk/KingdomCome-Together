@@ -20,10 +20,9 @@ namespace KcdMp.Wire;
 //
 //   1. BODY STATE 2 (Position/Ghost flag 0x10, 12 bytes). Supersedes the
 //      WO-100.5 0x04 block, which a v8 sender never sets and a v8 relay no
-//      longer accepts. Change-gated at the sender: present when any field
-//      differs from the last one sent, and at least every
-//      BodyState2HeartbeatMs while anything is non-zero, so a late joiner
-//      converges. Layout (LE):
+//      longer accepts. Movement and combat state keep their existing change
+//      gate. Ranged state rides positions already due for movement, another
+//      body field, or the normal position heartbeat. Layout (LE):
 //        [speedCm:u16]     planar speed of the sender's requested velocity, cm/s
 //        [moveDir:i8]      heading of that velocity minus the body's facing,
 //                          in 1/256 of a turn (1.40625 deg)
@@ -31,9 +30,9 @@ namespace KcdMp.Wire;
 //        [guardZone:u8]    WireZone
 //        [guardStance:u8]  WireGuardStance
 //        [atkZone:u8]      WireZone (the requested attack zone)
-//        [charge:u8]       ranged charge 0..255 (0 when no ranged weapon drawn)
-//        [aimYaw:i16]      ranged aim yaw, 1/10000 rad (0 when not aiming)
-//        [aimPitch:i16]    ranged aim pitch, 1/10000 rad
+//        [charge:u8]       ranged charge 0..255, meaningful with RangedChargeKnown
+//        [aimYaw:i16]      ranged aim yaw, 1/10000 rad, -32768 when held but unmeasured
+//        [aimPitch:i16]    ranged aim pitch, same encoding as aimYaw
 //      Tail order after the flags byte: [bodyState2:12 if 0x10][senderMs:4 if 0x08].
 //      Position lengths 17/21/29/33, Ghost 18/22/30/34 -- exact, never a range.
 //
@@ -80,7 +79,7 @@ public enum BodyState2Bits : byte
     BlockHeld = 0x02,
     /// <summary>Crouched (the state expansion's crouch desire).</summary>
     Crouched = 0x04,
-    /// <summary>A ranged weapon is drawn and aiming; charge/aim fields are meaningful.</summary>
+    /// <summary>A ranged weapon is held in a verified charging or aiming phase.</summary>
     RangedAim = 0x08,
     /// <summary>The sender is locked on an opponent (combat model opponent pointer set).</summary>
     Locked = 0x10,
@@ -89,6 +88,8 @@ public enum BodyState2Bits : byte
     /// <summary>WO-154: the sender's own body is down (its physics is no living entity: a knockdown's ragdoll, a
     /// knockout). The avatar falls, lies and stands up on this bit's edges.</summary>
     Downed = 0x40,
+    /// <summary>The ranged charge is a measured value. An absent measurement is distinct from a measured zero.</summary>
+    RangedChargeKnown = 0x80,
 }
 
 /// <summary>WO-121: the 12 replicated-state bytes (Position/Ghost flag 0x10).</summary>
@@ -97,6 +98,7 @@ public readonly record struct BodyState2(
     WireZone AtkZone, byte Charge, short AimYaw, short AimPitch)
 {
     public const int Len = 12;
+    public const short AimAngleUnavailable = short.MinValue;
 
     public float SpeedMps => SpeedCm / 100f;
     /// <summary>moveDir in radians, (-pi, pi].</summary>
@@ -240,34 +242,56 @@ public readonly record struct RowEvent(uint SenderMs, byte Flags, Guid Row, stri
 /// WO-121: PlayerHit (0x44 up / 0x45 down) -- one friendly-fire hit.
 /// Up: <c>[victimGhostId:1][stamina:4f][health:4f][flags:1][material:1]</c> (11).
 /// Down: <c>[attackerGhostId:1]</c> + the up body (12).
+/// With LinkCapPvpContact, both forms add a sequence and incarnation (two little-endian u64s).
+/// Up names the recipient incarnation, down names the relay-authenticated source incarnation.
 /// stamina/health are LOSS amounts, as TakeDamage takes them.
 /// </summary>
 public readonly record struct PlayerHitV8(byte Victim, float Stamina, float Health, byte Flags, byte Material)
 {
     public const int UpLen = 11;
     public const int DownLen = 12;
+    public const int IdentifiedUpLen = UpLen + 2 * sizeof(ulong);
+    public const int IdentifiedDownLen = DownLen + 2 * sizeof(ulong);
     /// <summary>The attacker had no weapon in hand: a fist hit (a knockdown, never a grave).</summary>
     public const byte FlagUnarmed = 0x01;
     /// <summary>A missile (arrow/bolt) hit, from the combat soul's missile slot.</summary>
     public const byte FlagMissile = 0x02;
 
-    public byte[] BuildUp()
+    public byte[] BuildUp(ulong sequence = 0, ulong recipient = 0)
     {
-        var p = new byte[3 + UpLen];
+        if ((sequence == 0) != (recipient == 0)) throw new ArgumentException("A contact needs both sequence and recipient.");
+        int length = sequence > 0 ? IdentifiedUpLen : UpLen;
+        var p = new byte[3 + length];
         p[0] = Protocol.PlayerHitV8Up;
-        BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(1), UpLen);
+        BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(1), (ushort)length);
         p[3] = Victim;
         BinaryPrimitives.WriteSingleLittleEndian(p.AsSpan(4), Stamina);
         BinaryPrimitives.WriteSingleLittleEndian(p.AsSpan(8), Health);
         p[12] = Flags; p[13] = Material;
+        if (sequence > 0)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(3 + UpLen), sequence);
+            BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(3 + UpLen + sizeof(ulong)), recipient);
+        }
         return p;
     }
 
     /// <summary>Decodes a 0x45 body; the attacker id comes back separately.</summary>
-    public static bool TryDecodeDown(ReadOnlySpan<byte> b, out byte attacker, out PlayerHitV8 hit)
+    public static bool TryDecodeDown(ReadOnlySpan<byte> b, out byte attacker, out PlayerHitV8 hit) =>
+        TryDecodeDown(b, out attacker, out hit, out _, out _);
+
+    public static bool TryDecodeDown(ReadOnlySpan<byte> b, out byte attacker, out PlayerHitV8 hit,
+        out ulong sequence, out ulong incarnation)
     {
         attacker = 0; hit = default;
-        if (b.Length != DownLen) return false;
+        sequence = incarnation = 0;
+        if (b.Length is not (DownLen or IdentifiedDownLen)) return false;
+        if (b.Length == IdentifiedDownLen)
+        {
+            sequence = BinaryPrimitives.ReadUInt64LittleEndian(b[DownLen..]);
+            incarnation = BinaryPrimitives.ReadUInt64LittleEndian(b[(DownLen + sizeof(ulong))..]);
+            if (sequence == 0 || incarnation == 0) return false;
+        }
         attacker = b[0];
         float st = BinaryPrimitives.ReadSingleLittleEndian(b[2..]);
         float hp = BinaryPrimitives.ReadSingleLittleEndian(b[6..]);
@@ -286,6 +310,17 @@ public static partial class Protocol
     // ---- WO-121 type bytes ----
     public const byte PlayerHitV8Up   = 0x44;
     public const byte PlayerHitV8Down = 0x45;
+    public const byte PvpPeerDown = 0x94; // negotiated relay roster entry [ghost:1][incarnation:8]
+    public const int PvpPeerLen = 1 + sizeof(ulong);
+
+    public static bool TryReadPvpPeer(ReadOnlySpan<byte> body, out byte ghost, out ulong incarnation)
+    {
+        ghost = 0; incarnation = 0;
+        if (body.Length != PvpPeerLen) return false;
+        ghost = body[0];
+        incarnation = BinaryPrimitives.ReadUInt64LittleEndian(body[1..]);
+        return incarnation != 0;
+    }
 
     // ---- WO-121 Position/Ghost ----
     /// <summary>WO-121: Position/Ghost flag -- BodyState2 (12 bytes) follows the flags byte.</summary>

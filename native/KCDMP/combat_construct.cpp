@@ -272,6 +272,27 @@ bool read_ptr(const void* base, size_t offset, void** out) {
     return fault::guarded(site, [&] { *out = *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(base) + offset); });
 }
 
+combatactions::QueueResult submit_combat_action(const combatactions::BodyProof& body, void* manager, QueueActionFn queue,
+                                              void* action, bool movesBody, bool lowerPrevious = false) {
+    using combatactions::QueueResult;
+    // Keep the caller's reference and the separate reference offered only if QueueAction runs.
+    auto* refs = reinterpret_cast<volatile LONG*>(static_cast<char*>(action) + 0x58);
+    InterlockedIncrement(refs);
+    InterlockedIncrement(refs);
+    const auto outcome = combatactions::detail::submit(
+        [&] { return combatactions::reserve_queue(body, action, movesBody); },
+        [&](const combatactions::QueueTicket& ticket) {
+            if (lowerPrevious) swing_lower_previous(body.eid);
+            void* current = nullptr;
+            return read_ptr(body.combat, kOffAnimActionManager, &current) && current == manager && combatactions::begin_queue(ticket);
+        },
+        [&] { void* offered = action; return call_queue_action(queue, manager, &offered, -1.0f); },
+        combatactions::settle_queue);
+    if (outcome == QueueResult::Refused) call_release(action);  // QueueAction never received its reference
+    if (outcome != QueueResult::Submitted) call_release(action);  // only our own reference after an uncertain dispatch
+    return outcome;
+}
+
 bool read_vptr(const void* obj, void** out) {
     KCDMP_FAULT_READ(site, "combat_construct::read_vptr");
     return fault::guarded(site, [&] { *out = *reinterpret_cast<void* const*>(obj); });
@@ -436,12 +457,17 @@ void hex20(const uint8_t* p, char* out /* >= 64 */) {
 // queue it through the actor's own manager. Every step SEH-isolated + logged;
 // every hardcoded RVA prologue-verified before the first call (WO-42 §7 note
 // 2's discipline, fail closed).
-void run_rung2(void* actor, void* combatActor, void* manager, const char* fragSpec) {
+void run_rung2(uint32_t eid, void* actor, void* combatActor, void* manager, const char* fragSpec) {
     char d[256]{};
     logf("COMBAT: === rung 2 -- construct + queue a real C_CombatAnimAction ===");
     logf("COMBAT: rung2 spec = \"%s\"", fragSpec);
     if (!combatActor || !manager) {
         logf("COMBAT: rung2 abort -- combatActor/manager missing");
+        return;
+    }
+    const auto body = combatactions::observe_body(eid);
+    if (body.actor != actor || body.combat != combatActor) {
+        logf("COMBAT: rung2 abort -- combat body proof unavailable");
         return;
     }
 
@@ -583,18 +609,9 @@ void run_rung2(void* actor, void* combatActor, void* manager, const char* fragSp
     logf("COMBAT: rung2 constructed C_CombatAnimAction %p: status(+0x28)=%u refcount(+0x58)=%u "
          "(ctor inits both 0; QueueAction's gate needs status 0 or 4)", anim, status, refc);
 
-    // --- AddRef twice, then queue. One reference is consumed by QueueAction
-    // (the game's own call site INCs immediately before the call, WO-42
-    // §5.2b); the second is deliberately retained -- in the game the owning
-    // attack action holds a stored reference for the fragment's lifetime, and
-    // without one here the action could be destroyed under the controller if
-    // IActionController::Queue does not take its own. A 0x1A8 leak per
-    // invocation, chosen over a possible use-after-free. --------------------
-    InterlockedIncrement(reinterpret_cast<volatile LONG*>(reinterpret_cast<char*>(anim) + 0x58));
-    InterlockedIncrement(reinterpret_cast<volatile LONG*>(reinterpret_cast<char*>(anim) + 0x58));
-    void* sp = anim;
-    if (!call_queue_action(reinterpret_cast<QueueActionFn>(queueFn), manager, &sp, -1.0f)) {
-        logf("COMBAT: rung2 QueueAction FAULTED");
+    const auto submitted = submit_combat_action(body, manager, reinterpret_cast<QueueActionFn>(queueFn), anim, false);
+    if (submitted != combatactions::QueueResult::Submitted) {
+        logf("COMBAT: rung2 QueueAction %s", submitted == combatactions::QueueResult::Refused ? "refused before dispatch" : "uncertain");
         return;
     }
     read_u32(anim, 0x28, &status);
@@ -604,6 +621,7 @@ void run_rung2(void* actor, void* combatActor, void* manager, const char* fragSp
          status, refc);
     logf("COMBAT: rung2 done -- a real C_CombatAnimAction is queued on the actor's own "
          "C_CombatAnimActionManager. Watch the character now.");
+    call_release(anim);
 }
 
 } // namespace
@@ -732,7 +750,8 @@ void probe_combat_construct() {
 
     // WO-45 rung 2 -- the first mutating mode in this file. Runs only after
     // the reads above have already logged the ghost's state this invocation.
-    run_rung2(actor, combatActor, manager, fragSpec);
+    if (wantPlayer) read_u32(actor, 0x30, &entityId);  // the local actor's own EID, as in motion::local_actor
+    run_rung2(entityId, actor, combatActor, manager, fragSpec);
 }
 
 namespace {
@@ -903,6 +922,9 @@ bool combat_row_current(uint32_t entityId, const CombatRow& row) {
            actorClass && actorClass == row.actorClass;
 }
 
+static bool watch_submitted_action(const combatactions::BodyProof& body, void* anim, uint64_t timelineToken);
+static void keep_last_action(const combatactions::BodyProof& body, void* anim);
+
 static SwingResult queue_swing(uint32_t entityId, const char* fragSpec, const CombatRow* cached,
                                uint64_t timelineToken, bool* watching) {
     if (watching) *watching = false;
@@ -983,6 +1005,8 @@ static SwingResult queue_swing(uint32_t entityId, const char* fragSpec, const Co
         logf("SWING: entity=%u -- anim-action manager (+0x490) unreadable/null", entityId);
         return SwingResult::ManagerMissing;
     }
+    const auto body = combatactions::observe_body(entityId);
+    if (body.actor != actor || body.combat != combatActor) return SwingResult::OwnerOwns;
 
     void* allocFn = nullptr;
     if (!read_ptr(combatModule, kRvaCombatAllocGlobal, &allocFn) || !allocFn) {
@@ -1013,33 +1037,18 @@ static SwingResult queue_swing(uint32_t entityId, const char* fragSpec, const Co
         return SwingResult::CtorFailed;
     }
 
-    // Two refs in: one for QueueAction to consume (the game's own convention),
-    // one held by us across the call and the state read below.
-    InterlockedIncrement(reinterpret_cast<volatile LONG*>(reinterpret_cast<char*>(anim) + 0x58));
-    InterlockedIncrement(reinterpret_cast<volatile LONG*>(reinterpret_cast<char*>(anim) + 0x58));
-    void* sp = anim;
-    swing_lower_previous(entityId);   // WO-202 IV.1: the copy's own last swing steps down the way the engine's Withdraw does
-    if (!call_queue_action(reinterpret_cast<QueueActionFn>(queueFn), manager, &sp, -1.0f)) {
-        logf("SWING: entity=%u -- QueueAction FAULTED", entityId);
-        if (cached) {
-            // A fault can occur after a partial engine install. Keep the
-            // one-shot holder until the existing action tracker reads it back.
-            permit->wrote();
-            combatactions::track(entityId, actor, anim, true);
-        }
-        call_release(anim);   // still drop our ref; the object outlives the fault path
-        return SwingResult::QueueFaulted;
-    }
+    const auto submitted = submit_combat_action(body, manager, reinterpret_cast<QueueActionFn>(queueFn), anim, !death, true);
+    if (submitted == combatactions::QueueResult::Refused) return SwingResult::OwnerOwns;
     permit->wrote();
-    combatactions::track(entityId, actor, anim, !death);   // WO-221 A: ended before this body's combat part goes
+    if (submitted == combatactions::QueueResult::Uncertain) return SwingResult::QueueFaulted;
     uint32_t status = ~0u, refc = ~0u;
     read_u32(anim, 0x28, &status);
     read_u32(anim, 0x58, &refc);
     // WO-167 C3: our reference goes to the swing watch (dropped there once the action was installed, or never was); with the watch
     // off it is dropped here as before. refc includes it, so the controller's view is refc-1.
-    const bool watched = swing_watch_take(entityId, anim, timelineToken);
+    const bool watched = watch_submitted_action(body, anim, timelineToken);
     if (watching) *watching = watched;
-    swing_keep_last(entityId, anim);   // WO-202 IV.1: one reference of ours until the next swing (or kLastSwingKeepS)
+    keep_last_action(body, anim);   // WO-202 IV.1: one reference of ours until the next swing (or kLastSwingKeepS)
     if (!watched) call_release(anim);
     if (cached) {
         logf("SWING: entity=%u queued typed fragment %u status=%u ref(controller)=%u%s",
@@ -1093,6 +1102,8 @@ SwingResult install_fragment(uint32_t entityId, uint32_t fragmentId, const uint8
     }
     void* manager = nullptr;
     if (!read_ptr(combatActor, kOffAnimActionManager, &manager) || !manager) return SwingResult::ManagerMissing;
+    const auto body = combatactions::observe_body(entityId);
+    if (body.actor != actor || body.combat != combatActor) return SwingResult::OwnerOwns;
     void* allocFn = nullptr;
     if (!read_ptr(combatModule, kRvaCombatAllocGlobal, &allocFn) || !allocFn) return SwingResult::AllocatorMissing;
     std::optional<holders::Permit> permit;
@@ -1116,16 +1127,10 @@ SwingResult install_fragment(uint32_t entityId, uint32_t fragmentId, const uint8
             }) || !anim)
             return SwingResult::CtorFailed;
     }
-    // two references in: one for QueueAction to consume (the game's own convention), one the owner keeps
-    InterlockedIncrement(reinterpret_cast<volatile LONG*>(reinterpret_cast<char*>(anim) + 0x58));
-    InterlockedIncrement(reinterpret_cast<volatile LONG*>(reinterpret_cast<char*>(anim) + 0x58));
-    void* sp = anim;
-    if (!call_queue_action(reinterpret_cast<QueueActionFn>(queueFn), manager, &sp, -1.0f)) {
-        call_release(anim);
-        return SwingResult::QueueFaulted;
-    }
+    const auto submitted = submit_combat_action(body, manager, reinterpret_cast<QueueActionFn>(queueFn), anim, movesBody);
+    if (submitted == combatactions::QueueResult::Refused) return SwingResult::OwnerOwns;
     if (permit) permit->wrote();
-    combatactions::track(entityId, actor, anim);   // WO-221 A: recorded, and ended before this body's combat part goes
+    if (submitted == combatactions::QueueResult::Uncertain) return SwingResult::QueueFaulted;
     *outAction = anim;
     return SwingResult::Ok;
 }
@@ -1177,8 +1182,8 @@ bool stop_action(void* action) {
 // own virtual. The last result per body is what the agent asks before it counts the swing as shown. Main thread only. Any fault
 // switches the watch off for the session (every held reference dropped, the site logged; the agent says it on screen once).
 namespace {
-struct SwingWatch { uint32_t eid = 0; void* anim = nullptr; double t0 = 0; bool seen = false; uint64_t timelineToken = 0; };
-struct SwingLast { wo167rules::Seen seen = wo167rules::Seen::None; double at = 0; float waitS = 0; };
+struct SwingWatch { combatactions::BodyProof body; void* anim = nullptr; double t0 = 0; bool seen = false; uint64_t timelineToken = 0; };
+struct SwingLast { combatactions::BodyProof body; wo167rules::Seen seen = wo167rules::Seen::None; double at = 0; float waitS = 0; };
 std::vector<SwingWatch> g_watches;                       // main thread
 std::unordered_map<uint32_t, SwingLast> g_swingSeen;      // main thread
 std::atomic<bool> g_watchOn{true};                  // mp_swing_watch (the agent)
@@ -1201,6 +1206,10 @@ bool w_release(void* anim) {
     });
 }
 
+bool same_swing_body(const combatactions::BodyProof& body) {
+    return combatactions::detail::same_body(body, combatactions::observe_body(body.eid));
+}
+
 void w_switch_off(const char* site) {
     if (g_watchFaulted.exchange(true)) return;
     g_watchFaultSite = site;
@@ -1208,22 +1217,24 @@ void w_switch_off(const char* site) {
     logf("WO167-SHOWN switched OFF for the session -- a fault at %s (every queued swing counts as shown again, as in 0.48.2)", site);
     for (auto& w : g_watches) {
         if (w.timelineToken) timelineactions::observed(w.timelineToken, false);
-        if (w.anim) w_release(w.anim);   // a release that faults again leaks one action: never a crash
+        if (w.anim && same_swing_body(w.body)) w_release(w.anim);
     }
     g_watches.clear();
 }
 
 void w_resolve(SwingWatch& w, wo167rules::Seen s, double now) {
-    if (w.timelineToken) timelineactions::observed(std::exchange(w.timelineToken, 0), s == wo167rules::Seen::Installed);
-    if (!w_release(w.anim)) { w_switch_off("wo167::watch_release"); return; }
+    const bool current = same_swing_body(w.body);
+    if (w.timelineToken) timelineactions::observed(std::exchange(w.timelineToken, 0), current && s == wo167rules::Seen::Installed);
+    if (current && !w_release(w.anim)) { w_switch_off("wo167::watch_release"); return; }
     w.anim = nullptr;
+    if (!current) { c_wNever.fetch_add(1, std::memory_order_relaxed); return; }
     (s == wo167rules::Seen::Installed ? c_wInstalled : c_wNever).fetch_add(1);
-    SwingLast& l = g_swingSeen[w.eid];
-    l.seen = s; l.at = now; l.waitS = static_cast<float>(now - w.t0);
+    SwingLast& l = g_swingSeen[w.body.eid];
+    l = {w.body, s, now, static_cast<float>(now - w.t0)};
 }
 } // namespace
 
-bool swing_watch_take(uint32_t eid, void* anim, uint64_t timelineToken) {
+static bool watch_submitted_action(const combatactions::BodyProof& body, void* anim, uint64_t timelineToken) {
     if ((!timelineToken && !g_watchOn.load(std::memory_order_relaxed)) || g_watchFaulted.load(std::memory_order_relaxed) || !anim) return false;
     const double now = w_now();
     if (g_watches.size() >= wo167rules::kMaxWatches) {   // the oldest first: it had its chance
@@ -1235,45 +1246,51 @@ bool swing_watch_take(uint32_t eid, void* anim, uint64_t timelineToken) {
         g_watches.erase(g_watches.begin());
         c_wEvicted.fetch_add(1);
     }
-    g_watches.push_back(SwingWatch{ eid, anim, now, false, timelineToken });
-    SwingLast& l = g_swingSeen[eid];
-    l.seen = wo167rules::Seen::Pending; l.at = now; l.waitS = 0;
+    g_watches.push_back(SwingWatch{ body, anim, now, false, timelineToken });
+    SwingLast& l = g_swingSeen[body.eid];
+    l = {body, wo167rules::Seen::Pending, now, 0};
     c_wTaken.fetch_add(1);
     return true;
 }
 
+bool swing_watch_take(uint32_t eid, void* anim, uint64_t timelineToken) {
+    const auto body = combatactions::observe_body(eid);
+    return body.combat && watch_submitted_action(body, anim, timelineToken);
+}
+
 // ---- WO-202 IV.1 anim_shown: each copy's last swing, one reference of ours, so the next swing can step it down ----
 namespace {
-struct LastSwing { void* anim = nullptr; double at = 0; };
+struct LastSwing { combatactions::BodyProof body; void* anim = nullptr; double at = 0; };
 std::unordered_map<uint32_t, LastSwing> g_lastSwing;   // main thread
 std::atomic<uint32_t> c_lowered{0}, c_lowerSkipped{0}, c_lowerFault{0};
 
 // A copy that is gone (a load, a despawn) may have taken its animation controller with it: our reference is dropped without the
 // action's own release then -- a few hundred bytes left behind, never a destroy path run against a controller that no longer exists.
-bool swing_owner_alive(uint32_t eid) { return eid && engine::entity_by_id(eid) != nullptr; }
-
 bool act_write_i32(void* anim, size_t off, int32_t v) {
     KCDMP_FAULT_READ(site, "wo202::swing_priority_write");   // our own write of game memory (Kind::Read covers both)
     return fault::guarded(site, [&] { *reinterpret_cast<int32_t*>(reinterpret_cast<char*>(anim) + off) = v; });
 }
 } // namespace
 
-void swing_keep_last(uint32_t eid, void* anim) {
+static void keep_last_action(const combatactions::BodyProof& body, void* anim) {
     if (!anim || !kcdmp::wo202::on(kcdmp::wo202rules::kBitAnimShown)) return;
+    if (!same_swing_body(body)) return;
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(reinterpret_cast<char*>(anim) + 0x58));
-    LastSwing& l = g_lastSwing[eid];
-    if (l.anim && swing_owner_alive(eid)) call_release(l.anim);
-    l.anim = anim;
-    l.at = w_now();
+    LastSwing& l = g_lastSwing[body.eid];
+    if (l.anim && same_swing_body(l.body)) call_release(l.anim);
+    l = {body, anim, w_now()};
 }
+
+void swing_keep_last(uint32_t eid, void* anim) { keep_last_action(combatactions::observe_body(eid), anim); }
 
 void swing_lower_previous(uint32_t eid) {
     auto it = g_lastSwing.find(eid);
     if (it == g_lastSwing.end()) return;
-    void* prev = it->second.anim;
+    const LastSwing previous = it->second;
     g_lastSwing.erase(it);
+    void* prev = previous.anim;
     if (!prev) return;
-    if (!swing_owner_alive(eid)) { c_lowerSkipped.fetch_add(1); return; }
+    if (!same_swing_body(previous.body)) { c_lowerSkipped.fetch_add(1); return; }
     uint32_t st = 0, pr = 0;
     const bool on = kcdmp::wo202::on(kcdmp::wo202rules::kBitAnimShown);
     if (read_u32(prev, kcdmp::wo202rules::kActStatusOff, &st) && read_u32(prev, kcdmp::wo202rules::kActPriorityOff, &pr) &&
@@ -1298,7 +1315,7 @@ void swing_watch_tick() {
         const double t = w_now();
         for (auto it = g_lastSwing.begin(); it != g_lastSwing.end();) {
             if (t - it->second.at > kcdmp::wo202rules::kLastSwingKeepS) {
-                if (it->second.anim && swing_owner_alive(it->first)) call_release(it->second.anim);
+                if (it->second.anim && same_swing_body(it->second.body)) call_release(it->second.anim);
                 it = g_lastSwing.erase(it);
             }
             else ++it;
@@ -1325,7 +1342,7 @@ wo167rules::Seen swing_watch_last(uint32_t eid, uint32_t* ageMs, uint32_t* waitM
     *ageMs = 0; *waitMs = 0;
     if (g_watchFaulted.load(std::memory_order_relaxed) || !g_watchOn.load(std::memory_order_relaxed)) return wo167rules::Seen::Off;
     auto it = g_swingSeen.find(eid);
-    if (it == g_swingSeen.end()) return wo167rules::Seen::None;
+    if (it == g_swingSeen.end() || !same_swing_body(it->second.body)) return wo167rules::Seen::None;
     const double age = w_now() - it->second.at;
     *ageMs = static_cast<uint32_t>(age < 0 ? 0 : (age > 4e6 ? 4e6 : age * 1000.0));
     *waitMs = static_cast<uint32_t>(it->second.waitS * 1000.0f);
@@ -1335,7 +1352,7 @@ wo167rules::Seen swing_watch_last(uint32_t eid, uint32_t* ageMs, uint32_t* waitM
 void swing_watch_set(bool on) {
     const bool was = g_watchOn.exchange(on);
     if (was != on) logf("WO167-SHOWN mp_swing_watch %s", on ? "on" : "off");
-    if (!on) { for (auto& w : g_watches) if (w.anim) w_release(w.anim); g_watches.clear(); }
+    if (!on) { for (auto& w : g_watches) if (w.anim && same_swing_body(w.body)) w_release(w.anim); g_watches.clear(); }
 }
 
 bool swing_watch_faulted() { return g_watchFaulted.load(std::memory_order_relaxed); }

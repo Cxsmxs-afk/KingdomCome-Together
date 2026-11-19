@@ -130,8 +130,8 @@ public partial class GameBridge
 {
     private readonly System.Collections.Concurrent.ConcurrentDictionary<byte, long> _w202OutfitChangedMs = new();
 
-    private Task Wo202EquipAllOnGhostAsync(string soulName, IReadOnlyList<Guid> classes, CancellationToken ct) =>
-        _transport.ExecuteNowAsync($"if KCD2MP_W202EquipAll then KCD2MP_W202EquipAll(\"{soulName}\",\"{Wo202Rules.OutfitList(classes)}\") end", ct);
+    private Task Wo202EquipAllOnGhostAsync(string soulName, IReadOnlyList<Guid> classes, FigureOutfitStamp stamp, CancellationToken ct) =>
+        _transport.ExecuteNowAsync($"if KCD2MP_W202EquipAll then KCD2MP_W202EquipAll(\"{soulName}\",\"{Wo202Rules.OutfitList(classes)}\",{stamp.LuaArguments}) end", ct);
 }
 
 // WO-202 IV.3 recoil_clinch: this player's own combat opponent, read every 0.5 s while a session runs (op 67's own-player query: the

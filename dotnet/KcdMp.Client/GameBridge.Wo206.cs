@@ -50,11 +50,17 @@ public partial class GameBridge
         }
         if (W206Host) return true;   // a host never takes another machine's epochs
         if (LoadSequenceEnabled && _hostModeKnown && src != _hostModeFrom) return true;
-        bool changed = _w206.LearnWorld(world, join);
+        if (HostAbsentPause && (!Protocol.TrySplitJoinDown(payload, out _, out byte target, out _, out _) || target != _myGhostId))
+            return true;
+        HostAbsentRules.TryReadRunFromDown(payload, out Guid hostRun);
+        if (!HostAbsentCanHearEpoch(world, hostRun)) return true;
+        bool changed;
+        lock (_joinGate) changed = _w206.LearnWorld(world, join);
         LoadSequenceObserveHostWorld(world);
         if (changed) { T3TpInvalidate(); _ = ResetHostCalendarAsync("host-world-epoch"); }
         Wo206SyncPublic();
         if (changed) Console.WriteLine($"MP-W206 the host's world epoch is {world} now ({why}; join epoch {join}) -- what was read before this is the old world's");
+        HostAbsentOnEpoch(world, hostRun);
         Wo211OnEpochHeard(world);   // WO-211 A.1: a link hold ends here -- the same world in place, a changed one through the in-world rejoin
         if (changed && _joinedWorld && _rewinding && !_rejoinPending) T3ArmInWorldRejoin("host-world-epoch-after-reload");
         // the answer goes out at once: everything this agent sends after it was sent knowing the new world
@@ -161,9 +167,12 @@ public partial class GameBridge
 
     private async Task Wo206AnnounceAsync(string why, byte? only = null)
     {
-        if (!W206Host) return;
-        _w206.EnsureHost();
-        Wo206SyncPublic();
+        if (!W206Host && !WorldReconnectCanAnnounceReturningHost()) return;
+        if (W206Host)
+        {
+            _w206.EnsureHost();
+            Wo206SyncPublic();
+        }
         Volatile.Write(ref _w206AnnouncedMs, Environment.TickCount64);
         uint world = _w206.World;
         string text = WorldReconnectEpochProof(Wo206Rules.EpochText(world, _w206.Join, why), world);
@@ -176,14 +185,14 @@ public partial class GameBridge
     {
         _w206.ForgetPeer(id);
         _w206.ForgetJoiner(id);
-        if (W206Host) _ = Wo206AnnounceAsync("peer", id);
+        if (W206Host || config.IsHosting) _ = Wo206AnnounceAsync("peer", id);
     }
 
     /// <summary>The 4 Hz session tick: the stats line every minute with a partner; the host's announcement every 10 s.</summary>
     private void Wo206Tick(long n)
     {
         if (n % 240 == 120 && LivePartners().Count > 0) Wo206Stats();
-        if (!W206Host) return;
+        if (!W206Host && !WorldReconnectCanAnnounceReturningHost()) return;
         if (Environment.TickCount64 - Volatile.Read(ref _w206AnnouncedMs) < Wo206Rules.AnnounceEveryMs) return;
         if (LivePartners().Count == 0) { Volatile.Write(ref _w206AnnouncedMs, Environment.TickCount64); return; }
         _ = Wo206AnnounceAsync("tick");

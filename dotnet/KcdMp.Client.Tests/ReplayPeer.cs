@@ -65,14 +65,33 @@ internal sealed class ReplayRelay : IAsyncDisposable
         catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
     }
 
-    public async ValueTask DisposeAsync()
+    public async Task StopAsync(bool gracefulEof = false)
     {
         _stop.Cancel();
         try { await _accept; }
         finally
         {
             _listener.Stop();
-            foreach (var client in _clients) client.Dispose();
+            for (int i = _clients.Count - 1; i >= 0; i--)
+            {
+                var client = _clients[i];
+                if (gracefulEof)
+                {
+                    try { client.Client?.Shutdown(SocketShutdown.Send); }
+                    catch (SocketException) { }
+                    catch (ObjectDisposedException) { }
+                }
+                client.Dispose();
+            }
+            _clients.Clear();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try { await StopAsync(); }
+        finally
+        {
             _stop.Dispose();
             await _app.DisposeAsync();
         }
@@ -96,6 +115,12 @@ internal sealed class ReplayPeer : IAsyncDisposable
     }
 
     public byte Id { get; private set; }
+
+    // After the handshake, an integration test may hand this endpoint to the production reader.
+    public Stream Wire => _wire;
+
+    // Let the relay announce a real departure while the reader drains its stream.
+    public void FinishSending() => _client.Client.Shutdown(SocketShutdown.Send);
 
     public static async Task<ReplayPeer> ConnectAsync(int port, string name, CancellationToken ct = default)
     {

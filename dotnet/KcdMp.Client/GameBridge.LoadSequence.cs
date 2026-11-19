@@ -126,7 +126,8 @@ public partial class GameBridge
         LoadSequenceChange(s => _worldLoad.TryAbort(s.Generation, s.Phase));
     }
 
-    private bool LoadSequenceTryHoldLink() => LoadSequenceChange(s => _worldLoad.TryHoldLink(s.Generation));
+    private bool LoadSequenceTryHoldLink(bool allowSettling = false) =>
+        LoadSequenceChange(s => _worldLoad.TryHoldLink(s.Generation, allowSettling));
 
     private bool LoadSequenceTryResumeLink(uint world, bool resumed, ulong expectedGeneration = 0, Func<bool>? proof = null) => LoadSequenceChange(s =>
     {
@@ -231,12 +232,13 @@ public partial class GameBridge
     }
 
     private static bool LoadSequenceWorldFrame(int type, byte[] body) =>
-        Wo206Rules.WorldCategory(type, body) is not null || type == Protocol.W164Down && body.Length > 6 && body[6] == Protocol.W164Clock ||
+        !(type == Protocol.W203Down && body.Length > 6 && body[6] == Protocol.W203JoinProgress) &&
+        (Wo206Rules.WorldCategory(type, body) is not null || type == Protocol.W164Down && body.Length > 6 && body[6] == Protocol.W164Clock ||
             type is Protocol.Ghost or Protocol.NpcStateQDown or
             Protocol.ActionDown or Protocol.PlayerStateDown or Protocol.PlayerHitDown or Protocol.PlayerHitV8Down or
             Protocol.PlayerDeathDown or Protocol.PlayerRespawnedDown or Protocol.CombatEventDown or Protocol.AppearanceDown or
             Protocol.HorseInfoDown or Protocol.WeatherDown or Protocol.TimeSkipDown or Protocol.ConvDown or Protocol.W203Down or
-            Protocol.ActivityHostDown or Protocol.ActivityExtraDown || Wo147IsLeashFrame(type);
+            Protocol.ActivityHostDown or Protocol.ActivityExtraDown || Wo147IsLeashFrame(type));
 
     private (ulong Generation, CancellationToken Token) LoadSequenceCapture()
     {
