@@ -97,6 +97,12 @@ internal sealed class ReplayPeer : IAsyncDisposable
 
     public byte Id { get; private set; }
 
+    // After the handshake, an integration test may hand this endpoint to the production reader.
+    public Stream Wire => _wire;
+
+    // Let the relay announce a real departure while the reader drains its stream.
+    public void FinishSending() => _client.Client.Shutdown(SocketShutdown.Send);
+
     public static async Task<ReplayPeer> ConnectAsync(int port, string name, CancellationToken ct = default)
     {
         using var deadline = Deadline(ct);

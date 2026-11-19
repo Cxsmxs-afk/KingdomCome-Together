@@ -75,8 +75,18 @@ public class T3RejoinReceiptTests
         try
         {
             await using var transport = new HttpGameTransport("http://localhost:1403", 5000, new Game());
-            var b = Bridge(transport); const uint joinId = 0x12345678; Set(b, "_joinOutId", joinId);
+            using var relay = new MemoryStream();
+            var b = Bridge(transport);
+            Set(b, "_wo122Stream", relay);
+            Set(b, "_wo122Connected", true);
+            Set(b, "_hostModeKnown", true);
+            Set(b, "_hostSharedWorld", true);
+            Set(b, "_hostModeFrom", (byte)0);
             var epochs = Get<Wo206Epochs>(b, "_w206"); epochs.LearnWorld(readerWorld, 1);
+            await (Task)Call(b, "SendJoinRequestAsync")!;
+            uint joinId = Get<uint>(b, "_joinOutId");
+            Assert.NotEqual(0u, joinId);
+            Assert.Equal(Protocol.JoinRequestUp, relay.ToArray()[0]);
             var offer = new WorldOffer(4, 4, 1, SHA256.HashData(new byte[] { 1, 2, 3, 4 }), 91, new byte[16]);
             var frames = new Frames(b); frames.Offer(DownOffer(joinId, offer), readerWorld);
             // This is the actual main-queue race: the reader already knows8

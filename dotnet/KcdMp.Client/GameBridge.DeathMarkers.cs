@@ -227,11 +227,16 @@ public partial class GameBridge
         }
     }
 
-    private async Task<bool> P5LoadGameAsync(int playline, string name, string reason, CancellationToken ct = default)
+    private Task<bool> P5LoadGameAsync(int playline, string name, string reason, CancellationToken ct = default) =>
+        P5LoadGameCoreAsync(playline, name, reason, null, ct);
+
+    private async Task<bool> P5LoadGameCoreAsync(int playline, string name, string reason, Func<bool>? authorizeDispatch,
+        CancellationToken ct = default)
     {
         if (ct == default) ct = _wo122Ct;
         bool own = reason is "leave-command" or "exit-to-menu";
         bool previousOwn = _ownLoadExpected, previousGrace = _loadGraceOwn, submitted = false;
+        CancellationTokenSource? loadLife = null;
         var previous = _worldLoad.Current;
         WorldLoadSnapshot prepared = previous;
         if (own) // the P1 pending mode must already know this is the private-world load
@@ -255,18 +260,63 @@ public partial class GameBridge
                 if (!await LoadSequenceSyncNativeAsync()) return false;
                 var current = _worldLoad.Current;
                 if (current.Generation != prepared.Generation || current.OwnIntentRevision != prepared.OwnIntentRevision) return false;
-                LoadSequenceBeginLoad();
+                if (authorizeDispatch is null)
+                    LoadSequenceBeginLoad();
+                else if (!LoadSequenceChange(s => s.Generation == prepared.Generation &&
+                    s.HostWorld == prepared.HostWorld && s.OwnIntentRevision == prepared.OwnIntentRevision &&
+                    s.Phase == WorldLoadPhase.Offer && _worldLoad.TryAdvance(s, WorldLoadPhase.Load)))
+                    return false;
             }
-            var loadLife = CancellationTokenSource.CreateLinkedTokenSource(ct); _p5LoadLife = loadLife;
-            _p5RebindAfterLoad = true; _p5LoadToPrivate = own;
-            if (own) _w207LeaveTarget = name;
-            submitted = true; // after HTTP submission, cancellation cannot prove that the game did not receive it
-            await _transport.ExecuteNowAsync(lua, loadLife.Token); return true;
+            var dispatchLife = loadLife = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            if (authorizeDispatch is null)
+            {
+                MarkSubmitted();
+                await _transport.ExecuteNowAsync(lua, dispatchLife.Token);
+                return true;
+            }
+
+            Task? Admit(Func<Task> send)
+            {
+                // Read retirement uses the same gate. Only the synchronous
+                // transport handoff is in the critical section, never its wait.
+                lock (_joinGate)
+                {
+                    if (dispatchLife.IsCancellationRequested || generation != P1Lifecycle.Current.Generation ||
+                        serial != Interlocked.Read(ref _p5ScopeSerial)) return null;
+                    if (LoadSequenceEnabled)
+                    {
+                        var load = _worldLoad.Current;
+                        if (load.Generation != prepared.Generation || load.HostWorld != prepared.HostWorld ||
+                            load.OwnIntentRevision != prepared.OwnIntentRevision || load.Phase != WorldLoadPhase.Load)
+                            return null;
+                    }
+                    if (!authorizeDispatch()) return null;
+                    MarkSubmitted();
+                    return send();
+                }
+            }
+
+            void MarkSubmitted()
+            {
+                _p5LoadLife = dispatchLife;
+                _p5RebindAfterLoad = true;
+                _p5LoadToPrivate = own;
+                if (own) _w207LeaveTarget = name;
+                submitted = true; // the game may still read the file if HTTP later fails
+            }
+
+            return await (_transport switch
+            {
+                HttpGameTransport http => http.ExecuteAdmittedNowAsync(lua, Admit, dispatchLife.Token),
+                LogTailGameTransport tail => tail.ExecuteAdmittedNowAsync(lua, Admit, dispatchLife.Token),
+                _ => Task.FromResult(false)
+            });
         }
         finally
         {
             if (!submitted)
             {
+                loadLife?.Dispose();
                 if (!LoadSequenceEnabled) { _ownLoadExpected = previousOwn; _loadGraceOwn = previousGrace; }
                 else if (own && _worldLoad.TryRestoreOwnIntent(prepared, previous)) _ = LoadSequenceSyncNativeAsync();
             }
