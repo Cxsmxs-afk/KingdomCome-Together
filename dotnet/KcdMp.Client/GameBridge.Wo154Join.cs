@@ -136,7 +136,7 @@ public partial class GameBridge
     /// </summary>
     private bool Wo154RemovePlacedLater(JoinerJoin j, string path)
     {
-        if (j.PlacedVerified && !_retainedJoinWorlds.MayRemove(path, j)) return true;
+        if (!_retainedJoinWorlds.MayRemove(path, j)) return true;
         if (JoinSaveReadEnded(j)) return false;
         if (Interlocked.Exchange(ref j.RemovalScheduled, 1) != 0) return true;
         Interlocked.Increment(ref _w154JoinDeferredRemovals);
