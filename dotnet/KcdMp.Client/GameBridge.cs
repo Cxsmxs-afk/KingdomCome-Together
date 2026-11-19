@@ -7502,12 +7502,12 @@ public partial class GameBridge(ClientConfig config)
                 // that started under an already-spawned avatar never saw the
                 // spawn-time "ghostid" event; without an id, every v8 attack,
                 // block, dodge and jump for that avatar had nowhere to go.
-                if (npc.StartsWith("kcd2mp_", StringComparison.Ordinal) && byte.TryParse(npc.AsSpan(7), out byte bindGhost)
-                    && _ghostEntityIds.TryAdd(bindGhost.ToString(), eid))
+                string? nativeGhost = null;
+                if (npc.StartsWith("kcd2mp_", StringComparison.Ordinal) && byte.TryParse(npc.AsSpan(7), out byte bindGhost))
                 {
-                    Console.WriteLine($"[wo121] ghost {bindGhost} entity id 0x{eid:X} learned from its native bind");
-                    _ = ExecLuaAsync(FormattableString.Invariant(
-                        $"if KCD2MP_W214ReportGhostId then KCD2MP_W214ReportGhostId(\"{bindGhost}\", true, \"{eid:X8}\") end"));
+                    nativeGhost = bindGhost.ToString(CultureInfo.InvariantCulture);
+                    if (_ghostEntityIds.TryAdd(nativeGhost, eid))
+                        Console.WriteLine($"[wo121] ghost {bindGhost} entity id 0x{eid:X} learned from its native bind");
                 }
                 NativeBindInOrder(async () =>
                 {
@@ -7520,7 +7520,13 @@ public partial class GameBridge(ClientConfig config)
                     if (!ok) Console.WriteLine($"[npcwrite] bind {npc} eid=0x{eid:X} refused: {tag}");
                     // the ack is not waited for: the next bind or unbind in the order goes out at once
                     string lease = bindLease == 0 ? "" : FormattableString.Invariant($", {bindLease}");
-                    _ = ExecLuaAsync($"if KCD2MP_NpcNativeAck then KCD2MP_NpcNativeAck(\"{npc}\", {(ok ? 1 : 0)}, \"{tag}\"{lease}) end");
+                    // Ask a ghost learned only from a native bind for its Lua incarnation
+                    // in the existing acknowledgement. A disconnected lease never gets here.
+                    string birthReport = nativeGhost is not null && _ghostEntityIds.GetValueOrDefault(nativeGhost) == eid &&
+                        _w214FigureBirths.GetValueOrDefault(nativeGhost).Entity != eid
+                        ? FormattableString.Invariant($"; if KCD2MP_W214ReportGhostId then KCD2MP_W214ReportGhostId(\"{nativeGhost}\", \"{_w214OutfitAgent}\", \"{eid:X8}\") end")
+                        : "";
+                    _ = ExecLuaAsync($"if KCD2MP_NpcNativeAck then KCD2MP_NpcNativeAck(\"{npc}\", {(ok ? 1 : 0)}, \"{tag}\"{lease}) end{birthReport}");
                 }, enforceOrder: bindLease != 0);
                 return;
             }

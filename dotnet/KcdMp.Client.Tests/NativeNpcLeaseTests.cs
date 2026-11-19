@@ -213,7 +213,9 @@ public class NativeNpcLeaseTests
         await rig.ReadBind(true);
         await rig.Answer(0x81, 1, 1, 0);
         await rig.Queue;
-        Assert.Contains("\"kcd2mp_7\", 1, \"ok\")", Assert.Single(rig.Lua));
+        string ack = Assert.Single(rig.Lua);
+        Assert.Contains("\"kcd2mp_7\", 1, \"ok\") end;", ack);
+        Assert.Matches(@"KCD2MP_W214ReportGhostId\(""7"", ""[0-9a-f]{32}"", ""0000002A""\)", ack);
 
         rig.Event("off cleanup");
         await rig.ReadBind(false);

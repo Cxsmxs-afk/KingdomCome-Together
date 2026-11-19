@@ -405,11 +405,12 @@ do
           KCD2MP_W202EquipAll(name, oldClass, body, noHand, "123457") == 1 and mutations == 2 and equipped == oldClass)
     W214.on.figure_hands = nil
     local g = KCD2MP.ghosts[id]
+    local agent = "aec8dbb6a1e84d0d932670fbe98917d9"
     local beforeReattach = #LOG
     check("H4: a delayed attach cannot rotate a different body's incarnation",
-          not KCD2MP_W214ReportGhostId(id, true, "0ABBABCD") and g.outfitBirth == "123457")
+          not KCD2MP_W214ReportGhostId(id, agent, "0ABBABCD") and g.outfitBirth == "123457")
     KCD2MP_W214FigureHand(id, true, oldClass, false, body, oldRevision, g.outfitBirth)
-    local attached = KCD2MP_W214ReportGhostId(id, true, body)
+    local attached = KCD2MP_W214ReportGhostId(id, agent, body)
     check("H4: the existing-body attach emits its new scoped ghost ID",
           attached and g.outfitBirth ~= "123457" and g.w214HandRevision == nil and
           countEvt("ghostid", id .. " " .. body .. " " .. g.outfitBirth, beforeReattach) == 1)
@@ -417,6 +418,16 @@ do
           KCD2MP_W202EquipAll(name, newClass, body, oldRevision, "123457") == 0 and mutations == 2)
     check("H4: the reattached current body can equip before the next hand report",
           KCD2MP_W202EquipAll(name, newClass, body, noHand, g.outfitBirth) == 1 and mutations == 3 and equipped == newClass)
+    local currentBirth = g.outfitBirth
+    KCD2MP_W214FigureHand(id, true, newClass, false, body, newRevision, currentBirth)
+    local currentHandTimer = W214.hand.gen[id]
+    local beforeDuplicate = #LOG
+    local repeated = KCD2MP_W214ReportGhostId(id, agent, body)
+    check("H4: a repeated attach from the same agent keeps the current hand and re-emits its scope",
+          repeated and g.outfitBirth == currentBirth and g.w214HandRevision == newRevision and
+          W214.hand.gen[id] == currentHandTimer and
+          countEvt("ghostid", id .. " " .. body .. " " .. currentBirth, beforeDuplicate) == 1,
+          "birth=" .. currentBirth .. "->" .. tostring(g.outfitBirth) .. " revision=" .. tostring(g.w214HandRevision))
 
     ENTS[name], KCD2MP.ghosts[id], ItemManager = nil, nil, oldIM
     noErrs("H4")

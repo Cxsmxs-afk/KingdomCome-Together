@@ -11570,15 +11570,17 @@ function KCD2MP_RemoveStaleGhostsForPlayer(identity, keepId)
     return #doomed
 end
 
-function KCD2MP_W214ReportGhostId(id, reattach, expectedEntity)
+function KCD2MP_W214ReportGhostId(id, agent, expectedEntity)
     id = tostring(id)
     local g = KCD2MP.ghosts[id]
     if not (g and g.entity) then return false end
     local hexid = string.match(tostring(g.entity.id), "(%x+)%s*$")
     if not hexid then return false end
     if expectedEntity and hexid:upper():gsub("^0+", "") ~= expectedEntity:gsub("^0+", "") then return false end
-    if reattach or not g.outfitBirth then
-        -- The token also changes when an Agent attaches to an existing ghost.
+    if not g.outfitBirth or (agent and g.outfitAgent ~= agent) then
+        -- A new agent takes a fresh incarnation. Repeated acknowledgements
+        -- from that agent must leave the accepted hand and its timers intact.
+        g.outfitAgent = agent or nil
         KCD2MP_W214GhostBirth = (KCD2MP_W214GhostBirth or 0) % 0xFFFFFF + 1
         g.outfitBirth = string.format("%06X", KCD2MP_W214GhostBirth)
         g.w214HandRevision, g.w214HandClass = nil, nil

@@ -28,6 +28,7 @@ public partial class GameBridge
         public string LuaArguments => FormattableString.Invariant($"\"{Body.Entity:X8}\",\"{HandRevision:X16}\",\"{Body.LuaBirth:X6}\"");
     }
     private readonly ConcurrentDictionary<string, (uint Entity, uint Birth)> _w214FigureBirths = new();
+    private readonly string _w214OutfitAgent = Guid.NewGuid().ToString("N");
     private sealed record FigureHand(bool Drawn, Guid? Cls, long AtMs, long ChangedAtMs, long RequestedAtMs,
         P6Context Context, long PeerSerial, FigureBody Body, long Revision, long? RangedMode = null);
     private sealed record OwnBow(P6Context Context, long Mode, BowHandProof Proof);
