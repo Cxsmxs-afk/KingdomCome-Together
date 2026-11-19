@@ -1,5 +1,6 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 using KcdMp.Wire;
+using Intent = KcdMp.Client.CombatPipe.NpcDeathIntent;
 using Receipt = KcdMp.Client.CombatPipe.NpcDeathReceipt;
 
 namespace KcdMp.Client;
@@ -28,7 +29,8 @@ public partial class GameBridge
     private readonly object _npcDeathDispatchGate = new();
     private readonly Dictionary<Guid, NpcDeathAttempt> _npcDeathAttempts = new();
     private static readonly TimeSpan NpcDeathPollCadence = TimeSpan.FromMilliseconds(40);
-    private static readonly TimeSpan NpcDeathPollBudget = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan NpcDeathPollBudget = TimeSpan.FromMilliseconds(2500);
+    private static readonly TimeSpan NpcDeathAbortBudget = TimeSpan.FromMilliseconds(500);
 
     private void ResetNpcDeathDispatch()
     {
@@ -128,20 +130,17 @@ public partial class GameBridge
             }
             ReceiptLog(attempt, "submitted");
             result = await ObserveNpcDeathAsync(attempt, ct);
-            if (result != Receipt.Pending) result = EndNpcDeathAttempt(attempt, result);
+            if (result is not (Receipt.Pending or Receipt.Uncertain)) return EndNpcDeathAttempt(attempt, result);
         }
         finally { _npcDeathDispatchOrder.Release(); }
 
-        if (result == Receipt.Pending)
-        {
-            ReceiptLog(attempt, "pending");
-            var frame = ProcessorFrameScope.Capture();
-            Task<Receipt> pending = PollNpcDeathAsync(attempt, frame?.ParentToken ?? ct);
-            // The frame processor can continue while the engine finishes on a
-            // later frame. Other callers can wait for the confirmed result.
-            return frame is null ? await pending : Receipt.Pending;
-        }
-        return result;
+        var intent = result == Receipt.Pending ? Intent.Advance : Intent.ObserveOnly;
+        ReceiptLog(attempt, intent == Intent.Advance ? "pending" : "observe-only");
+        var frame = ProcessorFrameScope.Capture();
+        Task<Receipt> pending = PollNpcDeathAsync(attempt, intent, frame?.ParentToken ?? ct);
+        // The frame processor can continue while the engine finishes on a
+        // later frame. Other callers can wait for the confirmed result.
+        return frame is null ? await pending : result;
     }
 
     private bool NpcDeathAttemptCurrent(NpcDeathAttempt attempt)
@@ -153,38 +152,55 @@ public partial class GameBridge
                 (attempt.Body is not { } body || Wo195BodyCurrent(attempt.Npc!, body));
     }
 
-    private async Task<Receipt> ObserveNpcDeathAsync(NpcDeathAttempt attempt, CancellationToken ct)
+    private async Task<Receipt> ObserveNpcDeathAsync(NpcDeathAttempt attempt, CancellationToken ct, Intent intent = Intent.Advance)
     {
         try
         {
             return await _combat.ApplyOwnedNpcDeathAsync(attempt.Soul, attempt.Body?.Eid ?? 0,
-                attempt.Scope.Lifecycle, attempt.Id, () => !ct.IsCancellationRequested && NpcDeathAttemptCurrent(attempt), ct);
+                attempt.Scope.Lifecycle, attempt.Id, intent, () => !ct.IsCancellationRequested && NpcDeathAttemptCurrent(attempt), ct);
         }
         catch (OperationCanceledException)
         {
             return NpcDeathAttemptCurrent(attempt) ? Receipt.Uncertain : Receipt.Stale;
         }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            ReceiptLog(attempt, $"transport-{ex.GetType().Name}");
+            return NpcDeathAttemptCurrent(attempt) ? Receipt.Uncertain : Receipt.Stale;
+        }
     }
 
-    private async Task<Receipt> PollNpcDeathAsync(NpcDeathAttempt attempt, CancellationToken ct)
+    private async Task<Receipt> PollNpcDeathAsync(NpcDeathAttempt attempt, Intent intent, CancellationToken ct)
     {
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
         budget.CancelAfter(NpcDeathPollBudget);
-        Receipt final = Receipt.Uncertain;
         try
         {
             while (NpcDeathAttemptCurrent(attempt))
             {
                 await Task.Delay(NpcDeathPollCadence, budget.Token);
-                Receipt receipt = await ObserveNpcDeathAsync(attempt, budget.Token);
+                budget.Token.ThrowIfCancellationRequested();
+                Receipt receipt = await ObserveNpcDeathAsync(attempt, budget.Token, intent);
                 if (receipt == Receipt.Pending) continue;
-                final = receipt;
-                return EndNpcDeathAttempt(attempt, final);
+                if (receipt != Receipt.Uncertain) return EndNpcDeathAttempt(attempt, receipt);
+                // The result of Apply can become visible later. Only an observation
+                // may be sent once a reply leaves the engine invocation uncertain.
+                if (intent == Intent.Advance) ReceiptLog(attempt, "observe-only");
+                intent = Intent.ObserveOnly;
             }
-            final = Receipt.Stale;
         }
         catch (OperationCanceledException) when (budget.IsCancellationRequested) { }
-        return EndNpcDeathAttempt(attempt, final);
+
+        if (ct.IsCancellationRequested || !NpcDeathAttemptCurrent(attempt))
+            return EndNpcDeathAttempt(attempt, Receipt.Stale);
+
+        // A single terminal request can reopen an unchanged living body only
+        // when the DLL proves preparation and the lethal call never began.
+        using var abort = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        abort.CancelAfter(NpcDeathAbortBudget);
+        ReceiptLog(attempt, "abort-before-apply");
+        Receipt result = await ObserveNpcDeathAsync(attempt, abort.Token, Intent.AbortBeforeApply);
+        return EndNpcDeathAttempt(attempt, result == Receipt.Pending ? Receipt.Uncertain : result);
     }
 
     private Receipt EndNpcDeathAttempt(NpcDeathAttempt attempt, Receipt receipt)
@@ -239,7 +255,7 @@ public partial class GameBridge
     {
         lock (_npcDeathDispatchGate)
             return _npcDeathAttempts.TryGetValue(soul, out var attempt) && attempt.Source is not null &&
-                attempt.Result != Receipt.Stale && Environment.TickCount64 < attempt.EchoUntil &&
+                attempt.Result is not (Receipt.Stale or Receipt.Aborted) && Environment.TickCount64 < attempt.EchoUntil &&
                 attempt.Scope == CurrentNpcDeathScope() &&
                 (attempt.Body is not { } body || Wo195MappedBodyCurrent(attempt.Npc!, body));
     }

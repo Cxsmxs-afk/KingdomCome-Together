@@ -135,7 +135,7 @@ public sealed class P6RangedBridgeTests
             ushort capabilities = Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat;
             if (friendlyFire)
             {
-                capabilities |= Protocol.LinkCapPvpContact;
+                capabilities |= Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife;
                 var contactSession = typeof(GameBridge).GetNestedType("PvpContactSession", BindingFlags.NonPublic)!;
                 Set(Bridge, "_wo121ContactSession", Activator.CreateInstance(contactSession, Private | BindingFlags.Public, null, [Link], null));
             }
@@ -450,22 +450,32 @@ public sealed class P6RangedBridgeTests
         r.Game.BlockHorse = true;
         r.Http.BatchingEnabled = false;
 
-        const ulong sourceIncarnation = 43;
+        const ulong sourceIncarnation = 43, formerLife = 1001, currentLife = 1002;
         byte local = Get<byte>(r.Bridge, "_myGhostId");
-        byte[] Contact(byte recipient, ulong sequence, float health) => Wire(Protocol.PlayerHitV8Down,
-            [r.Peer, .. new PlayerHitV8(recipient, 10, health, 0, 0).BuildUp(sequence, sourceIncarnation)[3..]]);
+        byte[] Contact(byte recipient, ulong sequence, float health, ulong life) => Wire(Protocol.PlayerHitV8Down,
+            [r.Peer, .. new PlayerHitV8(recipient, 10, health, 0, 0).BuildUp(sequence, sourceIncarnation, life)[3..]]);
+        async Task PublishNativeLifeAsync(ulong life)
+        {
+            byte[] proof = new byte[sizeof(ulong)];
+            BinaryPrimitives.WriteUInt64LittleEndian(proof, life);
+            await r.Server.WriteAsync(Wire(0xBC, proof));
+            await Until(() => r.Pipe.PvpNativeLife == life);
+        }
+
+        await PublishNativeLifeAsync(formerLife);
 
         long bytesRead = r.Link.ReadRequestedAfterBytes;
         byte[] horse = Wire(Protocol.HorseInfoDown, r.Peer, 0);
         r.Link.Feed(horse);
         await r.Game.HorseEntered.Task.WaitAsync(TimeSpan.FromSeconds(3));
 
-        byte[] retiredContact = Contact(local, 1, 5);
+        byte[] retiredContact = Contact(local, 1, 5, formerLife);
         r.Link.Feed(retiredContact);
         bytesRead += horse.Length + retiredContact.Length;
         await Until(() => r.Link.ReadRequestedAfterBytes >= bytesRead);
         Call(r.Bridge, "T3NoteInputLifeEdge", true);
         Call(r.Bridge, "T3NoteInputLifeEdge", false);
+        await PublishNativeLifeAsync(currentLife);
 
         byte[] retiredFire = TimedFire(r.Peer);
         r.Link.Feed(retiredFire);
@@ -473,8 +483,8 @@ public sealed class P6RangedBridgeTests
         await Until(() => r.Link.ReadRequestedAfterBytes >= bytesRead);
         Call(r.Bridge, "OnGameEvent", "ghostid", $"{r.Peer} df");
 
-        byte[] currentContact = Contact(local, 2, 7);
-        byte[] wrongRecipient = Contact(r.Peer, 3, 9);
+        byte[] currentContact = Contact(local, 2, 7, currentLife);
+        byte[] wrongRecipient = Contact(r.Peer, 3, 9, currentLife);
         byte[] version = Wire(Protocol.ReleaseVersion, [r.Peer, .. "integration-test"u8]);
         long currentContactReadStart = Environment.TickCount64;
         r.Link.Feed(retiredContact, wrongRecipient, currentContact, currentContact, version);
@@ -489,12 +499,13 @@ public sealed class P6RangedBridgeTests
         Assert.Same(request, await Task.WhenAny(request, processed));
         var (type, body) = await request;
         Assert.Equal(0x1A, type);
-        Assert.Equal(34, body.Length);
+        Assert.Equal(42, body.Length);
         Assert.Equal(7f, BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)));
         Assert.Equal(r.Peer, body[9]);
         Assert.Equal(2UL, BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(10)));
         Assert.Equal(sourceIncarnation, BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(18)));
         Assert.InRange((long)BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(26)), currentContactReadStart, currentContactReadEnd);
+        Assert.Equal(currentLife, BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(34)));
         await r.Server.WriteAsync(Wire(0x81, 1, 1, (byte)PipeReason.PvpEffectObserved));
 
         await processed;

@@ -96,19 +96,107 @@ public sealed class Lane2NpcDeathIngressTests
         Assert.False(fixture.Dead);
     }
 
-    [Fact]
-    public async Task Uncertain_receipt_quarantines_same_body_across_ingress_routes()
+    [Theory]
+    [InlineData("named-reader", Eid)]
+    [InlineData("fatal", Eid)]
+    [InlineData("guid", 0U)]
+    public async Task Finished_after_1200ms_confirms_one_apply_on_the_original_body(string route, uint expectedEid)
     {
         await using var fixture = await Fixture.OpenAsync();
-        Task ingress = fixture.Ingress("named");
-        fixture.AssertBound(await fixture.ReadRequestAsync(), Eid);
-        Assert.False(fixture.Dead);
-        await fixture.ReplyAsync(1, 0x71);
+        Task ingress = fixture.Ingress(route);
+        var first = await fixture.ReadRequestAsync();
+        fixture.AssertBound(first, expectedEid);
+        byte seq = 1;
+        long started = Stopwatch.GetTimestamp();
+        await fixture.ReplyAsync(seq++, 0x70);
+
+        while (true)
+        {
+            var next = await fixture.ReadWhilePendingAsync(ingress);
+            Assert.Equal(first.Op, next.Op);
+            Assert.Equal(first.Body, next.Body);
+            Assert.False(fixture.Dead);
+            Assert.Equal(0L, fixture.Releases);
+            if (Stopwatch.GetElapsedTime(started) >= TimeSpan.FromMilliseconds(1200))
+            {
+                // The DLL publishes its sole lethal application once Finished
+                // is visible. The same original request authorizes that apply.
+                await fixture.ReplyAsync(seq, 0);
+                break;
+            }
+            await fixture.ReplyAsync(seq++, 0x70);
+        }
+
         await ingress.WaitAsync(fixture.Token);
+        if (expectedEid != 0)
+        {
+            Assert.True(fixture.Dead);
+            Assert.Equal(1L, fixture.Releases);
+        }
+        await fixture.Ingress(route == "guid" ? "fatal" : "guid");
+        await fixture.AssertNoWriteAsync();
+    }
+
+    [Fact]
+    public async Task Uncertain_apply_is_observed_without_again_authorizing_engine_mutation()
+    {
+        await using var fixture = await Fixture.OpenAsync();
+        Task ingress = fixture.Ingress("fatal");
+        var first = await fixture.ReadRequestAsync();
+        fixture.AssertBound(first, Eid);
+        await fixture.ReplyAsync(1, 0x71);
+
+        var observation = await fixture.ReadWhilePendingAsync(ingress);
+        fixture.AssertFollowup(first, observation, 1);
+        Assert.False(fixture.Dead);
+        await fixture.Ingress("guid");
+        await fixture.ReplyAsync(2, 0x70);
+
+        var repeatedObservation = await fixture.ReadWhilePendingAsync(ingress);
+        fixture.AssertFollowup(first, repeatedObservation, 1);
+        Assert.False(fixture.Dead);
+        await fixture.ReplyAsync(3, 0);
+        await ingress.WaitAsync(fixture.Token);
+        Assert.True(fixture.Dead);
+        Assert.Equal(1L, fixture.Releases);
         await fixture.Ingress("fatal").WaitAsync(fixture.Token);
+        await fixture.AssertNoWriteAsync();
+    }
+
+    [Theory]
+    [InlineData((byte)0x73)]
+    [InlineData((byte)0x71)]
+    [InlineData(null)]
+    public async Task Deadline_sends_one_pre_apply_abort_and_no_replacement(byte? abortReceipt)
+    {
+        // This probe waits through both production budgets. Keep room for
+        // Named Pipe startup and timer scheduling on a busy test runner.
+        await using var fixture = await Fixture.OpenAsync(TimeSpan.FromSeconds(10));
+        Task ingress = fixture.Ingress("fatal");
+        var first = await fixture.ReadRequestAsync();
+        fixture.AssertBound(first, Eid);
+        byte seq = 1;
+        await fixture.ReplyAsync(seq++, 0x70);
+
+        while (true)
+        {
+            var next = await fixture.ReadWhilePendingAsync(ingress);
+            Assert.False(fixture.Dead);
+            if (next.Body.Length == 37)
+            {
+                fixture.AssertFollowup(first, next, 2);
+                if (abortReceipt is byte answer) await fixture.ReplyAsync(seq, answer);
+                break;
+            }
+            Assert.Equal(first.Body, next.Body);
+            await fixture.ReplyAsync(seq++, 0x70);
+        }
+
+        await ingress.WaitAsync(fixture.Token);
+        Assert.False(fixture.Dead);
+        Assert.Equal(0L, fixture.Releases);
         await fixture.Ingress("guid").WaitAsync(fixture.Token);
         await fixture.AssertNoWriteAsync();
-        Assert.False(fixture.Dead);
     }
 
     [Fact]
@@ -147,7 +235,7 @@ public sealed class Lane2NpcDeathIngressTests
 
     private sealed class Fixture : IAsyncDisposable
     {
-        private readonly CancellationTokenSource _deadline = new(TimeSpan.FromSeconds(4));
+        private readonly CancellationTokenSource _deadline;
         private readonly NamedPipeServerStream _wire;
         private readonly CombatPipe _pipe;
         private readonly GameBridge _bridge = new(new ClientConfig());
@@ -156,8 +244,9 @@ public sealed class Lane2NpcDeathIngressTests
         private readonly Guid _soul = Guid.NewGuid();
         private ulong _generation;
 
-        private Fixture()
+        private Fixture(TimeSpan deadline)
         {
+            _deadline = new(deadline);
             string name = "lane2-npc-death-" + Guid.NewGuid().ToString("N");
             _wire = new(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
             _pipe = new(name);
@@ -165,9 +254,9 @@ public sealed class Lane2NpcDeathIngressTests
 
         public CancellationToken Token => _deadline.Token;
 
-        public static async Task<Fixture> OpenAsync()
+        public static async Task<Fixture> OpenAsync(TimeSpan? deadline = null)
         {
-            var f = new Fixture();
+            var f = new Fixture(deadline ?? TimeSpan.FromSeconds(4));
             Task connecting = f._wire.WaitForConnectionAsync(f.Token);
             Assert.True(await f._pipe.EnsureConnectedAsync(f.Token));
             await connecting;
@@ -283,6 +372,21 @@ public sealed class Lane2NpcDeathIngressTests
             Assert.Equal(expectedEid, BinaryPrimitives.ReadUInt32LittleEndian(request.Body.AsSpan(16, 4)));
             Assert.Equal(_generation, BinaryPrimitives.ReadUInt64LittleEndian(request.Body.AsSpan(20, 8)));
             Assert.NotEqual(0UL, BinaryPrimitives.ReadUInt64LittleEndian(request.Body.AsSpan(28, 8)));
+        }
+
+        public async Task<(byte Op, byte[] Body)> ReadWhilePendingAsync(Task ingress)
+        {
+            Task<(byte Op, byte[] Body)> read = ReadRequestAsync();
+            Assert.Same(read, await Task.WhenAny(read, ingress).WaitAsync(Token));
+            return await read;
+        }
+
+        public void AssertFollowup((byte Op, byte[] Body) first, (byte Op, byte[] Body) next, byte intent)
+        {
+            Assert.Equal(first.Op, next.Op);
+            Assert.Equal(37, next.Body.Length);
+            Assert.Equal(first.Body, next.Body[..36]);
+            Assert.Equal(intent, next.Body[^1]);
         }
 
         public ValueTask ReplyAsync(byte seq, byte reason) =>

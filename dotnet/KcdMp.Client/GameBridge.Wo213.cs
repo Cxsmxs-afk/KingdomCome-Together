@@ -282,7 +282,8 @@ public partial class GameBridge
         }
         if (ExecutionContext.IsFlowSuppressed()) _ = Task.Run(RunWriter);
         else { using (ExecutionContext.SuppressFlow()) _ = Task.Run(RunWriter); }
-        ushort caps = (ushort)(Protocol.LinkCapLatestWins | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapPvpContact
+        ushort caps = (ushort)(Protocol.LinkCapLatestWins | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat
+                     | Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife
                      | (LoadSequenceEnabled && W221On("baseline_events") ? Protocol.LinkCapWorldSync : 0)
                      | (WorldRecoveryEnabled && W221On("baseline_events") ? Protocol.LinkCapWorldRecovery : 0)
                      | (W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
@@ -294,7 +295,7 @@ public partial class GameBridge
     private async Task Wo213AdvertisePvpContactAsync(Stream stream)
     {
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        try { await WritePacketAsync(stream, Protocol.BuildLinkHelloUp(Protocol.LinkCapPvpContact), deadline.Token); }
+        try { await WritePacketAsync(stream, Protocol.BuildLinkHelloUp(Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife), deadline.Token); }
         catch (Exception e) when (e is IOException or OperationCanceledException or ObjectDisposedException)
         {
             Console.WriteLine($"MP-LINK pvp contact hello failed reason={e.GetType().Name}");
@@ -333,6 +334,7 @@ public partial class GameBridge
         if (type != Protocol.LinkHelloDown) return false;
         if (!Protocol.TryParseLinkHello(payload, out byte v, out ushort caps, out byte transport, out int rateKBps)) return true;
         _w213Caps = caps;
+        if ((caps & Protocol.LinkCapPvpLife) != 0) _ = AdvertisePvpLifeAsync();
         if (_w213Writer is { } w) w.Scheduler.Options.Unreliable = (caps & Protocol.LinkCapUnreliableState) != 0 && w.Path.CanSendUnreliable;
         Console.WriteLine($"MP-LINK hello answered: version={v} caps=0x{caps:X4} transport={Protocol.LinkTransportName(transport)} relay_rate={rateKBps} KB/s -- latest wins={((caps & Protocol.LinkCapLatestWins) != 0 ? 1 : 0)} unreliable state={(_w213Writer?.Scheduler.Options.Unreliable == true ? 1 : 0)} compact npc={((caps & Protocol.LinkCapCompactNpc) != 0 ? 1 : 0)}");
         return true;

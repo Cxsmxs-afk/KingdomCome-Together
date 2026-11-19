@@ -21,6 +21,7 @@ uint64_t kcdmp_p4_test_now();
 #include <windows.h>
 #include <atomic>
 #include <cstring>
+#include <random>
 
 namespace kcdmp::p4 {
 namespace {
@@ -33,6 +34,8 @@ uint64_t now_ms() {
 }
 uint64_t g_values[p4rules::kFields]{};
 std::atomic<uint64_t> g_until{0}, g_recGen{0}, g_recWuid{0}, g_reset{0}, g_lifeEdge{0};
+std::atomic<uint64_t> g_pvpLifeRevision{1};
+std::atomic<bool> g_pvpBound{false};
 std::atomic<uintptr_t> g_recSoul{0};
 p4rules::Landing g_landing;
 uint64_t g_tickReset = 0, g_lastTpAt = 0, g_lastTpGen = 0, g_hitAt = 0;
@@ -72,8 +75,32 @@ uint64_t generation() { return wo216::lifecycle_generation(); }
 bool gameplay() { return wo216::lifecycle_gameplay(); }
 bool ready_context(Context c) { return p4rules::fresh(c, now_ms(), generation(), gameplay(), g_lifeEdge.load()); }
 uint64_t life_edge_tick(){return g_lifeEdge.load();}
-void note_life_edge(const char* why) { g_lifeEdge.store(now_ms()); logf("T3-LIFE-EDGE source=%s tick=%llu", why, static_cast<unsigned long long>(g_lifeEdge.load())); }
-void invalidate() { g_until.store(0, std::memory_order_release); g_reset.fetch_add(1); g_lifeEdge.store(now_ms()); }
+uint64_t pvp_life_proof() {
+    if (!g_pvpBound.load(std::memory_order_acquire) || !gameplay()) return 0;
+    // A DLL restart on the same relay link must never restart a previous proof.
+    static const uint64_t salt = []() noexcept -> uint64_t {
+        try {
+            std::random_device random;
+            return (static_cast<uint64_t>(random()) << 32) | random();
+        } catch (...) { return 0; }
+    }();
+    return salt ? salt ^ g_pvpLifeRevision.load(std::memory_order_acquire) : 0;
+}
+bool pvp_body_matches(void* soul, uint64_t wuid) {
+    return soul && wuid && g_observedWuid == wuid && g_observedSoul == canonical(soul);
+}
+void note_life_edge(const char* why) {
+    g_pvpLifeRevision.fetch_add(1, std::memory_order_release);
+    g_lifeEdge.store(now_ms());
+    logf("T3-LIFE-EDGE source=%s tick=%llu", why, static_cast<unsigned long long>(g_lifeEdge.load()));
+}
+void invalidate() {
+    g_pvpBound.store(false, std::memory_order_release);
+    g_pvpLifeRevision.fetch_add(1, std::memory_order_release);
+    g_until.store(0, std::memory_order_release);
+    g_reset.fetch_add(1);
+    g_lifeEdge.store(now_ms());
+}
 bool recovery_policy() {
     const uint64_t until = g_until.load(std::memory_order_acquire);
     return until && now_ms() < until && g_recGen.load() == generation() && gameplay() && g_until.load() == until;
@@ -176,6 +203,7 @@ void tick() {
         g_hitAt = 0; g_havePrevious = false; g_airAt = 0; g_forceGround = true;
     }
     if (!gameplay()) {
+        if (g_pvpBound.exchange(false)) g_pvpLifeRevision.fetch_add(1, std::memory_order_release);
         if (g_landing.held) {
             logf("T3-LANDING release=local_load lease_end_handled=%d", actions::suppress_fall_damage(false) ? 1 : 0);
             g_landing.held = false;
@@ -187,6 +215,7 @@ void tick() {
     void* soul = canonical(rttr::read_player_soul()); const uint64_t wuid = own_wuid();
     if (g_observedSoul && (soul != g_observedSoul || wuid != g_observedWuid)) { g_until.store(0); note_life_edge("player-identity"); g_hitAt = 0; }
     g_observedSoul = soul; g_observedWuid = wuid;
+    g_pvpBound.store(soul && wuid, std::memory_order_release);
     float pos[3]{}; const bool posKnown = actions::player_position(pos);
     bool dead = false; const bool deadKnown = soul && rttr::soul_bool(soul, "IsDead", &dead);
     if (deadKnown && dead && !g_deadSeen && posKnown) { note_downed(soul, pos, 0, -1); note_life_edge("engine-dead"); }

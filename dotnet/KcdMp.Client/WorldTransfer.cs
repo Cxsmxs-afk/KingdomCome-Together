@@ -40,7 +40,7 @@ public sealed class WorldSender
     public bool AllAcked => Acked >= ChunkCount;
 
     public WorldSender(byte[] file, uint joinId, byte target, uint worldSavedSeq, byte[] md5,
-                       int chunkSize = Protocol.WorldChunkMaxData, int windowBytes = Protocol.WorldWindowBytes)
+                       int chunkSize = Protocol.WorldChunkMaxData, int windowBytes = Protocol.WorldWindowBytes, WorldRunOffer? run = null)
     {
         if (file.Length == 0) throw new ArgumentException("empty file");
         if (file.Length > Protocol.WorldMaxBytes) throw new ArgumentException($"{file.Length} bytes is over the {Protocol.WorldMaxBytes} limit");
@@ -52,7 +52,7 @@ public sealed class WorldSender
         ChunkSize = chunkSize;
         WindowBytes = windowBytes;
         int n = (file.Length + chunkSize - 1) / chunkSize;
-        Offer = new WorldOffer(file.Length, chunkSize, n, SHA256.HashData(file), worldSavedSeq, md5);
+        Offer = new WorldOffer(file.Length, chunkSize, n, SHA256.HashData(file), worldSavedSeq, md5) { Run = run };
     }
 
     public byte[] BuildOfferPacket() => Protocol.BuildJoinUp(Protocol.WorldOfferUp, Target, JoinId, Offer.Encode());

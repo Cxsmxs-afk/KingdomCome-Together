@@ -17,6 +17,7 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
     {
         await using var target = await _relay.ConnectAsync("ff-target");
         Assert.True(await EnableAsync(target));
+        await WaitForCapabilitiesAppliedAsync(target);
         byte oldId;
         ulong oldIncarnation;
         var contact = new PlayerHitV8(target.Id, 10, 7, 0, 0);
@@ -47,6 +48,7 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
         await using var modern = await _relay.ConnectAsync("ff-modern");
         await using var legacy = await _relay.ConnectAsync("ff-legacy");
         Assert.True(await EnableAsync(modern));
+        await WaitForCapabilitiesAppliedAsync(modern);
         await modern.SendRawAsync(new PlayerHitV8(legacy.Id, 10, 7, 0, 0).BuildUp(1, 1));
         await legacy.SendRawAsync(new PlayerHitV8(modern.Id, 10, 7, 0, 0).BuildUp());
         Assert.True(await legacy.NoneOfAsync(Protocol.PlayerHitV8Down, Quiet));
@@ -64,6 +66,7 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
     {
         await using var source = await _relay.ConnectAsync("ff-source");
         Assert.True(await EnableAsync(source));
+        await WaitForCapabilitiesAppliedAsync(source);
         byte oldId;
         ulong oldIncarnation;
         byte[] delayed;
@@ -92,11 +95,15 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
     [Fact]
     public async Task Interior_hit_lengths_are_rejected_and_the_next_valid_frame_survives()
     {
-        for (int size = PlayerHitV8.UpLen + 1; size < PlayerHitV8.IdentifiedUpLen; ++size)
-            Assert.False(Protocol.IsUpLenOk(Protocol.PlayerHitV8Up, size), $"Unexpected hit length {size}");
+        for (int size = PlayerHitV8.UpLen + 1; size < PlayerHitV8.LifeUpLen; ++size)
+            if (size != PlayerHitV8.IdentifiedUpLen)
+                Assert.False(Protocol.IsUpLenOk(Protocol.PlayerHitV8Up, size), $"Unexpected hit length {size}");
+        Assert.False(Protocol.IsUpLenOk(Protocol.PvpLifeUp, PvpLifeState.Length - 1));
+        Assert.False(Protocol.IsUpLenOk(Protocol.PvpLifeUp, PvpLifeState.Length + 1));
         await using var target = await _relay.ConnectAsync("ff-target");
         await using var source = await _relay.ConnectAsync("ff-source");
         Assert.True(await EnableAsync(target));
+        await WaitForCapabilitiesAppliedAsync(target);
         Assert.True(await EnableAsync(source));
         ulong recipient = await ReadPeerAsync(source, target.Id);
         var contact = new PlayerHitV8(target.Id, 10, 7, 0, 0);
@@ -109,12 +116,62 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
         Assert.True(await target.NoneOfAsync(Protocol.PlayerHitV8Down, Quiet));
     }
 
-    private static async Task<bool> EnableAsync(Peer peer)
+    [Fact]
+    public async Task Life_proof_is_preserved_on_the_wire_and_retired_on_the_same_target_link()
     {
-        await peer.SendRawAsync(Protocol.BuildLinkHelloUp(Protocol.LinkCapPvpContact));
+        const ushort caps = Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife;
+        await using var source = await _relay.ConnectAsync("ff-source");
+        await using var target = await _relay.ConnectAsync("ff-target");
+        Assert.True(await EnableAsync(target, caps));
+        await WaitForCapabilitiesAppliedAsync(target);
+        Assert.True(await EnableAsync(source, caps));
+        var (recipient, initial) = await ReadLifeAsync(source, target.Id);
+        Assert.Equal(default, initial);
+        var contact = new PlayerHitV8(target.Id, 10, 7, 0, 0);
+        var oldLife = new PvpLifeState(1, 71);
+        await target.SendRawAsync(oldLife.BuildUp());
+        Assert.Equal((recipient, oldLife), await ReadLifeAsync(source, target.Id));
+
+        // A down frame can already be on the reliable link when its intended
+        // life ends. The relay carries its immutable proof to the reader.
+        await source.SendRawAsync(contact.BuildUp(1, recipient, oldLife.Proof));
+        byte[] held = await target.ReadUntilAsync(Protocol.PlayerHitV8Down, Wait);
+        Assert.True(PlayerHitV8.TryDecodeDown(held, out byte from, out var hit, out ulong seq, out _, out ulong proof));
+        Assert.Equal((source.Id, contact, 1UL, oldLife.Proof), (from, hit, seq, proof));
+
+        var current = new PvpLifeState(3, 72);
+        await target.SendRawAsync(current.BuildUp());
+        Assert.Equal((recipient, current), await ReadLifeAsync(source, target.Id));
+        await target.SendRawAsync(new PvpLifeState(2, oldLife.Proof).BuildUp());
+        Assert.True(await source.NoneOfAsync(Protocol.PvpPeerDown, Quiet));
+        await source.SendRawAsync(contact.BuildUp(2, recipient, oldLife.Proof));
+        await source.SendRawAsync(contact.BuildUp(3, recipient));  // negotiated life cannot downgrade
+        Assert.True(await target.NoneOfAsync(Protocol.PlayerHitV8Down, Quiet));
+        byte[] valid = contact.BuildUp(4, recipient, current.Proof);
+        await source.SendRawAsync(valid);
+        await source.SendRawAsync(valid);
+        byte[] accepted = await target.ReadUntilAsync(Protocol.PlayerHitV8Down, Wait);
+        Assert.True(PlayerHitV8.TryDecodeDown(accepted, out _, out _, out seq, out _, out proof));
+        Assert.Equal((4UL, current.Proof), (seq, proof));
+        Assert.True(await target.NoneOfAsync(Protocol.PlayerHitV8Down, Quiet));
+    }
+
+    private static async Task<bool> EnableAsync(Peer peer, ushort required = Protocol.LinkCapPvpContact)
+    {
+        await peer.SendRawAsync(Protocol.BuildLinkHelloUp(required));
         var hello = await peer.ReadUntilAsync(Protocol.LinkHelloDown, Wait);
         return Protocol.TryParseLinkHello(hello, out _, out ushort caps, out _, out _) &&
-            (caps & Protocol.LinkCapPvpContact) != 0;
+            (caps & required) == required;
+    }
+
+    internal static async Task WaitForCapabilitiesAppliedAsync(Peer firstPeer)
+    {
+        // LinkHelloDown can arrive before the relay has announced its roster.
+        // The same reader answers Ping after that announcement completes.
+        var ping = new byte[Protocol.PingPayloadLen];
+        ping[0] = 0x5A;
+        await firstPeer.SendRawAsync([Protocol.Ping, Protocol.PingPayloadLen, 0, .. ping]);
+        Assert.Equal(ping, await firstPeer.ReadUntilAsync(Protocol.Pong, Wait));
     }
 
     private static async Task<ulong> ReadAsync(Peer target, byte source, ulong sequence, PlayerHitV8 wanted)
@@ -134,5 +191,14 @@ public sealed class FriendlyFireContactRelayTests : IAsyncLifetime
         Assert.True(Protocol.TryReadPvpPeer(frame, out byte ghost, out ulong incarnation));
         Assert.Equal(expected, ghost);
         return incarnation;
+    }
+
+    private static async Task<(ulong Incarnation, PvpLifeState Life)> ReadLifeAsync(Peer peer, byte expected)
+    {
+        var body = await peer.ReadUntilAsync(Protocol.PvpPeerDown, Wait);
+        Assert.Equal(Protocol.PvpPeerLifeLen, body.Length);
+        Assert.True(Protocol.TryReadPvpPeer(body, out byte ghost, out ulong incarnation, out var life));
+        Assert.Equal(expected, ghost);
+        return (incarnation, life);
     }
 }

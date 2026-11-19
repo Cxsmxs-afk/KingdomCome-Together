@@ -114,10 +114,16 @@ bool forget(uint32_t eid) {
     return g_table.forget(eid);
 }
 
-void engine_stopped(uint32_t eid, Holder holder) {
+bool begin_drain(uint32_t eid, Holder holder) {
     std::lock_guard<std::mutex> lock(g_mutex);
     synchronize();
-    g_table.engine_stopped(eid, holder);
+    return g_table.begin_drain(eid, holder);
+}
+
+bool engine_stopped(uint32_t eid, Holder holder) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    synchronize();
+    return g_table.engine_stopped(eid, holder);
 }
 
 OwnerStats owner_stats() {

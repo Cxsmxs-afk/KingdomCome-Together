@@ -71,7 +71,7 @@ public static partial class Protocol
     public static readonly (byte Up, byte Down, string Name, int Min, int Max, JoinFrom From)[] JoinWire =
     {
         (JoinRequestUp, JoinRequestDown, "join-request", JoinHeaderLen + 1, JoinHeaderLen + 1, JoinFrom.Joiner),
-        (WorldOfferUp,  WorldOfferDown,  "world-offer",  JoinHeaderLen + 64, JoinHeaderLen + 64, JoinFrom.Host),
+        (WorldOfferUp,  WorldOfferDown,  "world-offer",  JoinHeaderLen + WorldOffer.BodyLen, JoinHeaderLen + WorldOffer.RunBodyLen, JoinFrom.Host),
         (WorldChunkUp,  WorldChunkDown,  "world-chunk",  JoinHeaderLen + 4 + 1, JoinHeaderLen + 4 + WorldChunkMaxData, JoinFrom.Host),
         (WorldAckUp,    WorldAckDown,    "world-ack",    JoinHeaderLen + 4, JoinHeaderLen + 4, JoinFrom.Joiner),
         (WorldDoneUp,   WorldDoneDown,   "world-done",   JoinHeaderLen + 8, JoinHeaderLen + 8, JoinFrom.Joiner),
@@ -230,21 +230,40 @@ public static partial class Protocol
     }
 }
 
+/// <summary>The stable campaign ID and the host's live world scope for one offered save.</summary>
+public readonly record struct WorldRunOffer(Guid RunId, uint HostKey, uint HostWorldEpoch, ulong HostGeneration)
+{
+    public bool IsValid => RunId != Guid.Empty && HostKey != 0 && HostWorldEpoch != 0 && HostGeneration != 0;
+}
+
 /// <summary>WO-123: the host's offer of one world save (body after [target][joinId]).</summary>
 public readonly record struct WorldOffer(int Size, int ChunkSize, int ChunkCount, byte[] Sha256, uint WorldSavedSeq, byte[] Md5)
 {
     public const int BodyLen = 4 + 4 + 4 + 32 + 4 + 16;
+    public const int RunBodyLen = BodyLen + 1 + 16 + 4 + 4 + 8;
+    private const byte RunVersion = 1;
+    public WorldRunOffer? Run { get; init; }
 
     public byte[] Encode()
     {
         if (Sha256.Length != 32 || Md5.Length != 16) throw new ArgumentException("sha256 is 32 bytes, md5 16");
-        var b = new byte[BodyLen];
+        var b = new byte[Run is null ? BodyLen : RunBodyLen];
         BinaryPrimitives.WriteInt32LittleEndian(b, Size);
         BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(4), ChunkSize);
         BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(8), ChunkCount);
         Sha256.CopyTo(b, 12);
         BinaryPrimitives.WriteUInt32LittleEndian(b.AsSpan(44), WorldSavedSeq);
         Md5.CopyTo(b, 48);
+        if (Run is { } run)
+        {
+            if (!run.IsValid) throw new ArgumentException("invalid host run scope");
+            Span<byte> scope = b.AsSpan(BodyLen);
+            scope[0] = RunVersion;
+            run.RunId.TryWriteBytes(scope[1..17]);
+            BinaryPrimitives.WriteUInt32LittleEndian(scope[17..], run.HostKey);
+            BinaryPrimitives.WriteUInt32LittleEndian(scope[21..], run.HostWorldEpoch);
+            BinaryPrimitives.WriteUInt64LittleEndian(scope[25..], run.HostGeneration);
+        }
         return b;
     }
 
@@ -252,13 +271,23 @@ public readonly record struct WorldOffer(int Size, int ChunkSize, int ChunkCount
     public static WorldOffer? TryDecode(ReadOnlySpan<byte> b, out string why)
     {
         why = "";
-        if (b.Length != BodyLen) { why = $"offer is {b.Length} bytes, not {BodyLen}"; return null; }
+        if (b.Length is not (BodyLen or RunBodyLen)) { why = $"offer is {b.Length} bytes, expected {BodyLen} or {RunBodyLen}"; return null; }
         int size = BinaryPrimitives.ReadInt32LittleEndian(b), cs = BinaryPrimitives.ReadInt32LittleEndian(b[4..]),
             n = BinaryPrimitives.ReadInt32LittleEndian(b[8..]);
         if (size <= 0) { why = "empty file"; return null; }
         if (size > Protocol.WorldMaxBytes) { why = $"{size} bytes is over the {Protocol.WorldMaxBytes} limit"; return null; }
         if (cs <= 0 || cs > Protocol.WorldChunkMaxData) { why = $"chunk size {cs} out of range"; return null; }
         if (n != (size + cs - 1) / cs) { why = $"{n} chunks do not cover {size} bytes at {cs}"; return null; }
-        return new WorldOffer(size, cs, n, b.Slice(12, 32).ToArray(), BinaryPrimitives.ReadUInt32LittleEndian(b[44..]), b.Slice(48, 16).ToArray());
+        WorldRunOffer? run = null;
+        if (b.Length == RunBodyLen)
+        {
+            ReadOnlySpan<byte> scope = b[BodyLen..];
+            var value = new WorldRunOffer(new Guid(scope[1..17]), BinaryPrimitives.ReadUInt32LittleEndian(scope[17..]),
+                BinaryPrimitives.ReadUInt32LittleEndian(scope[21..]), BinaryPrimitives.ReadUInt64LittleEndian(scope[25..]));
+            if (scope[0] != RunVersion || !value.IsValid) { why = "invalid host run scope"; return null; }
+            run = value;
+        }
+        return new WorldOffer(size, cs, n, b.Slice(12, 32).ToArray(), BinaryPrimitives.ReadUInt32LittleEndian(b[44..]),
+            b.Slice(48, 16).ToArray()) { Run = run };
     }
 }

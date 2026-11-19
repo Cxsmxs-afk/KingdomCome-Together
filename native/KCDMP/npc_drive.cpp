@@ -382,6 +382,7 @@ struct Puppet {
     uint32_t eid = 0;
     void*    ent = nullptr;
     uint64_t wuid = 0;
+    double poseBoundAt = 0;
     uint8_t  pendingDrop = kOk;
     bool     tellDrop = false;
     bool     pendingSeatPlace = false;
@@ -472,6 +473,7 @@ constexpr double kRagdollGraceS = 3.0;
 struct Ragdolled { uint32_t eid = 0; double at = 0; };
 std::unordered_map<std::string, Ragdolled> g_ragdolled;
 SenderClock g_clocks[256];
+double g_timelinePoseSince = 0;
 double      g_lastPrune = 0;
 double      g_lastTickAt = 0;
 bool        g_announcedFault = false;
@@ -1163,6 +1165,7 @@ uint8_t queue_raw_pose(const uint8_t* body, size_t len, rpmeasure::SampleScope r
     if (!reader.receiver.connected() || !decode(body, len, pose, timed) ||
         (reader.firstByteQpc > 0 && pose.arrivalQpc > reader.firstByteQpc)) return kBadRequest;
     pose.firstByteQpc = reader.firstByteQpc;
+    pose.readerLife = reader.life;
     std::lock_guard<std::mutex> lock(g_inboxMutex);
     const rpmeasure::ReceiverScope current{wo216::lifecycle_observation_stamp(), pipe::observation_connection()};
     if (!(reader.receiver == current) || !loadsequence::allows(reader.loadStamp, loadsequence::Access::Live)) return kOk;
@@ -1189,6 +1192,7 @@ uint8_t on_timed_pose(const uint8_t* body, size_t len, rpmeasure::SampleScope re
 
 uint8_t configure_timeline(uint8_t on) {
     if (on > 1) return kBadRequest;
+    g_timelinePoseSince = now_s();
     {
         std::lock_guard<std::mutex> lock(g_inboxMutex);
         g_inRawPoses.clear_timed();
@@ -1462,15 +1466,17 @@ uint8_t bind_main(const BindRequest& req) {
     const uint64_t wuid = nativeWuid ? nativeWuid : req.wuid;
     const auto existing = g_bound.find(key);
     const bool rebind = existing != g_bound.end();
-    if (rebind && (existing->second.eid != req.eid || existing->second.ent != e || existing->second.wuid != wuid) &&
-        !drop(existing, kUnbound, false))
+    const bool sameBody = rebind && existing->second.eid == req.eid && existing->second.ent == e && existing->second.wuid == wuid;
+    if (rebind && !sameBody && !drop(existing, kUnbound, false))
         return refuse(kOwnerBusy, "the previous body is still releasing its engine request");
     Puppet& p = g_bound[key];
+    const double poseBoundAt = sameBody ? p.poseBoundAt : now;
     // WO-214 B: how long the stream this bind is for had been silent (a bind for a stream the host no longer sends drops at once)
     double streamAge = -1;
     { auto si = g_streams.find(key); if (si != g_streams.end() && si->second.lastSampleAt > 0) streamAge = now - si->second.lastSampleAt; }
     p = Puppet{};
     p.key = key; p.name = req.name; p.eid = req.eid; p.ent = e; p.wuid = wuid;
+    p.poseBoundAt = poseBoundAt;
     p.beast = beast;
     p.human = npcscan::body_kind(e) == 0;   // WO-215 A
     p.noPhys = noPhys;
@@ -1665,7 +1671,7 @@ void tick() {
         sample.flags = pose.flags; sample.seq = pose.sequence; sample.senderMs = pose.senderMs;
         sample.arrivalQpc = pose.arrivalQpc;
         sample.hostMs = pose.hostMs; sample.hostAtArrivalMs = pose.hostAtArrivalMs; sample.stateHostMs = pose.stateHostMs;
-        sample.reader = {pose.firstByteQpc, reader, loadStamp};
+        sample.reader = {pose.firstByteQpc, reader, loadStamp, pose.readerLife};
         sample.raw = true; sample.rawGhost = pose.ghost();
         sample.stateQpc = pose.stateQpc;
         sample.haveSt2 = pose.stateQpc != 0;
@@ -2124,6 +2130,7 @@ void tick() {
                 di.figure = figure; di.beast = p.beast; di.parented = parented; di.human = p.human; di.physics = !p.noPhys; di.fight = ri.fight;
                 di.now = now;
                 const bodydrive::Out dv = bodydrive::frame(di);
+                if (dv == bodydrive::Out::Draining) { ++it; continue; }
                 if (dv == bodydrive::Out::Driven) {
                     p.haveLast = false;
                     p.havePrev = false;
@@ -2366,6 +2373,25 @@ bool is_bound_eid(uint32_t eid) {
     if (!eid) return false;
     for (const auto& kv : g_bound) if (kv.second.eid == eid) return true;
     return false;
+}
+
+PartnerPose partner_pose(uint32_t eid, uint8_t peer, void* entity) {
+    char name[16]{};
+    std::snprintf(name, sizeof name, "kcd2mp_%u", static_cast<unsigned>(peer));
+    const auto body = g_bound.find(name);
+    if (body == g_bound.end() || !entity || body->second.ent != entity || body->second.eid != eid ||
+        body->second.pendingDrop != kOk || g_qpcPeriod <= 0.0) return {};
+    const auto found = g_streams.find(body->second.key);
+    if (found == g_streams.end() || found->second.n <= 0) return {};
+    const auto& stream = found->second;
+    const auto& newest = stream.ring[stream.n - 1];
+    if (newest.sourceId != peer || (stream.flags & (0x01 | 0x02 | 0x10)) || stream.lastArrivalQpc <= 0 ||
+        newest.reader.firstByteQpc < stream.lastArrivalQpc) return {};
+    const double arrived = qpc_to_s(stream.lastArrivalQpc);
+    const double now = now_s();
+    if (arrived <= (std::max)(body->second.poseBoundAt, g_timelinePoseSince) || arrived > now) return {};
+    return {newest.reader.receiver.lifecycle, newest.reader.receiver.connection, newest.reader.life, newest.reader.loadStamp,
+            local_ms(now - arrived), newest.hostMs};
 }
 
 double pose_lag_s(uint32_t eid) {

@@ -320,7 +320,7 @@ public sealed class RelayFaults
 		byte type = frame[0];
 		var p = frame.AsSpan(3);   // [source][target][joinId:4][body]
 		const int body = 1 + Protocol.JoinHeaderLen;
-		if (type == Protocol.WorldOfferDown && p.Length == body + WorldOffer.BodyLen)
+		if (type == Protocol.WorldOfferDown && p.Length - body is WorldOffer.BodyLen or WorldOffer.RunBodyLen)
 			s.Offers[BinaryPrimitives.ReadUInt32LittleEndian(p[2..])] = BinaryPrimitives.ReadInt32LittleEndian(p[(body + 8)..]);
 		else if (type == Protocol.WorldChunkDown && p.Length > body + 4
 			&& s.Offers.TryGetValue(BinaryPrimitives.ReadUInt32LittleEndian(p[2..]), out int n)

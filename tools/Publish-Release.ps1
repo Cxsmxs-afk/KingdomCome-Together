@@ -153,24 +153,11 @@ try {
 } finally { $bz.Dispose() }
 Write-Output "Brand pak: kdcmp_brand.pak ($((Get-Item $brandPak).Length) bytes, $($brandFiles.Count) files: the menu logo and the partner markers)"
 
-# --- WO-159: the bundled start saves (a host's New adventure, a joiner's new character), one per playstyle: the
-#     maintainer supplies assets\start-save\<soldier|adviser|scout>\ (one save each, made where Hans and Henry part
-#     ways); they ship in start-save\<style>\ beside the launcher and the agent, behind the same Setup and its install
-#     manifest. Each must pass tools\Validate-StartSave.ps1 -Style. None supplied: none ships, and the menu says
-#     "No start save is installed". ---
-$shipped = @()
-foreach ($style in @("soldier", "adviser", "scout")) {
-    $saves = @(Get-ChildItem (Join-Path $root "assets\start-save\$style") -Filter *.whs -ErrorAction SilentlyContinue)
-    if ($saves.Count -gt 1) { throw "assets\start-save\$style holds $($saves.Count) saves (one is expected)" }
-    if ($saves.Count -eq 0) { continue }
-    & powershell -ExecutionPolicy Bypass -File (Join-Path $root "tools\Validate-StartSave.ps1") -Path $saves[0].FullName -Style $style -Agent (Join-Path $clientPublish "KcdMpClient.exe")
-    if ($LASTEXITCODE -ne 0) { throw "the $style start save in assets\start-save does not pass tools\Validate-StartSave.ps1" }
-    New-Item -ItemType Directory -Force (Join-Path $OutDir "start-save\$style") | Out-Null
-    Copy-Item $saves[0].FullName (Join-Path $OutDir "start-save\$style") -Force
-    $shipped += $style
+# Check the assembled installer input as well as the separately verified player ZIP.
+if (Get-ChildItem -LiteralPath $OutDir -Recurse -Force -File | Where-Object Extension -ieq '.whs') {
+    throw 'The public release staging directory contains a game save.'
 }
-if ($shipped.Count -gt 0) { Write-Output "Start saves: $($shipped -join ', ') (New adventure)" }
-else { Write-Output "No start saves in assets\start-save\<playstyle>: this build ships none (the menu's New adventure says so)" }
+Write-Output 'Private start saves stay on the player profile: this build ships none.'
 
 Write-Output "`nRelease assembled at: $OutDir"
 Write-Output "Contents:"

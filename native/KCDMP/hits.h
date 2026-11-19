@@ -65,7 +65,8 @@ AttribResult apply_attributed_ex(const uint8_t* body, size_t len, bool rawDamage
     RawDamageAuthority authority = RawDamageAuthority::ReplicatedMelee);
 
 // 0x1A, main thread: [st:4f][hp:4f][flags:1][attackerGhost:1], then on an
-// identified contact [sequence:8][sourceIncarnation:8][localRelayReadTick:8].
+// identified contact [sequence:8][sourceIncarnation:8][localRelayReadTick:8]
+// and, when negotiated, [nativeRecipientLifeProof:8].
 wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules::Recipient recipient,
                                   uint64_t readTick, uint8_t sequence);
 

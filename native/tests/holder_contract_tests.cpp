@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #include "holders.h"
+#include "body_drive_retirement.h"
 
 #include <cstdio>
 
@@ -147,6 +148,61 @@ int holder_contract_tests(int* passed) {
         table.engine_stopped(kBody, Holder::Route);
         HCHECK(table.select(kBody, Holder::Writer, 3).selected);
         HCHECK(write_once(table, kBody, Holder::Writer, "stream"));
+        HCHECK(table.stats().violations == 0);
+    }
+
+    {
+        // H14: a declined movement request may already have changed the old controller.
+        using namespace kcdmp::bodydrive;
+        int entity, actor, controller, replacementEntity, replacementActor, replacementController;
+        const ControllerBinding oldBinding{&entity, &actor, &controller};
+        const ControllerBinding reusedController{&replacementEntity, &replacementActor, &controller};
+        const ControllerBinding newBinding{&replacementEntity, &replacementActor, &replacementController};
+        constexpr uint64_t oldScope = 12, newScope = 31;
+        ControllerRequest motion{oldBinding, oldScope};
+        Table table;
+        table.synchronize(kSession, 1);
+        HCHECK(table.select(kBody, Holder::Driver, 1).selected);
+        HCHECK(write_once(table, kBody, Holder::Driver, kRemoteControllerSetter, Claim::Held));
+        HCHECK(motion.may_drive(oldBinding, oldScope));
+        HCHECK(!motion.may_drive(oldBinding, newScope));
+        HCHECK(!motion.may_drive(newBinding, oldScope));
+        motion.draining = true;
+        HCHECK(table.begin_drain(kBody, Holder::Driver));
+        HCHECK(!motion.may_drive(oldBinding, oldScope));
+        HCHECK(!table.select(kBody, Holder::Driver, 1).selected);
+        HCHECK(!table.acquire(kBody, Holder::Driver, kRemoteControllerSetter, Claim::Held));
+        HCHECK(!table.select(kBody, Holder::Writer, 1).selected);
+        HCHECK(!table.acquire(kBody, Holder::Writer, kStreamSetter, Claim::Available));
+
+        HCHECK(motion.observe(true, oldBinding, true) == RetirementCheck::Stop);
+        ++motion.stopCalls;
+        motion.defer(2, RetirementCheck::Stop);
+        HCHECK(motion.nextCheck == 2 + ControllerRequest::kRetryS);
+        HCHECK(motion.observe(true, oldBinding, true) == RetirementCheck::Stop);
+        ++motion.stopCalls;
+        motion.defer(3, RetirementCheck::Stop);
+        HCHECK(motion.nextCheck == 3 + ControllerRequest::kQuarantineProbeS);
+        HCHECK(motion.observe(true, oldBinding, true) == RetirementCheck::Wait);
+        HCHECK(motion.observe(true, reusedController, true) == RetirementCheck::Wait);
+        HCHECK(motion.observe(false, {}, true) == RetirementCheck::Wait);
+        HCHECK(motion.observe(true, {&entity, nullptr, nullptr}, true) == RetirementCheck::Wait);
+        HCHECK(motion.observe(true, {}, false) == RetirementCheck::Wait);
+        HCHECK(motion.observe(true, newBinding, false) == RetirementCheck::Wait);
+        HCHECK(motion.observe(true, {}, true) == RetirementCheck::Removed);
+        HCHECK(motion.observe(true, newBinding, true) == RetirementCheck::Replaced);
+
+        const auto retiredLease = table.acquire(kBody, Holder::Driver, kRemoteControllerSetter, Claim::Release);
+        HCHECK(retiredLease != 0);
+        table.synchronize({kSession.lifecycle + 1, 0}, 3); // load and disconnect
+        HCHECK(!table.engine_stopped(kBody, Holder::Driver));
+        HCHECK(!table.select(kBody, Holder::Writer, 3).selected);
+        HCHECK(!table.forget(kBody));
+        table.synchronize({kSession.lifecycle + 2, kSession.connection + 1}, 4);
+        table.finish(kBody, retiredLease);
+        HCHECK(table.engine_stopped(kBody, Holder::Driver));
+        HCHECK(table.select(kBody, Holder::Writer, 4).selected);
+        HCHECK(write_once(table, kBody, Holder::Writer, kStreamSetter));
         HCHECK(table.stats().violations == 0);
     }
 

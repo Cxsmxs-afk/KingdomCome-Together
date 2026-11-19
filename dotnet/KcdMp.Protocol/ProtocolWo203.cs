@@ -160,7 +160,8 @@ public static partial class Protocol
         (DeathMarkerUp,     "death-marker",       DeathMarkerUpLen, DeathMarkerUpLen),
         (GraveAddUp,        "grave-add",         GraveAddUpPayloadLen, GraveAddUpPayloadLen),
         (GraveRemoveUp,     "grave-remove",      GraveRemoveUpPayloadLen, GraveRemoveUpPayloadLen),
-        (PlayerHitV8Up,     "player-hit-v8",     PlayerHitV8.UpLen, PlayerHitV8.IdentifiedUpLen),
+        (PlayerHitV8Up,     "player-hit-v8",     PlayerHitV8.UpLen, PlayerHitV8.LifeUpLen),
+        (PvpLifeUp,         "pvp-life",          PvpLifeState.Length, PvpLifeState.Length),
         (WorldSavedUp,      "world-saved",       WorldSavedUpPayloadLen, WorldSavedUpPayloadLen),   // the damage authority only
         (LinkHelloUp,       "link-hello",        LinkHelloUpLen, LinkHelloUpLen),               // WO-213: relay-local, never forwarded
     };
@@ -229,7 +230,7 @@ public static partial class Protocol
         {
             Position => IsPositionPayloadLen(len),
             CombatEventUp => len is CombatEventUpPayloadLen or CombatEventUpPayloadLenV2,
-            PlayerHitV8Up => len is PlayerHitV8.UpLen or PlayerHitV8.IdentifiedUpLen,
+            PlayerHitV8Up => len is PlayerHitV8.UpLen or PlayerHitV8.IdentifiedUpLen or PlayerHitV8.LifeUpLen,
             PresentationClockUp => len is PresentationClock.QueryLength or PresentationClock.ConfirmLength,
             _ => true,
         };

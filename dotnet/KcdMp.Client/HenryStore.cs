@@ -29,7 +29,7 @@ namespace KcdMp.Client;
 /// parse). A snapshot that does not parse is skipped and logged, and the next
 /// older one is used.
 /// </summary>
-public sealed class HenryStore
+public sealed partial class HenryStore
 {
     /// <summary>
     /// Snapshots kept per world. 100 = the host's autosave rotation (100 slots per
@@ -86,6 +86,8 @@ public sealed class HenryStore
     public sealed record Snapshot(string Tag, string File, string Md5, DateTime TakenUtc, string Source, long Bytes)
     {
         public string Short => $"{Md5[..8]}@{TakenUtc:yyyy-MM-dd HH:mm:ss}";
+        public HenryCharacterScope? Scope { get; init; }
+        internal string? ScopedFingerprint { get; init; }
     }
 
     public sealed record WorldInfo(string Tag, DateTime LastJoinedUtc, int Count, long Bytes, string FirstSource);
@@ -124,6 +126,7 @@ public sealed class HenryStore
     /// <summary>Load and fully check one snapshot; null (logged) when it does not parse.</summary>
     public WhsSave.HenryParts? Load(Snapshot s)
     {
+        if (s.Scope is not null) return LoadScoped(s);
         try
         {
             var b = File.ReadAllBytes(Path.Combine(WorldDir(s.Tag), s.File));
@@ -146,6 +149,20 @@ public sealed class HenryStore
     public Pick? PickFor(string tag, IReadOnlyList<string> branchNewestFirst)
     {
         var all = Snapshots(tag);
+        if (PickPaired(all, branchNewestFirst) is { } paired) return paired;
+        foreach (var s in all)
+            if (Load(s) is { } p) return new Pick(s, p, branchNewestFirst.Count == 0 ? "newest (the host sent no branch)" : "newest (no snapshot pairs with any save of the host's branch)");
+        return null;
+    }
+
+    public Pick? PickVerified(string tag, IReadOnlyList<string> verifiedHostLineage)
+    {
+        string[] hashes = verifiedHostLineage.Where(IsSaveHash).Select(hash => hash.ToLowerInvariant()).ToArray();
+        return hashes.Length == 0 ? null : PickPaired(Snapshots(tag), hashes);
+    }
+
+    private Pick? PickPaired(IReadOnlyList<Snapshot> all, IReadOnlyList<string> branchNewestFirst)
+    {
         int pos = 0;
         foreach (var md5 in branchNewestFirst)
         {
@@ -153,8 +170,6 @@ public sealed class HenryStore
                 if (Load(s) is { } p) return new Pick(s, p, pos == 0 ? "paired with the host's newest save" : $"paired with the host's branch save #{pos} (newest = 0)");
             pos++;
         }
-        foreach (var s in all)
-            if (Load(s) is { } p) return new Pick(s, p, branchNewestFirst.Count == 0 ? "newest (the host sent no branch)" : "newest (no snapshot pairs with any save of the host's branch)");
         return null;
     }
 
@@ -217,10 +232,18 @@ public sealed class HenryStore
     /// pruned with its snapshot, so a restore brings back the ledger of the same
     /// moment: loss, never duplication.
     /// </summary>
-    public string ChestLedgerPath(Snapshot s) => Path.Combine(WorldDir(s.Tag), "chests-" + Path.GetFileNameWithoutExtension(s.File) + ".json");
+    public string ChestLedgerPath(Snapshot s) => s.Scope is null
+        ? Path.Combine(WorldDir(s.Tag), "chests-" + Path.GetFileNameWithoutExtension(s.File) + ".json")
+        : throw new InvalidOperationException("A scoped Henry snapshot has an embedded ledger.");
 
     public void StoreChestLedger(Snapshot s, string json)
     {
+        if (s.Scope is not null)
+        {
+            if (Load(s)?.PrivateLootLedgerJson != json)
+                throw new IOException("the scoped pair needs the original embedded loot ledger");
+            return;
+        }
         lock (_gate)
         {
             var p = ChestLedgerPath(s);
@@ -238,7 +261,7 @@ public sealed class HenryStore
     {
         var parts = Load(s);
         if (parts is null) return null; // a damaged/newer block must never borrow a sidecar
-        if (parts.PrivateLootLedgerJson is string json) return json;
+        if (s.Scope is not null || parts.PrivateLootLedgerJson is not null) return parts.PrivateLootLedgerJson;
         try { var p = ChestLedgerPath(s); return File.Exists(p) ? File.ReadAllText(p) : null; }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
     }
@@ -439,9 +462,10 @@ public sealed class HenryStore
         public DateTime SinceUtc { get; set; }
         public string? File { get; set; }
         public string? Md5 { get; set; }
+        public string? EngineProfileId { get; set; }
         public string WorldTag { get; set; } = "";
-        public string Kind { get; set; } = "snapshot";     // snapshot | leak
-        public string State { get; set; } = "pending";     // pending | written | done
+        public string Kind { get; set; } = "snapshot";     // snapshot | leak | scoped-guest
+        public string State { get; set; } = "pending";     // pending | written | done | retained
     }
 
     private string LedgerPath => Path.Combine(Root, "ledger.json");
@@ -482,6 +506,35 @@ public sealed class HenryStore
             foreach (var e in l.Where(x => x.Id == id)) f(e);
             WriteLedger(l);
         }
+    }
+
+    internal void RecordScopedGuestSave(string engineProfileId, int playline, string file, string md5)
+    {
+        lock (_gate)
+        {
+            var ledger = Ledger();
+            if (ledger.Any(e => e.State == "retained" && e.Kind == "scoped-guest" &&
+                e.EngineProfileId == engineProfileId && e.Playline == playline &&
+                string.Equals(e.File, file, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(e.Md5, md5, StringComparison.OrdinalIgnoreCase))) return;
+            ledger.Add(new() { EngineProfileId = engineProfileId, Playline = playline, File = file,
+                Md5 = md5, SinceUtc = _now(), Kind = "scoped-guest", State = "retained" });
+            WriteLedger(ledger);
+        }
+    }
+
+    internal Func<GameBridge.HenrySource, bool>? ScopedGuestSaveFilter(string engineProfileId)
+    {
+        var entries = Ledger().Where(e => e is { Kind: "scoped-guest", State: "retained", File: not null } &&
+            e.EngineProfileId == engineProfileId).ToLookup(e => (e.Playline, e.File!.ToLowerInvariant()));
+        if (entries.Count == 0) return null;
+        return source =>
+        {
+            var candidates = entries[(source.Playline, source.File.ToLowerInvariant())];
+            if (!candidates.Any()) return false;
+            var verified = WhsSave.VerifyFile(source.FullPath);
+            return verified.Ok && candidates.Any(e => string.Equals(e.Md5, verified.Md5, StringComparison.OrdinalIgnoreCase));
+        };
     }
 
     /// <summary>

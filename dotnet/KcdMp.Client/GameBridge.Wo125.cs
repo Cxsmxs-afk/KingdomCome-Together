@@ -205,6 +205,7 @@ public partial class GameBridge
 
     private void Wo125HostOnGameplayStarted()
     {
+        H21HostGameplayStarted();
         if (!_hostLoadAnnounced) return;
         _hostLoadAnnounced = false;
         Wo201HostLoadDone();   // WO-201 B15
@@ -242,8 +243,7 @@ public partial class GameBridge
     private string? _peerTag;
     private readonly List<string> _hostBranch = [];            // newest first, from the last complete replay
     private string?[] _branchRx = [];
-    private string? _firstChoice;                               // bring | fresh | playlineN/file, for _firstChoiceTag
-    private string? _firstChoiceTag;
+    private volatile JoinCharacterIntent? _firstCharacter;
     private bool _chooseAsked, _notHenryTold;
     private volatile bool _rewinding;                          // the host is reloading: nothing gained now is kept
     private volatile bool _rejoinPending;                      // the host is back: rejoin from inside the world
@@ -361,10 +361,7 @@ public partial class GameBridge
         c = (c ?? "").Trim().ToLowerInvariant();
         if (!Wo159Rules.TryParseJoinChoice(c, out string parsed, out string? style)) { Console.WriteLine($"MP-HENRY joiner: the launcher sent an unknown choice '{c}' -- ignored"); return; }
         c = parsed;
-        _w159FreshStyle = style;   // WO-159: "fresh:<playstyle>" = that bundled start save's Henry
-        if (style is not null) Console.WriteLine($"MP-HENRY joiner: a new character with the {style} playstyle (the bundled start save)");
-        _firstChoice = c;
-        _firstChoiceTag = _peerTag;
+        _firstCharacter = new(c, style, _peerTag);
         _chooseAsked = false;
         Console.WriteLine($"MP-HENRY joiner: first join to world {_peerTag ?? "?"}: the player chose '{(c == "bring" ? "Bring my character" : "Start fresh")}' (launcher)");
         _autoNextUtc = DateTime.UtcNow;
@@ -374,14 +371,17 @@ public partial class GameBridge
     private void Wo125OnConsoleChoice(string v)
     {
         v = (v ?? "").Trim();
-        _firstChoice = v == "auto" ? "bring" : v;
-        _firstChoiceTag = _peerTag;
+        string choice = v == "auto" ? "bring" : v;
+        _firstCharacter = new(choice, null, _peerTag);
         _chooseAsked = false;
-        Console.WriteLine($"MP-HENRY joiner: first-join answer '{_firstChoice}' (mp_join_henry) for world {_peerTag ?? "the next host world"}");
+        Console.WriteLine($"MP-HENRY joiner: a local character choice was received for world {_peerTag ?? "the next host world"}");
         _autoNextUtc = DateTime.UtcNow;
     }
 
-    private string? CurrentChoice() => _firstChoice is not null && (_firstChoiceTag is null || _firstChoiceTag == _peerTag) ? _firstChoice : null;
+    private JoinCharacterIntent? CurrentCharacter() =>
+        _firstCharacter is { } intent && (intent.WorldTag is null || intent.WorldTag == _peerTag) ? intent : null;
+
+    private string? CurrentChoice() => CurrentCharacter()?.Key;
 
     /// <summary>
     /// Whether a request may go out now (the host is never paused while
@@ -404,7 +404,8 @@ public partial class GameBridge
             return false;
         }
         if (!Wo180SlotAvailableOrTell()) { why = "no save slot for the host's world"; return false; }   // WO-180: before the first-join question and before any request
-        if (_henry.HasWorld(_peerTag!))
+        var choice = CurrentChoice();
+        if (choice is null && _henry.HasWorld(_peerTag!))
         {
             // WO-200 Act IV: a rejoin -- the launcher says which character comes back, by the per-world Henry file's time
             var newest = _henry.Snapshots(_peerTag!).FirstOrDefault();
@@ -421,7 +422,6 @@ public partial class GameBridge
             SetJoinUi("waiting", "Waiting for your host...");
             return false;
         }
-        var choice = CurrentChoice();
         if (choice is null)
         {
             why = "a first join: waiting for the player's choice";
@@ -433,19 +433,6 @@ public partial class GameBridge
                 SetJoinUi(state, msg, reason, canFresh);
                 if (state == "no-save") Wo135TellInGame(msg);
             }
-            return false;
-        }
-        var src = Wo125SourceFor(choice, out string swhy);
-        if (src is null)
-        {
-            // The chosen source does not exist: nothing is asked of the host; the question is asked again.
-            why = swhy;
-            Console.WriteLine($"MP-HENRY joiner: no join asked -- '{choice}': {swhy} (asking again)");
-            _firstChoice = null;
-            _chooseAsked = true;
-            var (state, msg, reason, canFresh) = Wo135FirstJoinUi();
-            SetJoinUi(state, state == "no-save" ? msg : $"{swhy} {msg}", reason, canFresh);
-            if (state == "no-save") Wo135TellInGame(msg); else Wo135TellInGame(swhy);
             return false;
         }
         return true;
@@ -472,7 +459,7 @@ public partial class GameBridge
     {
         if (ResolveSavesDirForJoin() is not string saves) return "no-saves";
         int all = ListOwnSaves(saves).Count;
-        var own = OwnSaves(saves, HostSeedForOwn(), null, Wo157HostedSeed);
+        var own = Wo125OwnSaves(saves, HostSeedForOwn());
         var builds = own.Select(s => WhsSave.ReadBuildFromFile(s.Save.FullPath)).ToList();
         int same = host is null ? own.Count : builds.Count(b => Wo135Rules.SameBuild(b, host));
         int regular = builds.Count(Wo154Rules.IsRegularGameBuild);
@@ -483,7 +470,7 @@ public partial class GameBridge
     private string? Wo135NewestHenryBuild()
     {
         if (ResolveSavesDirForJoin() is not string saves) return null;
-        foreach (var s in OwnSaves(saves, HostSeedForOwn(), null, Wo157HostedSeed))
+        foreach (var s in Wo125OwnSaves(saves, HostSeedForOwn()))
             if (WhsSave.ReadBuildFromFile(s.Save.FullPath) is string b) return b;
         return null;
     }
@@ -507,16 +494,27 @@ public partial class GameBridge
     /// own. Each skip is logged (a warning: the file is left where it is).
     /// WO-157: unless <paramref name="hostedHere"/> says this install hosted that world itself -- two hosts of
     /// the same start save share its seed, and the one who hosted it first then had "only copies of the host's
-    /// world" and could not join the other. The copies a join makes never stay in the playlines (the transient
-    /// world file is deleted, saves made while joined are moved out), so what is left there is his own play.
+    /// world" and could not join the other. Scoped guest saves with no cleanup receipt are retained and
+    /// excluded by their exact observed file and content identity.
     /// </summary>
     public static List<OwnSave> OwnSaves(string saves, uint? hostSeed, Action<string>? log = null, Func<uint, bool>? hostedHere = null)
+        => OwnSaves(saves, hostSeed, log, hostedHere, null);
+
+    private List<OwnSave> Wo125OwnSaves(string saves, uint? hostSeed, Action<string>? log = null)
+        => OwnSaves(saves, hostSeed, log, Wo157HostedSeed, Wo125ScopedGuestSaveFilter(saves));
+
+    private Func<HenrySource, bool>? Wo125ScopedGuestSaveFilter(string saves)
+        => TryCheckpointProfile(saves, out _, out string profile) ? _henry.ScopedGuestSaveFilter(profile) : null;
+
+    private static List<OwnSave> OwnSaves(string saves, uint? hostSeed, Action<string>? log, Func<uint, bool>? hostedHere,
+        Func<HenrySource, bool>? retainedGuestSave)
     {
         var o = new List<OwnSave>();
         var skipped = new List<string>();
         bool ownWorld = hostSeed is uint h0 && hostedHere?.Invoke(h0) == true;
         foreach (var s in ListOwnSaves(saves))
         {
+            if (retainedGuestSave?.Invoke(s) == true) continue;
             uint? seed = WhsSave.ReadSeedFromFile(s.FullPath);
             if (hostSeed is uint hs && seed == hs && !ownWorld)
             {
@@ -545,7 +543,7 @@ public partial class GameBridge
         why = "";
         if (TestNoOwnSave) { why = "KCDMP_TEST_NO_OWN_SAVE=1 (test: no own save)"; Console.WriteLine("MP-HENRY TEST KCDMP_TEST_NO_OWN_SAVE=1 -- acting as if this player had no save of their own"); return null; }
         if (ResolveSavesDirForJoin() is not string saves) { why = "no saves folder"; return null; }
-        var own = OwnSaves(saves, HostSeedForOwn(), l => Console.WriteLine(l), Wo157HostedSeed);
+        var own = Wo125OwnSaves(saves, HostSeedForOwn(), Console.WriteLine);
         // WO-147: only a save this game can load -- of the build of the world it runs. The live run's leave picked a
         // newer build's save (the retail game shares the saves folder): "needs newer game", and the joiner stayed.
         if (Wo135TargetBuild() is string build) own = SameBuildSaves(own, build, l => Console.WriteLine(l));
@@ -569,7 +567,7 @@ public partial class GameBridge
         if (TestNoOwnSave || ResolveSavesDirForJoin() is not string saves)
             return (Wo125NewestOwn(out string w0), w0);
         var selected = await SaveListMaintenance.FindOwnAsync(
-            OwnSaves(saves, HostSeedForOwn(), l => Console.WriteLine(l), Wo157HostedSeed),
+            Wo125OwnSaves(saves, HostSeedForOwn(), Console.WriteLine),
             s =>
             {
                 var v = WhsSave.VerifyFile(s.Save.FullPath);
@@ -582,7 +580,70 @@ public partial class GameBridge
         return (null, "no loadable save of this player's own (with a different playthrough than the host's)");
     }
 
-    public sealed record HenryChoice(string Mode, WhsSave.HenryParts Parts, HenrySource? Save, string Detail);
+    private async Task<(HenrySource? Save, string Why)> Wo125CapturedHomeAsync(HenrySource source, string fingerprint)
+    {
+        const string refused = "the selected character's original save is no longer verified";
+        if (ResolveSavesDirForJoin() is not string saves) return (null, refused);
+        bool matches = await Task.Run(() =>
+        {
+            try
+            {
+                string folder = Path.Combine(Path.GetFullPath(saves), $"playline{source.Playline}");
+                string path = Path.Combine(folder, source.File);
+                var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+                if (!string.Equals(path, source.FullPath, comparison) ||
+                    ((File.GetAttributes(saves) | File.GetAttributes(folder) | File.GetAttributes(path)) & FileAttributes.ReparsePoint) != 0)
+                    return false;
+                return string.Equals(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(WhsSave.ReadShared(path))),
+                    fingerprint, StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return false; }
+        });
+        if (!matches) return (null, refused);
+        var listed = await _combat.SaveListAsync(3, source.Playline, source.Base);
+        if (listed is { Listed: false }) listed = await _combat.SaveListAsync(1, source.Playline, source.Base);
+        if (listed is { Listed: false }) return (null, "the selected character's original save is absent from the engine list");
+        return (source, "");
+    }
+
+    public sealed record HenryChoice(string Mode, WhsSave.HenryParts Parts, HenrySource? Save, string Detail)
+    {
+        public string? Fingerprint { get; init; }
+    }
+
+    private sealed record JoinCharacterIntent(string Choice, string? Style, string? WorldTag)
+    {
+        public string Key => Style is null ? Choice : $"{Choice}:{Style}";
+    }
+
+    private sealed record JoinCharacterSelection(JoinCharacterIntent? Intent, uint? HostSeed, string? HostBuild, HenryChoice? First,
+        SelectedCharacter? Scoped = null);
+
+    private (JoinCharacterSelection? Character, string Why) Wo125PrepareCharacter(JoinCharacterIntent? intent, string? build, uint? seed)
+    {
+        if (intent is null && _joinedWorld && Volatile.Read(ref _joinedCharacter) is { } joined)
+            return (new(null, seed, build, null, joined.Selection), "");
+        if (intent is not null && TryCharacterChoice(intent.Choice, out Guid id, out bool restore))
+        {
+            var selected = Wo125SelectCatalogCharacter(id, build);
+            return selected.Selection is null
+                ? (null, selected.Why)
+                : (new(intent, seed, build, restore ? null : selected.Source, selected.Selection), "");
+        }
+        if (intent is null or { Choice: "restore" })
+        {
+            if (seed is not null && (_peerTag is not string tag || !_henry.HasWorld(tag)))
+                return (null, "Choose a verified local character before requesting this world.");
+            return (new(intent, seed, build, null), "");
+        }
+        var source = Wo125SourceFor(intent.Choice, out string why, (intent.Style, build, seed));
+        if (source is null) return (null, why);
+        if (build is not null && !Wo135Rules.SameBuild(source.Parts.Build, build))
+            return (null, Wo135Rules.WrongBuildMessage(source.Parts.Build, build));
+        if (seed is uint hostSeed && source.Parts.Seed == hostSeed && (source.Mode == "fresh" || !Wo157HostedSeed(hostSeed)))
+            return (null, "The chosen save belongs to the host's world.");
+        return (new(intent, seed, build, source), "");
+    }
 
     /// <summary>
     /// The source for a first join. bring = the newest own save whose player is
@@ -590,13 +651,13 @@ public partial class GameBridge
     /// first Henry save on this machine (Phase 3); playlineN/file = that save,
     /// refused when it is a copy of the host's world or not a Henry save.
     /// </summary>
-    private HenryChoice? Wo125SourceFor(string choice, out string why)
+    private HenryChoice? Wo125SourceFor(string choice, out string why, (string? Style, string? Build, uint? Seed)? requested = null)
     {
         why = "";
-        if (choice == "fresh" && Wo159BundledFresh(out string bwhy) is { } bundled) return bundled;   // WO-159
         if (ResolveSavesDirForJoin() is not string saves) { why = "no saves folder"; return null; }
-        uint? hostSeed = HostSeedForOwn();
-        string? build = Wo135TargetBuild();   // WO-135: only saves of the host world's build
+        uint? hostSeed = requested is { } scope ? scope.Seed : HostSeedForOwn();
+        string? build = requested is { } expected ? expected.Build : Wo135TargetBuild();
+        if (choice == "fresh") return Wo125LocalCheckpoint(saves, requested is { } offer ? offer.Style : CurrentCharacter()?.Style, build, out why);
         if (choice.StartsWith("playline", StringComparison.Ordinal))
         {
             var m = Regex.Match(choice, @"^playline([0-4])/([A-Za-z0-9_]+?)(\.whs)?$");
@@ -610,6 +671,11 @@ public partial class GameBridge
                 return null;
             }
             var src = new HenrySource(int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture), f, full, ReadSaveTime(full) ?? 0);
+            if (Wo125ScopedGuestSaveFilter(saves)?.Invoke(src) == true)
+            {
+                why = "That save was written while playing in a host's run. Choose a personal save.";
+                return null;
+            }
             if (build is not null && WhsSave.ReadBuildFromFile(full) is var fb && !Wo135Rules.SameBuild(fb, build))
             {
                 why = Wo135Rules.WrongBuildMessage(fb, build);
@@ -618,7 +684,7 @@ public partial class GameBridge
             }
             return TryHenrySave(src, WhsSave.HenryParts.OriginSave, "bring", out why, requirePristine: false);
         }
-        var own = OwnSaves(saves, hostSeed, l => Console.WriteLine(l), Wo157HostedSeed);
+        var own = Wo125OwnSaves(saves, hostSeed, Console.WriteLine);
         // WO-135: a save from another game build is skipped (logged once per file), before it is even read.
         var same = build is null ? own : SameBuildSaves(own, build, l => Console.WriteLine(l));
         if (choice == "bring")
@@ -631,20 +697,32 @@ public partial class GameBridge
                 : "No save of your own with Henry in it yet.";
             return null;
         }
-        if (choice == "fresh")
-        {
-            // A new game's first Henry save: quest saves first (a new game writes permanent002 right after the prologue).
-            // WO-157: then a pristine Henry save with the host's seed (a copy of the same start save): a Henry that
-            // has done nothing yet is nobody's character, so "Join with a new character" works from it too.
-            foreach (var s in Wo157Rules.FreshCandidates(same, OwnSaves(saves, null), build, hostSeed))
-                if (TryHenrySave(s.Save, WhsSave.HenryParts.OriginFreshSave, "fresh", out _, requirePristine: true, quiet: true) is { } c) return c;
-            why = build is null
-                ? "Start fresh needs a new game's first save on this computer: start a new game once and play past the prologue (its first save after it is used, never your host's character)."
-                : $"Start fresh needs a new game's first save from your host's game version ({Wo135Rules.PlainBuild(build)}): start a new game once in the Modding Tools build and play past the prologue.";
-            return null;
-        }
         why = $"unknown choice '{choice}'";
         return null;
+    }
+
+    private static HenryChoice? Wo125LocalCheckpoint(string saves, string? style, string? build, out string why)
+    {
+        why = "Start fresh needs a verified local checkpoint from the normal prologue in this game profile.";
+        if (!TryCheckpointProfile(saves, out _, out string profile)) return null;
+        var store = new LocalStartCheckpointStore(LocalStartCheckpointStore.DefaultRoot(), profile);
+        if (!store.TryFind(style, build, out var checkpoint, out _)) return null;
+        var catalog = new HenryCharacterCatalog(HenryCharacterCatalog.DefaultRoot(), profile);
+        if (!catalog.TryList(out var active) || active.Any(c => c.CreationId == checkpoint.CreationId) ||
+            catalog.IsDeletedCreation(checkpoint.CreationId)) return null;
+        why = "";
+        return Wo125CheckpointChoice(saves, checkpoint);
+    }
+
+    private static HenryChoice Wo125CheckpointChoice(string saves, LocalStartCheckpoint checkpoint)
+    {
+        var home = checkpoint.EngineSave.Split('/');
+        int playline = home[0][^1] - '0';
+        string file = home[1] + ".whs";
+        string path = Path.Combine(saves, home[0], file);
+        var parts = WhsSave.PartsFromFile(checkpoint.SaveBytes, WhsSave.HenryParts.OriginFreshSave);
+        return new HenryChoice("fresh", parts, new(playline, file, path, 0), "verified local checkpoint")
+        { Fingerprint = checkpoint.Sha256 };
     }
 
     private static readonly ConcurrentDictionary<string, byte> BuildWarned = new(StringComparer.OrdinalIgnoreCase);
@@ -675,7 +753,7 @@ public partial class GameBridge
         why = "";
         byte[] bytes;
         try { bytes = WhsSave.ReadShared(s.FullPath); }
-        catch (IOException ex) { why = "unreadable: " + ex.Message; return null; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { why = "The selected save cannot be read."; return null; }
         var v = WhsSave.Verify(bytes);
         if (!v.Ok) { why = v.Reason; return null; }
         var c = WhsSave.Inflate(bytes);
@@ -683,7 +761,8 @@ public partial class GameBridge
         if (!who.IsHenry) { why = $"its player is not Henry ({who.Player})"; if (!quiet) Console.WriteLine($"MP-HENRY joiner: {s.Display}: {why}"); return null; }
         if (requirePristine && !who.Pristine) { why = "not a new game's first Henry save"; return null; }
         var parts = WhsSave.PartsFromStream(c.Raw, WhsSave.DescriptionSummary(c.Desc).GetValueOrDefault("BuildInfo") ?? "", origin);
-        return new HenryChoice(mode, parts, s, s.Display);
+        return new HenryChoice(mode, parts, s, s.Display)
+        { Fingerprint = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)) };
     }
 
     // ---------------------------------------------------------------- joiner: the Henry for a received world
@@ -693,39 +772,89 @@ public partial class GameBridge
     /// world, then restore (a Henry file exists for it) or use the first-join
     /// choice. Null = abort with <paramref name="abortReason"/>.
     /// </summary>
-    private HenryChoice? Wo125HenryForWorld(uint joinId, byte[] hostBytes, out string why, out byte abortReason, out string tag)
+    private HenryChoice? Wo125HenryForWorld(JoinerJoin join, byte[] hostBytes,
+        out string why, out byte abortReason, out string tag)
     {
         why = ""; abortReason = 0; tag = "";
+        uint joinId = join.JoinId;
+        var selection = join.Character;
         var c = WhsSave.Inflate(hostBytes);
         uint? seed = WhsSave.ReadSeed(c.Raw);
         var who = WhsSave.PlayerOf(c.Raw);
         _lastWorldDesc = c.DescBytes;
         if (seed is not uint s) { why = "the world has no playthrough seed"; abortReason = Protocol.JoinAbortSpliceFailed; return null; }
         tag = Wo157TagFor(s);   // WO-157
-        if (_peerSeedKnown && s != _peerSeed)
+        if ((_peerSeedKnown && s != _peerSeed) || (selection?.HostSeed is uint selectedSeed && s != selectedSeed))
         {
             why = $"the world received ({tag}) is not the one the host announced ({_peerTag}) -- it changed; the next announcement decides";
             abortReason = Protocol.JoinAbortWorldChanged;
             return null;
         }
         if (!who.IsHenry) { why = $"the host's player in this world is not Henry ({who.Player})"; abortReason = Protocol.JoinAbortNotHenry; return null; }
-        if (_henry.HasWorld(tag))
+        if (selection is null)
+        {
+            why = "The join has no matching character selection.";
+            abortReason = Protocol.JoinAbortNoHenrySource;
+            return null;
+        }
+        string? receivedBuild = WhsSave.DescriptionSummary(c.Desc).GetValueOrDefault("BuildInfo");
+        if (selection.HostBuild is string expectedBuild && !Wo135Rules.SameBuild(receivedBuild, expectedBuild))
+        {
+            why = "The host's game build changed during the join.";
+            abortReason = Protocol.JoinAbortWorldChanged;
+            return null;
+        }
+        var footer = WhsSave.VerifyFooter(hostBytes);
+        if (!footer.Ok || !TryBindJoinCharacter(join, tag, footer.Stored))
+        {
+            why = "The offered world does not carry a verified run binding for the selected character.";
+            abortReason = Protocol.JoinAbortWorldChanged;
+            return null;
+        }
+        if (selection.First is { } src)
+        {
+            if (!Wo135Rules.SameBuild(src.Parts.Build, receivedBuild))
+            {
+                why = "The selected character and the received world are from different game builds.";
+                abortReason = Protocol.JoinAbortNoHenrySource;
+                return null;
+            }
+            if (src.Parts.Seed == s && (src.Mode == "fresh" || !Wo157HostedSeed(s)))
+            {
+                why = "The selected character source is a copy of the received world.";
+                abortReason = Protocol.JoinAbortNoHenrySource;
+                return null;
+            }
+            Wo134OnRestorePick(null);
+            Console.WriteLine($"MP-HENRY joiner: join 0x{joinId:x8}: world {tag} henry_source={(src.Mode == "fresh" ? "fresh-local" : src.Mode)} ({src.Detail})");
+            return src;
+        }
+        if (join.CharacterScope is not null || _henry.HasWorld(tag))
         {
             List<string> branch;
             lock (_hostBranch) branch = [.. _hostBranch];
-            var pick = _henry.PickFor(tag, branch);
+            var index = branch.FindIndex(md5 => string.Equals(md5, footer.Stored, StringComparison.OrdinalIgnoreCase));
+            var verified = index >= 0 ? branch.Skip(index).ToArray() : [footer.Stored];
+            var pick = join.CharacterScope is { } scoped ? _henry.PickScoped(scoped, verified) : _henry.PickVerified(tag, verified);
             if (pick is null) { why = $"world {tag}: no snapshot could be read (all broken)"; abortReason = Protocol.JoinAbortNoHenrySource; return null; }
             Console.WriteLine($"MP-HENRY joiner: join 0x{joinId:x8}: world {tag} -- RESTORE snapshot {pick.Snapshot.Short} ({pick.Snapshot.Source}): {pick.How}");
+            if (!footer.Ok || !verified.Contains(pick.Snapshot.Md5, StringComparer.OrdinalIgnoreCase) ||
+                !Wo135Rules.SameBuild(pick.Parts.Build, receivedBuild))
+            {
+                why = "No compatible character snapshot is paired with the received host save.";
+                abortReason = Protocol.JoinAbortNoHenrySource;
+                return null;
+            }
             Wo134OnRestorePick(pick.Snapshot);   // WO-134: its chest ledger comes back with it
-            return new HenryChoice("restore", pick.Parts, null, $"snapshot {pick.Snapshot.Short}");
+            if (join.CharacterScope is { } completed)
+                Console.WriteLine($"MP-HENRY character_restored id={completed.CharacterId.ToString("N")[..8]} run={completed.Run.RunId.ToString("N")[..8]} join=0x{joinId:x8}");
+            return new HenryChoice("restore", pick.Parts, selection.Scoped?.Home.Save, $"snapshot {pick.Snapshot.Short}")
+            { Fingerprint = selection.Scoped?.Home.Fingerprint };
         }
         Wo134OnRestorePick(null);   // WO-134: a first join: an empty chest ledger
-        var choice = CurrentChoice();
-        if (choice is null) { why = $"a first join to world {tag} but no choice was made (bring / fresh)"; abortReason = Protocol.JoinAbortNoHenrySource; return null; }
-        var src = Wo125SourceFor(choice, out string swhy);
-        if (src is null) { why = swhy; abortReason = choice == "bring" ? Protocol.JoinAbortNoOwnSave : Protocol.JoinAbortNoHenrySource; return null; }
-        Console.WriteLine($"MP-HENRY joiner: join 0x{joinId:x8}: world {tag} -- FIRST JOIN, {(src.Mode == "fresh" ? "Start fresh" : "Bring my character")}: the Henry comes from {src.Detail}{(src.Mode == "fresh" ? " (a new game's first Henry save; never the host's)" : "")}");
-        return src;
+        why = "Choose a local character before requesting this world.";
+        abortReason = Protocol.JoinAbortNoHenrySource;
+        return null;
     }
 
     /// <summary>After Ready: the join save pairs with the Henry just loaded (a matched pair: the joiner has not played in it yet).</summary>
@@ -756,11 +885,21 @@ public partial class GameBridge
         try
         {
             parts.Origin = WhsSave.HenryParts.OriginSnapshot;
+            if (Volatile.Read(ref _joinedCharacter) is { } character)
+            {
+                var scope = character.Scope;
+                string md5 = Convert.ToHexString(offerMd5);
+                if (scope.Run.WorldTag != tag || !string.Equals(scope.HostSaveMd5, md5, StringComparison.OrdinalIgnoreCase) ||
+                    !character.Selection.Catalog.TryNoteRun(scope)) return;
+                var scopedSnap = _henry.StoreScoped(scope, parts, mode == "restore" ? HenryStore.SourceJoin : mode,
+                    Wo134SnapshotLedgerJson(), () => ReferenceEquals(Volatile.Read(ref _joinedCharacter), character));
+                if (scopedSnap is not null) Wo134OnSnapshotStored(scopedSnap);
+                return;
+            }
             var joinSnap = _henry.Store(tag, parts, Convert.ToHexString(offerMd5), mode == "restore" ? HenryStore.SourceJoin : mode, $"the join save (seq {seq})", lootLedgerJson: Wo134SnapshotLedgerJson());
             Wo134OnSnapshotStored(joinSnap);   // WO-134: the chest ledger pairs with it
             _henry.MarkJoined(tag);
             Wo157ClaimJoinedWorld(tag);   // WO-157: this folder is this host's world from now on
-            if (_firstChoiceTag == tag || _firstChoiceTag is null) { _firstChoice = null; _firstChoiceTag = null; }
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
         {
@@ -772,7 +911,7 @@ public partial class GameBridge
 
     private int _snapBusy;
     private readonly object _snapGate = new();
-    private (int Playline, DateTime Since, TaskCompletionSource<string> Tcs)? _snapWait;
+    private (int Playline, DateTime Since, TaskCompletionSource<string> Tcs, JoinedCharacter? Character)? _snapWait;
 
     /// <summary>Guard: a playline near the engine's 100-quicksave rotation is never snapshotted into (the rotation could remove the player's oldest).</summary>
     public const int SnapshotQuicksaveGuard = 95;
@@ -789,9 +928,12 @@ public partial class GameBridge
     private bool Wo125OnJoinerSaveObserved(string path, string md5)
     {
         var id = WorldSaved.ParsePath(path);
+        if (_joinedWorld && Volatile.Read(ref _joinedCharacter) is not null)
+            Wo125RecordScopedGuestSave(path, md5);
         lock (_snapGate)
         {
-            if (_snapWait is { } w && id is { } i && i.Playline == w.Playline && i.Kind == Protocol.SaveKindQuick && File.GetLastWriteTimeUtc(path) >= w.Since)
+            if (_snapWait is { } w && ReferenceEquals(w.Character, Volatile.Read(ref _joinedCharacter)) &&
+                id is { } i && i.Playline == w.Playline && i.Kind == Protocol.SaveKindQuick && File.GetLastWriteTimeUtc(path) >= w.Since)
             {
                 w.Tcs.TrySetResult(path);
                 return true;
@@ -799,6 +941,8 @@ public partial class GameBridge
         }
         if (Wo184TakeLateFile(path)) return true;   // WO-184: a snapshot whose wait ended still pairs (0.50.9 moved it out as a "leak")
         if (!_joinedWorld) return false;
+        // An unexpected file has no character-scoped engine receipt. Leave it in place.
+        if (Volatile.Read(ref _joinedCharacter) is not null) return true;
         var led = _henry.LedgerAdd(new HenryStore.LedgerEntry
         {
             Playline = id?.Playline ?? -1, SinceUtc = DateTime.UtcNow, File = Path.GetFileName(path), Md5 = md5, WorldTag = _joinedTag ?? "", Kind = "leak", State = "written",
@@ -811,6 +955,13 @@ public partial class GameBridge
             Console.WriteLine($"MP-HENRY leak cleanup: moved out={On(gone)}; engine cache refresh deferred until a load");
         });
         return true;
+    }
+
+    private void Wo125RecordScopedGuestSave(string path, string md5)
+    {
+        if (ResolveSavesDirForJoin() is not string saves || H21EngineSavePath(saves, path) is not string reported ||
+            WorldSaved.ParsePath(reported) is not { } save || !TryCheckpointProfile(saves, out _, out string profile)) return;
+        _henry.RecordScopedGuestSave(profile, save.Playline, Path.GetFileName(reported), md5);
     }
 
     // ---------------------------------------------------------------- sweeps (agent start, before every join)
@@ -829,6 +980,9 @@ public partial class GameBridge
         if (saves is null) return 0;
         saves = Path.GetFullPath(saves);
         if (!_joinWorldJournal.CanSweepPath(saves, directory: true)) return 0;
+        var scopedGuestSave = Wo125ScopedGuestSaveFilter(saves);
+        bool IsScopedGuestSave(int playline, string file) =>
+            scopedGuestSave?.Invoke(new(playline, Path.GetFileName(file), file, 0)) == true;
         int n = 0;
         if (why == "agent start")
         {
@@ -850,7 +1004,7 @@ public partial class GameBridge
                     && !_retainedJoinWorlds.Protects(f) && (_jj?.PlacedPath is not string keep || !string.Equals(keep, f, StringComparison.OrdinalIgnoreCase))
                     && _henry.MoveOut(f, $"a transient file of the mod ({why})")) n++;
         }
-        foreach (var e in _henry.Ledger().Where(x => x.State != "done"))
+        foreach (var e in _henry.Ledger().Where(x => x.State != "done" && x.Kind != "scoped-guest"))
         {
             string dir = Path.Combine(saves, $"playline{e.Playline}");
             bool exists = Directory.Exists(dir);
@@ -861,7 +1015,7 @@ public partial class GameBridge
             if (e.File is string f && File.Exists(Path.Combine(dir, f)))
             {
                 string p = Path.Combine(dir, f);
-                if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p)) continue;
+                if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p) || IsScopedGuestSave(e.Playline, p)) continue;
                 var v = WhsSave.VerifyFile(p);
                 if (e.Md5 is null || string.Equals(v.Md5, e.Md5, StringComparison.OrdinalIgnoreCase))
                 { if (_henry.MoveOut(p, $"a {e.Kind} save the mod made or saw while joined ({why})")) n++; else done = false; }
@@ -873,7 +1027,7 @@ public partial class GameBridge
                 // the host's world (its seed) that landed in that playline within two minutes of the request.
                 foreach (var p in Directory.EnumerateFiles(dir, "*.whs"))
                 {
-                    if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p)) continue;
+                    if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p) || IsScopedGuestSave(e.Playline, p)) continue;
                     var t = File.GetLastWriteTimeUtc(p);
                     if (t < e.SinceUtc || t > e.SinceUtc.AddMinutes(2) || WorldSaved.ParsePath(p) is null) continue;
                     if (WhsSave.ReadSeedFromFile(p) is uint s && WhsSave.SeedTag(s) == _henry.BaseTagOf(e.WorldTag))
@@ -992,7 +1146,7 @@ public partial class GameBridge
             {
                 if (_peerTag is not string tag) { Console.WriteLine("MP-HENRY mp_henry_reset: the host's world is not known (no host, or it has not identified its world)"); _ = Wo125ToastAsync("mp_henry_reset: no host world known yet."); return; }
                 bool had = _henry.DeleteWorld(tag, "mp_henry_reset (the player starts over in this host's world)");
-                _firstChoice = null; _firstChoiceTag = null; _chooseAsked = false;
+                _firstCharacter = null; _chooseAsked = false;
                 if (_joinedWorld && _joinedTag == tag) _resetTag = tag;
                 Console.WriteLine($"MP-HENRY mp_henry_reset world {tag}: {(had ? "Henry files deleted" : "there were none")}; the next join asks Bring / Fresh again{(_resetTag == tag ? " (no snapshots for it this session)" : "")}");
                 _ = Wo125ToastAsync(had ? "Your character for this world was deleted. Next join: bring or start fresh." : "No character stored for this world.");

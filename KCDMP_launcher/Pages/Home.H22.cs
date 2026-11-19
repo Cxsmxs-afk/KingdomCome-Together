@@ -86,6 +86,7 @@ public partial class Home
 
     private async Task SelectLauncherRoleAsync(SessionRole role, ServerInfo server)
     {
+        if (O4BlocksSession()) return;
         if (diagnosticMessageRevision == messageRevision || directRoleTarget is not null) DismissMessage();
         var plan = sessionRoles.Select(role, role == SessionRole.Host ? LocalHostTarget() : server)!;
         if (launchStage == LaunchStage.WaitingForConnect && roleGame is { } scope)

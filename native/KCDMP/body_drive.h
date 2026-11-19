@@ -31,6 +31,7 @@ enum class Out : uint8_t {
     Driven = 1,   // the engine moves it by our request: nothing writes it
     Snap = 2,     // left behind: the writer places it once, without a blend, and it is driven on
     Arrive = 3,   // at its host NPC's stop: the writer takes it from where it stands (the last half metre and the facing, blended)
+    Draining = 4, // the old request is unconfirmed: no writer may run yet
 };
 
 struct In {

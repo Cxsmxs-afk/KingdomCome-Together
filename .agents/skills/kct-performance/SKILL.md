@@ -23,7 +23,7 @@ Zahlen am H0-Stand `6c8a63e` geprüft. Am aktuellen Tip erneut prüfen.
 5. **Logs gedrosselt:** pro Grund höchstens einmal pro Fenster, Zähler statt Zeile pro Ereignis. Warum: Logging im Hot Path kostet selbst Frames (der DLL-Log läuft im Spielprozess).
 6. **Gedrosselte Engine-Aufrufe:** pro Frame so wenige Engine-Calls wie möglich, Ergebnisse cachen, wenn die Engine das erlaubt, und nie einen Vollscan pro Frame (Beispiel `UpdateSaveGameDescriptions`, `docs/PAKET-D-FRAME-BUDGET.md`).
 
-H6 benutzt pro Todesversuch den vorhandenen Main-Pipe-Pfad. Der Tracker prüft einen Actor-Bucket. Ausstehende Versuche bleiben am selben Körper und werden mit 40 ms Abstand höchstens eine Sekunde lang beobachtet. Der Release-Hook läuft ohne wartendes Lock oder `Stop`-Aufruf. `FRAME ours_us_p95` bleibt das Live-Gate.
+H6 benutzt pro Todesversuch den vorhandenen Main-Pipe-Pfad. Der Tracker prüft einen Actor-Bucket. Die Nachbeobachtung läuft im Abstand von 40 ms bis zu 2,5 Sekunden. Für den einmaligen Abbruchnachweis folgen höchstens 500 ms. Nach unklarem Apply liest derselbe Versuch nur den Engine-Zustand. Der Release-Hook läuft ohne wartendes Lock oder `Stop`-Aufruf. `FRAME ours_us_p95` bleibt das Live-Gate.
 
 ## 3. Netz: Rate, Bandbreite, Latenz
 - **Zustand = latest wins pro Körper** (`dotnet/KcdMp.Protocol/LinkScheduler.cs`), Ereignisse zuverlässig und geordnet. Zustände nicht in die zuverlässige Queue legen. Warum: Veraltete Positionen nachzuliefern erzeugt Gummiband-Effekte.
@@ -43,6 +43,8 @@ H6 benutzt pro Todesversuch den vorhandenen Main-Pipe-Pfad. Der Tracker prüft e
 | `MP-T3-STATS` (`proc_stall_max_ms`, `proc_awaits_per_frame_max` …) | Agent (`GameBridge.T3.cs`), ausgewertet in `BRIEFING.md`/`ERGEBNIS.txt` | GRAU = nicht gemessen |
 | Sim-Bericht `sim.md`, `sim.json` (Ausgabeordner von run-sim) | `tools/sim/run-sim ci /tmp/kct-sim --timeline both` | 2/3/4 Spieler, Profile good/typical/bad/awful. Die `Feel`-Grenzen gelten für die 2-Spieler-Zeilen `typical`, `bad` und `awful`. `typical` prüft u. a. Höhe p95 < 10 cm, < 1 Bruch/min, Treffer-/Dialog-p95 ≤ 150 ms und maximal 1 ms über `before` (`tools/sim/KcdMp.Sim/Feel.cs:43–53`). |
 | Frame-Rate-Soak | Unter Windows mit Spiel und Wegwerfsave gemäß `tools/perf/README.md`. `python tools/perf/soak.py check` prüft den vorhandenen Nachweis beim öffentlichen Release-Build (`tools/Build-Installer.ps1:157–160`). | FPS mit vs. ohne Mod, sofern der Vergleich enthalten ist. |
+
+H14 prüft pro Frame höchstens zwei offene Controller-Freigaben. Je Controller-Anforderung gibt es bis zu zwei Stoppaufrufe mit mindestens 100 ms Abstand. In Quarantäne liegen mindestens 500 ms zwischen Prüfversuchen. Miss die Wiederaufnahme mit dem nächsten gültigen Bewegungsframe sowie `owner_violations`, `FRAME` und bei einem Ausreißer `MAIN-COST`.
 
 Live-Beispiel 18.11.2026, 22:10:29 Europe/Berlin (Freund-PC, native Log): `frame_ms_worst=1017.3 ours_us_max=981641 ours_us_p95=3950`. Im Fenster erreichte die DLL-Hook-Zeit knapp 982 ms, ihr p95 rund 4 ms. Das Maximum des gesamten Frames und das Hook-Maximum können aus unterschiedlichen Frames stammen. Das 2-ms-Pipe-Budget gilt für einen Teil der gemessenen Arbeit. Die Ursache ist **unbelegt**. Ein Kandidat ist der enginegebundene Vollscan vor dem Load (`docs/PAKET-D-FRAME-BUDGET.md`). Mit `mp_main_cost on` belegen, bevor gefixt wird.
 

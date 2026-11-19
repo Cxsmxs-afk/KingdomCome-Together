@@ -368,6 +368,19 @@ do
     check("S9: no swallowed Lua errors", #ERRS == 0, ERRS[1])
 end
 
+-- (H21) The code-only menu requires a verified local checkpoint before Fresh.
+do
+    KCD2MP_W159Disarm("h21-fixture")
+    KCD2MP_W159Model({ sig = "h21-empty", role = "join", join = { state = "idle", bring = false }, styles = {} })
+    KCD2MP_W159Tick()
+    press("MP_JoinGame")
+    local count = #events("w159")
+    local fresh = find(lastPage(), "MP_JoinFresh")
+    press("MP_JoinFresh")
+    check("H21: without a proven local checkpoint Fresh cannot emit a menu action",
+        fresh and fresh.off and #events("w159") == count and KCD2MP.w159.page == "join")
+end
+
 -- (D) disarm, recap ------------------------------------------------------------------------------------------------------------
 do
     KCD2MP_W159Disarm("load")

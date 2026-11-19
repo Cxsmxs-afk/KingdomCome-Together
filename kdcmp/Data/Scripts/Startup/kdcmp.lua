@@ -30445,7 +30445,7 @@ function KCD2MP_W159Page(w)
         for _, st in ipairs(KCD2MP_W159_STYLES) do
             local have = styles[st.id] == true
             if have and not first then first = "MP_Style_" .. st.id end
-            add("MP_Style_" .. st.id, st.text, have and st.tip or "This playstyle's start save is not installed.", not have)
+            add("MP_Style_" .. st.id, st.text, have and st.tip or "There is no verified local start for this playstyle.", not have)
         end
         add("MP_Back", "@ui_back", "", false, 1)
         return b, "Choose your playstyle", first or "MP_Style_soldier"
@@ -30469,11 +30469,14 @@ function KCD2MP_W159Page(w)
             add("MP_JoinWait", "Joining your host...", line ~= "" and line or "Your host's world is on its way.", true)
             return b, "Join Game", "MP_JoinWait"
         end
-        add("MP_JoinFresh", "Join with a new character", "A new Henry where Hans and Henry part ways, in your host's world. You choose the playstyle next.")
+        local styles = type(m.styles) == "table" and m.styles or {}
+        local fresh = styles.soldier == true or styles.adviser == true or styles.scout == true
+        add("MP_JoinFresh", "Join with a new character",
+            fresh and "Use a locally verified Henry after the prologue." or "A verified local checkpoint after the prologue is required.", not fresh)
         if j.bring then add("MP_JoinBring", "Bring my character", "Your own Henry from your newest save of this game.")
         else add("MP_JoinBring", "Bring my character", tostring(j.msg or "You have no save of your own to bring."), true) end
         add("MP_Back", "@ui_back", "", false, 1)
-        return b, "Join Game", (j.bring and "MP_JoinBring" or "MP_JoinFresh")
+        return b, "Join Game", (j.bring and "MP_JoinBring" or (fresh and "MP_JoinFresh" or "MP_Back"))
     end
     local busy = w.roleRequest ~= nil or w.joinState == "joining" or (m.role ~= "host" and m.role ~= "join")
     add("MP_StartGame", "Start Game", role == "host" and KCD2MP_W159_ABOUT or "Choose to host here.", busy)

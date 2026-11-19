@@ -462,6 +462,7 @@ namespace KCDMP_launcher.Pages
 
         private async Task LaunchGameCoreAsync(SessionLaunchPlan plan)
         {
+            if (O4BlocksSession()) return;
             if (!await EnsureSetupReadyAsync()) return;   // WO-150: Host and Join unlock at Ready!
             lastLaunchPlan = plan;   // WO-157: LAUNCH ANYWAY repeats the selected role and destination
             ServerInfo server = plan.Server;
@@ -556,7 +557,7 @@ namespace KCDMP_launcher.Pages
                     GameLocator.InstallRootOf(gameStartInfo.FileName) ?? gameStartInfo.WorkingDirectory);
                 pendingGameProcess = gameProcess;
                 SetSessionPlan(menuScope, plan, "launcher");
-                Wo159StartDriver(menuScope, menuPreparationStarted, agentPath);
+                Wo159StartDriver(menuScope, menuPreparationStarted);
                 StateHasChanged();
 
                 bool ready = await WaitForInjectableAsync(gameProcess, settings.InjectDelaySeconds);
@@ -592,7 +593,7 @@ namespace KCDMP_launcher.Pages
             }
             finally
             {
-                if (menuPreparationStarted && !gameStarted) await Wo159CleanupPreparedMenuAsync(agentPath);
+                if (menuPreparationStarted && !gameStarted) await Wo159CleanupPreparedMenuAsync();
             }
         }
 
@@ -656,17 +657,6 @@ namespace KCDMP_launcher.Pages
 
                 // WO-157: the launcher loads the DLL itself (no KCDMP_LauncherInjector.exe for Windows to
                 // remove or refuse): the same steps and checks, failing closed with a plain message.
-                if (!plan.Hosting && !await Wo159DiscardStartSaveForJoinAsync())
-                {
-                    if (roleGame is { } scope && RoleSessionCurrent(scope) && ReferenceEquals(pendingPlan, plan))
-                    {
-                        launchStage = LaunchStage.WaitingForConnect;
-                        launchStatusMessage = waitingText;
-                        StartConnectGate(plan, scope);
-                        UiService.ShowError("The staged start save could not be released. Close the game and check the launcher log before joining.");
-                    }
-                    return;
-                }
                 if (!ReferenceEquals(pendingGameProcess, game) || game.HasExited) return;
                 var inject = await InjectFromLauncherAsync(game.Id, dllPath);
                 if (!ReferenceEquals(pendingGameProcess, game) || game.HasExited) return;
@@ -730,7 +720,10 @@ namespace KCDMP_launcher.Pages
         private async Task SendJoinChoiceAsync(string choice)
         {
             bool ok = await NetService.PostJoinChoiceAsync(settings.VersionIpcPort, choice);
-            joinStatusMessage = ok ? (choice == "bring" ? "Bringing your character..." : "Starting fresh...") : "The choice did not reach the agent -- try again.";
+            joinStatusMessage = !ok ? "The choice did not reach the agent -- try again."
+                : choice.StartsWith("restore:", StringComparison.Ordinal) ? "Restoring the selected character..."
+                : choice == "bring" || choice.StartsWith("character:", StringComparison.Ordinal) ? "Bringing your character..."
+                : "Starting fresh...";
             joinStatusState = ok ? "chosen" : joinStatusState;
             await InvokeAsync(StateHasChanged);
         }
@@ -936,6 +929,7 @@ namespace KCDMP_launcher.Pages
         // of what address a friend uses to reach it).
         private async Task OpenHostModal()
         {
+            if (O4BlocksSession()) return;
             if (HostSettingsLocked)
             {
                 UiService.ShowError(RoleMenuText);

@@ -53,6 +53,7 @@ class Table {
         bool transient = false;
         bool retired = false;
         bool engineActive = false;
+        bool draining = false;
     };
     std::unordered_map<uint32_t, Body> bodies_;
     std::vector<uint32_t> transient_;
@@ -118,7 +119,7 @@ public:
         if (!eid || !valid(who)) return {};
         auto& body = bodies_[eid];
         const Holder was = body.holder;
-        if (body.retired) return {was};
+        if (body.retired || body.draining) return {was};
         if (was == who) return {was, true};
         if (body.lease || body.engineActive) return {was};
         const double seconds = now - body.since;
@@ -141,7 +142,7 @@ public:
         const auto it = bodies_.find(eid);
         if (it == bodies_.end()) return true;
         auto& body = it->second;
-        if (body.lease || body.engineActive) return false;
+        if (body.lease || body.engineActive || body.draining) return false;
         if (body.writeHolder == Holder::None || body.writeFrame != frame_) {
             bodies_.erase(it);
         } else {
@@ -151,11 +152,22 @@ public:
         return true;
     }
 
-    void engine_stopped(uint32_t eid, Holder holder) {
+    bool begin_drain(uint32_t eid, Holder holder) {
         const auto it = bodies_.find(eid);
-        if (it == bodies_.end() || it->second.lease || it->second.holder != holder || !engine_request(holder)) return;
-        it->second.engineActive = false;
-        if (it->second.retired) bodies_.erase(it);
+        if (it == bodies_.end() || it->second.holder != holder || !engine_request(holder)) return false;
+        it->second.draining = true;
+        return true;
+    }
+
+    bool engine_stopped(uint32_t eid, Holder holder) {
+        const auto it = bodies_.find(eid);
+        if (it == bodies_.end()) return true;
+        auto& body = it->second;
+        if (body.lease || body.holder != holder || !engine_request(holder)) return false;
+        body.engineActive = false;
+        body.draining = false;
+        if (body.retired) bodies_.erase(it);
+        return true;
     }
 
     uint64_t acquire(uint32_t eid, Holder who, std::string_view path, Claim claim) {
@@ -168,7 +180,7 @@ public:
             remember_transient(eid, it->second);
         }
         auto& body = it->second;
-        if ((body.retired && claim != Claim::Release) || body.lease ||
+        if (((body.retired || body.draining) && claim != Claim::Release) || body.lease ||
             (body.holder != who && (body.holder != Holder::None || claim != Claim::Available)) ||
             conflicts(body, who, path, frame_))
             return deny();

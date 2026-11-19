@@ -23,12 +23,20 @@ if (-not $OutZip) { $OutZip = Join-Path $root "release\KingdomComeTogether-DropI
 $pak = Join-Path $root "kdcmp\Data\kdcmp.pak"
 $manifest = Join-Path $root "kdcmp\mod.manifest"
 $launcher = Join-Path $ReleaseDir "KCDMP_launcher.exe"
+$agent = Join-Path $ReleaseDir "KcdMpClient.exe"
+$relay = Join-Path $ReleaseDir "KcdMpServer.exe"
 $dll = Join-Path $ReleaseDir "KCDMP.dll"
-foreach ($p in @($ReleaseDir, $pak, $manifest, $launcher, $dll)) {
-    if (-not (Test-Path $p)) { throw "missing: $p" }
+$installManifest = Join-Path $ReleaseDir "install-manifest.txt"
+foreach ($p in @($pak, $manifest, $launcher, $agent, $relay, $dll, $installManifest)) {
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "missing: $p" }
+}
+if (Get-ChildItem -LiteralPath $ReleaseDir -Recurse -Force -File | Where-Object Extension -ieq '.whs') {
+    throw 'The player drop-in cannot contain game saves.'
 }
 
 $version = (Get-Content (Join-Path $root "VERSION") -TotalCount 1).Trim()
+$buildId = (Get-Content -LiteralPath (Join-Path $root "BUILD_ID") -Raw).Trim()
+if ($buildId -cnotmatch '^[0-9a-f]{7,40}-[0-9]{10}$') { throw "Missing or invalid drop-in BUILD_ID." }
 $stage = Join-Path $env:TEMP ("kct-dropin-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 try {
@@ -46,6 +54,7 @@ try {
     $verify = @"
 PASS  drop-in $version : these files are the verified build
 version $version
+build $buildId
 "@
     [System.IO.File]::WriteAllText((Join-Path $app "install-verify.txt"), $verify.Replace("`n", "`r`n"), [System.Text.UTF8Encoding]::new($false))
 

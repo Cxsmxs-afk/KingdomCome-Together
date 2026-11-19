@@ -1402,8 +1402,10 @@ public class RelayRoundTripTests : IClassFixture<RelayFixture>
         Assert.True(await a.NoneOfAsync(Protocol.ActivityExtraDown, Quiet));
     }
 
-    [Fact]
-    public async Task A_whole_world_crosses_the_relay_windowed_and_byte_exact()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_whole_world_crosses_the_relay_windowed_and_byte_exact(bool scoped)
     {
         // alpha connects first -> lowest ready id -> damage authority (the host); bravo joins.
         var (a, b) = await TwoPeersAsync();
@@ -1418,14 +1420,18 @@ public class RelayRoundTripTests : IClassFixture<RelayFixture>
         Assert.Equal(join, rid);
 
         var file = System.Security.Cryptography.RandomNumberGenerator.GetBytes(700_001);   // 22 chunks: three windows' worth
-        var tx = new WorldSender(file, join, src, 5, new byte[16]);
+        WorldRunOffer? run = scoped ? new WorldRunOffer(Guid.NewGuid(), 34, 7, 8) : null;
+        var tx = new WorldSender(file, join, src, 5, new byte[16], run: run);
         await a.SendRawAsync(tx.BuildOfferPacket());
         var offerDown = await b.ReadUntilAsync(Protocol.WorldOfferDown, Wait);
-        Assert.True(Protocol.TrySplitJoinDown(offerDown, out byte host, out _, out _, out _));
+        Assert.True(Protocol.TrySplitJoinDown(offerDown, out byte host, out byte target, out uint offeredJoin, out _));
         Assert.Equal(a.Id, host);
+        Assert.Equal(b.Id, target);
+        Assert.Equal(join, offeredJoin);
         var offer = WorldOffer.TryDecode(offerDown.AsSpan(1 + Protocol.JoinHeaderLen), out string why);
         Assert.NotNull(offer);
         Assert.Equal(file.Length, offer!.Value.Size);
+        Assert.Equal(run, offer.Value.Run);
 
         var got = new MemoryStream();
         int next = 0, acksSeen = 0;

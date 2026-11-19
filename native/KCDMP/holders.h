@@ -47,7 +47,8 @@ Holder set(uint32_t eid, const char* npc, Holder h, double now);
 bool handover(uint32_t eid, const char* npc, Holder h, double now);
 Holder of(uint32_t eid);                                            // None: not a bound copy
 bool forget(uint32_t eid);                                         // after an unbind, retain this frame's observed setter
-void engine_stopped(uint32_t eid, Holder holder);                   // game confirmed cancellation or the verified actor vanished
+bool begin_drain(uint32_t eid, Holder holder);                     // only a release may mutate the outgoing controller
+bool engine_stopped(uint32_t eid, Holder holder);                   // engine evidence cannot retire an executing permit
 OwnerStats owner_stats();
 
 class [[nodiscard]] Permit {

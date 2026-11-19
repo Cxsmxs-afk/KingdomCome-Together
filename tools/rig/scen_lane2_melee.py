@@ -287,18 +287,31 @@ def partner_contacts(outgoing, incoming, attacker, victim):
     return sent, received
 
 
-def partner_effect(receiver_native, source_peer, target):
+def contact_id(sent, received):
+    if len(sent) != 1 or len(received) != 1:
+        return None
+    outgoing = dict(LIVE_FIELDS.findall(sent[0]))
+    incoming = dict(LIVE_FIELDS.findall(received[0]))
+    key = incoming.get('contact', '')
+    if re.fullmatch(r'[1-9]\d*/[1-9]\d*', key) and key.split('/')[1] == outgoing.get('contact_seq'):
+        return key
+    return None
+
+
+def partner_effect(receiver_native, source_peer, target, contact):
+    if not contact or not target:
+        return None
     rows = []
     for line in receiver_native:
         if match := NATIVE_CONTACT.search(line):
             row = dict(LIVE_FIELDS.findall(match[1]))
             if row.get('event') == 'contact' and row.get('source') == 'pvp' and number(row, 'peer') == source_peer:
                 rows.append(row)
-    if len(rows) != 1 or not target:
+    if len(rows) != 1:
         return None
     row = rows[0]
     eid = row.get('target', '')
-    if not re.fullmatch(r'0x[0-9A-Fa-f]+', eid) or target['eid'] != int(eid, 16):
+    if row.get('contact') != contact or not re.fullmatch(r'0x[0-9A-Fa-f]+', eid) or target['eid'] != int(eid, 16):
         return None
     if not re.fullmatch(r'\d+/\d+', row.get('scope', '')) or number(row, 'seq') is None:
         return None
@@ -313,7 +326,7 @@ def partner_effect(receiver_native, source_peer, target):
     outcome = row.get('outcome')
     if ((outcome == 'observed' and (hp_loss > 0 or st_loss > 0)) or
             (outcome == 'protected_consumed' and hp_loss == st_loss == 0)):
-        return {'status': outcome, 'scope': row['scope'], 'pipe_seq': int(row['seq']), 'eid': target['eid'], **vitals}
+        return {'status': outcome, 'contact': contact, 'scope': row['scope'], 'pipe_seq': int(row['seq']), 'eid': target['eid'], **vitals}
     return None
 
 
@@ -350,7 +363,10 @@ def case_signal(case, before, after, sent, received, protected, npc_hits, receiv
     fields = ('hp', 'st', 'unarmed')
     if any(key not in outbound or outbound[key] != inbound.get(key) for key in fields):
         return 'partner-contact-values-mismatch'
-    effect = partner_effect(receiver_native, source_peer, before.get('partner'))
+    contact = contact_id(sent, received)
+    if not contact:
+        return 'partner-contact-id-mismatch'
+    effect = partner_effect(receiver_native, source_peer, before.get('partner'), contact)
     if case == 'protected':
         return 'protected-consumed-zero' if effect and effect['status'] == 'protected_consumed' else 'protection-unmeasured'
     if protected or inbound.get('result') == 'protected_consumed' or effect and effect['status'] == 'protected_consumed':
@@ -435,7 +451,7 @@ def observe_combat(S, run, args, send_role):
     stable = ff_after and host_authority and not world_changed
     npc_hits = authority_contacts(send_role, ids[send_role], args.bandit, before['npc']['eid'], *traces['host']) if before.get('npc') else []
     signal = case_signal(case, before, after, sent, received, protected, npc_hits, traces[receive_role][1], ids[send_role])
-    effect = partner_effect(traces[receive_role][1], ids[send_role], before.get('partner'))
+    effect = partner_effect(traces[receive_role][1], ids[send_role], before.get('partner'), contact_id(sent, received))
     exact = (effect if target == 'partner' and stable and len(source_actions) == len(sent) == len(received) == 1
              and signal != 'partner-contact-values-mismatch' else None)
     exact = exact or {'status': 'grey', 'reason': 'no isolated native effect with a verified actor and before/after values'}

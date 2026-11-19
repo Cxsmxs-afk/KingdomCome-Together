@@ -24,8 +24,12 @@ FRIENDLY_FIRE = re.compile(r'\b(?:MP-WO121 cfg .*friendly_fire|MP-FF (?:host sen
 EID = re.compile(r'0x[0-9a-fA-F]+\Z')
 CRASH = re.compile(r'\bWO202-CRASH 0x[0-9a-fA-F]+\b')
 PLAYBACK_STAGES = ('ready', 'death-dispatched', 'applied')
-TERMINAL_STAGES = ('applied', 'uncertain', 'stale')
-PHASES = {*PLAYBACK_STAGES, *TERMINAL_STAGES, 'release-pending', 'death-pending'}
+ABORTED = ('aborted-before-apply', 'aborted-unadmitted')
+TERMINAL_STAGES = ('applied', 'uncertain', 'preparation-uncertain', 'stale', *ABORTED)
+AWAITING_READBACK = ('death-pending', 'apply-uncertain')
+FAILED_PREPARATION = ('preparation-not-started', 'preparation-uncertain')
+PHASES = {*PLAYBACK_STAGES, *TERMINAL_STAGES, *AWAITING_READBACK, *FAILED_PREPARATION,
+          'release-pending', 'release-uncertain', 'apply-exception'}
 FRAME_P95 = re.compile(r'\bFRAME .*\bframes=([1-9]\d*) .*\bours_us_p95=(\d+)\b')
 
 
@@ -96,6 +100,14 @@ def native_evidence(rows):
             grey.append(f'attempt-{attempt}-scope-unmeasured')
             continue
         terminal = [phase for phase in phases if phase in TERMINAL_STAGES]
+        if any(phase in FAILED_PREPARATION for phase in phases) and (
+                'death-dispatched' in phases or 'applied' in terminal):
+            red.append(f'attempt-{attempt}-mutation-after-failed-preparation')
+            continue
+        aborted = next((phase for phase in terminal if phase in ABORTED), None)
+        if aborted:
+            red.append(f'attempt-{attempt}-{aborted}')
+            continue
         if len(terminal) > 1 or phases.count('death-dispatched') > 1 or phases.count('ready') > 1:
             red.append(f'attempt-{attempt}-duplicate-terminal-or-dispatch')
             continue
@@ -108,7 +120,9 @@ def native_evidence(rows):
         ordered = list(phases)
         if ordered[0] == 'release-pending':
             ordered.pop(0)
-        if ordered[-2] == 'death-pending':
+        if ordered[-2] in AWAITING_READBACK:
+            ordered.pop(-2)
+        if ordered[-2] == 'apply-exception':
             ordered.pop(-2)
         if ordered != list(PLAYBACK_STAGES):
             red.append(f'attempt-{attempt}-mutation-without-ordered-release')
@@ -139,7 +153,13 @@ def native_evidence(rows):
         grey.append('fewer-than-30-qualified-deaths')
     observed = peak = None
     if proved:
+        scopes = {(row['connection'], row['lifecycle']) for row in proved}
+        if len(scopes) != 1:
+            red.append('h6-run-scope-changed')
         first, last = min(row['at_ms'] for row in proved), max(row['at_ms'] for row in proved)
+        start = min(entries[0][1] for entries in history.values())
+        if any(start <= tick <= last + OBSERVATION_MS and line == 'PIPE: agent disconnected' for tick, line in rows):
+            red.append('native-pipe-disconnected-during-h6')
         frames = [(tick, int(match[2])) for tick, line in rows if tick >= first and (match := FRAME_P95.search(line))]
         if frames:
             observed = max(tick for tick, _ in frames) - last

@@ -81,6 +81,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
     private const byte AttributedReply   = 0x8B;   // [ok][seq][steps][attackerWuid:8][victimWuid:8]
     private const byte LocalAction       = 0x96;   // unsolicited, LocalActionFrame
     private const byte PvpHitOut         = 0x97;   // unsolicited: [victimEid:4][stamina:4f][health:4f][flags][material]
+    private const byte PvpLifeOut        = 0xBC;   // unsolicited: [nativeLifeProof:8]
     // WO-124: the joiner's side of the join (native/KCDMP/join_native.h, savelist.h)
     private const byte JoinPlace         = 0x1C;   // [hostX:4f][hostY:4f][hostZ:4f][dist:4f] -> 0x8C
     private const byte JoinPlaceReply    = 0x8C;
@@ -154,8 +155,12 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// </summary>
     public Func<LocalActionFrame, Task>? OnLocalAction { get; set; }
 
-    /// <summary>WO-121: the local player hit a peer's avatar: victim eid, stamina, health (what the hit took), flags, material.</summary>
-    public Func<uint, float, float, byte, byte, Task>? OnPvpHit { get; set; }
+    // Resolve the victim's life before a 0x97 frame leaves the physical reader.
+    internal Func<uint, GameBridge.PvpHitTarget?>? CapturePvpHitTarget { get; set; }
+    internal Func<GameBridge.PvpHitTarget?, uint, float, float, byte, byte, Task>? OnPvpHit { get; set; }
+    internal Func<Task>? OnPvpLifeChanged { get; set; }
+    private ulong _pvpNativeLife;
+    internal ulong PvpNativeLife => Volatile.Read(ref _pvpNativeLife);
 
     /// <summary>WO-132: an NPC hit a peer's avatar (measured over the hit window, put back): victim eid, stamina, health, attacker eid, flags, attacker name.</summary>
     public Func<uint, float, float, uint, byte, string, Task>? OnNpcAvatarHit { get; set; }
@@ -556,17 +561,20 @@ public sealed partial class CombatPipe : IAsyncDisposable
         return SendAsync(ApplyDamage, payload, ct);
     }
 
-    internal enum NpcDeathReceipt { Applied, Pending, Uncertain, Stale }
+    internal enum NpcDeathReceipt { Applied, Pending, Uncertain, Stale, Aborted }
+    internal enum NpcDeathIntent : byte { Advance, ObserveOnly, AbortBeforeApply }
 
     internal async Task<NpcDeathReceipt> ApplyOwnedNpcDeathAsync(Guid soul, uint eid, ulong lifecycle,
-        ulong attempt, Func<bool> current, CancellationToken ct)
+        ulong attempt, NpcDeathIntent intent, Func<bool> current, CancellationToken ct)
     {
         if (!current()) return NpcDeathReceipt.Stale;
-        var payload = new byte[36];
+        // The original layout advances the attempt. Restricted follow-ups name the same attempt and append the intent.
+        var payload = new byte[intent == NpcDeathIntent.Advance ? 36 : 37];
         WriteSoulGuid(soul, payload);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(16), eid);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(20), lifecycle);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(28), attempt);
+        if (intent != NpcDeathIntent.Advance) payload[36] = (byte)intent;
         var (reply, _) = await SendAndAwaitAsync(ApplyDeath, payload, Result, ct,
             beforeWrite: current, exactSequence: true);
         if (!current()) return NpcDeathReceipt.Stale;
@@ -575,6 +583,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             [1, _, 0] => NpcDeathReceipt.Applied,
             [0, _, 0x70] => NpcDeathReceipt.Pending,
             [0, _, 0x72] => NpcDeathReceipt.Stale,
+            [0, _, 0x73] when intent != NpcDeathIntent.Advance => NpcDeathReceipt.Aborted,
             _ => NpcDeathReceipt.Uncertain
         };
     }
@@ -812,12 +821,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// </summary>
     public async Task<PipeResult> ApplyPvpHitAsync(float stamina, float health, byte flags, byte attackerGhost,
         CancellationToken ct = default, Func<bool>? recipientCurrent = null, ulong sequence = 0, ulong incarnation = 0,
-        ulong ingressTick = 0)
+        ulong ingressTick = 0, ulong recipientLife = 0)
     {
         bool identified = sequence != 0;
-        if (identified != (incarnation != 0) || identified != (ingressTick != 0)) return PipeResult.Fail(PipeReason.BadSpec);
+        if (identified != (incarnation != 0) || identified != (ingressTick != 0) || (!identified && recipientLife != 0))
+            return PipeResult.Fail(PipeReason.BadSpec);
         if (CaptureSource() is not { } source) return PipeResult.Fail(PipeReason.NotConnected);
-        var p = new byte[identified ? 34 : 10];
+        var p = new byte[recipientLife != 0 ? 42 : identified ? 34 : 10];
         BinaryPrimitives.WriteSingleLittleEndian(p.AsSpan(0), stamina);
         BinaryPrimitives.WriteSingleLittleEndian(p.AsSpan(4), health);
         p[8] = flags; p[9] = attackerGhost;
@@ -827,6 +837,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(18), incarnation);
             BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(26), ingressTick);
         }
+        if (recipientLife != 0) BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(34), recipientLife);
         bool writeAllowed = false, recipientRetired = false;
         bool AuthorizeWrite()
         {
@@ -2294,9 +2305,11 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     // Replies stay on the physical reader; callbacks can themselves need the
     // pipe or the relay. One FIFO worker retains unsolicited event order.
+    private readonly record struct PipeNotice(byte Type, byte[] Body, GameBridge.PvpHitTarget? PvpTarget);
+
     private async Task ReadLoopAsync(NamedPipeClientStream myPipe, ChannelWriter<(byte Type, byte[] Body)> replies)
     {
-        var notices = Channel.CreateUnbounded<(byte Type, byte[] Body)>(new UnboundedChannelOptions
+        var notices = Channel.CreateUnbounded<PipeNotice>(new UnboundedChannelOptions
         {
             SingleReader = true, SingleWriter = true
         });
@@ -2308,12 +2321,23 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 var (type, body) = await ReadFrameAsync(myPipe, CancellationToken.None);
                 if (!ReferenceEquals(_pipe, myPipe)) break;
                 if (TryLifecycleReply(myPipe, type, body) || TryEdgeReply(myPipe, type, body)) continue;
+                if (type == PvpLifeOut && body.Length == sizeof(ulong))
+                {
+                    lock (_connectionState)
+                    {
+                        if (!ReferenceEquals(_pipe, myPipe)) break;
+                        Volatile.Write(ref _pvpNativeLife, BinaryPrimitives.ReadUInt64LittleEndian(body));
+                    }
+                }
                 if (type is not (Result or LocalStateReply or NpcStatusReply or BodyStateReply or LocalAction or PvpHitOut or NpcCombatOut or Wo132Reply or Wo131Reply or Wo137Reply or QuestChangeOut or BatchReply))
                     Console.WriteLine($"[combat] pipe frame 0x{type:X2} ({body.Length} bytes)");
                 if (type == BatchReply) OnBatchReply(body);
                 else if (IsPipeNotice(type))
                 {
-                    if (!notices.Writer.TryWrite((type, body)))
+                    var pvpTarget = type == PvpHitOut && body.Length == 14
+                        ? CapturePvpHitTarget?.Invoke(BinaryPrimitives.ReadUInt32LittleEndian(body))
+                        : null;
+                    if (!notices.Writer.TryWrite(new(type, body, pvpTarget)))
                         throw new InvalidOperationException("The connection's notice queue has already closed.");
                 }
                 else if (!replies.TryWrite((type, body)))
@@ -2334,20 +2358,20 @@ public sealed partial class CombatPipe : IAsyncDisposable
     }
 
     private static bool IsPipeNotice(byte type) => type is LocalHit or LocalDowned or LocalRespawned or Protocol.DeathMarkerEvent
-        or LocalGrave or LocalAction or PvpHitOut or NpcAvatarHit or NpcCombatOut or QuestChangeOut or NpcStreamOut or WorldOut
+        or LocalGrave or LocalAction or PvpHitOut or PvpLifeOut or NpcAvatarHit or NpcCombatOut or QuestChangeOut or NpcStreamOut or WorldOut
         or MenuOut or ActivityOut or ExtraOut or SleepOut or CrimeOut or DefenceOut or DiscardedHit or NpcDropped or NpcTraceDone;
 
-    private async Task ReadNoticesAsync(NamedPipeClientStream pipe, ChannelReader<(byte Type, byte[] Body)> notices)
+    private async Task ReadNoticesAsync(NamedPipeClientStream pipe, ChannelReader<PipeNotice> notices)
     {
-        await foreach (var (type, body) in notices.ReadAllAsync())
+        await foreach (var (type, body, pvpTarget) in notices.ReadAllAsync())
         {
             if (!ReferenceEquals(_pipe, pipe)) return;
-            try { await DeliverNoticeAsync(type, body); }
+            try { await DeliverNoticeAsync(type, body, pvpTarget); }
             catch (Exception ex) { Console.WriteLine($"[combat] notice 0x{type:X2} failed: {ex.GetType().Name}: {ex.Message}"); }
         }
     }
 
-    private async Task DeliverNoticeAsync(byte type, byte[] body)
+    private async Task DeliverNoticeAsync(byte type, byte[] body, GameBridge.PvpHitTarget? pvpTarget)
     {
         if (type == LocalHit && body.Length >= 24)
         {
@@ -2424,13 +2448,17 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 catch (Exception ex) { Console.WriteLine($"[wo121] local action not sent: {ex.Message}"); }
             }
         }
+        else if (type == PvpLifeOut && body.Length == sizeof(ulong))
+        {
+            if (OnPvpLifeChanged is { } h) await h();
+        }
         else if (type == PvpHitOut && body.Length == 14)
         {
             if (OnPvpHit is { } h)
             {
                 try
                 {
-                    await h(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)),
+                    await h(pvpTarget, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)),
                             BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
                             BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12], body[13]);
                 }
@@ -2970,6 +2998,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             if (expected is not null && !ReferenceEquals(_pipe, expected)) return;
             var dropped = _pipe;
             _pipe = null;
+            Volatile.Write(ref _pvpNativeLife, 0);
             dropped?.Dispose();
             // Complete old promises before a new connection can be published.
             OnDropLifecycle(dropped);

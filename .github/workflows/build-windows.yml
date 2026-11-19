@@ -44,12 +44,10 @@ jobs:
 
       - name: Verify drop-in contents
         shell: pwsh
-        # H21 removes the exact missing-saves expectation when the approved saves are packaged.
-        run: >
-          ./tools/Verify-DropIn.ps1
-          -ZipPath release/KingdomComeTogether-DropIn.zip
-          -Agent release/KCDMP/KcdMpClient.exe
-          -ExpectMissingStartSaves
+        # Evaluate the temporary H21 expectation after the package integrity gate.
+        run: |
+          ./tools/Test-DropIn.ps1
+          ./tools/Verify-DropIn.ps1 -ZipPath release/KingdomComeTogether-DropIn.zip -Agent release/KCDMP/KcdMpClient.exe -ExpectMissingStartSaves
 
       - uses: actions/upload-artifact@v4
         with:

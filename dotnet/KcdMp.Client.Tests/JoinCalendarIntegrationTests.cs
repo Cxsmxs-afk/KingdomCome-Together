@@ -16,7 +16,7 @@ public sealed class JoinCalendarIntegrationCollection { }
 public sealed partial class JoinCalendarIntegrationTests
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
-    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts }
+    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts, ChangeCharacter, LocalFresh, CompatibleRestore }
 
     [Theory]
     [InlineData(false)]
@@ -29,6 +29,22 @@ public sealed partial class JoinCalendarIntegrationTests
     [InlineData(true)]
     public Task B_hosts_and_A_joins_from_the_main_menu(bool dropFirstSnapshot) =>
         RunAsync("B", "A", dropFirstSnapshot);
+
+    [Theory]
+    [InlineData("A", "B")]
+    [InlineData("B", "A")]
+    public Task A_newer_local_save_and_choice_during_transfer_do_not_replace_the_requested_character(string host, string guest) =>
+        RunAsync(host, guest, dropFirstSnapshot: false, JoinProbe.ChangeCharacter);
+
+    [Theory]
+    [InlineData("A", "B")]
+    [InlineData("B", "A")]
+    public Task Fresh_uses_the_verified_local_checkpoint_through_the_real_relay(string host, string guest) =>
+        RunAsync(host, guest, dropFirstSnapshot: false, JoinProbe.LocalFresh);
+
+    [Fact]
+    public Task Explicit_restore_loads_the_pair_for_the_verified_host_save_through_the_real_relay() =>
+        RunAsync("A", "B", dropFirstSnapshot: false, JoinProbe.CompatibleRestore);
 
     [Fact]
     public Task A_delayed_calendar_can_arrive_after_five_seconds_while_the_host_still_waits() =>
@@ -109,6 +125,8 @@ public sealed partial class JoinCalendarIntegrationTests
         BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false, bool? relayEofWorldRecovery = null)
     {
         using var fixture = new SaveFixture();
+        string? checkpointPath = probe == JoinProbe.LocalFresh ? fixture.RecordLocalCheckpoint() : null;
+        byte[]? checkpointBytes = checkpointPath is null ? null : File.ReadAllBytes(checkpointPath);
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(boundary is null ? 25 : 40));
         var ct = stop.Token;
         await using var relay = await ReplayRelay.StartAsync(ct);
@@ -160,7 +178,22 @@ public sealed partial class JoinCalendarIntegrationTests
             await WaitAsync(() => Get<bool>(guest, "_hostModeKnown") && Get<Wo206Epochs>(guest, "_w206").World != 0,
                 "guest learned the host world and session mode", ct);
             Assert.Equal(hostPeer.Id, Get<byte>(guest, "_hostModeFrom"));
-            Call(guest, "Wo125OnLauncherChoice", "bring");
+            if (probe == JoinProbe.CompatibleRestore)
+            {
+                await WaitAsync(() => Get<string?>(guest, "_peerTag") is not null, "the authenticated host save identity", ct);
+                var store = Get<HenryStore>(guest, "_henry");
+                byte[] hostSave = fixture.MakeHostSave(1);
+                var footer = WhsSave.VerifyFooter(hostSave);
+                Assert.True(footer.Ok);
+                var own = WhsSave.PartsFromFile(File.ReadAllBytes(fixture.GuestOwnSave), WhsSave.HenryParts.OriginSnapshot);
+                store.Store(Get<string>(guest, "_peerTag"), own, footer.Stored, HenryStore.SourceSnapshot, "fixture pair");
+            }
+            Call(guest, "Wo125OnLauncherChoice", probe switch
+            {
+                JoinProbe.LocalFresh => "fresh:soldier",
+                JoinProbe.CompatibleRestore => "restore",
+                _ => "bring"
+            });
             Assert.True(Property<bool>(guest, "LoadSequenceEnabled"));
             Assert.True(Property<bool>(guest, "WorldSyncEffective"));
             Assert.False(Property<bool>(guest, "WorldSyncReady"));
@@ -174,8 +207,19 @@ public sealed partial class JoinCalendarIntegrationTests
 
             var atOffer = new TaskCompletionSource<(long ClockIn, HostCalendarSample? Bootstrap)>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
-            guestLink.BeforeFirstOffer = () => atOffer.TrySetResult(
-                (Get<long>(guest, "_w200ClockIn"), Get<HostCalendarSample?>(guest, "_hostCalendarBootstrap")));
+            byte[]? original = probe == JoinProbe.ChangeCharacter ? File.ReadAllBytes(fixture.GuestOwnSave) : null;
+            guestLink.BeforeFirstOffer = () =>
+            {
+                if (original is not null)
+                {
+                    var (_, newer) = WhsSaveTests.Pair();
+                    newer.Seed += 2;
+                    newer.SaveTime = 1_790_000_020;
+                    File.WriteAllBytes(Path.Combine(fixture.GuestSaves, "playline0", "save002.whs"), WhsSaveTests.File(newer));
+                    Call(guest, "Wo125OnConsoleChoice", "playline0/save002");
+                }
+                atOffer.TrySetResult((Get<long>(guest, "_w200ClockIn"), Get<HostCalendarSample?>(guest, "_hostCalendarBootstrap")));
+            };
             if (probe == JoinProbe.Scope) guestLink.ProbeCalendarEpoch = Get<Wo206Epochs>(guest, "_w206").World;
             if (boundary is not null)
             {
@@ -262,6 +306,18 @@ public sealed partial class JoinCalendarIntegrationTests
                 "the host finished the join and the guest entered the world", ct);
             await guestGame.JoinedNotification.WaitAsync(ct);
             Assert.True(Get<bool>(guest, "_joinedWorld"));
+            if (original is not null)
+            {
+                Assert.Equal(fixture.GuestOwnSave, Get<GameBridge.HenrySource>(guest, "_joinedSource").FullPath);
+                Assert.Equal(original, File.ReadAllBytes(fixture.GuestOwnSave));
+            }
+            if (checkpointPath is not null)
+            {
+                Assert.Equal(checkpointPath, Get<GameBridge.HenrySource>(guest, "_joinedSource").FullPath);
+                Assert.Equal(checkpointBytes, File.ReadAllBytes(checkpointPath));
+            }
+            if (probe == JoinProbe.CompatibleRestore)
+                Assert.Null(Get<GameBridge.HenrySource?>(guest, "_joinedSource"));
             foreach (var observer in new[] { observerC, observerD }.OfType<ReplayPeer>())
             {
                 var observed = await observer.DrainAsync(ct);
@@ -723,7 +779,7 @@ public sealed partial class JoinCalendarIntegrationTests
 
         public string Root { get; } = Directory.CreateTempSubdirectory("kcdmp-join-calendar-").FullName;
         public string HostSaves => Path.Combine(Root, "host-saves");
-        public string GuestSaves => Path.Combine(Root, "guest-saves");
+        public string GuestSaves => Path.Combine(Root, "guest", "saves");
         public string HostLoadedSave => Path.Combine(HostSaves, "playline0", "save000.whs");
         public string GuestOwnSave => Path.Combine(GuestSaves, "playline0", "save001.whs");
 
@@ -756,6 +812,39 @@ public sealed partial class JoinCalendarIntegrationTests
             var (host, _) = WhsSaveTests.Pair();
             host.SaveTime = 1_790_000_000 + sequence;
             return WhsSaveTests.File(host);
+        }
+
+        public string RecordLocalCheckpoint()
+        {
+            // Engine proof is controlled here. The same production checkpoint store consumes the receipt,
+            // and the playable join still traverses a real TCP relay and the shipped source resolver.
+            const string build = "1.5.5-release_1_5", file = "playline2/autosave002";
+            const string cutPoint = "<Roots><_Barbora><Nodes><_trosecko><Nodes>"
+                + "<_socky><Nodes><_questProgress value='Done'/></Nodes></_socky>"
+                + "<_svatba><Nodes><_questProgress value='Active'/><_objectiveVisual1><Logs><Active/></Logs></_objectiveVisual1></Nodes></_svatba>"
+                + "</Nodes></_trosecko></Nodes></_Barbora></Roots>";
+            const int process = 4321;
+            var started = DateTimeOffset.UtcNow;
+            string profileRoot = Path.GetDirectoryName(GuestSaves)!;
+            string profile = LocalStartCheckpointStore.ProfileId(profileRoot);
+            var store = new LocalStartCheckpointStore(LocalStartCheckpointStore.DefaultRoot(), profile);
+            Assert.True(store.TryReserve(profileRoot, Guid.NewGuid(), process, build, 2, "join", out var reservation, out var why), why);
+            using (reservation)
+            {
+                Assert.True(store.TryAuthorizeNativeStart(reservation!, process, profile, build, "join", started.AddSeconds(1), out why), why);
+                var (_, origin) = WhsSaveTests.Pair();
+                origin.World = cutPoint;
+                origin.Seed = 122;
+                origin.Skills = [(17, 1500), (23, 900), (24, 600), (19, 10)];
+                byte[] bytes = WhsSaveTests.File(origin);
+                string path = Path.Combine(GuestSaves, "playline2", "autosave002.whs");
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllBytes(path, bytes);
+                var receipt = new LocalStartCheckpointStore.EngineSaveReceipt(reservation!.CreationId, process, profile, build, "fighter", file,
+                    Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant(), started.AddSeconds(2));
+                Assert.True(store.TryCapture(reservation, receipt, out _, out why), why);
+                return path;
+            }
         }
 
         private void Override(string name, string value)

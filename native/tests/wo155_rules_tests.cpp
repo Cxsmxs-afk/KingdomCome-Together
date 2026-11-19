@@ -27,6 +27,10 @@ int wo155_rules_tests(int* passed) {
     HCHECK(!recipient.matches({8, 10, 2, false}, 11), "a stopped world cannot apply through the queue");
     HCHECK(!recipient.matches({8, 10, 2, true}, 10), "an equal tick cannot establish which life was read");
     HCHECK(!recipient.matches({8, 10, 2, true}, 9), "relay ingress before a life edge is retired even on a fresh pipe read");
+    const Recipient bound{8, 10, 2, true, 51};
+    HCHECK(!bound.matches({8, 10, 2, true, 52}, 12), "a packet held before the reader cannot use a new native life");
+    HCHECK(!bound.matches({8, 10, 2, true, 0}, 12), "an unavailable native life proves no recipient");
+    HCHECK(bound.matches({8, 10, 2, true, 51}, 12), "the exact proved life is accepted");
 
     struct DamageDouble {
         float hp = 95, st = 85;
