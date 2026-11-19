@@ -45,15 +45,17 @@ public sealed class JoinWorldFiles<T> where T : class
                 _files[path] = _files[path] with { Released = true };
     }
 
-    /// <summary>A stale cleanup cannot delete a newer lease of the same path. Failed deletion keeps sweep protection.</summary>
-    public bool TryDelete(string path, T owner, Func<string, bool>? removeOwned = null)
+    /// <summary>
+    /// A stale cleanup cannot delete a newer lease of the same path. The caller removes the
+    /// verified file. This lease never deletes by path: a refused or failed removal keeps sweep protection.
+    /// </summary>
+    public bool TryDelete(string path, T owner, Func<string, bool> removeOwned)
     {
         lock (_gate)
         {
             string full = Path.GetFullPath(path);
             if (!_files.TryGetValue(full, out var e) || !ReferenceEquals(e.Owner, owner) || !e.Released) return false;
-            if (removeOwned is null) File.Delete(full);
-            else if (!removeOwned(full)) return false;
+            if (!removeOwned(full)) return false;
             _files.Remove(full);
             return true;
         }
