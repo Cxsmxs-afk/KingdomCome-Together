@@ -51,32 +51,33 @@ public sealed class RelayFixture : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        TcpPort = FreePort();
-        int httpPort = FreePort();
-        _app = Program.CreateApp(new[]
+        _app = await RelayPorts.BindAsync(async (tcp, http) =>
         {
-            "--port", TcpPort.ToString(),
-            "--Urls", $"http://127.0.0.1:{httpPort}",
-            // Keep the relay's rolling file sink out of the test tree.
-            "--Serilog:WriteTo:1:Name", "Console",
-        });
-        await _app.StartAsync();
-
-        // TcpSocketService binds inside its own background task; wait for it.
-        var deadline = DateTime.UtcNow.AddSeconds(10);
-        while (true)
-        {
+            TcpPort = tcp;
+            var app = Program.CreateApp(new[]
+            {
+                "--port", tcp.ToString(),
+                "--Urls", $"http://127.0.0.1:{http}",
+                // Keep the relay's rolling file sink out of the test tree.
+                "--Serilog:WriteTo:1:Name", "Console",
+            });
             try
             {
-                using var probe = new TcpClient();
-                await probe.ConnectAsync(IPAddress.Loopback, TcpPort);
-                return;
+                await app.StartAsync();
+                return app;
             }
-            catch (SocketException) when (DateTime.UtcNow < deadline)
+            catch
             {
-                await Task.Delay(50);
+                await app.DisposeAsync();
+                throw;
             }
-        }
+        }, StopAsync);
+    }
+
+    private static async Task StopAsync(WebApplication app)
+    {
+        try { await app.StopAsync(); }
+        finally { await app.DisposeAsync(); }
     }
 
     public async Task DisposeAsync()
@@ -86,12 +87,86 @@ public sealed class RelayFixture : IAsyncLifetime
         await _app.DisposeAsync();
     }
 
+}
+
+/// <summary>
+/// One process-wide bind for every in-process relay. <see cref="TcpListener.Start"/>
+/// sets <c>SO_REUSEADDR</c>, so two fixtures that sample the same free port can both
+/// bind it. A later handshake then reads EOF when the other listener closes.
+/// PR 44447771182 failed all five <c>P5DeathMarkerRelayTests</c> that way on the same
+/// tree that push run 44447734044 passed. The gate covers port selection through the
+/// first accepted connection; an address conflict retries, any other failure stops
+/// the app it started.
+/// </summary>
+internal static class RelayPorts
+{
+    private static readonly SemaphoreSlim Gate = new(1, 1);
+
+    internal static async Task<T> BindAsync<T>(Func<int, int, Task<T>> start, Func<T, Task> stop) where T : class
+    {
+        await Gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            Exception? last = null;
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                int tcp = FreePort();
+                int http = FreePort();
+                T? running = null;
+                try
+                {
+                    running = await start(tcp, http).ConfigureAwait(false);
+                    await WaitForAcceptAsync(tcp).ConfigureAwait(false);
+                    return running;
+                }
+                catch (Exception ex)
+                {
+                    if (running is not null)
+                    {
+                        try { await stop(running).ConfigureAwait(false); }
+                        catch { /* the next attempt still has to be able to bind */ }
+                    }
+                    if (attempt == 7 || !IsAddressInUse(ex)) throw;
+                    last = ex;
+                }
+            }
+            throw new IOException("the relay did not bind a private loopback port", last);
+        }
+        finally { Gate.Release(); }
+    }
+
+    private static async Task WaitForAcceptAsync(int port)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (true)
+        {
+            try
+            {
+                using var probe = new TcpClient();
+                await probe.ConnectAsync(IPAddress.Loopback, port).ConfigureAwait(false);
+                return;
+            }
+            catch (SocketException) when (DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(50).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static bool IsAddressInUse(Exception ex)
+    {
+        for (Exception? cursor = ex; cursor is not null; cursor = cursor.InnerException)
+            if (cursor is SocketException socket && socket.SocketErrorCode == SocketError.AddressAlreadyInUse)
+                return true;
+        return false;
+    }
+
     private static int FreePort()
     {
-        var l = new TcpListener(IPAddress.Loopback, 0);
-        l.Start();
-        int port = ((IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
         return port;
     }
 }
