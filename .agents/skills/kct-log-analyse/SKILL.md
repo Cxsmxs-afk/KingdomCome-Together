@@ -37,6 +37,7 @@ Ziel: Jede Aussage über den Spieltest stützt sich auf **Logzeile + Datei:Zeile
 | Zeile | Bedeutung | Code |
 |---|---|---|
 | `setup: Ready! Host and Join unlocked` | Setup fertig | `Home.Wo150.cs:97` |
+| `MP-LAUNCH session role selected (host|join) source=… gamePid=… menuSeq=…` | Der Launcher hat Plan und passendes Gate übernommen. Bei einem Wechsel aus dem Spiel dieselbe Sequenz in `WO159-MENU role receipt seq=… target=… accepted=true` suchen. Anschließend den Ladebefehl und Host-Connect oder die beim Agent eingereichte Join-Wahl belegen. | `KCDMP_launcher/Pages/Home.H22.cs`, `tools/rig/scen_session_role.py` |
 | `MP-W159 start saves installed: none\|soldier, adviser, scout` | Start-Saves vorhanden? | `Home.Wo159.cs:87` |
 | `MP-JOIN host: join 0x… world=playlineN/… verify=ok` | Host hat den Save für das Angebot verifiziert. Den weiteren Versand separat prüfen. | `dotnet/KcdMp.Client/GameBridge.Wo123.cs:525` |
 | `MP-JOIN host: join 0x…: native calendar unreadable -- offer not sent` | Host-Uhr nicht lesbar | `GameBridge.Wo123.cs:520` |

@@ -217,13 +217,13 @@ namespace KCDMP_launcher.Pages
         {
             showMessage = false;
             launchAnywayAvailable = false;
-            if (lastLaunchServer is not { } server) return;
+            if (lastLaunchPlan is not { } plan) return;
             Log.Warning("MP-LAUNCH launch anyway: the player started the game past the mod-file check");
             skipModFileCheckOnce = true;
-            await LaunchGame(server);
+            await LaunchGame(plan);
         }
 
-        private ServerInfo? lastLaunchServer;
+        private SessionLaunchPlan? lastLaunchPlan;
         private bool skipModFileCheckOnce;
 
         // ------------------------------------------------------------ the Visual C++ 2013 runtime (2.3)

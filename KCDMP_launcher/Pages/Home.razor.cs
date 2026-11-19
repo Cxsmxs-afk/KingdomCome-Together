@@ -20,6 +20,8 @@ using Microsoft.AspNetCore.Components;
 using Microsoft.JSInterop;
 using Serilog;
 using KcdMp.Wire;
+using KcdMp.Setup;
+using SessionRole = KCDMP_launcher.Models.SessionRole;
 
 
 // TO DO
@@ -92,7 +94,6 @@ namespace KCDMP_launcher.Pages
         private enum LaunchStage { Idle, WaitingForConnect, Injecting, Verifying, Connected, Failed }
         private LaunchStage launchStage = LaunchStage.Idle;
         private Process? pendingGameProcess = null;
-        private ServerInfo? pendingServer = null;
         private string? pendingDllPath = null;
         private string? pendingGameExe = null;   // WO-157
         private string launchStatusMessage = "";
@@ -446,10 +447,24 @@ namespace KCDMP_launcher.Pages
         /// The game must be the Modding Tools build. That is checked here
         /// rather than left to fail confusingly later — see AppSettings.GamePath.
         /// </summary>
-        private async Task LaunchGame(ServerInfo server)
+        private async Task LaunchGame(SessionLaunchPlan plan)
+        {
+            if (launchPreparationBusy || roleSwitchBusy || roleGame is not null)
+            {
+                Log.Information("MP-LAUNCH launch refused reason=game-already-tracked");
+                UiService.ShowError("Close the current game before launching another session.");
+                return;
+            }
+            launchPreparationBusy = true;
+            try { await LaunchGameCoreAsync(plan); }
+            finally { launchPreparationBusy = false; }
+        }
+
+        private async Task LaunchGameCoreAsync(SessionLaunchPlan plan)
         {
             if (!await EnsureSetupReadyAsync()) return;   // WO-150: Host and Join unlock at Ready!
-            lastLaunchServer = server;   // WO-157: LAUNCH ANYWAY repeats this launch
+            lastLaunchPlan = plan;   // WO-157: LAUNCH ANYWAY repeats the selected role and destination
+            ServerInfo server = plan.Server;
 
             if (launchStage != LaunchStage.Idle && launchStage != LaunchStage.Failed)
             {
@@ -494,10 +509,10 @@ namespace KCDMP_launcher.Pages
             // A failure is logged and shown; the game starts anyway.
             await Wo175BackupBeforeSessionAsync();
 
-            // WO-159: the first-run pages (read only), the host's start save staged, the player's worlds listed
-            if (!await Wo159BeforeLaunchAsync(hostedRelayProcess != null && !hostedRelayProcess.HasExited))
+            if (!await Wo159ConsentReadyAsync())
                 return;
 
+            bool menuPreparationStarted = false, gameStarted = false;
             try
             {
                 var gameStartInfo = new ProcessStartInfo
@@ -522,6 +537,9 @@ namespace KCDMP_launcher.Pages
                     ShowBlocked(keysBlock);
                     return;
                 }
+                // The engine indexes saves at startup. Prepare after the earlier launch gates have passed.
+                menuPreparationStarted = settings.MenuTakeover;
+                await Wo159PrepareMenuAsync(agentPath, menuPreparationStarted);
                 var gameStartLocal = DateTime.Now;   // WO-154: the gate reads only this game's kcd.log
                 var gameProcess = StartChecked(gameStartInfo);
                 if (gameProcess == null)
@@ -529,15 +547,21 @@ namespace KCDMP_launcher.Pages
                     UiService.ShowError("The game process could not be started.");
                     return;
                 }
+                gameStarted = true;
 
                 launchStage = LaunchStage.WaitingForConnect;
                 launchStatusMessage = "Waiting for the game to start...";
                 // WO-154: CONNECT waits until it can work (the host's world, the joiner's host), with the reason shown.
-                StartConnectGate(hostedRelayProcess != null && !hostedRelayProcess.HasExited, server, gameStartLocal);
-                Wo159StartDriver(gameProcess, hostedRelayProcess != null && !hostedRelayProcess.HasExited, gameStartLocal);   // WO-159
+                var menuScope = roleGame = new MenuGameScope(gameProcess, gameStartLocal, gameStartInfo.WorkingDirectory,
+                    GameLocator.InstallRootOf(gameStartInfo.FileName) ?? gameStartInfo.WorkingDirectory);
+                pendingGameProcess = gameProcess;
+                SetSessionPlan(menuScope, plan, "launcher");
+                Wo159StartDriver(menuScope, menuPreparationStarted, agentPath);
                 StateHasChanged();
 
-                if (!await WaitForInjectableAsync(gameProcess, settings.InjectDelaySeconds))
+                bool ready = await WaitForInjectableAsync(gameProcess, settings.InjectDelaySeconds);
+                if (!ReferenceEquals(pendingGameProcess, gameProcess)) return;
+                if (!ready)
                 {
                     UiService.ShowError(gameProcess.HasExited
                         ? "Game process exited unexpectedly before injection."
@@ -546,17 +570,11 @@ namespace KCDMP_launcher.Pages
                     return;
                 }
 
-                pendingGameProcess = gameProcess;
-                pendingServer = server;
                 pendingDllPath = dllFullPath;
                 pendingGameExe = settings.GamePath;   // WO-157: the load checks it is this game
                 // WO-140: the joiner's flow is the main menu (a joiner who loads his own save plays alone,
                 // in a separate world -- the field trap); only the host loads a save first.
-                bool hostingNow = hostedRelayProcess != null && !hostedRelayProcess.HasExited;
-                launchStatusMessage = hostingNow
-                    ? (w159Takeover ? "Press Start Game on the game's main menu. The launcher connects by itself once your world has loaded."
-                                    : "Load into your save, then click CONNECT once you can see and move your character.")
-                    : (w159Takeover ? "Press Join Game on the game's main menu. You join as soon as your host is ready." : JoinerReadyText);
+                launchStatusMessage = RoleLaunchStatus(plan.Hosting);
                 StateHasChanged();
             }
             catch (LaunchBlockedException lb)
@@ -571,6 +589,10 @@ namespace KCDMP_launcher.Pages
                 Log.Error(ex, "Launch failed");
                 UiService.ShowError("The game couldn't be started. Check the game path in Settings, then try again.");
                 ResetLaunchState();
+            }
+            finally
+            {
+                if (menuPreparationStarted && !gameStarted) await Wo159CleanupPreparedMenuAsync(agentPath);
             }
         }
 
@@ -592,12 +614,18 @@ namespace KCDMP_launcher.Pages
         /// </summary>
         private async Task ConnectToGame()
         {
-            if (pendingGameProcess == null || pendingServer == null || pendingDllPath == null)
+            if (launchStage != LaunchStage.WaitingForConnect || roleSwitchBusy || roleGame?.ActionInProgress == true)
             {
+                Log.Information("MP-LAUNCH CONNECT not taken: action already active");
+                return;
+            }
+            if (pendingGameProcess is not { } game || pendingPlan is not { } plan || pendingDllPath is not { } dllPath)
+            {
+                Log.Information("MP-LAUNCH CONNECT not taken: no prepared session");
                 return;
             }
 
-            if (pendingGameProcess.HasExited)
+            if (game.HasExited)
             {
                 UiService.ShowError("The game process has already exited.");
                 ResetLaunchState();
@@ -610,9 +638,14 @@ namespace KCDMP_launcher.Pages
                 Log.Information("MP-LAUNCH CONNECT not taken: {Reason}", connectGateReason);
                 return;
             }
+            if (plan.Hosting && hostedRelayProcess is not { HasExited: false })
+            {
+                Log.Warning("MP-LAUNCH CONNECT not taken: selected host relay is unavailable");
+                UiService.ShowError("Start the local relay from Host Game before connecting.");
+                return;
+            }
             StopConnectGate();
 
-            string agentPath = ResolveAgainstLauncher(settings.AgentPath);
             string waitingText = launchStatusMessage;   // WO-154: back to it when Windows refuses a start
 
             try
@@ -623,7 +656,20 @@ namespace KCDMP_launcher.Pages
 
                 // WO-157: the launcher loads the DLL itself (no KCDMP_LauncherInjector.exe for Windows to
                 // remove or refuse): the same steps and checks, failing closed with a plain message.
-                var inject = await InjectFromLauncherAsync(pendingGameProcess.Id, pendingDllPath);
+                if (!plan.Hosting && !await Wo159DiscardStartSaveForJoinAsync())
+                {
+                    if (roleGame is { } scope && RoleSessionCurrent(scope) && ReferenceEquals(pendingPlan, plan))
+                    {
+                        launchStage = LaunchStage.WaitingForConnect;
+                        launchStatusMessage = waitingText;
+                        StartConnectGate(plan, scope);
+                        UiService.ShowError("The staged start save could not be released. Close the game and check the launcher log before joining.");
+                    }
+                    return;
+                }
+                if (!ReferenceEquals(pendingGameProcess, game) || game.HasExited) return;
+                var inject = await InjectFromLauncherAsync(game.Id, dllPath);
+                if (!ReferenceEquals(pendingGameProcess, game) || game.HasExited) return;
                 if (!inject.Ok)
                 {
                     UiService.ShowError(inject.Message);
@@ -635,7 +681,8 @@ namespace KCDMP_launcher.Pages
                 launchStatusMessage = "Verifying the plugin actually attached...";
                 StateHasChanged();
 
-                var verdict = await VerifyInjectionAsync(pendingDllPath, pendingGameProcess.Id);
+                var verdict = await VerifyInjectionAsync(dllPath, game.Id);
+                if (!ReferenceEquals(pendingGameProcess, game) || game.HasExited) return;
                 if (!verdict)
                 {
                     UiService.ShowError(
@@ -649,16 +696,9 @@ namespace KCDMP_launcher.Pages
                     return;
                 }
 
-                // WO-50: --hosting is purely cosmetic (Discord Rich Presence
-                // text) -- the agent otherwise treats hosting and joining
-                // identically. hostedRelayProcess is set by OpenHostModal
-                // before LaunchAsHost ever reaches here, so its liveness at
-                // this point is a reliable "this session is hosting" signal;
-                // ServerHost/Ip alone is not, since a LAN host address looks
-                // identical to a joiner pointed at the same address.
-                StartAgent(pendingServer);   // WO-127: also used by the Steam -> address fallback
-
+                StartAgent(plan, game);
                 launchStage = LaunchStage.Connected;
+                showConnectedPanel = true;
                 launchStatusMessage = "The game is ready. The line at the bottom of this window shows the connection; you can close this.";
                 StateHasChanged();
             }
@@ -670,8 +710,8 @@ namespace KCDMP_launcher.Pages
                 ShowBlocked(lb.Block);
                 launchStage = LaunchStage.WaitingForConnect;
                 launchStatusMessage = waitingText;
-                connectGateOpen = true;   // the gate was passed already
-                connectGateReason = "";
+                if (roleGame is { } scope && RoleSessionCurrent(scope) && ReferenceEquals(pendingPlan, plan))
+                    StartConnectGate(plan, scope);
                 StateHasChanged();
             }
             catch (Exception ex)
@@ -828,8 +868,11 @@ namespace KCDMP_launcher.Pages
         {
             launchStage = LaunchStage.Idle;
             pendingGameProcess = null;
-            pendingServer = null;
+            pendingPlan = null;
             pendingDllPath = null;
+            showConnectedPanel = false;
+            hidePendingPanel = false;
+            showJoinRole = false;
             launchStatusMessage = "";
             versionPollCts?.Cancel();
             versionPollCts = null;
@@ -840,7 +883,13 @@ namespace KCDMP_launcher.Pages
             StateHasChanged();
         }
 
-        private void CancelPendingConnect() => ResetLaunchState();
+        private bool PendingConnectCanBeCancelled => launchStage == LaunchStage.WaitingForConnect
+            && !w159Takeover && !roleSwitchBusy && roleGame is { ActionInProgress: false, LoadIssued: false };
+
+        private void CancelPendingConnect()
+        {
+            if (PendingConnectCanBeCancelled) ResetLaunchState();
+        }
 
         // WO-27: kill any agent this launcher already started, plus a
         // by-name sweep for any other KcdMpClient.exe still running (e.g.
@@ -887,26 +936,45 @@ namespace KCDMP_launcher.Pages
         // of what address a friend uses to reach it).
         private async Task OpenHostModal()
         {
-            if (!await EnsureSetupReadyAsync()) return;   // WO-150: before a relay is started
-
-            hostErrorMessage = "";
-            hostLanAddresses = NetService.GetLocalIPv4Addresses();
-
-            if (hostedRelayProcess == null || hostedRelayProcess.HasExited)
+            if (HostSettingsLocked)
             {
-                string relayPath = ResolveAgainstLauncher(settings.RelayPath);
-                // WO-154: gone or empty (a quarantine looks like this) -- one plain message, no path.
-                if (BlockedBeforeLaunch("", relayPath, Path.ChangeExtension(relayPath, ".dll")))
-                    return;
-                // WO-154: the ports may be held by this install's own relay (a launcher closed with the
-                // window's X leaves it running): used again, or replaced. Another program's: told, untouched.
-                bool startOurs = !settings.RelayReuse || await ApplyRelayDecisionAsync(await DecideRelayAsync(relayPath));
-                if (startOurs && !await StartRelayAsync(relayPath)) return;   // Windows refused it: told
+                UiService.ShowError(RoleMenuText);
+                return;
             }
+            roleSwitchBusy = true;
+            try
+            {
+                if (!await EnsureSetupReadyAsync()) return;   // WO-150: before a relay is started
+                hostLanAddresses = NetService.GetLocalIPv4Addresses();
+                if (!await EnsureHostedRelayAsync() && hostErrorMessage.Length == 0) return;
+                showHostInfo = true;
+                StartHostStatusPoll();
+            }
+            finally
+            {
+                roleSwitchBusy = false;
+                StateHasChanged();
+            }
+        }
 
-            showHostInfo = true;
-            StartHostStatusPoll();   // WO-127: Steam state, the code, refused joiner versions
-            StateHasChanged();
+        private async Task<bool> EnsureHostedRelayAsync()
+        {
+            if (hostRelayPreparation is { } pending) return await pending;
+            try { return await (hostRelayPreparation = PrepareHostedRelayAsync()); }
+            finally { hostRelayPreparation = null; }
+        }
+
+        private Task<bool>? hostRelayPreparation;
+
+        private async Task<bool> PrepareHostedRelayAsync()
+        {
+            hostErrorMessage = "";
+            if (hostedRelayProcess is { HasExited: false }) return true;
+            string relayPath = ResolveAgainstLauncher(settings.RelayPath);
+            if (BlockedBeforeLaunch("", relayPath, Path.ChangeExtension(relayPath, ".dll"))) return false;
+            bool startOurs = !settings.RelayReuse || await ApplyRelayDecisionAsync(await DecideRelayAsync(relayPath));
+            if (startOurs && !await StartRelayAsync(relayPath)) return false;
+            return hostedRelayProcess is { HasExited: false };
         }
 
         /// <summary>Starts this install's relay. False only when Windows refused it (the player has been told).</summary>
@@ -952,15 +1020,16 @@ namespace KCDMP_launcher.Pages
 
         private Task LaunchAsHost()
         {
+            if (!showHostInfo || HostSettingsLocked) return Task.CompletedTask;
             showHostInfo = false;
-            var hostServer = new ServerInfo
-            {
-                Name = "(Hosting)",
-                Ip = "127.0.0.1",
-                Port = settings.HostPort,
-                Ping = 0
-            };
-            return LaunchGame(hostServer);
+            return SelectLauncherRoleAsync(SessionRole.Host, LocalHostTarget());
+        }
+
+        private void StopHostingFromModal()
+        {
+            if (!showHostInfo || HostSettingsLocked) return;
+            StopHostedRelay();
+            showHostInfo = false;
         }
 
         private void StopHostedRelay()

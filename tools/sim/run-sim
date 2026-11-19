@@ -73,6 +73,7 @@ EOF
     python3 tools/Test-NoInputTooling.py tools/rig/Solo-Abend.ps1 tools/rig/scen_solo_abend.py
     python3 tools/Test-NoScreenshots.py tools/rig/Solo-Abend.ps1 tools/rig/scen_solo_abend.py
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_guided_*.py'
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_session_role.py'
     pwsh -NoLogo -NoProfile -NonInteractive -File tools/Test-TestlaufSynthetic.ps1
     guided_sources=(kdcmp/Data/Scripts/Startup/kdcmp.lua
         dotnet/KcdMp.Client/GuidedRun.cs dotnet/KcdMp.Client/GameBridge.GuidedRun.cs

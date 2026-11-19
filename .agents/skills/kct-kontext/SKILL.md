@@ -5,7 +5,7 @@ description: "Projektkarte für „Kingdom Come: Together“ (KCD2-Koop-Mod). Zu
 
 # kct-kontext — Was das Projekt ist, wie es gebaut ist, wo was liegt
 
-Stand: geprüft auf `codex/self-check` seit `6f66913` mit den zusätzlichen Frame-Test-Korrekturen aus Draft #49, Version `0.65.2` (`VERSION`), Protokoll `Protocol.Version = 10` (`dotnet/KcdMp.Protocol/Protocol.cs:800`). **Vor jeder Nutzung am aktuellen Tip nachprüfen.** Warum: Die Kette ist gestapelt, Zeilen wandern.
+Stand: H22 auf dem grünen H0-Commit `a60c9a7`, Version `0.65.2` (`VERSION`), Protokoll `Protocol.Version = 10` (`dotnet/KcdMp.Protocol/Protocol.cs:800`). **Vor jeder Nutzung am aktuellen Tip nachprüfen.** Warum: Die Kette ist gestapelt, Zeilen wandern.
 
 ## So nutzt du diese Karte
 1. Thema in der Tabelle „Thema → lesen“ suchen und **alle** genannten Dateien gründlich lesen, inklusive Aufrufer und Tests. Warum: passgenauer Code entsteht nur aus dem echten Kontext. Die Karte zeigt, wo du anfangen musst, sie ersetzt das Lesen nicht.
@@ -39,7 +39,7 @@ Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op 
 
 ## Hauptflüsse
 **Join (Joiner im Hauptmenü → gemeinsame Welt)**
-1. Launcher: Die Rolle pro Sitzung (`hosting`) ergibt sich aktuell daraus, ob der lokale Relay-Prozess läuft (`Home.razor.cs:536–537`). Der Direct-Test führt eine Diagnose aus (`KCDMP_launcher/Pages/Home.Wo127.cs:238–251`). `MenuTakeoverRule.ModelCall` schreibt `role=host|join` (`MenuTakeover.cs:109`). Lua graut den anderen Knopf (`kdcmp.lua:30422–30423`, Continue/NewGame/LoadGame `:30424–30426`) → **H22**.
+1. Launcher: `SessionLaunchPlan` hält gewählte Rolle und Ziel. Der Direct-Test liefert eine Diagnose und kann ein Join-Ziel merken. Erst die Launcher-Wahl oder bestätigte Menüanfrage setzt den Plan und das passende Gate. Der Menütreiber erzeugt daraus `role=host|join` über `MenuTakeoverRule.ModelCall`. Bei einem Wechsel im Hauptmenü wartet Lua auf die konkrete `roleAck`; der Treiber prüft den aktuellen Plan beim Ausführen von Laden oder Join erneut. Das gleiche Host-Bit steuert `--hosting`. [Rollenpfad](../../../docs/ABNAHME-H22.md)
 2. Host: Join-Hold, dann gefrorener Kalender **vor** dem Angebot: `SendHostCalendarAsync(j.Joiner, frozen: true, joinId)` (`GameBridge.Wo123.cs:517`). Bei Fehlschlag wird kein Angebot gesendet (`:520`).
 3. Übertragung: Kalender als `W164Down` mit Kind 18 = `Protocol.W164Clock` (`ProtocolWo200.cs:42`).
 4. Joiner-Reader (`GameBridge.cs:4872–4881`): Bei aktiver Ladesequenz markiert `LoadSequenceWorldFrame` die Kategorie `LoadScoped`, einschließlich `W164Clock` (`GameBridge.LoadSequence.cs:233–234`). Danach folgen `LoadSequenceFrameCurrent`, `T3TryDeferSideChannel` und für verbleibende Frames `if (!WorldSyncReady && inFrame.LoadScoped) continue` (`GameBridge.cs:4881`). Der Helfer verarbeitet erkannte Uhrpakete bereits vor diesem allgemeinen Gate. Er prüft Weltstempel und Absender und ruft erst dann `CacheHostCalendar` auf (`GameBridge.T3SideChannels.cs:43–51`). Welche Abzweigung im Live-Test die Uhr verworfen hat, muss H20 über den echten Reader belegen.
@@ -61,7 +61,7 @@ Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op 
 ## Thema → lesen (und warum)
 | Thema | Gründlich lesen | Warum |
 |---|---|---|
-| Rolle/Menü | `KCDMP_launcher/Pages/Home.Wo154.cs`, `KCDMP_launcher/Pages/Home.Wo159.cs`, `KCDMP_launcher/Models/MenuTakeover.cs`, `kdcmp.lua` um `MP_StartGame`, Tests `Wo154MenuTests.cs`, `Wo159MenuTests.cs` und `tools/Test-WO159Synthetic.lua` | Die Rolle wird im Launcher festgelegt und im Lua-Menü durchgesetzt |
+| Rolle/Menü | `KCDMP_launcher/Pages/Home.H22.cs`, `KCDMP_launcher/Pages/Home.Wo154.cs`, `KCDMP_launcher/Pages/Home.Wo159.cs`, `KCDMP_launcher/Models/LauncherSessionRole.cs`, `KCDMP_launcher/Models/MenuTakeover.cs`, `kdcmp.lua` um `MP_StartGame`, `dotnet/KcdMp.Client.Tests/H22LauncherSessionRoleTests.cs` und `tools/Test-WO159Synthetic.lua` | Erfolgreiche Auswahl, Gate, Menübestätigung und ausgeführte Aktion für beide Rollen |
 | Join/Uhr | `GameBridge.Wo123.cs` (Host), `GameBridge.Wo124.cs` (Joiner), `GameBridge.HostCalendar.cs`, `GameBridge.T3SideChannels.cs`, `GameBridge.cs` Reader um `:4860–4890`, Tests `HostCalendarTests`, `T3SideChannelsTests`, `Wo123Tests`, `Wo124Tests`, `T4BotRelayTests` | Gemeinsam prüfen, welche Reader-, Scope- und Cache-Entscheidung den Bootstrap erreicht |
 | Slots | `JoinWorldFiles.cs`, `GameBridge.Wo124.cs` (`AbortJoinerJoinAsync`, `RemovePlacedWorldAsync`), `Wo175Coop.cs`, `JoinWorldFilesTests` | Freigabe- und Aufräumlogik |
 | Laden/WorldSync | `WorldLoadSequence.cs`, `GameBridge.LoadSequence.cs`, `GameBridge.WorldSync.cs`, `CombatPipe.LoadSequence.cs`, native `load_sequence*` | Phasen-Gates entscheiden, welche Pakete gelten |
@@ -74,7 +74,7 @@ Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op 
 2. **LoadScoped-Seitenkanäle in Phase Menu:** Alles, was vor dem Laden gebraucht wird (Uhr-Snapshot), darf nicht am WorldSync-Gate hängen.
 3. **Slot-Leck:** Ein Abbruch vor dem Laden gibt die Welt nicht frei, der Retry nimmt die nächste Playline.
 4. **Fehlende Start-Saves:** Der Build war grün, aber `start saves installed: none`.
-5. **Rollen-Lock:** Der Launcher leitet beim Start die Rolle aus dem Relay ab (`Home.razor.cs:536–537`). Das gestartete Menü graut die jeweils andere Rolle aus (`kdcmp.lua:30422–30423`). Der Direct-Test schreibt diese Rolle nicht.
+5. **Rollen-Lock vor H22:** Der Launcher leitete die Startrolle aus dem Relay ab und graute im Menü die Gegenrolle aus. H22 wählt die Rolle pro Versuch und bestätigt Änderungen im Hauptmenü vor Lade- oder Join-Aktionen. Ein weiterlaufendes lokales Relay ändert die gewählte Join-Rolle nicht. Der Rollentausch auf zwei PCs bleibt offen.
 6. **Tests prüften Teile, nicht den Ablauf:** `HostCalendarTests` (Parse), `T3SideChannelsTests` (Decode/Queue), `T4BotRelayTests` (Relay). Keiner fuhr Host↔Joiner durch den echten Reader im Menü.
 7. **Zeitabhängige Tests:** Die Testuhr `dotnet/KcdMp.Client.Tests/ManualFrameTime.cs` steuert die Frist für zwei HostAuthority-Tests, den abgeschlossenen Processor-Frame sowie die Prüfungen auf späte HTTP-Schreibversuche und Wiederaufnahme nach einem Timeout. Die Tests lösen die Frist an einem belegten Wartepunkt aus. Der Test für regulären Abschluss lässt den Frame mit kontrollierter Uhr fertiglaufen. Bei weiteren Timing-Fehlern den Ablauf reproduzieren und die Assertions erhalten. [Nachweis](../../../docs/H0-SELBSTKONTROLLE.md)
 

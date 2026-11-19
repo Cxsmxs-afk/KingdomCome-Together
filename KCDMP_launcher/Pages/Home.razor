@@ -38,7 +38,7 @@
                     CurrentSortColumn="@currentSortColumn"
                     IsAscending="@isAscending"
                     OnSort="@SortTable"
-                    OnLaunch="@LaunchGame"
+                    OnLaunch="@LaunchJoinGame"
                     OnTest="@TestServerConnectionAsync"
                     OnToggleFavorite="@ToggleFavorite"
                     OnAddClick="@OpenAddModal"
@@ -62,6 +62,8 @@
             OnAbout="@(() => showAbout = true)"
             OnCheckSetup="@OpenSetupChecklist"
             OnRestoreSaves="@(() => showRestoreSaves = true)"
+            ShowPendingConnection="@(launchStage == LaunchStage.WaitingForConnect && hidePendingPanel)"
+            OnShowPendingConnection="@(() => hidePendingPanel = false)"
 />
 
 @* WO-150: the first-run checklist (and "Check setup"); hidden whenever setup is complete *@
@@ -73,7 +75,8 @@
                      OnCheckAgain="@CheckSetupAgainAsync"
                      OnClose="@CloseSetupChecklist" />
 
-@if (launchStage != LaunchStage.Idle)
+@if (launchStage != LaunchStage.Idle && (launchStage != LaunchStage.Connected || showConnectedPanel)
+    && (launchStage != LaunchStage.WaitingForConnect || !hidePendingPanel))
 {
     <div class="modal-overlay">
         <div class="modal-box" @onclick:stopPropagation="true" style="max-width: 480px;">
@@ -91,6 +94,14 @@
                     })
                 </div>
                 <p style="margin: 15px 0;">@launchStatusMessage</p>
+                @if (launchStage == LaunchStage.WaitingForConnect && pendingPlan is { } plan)
+                {
+                    <div class="kcd-hint">@(plan.Hosting ? "Host Game" : "Join Game")</div>
+                    <div class="modal-actions">
+                        <button class="kcd-btn" disabled="@roleSwitchBusy" @onclick="SelectHostForPendingGameAsync">HOST GAME</button>
+                        <button class="kcd-btn" disabled="@roleSwitchBusy" @onclick="OpenJoinRole">JOIN GAME</button>
+                    </div>
+                }
                 @if (launchStage == LaunchStage.WaitingForConnect && !ConnectEnabled && !string.IsNullOrEmpty(connectGateReason))
                 {
                     @* WO-154: why CONNECT waits, in plain words (Models/ConnectGate.cs) *@
@@ -106,12 +117,45 @@
                     @if (launchStage == LaunchStage.WaitingForConnect)
                     {
                         <button class="kcd-btn primary" disabled="@(!ConnectEnabled)" @onclick="ConnectToGame">CONNECT</button>
-                        <button class="kcd-btn" @onclick="CancelPendingConnect">CANCEL</button>
+                        @if (w159Takeover)
+                        {
+                            <button class="kcd-btn" @onclick="@(() => hidePendingPanel = true)">HIDE</button>
+                        }
+                        else
+                        {
+                            <button class="kcd-btn" disabled="@(!PendingConnectCanBeCancelled)" @onclick="CancelPendingConnect">CANCEL</button>
+                        }
                     }
                     else if (launchStage == LaunchStage.Connected || launchStage == LaunchStage.Failed)
                     {
-                        <button class="kcd-btn primary" @onclick="ResetLaunchState">CLOSE</button>
+                        <button class="kcd-btn primary" @onclick="CloseLaunchPanel">CLOSE</button>
                     }
+                </div>
+            </div>
+            <div class="modal-frame-bottom modal-frame-bg"></div>
+        </div>
+    </div>
+}
+
+@if (showJoinRole)
+{
+    <div class="modal-overlay">
+        <div class="modal-box" @onclick:stopPropagation="true">
+            <div class="modal-frame-top modal-frame-bg"></div>
+            <div class="modal-content">
+                <div class="modal-title">JOIN A GAME</div>
+                <div class="kcd-input-group">
+                    <label class="kcd-label" for="join-role-address">Host address</label>
+                    <input id="join-role-address" class="kcd-input" @bind="joinRoleAddress" @bind:event="oninput" placeholder="host.example.net:7778" />
+                </div>
+                @if (!string.IsNullOrEmpty(joinRoleError))
+                {
+                    <div class="kcd-hint">@joinRoleError</div>
+                }
+                <div class="modal-actions">
+                    <button class="kcd-btn primary" @onclick="ConfirmJoinRoleAsync">JOIN BY ADDRESS</button>
+                    <button class="kcd-btn" @onclick="JoinRoleThroughSteamAsync">JOIN THROUGH STEAM</button>
+                    <button class="kcd-btn" @onclick="@(() => showJoinRole = false)">CANCEL</button>
                 </div>
             </div>
             <div class="modal-frame-bottom modal-frame-bg"></div>
@@ -125,7 +169,7 @@
                 ErrorMessage="@hostErrorMessage"
                 RelayRunning="@(hostedRelayProcess != null && !hostedRelayProcess.HasExited)"
                 AllowSteam="@settings.HostAllowSteam"
-                SteamToggleLocked="@(launchStage != LaunchStage.Idle && launchStage != LaunchStage.Failed)"
+                HostSettingsLocked="@HostSettingsLocked"
                 OnAllowSteamChanged="@SetHostAllowSteamAsync"
                 SteamState="@hostSteamState"
                 SteamMessage="@hostSteamMessage"
@@ -133,7 +177,7 @@
                 SteamAppName="@hostSteamAppName"
                 RefusedNotice="@hostRefusedNotice"
                 OnLaunchAsHost="@LaunchAsHost"
-                OnStopRelay="@(() => { StopHostedRelay(); showHostInfo = false; })"
+                OnStopRelay="@StopHostingFromModal"
                 OnClose="@(() => showHostInfo = false)" />
 
 <JoinSteamModal IsVisible="@showJoinSteam"
@@ -159,11 +203,14 @@
               Address="@fallbackAddress"
               AddressChanged="@(a => fallbackAddress = a)"
               OnUseAddress="@ConnectByAddressAfterSteamAsync"
+              ShowRoleChoices="@(directRoleTarget is not null)"
+              OnChooseHost="@HostFromDirectTestAsync"
+              OnChooseJoin="@JoinFromDirectTestAsync"
               ShowReportBug="@messageReportBug"
               ShowLaunchAnyway="@launchAnywayAvailable"
               OnLaunchAnyway="@LaunchAnywayAsync"
-              OnReportBug="@(() => { showMessage = false; showReportBug = true; })"
-              OnClose="@(() => showMessage = false)" />
+              OnReportBug="@(() => { DismissMessage(); showReportBug = true; })"
+              OnClose="@DismissMessage" />
 
 <ExitModal  IsVisible="@showExitConfirm"
             OnConfirm="@ConfirmExit"

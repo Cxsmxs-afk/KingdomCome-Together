@@ -17,6 +17,8 @@ public class Wo159MenuTests
     [InlineData("[KCD2-MP-EVT] v1 15 w159 join bring", "join", -1, "", "bring", "", false)]
     [InlineData("[KCD2-MP-EVT] v1 16 w159 cancel", "cancel", -1, "", "", "", false)]
     [InlineData("[KCD2-MP-EVT] v1 17 w159 recap skipped", "recap", -1, "skipped", "", "", false)]
+    [InlineData("[KCD2-MP-EVT] v1 18 w159 role host", "role", -1, "host", "", "", false)]
+    [InlineData("[KCD2-MP-EVT] v1 19 w159 role join", "role", -1, "join", "", "", false)]
     public void The_menus_choices_are_read_from_its_log_line(string line, string kind, int pl, string name, string join, string style, bool watch)
     {
         var c = MenuTakeoverRule.Parse(line);
@@ -35,6 +37,9 @@ public class Wo159MenuTests
     [InlineData("[KCD2-MP-EVT] v1 12 w159 newadv wizard skip")]        // not one of the three
     [InlineData("[KCD2-MP-EVT] v1 12 w159 newadv scout maybe")]
     [InlineData("[KCD2-MP-EVT] v1 12 w159 join fresh")]                // a new character always names its playstyle
+    [InlineData("[KCD2-MP-EVT] v1 12 w159 role observer")]
+    [InlineData("[KCD2-MP-EVT] v1 12 w159 role host join")]
+    [InlineData("[KCD2-MP-EVT] v1 0 w159 role host")]
     [InlineData("[KCD2-MP-EVT] v1 12 w159 lo")]                         // a line cut short
     [InlineData("[KCD2-MP] WO159-MENU chose newadv")]                   // the human-readable line is not the event
     public void Anything_else_is_not_a_choice(string line) => Assert.Null(MenuTakeoverRule.Parse(line));
@@ -69,6 +74,22 @@ public class Wo159MenuTests
     }
 
     private static string Sig(string call) => call.Split("sig=\"")[1][..12];
+
+    [Fact]
+    public void A_role_acknowledgement_names_the_request_even_if_the_role_does_not_change()
+    {
+        const string status = "Choose a host in the launcher.";
+        string before = MenuTakeoverRule.ModelCall(true, [], "", null, "", "idle", true, "");
+        string rejected = MenuTakeoverRule.ModelCall(true, [], "", null, "", "idle", true, "", roleStatus: status, roleAck: 18);
+        string later = MenuTakeoverRule.ModelCall(true, [], "", null, "", "idle", true, "", roleStatus: status, roleAck: 19);
+        Assert.DoesNotContain("roleAck=", before);
+        Assert.Contains("role=\"host\"", rejected);
+        Assert.Contains("roleAck=18", rejected);
+        Assert.Contains("roleStatus=\"Choose a host in the launcher.\"", rejected);
+        Assert.NotEqual(Sig(before), Sig(rejected));
+        Assert.NotEqual(Sig(rejected), Sig(later));
+        Assert.True(Uri.EscapeDataString("#" + rejected).Length <= MenuTakeoverRule.MaxEncoded);
+    }
 
     [Fact]
     public void The_model_says_which_playstyles_are_installed_and_the_joins_own_line()

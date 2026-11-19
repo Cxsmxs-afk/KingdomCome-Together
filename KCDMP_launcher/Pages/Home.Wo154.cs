@@ -193,12 +193,13 @@ namespace KCDMP_launcher.Pages
         }
 
         /// <summary>Runs the agent as a one-shot helper; a start Windows refused is told and gives (null, true).</summary>
-        private async Task<(T? Result, bool Blocked)> RunHelperAsync<T>(string agentPath, string arguments, string tag, TimeSpan timeout) where T : class
+        private async Task<(T? Result, bool Blocked)> RunHelperAsync<T>(string agentPath, string arguments, string tag, TimeSpan timeout,
+            Func<bool>? messageCurrent = null) where T : class
         {
             try { return (await AgentHelper.RunAsync<T>(agentPath, arguments, tag, timeout), false); }
             catch (Exception ex) when (LaunchBlocks.FromStartFailure(ex, Path.GetFileName(agentPath), IsInstalledFile(agentPath)) is { } b)
             {
-                ShowBlocked(b);
+                if (messageCurrent is null || messageCurrent()) ShowBlocked(b);
                 return (null, true);
             }
         }
@@ -257,12 +258,13 @@ namespace KCDMP_launcher.Pages
         private CancellationTokenSource? connectGateCts;
 
         /// <summary>The CONNECT button's state: always on with the ConnectGate setting off.</summary>
-        private bool ConnectEnabled => !settings.ConnectGate || connectGateOpen;
+        private bool ConnectEnabled => !roleSwitchBusy && (!settings.ConnectGate || connectGateOpen);
 
         /// <summary>From LaunchGame, once the game is up: the gate for this launch.</summary>
-        private void StartConnectGate(bool hosting, ServerInfo server, DateTime gameStartLocal)
+        private void StartConnectGate(SessionLaunchPlan plan, MenuGameScope scope)
         {
             StopConnectGate();
+            bool hosting = plan.Hosting;
             connectGateOpen = true;
             connectGateReason = "";
             if (!settings.ConnectGate) return;
@@ -270,7 +272,7 @@ namespace KCDMP_launcher.Pages
             connectGateReason = hosting ? ConnectGateRule.LoadSaveFirst : ConnectGateRule.HostNotReady;
             Log.Information("MP-LAUNCH connect gate closed ({Who}) -- {Reason}", hosting ? "host: the game's log" : "joiner: the host's relay", connectGateReason);
             var cts = connectGateCts = new CancellationTokenSource();
-            _ = hosting ? HostGateLoopAsync(gameStartLocal, cts.Token) : JoinerGateLoopAsync(server, cts.Token);
+            _ = hosting ? HostGateLoopAsync(scope, cts.Token) : JoinerGateLoopAsync(plan.Server, cts.Token);
         }
 
         private void StopConnectGate()
@@ -279,25 +281,14 @@ namespace KCDMP_launcher.Pages
             connectGateCts = null;
         }
 
-        private async Task HostGateLoopAsync(DateTime gameStartLocal, CancellationToken ct)
+        private async Task HostGateLoopAsync(MenuGameScope scope, CancellationToken ct)
         {
-            var clock = Stopwatch.StartNew();
-            KcdLogFollower? follower = null;
-            double nextFind = 0;
             while (!ct.IsCancellationRequested)
             {
-                double now = clock.Elapsed.TotalSeconds;
-                if (follower is null && now >= nextFind)
-                {
-                    string root = LogBundleGameRoot;
-                    if (await Task.Run(() => LogBundle.FindKcdLog(root)) is string path) follower = new KcdLogFollower(path, gameStartLocal);
-                    else nextFind = now + 5;
-                }
-                if (follower is not null) await Task.Run(() => follower.Poll(now));
-                bool reading = follower?.Reading == true;
-                var v = ConnectGateRule.ForHost(follower?.State.Stage ?? GameStage.Starting, follower?.State.WorldSinceS ?? double.NaN,
-                                            reading, (DateTime.Now - gameStartLocal).TotalSeconds, now);
-                await SetGateAsync(v, reading ? $"game {follower!.State.Stage.ToString().ToLowerInvariant()}" : "the game's log is not readable yet", ct);
+                var seen = await scope.ObserveAsync();
+                double now = scope.Clock.Elapsed.TotalSeconds;
+                var v = ConnectGateRule.ForHost(seen.Stage, seen.WorldSinceS, seen.Reading, (DateTime.Now - scope.Started).TotalSeconds, now);
+                await SetGateAsync(v, seen.Reading ? $"game {seen.Stage.ToString().ToLowerInvariant()}" : "the game's log is not readable yet", ct);
                 try { await Task.Delay(1000, ct); } catch (OperationCanceledException) { break; }
             }
         }
@@ -322,15 +313,15 @@ namespace KCDMP_launcher.Pages
             }
         }
 
-        private async Task SetGateAsync(GateView v, string detail, CancellationToken ct)
+        private Task SetGateAsync(GateView v, string detail, CancellationToken ct) => InvokeAsync(() =>
         {
-            if (ct.IsCancellationRequested) return;   // CONNECT was pressed (or the launch ended): this loop no longer decides
+            if (ct.IsCancellationRequested) return;   // a retired role's watcher no longer decides
             if (v.Open == connectGateOpen && v.Reason == connectGateReason) return;
             connectGateOpen = v.Open;
             connectGateReason = v.Reason;
             Log.Information("MP-LAUNCH connect gate {State} ({Detail}){Reason}", v.Open ? "open" : "closed", detail, v.Open ? "" : " -- " + v.Reason);
-            await InvokeAsync(StateHasChanged);
-        }
+            StateHasChanged();
+        });
 
         // ------------------------------------------------------------ the relay's ports (Phase 7)
 

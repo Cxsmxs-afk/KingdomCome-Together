@@ -88,6 +88,7 @@ namespace KCDMP_launcher.Models
     public sealed class GameLogStage
     {
         public GameStage Stage { get; private set; } = GameStage.Starting;
+        public long MenuRevision { get; private set; }
         /// <summary>When the last "Gameplay started" was read (seconds on the caller's clock); NaN before.</summary>
         public double WorldSinceS { get; private set; } = double.NaN;
 
@@ -97,6 +98,7 @@ namespace KCDMP_launcher.Models
                 || line.StartsWith("Exiting to main menu because save game loading failed", StringComparison.Ordinal))
             {
                 Stage = GameStage.Menu;
+                MenuRevision++;
                 WorldSinceS = double.NaN;
             }
             else if (line.StartsWith("Loading saved game", StringComparison.Ordinal)
@@ -126,10 +128,12 @@ namespace KCDMP_launcher.Models
     public sealed class KcdLogFollower
     {
         public static readonly TimeSpan StartSlack = TimeSpan.FromSeconds(30);
+        public static readonly TimeSpan SessionStartSlack = TimeSpan.FromSeconds(1);
         private static readonly Regex Header = new(@"Log Started at (\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", RegexOptions.CultureInvariant);
 
         private readonly string _path;
         private readonly DateTime _gameStartLocal;
+        private readonly TimeSpan _startSlack;
         private long _offset;
         private bool _ours;
         private readonly StringBuilder _partial = new();
@@ -141,11 +145,13 @@ namespace KCDMP_launcher.Models
         public Action<string>? OnLine { get; set; }
         /// <summary>This game's log has been found and is being read.</summary>
         public bool Reading => _ours;
+        public bool LatestPollRead { get; private set; }
 
-        public KcdLogFollower(string path, DateTime gameStartLocal)
+        public KcdLogFollower(string path, DateTime gameStartLocal, TimeSpan? startSlack = null)
         {
             _path = path;
             _gameStartLocal = gameStartLocal;
+            _startSlack = startSlack ?? StartSlack;
         }
 
         /// <summary>The "Log Started at" time in the head of a kcd.log, or null.</summary>
@@ -160,6 +166,7 @@ namespace KCDMP_launcher.Models
         /// <summary>Reads what the game added since the last poll. Never throws; an unreadable file is tried again next time.</summary>
         public void Poll(double nowS)
         {
+            LatestPollRead = false;
             try
             {
                 using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -169,7 +176,7 @@ namespace KCDMP_launcher.Models
                     var head = new byte[(int)Math.Min(fs.Length, 8192)];
                     int got = fs.Read(head, 0, head.Length);
                     var started = StartedAt(Encoding.UTF8.GetString(head, 0, got));
-                    if (started is null || started.Value < _gameStartLocal - StartSlack) return;   // not this game's (yet)
+                    if (started is null || started.Value < _gameStartLocal - _startSlack) return;   // not this game's (yet)
                     _ours = true;
                     _offset = 0;
                 }
@@ -203,6 +210,7 @@ namespace KCDMP_launcher.Models
                     OnLine?.Invoke(tail);
                     _tailFed = tail;
                 }
+                LatestPollRead = true;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }

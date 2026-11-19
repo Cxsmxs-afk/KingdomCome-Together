@@ -30317,7 +30317,7 @@ end
 --     its own root page on Back AFTER our listener ran -- so a rebuild after a native page waits for the
 --     launcher's next tick (no Lua timer fires at the main menu: observed again);
 --   * the shipped entries keep their own ids, so Settings / Help / DLCs / Credits / Quit still work.
--- The launcher acts on the "w159" events (load a save, a new adventure, join, cancel); Lua only draws.
+-- The launcher acts on the "w159" events (select a role, load a save, a new adventure, join, cancel).
 KCD2MP.w159 = { armed = false, listening = false, page = "root", depth = 0, dirty = true, model = nil, sig = "",
     builds = 0, joinState = "idle", lastWhy = "" }
 
@@ -30341,15 +30341,33 @@ function KCD2MP_W159AtMenu()
 end
 
 -- The launcher's model: { sig, role = "host"|"join", saves = { {pl, name, label}, ... }, hidden, newadv = {pl, name}|nil,
--- newwhy, join = { state = "idle"|"waiting"|"joining", bring = bool, msg } }. A new sig redraws the page.
+-- newwhy, join = { state = "idle"|"waiting"|"joining", bring = bool, msg }, roleAck, roleStatus }.
+-- The launcher acknowledges the sequence of a role request after it has selected the connection and gate.
 function KCD2MP_W159Model(t)
     local w = KCD2MP.w159
     if type(t) ~= "table" then return false end
     local sig = tostring(t.sig or "")
+    local previousRole = w.model and w.model.role
     w.model = t
     if sig ~= w.sig then
         w.sig = sig
         if type(t.join) == "table" and t.join.state then w.joinState = tostring(t.join.state) end
+        local request = w.roleRequest
+        if request and tonumber(t.roleAck) == request.seq then
+            w.roleRequest = nil
+            local status = tostring(t.roleStatus or "")
+            if t.role == request.target and status == "" then
+                w.roleStatus = nil
+                if w.armed and w.depth == 0 and w.page == "root" then w.page = request.target end
+            else
+                w.roleStatus = status ~= "" and status or "The launcher did not change the session role."
+            end
+            mp_log(string.format("WO159-MENU role receipt seq=%d target=%s accepted=%s", request.seq, request.target,
+                tostring(w.roleStatus == nil)))
+        elseif not request and previousRole and previousRole ~= t.role then
+            w.roleStatus = nil
+            w.page = "root"
+        end
         w.dirty = true
         mp_log(string.format("WO159-MENU model role=%s saves=%d newadv=%s join=%s", tostring(t.role),
             type(t.saves) == "table" and #t.saves or 0, t.newadv and "yes" or "no", w.joinState))
@@ -30419,8 +30437,14 @@ function KCD2MP_W159Page(w)
         add("MP_Back", "@ui_back", "", false, 1)
         return b, "Join Game", (j.bring and "MP_JoinBring" or "MP_JoinFresh")
     end
-    add("MP_StartGame", "Start Game", role == "host" and KCD2MP_W159_ABOUT or "You are joining: use Join Game.", role ~= "host")
-    add("MP_JoinGame", "Join Game", role == "join" and KCD2MP_W159_ABOUT or "You are hosting: your partner uses Join Game.", role ~= "join")
+    local busy = w.roleRequest ~= nil or w.joinState == "joining" or (m.role ~= "host" and m.role ~= "join")
+    add("MP_StartGame", "Start Game", role == "host" and KCD2MP_W159_ABOUT or "Choose to host here.", busy)
+    add("MP_JoinGame", "Join Game", role == "join" and KCD2MP_W159_ABOUT or "Choose to join here.", busy)
+    if w.roleRequest then
+        add("MP_RoleStatus", "Switching session role...", "", true)
+    elseif w.roleStatus then
+        add("MP_RoleStatus", w.roleStatus, "", true)
+    end
     add("Continue", "@ui_Continue", KCD2MP_W159_HINT, true)
     add("NewGame", "@ui_NewGame", KCD2MP_W159_HINT, true)
     add("LoadGame", "@ui_LoadGame", KCD2MP_W159_HINT, true)
@@ -30429,7 +30453,7 @@ function KCD2MP_W159Page(w)
     add("DLC", "@ui_DLCs")
     add("Credits", "@ui_Credits")
     add("Exit", "@ui_Exit", "", false, 1)
-    return b, "", (role == "join" and "MP_JoinGame" or "MP_StartGame")
+    return b, "", not busy and (role == "join" and "MP_JoinGame" or "MP_StartGame") or nil
 end
 
 function KCD2MP_W159Build()
@@ -30437,7 +30461,12 @@ function KCD2MP_W159Build()
     local list, head, sel = KCD2MP_W159Page(w)
     KCD2MP_W159Call("ClearAll")
     KCD2MP_W159Call("PreparePage", 1500, w.page == "root" and 325 or 360, 8, head, w.page == "root" and 196 or 248)
-    for _, e in ipairs(list) do KCD2MP_W159Call("AddBasicButton", e.id, e.cont, e.text, e.tip, e.off) end
+    w.enabledButtons = {}
+    for _, e in ipairs(list) do
+        if KCD2MP_W159Call("AddBasicButton", e.id, e.cont, e.text, e.tip, e.off) and not e.off then
+            w.enabledButtons[e.id] = true
+        end
+    end
     KCD2MP_W159Call("ShowPage")
     if sel then KCD2MP_W159Call("SelectButton", sel, 0) end
     w.dirty = false
@@ -30448,6 +30477,14 @@ end
 function KCD2MP_W159Emit(what)
     mp_log("WO159-MENU chose " .. tostring(what))
     KCD2MP_EmitEvent("w159", what)
+    return KCD2MP.evtSeq
+end
+
+function KCD2MP_W159CancelWaiting(w)
+    if w.page == "join" and w.joinState == "waiting" then
+        w.joinState = "idle"
+        KCD2MP_W159Emit("cancel")
+    end
 end
 
 -- Where our Back goes from each of our pages.
@@ -30456,7 +30493,7 @@ KCD2MP_W159_PARENT = { host = "root", join = "root", prologue = "style" }
 -- The game's own menu events. Our MP_* entries are acted on here; the game's own only move the page depth.
 function KCD2MP.w159.OnMenu(self, el, inst, ev, args)
     local w = KCD2MP.w159
-    if not w.armed then return end
+    if not w.armed or not KCD2MP_W159AtMenu() then return end
     local a = type(args) == "table" and args or {}
     local id = tostring(a[0] or a[1] or "")
     if ev == "OnCreditsHide" or ev == "OnHelpOverlayClose" then
@@ -30467,16 +30504,27 @@ function KCD2MP.w159.OnMenu(self, el, inst, ev, args)
     if id == "Back" then
         -- the game's own Back: from one of its pages (one level up), or Esc on ours (our root again)
         if w.depth > 0 then w.depth = w.depth - 1 end
-        if w.depth == 0 then w.page = "root"; w.dirty = true end
+        if w.depth == 0 then
+            KCD2MP_W159CancelWaiting(w)
+            w.page = "root"
+            w.dirty = true
+        end
         return
     end
     if KCD2MP_W159_SUBPAGES[id] then w.depth = w.depth + 1; return end
-    if id:sub(1, 3) ~= "MP_" then return end
+    if id:sub(1, 3) ~= "MP_" or w.depth ~= 0 or w.dirty or not (w.enabledButtons and w.enabledButtons[id]) then return end
     local m = w.model or {}
-    if id == "MP_StartGame" then w.page = "host"; KCD2MP_W159Build()
-    elseif id == "MP_JoinGame" then w.page = "join"; KCD2MP_W159Build()
+    if id == "MP_StartGame" or id == "MP_JoinGame" then
+        local target = id == "MP_StartGame" and "host" or "join"
+        w.roleStatus = nil
+        if m.role == target then
+            w.page = target
+        else
+            w.roleRequest = { target = target, seq = KCD2MP_W159Emit("role " .. target) }
+        end
+        KCD2MP_W159Build()
     elseif id == "MP_Back" then
-        if w.page == "join" and w.joinState == "waiting" then w.joinState = "idle"; KCD2MP_W159Emit("cancel") end
+        KCD2MP_W159CancelWaiting(w)
         w.page = w.page == "style" and (w.styleFor == "join" and "join" or "host") or (KCD2MP_W159_PARENT[w.page] or "root")
         KCD2MP_W159Build()
     elseif id:match("^MP_Load_%d+$") then
@@ -30505,8 +30553,7 @@ function KCD2MP.w159.OnMenu(self, el, inst, ev, args)
         KCD2MP_W159Emit("join bring")
         KCD2MP_W159Build()
     elseif id == "MP_JoinCancel" then
-        w.joinState = "idle"
-        KCD2MP_W159Emit("cancel")
+        KCD2MP_W159CancelWaiting(w)
         KCD2MP_W159Build()
     end
 end
@@ -30518,6 +30565,8 @@ function KCD2MP_W159Tick()
     if not KCD2MP_W159AtMenu() then
         if w.armed then mp_log("WO159-MENU not at the main menu: the menu is left alone") end
         w.armed = false
+        w.roleRequest = nil
+        w.roleStatus = nil
         w.dirty = true
         return "away"
     end
@@ -30543,6 +30592,8 @@ function KCD2MP_W159Disarm(why)
     local w = KCD2MP.w159
     if w.armed then mp_log("WO159-MENU disarmed (" .. tostring(why) .. ")") end
     w.armed = false
+    w.roleRequest = nil
+    w.roleStatus = nil
     w.dirty = true
     return true
 end
