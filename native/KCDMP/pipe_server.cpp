@@ -1475,17 +1475,26 @@ struct DeathBackend {
     npcdeath::Preparation prepare(const DeathBody& body, const npcdeath::Request& request, uint64_t attempt) const {
         using Preparation = npcdeath::Preparation;
         const uint32_t eid = body.actions.eid;
-        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::NotStarted;
-        // Release can change native holds. From here on, a failed readback must retain the fence.
-        wo195::release(eid, "verified remote NPC death");
-        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::Uncertain;
-        hits::discard_from(eid, false);
-        uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
-        std::memcpy(payload + 2, &eid, sizeof eid);
-        uint8_t guard[32]{};
-        size_t used = 0;
-        return wo131::handle(payload, sizeof payload, guard, sizeof guard, &used) == wo131::kROk && used == 1 && guard[0] == 1
-            ? Preparation::Ready : Preparation::Uncertain;
+        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::Unchanged;
+        // WO195 can remove engagement, wish and motion holds. From its first
+        // call onward, a fault or refused readback cannot prove unchanged state.
+        KCDMP_FAULT_CALL(site, "pipe::npc_death/prepare");
+        try {
+            return fault::guarded_or(site, Preparation::Uncertain, [&] {
+                wo195::release(eid, "verified remote NPC death");
+                if (!current(body, request, true) || !ready(body, attempt) || !hits::discard_from(eid, false))
+                    return Preparation::Uncertain;
+                uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
+                std::memcpy(payload + 2, &eid, sizeof eid);
+                uint8_t guard[32]{};
+                size_t used = 0;
+                const auto result = wo131::handle(payload, sizeof payload, guard, sizeof guard, &used);
+                return result == wo131::kROk && used == 1 && guard[0] == 1 ? Preparation::Ready : Preparation::Uncertain;
+            });
+        } catch (...) {
+            report_tag(body, request, "prepare-exception");
+            return Preparation::Uncertain;
+        }
     }
 
     bool apply(const DeathBody& body, const npcdeath::Request& request) const {
@@ -1520,6 +1529,9 @@ struct DeathBackend {
             case npcdeath::Stage::ReleasePending: return report_tag(body, request, "release-pending");
             case npcdeath::Stage::ReleaseUncertain: return report_tag(body, request, "release-uncertain");
             case npcdeath::Stage::Ready: return report_tag(body, request, "ready");
+            case npcdeath::Stage::PrepareUnchanged: return report_tag(body, request, "prepare-unchanged");
+            case npcdeath::Stage::PrepareUncertain: return report_tag(body, request, "prepare-uncertain");
+            case npcdeath::Stage::PrepareObservedDead: return report_tag(body, request, "prepare-observed-dead");
             case npcdeath::Stage::DeathPending: return report_tag(body, request, "death-pending");
             case npcdeath::Stage::Applied: return report_tag(body, request, "applied");
             case npcdeath::Stage::Uncertain: return report_tag(body, request, "uncertain");
@@ -1527,8 +1539,6 @@ struct DeathBackend {
             case npcdeath::Stage::Aborted: return report_tag(body, request, "aborted-before-apply");
             case npcdeath::Stage::AbortedUnadmitted: return report_tag(body, request, "aborted-unadmitted", " reason=never-admitted");
             case npcdeath::Stage::ApplyUncertain: return report_tag(body, request, "apply-uncertain");
-            case npcdeath::Stage::PreparationNotStarted: return report_tag(body, request, "preparation-not-started");
-            case npcdeath::Stage::PreparationUncertain: return report_tag(body, request, "preparation-uncertain");
         }
     }
 };

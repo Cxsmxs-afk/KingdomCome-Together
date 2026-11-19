@@ -25,11 +25,11 @@ struct Scope {
 enum class Intent : uint8_t { Advance, ObserveOnly, AbortBeforeApply };
 enum class Receipt : uint8_t { Applied = 0, Pending = 0x70, Uncertain = 0x71, Stale = 0x72, Aborted = 0x73 };
 enum class Retirement { Ready, Pending, Uncertain, Stale };
-enum class Preparation { Ready, NotStarted, Uncertain };
+enum class Preparation { Ready, Unchanged, Uncertain };
 enum class Life { Alive, Dead, Unreadable };
 enum class Stage {
-    ReleasePending, ReleaseUncertain, Ready, DeathPending, ApplyUncertain,
-    Applied, Uncertain, Stale, Aborted, AbortedUnadmitted, PreparationNotStarted, PreparationUncertain
+    ReleasePending, ReleaseUncertain, Ready, PrepareUnchanged, PrepareUncertain, PrepareObservedDead,
+    DeathPending, ApplyUncertain, Applied, Uncertain, Stale, Aborted, AbortedUnadmitted
 };
 
 inline bool nonlethal_health(float requested, float observed, float& allowed) {
@@ -44,7 +44,7 @@ inline bool nonlethal_health(float requested, float observed, float& allowed) {
 template <class Body>
 class Attempts {
     static constexpr std::size_t kWindow = 512;
-    enum class Phase { Release, Busy, Observe, Done };
+    enum class Phase { Release, Busy, ObservePreparation, Observe, Done };
 
     struct Entry {
         Scope scope{};
@@ -105,6 +105,17 @@ public:
         // Reentry during an engine read, Stop or preparation observes a busy receipt and cannot change the attempt.
         entry.phase = Phase::Busy;
         if (beforeApply && !backend.current(entry.body, request, true)) return finish(Receipt::Stale, Stage::Stale);
+        auto observe_preparation = [&](bool first) {
+            // Read the original actor only. No lethal call was made, so even
+            // a later IsDead cannot be credited to this attempt.
+            if (!first && backend.current(entry.body, request, false) && backend.life(entry.body) == Life::Dead &&
+                backend.current(entry.body, request, false))
+                return finish(Receipt::Uncertain, Stage::PrepareObservedDead);
+            entry.phase = Phase::ObservePreparation;
+            if (first) report(Stage::PrepareUncertain);
+            return Receipt::Uncertain;
+        };
+        if (phase == Phase::ObservePreparation) return observe_preparation(false);
         auto confirm = [&] {
             entry.phase = Phase::Done; // a corpse readback/notification must not admit a second mutation
             entry.receipt = Receipt::Applied;
@@ -132,11 +143,13 @@ public:
             entry.advanceBlocked = true;
             return Receipt::Uncertain;
         };
-        if (intent == Intent::AbortBeforeApply) {
-            if (backend.life(entry.body) != Life::Alive || !backend.current(entry.body, request, true) ||
-                !backend.abort(entry.body, request.attempt)) return unconfirmed_before_prepare();
+        auto abort_unmutated = [&] {
+            if (!backend.current(entry.body, request, true) || backend.life(entry.body) != Life::Alive ||
+                !backend.current(entry.body, request, true) || !backend.abort(entry.body, request.attempt))
+                return unconfirmed_before_prepare();
             return finish(Receipt::Aborted, Stage::Aborted);
-        }
+        };
+        if (intent == Intent::AbortBeforeApply) return abort_unmutated();
 
         switch (backend.retire(entry.body, request.attempt)) {
             case Retirement::Pending:
@@ -156,12 +169,16 @@ public:
             return backend.current(entry.body, request, false) ? confirm() : finish(Receipt::Uncertain, Stage::Uncertain);
         if (before != Life::Alive) return unconfirmed_before_prepare();
         switch (backend.prepare(entry.body, request, request.attempt)) {
-            case Preparation::NotStarted: return unconfirmed_before_prepare(Stage::PreparationNotStarted);
-            case Preparation::Uncertain: return finish(Receipt::Uncertain, Stage::PreparationUncertain);
-            case Preparation::Ready: break;
+            case Preparation::Unchanged:
+                report(Stage::PrepareUnchanged);
+                return abort_unmutated();
+            case Preparation::Uncertain:
+                return observe_preparation(true);
+            case Preparation::Ready:
+                break;
         }
         if (!backend.current(entry.body, request, true) || !backend.ready(entry.body, request.attempt))
-            return finish(Receipt::Stale, Stage::Stale);
+            return observe_preparation(true);
         const bool admitted = backend.apply(entry.body, request);
         return observe(admitted ? Receipt::Pending : Receipt::Uncertain, true);
     }

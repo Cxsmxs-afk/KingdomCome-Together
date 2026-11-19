@@ -583,7 +583,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             [1, _, 0] => NpcDeathReceipt.Applied,
             [0, _, 0x70] => NpcDeathReceipt.Pending,
             [0, _, 0x72] => NpcDeathReceipt.Stale,
-            [0, _, 0x73] when intent != NpcDeathIntent.Advance => NpcDeathReceipt.Aborted,
+            [0, _, 0x73] => NpcDeathReceipt.Aborted,
             _ => NpcDeathReceipt.Uncertain
         };
     }
