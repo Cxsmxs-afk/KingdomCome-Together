@@ -12,6 +12,8 @@ from uuid import UUID
 BOW = re.compile(r'\bMP-LANE1-BOW (out|in|reset) (.+)$')
 HAND = re.compile(r'\bWO214-HAND own (.+?) -> sent\b(?: to (\d+)\b)?')
 STATS = re.compile(r'\bMP-T3-STATS origin=agent role=(?:host|joiner) (.+)$')
+RANGED_IN = re.compile(r'\bMP-RP-RANGED-IN (.+)$')
+NATIVE_ACTION = re.compile(r'\bMP-RP-COMBAT-ACTION (.+)$')
 FIELD = re.compile(r'(\w+)=([^\s]+)')
 EMPTY_COUNTER = 'bow_hand_empty_while_drawn'
 EMPTY_CLASS = str(UUID(int=0))
@@ -21,6 +23,22 @@ CAPTURE_MAX_AGE_MS = 2000
 def number(fields, key):
     value = fields.get(key, '')
     return int(value) if re.fullmatch(r'[0-9]{1,19}', value) else None
+
+
+def fire_key(fields, native=False):
+    peer = number(fields, 'peer')
+    seq = number(fields, 'seq')
+    stamp = number(fields, 'event_host_ms')
+    eid = fields.get('eid', '')
+    if (peer is None or peer > 255 or not stamp or seq is None or
+            seq > (0xFFFF if native else 0xFFFFFFFF) or not re.fullmatch(r'0x[0-9a-fA-F]{1,8}', eid)):
+        return None
+    entity = int(eid, 16)
+    return (peer, entity, seq & 0xFFFF, stamp) if entity else None
+
+
+def fire_scope(fields):
+    return number(fields, 'scope'), number(fields, 'connection')
 
 
 def inspect_sender(lines, bow_class):
@@ -110,11 +128,22 @@ def inspect_sender(lines, bow_class):
     return outgoing, retention, checked_age, repeated_sheathe, failures
 
 
-def inspect_receiver(lines, bow_class, source_peer):
+def inspect_receiver(lines, bow_class, source_peer, check_native=False):
     requests = 0
     cleared = set()
     requested = set()
+    fire_receipts = {}
     for line in lines:
+        ranged = RANGED_IN.search(line) if check_native else None
+        if ranged:
+            fields = dict(FIELD.findall(ranged[1]))
+            cls = fields.get('cls', fields.get('item', bow_class)).lower()
+            if (fields.get('result') == 'accepted' and fields.get('weapon') == 'Bow' and fields.get('phase') == '3'
+                    and cls == bow_class):
+                key = fire_key(fields)
+                if key and key[0] in requested:
+                    fire_receipts.setdefault(key[0], {}).setdefault(key, set()).add(fire_scope(fields))
+            continue
         bow = BOW.search(line)
         if not bow or bow[1] != 'in':
             continue
@@ -125,6 +154,8 @@ def inspect_receiver(lines, bow_class, source_peer):
         cls = fields.get('cls', '').lower()
         result = fields.get('result')
         if result == 'hand-requested':
+            if peer in cleared or cls != bow_class:
+                fire_receipts.pop(peer, None)
             cleared.discard(peer)
             if cls == bow_class:
                 requests += 1
@@ -134,13 +165,35 @@ def inspect_receiver(lines, bow_class, source_peer):
         elif result == 'hand-sheathed' and cls == '-' and peer in requested:
             cleared.add(peer)
             requested.remove(peer)
-    return requests, cleared
+    return requests, cleared, fire_receipts
+
+
+def installed_fire(lines, fire_receipts, cleared):
+    matches = {}
+    for line in lines:
+        action = NATIVE_ACTION.search(line)
+        if not action:
+            continue
+        fields = dict(FIELD.findall(action[1]))
+        if (fields.get('result') != 'installed' or fields.get('kind') != '130'
+                or fields.get('ranged_phase') != '3' or fields.get('weapon') != '1'):
+            continue
+        key = fire_key(fields, native=True)
+        if key is None or key[0] not in cleared:
+            continue
+        scope = fire_scope(fields)
+        for expected in fire_receipts.get(key[0], {}).get(key, ()):
+            if all(want is None or seen == want for want, seen in zip(expected, scope)):
+                matches.setdefault(key, []).append(scope)
+                break
+    return next(((key, scopes[0]) for key, scopes in matches.items() if len(scopes) == 1), None)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sender-log', type=Path, required=True)
     parser.add_argument('--receiver-log', type=Path, required=True)
+    parser.add_argument('--native-log', type=Path, help='receiver native log to verify installation of the Bow Fire action')
     parser.add_argument('--bow-class', type=UUID, required=True)
     parser.add_argument('--source-peer', type=int, help='sender peer id on the receiver')
     args = parser.parse_args(argv)
@@ -156,7 +209,7 @@ def main(argv=None):
         with args.sender_log.open(encoding='utf-8-sig', errors='replace') as sender:
             outgoing, retention, checked_age, repeated_sheathe, failures = inspect_sender(sender, bow_class)
         with args.receiver_log.open(encoding='utf-8-sig', errors='replace') as receiver:
-            requests, cleared = inspect_receiver(receiver, bow_class, args.source_peer)
+            requests, cleared, fire_receipts = inspect_receiver(receiver, bow_class, args.source_peer, args.native_log is not None)
     except OSError as error:
         print(f'INCONCLUSIVE {error}')
         return 2
@@ -180,9 +233,31 @@ def main(argv=None):
     if missing:
         print('INCONCLUSIVE missing ' + ', '.join(missing))
         return 2
-    print(f'PASS cls={bow_class} outgoing={outgoing} hand_requests={requests} '
-          f'retained_age_ms={checked_age} sheathe_revision={repeated_sheathe[0]} '
-          f'sheathed_peers={",".join(map(str, sorted(cleared)))} {EMPTY_COUNTER}=0')
+
+    engine_fire = None
+    if args.native_log is not None:
+        try:
+            with args.native_log.open(encoding='utf-8-sig', errors='replace') as native:
+                engine_fire = installed_fire(native, fire_receipts, cleared)
+        except OSError as error:
+            print(f'INCONCLUSIVE {error}')
+            return 2
+        if engine_fire is None:
+            print('INCONCLUSIVE missing unique engine-installed Bow Fire action matching an accepted receiver event')
+            return 2
+
+    report = (f'PASS cls={bow_class} outgoing={outgoing} hand_requests={requests} '
+              f'retained_age_ms={checked_age} sheathe_revision={repeated_sheathe[0]} '
+              f'sheathed_peers={",".join(map(str, sorted(cleared)))} {EMPTY_COUNTER}=0')
+    if engine_fire is not None:
+        (peer, eid, seq, stamp), (scope, connection) = engine_fire
+        report += (f' engine_fire_installed=1 engine_peer={peer} engine_eid=0x{eid:X} '
+                   f'engine_seq16={seq} engine_event_host_ms={stamp} pose_observation=unmeasured')
+        if scope is not None:
+            report += f' engine_scope={scope}'
+        if connection is not None:
+            report += f' engine_connection={connection}'
+    print(report)
     return 0
 
 

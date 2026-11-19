@@ -36,7 +36,7 @@ public partial class GameBridge
     private long _p6CatalogRetryMs, _w201RangedRetryAtMs;
     private int _w201RangedRefusals;
     private int _p6CaptureWasOn;
-    private long _w201RangedOut, _w201RangedIn, _w201RangedShown;
+    private long _w201RangedOut, _w201RangedIn, _w201RangedDispatched, _w201RangedRefused;
     private readonly ConcurrentDictionary<byte, (long Peer, ulong Gen, ulong Epoch, uint Seq)> _p6RemoteSteps = new();
 
     private bool P6Current(P6Context c) => !c.Stop.IsCancellationRequested && ReferenceEquals(c.Stream, _wo122Stream) &&
@@ -230,15 +230,15 @@ public partial class GameBridge
         if (!P6Message(frame.Type, frame.Payload, out byte src, out var message)) return false;
         if (!frame.P6Ready || P6GetContext() is not { } context || frame.P6Generation != context.Generation || frame.P6Serial != context.Serial ||
             frame.P6Life != context.Life || !P6PeerCurrent(src, frame.P6PeerSerial)) { T3Increment("ranged_stale"); return true; }
-        if (message.Kind == Protocol.W164RangedStep) await Wo201OnRangedStepAsync(src, message.Text, frame, context, ct);
+        if (message.Kind == Protocol.W164RangedStep) await Wo201OnRangedStepAsync(src, message, frame, context, ct);
         else if (message.Kind == Protocol.W164MeasuredMissile) await P6OnMissileRequestAsync(src, message.Text, frame, context, ct);
         else P6OnMissileResult(src, message.Text, context);
         return true;
     }
-    private async Task Wo201OnRangedStepAsync(byte src, string text, InFrame frame, P6Context context, CancellationToken ct)
+    private async Task Wo201OnRangedStepAsync(byte src, LootMsg message, InFrame frame, P6Context context, CancellationToken ct)
     {
         if (!W201("figure_ranged") || frame.P6ModeSerial != Interlocked.Read(ref _p6VisualModeSerial)) return;
-        if (!RangedStepV2.TryDecode(text, out var step)) { T3Increment("ranged_malformed"); return; }
+        if (!RangedStepV2.TryDecode(message.Text, out var step)) { T3Increment("ranged_malformed"); return; }
         if (frame.Stamp == 0 || frame.Stamp != step.World || context.World != step.World ||
             Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds + step.AgeMs > Protocol.RangedCaptureMaxAgeMs) { T3Increment("ranged_stale"); return; }
         if (_p6RemoteSteps.TryGetValue(src, out var last) && last.Peer == frame.P6PeerSerial)
@@ -249,11 +249,13 @@ public partial class GameBridge
         if (last.Gen != step.Generation || last.Epoch != step.Epoch || last.Peer != frame.P6PeerSerial) T3Increment("ranged_stream_reset");
         _p6RemoteSteps[src] = (frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence);
         T3Increment("ranged_in"); Interlocked.Increment(ref _w201RangedIn);
+        var body = Wo214FigureBody(src);
         var catalog = await P6CatalogAsync();
         if (!P6Current(context) || !P6PeerCurrent(src, frame.P6PeerSerial)) return;
         if (step.Kind == RangedWeaponKind.Unknown || catalog?.Kind(step.ItemClass) != step.Kind)
         { T3Increment("ranged_kind_unknown"); return; }
         bool Current() => P6Current(context) && W201("figure_ranged") && P6PeerCurrent(src, frame.P6PeerSerial) &&
+            body == Wo214FigureBody(src) && Wo214RangedReceiptCurrent(src, context, frame.P6PeerSerial, body, message.Tok, step.ItemClass) &&
             frame.P6ModeSerial == Interlocked.Read(ref _p6VisualModeSerial) &&
             frame.P6VisualSerial == Interlocked.Read(ref _p6VisualSerial) && (!_w179Remote.TryGetValue(src, out var scene) || (scene.Ended && !scene.CopyPlaying && scene.Landing != 1)) &&
             _p6RemoteSteps.TryGetValue(src, out var latest) && latest == (frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence) &&
@@ -261,34 +263,53 @@ public partial class GameBridge
         if (!_p5Peers.TryGetValue(src, out var peer) || peer.Serial != frame.P6PeerSerial) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, peer.Token);
         long capturedAt = Environment.TickCount64 - step.AgeMs - (long)Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds;
-        if (step.Kind == RangedWeaponKind.Bow && BowHandProof.IsDrawnPhase(step.Phase))
-            await Wo214OnRangedBowHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, capturedAt, Current, linked.Token);
+        if (BowHandProof.IsDrawnPhase(step.Phase))
+            await Wo214OnRangedHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, capturedAt, Current, linked.Token);
         else if (step.Kind == RangedWeaponKind.Crossbow && !linked.IsCancellationRequested && Current())
             Wo214OnOtherRangedHand(src, step.ItemClass, capturedAt);
         // Charge and Aim still lack a verified animation entry. Crossbow reload tags vary by subclass.
-        string fragment = Wo201Rules.RangedFragment(step.Phase);
-        if (fragment.Length == 0 || (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4))
+        if (Wo201Rules.RangedFragment(step.Phase).Length == 0 || (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4))
         { T3Increment("ranged_phase_unrenderable"); return; }
-        string tags = step.Kind == RangedWeaponKind.Bow ? "l_bow" : "l_crossbow";
-        if (frame.Presentation.SampleMs != 0 && W221On("rp_combat") &&
-            _ghostEntityIds.TryGetValue(src.ToString(System.Globalization.CultureInfo.InvariantCulture), out uint eid))
+
+        if (frame.Presentation.SampleMs == 0 || !W221On("rp_combat") || body.Entity == 0)
         {
-            var data = new byte[18];
-            data[0] = (byte)step.Kind;
-            data[1] = step.Phase;
-            step.ItemClass.TryWriteBytes(data.AsSpan(2));
-            var admission = await TrySubmitPresentationCombatAsync(src, eid, frame.Presentation,
-                unchecked((ushort)step.Sequence), 0x82, data, linked.Token, beforeWrite: Current);
-            if (admission != PresentationCombatAdmission.Fallback)
-            {
-                string result = admission == PresentationCombatAdmission.Accepted ? "accepted" : "suppressed";
-                Console.WriteLine(FormattableString.Invariant($"MP-RP-RANGED-IN peer={src} eid=0x{eid:X} weapon={step.Kind} phase={step.Phase} seq={step.Sequence} event_host_ms={frame.Presentation.SampleMs} result={result}"));
-                return;
-            }
+            Wo201RangedRefused(src, step, "typed-route-unavailable");
+            return;
         }
-        var id = await _combat.RangedOneShotAsync(Wo141Rules.AvatarName(src), fragment, tags, Current, linked.Token);
-        if (id is >= 0 && Current()) { Interlocked.Increment(ref _w201RangedShown); if (step.Kind == RangedWeaponKind.Bow) T3Increment("ranged_bow_played"); }
-        else T3Increment("ranged_animation_refused");
+        if (!_w214FigureHand.TryGetValue(src, out var hand) || !hand.Drawn || hand.Cls != step.ItemClass ||
+            hand.Body != body || !Wo214HandCurrent(src, hand))
+        {
+            Wo201RangedRefused(src, step, "no-current-hand-revision");
+            return;
+        }
+
+        // The hand record is intent. The typed native provider reads the actual hands before applying.
+        bool CurrentHand() => Current() && W214On("figure_hands") &&
+            _w214FigureHand.TryGetValue(src, out var latest) && Wo214SameHandState(latest, hand);
+        var data = new byte[18];
+        data[0] = (byte)step.Kind;
+        data[1] = step.Phase;
+        step.ItemClass.TryWriteBytes(data.AsSpan(2));
+        var admission = await TrySubmitPresentationCombatAsync(src, body.Entity, frame.Presentation,
+            unchecked((ushort)step.Sequence), 0x82, data, linked.Token, beforeWrite: CurrentHand);
+        if (admission != PresentationCombatAdmission.Accepted)
+        {
+            Wo201RangedRefused(src, step, admission == PresentationCombatAdmission.Fallback ? "typed-unavailable" : "typed-suppressed");
+            return;
+        }
+        Interlocked.Increment(ref _w201RangedDispatched);
+        Console.WriteLine(FormattableString.Invariant(
+            $"MP-RP-RANGED-IN peer={src} eid=0x{body.Entity:X} weapon={step.Kind} phase={step.Phase} seq={step.Sequence} event_host_ms={frame.Presentation.SampleMs} result=accepted body_generation={body.Generation} hand_rev={hand.Revision} cls={step.ItemClass:D}"));
     }
-    private string Wo201RangedStats() => $"ranged_out={Interlocked.Read(ref _w201RangedOut)} ranged_in={Interlocked.Read(ref _w201RangedIn)} ranged_shown={Interlocked.Read(ref _w201RangedShown)}";
+
+    private void Wo201RangedRefused(byte src, RangedStepV2 step, string reason)
+    {
+        T3Increment("ranged_animation_refused");
+        long count = Interlocked.Increment(ref _w201RangedRefused);
+        if (count <= 12 || count % 128 == 0)
+            Console.WriteLine(FormattableString.Invariant(
+                $"MP-RP-RANGED-IN peer={src} weapon={step.Kind} phase={step.Phase} seq={step.Sequence} result=refused reason={reason} n={count}"));
+    }
+
+    private string Wo201RangedStats() => $"ranged_out={Interlocked.Read(ref _w201RangedOut)} ranged_in={Interlocked.Read(ref _w201RangedIn)} ranged_dispatched={Interlocked.Read(ref _w201RangedDispatched)}";
 }
