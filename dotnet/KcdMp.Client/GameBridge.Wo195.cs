@@ -214,6 +214,7 @@ public partial class GameBridge
             }
             if (reply is not { Ok: true, Payload.Length: 3 } confirmed)
             {
+                _w195Dead.TryRemove(new KeyValuePair<string, Wo195DeathMark>(npc, mark));
                 Console.WriteLine($"MP-LANE2-H6 npc={npc} eid=0x{body.Eid:X} path={path} release=unconfirmed native_reason={reply?.Reason.ToString() ?? "no-ack"}");
                 return;
             }
@@ -221,7 +222,11 @@ public partial class GameBridge
             Console.WriteLine($"WO195-RELEASE npc={npc} path={path} eid=0x{body.Eid:X} engaged={(engaged ? "yes" : "no")} local={(local ? "yes" : "no")} wish={(wish ? "yes" : "no")} guard={(guard ? "yes" : "no")} native_held={Wo195Rules.HeldText(result[0])} combat_mode={Wo195Rules.Tri(result[1], "on", "off")} living={Wo195Rules.Tri(result[2], "yes", "no")}");
             if (_w195DeadRelease) _ = Wo195CheckLaterAsync(npc, body, mark.At, Current);
         }
-        catch (Exception ex) { Console.WriteLine($"MP-LANE2-H6 npc={npc} eid=0x{body.Eid:X} path={path} release=unconfirmed reason={ex.GetType().Name}"); }
+        catch (Exception ex)
+        {
+            if (_w195Dead.TryGetValue(npc, out var current) && current == mark) _w195Dead.TryRemove(new KeyValuePair<string, Wo195DeathMark>(npc, mark));
+            Console.WriteLine($"MP-LANE2-H6 npc={npc} eid=0x{body.Eid:X} path={path} release=unconfirmed reason={ex.GetType().Name}");
+        }
     }
 
     /// <summary>The release's proof: the body 1 s later (combat mode off, a ragdoll), this player's combat state 2 s later (the Lua).</summary>
