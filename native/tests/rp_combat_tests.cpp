@@ -32,7 +32,7 @@ int rp_combat_tests(int* passed) {
     reg[6] = 7; reg[kRegistrationHeader + 1] = 0;
     check(!decode_registration(reg.data(), reg.size(), registration), "embedded NUL refused at setup");
 
-    std::array<uint8_t, kActionHeader + 18> bytes{5, 0x78, 0x56, 0x34, 0x12, 0x24, 0, 0, 0, 0x96, 1, 0, 0, 0xff, 0xff, kSwing, kCommit};
+    std::array<uint8_t, kActionHeader + kRangedPayloadSize> bytes{5, 0x78, 0x56, 0x34, 0x12, 0x24, 0, 0, 0, 0x96, 1, 0, 0, 0xff, 0xff, kSwing, kCommit};
     bytes[kActionHeader] = 7;
     Event event;
     for (const uint8_t kind : {kSwing, kBlock, kDodge, kParry, kHit, kRecoil}) {
@@ -51,17 +51,36 @@ int rp_combat_tests(int* passed) {
     check(decode_event(bytes.data(), kActionHeader + 1, event) && event.stage == 0, "typed KO wake");
     bytes[kActionHeader] = 2;
     check(!decode_event(bytes.data(), kActionHeader + 1, event), "unknown KO state refused");
-    bytes[15] = kRanged; bytes[kActionHeader] = 1; bytes[kActionHeader + 1] = 3;
-    bytes[kActionHeader + 2] = 0x42;
+    bytes[15] = kRanged;
+    auto* ranged = bytes.data() + kActionHeader;
+    ranged[0] = kRangedProtocolVersion;
+    ranged[1] = 1;
+    ranged[2] = 3;
+    ranged[3] = 0x42;
+    ranged[19] = 0x11;
+    ranged[26] = 0x80;
+    ranged[30] = 0x90;
+    ranged[31] = 0xde;
+    ranged[33] = 0x80;
+    ranged[42] = 0x70;
     check(decode_event(bytes.data(), bytes.size(), event) && event.stage == 1 && event.rangedPhase == 3 &&
-          event.itemClass[0] == 0x42, "typed P6 bow fire retains held item class");
-    bytes[kActionHeader + 1] = 4;
+          event.itemClass[0] == 0x42 && event.rangedHand.peerSerial == 0x8000000000000011ULL &&
+          event.rangedHand.bodyGeneration == 0x90000000 && event.rangedHand.birth == 0x8000de &&
+          event.rangedHand.revision == 0x7000000000000000ULL, "typed bow Fire retains class, peer, generation, birth and revision");
+    check(!decode_event(bytes.data(), kActionHeader + 18, event), "class-only Fire cannot reach any provider");
+    ranged[0] = 2;
+    check(!decode_event(bytes.data(), bytes.size(), event), "Fire version without birth is refused");
+    ranged[0] = kRangedProtocolVersion;
+    ranged[34] = 1;
+    check(!decode_event(bytes.data(), bytes.size(), event), "unrepresentable Lua birth is refused");
+    ranged[34] = 0;
+    ranged[2] = 4;
     check(decode_event(bytes.data(), bytes.size(), event) && event.rangedPhase == 4, "bow load permitted");
-    bytes[kActionHeader] = 2;
+    ranged[1] = 2;
     check(!decode_event(bytes.data(), bytes.size(), event), "unverified crossbow load excluded");
-    bytes[kActionHeader + 1] = 5;
+    ranged[2] = 5;
     check(decode_event(bytes.data(), bytes.size(), event) && event.stage == 2, "typed crossbow uncharge");
-    bytes[kActionHeader + 2] = 0;
+    ranged[3] = 0;
     check(!decode_event(bytes.data(), bytes.size(), event), "ranged item must have nonempty class");
 
     Event hit{5, kHit, kCommit, 0, 8, 7, 9000, 42, 0, {}};

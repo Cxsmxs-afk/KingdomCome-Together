@@ -477,7 +477,7 @@ bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) 
                             request.frame.body[0] == pipecontrol::kEdgeCapabilities);
     const bool latest = nested == kSetPartner || nested == kReadBodyState || nested == kReadLocalState;
     const bool presentation = nested == kTimedAction || nested == kTimedPose || nested == kTimelineConfig ||
-                              nested == kRemoteRelocation || nested == kCombatEvent;
+                              nested == kRemoteRelocation || nested == kCombatEvent || nested == kRangedHand;
     const bool bulk = nested == kProbe || nested == kCombatRow;
     if (lifecycle || (nested > kPinLabel && nested != kRawPose && !bulk && !presentation) ||
         (request.lane == Lane::Latest && !latest) ||
@@ -603,7 +603,7 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
         case kAvatarEvent: case kAttributedDamage: case kApplyPvpHit: case kNpcHold:
         case kNpcSamples: case kLeashSample: case kSetPartner:
         case edgelanes::kRawPose: case edgelanes::kTimedPose: case edgelanes::kTimedAction:
-        case edgelanes::kRemoteRelocation: case edgelanes::kCombatEvent: case edgelanes::kCombatRow:
+        case edgelanes::kRemoteRelocation: case edgelanes::kCombatEvent: case edgelanes::kCombatRow: case edgelanes::kRangedHand:
             return LoadAccess::Live;
         case kJoinPlace: case kGhostIsolate: case kMirrorGrave:
             return LoadAccess::Setup;
@@ -1978,6 +1978,17 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 const uint8_t r = t_edgeReply ? npcdrive::authorize_remote_relocation(body, len,
                     {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp}) : npcdrive::kBadRequest;
                 send_result(h, r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case edgelanes::kRangedHand: {
+                using namespace timelineactions;
+                const Scope scope{incoming.readerObservation, generation + 1, incoming.readerLife, incoming.loadStamp};
+                const auto receipt = t_edgeReply ? handle_ranged_hand(body, len, scope) : HandObservation{};
+                uint8_t out[kRangedHandReplySize]{static_cast<uint8_t>(receipt.result == Accepted), 0,
+                    kRangedHandVersion, receipt.result, receipt.known};
+                std::copy(receipt.left.begin(), receipt.left.end(), out + 5);
+                std::copy(receipt.right.begin(), receipt.right.end(), out + 21);
+                send_frame(h, edgelanes::kRangedHandReply, out, sizeof out, generation);
                 break;
             }
             case edgelanes::kProbe: {

@@ -36558,13 +36558,15 @@ do
     end
 
     -- the partner's hand (the agent: his W203 FigureHand row): his figure <id> here holds <cls> while <drawn>
-    function KCD2MP_W214FigureHand(id, drawn, cls, oversized, body, revision, birth)
+    function KCD2MP_W214FigureHand(id, drawn, cls, oversized, body, revision, birth, observationStamp)
         if not KCD2MP_W214On("figure_hands") then return false end   -- the twin: today's path (the outfit and DrawWeapon only)
         id = tostring(id); cls = tostring(cls or "-")
         local h = W214.hand
         local g = KCD2MP.ghosts and KCD2MP.ghosts[id]
         local e = g and g.entity
         if not (e and e.human and KCD2MP.w136 and KCD2MP.w136.handClass) then return false end
+        if observationStamp and (not body or type(observationStamp) ~= "string" or #observationStamp ~= 64
+            or not observationStamp:match("^%x+$") or observationStamp:sub(-16) ~= revision) then return false end
         if body then
             if not w214BodyMatches(g, body, birth) then w214OutfitRefused(id, "hand-old-body"); return false end
             if g.w214HandRevision and revision < g.w214HandRevision then w214OutfitRefused(id, "hand-old-revision"); return false end
@@ -36579,24 +36581,32 @@ do
         local gen = (h.gen[id] or 0) + 1   -- a newer message supersedes a check still running
         h.gen[id] = gen
         local t0 = os.clock()
-        local function held() return KCD2MP.w136.handClass(e, 0) end
-        local function live() local gg = KCD2MP.ghosts[id]; return h.gen[id] == gen and gg ~= nil and gg.entity == e end
+        local function held(slot) return KCD2MP.w136.handClass(e, slot) end
+        local function holdsClass() return held(0) == cls or held(1) == cls end
+        local function empty() return held(0) == nil and held(1) == nil end
+        local function live()
+            local gg = KCD2MP.ghosts[id]
+            return h.gen[id] == gen and gg == g and gg.entity == e
+                and (not body or (w214BodyMatches(gg, body, birth) and gg.w214HandRevision == revision))
+        end
         local function report(result, how)
-            local now = held()
+            if not live() then return end
+            local now = tostring(held(0) or "-") .. "/" .. tostring(held(1) or "-")
             if result == "ok" then h.stats.ok = h.stats.ok + 1 elseif result == "fixed" then h.stats.fixed = h.stats.fixed + 1 else h.stats.failed = h.stats.failed + 1 end
             mp_log(string.format("WO214-HAND figure=%s want=%s held=%s -> %s %s (%.0f ms)", id, drawn and cls or "-", tostring(now or "-"), result, how,
                 (os.clock() - t0) * 1000))
-            KCD2MP_EmitEvent("w214_figure_hand", id .. " " .. result .. " " .. how)
+            local stamp = observationStamp and (" " .. birth .. " " .. observationStamp) or ""
+            KCD2MP_EmitEvent("w214_figure_hand", id .. " " .. result .. " " .. how .. stamp)
         end
         if not drawn then
             if body and KCD2MP_GhostCombat then KCD2MP_GhostCombat(id, 1) end -- CombatEventWeaponSheathed
             -- the sheathe is the combat event's own (HolsterWeapon); a hand still full 1.5 s later, while sheathed, is put away
             Script.SetTimer(1500, function()
                 if not live() then return end
-                if held() == nil then return report("ok", "empty") end
+                if empty() then return report("ok", "empty") end
                 if KCD2MP.ghostWeaponDrawn[id] then return end   -- drawn again since
                 pcall(function() e.human:HolsterWeapon() end)
-                Script.SetTimer(1200, function() if live() then report(held() == nil and "fixed" or "failed", "holstered") end end)
+                Script.SetTimer(1200, function() if live() then report(empty() and "fixed" or "failed", "holstered") end end)
             end)
             return true
         end
@@ -36604,30 +36614,33 @@ do
         local function item()
             local it = nil
             pcall(function() it = e.inventory and e.inventory:FindItem(cls) end)
-            if not it and e.inventory then
+            if not it and e.inventory and live() then
                 pcall(function() e.inventory:CreateItem(cls, 1, 1) end)
                 pcall(function() it = e.inventory:FindItem(cls) end)
             end
             return it
         end
         local function lastResort(it)
+            if not live() then return end
             pcall(function() e.human:DrawFromInventory(it, 0, true) end)
             KCD2MP.ghostWeaponDrawn[id] = true
             Script.SetTimer(1000, function()
-                if live() then report(held() == cls and "fixed" or "failed", "drawn-from-inventory") end
+                if live() then report(holdsClass() and "fixed" or "failed", "drawn-from-inventory") end
             end)
         end
         local function fix()
+            if not live() then return end
             local it = item()
-            if not it then return report("failed", "no-item") end
+            if not it or not live() then return report("failed", "no-item") end
             if oversized then return lastResort(it) end   -- WO-47: an oversized weapon's own path
             pcall(function() e.actor:EquipInventoryItem(it) end)   -- the game's own equip: into the figure's weapon set
-            if held() ~= nil then pcall(function() e.human:HolsterToInventory(0, false) end) end   -- a wrong item in hand goes first
+            if held(0) ~= nil and live() then pcall(function() e.human:HolsterToInventory(0, false) end) end  -- a wrong item in hand goes first
+            if not live() then return end
             pcall(function() e.human:DrawWeapon() end)
             KCD2MP.ghostWeaponDrawn[id] = true
             Script.SetTimer(1200, function()
                 if not live() then return end
-                if held() == cls then return report("fixed", "equipped+drawn") end
+                if holdsClass() then return report("fixed", "equipped+drawn") end
                 lastResort(it)
             end)
         end
@@ -36636,7 +36649,7 @@ do
         local waited = 0
         local function check()
             if not live() then return end
-            if held() == cls then return report("ok", waited == 0 and "held" or "drew") end
+            if holdsClass() then return report("ok", waited == 0 and "held" or "drew") end
             if waited >= 500 then return fix() end
             waited = waited + 250
             Script.SetTimer(250, check)
