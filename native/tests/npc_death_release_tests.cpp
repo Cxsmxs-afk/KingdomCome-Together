@@ -13,6 +13,7 @@ struct Engine {
     int body = 8, resolves = 0, stops = 0, prepares = 0, writes = 0, confirmed = 0;
     int aborts = 0;
     bool gameplay = true, seenFinished = false, releaseProof = true, guardOff = true, invokeAck = true;
+    bool preparationCurrent = true;
     bool combatCurrent = true, stopRequested = false, reusesOnInvoke = false;
     bool fence = false, mayAbort = true;
     bool bodyReadable = true, hideOnInvoke = false;
@@ -40,7 +41,11 @@ struct Engine {
         return true;
     }
     Life life(int) const { return currentLife; }
-    bool prepare(int, const Request&, uint64_t) { ++prepares; return guardOff; }
+    Preparation prepare(int, const Request&, uint64_t) {
+        ++prepares;
+        if (!preparationCurrent) return Preparation::NotStarted;
+        return guardOff ? Preparation::Ready : Preparation::Uncertain;
+    }
     bool apply(int, const Request&) {
         ++writes;
         if (reusesOnInvoke) ++body;
@@ -185,6 +190,30 @@ int npc_death_release_tests(int* passed) {
         wrong.soul[0] = 8;
         check(attempts.step(wrong, scope, engine) == Receipt::Stale && engine.resolves == 1,
               "same attempt can't be moved to a different GUID");
+    }
+    {
+        Engine engine;
+        engine.seenFinished = true;
+        engine.preparationCurrent = false;
+        Attempts<int> attempts;
+        check(attempts.step(named, scope, engine) == Receipt::Uncertain && engine.prepares == 1 &&
+              engine.fence && engine.writes == 0, "loss of the pre-mutation preparation proof holds the attempt");
+        engine.preparationCurrent = true;
+        check(attempts.step(named, scope, engine) == Receipt::Uncertain &&
+              engine.prepares == 1 && engine.writes == 0, "a late Advance cannot restart failed preparation");
+        engine.mayAbort = false;
+        check(attempts.step(named, scope, engine, Intent::AbortBeforeApply) == Receipt::Uncertain &&
+              engine.fence, "missing release ownership cannot clear the fence");
+        engine.mayAbort = true;
+        check(attempts.step(named, scope, engine, Intent::AbortBeforeApply) == Receipt::Aborted &&
+              engine.aborts == 2 && !engine.fence && engine.writes == 0,
+              "proved unchanged body and attempt can abort when no preparation mutation began");
+        check(attempts.step(named, scope, engine) == Receipt::Aborted && engine.prepares == 1 &&
+              engine.writes == 0, "a proved abort seals the original attempt against late Advance");
+        auto later = named;
+        later.attempt += 2;
+        check(attempts.step(later, scope, engine) == Receipt::Pending && engine.prepares == 2 &&
+              engine.writes == 1, "the new attempt can perform the sole lethal dispatch after a proved abort");
     }
     {
         Engine engine;

@@ -25,9 +25,11 @@ EID = re.compile(r'0x[0-9a-fA-F]+\Z')
 CRASH = re.compile(r'\bWO202-CRASH 0x[0-9a-fA-F]+\b')
 PLAYBACK_STAGES = ('ready', 'death-dispatched', 'applied')
 ABORTED = ('aborted-before-apply', 'aborted-unadmitted')
-TERMINAL_STAGES = ('applied', 'uncertain', 'stale', *ABORTED)
+TERMINAL_STAGES = ('applied', 'uncertain', 'preparation-uncertain', 'stale', *ABORTED)
 AWAITING_READBACK = ('death-pending', 'apply-uncertain')
-PHASES = {*PLAYBACK_STAGES, *TERMINAL_STAGES, *AWAITING_READBACK, 'release-pending', 'release-uncertain', 'apply-exception'}
+FAILED_PREPARATION = ('preparation-not-started', 'preparation-uncertain')
+PHASES = {*PLAYBACK_STAGES, *TERMINAL_STAGES, *AWAITING_READBACK, *FAILED_PREPARATION,
+          'release-pending', 'release-uncertain', 'apply-exception'}
 FRAME_P95 = re.compile(r'\bFRAME .*\bframes=([1-9]\d*) .*\bours_us_p95=(\d+)\b')
 
 
@@ -98,6 +100,10 @@ def native_evidence(rows):
             grey.append(f'attempt-{attempt}-scope-unmeasured')
             continue
         terminal = [phase for phase in phases if phase in TERMINAL_STAGES]
+        if any(phase in FAILED_PREPARATION for phase in phases) and (
+                'death-dispatched' in phases or 'applied' in terminal):
+            red.append(f'attempt-{attempt}-mutation-after-failed-preparation')
+            continue
         aborted = next((phase for phase in terminal if phase in ABORTED), None)
         if aborted:
             red.append(f'attempt-{attempt}-{aborted}')

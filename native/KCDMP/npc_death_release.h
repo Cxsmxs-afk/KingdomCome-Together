@@ -25,10 +25,11 @@ struct Scope {
 enum class Intent : uint8_t { Advance, ObserveOnly, AbortBeforeApply };
 enum class Receipt : uint8_t { Applied = 0, Pending = 0x70, Uncertain = 0x71, Stale = 0x72, Aborted = 0x73 };
 enum class Retirement { Ready, Pending, Uncertain, Stale };
+enum class Preparation { Ready, NotStarted, Uncertain };
 enum class Life { Alive, Dead, Unreadable };
 enum class Stage {
     ReleasePending, ReleaseUncertain, Ready, DeathPending, ApplyUncertain,
-    Applied, Uncertain, Stale, Aborted, AbortedUnadmitted
+    Applied, Uncertain, Stale, Aborted, AbortedUnadmitted, PreparationNotStarted, PreparationUncertain
 };
 
 inline bool nonlethal_health(float requested, float observed, float& allowed) {
@@ -125,9 +126,9 @@ public:
         };
         if (phase == Phase::Observe) return observe(entry.receipt, false);
 
-        auto unconfirmed_before_prepare = [&] {
+        auto unconfirmed_before_prepare = [&](Stage stage = Stage::ReleaseUncertain) {
             entry.phase = Phase::Release;
-            if (!entry.advanceBlocked) report(Stage::ReleaseUncertain);
+            if (!entry.advanceBlocked) report(stage);
             entry.advanceBlocked = true;
             return Receipt::Uncertain;
         };
@@ -154,7 +155,11 @@ public:
         if (before == Life::Dead)
             return backend.current(entry.body, request, false) ? confirm() : finish(Receipt::Uncertain, Stage::Uncertain);
         if (before != Life::Alive) return unconfirmed_before_prepare();
-        if (!backend.prepare(entry.body, request, request.attempt)) return finish(Receipt::Uncertain, Stage::Uncertain);
+        switch (backend.prepare(entry.body, request, request.attempt)) {
+            case Preparation::NotStarted: return unconfirmed_before_prepare(Stage::PreparationNotStarted);
+            case Preparation::Uncertain: return finish(Receipt::Uncertain, Stage::PreparationUncertain);
+            case Preparation::Ready: break;
+        }
         if (!backend.current(entry.body, request, true) || !backend.ready(entry.body, request.attempt))
             return finish(Receipt::Stale, Stage::Stale);
         const bool admitted = backend.apply(entry.body, request);

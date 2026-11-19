@@ -1471,17 +1471,20 @@ struct DeathBackend {
         return dead ? npcdeath::Life::Dead : npcdeath::Life::Alive;
     }
 
-    bool prepare(const DeathBody& body, const npcdeath::Request& request, uint64_t attempt) const {
+    npcdeath::Preparation prepare(const DeathBody& body, const npcdeath::Request& request, uint64_t attempt) const {
+        using Preparation = npcdeath::Preparation;
         const uint32_t eid = body.actions.eid;
-        if (!current(body, request, true) || !ready(body, attempt)) return false;
+        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::NotStarted;
+        // Release can change native holds. From here on, a failed readback must retain the fence.
         wo195::release(eid, "verified remote NPC death");
-        if (!current(body, request, true) || !ready(body, attempt)) return false;
+        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::Uncertain;
         hits::discard_from(eid, false);
         uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
         std::memcpy(payload + 2, &eid, sizeof eid);
         uint8_t guard[32]{};
         size_t used = 0;
-        return wo131::handle(payload, sizeof payload, guard, sizeof guard, &used) == wo131::kROk && used == 1 && guard[0] == 1;
+        return wo131::handle(payload, sizeof payload, guard, sizeof guard, &used) == wo131::kROk && used == 1 && guard[0] == 1
+            ? Preparation::Ready : Preparation::Uncertain;
     }
 
     bool apply(const DeathBody& body, const npcdeath::Request& request) const {
@@ -1523,6 +1526,8 @@ struct DeathBackend {
             case npcdeath::Stage::Aborted: return report_tag(body, request, "aborted-before-apply");
             case npcdeath::Stage::AbortedUnadmitted: return report_tag(body, request, "aborted-unadmitted", " reason=never-admitted");
             case npcdeath::Stage::ApplyUncertain: return report_tag(body, request, "apply-uncertain");
+            case npcdeath::Stage::PreparationNotStarted: return report_tag(body, request, "preparation-not-started");
+            case npcdeath::Stage::PreparationUncertain: return report_tag(body, request, "preparation-uncertain");
         }
     }
 };

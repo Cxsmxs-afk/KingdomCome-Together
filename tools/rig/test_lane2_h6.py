@@ -85,6 +85,19 @@ class H6EvidenceTests(unittest.TestCase):
         self.assertIn('attempt-1-aborted-before-apply', report['red'])
         self.assertEqual(29, len(report['qualified_deaths']))
 
+    def test_failed_preparation_cannot_count_or_later_dispatch_for_the_same_attempt(self):
+        rows = death_rows()
+        dispatched = next(i for i, row in enumerate(rows) if 'attempt=1 ' in row and 'stage=death-dispatched' in row)
+        for marker in ('preparation-not-started', 'preparation-uncertain'):
+            failed_preparation = rows[dispatched].replace('stage=death-dispatched', f'stage={marker}')
+            incomplete = [*rows[:dispatched], failed_preparation, *rows[dispatched + 3:]]
+            report = self.check(incomplete)
+            self.assertEqual(29, len(report['qualified_deaths']))
+            self.assertIn('attempt-1-death-unconfirmed', report['grey'])
+            self.assertNotIn('unreadable-h6-marker', report['grey'])
+            self.assertIn('attempt-1-mutation-after-failed-preparation',
+                          self.check([*rows[:dispatched], failed_preparation, *rows[dispatched:]])['red'])
+
     def test_ready_is_required_before_dispatch_and_isdead(self):
         rows = death_rows()
         ready = next(i for i, row in enumerate(rows) if 'attempt=1 ' in row and 'stage=ready' in row)
