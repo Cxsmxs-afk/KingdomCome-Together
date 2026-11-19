@@ -169,7 +169,9 @@ public sealed class Lane2NpcDeathIngressTests
     [InlineData(null)]
     public async Task Deadline_sends_one_pre_apply_abort_and_no_replacement(byte? abortReceipt)
     {
-        await using var fixture = await Fixture.OpenAsync();
+        // This probe waits through both production budgets. Keep room for
+        // Named Pipe startup and timer scheduling on a busy test runner.
+        await using var fixture = await Fixture.OpenAsync(TimeSpan.FromSeconds(10));
         Task ingress = fixture.Ingress("fatal");
         var first = await fixture.ReadRequestAsync();
         fixture.AssertBound(first, Eid);
@@ -233,7 +235,7 @@ public sealed class Lane2NpcDeathIngressTests
 
     private sealed class Fixture : IAsyncDisposable
     {
-        private readonly CancellationTokenSource _deadline = new(TimeSpan.FromSeconds(4));
+        private readonly CancellationTokenSource _deadline;
         private readonly NamedPipeServerStream _wire;
         private readonly CombatPipe _pipe;
         private readonly GameBridge _bridge = new(new ClientConfig());
@@ -242,8 +244,9 @@ public sealed class Lane2NpcDeathIngressTests
         private readonly Guid _soul = Guid.NewGuid();
         private ulong _generation;
 
-        private Fixture()
+        private Fixture(TimeSpan deadline)
         {
+            _deadline = new(deadline);
             string name = "lane2-npc-death-" + Guid.NewGuid().ToString("N");
             _wire = new(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
             _pipe = new(name);
@@ -251,9 +254,9 @@ public sealed class Lane2NpcDeathIngressTests
 
         public CancellationToken Token => _deadline.Token;
 
-        public static async Task<Fixture> OpenAsync()
+        public static async Task<Fixture> OpenAsync(TimeSpan? deadline = null)
         {
-            var f = new Fixture();
+            var f = new Fixture(deadline ?? TimeSpan.FromSeconds(4));
             Task connecting = f._wire.WaitForConnectionAsync(f.Token);
             Assert.True(await f._pipe.EnsureConnectedAsync(f.Token));
             await connecting;
