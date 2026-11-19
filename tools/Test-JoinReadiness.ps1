@@ -15,11 +15,6 @@ $root = Split-Path -Parent $PSScriptRoot
 if ($Check -eq 'EndToEnd') {
     $tests = Join-Path $root 'dotnet/KcdMp.Client.Tests'
     $fixture = Join-Path $tests 'JoinCalendarIntegrationTests.cs'
-    if ($ExpectKnownFailure) {
-        if (Test-Path -LiteralPath $fixture) { throw 'H20 fixture exists. Enable the required End-to-End-Join assertions.' }
-        Write-Warning 'EXPECTED FAILURE H20: End-to-End-Join fixture missing. The network simulation provides no proof of a calendar bootstrap at the main menu.'
-        return
-    }
     if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) { throw 'Required H20 End-to-End-Join fixture missing' }
 
     . (Join-Path $PSScriptRoot 'Required-TestResults.ps1')
@@ -29,6 +24,8 @@ if ($Check -eq 'EndToEnd') {
         Invoke-KcdManagedTests $project "End-to-End-Join $case" 2 `
             -Filter "FullyQualifiedName=KcdMp.Client.Tests.JoinCalendarIntegrationTests.$case"
     }
+    Invoke-KcdManagedTests $project "End-to-End-Join delayed calendar" 1 `
+        -Filter 'FullyQualifiedName=KcdMp.Client.Tests.JoinCalendarIntegrationTests.A_delayed_calendar_can_arrive_after_five_seconds_while_the_host_still_waits'
     return
 }
 

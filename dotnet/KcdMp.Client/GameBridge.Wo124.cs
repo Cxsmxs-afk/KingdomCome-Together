@@ -786,12 +786,13 @@ public partial class GameBridge
                 await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, authorityReason, HostAuthorityFailure.Message(authorityReason)!);
                 return;
             }
-            if (!await PrepareHostCalendarAsync(j))
+            bool calendarReady = await PrepareHostCalendarAsync(j);
+            if (Wo124JoinGone(j, "after calendar prepare")) return;
+            if (!calendarReady)
             {
                 await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "clock-unavailable", "Your host's world clock could not be prepared.");
                 return;
             }
-            if (Wo124JoinGone(j, "after calendar prepare")) return;
             j.Phase = "loading";
             Wo137OnJoinLoading(j.JoinId);   // WO-137: host quest changes from before this world are in it already
             SetJoinUi("loading", "Loading your host's world...");

@@ -4875,6 +4875,7 @@ public partial class GameBridge(ClientConfig config)
                     LoadGeneration = load.Generation, LoadCancellation = load.Token,
                     Presentation = presentation, MarkerPeerSerial = markerPeer
                 };
+                if ((type is Protocol.W164Down or Protocol.W203Down) && TryHandleJoinCalendarAtRead(inFrame, stream, ct)) continue;
                 if (!LoadSequenceFrameCurrent(inFrame)) continue;
                 if (WorldSyncEffective && WorldSyncCatalog.EventChannel(type, payload) is not null) continue;
                 if (T3TryDeferSideChannel(inFrame)) continue;

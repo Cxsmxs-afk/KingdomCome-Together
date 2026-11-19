@@ -78,8 +78,7 @@ jobs:
 
       - name: End-to-End-Join
         shell: pwsh
-        # H20 enables the required tests once the real reader integration fixture lands.
-        run: ./tools/Test-JoinReadiness.ps1 -Check EndToEnd -ExpectKnownFailure
+        run: ./tools/Test-JoinReadiness.ps1 -Check EndToEnd
 
       - name: Join aborts preserve personal saves
         shell: pwsh
