@@ -86,6 +86,9 @@ try {
     Add-Type -TypeDefinition $expectedSource -OutputAssembly (Join-Path $work 'expected.dll')
     Add-Type -TypeDefinition $otherSource -OutputAssembly (Join-Path $work 'other.dll')
     Invoke-Fixture 'Complete_code_only_drop_in_passes'
+    Invoke-Fixture 'Save_anywhere_in_code_only_zip_is_rejected' 'A code-only drop-in contains a save file' -AlterArchive {
+        param($root) Write-FixtureText (Join-Path $root 'KingdomComeTogether/synthetic.WhS') 'synthetic test bytes'
+    }
     Invoke-Fixture 'Missing_agent_is_rejected' 'Missing or empty drop-in entry: KingdomComeTogether/KcdMpClient.exe' -AlterArchive {
         param($root) Remove-Item -LiteralPath (Join-Path $root 'KingdomComeTogether/KcdMpClient.exe')
     }
@@ -117,4 +120,4 @@ finally {
 }
 
 if ($failures.Count) { throw "Drop-in synthetic gate failed ($($failures.Count) failures)" }
-Write-Output 'Drop-in synthetic gate PASS: 8 cases'
+Write-Output 'Drop-in synthetic gate PASS: 9 cases'

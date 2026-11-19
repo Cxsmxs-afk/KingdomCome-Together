@@ -30,6 +30,9 @@ $installManifest = Join-Path $ReleaseDir "install-manifest.txt"
 foreach ($p in @($pak, $manifest, $launcher, $agent, $relay, $dll, $installManifest)) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "missing: $p" }
 }
+if (Get-ChildItem -LiteralPath $ReleaseDir -Recurse -Force -File | Where-Object Extension -ieq '.whs') {
+    throw 'The player drop-in cannot contain game saves.'
+}
 
 $version = (Get-Content (Join-Path $root "VERSION") -TotalCount 1).Trim()
 $buildId = (Get-Content -LiteralPath (Join-Path $root "BUILD_ID") -Raw).Trim()

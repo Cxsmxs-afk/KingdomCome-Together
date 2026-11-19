@@ -154,7 +154,7 @@ try {
 Write-Output "Brand pak: kdcmp_brand.pak ($((Get-Item $brandPak).Length) bytes, $($brandFiles.Count) files: the menu logo and the partner markers)"
 
 # Check the assembled installer input as well as the separately verified player ZIP.
-if (Get-ChildItem -LiteralPath $OutDir -Recurse -Force -File -Filter '*.whs') {
+if (Get-ChildItem -LiteralPath $OutDir -Recurse -Force -File | Where-Object Extension -ieq '.whs') {
     throw 'The public release staging directory contains a game save.'
 }
 Write-Output 'Private start saves stay on the player profile: this build ships none.'
