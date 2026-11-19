@@ -121,7 +121,7 @@ public sealed class P6RangedBridgeTests
             finally { File.Delete(path); }
         }
         public void Receive() => _receive = (Task)Call(Bridge, "ReceiveLoopAsync", Link, Stop.Token)!;
-        public async Task StartTimedReceiveAsync()
+        public async Task StartTimedReceiveAsync(bool friendlyFire = false)
         {
             Assert.True(await Pipe.EnsureConnectedAsync());
             await Accept;
@@ -132,7 +132,14 @@ public sealed class P6RangedBridgeTests
             await Reply(Server, 0xAC, 0, 255, [1]);
             Assert.True(await probe);
 
-            Set(Bridge, "_w213Caps", (ushort)(Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat));
+            ushort capabilities = Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat;
+            if (friendlyFire)
+            {
+                capabilities |= Protocol.LinkCapPvpContact;
+                var contactSession = typeof(GameBridge).GetNestedType("PvpContactSession", BindingFlags.NonPublic)!;
+                Set(Bridge, "_wo121ContactSession", Activator.CreateInstance(contactSession, Private | BindingFlags.Public, null, [Link], null));
+            }
+            Set(Bridge, "_w213Caps", capabilities);
             Get<ConcurrentDictionary<string, byte>>(Bridge, "_nativeBound")[$"kcd2mp_{Peer}"] = 1;
             Get<ConcurrentDictionary<string, bool>>(Bridge, "_w221On")["rp_combat"] = true;
             Receive();
@@ -381,6 +388,71 @@ public sealed class P6RangedBridgeTests
         Assert.False(await nextRequest);
         Assert.Equal(1, Count(r.Bridge, "ranged_stale"));
         Assert.Equal(0, Count(r.Bridge, "ranged_in"));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_mixed_reader_queue_preserves_the_fire_body_and_friendly_fire_contact_without_affecting_other_frames(bool host)
+    {
+        await using var r = await Rig.Create(host);
+        await r.StartTimedReceiveAsync(friendlyFire: true);
+        r.Game.BlockHorse = true;
+        r.Http.BatchingEnabled = false;
+
+        const ulong sourceIncarnation = 43;
+        byte local = Get<byte>(r.Bridge, "_myGhostId");
+        byte[] Contact(byte recipient, ulong sequence, float health) => Wire(Protocol.PlayerHitV8Down,
+            [r.Peer, .. new PlayerHitV8(recipient, 10, health, 0, 0).BuildUp(sequence, sourceIncarnation)[3..]]);
+
+        long bytesRead = r.Link.ReadRequestedAfterBytes;
+        byte[] horse = Wire(Protocol.HorseInfoDown, r.Peer, 0);
+        r.Link.Feed(horse);
+        await r.Game.HorseEntered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+        byte[] retiredContact = Contact(local, 1, 5);
+        r.Link.Feed(retiredContact);
+        bytesRead += horse.Length + retiredContact.Length;
+        await Until(() => r.Link.ReadRequestedAfterBytes >= bytesRead);
+        Call(r.Bridge, "T3NoteInputLifeEdge", true);
+        Call(r.Bridge, "T3NoteInputLifeEdge", false);
+
+        byte[] retiredFire = TimedFire(r.Peer);
+        r.Link.Feed(retiredFire);
+        bytesRead += retiredFire.Length;
+        await Until(() => r.Link.ReadRequestedAfterBytes >= bytesRead);
+        Call(r.Bridge, "OnGameEvent", "ghostid", $"{r.Peer} df");
+
+        byte[] currentContact = Contact(local, 2, 7);
+        byte[] wrongRecipient = Contact(r.Peer, 3, 9);
+        byte[] version = Wire(Protocol.ReleaseVersion, [r.Peer, .. "integration-test"u8]);
+        long currentContactReadStart = Environment.TickCount64;
+        r.Link.Feed(retiredContact, wrongRecipient, currentContact, currentContact, version);
+        bytesRead += retiredContact.Length + wrongRecipient.Length + 2 * currentContact.Length + version.Length;
+        await Until(() => r.Link.ReadRequestedAfterBytes >= bytesRead);
+        long currentContactReadEnd = Environment.TickCount64;
+
+        r.Game.ReleaseHorse.TrySetResult();
+        var versions = Get<ConcurrentDictionary<byte, string>>(r.Bridge, "_ghostReleaseVersions");
+        Task processed = Until(() => versions.ContainsKey(r.Peer));
+        var request = Read(r.Server);
+        Assert.Same(request, await Task.WhenAny(request, processed));
+        var (type, body) = await request;
+        Assert.Equal(0x1A, type);
+        Assert.Equal(34, body.Length);
+        Assert.Equal(7f, BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)));
+        Assert.Equal(r.Peer, body[9]);
+        Assert.Equal(2UL, BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(10)));
+        Assert.Equal(sourceIncarnation, BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(18)));
+        Assert.InRange((long)BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(26)), currentContactReadStart, currentContactReadEnd);
+        await r.Server.WriteAsync(Wire(0x81, 1, 1, (byte)PipeReason.PvpEffectObserved));
+
+        await processed;
+        Assert.Equal("integration-test", versions[r.Peer]);
+        Assert.Equal(1, Count(r.Bridge, "ranged_stale"));
+        Assert.Equal(0, Count(r.Bridge, "ranged_in"));
+        Assert.Equal(1, Get<long>(r.Bridge, "_w121FfIn"));
+        Assert.Equal(4, Get<long>(r.Bridge, "_w121FfInDropped"));
     }
 
     [Theory]
