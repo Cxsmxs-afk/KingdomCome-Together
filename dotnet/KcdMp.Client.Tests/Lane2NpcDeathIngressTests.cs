@@ -200,6 +200,22 @@ public sealed class Lane2NpcDeathIngressTests
     }
 
     [Fact]
+    public async Task Initial_abort_receipt_closes_the_attempt_without_followup_or_replacement()
+    {
+        await using var fixture = await Fixture.OpenAsync();
+        Task ingress = fixture.Ingress("fatal");
+        fixture.AssertBound(await fixture.ReadRequestAsync(), Eid);
+        await fixture.ReplyAsync(1, 0x73);
+
+        await fixture.AssertCompletedWithoutWriteAsync(ingress);
+        Assert.False(fixture.Dead);
+        Assert.Equal(0L, fixture.Releases);
+        await fixture.Ingress("named");
+        await fixture.Ingress("guid");
+        await fixture.AssertNoWriteAsync();
+    }
+
+    [Fact]
     public async Task Pending_releases_the_frame_and_keeps_observing_the_same_attempt()
     {
         await using var fixture = await Fixture.OpenAsync();
@@ -395,6 +411,17 @@ public sealed class Lane2NpcDeathIngressTests
         public async Task WaitForDeadAsync()
         {
             while (!Dead) await Task.Delay(10, Token);
+        }
+
+        public async Task AssertCompletedWithoutWriteAsync(Task ingress)
+        {
+            using var wait = CancellationTokenSource.CreateLinkedTokenSource(Token);
+            Task read = _wire.ReadExactlyAsync(new byte[1], wait.Token).AsTask();
+            Task first = await Task.WhenAny(ingress, read).WaitAsync(Token);
+            Assert.Same(ingress, first);
+            await ingress;
+            await wait.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await read);
         }
 
         public async Task AssertNoWriteAsync()

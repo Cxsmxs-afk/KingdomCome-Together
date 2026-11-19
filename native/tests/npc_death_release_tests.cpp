@@ -11,14 +11,16 @@ using namespace kcdmp::npcdeath;
 
 struct Engine {
     int body = 8, resolves = 0, stops = 0, prepares = 0, writes = 0, confirmed = 0;
-    int aborts = 0;
+    int aborts = 0, holdChanges = 0, followupActions = 0;
+    mutable int lifeReads = 0;
     bool gameplay = true, seenFinished = false, releaseProof = true, guardOff = true, invokeAck = true;
     bool combatCurrent = true, stopRequested = false, reusesOnInvoke = false;
     bool fence = false, mayAbort = true;
-    bool bodyReadable = true, hideOnInvoke = false;
+    bool bodyReadable = true, hideOnInvoke = false, refuseBeforePreparation = false;
     uint64_t nowMs = 0, finishAtMs = 0;
     Life currentLife = Life::Alive;
     std::function<void()> onStop;
+    std::function<void()> onPrepare;
     std::vector<Stage> stages;
 
     bool scope_current() const { return gameplay; }
@@ -39,8 +41,19 @@ struct Engine {
         fence = false;
         return true;
     }
-    Life life(int) const { return currentLife; }
-    bool prepare(int, const Request&, uint64_t) { ++prepares; return guardOff; }
+    Life life(int) const { ++lifeReads; return currentLife; }
+    Preparation prepare(int, const Request&, uint64_t) {
+        ++prepares;
+        if (onPrepare) onPrepare();
+        if (refuseBeforePreparation) return Preparation::Unchanged;
+        ++holdChanges;
+        return guardOff ? Preparation::Ready : Preparation::Uncertain;
+    }
+    bool queue_followup(int proof) {
+        if (fence || proof != body || currentLife != Life::Alive || followupActions) return false;
+        ++followupActions;
+        return true;
+    }
     bool apply(int, const Request&) {
         ++writes;
         if (reusesOnInvoke) ++body;
@@ -216,6 +229,89 @@ int npc_death_release_tests(int* passed) {
         ++engine.body;
         check(attempts.step(named, scope, engine, Intent::AbortBeforeApply) == Receipt::Stale &&
               engine.aborts == 0 && engine.fence, "an EID reused before abort does not touch another body's fence");
+    }
+    {
+        Engine engine;
+        engine.seenFinished = true;
+        engine.refuseBeforePreparation = true;
+        Attempts<int> attempts;
+        const auto result = attempts.step(named, scope, engine);
+        std::printf("H6 prep unchanged: receipt=%u fence=%d lethal_calls=%d abort_calls=%d\n",
+            static_cast<unsigned>(result), engine.fence, engine.writes, engine.aborts);
+        check(result == Receipt::Aborted && !engine.fence && engine.holdChanges == 0 &&
+              engine.aborts == 1 && engine.writes == 0,
+              "a refusal before the first prepare writer reopens only the proven live original binding");
+        check(engine.queue_followup(engine.body) && !engine.queue_followup(engine.body) && engine.followupActions == 1,
+              "same verified living body admits one new action after its fence was lifted");
+        check(attempts.step(named, scope, engine, Intent::AbortBeforeApply) == Receipt::Aborted &&
+              attempts.step(named, scope, engine) == Receipt::Aborted && engine.aborts == 1 &&
+              !engine.fence && engine.writes == 0,
+              "late commands cannot reopen the aborted death attempt or clear a fence a second time");
+    }
+    {
+        Engine engine;
+        engine.seenFinished = true;
+        engine.refuseBeforePreparation = true;
+        engine.onPrepare = [&] { engine.currentLife = Life::Unreadable; };
+        Attempts<int> attempts;
+        check(attempts.step(guid, scope, engine) == Receipt::Uncertain && engine.fence &&
+              engine.aborts == 0 && engine.holdChanges == 0,
+              "preparation did not write but an unreadable body cannot yet be reopened");
+        engine.currentLife = Life::Alive;
+        check(attempts.step(guid, scope, engine) == Receipt::Uncertain &&
+              attempts.step(guid, scope, engine, Intent::ObserveOnly) == Receipt::Uncertain &&
+              engine.prepares == 1 && engine.writes == 0,
+              "a late Advance and an observation cannot retry the failed preparation");
+        check(attempts.step(guid, scope, engine, Intent::AbortBeforeApply) == Receipt::Aborted &&
+              engine.aborts == 1 && engine.queue_followup(engine.body) && engine.writes == 0,
+              "a later explicit abort can prove recovery after an earlier read failure before mutation");
+    }
+    {
+        Engine engine;
+        engine.seenFinished = true;
+        engine.refuseBeforePreparation = true;
+        engine.onPrepare = [&] { ++engine.body; };
+        Attempts<int> attempts;
+        check(attempts.step(named, scope, engine) == Receipt::Uncertain && engine.fence && engine.aborts == 0,
+              "pre-writer recovery cannot relax the fence when the original body has already changed");
+        check(attempts.step(named, scope, engine, Intent::AbortBeforeApply) == Receipt::Stale &&
+              engine.aborts == 0 && !engine.queue_followup(engine.body) && engine.writes == 0,
+              "late explicit abort with reused EID cannot reopen the replacement or invoke lethal damage");
+    }
+    {
+        Engine engine;
+        engine.seenFinished = true;
+        engine.guardOff = false;
+        Attempts<int> attempts;
+        check(attempts.step(named, scope, engine) == Receipt::Uncertain && engine.holdChanges == 1 &&
+              engine.fence && engine.writes == 0, "guard refusal after an engagement mutation stays fenced");
+        const int before = engine.lifeReads;
+        check(attempts.step(named, scope, engine, Intent::ObserveOnly) == Receipt::Uncertain &&
+              engine.lifeReads == before + 1 && engine.prepares == 1 && engine.writes == 0,
+              "partially mutated preparation still allows read-only observation of the original body");
+        engine.currentLife = Life::Dead;
+        check(attempts.step(named, scope, engine, Intent::ObserveOnly) == Receipt::Uncertain &&
+              engine.confirmed == 0 && engine.writes == 0 && engine.fence &&
+              engine.stages.back() == Stage::PrepareObservedDead,
+              "a later death after a failed preparation is not credited to an uninvoked lethal mutation");
+        check(attempts.step(named, scope, engine, Intent::AbortBeforeApply) == Receipt::Uncertain &&
+              engine.aborts == 0 && engine.prepares == 1 && !engine.queue_followup(engine.body),
+              "a late abort does not reopen a potentially partially modified body");
+    }
+    {
+        Engine engine;
+        engine.seenFinished = true;
+        engine.onPrepare = [&] { engine.releaseProof = false; };
+        Attempts<int> attempts;
+        check(attempts.step(guid, scope, engine) == Receipt::Uncertain && engine.holdChanges == 1 &&
+              engine.fence && engine.writes == 0,
+              "losing retirement proof after successful preparation is still potentially mutated");
+        const int before = engine.lifeReads;
+        engine.gameplay = false;
+        check(attempts.step(guid, scope, engine, Intent::ObserveOnly) == Receipt::Stale &&
+              attempts.step(guid, scope, engine, Intent::AbortBeforeApply) == Receipt::Stale &&
+              engine.lifeReads == before && engine.aborts == 0 && engine.writes == 0,
+              "scope retirement stops reads and writes from delayed observer or abort requests");
     }
     return failed;
 }
