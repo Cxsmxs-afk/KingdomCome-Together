@@ -24,7 +24,9 @@ public partial class GameBridge
         var life = T3SideLease();
         T3SideGuard(life);
         if (_wo122Stream is not Stream stream) throw new IOException("no relay connection for the frozen calendar");
-        var packet = new LootMsg(Protocol.W164Clock, Interlocked.Increment(ref _w137Tok), line).BuildUp(Protocol.W164Up, join.Joiner);
+        // Live clock rows still use an unscoped envelope. Bootstrap rows carry the
+        // actual attempt in the envelope and the originating world in the token.
+        var packet = new LootMsg(Protocol.W164Clock, life.World, line).BuildUp(Protocol.W164Up, join.Joiner, join.JoinId);
         var calendar = new HeldJoinCalendar(stream, life.World, _w206.Join,
             CancellationTokenSource.CreateLinkedTokenSource(join.DeadlineCts?.Token ?? join.Cts.Token, _wo122Ct, life.Token));
         Volatile.Write(ref join.Calendar, calendar); // An immediate reply can arrive before the first write returns.

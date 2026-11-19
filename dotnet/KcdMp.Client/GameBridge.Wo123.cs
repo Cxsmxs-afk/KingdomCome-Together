@@ -117,6 +117,11 @@ public partial class GameBridge
     private async Task Wo123OnDisconnectAsync()
     {
         _hostJoin?.Cancel("relay-lost");
+        lock (_joinGate)
+        {
+            Volatile.Write(ref _joinCalendarRequest, null);
+            ClearJoinCalendarBootstrap();
+        }
         if (_joinRx is { } rx)
         {
             rx.Abort();
@@ -185,6 +190,14 @@ public partial class GameBridge
             _joinRx = null;
             SetJoinUi("aborted", "Your host left -- the world transfer stopped.");
             Console.WriteLine($"MP-JOIN joiner: the host (ghost {ghostId}) disconnected -- staged transfer 0x{rx.JoinId:x8} deleted");
+        }
+        lock (_joinGate)
+        {
+            if (_hostModeKnown && ghostId == _hostModeFrom && _joinOutId != 0)
+            {
+                _joinOutId = 0;
+                SetJoinUi("aborted", "Lost the connection to your host.");
+            }
         }
         await Task.CompletedTask;
     }
@@ -268,6 +281,14 @@ public partial class GameBridge
                     // out) never asked again: session A's joiner stayed "the host is reloading" until the 10-minute watchdog sent him home.
                     if (_joinOutId == joinId) _joinOutId = 0;
                     Wo202RejoinFailed(r);
+                    return;
+                }
+                var requested = Volatile.Read(ref _joinCalendarRequest);
+                bool fromActiveHost = _jj is { } active && active.JoinId == joinId && active.Host == src ||
+                    requested is not null && requested.JoinId == joinId && requested.Host == src;
+                if (!fromActiveHost)
+                {
+                    DropJoinCalendar(src, joinId, "abort-not-current-host");
                     return;
                 }
                 if (await Wo124OnHostAbortAsync(joinId, Protocol.JoinAbortName(body.Length > 0 ? body[0] : (byte)0))) return;   // WO-124
@@ -722,18 +743,46 @@ public partial class GameBridge
         if (!JoinerSharedEffective) { Console.WriteLine($"MP-JOIN mp_join_request needs a shared-world session ({(_hostModeKnown ? "the host runs separate worlds" : "mp_shared_world off here and no word from a host")})"); return; }
         if (!_wo122Connected || !_combatRoleApplied) { Console.WriteLine("MP-JOIN mp_join_request: no session"); return; }
         if (_isDamageAuthority) { Console.WriteLine("MP-JOIN mp_join_request: this machine is the host -- the joiner asks"); return; }
-        if (_joinRx is not null) { Console.WriteLine("MP-JOIN mp_join_request: a transfer is already running"); return; }
         if (!Wo180SlotAvailableOrTell()) return;   // WO-180: no save slot for the host's world -- nothing is sent, the host is not paused
-        _joinOutId = (uint)Random.Shared.Next(1, int.MaxValue);
-        Wo206NoteOwnAttempt(_joinOutId);   // WO-206 E: the host's statuses of this attempt are this joiner's
+        JoinCalendarRequest request;
+        lock (_joinGate)
+        {
+            if (_joinRx is not null || _joinOutId != 0 || _jj is not null)
+            {
+                Console.WriteLine("MP-JOIN mp_join_request: a request or transfer is already running");
+                return;
+            }
+            if (!_hostModeKnown || _wo122Stream is not Stream stream)
+            {
+                Console.WriteLine("MP-JOIN mp_join_request: waiting for a confirmed host on this relay connection");
+                return;
+            }
+            request = new((uint)Random.Shared.Next(1, int.MaxValue), _hostModeFrom, stream);
+            _joinOutId = request.JoinId;
+            ClearJoinCalendarBootstrap();
+            Volatile.Write(ref _joinCalendarRequest, request);
+        }
+        Wo206NoteOwnAttempt(request.JoinId);   // WO-206 E: the host's statuses of this attempt are this joiner's
         WorldReceiver.SweepStaging(WorldReceiver.DefaultStagingDir());
         SetJoinUi("requested", "Asking your host for the world...");
         try
         {
-            await WriteJoinAsync(WorldReceiver.BuildRequest(_joinOutId));
-            Console.WriteLine($"MP-JOIN joiner: join 0x{_joinOutId:x8} requested from the host");
+            await WritePacketAsync(request.Link, WorldReceiver.BuildRequest(request.JoinId, host: request.Host), _wo122Ct);
+            Console.WriteLine($"MP-JOIN joiner: join 0x{request.JoinId:x8} requested from the host");
         }
-        catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: request not sent: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            lock (_joinGate)
+            {
+                if (ReferenceEquals(_joinCalendarRequest, request))
+                {
+                    Volatile.Write(ref _joinCalendarRequest, null);
+                    if (_joinOutId == request.JoinId) _joinOutId = 0;
+                    ClearJoinCalendarBootstrap();
+                }
+            }
+            Console.WriteLine($"MP-JOIN joiner: request not sent: {ex.Message}");
+        }
     }
 
     private async Task CancelOutgoingJoinAsync(string why)
@@ -813,6 +862,12 @@ public partial class GameBridge
         {
             Console.WriteLine($"MP-JOIN joiner: offer 0x{joinId:x8} refused: this machine asked for 0x{_joinOutId:x8}");
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortProtocol)); } catch { }
+            return;
+        }
+        if (Volatile.Read(ref _joinCalendarRequest) is not { } request || request.JoinId != joinId ||
+            request.Host != host || !ReferenceEquals(request.Link, _wo122Stream))
+        {
+            DropJoinCalendar(host, joinId, "offer-not-current-host");
             return;
         }
         var offer = WorldOffer.TryDecode(body, out string why);

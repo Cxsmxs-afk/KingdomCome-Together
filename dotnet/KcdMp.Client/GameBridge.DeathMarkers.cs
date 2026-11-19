@@ -227,7 +227,11 @@ public partial class GameBridge
         }
     }
 
-    private async Task<bool> P5LoadGameAsync(int playline, string name, string reason, CancellationToken ct = default)
+    private Task<bool> P5LoadGameAsync(int playline, string name, string reason, CancellationToken ct = default) =>
+        P5LoadGameCoreAsync(playline, name, reason, null, ct);
+
+    private async Task<bool> P5LoadGameCoreAsync(int playline, string name, string reason, Func<bool>? authorizeDispatch,
+        CancellationToken ct = default)
     {
         if (ct == default) ct = _wo122Ct;
         bool own = reason is "leave-command" or "exit-to-menu";
@@ -255,8 +259,9 @@ public partial class GameBridge
                 if (!await LoadSequenceSyncNativeAsync()) return false;
                 var current = _worldLoad.Current;
                 if (current.Generation != prepared.Generation || current.OwnIntentRevision != prepared.OwnIntentRevision) return false;
-                LoadSequenceBeginLoad();
             }
+            if (authorizeDispatch is not null && !authorizeDispatch()) return false;
+            if (LoadSequenceEnabled) LoadSequenceBeginLoad();
             var loadLife = CancellationTokenSource.CreateLinkedTokenSource(ct); _p5LoadLife = loadLife;
             _p5RebindAfterLoad = true; _p5LoadToPrivate = own;
             if (own) _w207LeaveTarget = name;

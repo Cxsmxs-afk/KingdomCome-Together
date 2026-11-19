@@ -19,13 +19,19 @@ if ($Check -eq 'EndToEnd') {
 
     . (Join-Path $PSScriptRoot 'Required-TestResults.ps1')
     $project = Join-Path $tests 'KcdMp.Client.Tests.csproj'
-    foreach ($case in @('A_hosts_and_B_joins_from_the_main_menu', 'B_hosts_and_A_joins_from_the_main_menu')) {
-        # Each role assignment must run normally and with an interrupted calendar delivery.
-        Invoke-KcdManagedTests $project "End-to-End-Join $case" 2 `
+    $cases = [ordered] @{
+        A_hosts_and_B_joins_from_the_main_menu = 2
+        B_hosts_and_A_joins_from_the_main_menu = 2
+        A_delayed_calendar_can_arrive_after_five_seconds_while_the_host_still_waits = 1
+        Authenticated_stale_calendar_cannot_arm_the_latch_and_duplicates_arm_it_once = 1
+        Host_loss_retires_the_join_before_the_guest_can_load = 2
+        Host_does_not_offer_a_world_the_native_pipe_never_confirmed_as_held = 1
+        Menu_progress_cannot_renew_the_host_hold_before_the_calendar_receipt = 1
+    }
+    foreach ($case in $cases.Keys) {
+        Invoke-KcdManagedTests $project "End-to-End-Join $case" $cases[$case] `
             -Filter "FullyQualifiedName=KcdMp.Client.Tests.JoinCalendarIntegrationTests.$case"
     }
-    Invoke-KcdManagedTests $project "End-to-End-Join delayed calendar" 1 `
-        -Filter 'FullyQualifiedName=KcdMp.Client.Tests.JoinCalendarIntegrationTests.A_delayed_calendar_can_arrive_after_five_seconds_while_the_host_still_waits'
     return
 }
 

@@ -16,6 +16,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private readonly Task _serverLoop;
     private readonly bool _failCalendarArm;
     private readonly bool _failCalendarVerify;
+    private readonly bool _refuseHold;
     private readonly TaskCompletionSource _arm = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _verify = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _hold = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -24,12 +25,14 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private long? _armedWorldMs, _loadedWorldMs, _verifiedWorldMs;
     private bool _gameplayStarted;
     private int _snapshotWhileHeld;
+    private int _armRequests;
     private bool _held;
     private byte _loadPhase, _loadFlags, _lifecyclePhase;
     private ulong _loadGeneration, _lifecycleGeneration;
 
     public CombatPipe Pipe { get; }
     public Task ArmObserved => _arm.Task;
+    public int ArmRequests => Volatile.Read(ref _armRequests);
     public Task VerifyObserved => _verify.Task;
     public Task HoldObserved => _hold.Task;
     public Task ReleaseObserved => _release.Task;
@@ -37,10 +40,11 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     public long? ArmedWorldMs { get { lock (_calendar) return _armedWorldMs; } }
     public long? VerifiedWorldMs { get { lock (_calendar) return _verifiedWorldMs; } }
 
-    public JoinCalendarTestPipe(bool failCalendarArm = false, bool failCalendarVerify = false)
+    public JoinCalendarTestPipe(bool failCalendarArm = false, bool failCalendarVerify = false, bool refuseHold = false)
     {
         _failCalendarArm = failCalendarArm;
         _failCalendarVerify = failCalendarVerify;
+        _refuseHold = refuseHold;
         string name = $"h20-calendar-{Guid.NewGuid():N}";
         Pipe = new CombatPipe(name);
         _serverLoop = ServeAsync(name, _stop.Token);
@@ -123,6 +127,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
                     BinaryPrimitives.WriteInt64LittleEndian(body.AsSpan(13), worldMs);
                     break;
                 case 2:
+                    Interlocked.Increment(ref _armRequests);
                     if (!_failCalendarArm && !_gameplayStarted && worldMs is >= 0 and <= HostCalendar.MaxWorldMs)
                     {
                         _armedWorldMs = worldMs;
@@ -178,11 +183,11 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
             _loadPhase = request[1];
             _loadFlags = request[2];
             _loadGeneration = BinaryPrimitives.ReadUInt64LittleEndian(request[5..]);
-            SetHold((_loadFlags & 2) != 0);
+            SetHold((_loadFlags & 2) != 0 && !_refuseHold);
         }
         byte[] body = ReplyBody(seq, request[0], 14);
         body[4] = _loadPhase;
-        body[5] = (byte)(_loadFlags | 0x80);
+        body[5] = (byte)(_loadFlags | (((_loadFlags & 2) == 0 || _held) ? 0x80 : 0));
         BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(6), _loadGeneration);
         request[13..17].CopyTo(body.AsSpan(14));
         return body;

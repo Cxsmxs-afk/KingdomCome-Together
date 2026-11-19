@@ -85,6 +85,8 @@ public partial class GameBridge
         public WhsSave.PlayerSoul? Henry;          // the spliced file's Henry (= the source's, minus quest items)
         public DateTime LoadCmdUtc, LoadStartUtc, LoadGameUtc, GameplayUtc;
         public ulong LoadGeneration;
+        public long CalendarGeneration;
+        public long CalendarPipeRevision;
         public volatile string Phase = "preparing";
         public bool InWorld;                        // WO-125: an in-world rejoin (a host reload) or a join from the own world
         public bool Frozen;                         // WO-154 4.2: the load froze (busy, no CPU): the player is told to restart the game
@@ -625,7 +627,7 @@ public partial class GameBridge
 
     private bool Wo124JoinGone(JoinerJoin j, string at)
     {
-        if (LoadSequenceEnabled && (j.LoadGeneration != _worldLoad.Current.Generation || j.Abandoned.Task.IsCompleted))
+        if (j.Abandoned.Task.IsCompleted || LoadSequenceEnabled && j.LoadGeneration != _worldLoad.Current.Generation)
             return true;
         return Wo206JoinGone(j, at);
     }
@@ -793,15 +795,9 @@ public partial class GameBridge
                 await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "clock-unavailable", "Your host's world clock could not be prepared.");
                 return;
             }
-            j.Phase = "loading";
-            Wo137OnJoinLoading(j.JoinId);   // WO-137: host quest changes from before this world are in it already
-            SetJoinUi("loading", "Loading your host's world...");
-            j.LoadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            j.GameplayStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            j.LoadFailed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            j.LoadCmdUtc = DateTime.UtcNow;
-            if (!await P5LoadGameAsync(j.Playline, j.Name, "join-command"))
+            if (!await P5LoadGameCoreAsync(j.Playline, j.Name, "join-command", () => AuthorizeJoinCalendarLoad(j)))
             {
+                if (Wo124JoinGone(j, "after load dispatch refusal")) return;
                 await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "authority-pending-unconfirmed", _p5LoadRefusal.Length > 0 ? _p5LoadRefusal : "The load safety gate could not be confirmed.");
                 return;
             }
@@ -860,6 +856,27 @@ public partial class GameBridge
     }
 
     /// <summary>Delete the transient file and report the engine cache without refreshing it during active play.</summary>
+    private bool AuthorizeJoinCalendarLoad(JoinerJoin join)
+    {
+        lock (_joinGate)
+        {
+            if (!JoinCalendarCurrent(join, join.CalendarGeneration) || !_hostCalendarArmed ||
+                join.CalendarPipeRevision != _combat.EdgeConnectionRevision)
+            {
+                DropJoinCalendar(join.Host, join.JoinId, "load-dispatch-scope-retired");
+                return false;
+            }
+            join.LoadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            join.GameplayStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            join.LoadFailed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            join.LoadCmdUtc = DateTime.UtcNow;
+            join.Phase = "loading";
+            Wo137OnJoinLoading(join.JoinId);   // changes from before the transferred save are in it already
+            SetJoinUi("loading", "Loading your host's world...");
+            return true;
+        }
+    }
+
     private async Task RemovePlacedWorldAsync(JoinerJoin j, string why)
     {
         if (j.PlacedPath is not string p) return;

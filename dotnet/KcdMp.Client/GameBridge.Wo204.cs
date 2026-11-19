@@ -57,6 +57,13 @@ public partial class GameBridge
         if (m.Kind != Protocol.W203JoinProgress || !Wo204Rules.TryParseJoinProgress(m.Text, out uint jid, out string where, out int secs)) return;
         if (!Wo206JoinMessageAdmitted(Protocol.W203Down, jid, src, "progress")) return;   // WO-206 E: a late "loading" of a closed attempt is never shown
         if (_hostJoin is not { } j || j.JoinId != jid || j.Joiner != src) return;
+        // The pre-load bootstrap has the initial wait budget. A guest stuck in
+        // the menu must not extend it indefinitely by sending load progress.
+        if (Volatile.Read(ref j.Calendar) is not { } held || !held.Receipt.Task.IsCompletedSuccessfully)
+        {
+            DropJoinCalendar(src, jid, "progress-before-calendar-receipt");
+            return;
+        }
         Interlocked.Increment(ref _w204JoinProgressIn);
         j.LastJoinerMsgMs = Environment.TickCount64;
         try { j.DeadlineCts?.CancelAfter(TimeSpan.FromSeconds(Wo204Rules.JoinLoadSilenceS + 5)); } catch (ObjectDisposedException) { }

@@ -243,8 +243,8 @@ public sealed class WorldReceiver : IDisposable
         return Protocol.BuildJoinUp(Protocol.JoinerReadyUp, Protocol.JoinTargetHost, joinId, b);
     }
 
-    public static byte[] BuildRequest(uint joinId, byte flags = 0) =>
-        Protocol.BuildJoinUp(Protocol.JoinRequestUp, Protocol.JoinTargetHost, joinId, [flags]);
+    public static byte[] BuildRequest(uint joinId, byte flags = 0, byte host = Protocol.JoinTargetHost) =>
+        Protocol.BuildJoinUp(Protocol.JoinRequestUp, host, joinId, [flags]);
 
     public void Dispose()
     {

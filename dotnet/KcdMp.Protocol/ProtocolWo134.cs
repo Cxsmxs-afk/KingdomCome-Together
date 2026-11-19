@@ -82,7 +82,7 @@ public readonly record struct LootMsg(byte Kind, uint Tok, string Text)
     /// row allows -- WO-203 II.5: until then a text the row did not allow left the agent and the relay dropped it, counted on the
     /// relay only (session C: 463 W164 frames). Every sender's catch logs the refusal ("... not sent ...").
     /// </summary>
-    public byte[] BuildUp(byte type, byte target)
+    public byte[] BuildUp(byte type, byte target, uint joinId = 0)
     {
         var tb = Encoding.ASCII.GetBytes(Text ?? "");
         if (tb.Length == 0 || tb.Length > Protocol.LootTextMax) throw new ArgumentOutOfRangeException(nameof(Text), $"loot text length {tb.Length}");
@@ -99,7 +99,8 @@ public readonly record struct LootMsg(byte Kind, uint Tok, string Text)
         var p = new byte[3 + len];
         p[0] = type;
         BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(1), (ushort)len);
-        p[3] = target;                         // joinId [4..7] = 0
+        p[3] = target;
+        BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(4), joinId);
         p[8] = Kind;
         BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(9), Tok);
         tb.CopyTo(p, 13);
