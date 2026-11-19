@@ -238,10 +238,11 @@ if (-not $SkipPublish) {
     # suite above) and the save repair tool's own tests here; live: a game with a throwaway playline4 save -- skipped with a
     # logged reason when no game runs, never silently.
     Write-Host "Save repair tool tests (tools\savegame) ..."
-    & python (Join-Path $PSScriptRoot "savegame\test_whs_repair.py")
-    if ($LASTEXITCODE -ne 0) { throw "tools\savegame\test_whs_repair.py FAILED. Not shipping." }
-    & python (Join-Path $PSScriptRoot "savegame\test_whs_dump.py")
-    if ($LASTEXITCODE -ne 0) { throw "tools\savegame\test_whs_dump.py FAILED. Not shipping." }
+    foreach ($suite in @("test_whs_repair.py", "test_whs_dump.py")) {
+        Write-Host "Required Python suite $suite ..."
+        & python -B (Join-Path $PSScriptRoot "sim\run-required-python.py") discover -s (Join-Path $PSScriptRoot "savegame") -p $suite
+        if ($LASTEXITCODE -ne 0) { throw "tools\savegame\$suite FAILED. Not shipping." }
+    }
     Write-Host "Save round trip, live part (WO-175 S5) ..."
     & python (Join-Path $PSScriptRoot "Test-WO175SaveRoundTrip.py")
     $rt = $LASTEXITCODE

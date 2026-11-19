@@ -4,14 +4,15 @@
 # content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 """WO-174 Phase 0.1 -- tests for whs_dump.py.
 
-A synthetic container is built in the test (a save file is never committed: it carries the account name). The field
-file (the affected host save, 148 chunks) is checked too when KCDMP_FIELD_SAVE names it or logs/saves/autosave335.whs exists.
+A synthetic container always exercises the field save's 148-chunk layout.
+The original is checked as well when KCDMP_FIELD_SAVE is set or logs/saves/autosave335.whs exists.
 Run: python -I tools/savegame/test_whs_dump.py
 """
 import hashlib
 import os
 import struct
 import sys
+import tempfile
 import unittest
 import zlib
 
@@ -79,15 +80,24 @@ class Synthetic(unittest.TestCase):
         self.assertNotIn('SOMEONE', ' '.join(f.values()))
 
 
-class FieldFile(unittest.TestCase):
-    def setUp(self):
-        p = os.environ.get('KCDMP_FIELD_SAVE') or os.path.join(HERE, '..', '..', 'logs', 'saves', 'autosave335.whs')
-        if not os.path.isfile(p):
-            self.skipTest('the field save is not on this machine')
-        self.path = p
-
+class LargeSave(unittest.TestCase):
     def test_148_chunks_sizes_match_and_footer(self):
-        s = w.load(self.path)
+        chunks = [bytes([index]) * 0x8000 for index in range(147)] + [b'\x93' * 7815]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'large-synthetic.whs')
+            with open(path, 'wb') as fixture:
+                fixture.write(build(chunks))
+            self.check_large_save(path)
+
+        original = os.environ.get('KCDMP_FIELD_SAVE')
+        fallback = os.path.join(HERE, '..', '..', 'logs', 'saves', 'autosave335.whs')
+        if original:
+            self.check_large_save(original)
+        elif os.path.isfile(fallback):
+            self.check_large_save(fallback)
+
+    def check_large_save(self, path):
+        s = w.load(path)
         self.assertEqual(len(s['chunks']), 148)
         self.assertEqual(sum(r for _, r in s['chunks']), len(s['body']))
         self.assertEqual(len(s['body']), 4824711)
