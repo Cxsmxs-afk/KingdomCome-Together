@@ -60,14 +60,17 @@ public sealed class JoinCalendarIntegrationTests
         hostGame.Emit("wo124_where", "world");
         Call(host, "Wo125HostIdentify", fixture.HostLoadedSave, true, "fixture starting world");
 
-        Task hostRead = InvokeAsync(host, "ReceiveLoopAsync", hostLink, ct);
+        Task hostRead = Task.CompletedTask;
         Task guestRead = InvokeAsync(guest, "ReceiveLoopAsync", guestLink, ct);
         try
         {
-            await WaitAsync(() => Get<bool>(host, "_combatRoleApplyComplete") && Get<bool>(guest, "_combatRoleApplyComplete"),
-                "both relay-assigned combat roles applied", ct);
-            Assert.True(Get<bool>(host, "_isDamageAuthority"));
+            // Complete the guest's authenticated role first. Starting the host reader announces the world
+            // to the guest as soon as it handles the peer name.
+            await WaitAsync(() => Get<bool>(guest, "_combatRoleApplyComplete"), "the guest's relay-assigned combat role", ct);
             Assert.False(Get<bool>(guest, "_isDamageAuthority"));
+            hostRead = InvokeAsync(host, "ReceiveLoopAsync", hostLink, ct);
+            await WaitAsync(() => Get<bool>(host, "_combatRoleApplyComplete"), "the host's relay-assigned combat role", ct);
+            Assert.True(Get<bool>(host, "_isDamageAuthority"));
             await WaitAsync(() => (Get<ushort>(guest, "_w213Caps") & Protocol.LinkCapWorldSync) != 0
                     && ((List<byte>)Call(host, "LivePartners")!).Contains(guestPeer.Id),
                 "the relay's world-sync capability and live guest", ct);
