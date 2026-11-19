@@ -69,6 +69,7 @@ public partial class GameBridge
         public volatile string? CancelReason;
         public readonly Channel<(byte Type, byte[] Body)> Inbox = Channel.CreateUnbounded<(byte, byte[])>();
         public WorldSender? Sender;
+        public HeldJoinCalendar? Calendar;
         public volatile bool EngineHeld;   // WO-151 3.8: the engine's own hold is on for this join
         public CancellationTokenSource? DeadlineCts;   // WO-204 IV.1: the paused join's deadline, renewed by the joiner's progress
         public long LastJoinerMsgMs = Environment.TickCount64;   // WO-204 IV.1: the joiner's last message of this join (progress, ack, ready)
@@ -677,6 +678,7 @@ public partial class GameBridge
 
     private async Task FinishHostJoinAsync(HostJoin j, string reason, byte abortReason)
     {
+        Task calendarStopped = StopHeldJoinCalendarAsync(j);
         Wo206HostJoinEnded(j.JoinId, reason);   // WO-206 E: first of all -- an abort is a new join epoch, nothing of this attempt counts from here
         double pausedS = j.PausedUtc is { } p ? (DateTime.UtcNow - p).TotalSeconds : 0;
         // Resume first: nothing below may keep the host frozen. WO-151: the engine's own hold first of all
@@ -709,6 +711,7 @@ public partial class GameBridge
             $"MP-JOIN host: resume join=0x{j.JoinId:x8} reason={reason} paused_s={pausedS:F1} phase_at_end={j.Phase}{(abortReason != 0 ? $" abort_sent={Protocol.JoinAbortName(abortReason)}" : "")}"));
         Wo202NoteEvent(FormattableString.Invariant($"the join's hold ended ({reason}, {pausedS:F0} s)"));
         lock (_joinGate) if (ReferenceEquals(_hostJoin, j)) _hostJoin = null;
+        await calendarStopped;
         j.Cts.Dispose();
     }
 

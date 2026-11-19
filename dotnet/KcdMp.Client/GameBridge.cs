@@ -4800,6 +4800,7 @@ public partial class GameBridge(ClientConfig config)
                     NpcDeathPeerSerial = NpcDeathPeerAtRead(type, payload),
                     PvpContact = pvpScope
                 };
+                if ((type is Protocol.W164Down or Protocol.W203Down) && TryHandleJoinCalendarAtRead(inFrame, stream, ct)) continue;
                 if (!LoadSequenceFrameCurrent(inFrame)) continue;
                 if (WorldSyncEffective && WorldSyncCatalog.EventChannel(type, payload) is not null) continue;
                 if (T3TryDeferSideChannel(inFrame)) continue;

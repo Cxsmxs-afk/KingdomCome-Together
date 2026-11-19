@@ -92,6 +92,7 @@ public static partial class Protocol
                       W203DigestCheckpoint = 10,   // WO-206 C (ProtocolWo206.cs)
                       W203Epoch = 11,   // WO-206 E
                       W203FigureHand = 12;   // WO-214 F (ProtocolWo214.cs)
+    public const byte W203JoinCalendarReceipt = 15;   // 13 and 14 are the teleport snapshot kinds
 
     public static string W203KindName(byte k) => k switch
     {
@@ -99,6 +100,7 @@ public static partial class Protocol
         W203EngageEarly => "engage-early", W203NpcWorn => "npc-worn", W203NpcPose => "npc-pose", W203JoinProgress => "join-progress",
         W203FocusEdge => "focus-edge", W203TravelRoute => "travel-route", W203DigestCheckpoint => "digest-checkpoint", W203Epoch => "epoch",
         W203FigureHand => "figure-hand", W203TpSnapshotRequest => "tp-snapshot-request", W203TpSnapshotResponse => "tp-snapshot-response",
+        W203JoinCalendarReceipt => "join-calendar-receipt",
         _ => $"unknown-{k}",
     };
 
