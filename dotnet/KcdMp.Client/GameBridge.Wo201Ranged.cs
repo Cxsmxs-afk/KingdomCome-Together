@@ -211,11 +211,7 @@ public partial class GameBridge
         catch (OperationCanceledException) { return false; }
         catch (IOException) { return false; }
     }
-    private long P6PeerAtRead(int type, byte[] p)
-    {
-        if (type != Protocol.W164Down || p.Length == 0) return 0;
-        return _p5Peers.TryGetValue(p[0], out var peer) && peer.Connected ? peer.Serial : 0;
-    }
+    private long P6PeerAtRead(byte src) => _p5Peers.TryGetValue(src, out var peer) && peer.Connected ? peer.Serial : 0;
     private bool P6PeerCurrent(byte src, long serial) => serial != 0 && _p5Peers.TryGetValue(src, out var peer) && peer.Serial == serial && peer.Connected && !peer.Token.IsCancellationRequested;
     private static bool P6Message(int type, byte[] payload, out byte source, out LootMsg message)
     {
@@ -223,7 +219,6 @@ public partial class GameBridge
         if (type != Protocol.W164Down || !Protocol.TrySplitJoinDown(payload, out source, out _, out _, out var body) || !LootMsg.TryDecode(body, out message)) return false;
         return message.Kind is Protocol.W164RangedStep or Protocol.W164MeasuredMissile || (message.Kind == Protocol.W164RealHit && message.Text.StartsWith("m1|", StringComparison.Ordinal));
     }
-    private static bool P6Frame(int type, byte[] payload) => P6Message(type, payload, out _, out _);
     // Consumes only these kinds before generic catchup/hold logic, preserving the original reader receipts.
     private async Task<bool> P6TryProcessFrameAsync(InFrame frame, CancellationToken ct)
     {
@@ -241,6 +236,13 @@ public partial class GameBridge
         if (!RangedStepV2.TryDecode(message.Text, out var step)) { T3Increment("ranged_malformed"); return; }
         if (frame.Stamp == 0 || frame.Stamp != step.World || context.World != step.World ||
             Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds + step.AgeMs > Protocol.RangedCaptureMaxAgeMs) { T3Increment("ranged_stale"); return; }
+        var body = frame.P6RangedBody;
+        if (body.Entity == 0 || body != Wo214FigureBody(src))
+        {
+            T3Increment("ranged_stale");
+            Wo201RangedRefused(src, step, body.Entity == 0 ? "body-unbound-at-read" : "body-changed-since-read");
+            return;
+        }
         if (_p6RemoteSteps.TryGetValue(src, out var last) && last.Peer == frame.P6PeerSerial)
         {
             if (step.Generation < last.Gen || (step.Generation == last.Gen && step.Epoch < last.Epoch)) { T3Increment("ranged_stale"); return; }
@@ -249,7 +251,6 @@ public partial class GameBridge
         if (last.Gen != step.Generation || last.Epoch != step.Epoch || last.Peer != frame.P6PeerSerial) T3Increment("ranged_stream_reset");
         _p6RemoteSteps[src] = (frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence);
         T3Increment("ranged_in"); Interlocked.Increment(ref _w201RangedIn);
-        var body = Wo214FigureBody(src);
         var catalog = await P6CatalogAsync();
         if (!P6Current(context) || !P6PeerCurrent(src, frame.P6PeerSerial)) return;
         if (step.Kind == RangedWeaponKind.Unknown || catalog?.Kind(step.ItemClass) != step.Kind)
@@ -264,32 +265,34 @@ public partial class GameBridge
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, peer.Token);
         long capturedAt = Environment.TickCount64 - step.AgeMs - (long)Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds;
         if (BowHandProof.IsDrawnPhase(step.Phase))
-            await Wo214OnRangedHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, capturedAt, Current, linked.Token);
+            await Wo214OnRangedHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, body,
+                capturedAt, Current, linked.Token, message.Tok);
         else if (step.Kind == RangedWeaponKind.Crossbow && !linked.IsCancellationRequested && Current())
-            Wo214OnOtherRangedHand(src, step.ItemClass, capturedAt);
+            Wo214OnOtherRangedHand(src, step.ItemClass, body, capturedAt);
         // Charge and Aim still lack a verified animation entry. Crossbow reload tags vary by subclass.
         if (Wo201Rules.RangedFragment(step.Phase).Length == 0 || (step.Kind == RangedWeaponKind.Crossbow && step.Phase == 4))
         { T3Increment("ranged_phase_unrenderable"); return; }
 
-        if (frame.Presentation.SampleMs == 0 || !W221On("rp_combat") || body.Entity == 0)
+        if (frame.Presentation.SampleMs == 0 || !W221On("rp_combat"))
         {
             Wo201RangedRefused(src, step, "typed-route-unavailable");
             return;
         }
         if (!_w214FigureHand.TryGetValue(src, out var hand) || !hand.Drawn || hand.Cls != step.ItemClass ||
-            hand.Body != body || !Wo214HandCurrent(src, hand))
+            hand.Body != body || !Wo214HandCurrent(src, hand) || !Wo214ConfirmedRangedHand(src, hand, step.ItemClass))
         {
-            Wo201RangedRefused(src, step, "no-current-hand-revision");
+            Wo201RangedRefused(src, step, "hand-readback-unconfirmed");
             return;
         }
 
-        // The hand record is intent. The typed native provider reads the actual hands before applying.
         bool CurrentHand() => Current() && W214On("figure_hands") &&
-            _w214FigureHand.TryGetValue(src, out var latest) && Wo214SameHandState(latest, hand);
-        var data = new byte[18];
-        data[0] = (byte)step.Kind;
-        data[1] = step.Phase;
-        step.ItemClass.TryWriteBytes(data.AsSpan(2));
+            Wo214ConfirmedRangedHand(src, hand, step.ItemClass);
+        var data = new byte[39];
+        data[0] = 2;
+        data[1] = (byte)step.Kind;
+        data[2] = step.Phase;
+        step.ItemClass.TryWriteBytes(data.AsSpan(3));
+        CombatPipe.PutRangedHandFence(data.AsSpan(19), hand.PeerSerial, hand.Body.Generation, hand.Revision);
         var admission = await TrySubmitPresentationCombatAsync(src, body.Entity, frame.Presentation,
             unchecked((ushort)step.Sequence), 0x82, data, linked.Token, beforeWrite: CurrentHand);
         if (admission != PresentationCombatAdmission.Accepted)

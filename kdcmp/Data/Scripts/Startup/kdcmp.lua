@@ -11923,9 +11923,12 @@ function KCD2MP_SpawnGhost(id, x, y, z, rotZ)
         spawnedAtClock = os.clock(),
     }
 
+    W214.outfitBodySequence = (W214.outfitBodySequence or 0) + 1
+    local outfitIncarnation = string.format("%08X", W214.outfitBodySequence)
     KCD2MP.ghosts[id] = {
         entity = entity,
         entityId = entity.id,
+        outfitIncarnation = outfitIncarnation,
         istate = istate,
         facePick = facePick,
         faceKey = faceKey,
@@ -11946,7 +11949,7 @@ function KCD2MP_SpawnGhost(id, x, y, z, rotZ)
     -- a save reload rebuilds the ghost bodies.
     local hexid = string.match(tostring(entity.id), "(%x+)%s*$")
     if hexid then
-        KCD2MP_EmitEvent("ghostid", tostring(id) .. " " .. hexid)
+        KCD2MP_EmitEvent("ghostid", tostring(id) .. " " .. hexid .. " " .. outfitIncarnation)
     else
         mp_log("SpawnGhost: could not extract entity id hex from " .. tostring(entity.id)
                .. " -- native swings unavailable for ghost " .. tostring(id))
@@ -36465,34 +36468,67 @@ do
         KCD2MP_EmitEvent("w214_hand", (drawn and "1" or "0") .. " " .. tostring(cls or "-"))
     end
 
-    -- the partner's hand (the agent: his W203 FigureHand row): his figure <id> here holds <cls> while <drawn>
-    function KCD2MP_W214FigureHand(id, drawn, cls, oversized)
+    W214.hand.scopes = W214.hand.scopes or {}
+
+    function KCD2MP_W214HandScope(id)
+        id = tostring(id)
+        local g = KCD2MP.ghosts and KCD2MP.ghosts[id]
+        local scope = W214.hand.scopes[id]
+        if g and scope and g.entity == scope.entity and g.outfitIncarnation == scope.incarnation then return scope end
+        return nil
+    end
+
+    function KCD2MP_W214NativeHandProof(id, incarnation, token, known, left, right)
+        local scope = KCD2MP_W214HandScope(id)
+        if not scope or scope.incarnation ~= incarnation or scope.scope ~= token then return false end
+        if known ~= 0 and known ~= 1 and known ~= 2 and known ~= 3 then return false end
+        scope.known, scope.left, scope.right = known, left, right
+        return true
+    end
+
+    -- This is the single mutating hand request from a scoped WO-214 state.
+    -- Its terminal event only prompts a strict native observation.
+    function KCD2MP_W214FigureHand(id, drawn, cls, oversized, incarnation, token, revision)
         if not KCD2MP_W214On("figure_hands") then return false end   -- the twin: today's path (the outfit and DrawWeapon only)
         id = tostring(id); cls = tostring(cls or "-")
         local h = W214.hand
         local g = KCD2MP.ghosts and KCD2MP.ghosts[id]
         local e = g and g.entity
-        if not (e and e.human and KCD2MP.w136 and KCD2MP.w136.handClass) then return false end
+        if not (e and e.human and KCD2MP.w136 and KCD2MP.w136.handClass and g.outfitIncarnation == incarnation
+            and type(incarnation) == "string" and #incarnation == 8 and type(token) == "string" and #token == 64
+            and type(revision) == "string" and #revision == 16 and string.sub(token, -16) == revision) then return false end
+        local scope = KCD2MP_W214HandScope(id)
+        if scope and scope.scope ~= token and scope.revision >= revision then return false end
+        if not scope or scope.scope ~= token then
+            scope = { entity = e, incarnation = incarnation, scope = token, revision = revision, drawn = drawn, known = 0, left = "-", right = "-" }
+            h.scopes[id] = scope
+        end
         local gen = (h.gen[id] or 0) + 1   -- a newer message supersedes a check still running
         h.gen[id] = gen
         local t0 = os.clock()
-        local function held() return KCD2MP.w136.handClass(e, 0) end
-        local function live() local gg = KCD2MP.ghosts[id]; return h.gen[id] == gen and gg ~= nil and gg.entity == e end
+        local function held(slot) return KCD2MP.w136.handClass(e, slot) end
+        local function holdsClass() return held(0) == cls or held(1) == cls end
+        local function live() return h.gen[id] == gen and KCD2MP_W214HandScope(id) == scope end
         local function report(result, how)
-            local now = held()
+            if not live() then return end
+            local now = tostring(held(0) or "-") .. "/" .. tostring(held(1) or "-")
+            if not live() then return end
             if result == "ok" then h.stats.ok = h.stats.ok + 1 elseif result == "fixed" then h.stats.fixed = h.stats.fixed + 1 else h.stats.failed = h.stats.failed + 1 end
             mp_log(string.format("WO214-HAND figure=%s want=%s held=%s -> %s %s (%.0f ms)", id, drawn and cls or "-", tostring(now or "-"), result, how,
                 (os.clock() - t0) * 1000))
-            KCD2MP_EmitEvent("w214_figure_hand", id .. " " .. result .. " " .. how)
+            KCD2MP_EmitEvent("w214_figure_hand", id .. " " .. result .. " " .. how .. " " .. incarnation .. " " .. token)
         end
         if not drawn then
+            if KCD2MP_GhostCombat and live() then KCD2MP_GhostCombat(id, 1) end   -- WeaponSheathed
             -- the sheathe is the combat event's own (HolsterWeapon); a hand still full 1.5 s later, while sheathed, is put away
             Script.SetTimer(1500, function()
                 if not live() then return end
-                if held() == nil then return report("ok", "empty") end
-                if KCD2MP.ghostWeaponDrawn[id] then return end   -- drawn again since
+                if held(0) == nil and held(1) == nil then return report("ok", "empty") end
+                if not live() or KCD2MP.ghostWeaponDrawn[id] then return end   -- drawn again since
                 pcall(function() e.human:HolsterWeapon() end)
-                Script.SetTimer(1200, function() if live() then report(held() == nil and "fixed" or "failed", "holstered") end end)
+                Script.SetTimer(1200, function()
+                    if live() then report(held(0) == nil and held(1) == nil and "fixed" or "failed", "holstered") end
+                end)
             end)
             return true
         end
@@ -36500,30 +36536,35 @@ do
         local function item()
             local it = nil
             pcall(function() it = e.inventory and e.inventory:FindItem(cls) end)
-            if not it and e.inventory then
+            if not it and e.inventory and live() then
                 pcall(function() e.inventory:CreateItem(cls, 1, 1) end)
                 pcall(function() it = e.inventory:FindItem(cls) end)
             end
             return it
         end
         local function lastResort(it)
+            if not live() then return end
             pcall(function() e.human:DrawFromInventory(it, 0, true) end)
+            if not live() then return end
             KCD2MP.ghostWeaponDrawn[id] = true
             Script.SetTimer(1000, function()
-                if live() then report(held() == cls and "fixed" or "failed", "drawn-from-inventory") end
+                if live() then report(holdsClass() and "fixed" or "failed", "drawn-from-inventory") end
             end)
         end
         local function fix()
+            if not live() then return end
             local it = item()
-            if not it then return report("failed", "no-item") end
+            if not it or not live() then return report("failed", "no-item") end
             if oversized then return lastResort(it) end   -- WO-47: an oversized weapon's own path
             pcall(function() e.actor:EquipInventoryItem(it) end)   -- the game's own equip: into the figure's weapon set
-            if held() ~= nil then pcall(function() e.human:HolsterToInventory(0, false) end) end   -- a wrong item in hand goes first
+            if held(0) ~= nil and live() then pcall(function() e.human:HolsterToInventory(0, false) end) end
+            if not live() then return end
             pcall(function() e.human:DrawWeapon() end)
+            if not live() then return end
             KCD2MP.ghostWeaponDrawn[id] = true
             Script.SetTimer(1200, function()
                 if not live() then return end
-                if held() == cls then return report("fixed", "equipped+drawn") end
+                if holdsClass() then return report("fixed", "equipped+drawn") end
                 lastResort(it)
             end)
         end
@@ -36532,7 +36573,7 @@ do
         local waited = 0
         local function check()
             if not live() then return end
-            if held() == cls then return report("ok", waited == 0 and "held" or "drew") end
+            if holdsClass() then return report("ok", waited == 0 and "held" or "drew") end
             if waited >= 500 then return fix() end
             waited = waited + 250
             Script.SetTimer(250, check)
@@ -36544,6 +36585,85 @@ do
         local fname = "KCD2MP_W214Set_" .. k
         _G[fname] = function(arg) return KCD2MP_W214Set(k, arg) end
         System.AddCCommand(label, fname .. "(%line)", "WO-214 " .. (W214.HELP[k] or k) .. " (default on): " .. label .. " on|off")
+    end
+end
+
+-- ===== H4 Outfit engine fence =====
+do
+    local function handsEmpty(e)
+        local function empty(slot)
+            local ok, item = pcall(function() return e.human:GetItemInHand(slot) end)
+            return ok and (item == nil or item == 0 or tostring(item) == "userdata: 0000000000000000")
+        end
+        return empty(0) and empty(1)
+    end
+
+    -- All partner outfit changes reach this function. The item/actor bindings below are
+    -- the last callable mutation boundary, so every piece and every Create/Equip pair
+    -- must recheck the scope. Unknown occupancy cannot authorize a slot replacement.
+    function KCD2MP_W214OutfitApply(id, incarnation, handScope, order, operation, classes)
+        id = tostring(id)
+        local g = KCD2MP.ghosts and KCD2MP.ghosts[id]
+        if not (g and g.outfitIncarnation == incarnation and g.entity and #order == 16 and string.match(order, "^%x+$")) then
+            return false
+        end
+        local e = g.entity
+        if g.outfitOrder and order < g.outfitOrder then return false end
+        g.outfitOrder = order
+        local function attempted()
+            if g.outfitAttemptedOrder ~= order then
+                g.outfitAttemptedOrder = order
+                KCD2MP_EmitEvent("w214_outfit_attempt", id .. " " .. incarnation .. " " .. order)
+            end
+        end
+        local function check()
+            local reason
+            if KCD2MP.ghosts[id] ~= g or g.entity ~= e or g.outfitIncarnation ~= incarnation then reason = "body"
+            elseif g.outfitOrder and order < g.outfitOrder then reason = "older-outfit"
+            elseif not KCD2MP_W214HandScope then reason = "hand-owner-unavailable"
+            else
+                local hand = KCD2MP_W214HandScope(id)
+                if handScope == "-" then
+                    if hand ~= nil or (KCD2MP.ghostWeaponDrawn and KCD2MP.ghostWeaponDrawn[id]) then reason = "newer-hand" end
+                elseif not hand or hand.incarnation ~= incarnation or hand.scope ~= handScope then reason = "hand-scope"
+                elseif hand.drawn ~= false or hand.known ~= 3 or hand.left ~= "-" or hand.right ~= "-" then reason = "hand-pending"
+                end
+                if not reason and not handsEmpty(e) then reason = "actual-hand-occupied-or-unreadable" end
+            end
+            if reason then
+                if g.outfitDeferral ~= reason then
+                    g.outfitDeferral = reason
+                    mp_log("MP-W214-OUTFIT peer=" .. id .. " result=deferred reason=" .. reason)
+                end
+                return false
+            end
+            g.outfitDeferral = nil
+            return true
+        end
+
+        if not check() then return false end
+        if operation == "preset" then
+            local ok = pcall(function() e.actor:EquipClothingPreset(KCD2MP.w136.PRESET_BARE) end)
+            if ok then attempted() end
+            return ok
+        end
+        if operation ~= "equip" and operation ~= "unequip" and operation ~= "atomic" then return false end
+        for cls in string.gmatch(classes, "[^,]+") do
+            if not check() then return false end
+            local ok, item = pcall(function() return e.inventory:FindItem(cls) end)
+            if ok and not item and operation ~= "unequip" then
+                if not check() then return false end
+                pcall(function() e.inventory:CreateItem(cls, 1, 1) end)
+                ok, item = pcall(function() return e.inventory:FindItem(cls) end)
+            end
+            if ok and item then
+                if not check() then return false end
+                if operation == "unequip" then pcall(function() e.actor:UnequipInventoryItem(item) end)
+                else pcall(function() e.actor:EquipInventoryItem(item) end) end
+                attempted()
+            end
+        end
+        return true
     end
 end
 
