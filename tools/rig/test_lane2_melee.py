@@ -158,13 +158,14 @@ class Lane2EvidenceTests(unittest.TestCase):
         self.assertIsNone(lane.parse_vitals(after.replace('hp=80.0', 'hp=nan'), '7', 'after', 'partner'))
 
     def test_live_contact_separates_protected_zero_from_damage_apply(self):
-        sender = 'MP-FF dir=out victim_eid=0x31 ghost=1 hp=4.00 st=5.00 unarmed=0 missile=0 session=on result=sent'
-        receiver = 'MP-FF dir=in attacker=2 victim=1 hp=4.00 st=5.00 unarmed=0 missile=0 material=0 session=on result=applied reason=ok'
+        sender = 'MP-FF dir=out victim_eid=0x31 ghost=1 hp=4.00 st=5.00 unarmed=0 missile=0 session=on result=sent contact_seq=12'
+        receiver = ('MP-FF dir=in attacker=2 victim=1 hp=4.00 st=5.00 unarmed=0 missile=0 material=0 '
+                    'session=on result=applied reason=ok contact=44/12')
         sent, received = lane.partner_contacts([sender, sender.replace('ghost=1', 'ghost=4')], [receiver], 2, 1)
         self.assertEqual(([sender], [receiver]), (sent, received))
         dispatch = 'WO121-HITS friendly-fire hit on the player: hp -4.00 st -5.00 unarmed=0 from ghost 2 -> applied'
         applied = ('MP-LANE2-COMBAT event=contact source=pvp outcome=observed peer=2 seq=9 scope=1/87 target=0x1B '
-                   'hp_before=100 hp_after=96 st_before=100 st_after=95')
+                   'hp_before=100 hp_after=96 st_before=100 st_after=95 contact=44/12')
         guard = applied.replace('outcome=observed', 'outcome=protected_consumed').replace('hp_after=96', 'hp_after=100').replace('st_after=95', 'st_after=100')
         before = {'partner': {'eid': 0x1B}}
         for result in ('applied', 'acknowledged', 'observed'):
@@ -175,6 +176,9 @@ class Lane2EvidenceTests(unittest.TestCase):
             self.assertEqual('partner-application-observed', lane.case_signal('partner-hit', before, {}, sent, received, [], [], [applied], 2))
         self.assertEqual('partner-damage-effect-unmeasured', lane.case_signal('partner-hit', before, {}, sent, received, [], [], [applied, applied], 2))
         self.assertEqual('partner-damage-effect-unmeasured', lane.case_signal('partner-hit', before, {}, sent, received, [], [], [applied.replace('target=0x1B', 'target=0x1C')], 2))
+        self.assertEqual('partner-damage-effect-unmeasured', lane.case_signal('partner-hit', before, {}, sent, received, [], [], [applied.replace('contact=44/12', 'contact=45/12')], 2))
+        self.assertEqual('partner-damage-effect-unmeasured', lane.case_signal('partner-hit', before, {}, sent, received, [], [], [applied.replace(' contact=44/12', '')], 2))
+        self.assertEqual('partner-contact-id-mismatch', lane.case_signal('partner-hit', before, {}, [sender.replace('contact_seq=12', 'contact_seq=13')], received, [], [], [applied], 2))
         protected_reply = receiver.replace('result=applied', 'result=protected_consumed')
         sent, received = lane.partner_contacts([sender], [protected_reply], 2, 1)
         self.assertEqual(([sender], [protected_reply]), (sent, received))
