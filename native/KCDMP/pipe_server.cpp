@@ -14,6 +14,9 @@
 #include "engine.h"
 #include "rttr_abi.h"
 #include "combat_swing.h"
+#include "combat_actions.h"
+#include "npc_death_release.h"
+#include "npcstate.h"
 #include "lua_closure.h"
 #include "script_context.h"
 #include "concept_read.h"
@@ -48,6 +51,7 @@
 #include "wo139.h"
 #include "wo140.h"
 #include "wo141.h"
+#include "wo195.h"
 #include "wo143.h"
 #include "wo210_hit.h"
 #include "fault_guard.h"
@@ -71,6 +75,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <unordered_map>
@@ -1318,6 +1323,10 @@ bool next_normal_frame(ReaderContext& input, pipecontrol::Frame* frame) {
 constexpr unsigned kPipeSyncTimeoutMs = 3500;
 constexpr uint8_t  kReasonTaskFaulted    = 17;   // mirrors PipeReason.TaskFaulted
 constexpr uint8_t  kReasonUnknownCommand = 18;   // mirrors PipeReason.UnknownCommand
+constexpr uint8_t  kReasonPvpProtectedConsumed = 21;   // mirrors PipeReason.PvpProtectedConsumed
+constexpr uint8_t  kReasonPvpDispatchUnconfirmed = 22;
+constexpr uint8_t  kReasonPvpRecipientRetired = 23;
+constexpr uint8_t  kReasonPvpEffectObserved = 24;
 
 // `work` must capture everything it needs BY VALUE: it can end up running
 // well after this function has returned to its caller. Returns run_sync's
@@ -1330,10 +1339,12 @@ constexpr uint8_t  kReasonUnknownCommand = 18;   // mirrors PipeReason.UnknownCo
 // -- an empty ScanResult with refuse=kOk would make the agent untrack every
 // NPC, a default BodyState would report a body at rest.
 template <typename T>
-bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& outValue, bool* faultedOut = nullptr) {
+bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& outValue,
+                      bool* faultedOut = nullptr, bool* startedOut = nullptr) {
     if (t_edgeReply) {
         bool faulted = true;
         if (!loadsequence::allows(t_loadStamp, t_loadAccess)) return false;
+        if (startedOut) *startedOut = true;
         try { faulted = !fault::guarded(g_sitePipeTask, [&] { work(outValue); }); }
         catch (...) { logf("PIPE: async %s raised a C++ exception on Main", what); }
         if (faultedOut) *faultedOut = faulted;
@@ -1375,6 +1386,7 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
     std::unique_lock<std::mutex> lock(state->mutex);
     const auto waited = pipecontrol::wait_pumped(state->cv, lock, std::chrono::milliseconds(kPipeSyncTimeoutMs),
         [&] { return state->done; }, [&] { return pump_control_available() && generation == g_connGen.load() && g_running; });
+    if (startedOut) *startedOut = state->started;
     if (waited != pipecontrol::Wait::Done) {
         if (!state->started) state->cancelled = true;
         lock.unlock();
@@ -1388,9 +1400,136 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
     return state->ran && !state->faulted;
 }
 
-// One existing handler per operation. The compatibility path arrives on the
-// pipe thread. An admitted lane request calls the same validation on Main and
-// captures only its expected direct reply, leaving unsolicited events intact.
+struct DeathBody {
+    combatactions::BodyProof actions{};
+    void* soul = nullptr;
+    uint64_t wuid = 0;
+};
+
+void* canonical_death_soul(void* soul) {
+    if (void* canonical = soul ? buffs::as_c_soul(soul) : nullptr) return canonical;
+    return soul;
+}
+
+struct DeathBackend {
+    npcdeath::Scope scope;
+
+    bool scope_current() const {
+        return g_running && g_connected && scope.connection == g_connGen.load() && scope.lifecycle &&
+            scope.lifecycle == wo216::lifecycle_generation() && wo216::lifecycle_gameplay() &&
+            scope.playerLife == p4::life_edge_tick() && loadsequence::allows(scope.load, LoadAccess::Live);
+    }
+
+    DeathBody resolve(const npcdeath::Request& request) const {
+        if (request.soul == npcdeath::Guid{}) return {};
+        void* soul = canonical_death_soul(request.eid ? hits::soul_of_eid(request.eid) :
+            rttr::tracked_soul_by_guid(request.soul.data()));
+        if (!soul || soul == canonical_death_soul(rttr::read_player_soul())) return {};
+        npcdeath::Guid liveGuid{};
+        if (!rttr::soul_guid(soul, liveGuid.data()) || liveGuid != request.soul) return {};
+        const uint64_t wuid = sctx::soul_wuid(soul);
+        if (!wuid) return {};
+        void* entity = request.eid ? engine::entity_by_id(request.eid) : wo141::x::entity_of(wuid);
+        const uint32_t eid = entity ? engine::entity_id(entity) : 0;
+        if (!eid || (request.eid && eid != request.eid) || hits::avatar_known(eid) || npcscan::body_kind(entity) < 0)
+            return {};
+        const auto proof = combatactions::observe_body(eid);
+        if (!combatactions::detail::known_body(proof) || proof.entity != entity || proof.load != scope.load ||
+            canonical_death_soul(hits::soul_of_eid(eid)) != soul || actions::entity_wuid(entity) != wuid)
+            return {};
+        return {proof, soul, wuid};
+    }
+
+    bool current(const DeathBody& body, const npcdeath::Request&, bool beforeApply) const {
+        if (!scope_current() || !body.soul) return false;
+        const uint32_t eid = body.actions.eid;
+        auto proof = combatactions::observe_body(eid);
+        if (!combatactions::detail::known_body(proof) || proof.eid != eid || proof.entity != body.actions.entity ||
+            proof.actor != body.actions.actor || proof.lifecycle != body.actions.lifecycle || proof.load != body.actions.load ||
+            canonical_death_soul(hits::soul_of_eid(eid)) != body.soul || sctx::soul_wuid(body.soul) != body.wuid)
+            return false;
+        // Death itself may release the combat component. The subsequent observation is read-only.
+        return scope_current() && (!beforeApply || combatactions::detail::same_body(proof, body.actions));
+    }
+
+    npcdeath::Retirement retire(const DeathBody& body, uint64_t attempt) const {
+        switch (combatactions::retire_for_body(body.actions, "remote-npc-death", attempt)) {
+            case combatactions::ReleaseReceipt::Ready: return npcdeath::Retirement::Ready;
+            case combatactions::ReleaseReceipt::Pending: return npcdeath::Retirement::Pending;
+            case combatactions::ReleaseReceipt::Uncertain: return npcdeath::Retirement::Uncertain;
+            case combatactions::ReleaseReceipt::Stale: return npcdeath::Retirement::Stale;
+        }
+        return npcdeath::Retirement::Uncertain;
+    }
+
+    bool ready(const DeathBody& body, uint64_t attempt) const { return combatactions::release_ready(body.actions, attempt); }
+    bool abort(const DeathBody& body, uint64_t attempt) const { return combatactions::abort_release(body.actions, attempt); }
+
+    npcdeath::Life life(const DeathBody& body) const {
+        bool dead = false;
+        if (!rttr::soul_bool(body.soul, "IsDead", &dead)) return npcdeath::Life::Unreadable;
+        return dead ? npcdeath::Life::Dead : npcdeath::Life::Alive;
+    }
+
+    bool prepare(const DeathBody& body, const npcdeath::Request& request, uint64_t attempt) const {
+        const uint32_t eid = body.actions.eid;
+        if (!current(body, request, true) || !ready(body, attempt)) return false;
+        wo195::release(eid, "verified remote NPC death");
+        if (!current(body, request, true) || !ready(body, attempt)) return false;
+        hits::discard_from(eid, false);
+        uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
+        std::memcpy(payload + 2, &eid, sizeof eid);
+        uint8_t guard[32]{};
+        size_t used = 0;
+        return wo131::handle(payload, sizeof payload, guard, sizeof guard, &used) == wo131::kROk && used == 1 && guard[0] == 1;
+    }
+
+    bool apply(const DeathBody& body, const npcdeath::Request& request) const {
+        report_tag(body, request, "death-dispatched");
+        // The confirmed Soul pointer is used once. An unreadable result never triggers a second invoke or a GUID re-lookup write.
+        KCDMP_FAULT_CALL(site, "pipe::npc_death/TakeDamage");
+        try {
+            return fault::guarded_or(site, false, [&] {
+                return rttr::apply_damage_soul_ex(body.soul, 0.0f, 100000.0f, nullptr, 1);
+            });
+        } catch (...) {
+            report_tag(body, request, "apply-exception");
+            return false;
+        }
+    }
+
+    void confirm(const DeathBody& body, const npcdeath::Request& request) const {
+        rttr::note_remote_death(request.soul.data(), body.soul);
+        wo216::p5_copy_dead(body.actions.eid);
+    }
+
+    void report_tag(const DeathBody& body, const npcdeath::Request& request, const char* stage, const char* reason = nullptr) const {
+        logf("MP-LANE2-H6 attempt=%llu eid=0x%X path=%s stage=%s lifecycle=%llu connection=%llu%s",
+            static_cast<unsigned long long>(request.attempt), body.actions.eid ? body.actions.eid : request.eid,
+            request.eid ? "named" : "guid", stage, static_cast<unsigned long long>(scope.lifecycle),
+            static_cast<unsigned long long>(scope.connection), reason ? reason : body.soul ? "" :
+                (request.eid ? " reason=named-binding-unproven" : " reason=guid-tracked-binding-unproven"));
+    }
+
+    void report(const DeathBody& body, const npcdeath::Request& request, npcdeath::Stage stage) const {
+        switch (stage) {
+            case npcdeath::Stage::ReleasePending: return report_tag(body, request, "release-pending");
+            case npcdeath::Stage::ReleaseUncertain: return report_tag(body, request, "release-uncertain");
+            case npcdeath::Stage::Ready: return report_tag(body, request, "ready");
+            case npcdeath::Stage::DeathPending: return report_tag(body, request, "death-pending");
+            case npcdeath::Stage::Applied: return report_tag(body, request, "applied");
+            case npcdeath::Stage::Uncertain: return report_tag(body, request, "uncertain");
+            case npcdeath::Stage::Stale: return report_tag(body, request, "stale");
+            case npcdeath::Stage::Aborted: return report_tag(body, request, "aborted-before-apply");
+            case npcdeath::Stage::AbortedUnadmitted: return report_tag(body, request, "aborted-unadmitted", " reason=never-admitted");
+            case npcdeath::Stage::ApplyUncertain: return report_tag(body, request, "apply-uncertain");
+        }
+    }
+};
+
+npcdeath::Attempts<DeathBody> g_npcDeaths;
+
+// Admitted lane requests call the same handler on Main and capture only their direct reply.
 void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& incoming) {
         const uint8_t type = incoming.type;
         const uint16_t len = static_cast<uint16_t>(incoming.body.size());
@@ -1410,7 +1549,8 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 const BYTE reply[]{0, seq};
                 const uint8_t replyType = type == kAttributedDamage ? kAttributedReply : type == kLeashSample ? kLeashReply : kJoinPlaceReply;
                 send_frame(h, replyType, reply, sizeof reply, generation);
-            } else send_result(h, false, seq, kLoadRefused);
+            } else if (type == kApplyDeath) send_result(h, false, seq, static_cast<uint8_t>(npcdeath::Receipt::Stale));
+            else send_result(h, false, seq, kLoadRefused);
             return;
         }
 
@@ -1430,6 +1570,10 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 float stamina, health;
                 std::memcpy(&stamina, body + 16, 4);
                 std::memcpy(&health,  body + 20, 4);
+                if (!std::isfinite(stamina) || !std::isfinite(health) || stamina < 0.0f || health < 0.0f) {
+                    send_result(h, false, seq);
+                    break;
+                }
                 const bool suppress = (body[24] & kFlagSuppressHitReaction) != 0;
                 const bool nonLethal = (body[24] & kFlagNonLethal) != 0;   // WO-147
 
@@ -1444,16 +1588,23 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                             logf("T3-RECOVERY hit=PlayerHenry decision=protected_consumed applied_hp=0 applied_st=0");
                             result = true; return; // consume reliable order, never replay the hit after grace
                         }
-                        if (nonLethal) {
+                        void* canonicalTarget = canonical_death_soul(targetSoul);
+                        if (!canonicalTarget) return;
+                        const bool isPlayer = canonicalTarget == canonical_death_soul(rttr::read_player_soul());
+                        if (nonLethal || !isPlayer) {
                             // WO-147: the field's fist-fight opponent died on the joiner's copy from the host's
                             // own non-fatal blow (9.35 on a copy the follow had just set to the host's 4.8).
                             // The host decides deaths: this damage stops 1 hp short.
-                            void* s = rttr::find_soul_by_guid(guid.data());
-                            void* cs = s && kcdmp::buffs::as_c_soul(s) ? kcdmp::buffs::as_c_soul(s) : s;
-                            float cur = -1.0f, hp = health;
-                            if (cs) rttr::soul_state(cs, "health", &cur);
-                            if (cur >= 0.0f && cur - hp < 1.0f) hp = cur > 1.0f ? cur - 1.0f : 0.0f;
-                            result = s && rttr::apply_damage_soul(s, stamina, hp, nullptr);
+                            void* s = targetSoul;
+                            float cur = -1.0f, hp = 0.0f;
+                            if (!rttr::soul_state(canonicalTarget, "health", &cur) || !npcdeath::nonlethal_health(health, cur, hp)) {
+                                logf("PIPE: ApplyDamage non-lethal refused -- current target health unreadable");
+                                return;
+                            }
+                            auto receipt = rttr::invoke_damage_soul(s, stamina, hp, nullptr, suppress ? 1 : -1);
+                            if (suppress && receipt == rttr::DamageInvocation::NotInvoked)
+                                receipt = rttr::invoke_damage_soul(s, stamina, hp, nullptr, -1);
+                            result = receipt == rttr::DamageInvocation::Acknowledged;
                             if (result) rttr::note_remote_damage(guid.data(), hp);
                             if (hp != health) logf("PIPE: ApplyDamage non-lethal: %.2f of %.2f applied (health %.2f) -- the host decides deaths", hp, health, cur);
                             return;
@@ -1473,21 +1624,28 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
             }
 
             case kApplyDeath: {
-                if (len != kApplyDeathLen) {
-                    logf("PIPE: ApplyDeath wrong length %u", len);
-                    send_result(h, false, seq);
+                if ((len != kApplyDeathLen && len != kApplyDeathLen + 1) ||
+                    (len == kApplyDeathLen + 1 && body[kApplyDeathLen] > static_cast<uint8_t>(npcdeath::Intent::AbortBeforeApply))) {
+                    logf("PIPE: ApplyDeath refused an invalid request (length %u)", len);
+                    send_result(h, false, seq, static_cast<uint8_t>(npcdeath::Receipt::Stale));
                     break;
                 }
-                std::array<unsigned char, 16> guid;
-                std::memcpy(guid.data(), body, 16);
-                bool ok = false;
-                bool faultedFlag = false;
-                const bool ran = run_sync_bounded<bool>(
-                    [guid](bool& result) { result = rttr::apply_death(guid.data()); if(result)wo216::p5_copy_dead_soul(rttr::find_soul_by_guid(guid.data())); },
-                    "ApplyDeath", ok, &faultedFlag);
-                if (!ran) logf("PIPE: ApplyDeath timed out waiting for a frame");
-                logf("PIPE: ApplyDeath -> %s", ok ? "dead" : "soul not loaded / failed");
-                send_result(h, ran && ok, seq, (ran && ok) ? 0 : (faultedFlag ? kReasonTaskFaulted : 0));
+                npcdeath::Request request;
+                std::memcpy(request.soul.data(), body, request.soul.size());
+                std::memcpy(&request.eid, body + 16, sizeof request.eid);
+                std::memcpy(&request.lifecycle, body + 20, sizeof request.lifecycle);
+                std::memcpy(&request.attempt, body + 28, sizeof request.attempt);
+                const auto intent = len == kApplyDeathLen ? npcdeath::Intent::Advance :
+                    static_cast<npcdeath::Intent>(body[kApplyDeathLen]);
+                const npcdeath::Scope scope{generation, renderStamp.generation, incoming.loadStamp, renderStamp.life};
+                auto reply = npcdeath::Receipt::Uncertain;
+                const bool ran = run_sync_bounded<npcdeath::Receipt>(
+                    [request, scope, intent, gameplay = renderStamp.gameplay](npcdeath::Receipt& result) {
+                        DeathBackend backend{scope};
+                        result = gameplay ? g_npcDeaths.step(request, scope, backend, intent) : npcdeath::Receipt::Stale;
+                    }, "ApplyDeath", reply);
+                if (!ran) reply = npcdeath::Receipt::Uncertain; // the task may have entered the engine before the caller timed out
+                send_result(h, reply == npcdeath::Receipt::Applied, seq, static_cast<uint8_t>(reply));
                 break;
             }
 
@@ -1794,20 +1952,20 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
             // (engine reads) is marshalled onto the main thread.
             case kNpcSamples: {
                 const uint8_t r = npcdrive::on_samples(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp});
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp, incoming.readerLife});
                 if (r != npcdrive::kOk) logf("PIPE: NpcSamples refused (%s, %u bytes)", npcdrive::reason_name(r), len);
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
             case edgelanes::kRawPose: {
                 const uint8_t r = t_edgeReply ? npcdrive::on_raw_pose(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp}) : npcdrive::kBadRequest;
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp, incoming.readerLife}) : npcdrive::kBadRequest;
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
             case edgelanes::kTimedPose: {
                 const uint8_t r = t_edgeReply ? npcdrive::on_timed_pose(body, len,
-                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp}) : npcdrive::kBadRequest;
+                    {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp, incoming.readerLife}) : npcdrive::kBadRequest;
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
@@ -1899,10 +2057,28 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
             }
             case kApplyPvpHit: {
                 std::vector<uint8_t> copy(body, body + len);
-                bool ok = false, faulted = false;
-                const bool ran = run_sync_bounded<bool>(
-                    [copy](bool& out) { out = kcdmp::hits::apply_pvp_hit(copy.data(), copy.size()); }, "ApplyPvpHit", ok, &faulted);
-                send_result(h, ran && ok, seq, faulted ? 17 : (ran ? 0 : 16));
+                using wo155rules::HitResult;
+                HitResult outcome = HitResult::Refused;
+                bool started = false;
+                const wo155rules::Recipient recipient{
+                    incoming.readerGeneration, incoming.readerLife, generation + 1, incoming.readerGameplay};
+                const bool ran = run_sync_bounded<HitResult>(
+                    [copy, recipient, readTick = incoming.readerTick, seq](HitResult& out) {
+                        out = hits::apply_pvp_hit(copy.data(), copy.size(), recipient, readTick, seq);
+                    }, "ApplyPvpHit", outcome, nullptr, &started);
+                bool ok = false;
+                uint8_t reason = 0;
+                if (!ran) reason = started ? kReasonPvpDispatchUnconfirmed : 16;
+                else switch (outcome) {
+                    case HitResult::Acknowledged: ok = true; break;
+                    case HitResult::ProtectedConsumed: ok = true; reason = kReasonPvpProtectedConsumed; break;
+                    case HitResult::EffectObserved: ok = true; reason = kReasonPvpEffectObserved; break;
+                    case HitResult::DispatchUnconfirmed: reason = kReasonPvpDispatchUnconfirmed; break;
+                    case HitResult::RecipientRetired: reason = kReasonPvpRecipientRetired; break;
+                    case HitResult::Refused: break;
+                }
+                const BYTE reply[]{static_cast<BYTE>(ok ? 1 : 0), seq, reason};
+                send_frame(h, kResult, reply, sizeof reply, generation);
                 break;
             }
             case kWo121Status: {
@@ -2600,6 +2776,29 @@ void stop() {
 
 bool connected() { return g_connected; }
 uint64_t observation_connection() { return g_connected ? g_connGen.load() + 1 : 0; }
+
+void publish_pvp_life() {
+    const uint64_t connection = observation_connection();
+    if (!connection) return;
+    const uint64_t proof = p4::pvp_life_proof();
+    static uint64_t observedConnection = 0, observedProof = 0, retryAt = 0;
+    static unsigned attempts = 0;
+    static bool queued = false;
+    if (observedConnection != connection || observedProof != proof) {
+        observedConnection = connection;
+        observedProof = proof;
+        attempts = 0;
+        queued = false;
+    }
+    if (queued || attempts >= 2 || (attempts && GetTickCount64() < retryAt)) return;
+    ++attempts;
+    queued = send_frame(g_pipe.load(), kPvpLifeOut, &proof, sizeof(proof), connection - 1);
+    if (!queued) {
+        const DWORD err = GetLastError();
+        retryAt = GetTickCount64() + 100;
+        logf("PIPE: PvpLife enqueue failed: %lu", err);
+    }
+}
 
 } // namespace kcdmp::pipe
 

@@ -2,6 +2,8 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #pragma once
+#include <cstdint>
+#include "damage_invocation.h"
 // WO-155: the engine-free rule of the friendly-fire knockdown window (hits.cpp). native/tests/wo155_rules_tests.cpp
 // pins it.
 //
@@ -12,6 +14,35 @@
 // second fall).
 
 namespace kcdmp::wo155rules {
+
+struct Recipient {
+    uint64_t generation;
+    uint64_t life;
+    uint64_t connection;
+    bool gameplay;
+    uint64_t proof = 0;
+    bool matches(Recipient current, uint64_t readTick) const {
+        return generation && connection && gameplay && current.gameplay &&
+            generation == current.generation && life == current.life &&
+            connection == current.connection && readTick > life &&
+            (!proof || proof == current.proof);
+    }
+};
+
+enum class HitResult : uint8_t {
+    Refused, Acknowledged, ProtectedConsumed, DispatchUnconfirmed, RecipientRetired, EffectObserved
+};
+
+template<class Invoke>
+HitResult dispatch(bool protectedPlayer, bool suppress, Invoke invoke) {
+    if (protectedPlayer) return HitResult::ProtectedConsumed;
+    using rttr::DamageInvocation;
+    auto result = suppress ? invoke(true) : DamageInvocation::NotInvoked;
+    if (result == DamageInvocation::NotInvoked) result = invoke(false);
+    if (result == DamageInvocation::Acknowledged) return HitResult::Acknowledged;
+    if (result == DamageInvocation::Unconfirmed) return HitResult::DispatchUnconfirmed;
+    return HitResult::Refused;
+}
 
 constexpr double kWindowS = 5.0;       // after a knocking hit, no new knockdown from friendly fire
 constexpr double kSettleS = 1.5;       // a knockdown shows as a down edge this soon after the hit or not at all

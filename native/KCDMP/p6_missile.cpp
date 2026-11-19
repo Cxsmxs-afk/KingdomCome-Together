@@ -73,7 +73,11 @@ bool engine_vitals(void* soul,float* hp,float* st){return rttr::soul_state(soul,
 bool engine_arranged(uint32_t eid){return hits::scene_owned_eid(eid,"measured_missile_accept");}
 uint32_t engine_named(const char* name){return hits::eid_of_name(name);}
 bool engine_avatar(uint8_t peer,uint32_t eid){char name[32]{};std::snprintf(name,sizeof name,"kcd2mp_%u",unsigned(peer));return hits::avatar_known(eid)&&hits::eid_of_name(name)==eid;}
-bool engine_apply(const uint8_t* body,size_t len,uint8_t* steps){const auto r=hits::apply_attributed_ex(body,len,true,-1.0f,true);*steps=r.steps;return (r.steps&1)!=0;}
+bool engine_apply(const uint8_t* body, size_t len, uint8_t* steps) {
+    const auto receipt = hits::apply_attributed_ex(body, len, true, -1.0f, true, hits::RawDamageAuthority::OwnerMeasuredMissile);
+    *steps = receipt.steps;
+    return (receipt.steps & 1) != 0;
+}
 Backend defaults(){return {engine_now,engine_main,engine_scope,engine_victim,engine_same,engine_vitals,engine_arranged,engine_named,engine_avatar,engine_apply};}
 #endif
 void ensure(){

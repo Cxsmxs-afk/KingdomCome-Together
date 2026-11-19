@@ -993,37 +993,6 @@ bool apply_damage(const unsigned char guid[16], float stamina, float health,
     return true;
 }
 
-bool apply_death(const unsigned char guid[16]) {
-    Api api{};
-    if (!resolve(api)) return false;
-
-    void* soul = find_soul_by_guid(guid);
-    if (!soul) return false;
-
-    // Idempotent: already dead is success. The relay makes no promises about
-    // duplicates and two clients may both report the same death.
-    const std::string_view soul_tn{"wh::rpgmodule::Soul"};
-    Type t_soul{};
-    bool ok = false;
-    if (!call_get_by_name(api.get_by_name, &t_soul, &soul_tn) ||
-        !call_is_valid(api.type_is_valid, &t_soul, &ok) || !ok) return false;
-
-    InstanceBuf inst{};
-    inst.build(g_layout, t_soul, soul);
-    const std::string_view dead{"IsDead"};
-    Variant v{};
-    if (call_get_property_value(KCDMP_SITE_CALL("rttr::apply_death/IsDead"), api.get_property_value, &t_soul, &v, &dead, inst.bytes)) {
-        bool is_dead = false;
-        std::memcpy(&is_dead, v.data, sizeof(is_dead));
-        call_variant_dtor(api.variant_dtor, &v);
-        if (is_dead) return true;
-    }
-
-    // GUESS: 100000 is arbitrary, but far above any max health observed (~136),
-    // so it is lethal regardless of the soul.
-    return apply_damage(guid, 0.0f, 100000.0f, true);
-}
-
 namespace {
 
 // kcdmp-faction.txt: line 1 the ghost's GUID, line 2 a faction name id.
@@ -1829,6 +1798,18 @@ const Carry* find_carry(const unsigned char guid[16]) {
 void note_remote_damage(const unsigned char guid[16], float health_delta) {
     p6::remote_follow(guid);
     if (Tracked* t = find_tracked(guid)) t->credit += health_delta;
+}
+
+void note_remote_death(const unsigned char guid[16], void* soul) {
+    if (Tracked* t = find_tracked(guid); t && t->soul == soul) {
+        t->dead = true;
+        if (std::isfinite(t->health) && t->health > t->credit) t->credit = t->health;
+    }
+}
+
+void* tracked_soul_by_guid(const unsigned char guid[16]) {
+    const Tracked* target = find_tracked(guid);
+    return target && !target->gone && soul_alive(*target) ? target->soul : nullptr;
 }
 
 void sample_health(void (*on_hit)(const unsigned char[16], void*, float, float, bool)) {
@@ -2846,16 +2827,16 @@ void* combat_soul_of(void* soul) {
     return plausible_pointer(combat) ? combat : nullptr;
 }
 
-bool apply_damage_soul(void* soul, float stamina, float health, void* attacker) {
+static DamageInvocation invoke_base_damage_soul(void* soul, float stamina, float health, void* attacker) {
     const Api* api = cached_api();
-    if (!api || !plausible_pointer(soul)) return false;
+    if (!api || !plausible_pointer(soul) || (attacker ? !api->invoke3 : !api->invoke2)) return DamageInvocation::NotInvoked;
     void* combat = read_object_property(KCDMP_SITE_CALL("rttr::apply_damage_soul/CombatSoul"), *api, "wh::rpgmodule::Soul", soul, "CombatSoul", g_layout);
-    if (!plausible_pointer(combat)) return false;
+    if (!plausible_pointer(combat)) return DamageInvocation::NotInvoked;
     Type tCs{}, tFloat{}, tSoulPtr{};
-    if (!type_named(*api, "wh::rpgmodule::CombatSoul", &tCs)) return false;
-    if (!type_named(*api, "float", &tFloat)) return false;
+    if (!type_named(*api, "wh::rpgmodule::CombatSoul", &tCs)) return DamageInvocation::NotInvoked;
+    if (!type_named(*api, "float", &tFloat)) return DamageInvocation::NotInvoked;
     Method m{};
-    if (!method_named(*api, tCs, "TakeDamage", &m)) return false;
+    if (!method_named(*api, tCs, "TakeDamage", &m)) return DamageInvocation::NotInvoked;
     // TakeDamage(float Stamina, float Health, I_Soul* Attacker, ...): the
     // attacker is argument THREE (see apply_damage). With none, two args.
     const Arg<float> a0(stamina, tFloat);
@@ -2865,7 +2846,7 @@ bool apply_damage_soul(void* soul, float stamina, float health, void* attacker) 
     Variant res{};
     bool invoked;
     if (attacker) {
-        if (!type_named(*api, "wh::rpgmodule::I_Soul*", &tSoulPtr)) return false;
+        if (!type_named(*api, "wh::rpgmodule::I_Soul*", &tSoulPtr)) return DamageInvocation::NotInvoked;
         const Arg<void*> a2(attacker, tSoulPtr);
         invoked = call_invoke3(KCDMP_SITE_CALL("rttr::apply_damage_soul/TakeDamage(attacker)"), api->invoke3, &m, &res, inst.bytes,
                                a0.get(), a1.get(), a2.get());
@@ -2873,13 +2854,16 @@ bool apply_damage_soul(void* soul, float stamina, float health, void* attacker) 
         invoked = call_invoke2(KCDMP_SITE_CALL("rttr::apply_damage_soul/TakeDamage"), api->invoke2, &m, &res, inst.bytes,
                                a0.get(), a1.get());
     }
-    if (!invoked) return false;
+    if (!invoked) return DamageInvocation::Unconfirmed;
     bool valid = false;
     call_variant_valid(api->variant_is_valid, &res, &valid);
     call_variant_dtor(api->variant_dtor, &res);
-    return valid;
+    return valid ? DamageInvocation::Acknowledged : DamageInvocation::Unconfirmed;
 }
 
+bool apply_damage_soul(void* soul, float stamina, float health, void* attacker) {
+    return invoke_base_damage_soul(soul, stamina, health, attacker) == DamageInvocation::Acknowledged;
+}
 // ---- WO-151 ------------------------------------------------------------------
 
 bool can_suppress_hit_reaction() {
@@ -2887,17 +2871,17 @@ bool can_suppress_hit_reaction() {
     return api && api->invoke4;
 }
 
-bool apply_damage_soul_ex(void* soul, float stamina, float health, void* attacker, int suppress) {
-    if (suppress < 0) return apply_damage_soul(soul, stamina, health, attacker);
+DamageInvocation invoke_damage_soul(void* soul, float stamina, float health, void* attacker, int suppress) {
+    if (suppress < 0) return invoke_base_damage_soul(soul, stamina, health, attacker);
     const Api* api = cached_api();
-    if (!api || !api->invoke4 || !plausible_pointer(soul)) return false;
+    if (!api || !api->invoke4 || !plausible_pointer(soul)) return DamageInvocation::NotInvoked;
     void* combat = read_object_property(KCDMP_SITE_CALL("rttr::apply_damage_soul_ex/CombatSoul"), *api, "wh::rpgmodule::Soul", soul, "CombatSoul", g_layout);
-    if (!plausible_pointer(combat)) return false;
+    if (!plausible_pointer(combat)) return DamageInvocation::NotInvoked;
     Type tCs{}, tFloat{}, tSoulPtr{}, tBool{};
     if (!type_named(*api, "wh::rpgmodule::CombatSoul", &tCs) || !type_named(*api, "float", &tFloat)
-        || !type_named(*api, "wh::rpgmodule::I_Soul*", &tSoulPtr) || !type_named(*api, "bool", &tBool)) return false;
+        || !type_named(*api, "wh::rpgmodule::I_Soul*", &tSoulPtr) || !type_named(*api, "bool", &tBool)) return DamageInvocation::NotInvoked;
     Method m{};
-    if (!method_named(*api, tCs, "TakeDamage", &m)) return false;
+    if (!method_named(*api, tCs, "TakeDamage", &m)) return DamageInvocation::NotInvoked;
     // TakeDamage(float Stamina, float Health, I_Soul* Attacker, bool SuppressHitReaction, BodyPartData InjureBodypart):
     // four of five; the body part keeps its default.
     const Arg<float> a0(stamina, tFloat);
@@ -2908,14 +2892,18 @@ bool apply_damage_soul_ex(void* soul, float stamina, float health, void* attacke
     inst.build(g_layout, tCs, combat);
     Variant res{};
     if (!call_invoke4(KCDMP_SITE_CALL("rttr::apply_damage_soul_ex/TakeDamage(4)"), api->invoke4, &m, &res, inst.bytes,
-                      a0.get(), a1.get(), a2.get(), a3.get())) return false;
+                      a0.get(), a1.get(), a2.get(), a3.get())) return DamageInvocation::Unconfirmed;
     bool valid = false;
     call_variant_valid(api->variant_is_valid, &res, &valid);
     call_variant_dtor(api->variant_dtor, &res);
     static std::atomic<bool> s_logged{false};
     if (!valid && !s_logged.exchange(true))
-        logf("WO151-TAKEDAMAGE the four-argument TakeDamage returned an invalid variant (argument mismatch) -- the reaction is not suppressed; the old call is used");
-    return valid;
+        logf("WO151-TAKEDAMAGE the four-argument TakeDamage returned an invalid variant; engine effect unconfirmed");
+    return valid ? DamageInvocation::Acknowledged : DamageInvocation::Unconfirmed;
+}
+
+bool apply_damage_soul_ex(void* soul, float stamina, float health, void* attacker, int suppress) {
+    return invoke_damage_soul(soul, stamina, health, attacker, suppress) == DamageInvocation::Acknowledged;
 }
 
 } // namespace kcdmp::rttr

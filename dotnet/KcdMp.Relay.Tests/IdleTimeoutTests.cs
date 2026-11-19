@@ -2,11 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
-using System.Net;
-using System.Net.Sockets;
-using KcdMp.Server;
 using KcdMp.Wire;
-using Microsoft.AspNetCore.Builder;
 using Xunit;
 
 namespace KcdMp.Relay.Tests;
@@ -30,17 +26,9 @@ public class IdleTimeoutTests
     [Fact]
     public async Task Silent_peer_is_dropped_and_damage_authority_moves_to_the_survivor()
     {
-        int tcpPort = FreePort();
-        int httpPort = FreePort();
-        await using var app = Program.CreateApp(new[]
-        {
-            "--port", tcpPort.ToString(),
-            "--Urls", $"http://127.0.0.1:{httpPort}",
-            "--Serilog:WriteTo:1:Name", "Console",
-            "--Tcp:IdleTimeoutMs", "300",
-        });
-        await app.StartAsync();
-        await WaitForBindAsync(tcpPort);
+        var relay = RelayListeners.CreateApp("--Tcp:IdleTimeoutMs", "300");
+        int tcpPort = (await RelayListeners.StartAsync(relay)).Port;
+        await using var app = relay;
 
         var a = await Peer.ConnectAsync(tcpPort, "alpha");
         var b = await Peer.ConnectAsync(tcpPort, "bravo");
@@ -74,24 +62,6 @@ public class IdleTimeoutTests
         await app.StopAsync();
     }
 
-    private static async Task WaitForBindAsync(int port)
-    {
-        var deadline = DateTime.UtcNow.AddSeconds(10);
-        while (true)
-        {
-            try
-            {
-                using var probe = new TcpClient();
-                await probe.ConnectAsync(IPAddress.Loopback, port);
-                return;
-            }
-            catch (SocketException) when (DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(50);
-            }
-        }
-    }
-
     private static byte[] BuildPing()
     {
         var packet = new byte[3 + 8];
@@ -99,14 +69,5 @@ public class IdleTimeoutTests
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(1), 8);
         BinaryPrimitives.WriteInt64LittleEndian(packet.AsSpan(3), DateTime.UtcNow.Ticks);
         return packet;
-    }
-
-    private static int FreePort()
-    {
-        var l = new TcpListener(IPAddress.Loopback, 0);
-        l.Start();
-        int port = ((IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
     }
 }

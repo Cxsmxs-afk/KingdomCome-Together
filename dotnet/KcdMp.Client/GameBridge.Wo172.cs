@@ -33,7 +33,7 @@ public partial class GameBridge
                     _w172Dead[f[0]] = Environment.TickCount64;
                     if (_w172Dead.Count > 1024) foreach (var k in _w172Dead.Where(kv => Environment.TickCount64 - kv.Value > 1_800_000).Select(kv => kv.Key).ToList()) _w172Dead.TryRemove(k, out _);
                     Interlocked.Increment(ref _w172DeadMarks);
-                    if (_w172DeadWins) _ = Wo172MarkDeadAsync(f[0]);
+                    // The native death attempt owns release. The Lua fact only blocks managed presentation rows.
                 }
                 return;
             case "w172_alive":   // <npc>: C1 -- it reads alive again (a reload): rows may play on it again
@@ -61,20 +61,6 @@ public partial class GameBridge
                 }
                 return;
         }
-    }
-
-    private async Task Wo172MarkDeadAsync(string npc)
-    {
-        try
-        {
-            // the WO-132 engagement ends first (the copy no longer counts as fighting this player), then the DLL is told
-            bool engaged = false;
-            if (_w132Engaged.TryRemove(npc, out var eg)) { engaged = true; await _combat.Wo132EngageAsync(false, eg.Eid, default); }
-            if (engaged) Console.WriteLine($"WO172-DEAD npc={npc} engagement released");
-            string? r = await _combat.Wo172DeadAsync(npc);
-            Console.WriteLine($"WO172-DEAD npc={npc} marked -- the host's death wins here: no activity, tool, retarget, strike or row on it ({r ?? "no answer"})");
-        }
-        catch (Exception ex) { Console.WriteLine($"WO172-DEAD npc={npc} the DLL was not told ({ex.GetType().Name}) -- its own IsDead read still skips the body"); }
     }
 
     private async Task Wo172PushConfigAsync()

@@ -64,6 +64,8 @@ int p6_capture_flow_tests(int* passed);
 int p6_render_fence_tests(int* passed);
 int t3_native_stats_tests(int* passed);
 int t3_recovery_stats_tests(int* passed);
+int h6_combat_action_tests(int* passed);
+int npc_death_release_tests(int* passed);
 int rp_measure_tests(int* passed);
 int holder_contract_tests(int* passed);
 int edge_lanes_tests(int* passed);
@@ -71,6 +73,7 @@ int rp_timeline_tests(int* passed);
 int rp_timeline_action_tests(int* passed);
 int rp_controller_tests(int* passed);
 int rp_combat_tests(int* passed);
+int rp_timeline_outcome_integration(int* passed);
 int rp_body_action_tests(int* passed);
 int load_sequence_tests(int* passed);
 int motion_remote_tests(int* passed);
@@ -480,6 +483,8 @@ int main() {
     { int pp = 0; const int pf = p6_render_fence_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = t3_native_stats_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = t3_recovery_stats_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = h6_combat_action_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = npc_death_release_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_measure_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = holder_contract_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = edge_lanes_tests(&pp); g_pass += pp; g_fail += pf; }
@@ -487,6 +492,7 @@ int main() {
     { int pp = 0; const int pf = rp_timeline_action_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_controller_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_combat_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = rp_timeline_outcome_integration(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_body_action_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = load_sequence_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = motion_remote_tests(&pp); g_pass += pp; g_fail += pf; }

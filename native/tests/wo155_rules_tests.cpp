@@ -18,6 +18,54 @@ constexpr double kNever = -1e9;
 int wo155_rules_tests(int* passed) {
     HCHECK(kWindowS == 5.0, "the window is 5 s");
 
+    using kcdmp::rttr::DamageInvocation;
+    const Recipient recipient{8, 10, 2, true};
+    HCHECK(recipient.matches({8, 10, 2, true}, 11), "the current player life is allowed");
+    HCHECK(!recipient.matches({8, 12, 2, true}, 11), "the old life cannot apply through the queue");
+    HCHECK(!recipient.matches({9, 10, 2, true}, 11), "the former world cannot apply through the queue");
+    HCHECK(!recipient.matches({8, 10, 3, true}, 11), "the former pipe cannot apply through the queue");
+    HCHECK(!recipient.matches({8, 10, 2, false}, 11), "a stopped world cannot apply through the queue");
+    HCHECK(!recipient.matches({8, 10, 2, true}, 10), "an equal tick cannot establish which life was read");
+    HCHECK(!recipient.matches({8, 10, 2, true}, 9), "relay ingress before a life edge is retired even on a fresh pipe read");
+    const Recipient bound{8, 10, 2, true, 51};
+    HCHECK(!bound.matches({8, 10, 2, true, 52}, 12), "a packet held before the reader cannot use a new native life");
+    HCHECK(!bound.matches({8, 10, 2, true, 0}, 12), "an unavailable native life proves no recipient");
+    HCHECK(bound.matches({8, 10, 2, true, 51}, 12), "the exact proved life is accepted");
+
+    struct DamageDouble {
+        float hp = 95, st = 85;
+        int dispatched = 0;
+        DamageInvocation suppressed = DamageInvocation::Acknowledged;
+        DamageInvocation operator()(bool suppress) {
+            if (suppress && suppressed == DamageInvocation::NotInvoked) return suppressed;
+            hp -= 10; st -= 7; ++dispatched;
+            return suppress ? suppressed : DamageInvocation::Acknowledged;
+        }
+    };
+    {
+        DamageDouble damage;
+        const auto protectedHit = dispatch(true, false, [&](bool suppress) { return damage(suppress); });
+        HCHECK(protectedHit == HitResult::ProtectedConsumed && damage.dispatched == 0 && damage.hp == 95 && damage.st == 85,
+               "protected contact is consumed with HP and stamina unchanged");
+        const auto normal = dispatch(false, false, [&](bool suppress) { return damage(suppress); });
+        HCHECK(normal == HitResult::Acknowledged && damage.dispatched == 1 && damage.hp == 85 && damage.st == 78,
+               "allowed contact changes HP and stamina exactly once");
+    }
+    {
+        DamageDouble damage;
+        damage.suppressed = DamageInvocation::Unconfirmed;
+        const auto ambiguous = dispatch(false, true, [&](bool suppress) { return damage(suppress); });
+        HCHECK(ambiguous == HitResult::DispatchUnconfirmed && damage.dispatched == 1 && damage.hp == 85 && damage.st == 78,
+               "an engine call can change HP and stamina before a lost receipt, so fallback would apply a second hit");
+    }
+    {
+        DamageDouble damage;
+        damage.suppressed = DamageInvocation::NotInvoked;
+        const auto fallback = dispatch(false, true, [&](bool suppress) { return damage(suppress); });
+        HCHECK(fallback == HitResult::Acknowledged && damage.dispatched == 1 && damage.hp == 85 && damage.st == 78,
+               "fallback is safe when the first call provably never entered the engine");
+    }
+
     // the first hit may knock him down (not suppressed); a second 2 s later, after the down edge, is suppressed
     {
         FfWindow w;

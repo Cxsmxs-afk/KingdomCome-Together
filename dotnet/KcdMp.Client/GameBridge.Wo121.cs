@@ -49,6 +49,79 @@ public partial class GameBridge
 
     private Stream? _wo121Stream;
     private CancellationToken _wo121Ct;
+    private volatile PvpContactSession? _wo121ContactSession;
+    private sealed record PvpFrameScope(PvpContactSession Session, long Lifecycle, long Life, long ReadTick, ulong NativeLife = 0);
+
+    private bool PvpRecipientCurrent(PvpFrameScope scope) =>
+        ReferenceEquals(scope.Session, _wo121ContactSession) &&
+        scope.Lifecycle == Interlocked.Read(ref _p1Serial) &&
+        scope.Life == Interlocked.Read(ref _t3InputLifeRevision) &&
+        scope.NativeLife == _combat.PvpNativeLife;
+
+    private sealed class PvpContactSession(Stream relay)
+    {
+        public Stream Relay { get; } = relay;
+        private long _sent;
+        private readonly (ulong Incarnation, PvpContactWindow Window)[] _received = new (ulong, PvpContactWindow)[256];
+        private readonly (ulong Incarnation, PvpLifeState Life, uint RetiredEntity, bool Detached)[] _targets =
+            new (ulong, PvpLifeState, uint, bool)[256];
+        private PvpLifeState _localLife;
+
+        public ulong Next() => (ulong)Interlocked.Increment(ref _sent);
+
+        public bool TryClaim(byte source, ulong incarnation, ulong sequence)
+        {
+            lock (_received)
+            {
+                ref var bound = ref _received[source];
+                if (incarnation < bound.Incarnation || incarnation < _targets[source].Incarnation) return false;
+                if (incarnation > bound.Incarnation) bound = (incarnation, default);
+                return bound.Window.TryClaim(sequence);
+            }
+        }
+
+        public void NoteTarget(byte ghost, ulong incarnation, uint currentEntity, PvpLifeState life)
+        {
+            lock (_received)
+            {
+                ref var target = ref _targets[ghost];
+                if (incarnation > target.Incarnation)
+                    target = (incarnation, life, target.Incarnation != 0 && !target.Detached ? currentEntity : 0, false);
+                else if (incarnation == target.Incarnation && life.Revision > target.Life.Revision)
+                    target.Life = life;
+            }
+        }
+
+        public (ulong Incarnation, ulong Proof) FindTarget(byte ghost, uint entity)
+        {
+            lock (_received)
+            {
+                var target = _targets[ghost];
+                return entity != target.RetiredEntity ? (target.Incarnation, target.Life.Proof) : default;
+            }
+        }
+
+        public void NoteBodyDetached(byte ghost)
+        {
+            lock (_received)
+            {
+                ref var target = ref _targets[ghost];
+                target.RetiredEntity = 0;
+                target.Detached = true;
+            }
+        }
+
+        public PvpLifeState? TakeLocalChange(CombatPipe pipe)
+        {
+            lock (_received)
+            {
+                ulong proof = pipe.PvpNativeLife;
+                if (_localLife.Proof == proof) return null;
+                _localLife = new(_localLife.Revision + 1, proof);
+                return _localLife;
+            }
+        }
+    }
     private readonly ConcurrentDictionary<byte, uint> _ghostLastSenderMs = new();
     private readonly ConcurrentDictionary<byte, DateTime> _peerV8AttackAt = new();
     private readonly ConcurrentDictionary<byte, DateTime> _peerState2At = new();
@@ -75,9 +148,11 @@ public partial class GameBridge
     {
         _wo121Stream = stream;
         _wo121Ct = ct;
+        _wo121ContactSession = new(stream);
         _st2LastSent = null;
         _combat.OnLocalAction = OnLocalActionAsync;
         _combat.OnPvpHit = OnPvpHitAsync;
+        _combat.OnPvpLifeChanged = AdvertisePvpLifeAsync;
         _ = PushWo121ConfigAsync(ct);
         _ = Wo121HeartbeatAsync(ct);
     }
@@ -96,9 +171,11 @@ public partial class GameBridge
     private void Wo121OnDisconnect()
     {
         _w121Engaged.Clear();
+        _wo121ContactSession = null;
         _wo121Stream = null;
         _combat.OnLocalAction = null;
         _combat.OnPvpHit = null;
+        _combat.OnPvpLifeChanged = null;
         _ffFromHost = false;
         _ffSession = _isDamageAuthority ? _ffLocalPref : FriendlyFireDefault;
     }
@@ -333,10 +410,26 @@ public partial class GameBridge
             Console.WriteLine(line + $" result=dropped reason={(!_ffSession ? "friendly-fire-off" : victim is null ? "unknown-avatar" : _wo121Stream is null ? "no-relay" : "no-damage")}");
             return;
         }
-        await WritePacketAsync(s, new PlayerHitV8(vid, stamina, health, flags, material).BuildUp(), _wo121Ct);
+        if (_wo121ContactSession is not { } session || !ReferenceEquals(s, session.Relay) ||
+            (_w213Caps & Protocol.LinkCapPvpLife) == 0)
+        {
+            _w121FfOutDropped++;
+            Console.WriteLine(line + " result=dropped reason=contact-capability");
+            return;
+        }
+        var recipient = session.FindTarget(vid, victimEid);
+        if (recipient.Proof == 0 || !_ghostEntityIds.TryGetValue(vid.ToString(), out uint stillBound) || stillBound != victimEid)
+        {
+            _w121FfOutDropped++;
+            Console.WriteLine(line + " result=dropped reason=recipient-life-unavailable");
+            return;
+        }
+        ulong contact = session.Next();
+        await WritePacketAsync(s, new PlayerHitV8(vid, stamina, health, flags, material)
+            .BuildUp(contact, recipient.Incarnation, recipient.Proof), _wo121Ct);
         _w121FfOut++;
         Wo155NoteFfSent(vid);   // WO-155: the knockdown this hit causes on his screen is the one his figure falls for here
-        Console.WriteLine(line + " result=sent");
+        Console.WriteLine(line + $" result=sent contact_seq={contact} recipient={recipient.Incarnation} recipient_life={recipient.Proof}");
     }
 
     // =====================================================================
@@ -553,10 +646,33 @@ public partial class GameBridge
     private bool Wo121SupersedesNpcCue(string npc) =>
         _npcRows && _npcRowAt.TryGetValue(npc, out var t) && (DateTime.UtcNow - t).TotalSeconds < 60;
 
-    /// <summary>0x45: a partner's friendly-fire hit on our Henry.</summary>
-    private async Task OnPlayerHitV8InAsync(byte[] payload, CancellationToken ct)
+    private async Task AdvertisePvpLifeAsync()
     {
-        if (!PlayerHitV8.TryDecodeDown(payload, out byte attacker, out var hit))
+        if ((_w213Caps & Protocol.LinkCapPvpLife) == 0 || _wo121ContactSession is not { } session) return;
+        CancellationToken lifetime = _wo121Ct;
+        if (session.TakeLocalChange(_combat) is not { } state ||
+            !ReferenceEquals(session, _wo121ContactSession)) return;
+        try { await WritePacketAsync(session.Relay, state.BuildUp(), lifetime); }
+        catch (Exception e) when (e is IOException or OperationCanceledException or ObjectDisposedException)
+        {
+            Console.WriteLine($"MP-FF dir=out result=life-advert-unavailable revision={state.Revision} reason={e.GetType().Name}");
+        }
+    }
+
+    private void OnPvpPeer(byte[] frame, PvpContactSession? session)
+    {
+        if (session is null || !ReferenceEquals(session, _wo121ContactSession) ||
+            (_w213Caps & Protocol.LinkCapPvpLife) == 0 || frame.Length != Protocol.PvpPeerLifeLen ||
+            !Protocol.TryReadPvpPeer(frame, out byte ghost, out ulong incarnation, out var life)) return;
+        _ghostEntityIds.TryGetValue(ghost.ToString(), out uint currentEntity);
+        session.NoteTarget(ghost, incarnation, currentEntity, life);
+    }
+
+    /// <summary>0x45: a partner's friendly-fire hit on our Henry.</summary>
+    private async Task OnPlayerHitV8InAsync(byte[] payload, PvpFrameScope? scope, CancellationToken ct)
+    {
+        if (!PlayerHitV8.TryDecodeDown(payload, out byte attacker, out var hit, out ulong sequence,
+            out ulong incarnation, out ulong recipientLife))
         {
             _w121FfInDropped++;
             Console.WriteLine($"MP-FF dir=in result=dropped reason=malformed len={payload.Length}");
@@ -569,9 +685,44 @@ public partial class GameBridge
             Console.WriteLine(line + $" result=dropped reason={(!_ffSession ? "friendly-fire-off" : "not-me")}");
             return;
         }
-        var r = await _combat.ApplyPvpHitAsync(hit.Stamina, hit.Health, Wo155PvpFlags(hit.Flags), attacker, ct);
+        if (scope is null || !ReferenceEquals(scope.Session, _wo121ContactSession) ||
+            recipientLife == 0 || (_w213Caps & Protocol.LinkCapPvpLife) == 0)
+        {
+            _w121FfInDropped++;
+            Console.WriteLine(line + " result=dropped reason=contact-capability");
+            return;
+        }
+        string contact = $" contact={incarnation}/{sequence} recipient_life={recipientLife}";
+        // A timeout cannot authorize another mutation. Claim the contact
+        // before waiting for the writer or receiving any native acknowledgement.
+        ct.ThrowIfCancellationRequested();
+        if (!scope.Session.TryClaim(attacker, incarnation, sequence))
+        {
+            _w121FfInDropped++;
+            Console.WriteLine(line + " result=dropped reason=contact-stale-or-duplicate" + contact);
+            return;
+        }
+        if (recipientLife != scope.NativeLife || !PvpRecipientCurrent(scope))
+        {
+            _w121FfInDropped++;
+            Console.WriteLine(line + " result=recipient_retired reason=recipient-life" + contact);
+            return;
+        }
+        var r = await _combat.ApplyPvpHitAsync(hit.Stamina, hit.Health, Wo155PvpFlags(hit.Flags), attacker, ct,
+            recipientCurrent: () => _ffSession && hit.Victim == Volatile.Read(ref _myGhostId) &&
+                PvpRecipientCurrent(scope), sequence: sequence, incarnation: incarnation,
+            ingressTick: (ulong)scope.ReadTick, recipientLife: recipientLife);
         _w121FfIn++;
-        Console.WriteLine(line + $" result={(r.Ok ? "applied" : "failed")} reason={r.ReasonTag}");
+        string outcome = (r.Ok, r.Reason) switch
+        {
+            (true, PipeReason.PvpProtectedConsumed) => "protected_consumed",
+            (true, PipeReason.PvpEffectObserved) => "observed",
+            (true, _) => "acknowledged",
+            (false, PipeReason.PvpDispatchUnconfirmed or PipeReason.TaskFaulted) => "dispatch_unconfirmed",
+            (false, PipeReason.PvpRecipientRetired or PipeReason.LoadRefused) => "recipient_retired",
+            _ => "failed"
+        };
+        Console.WriteLine(line + $" result={outcome} reason={r.ReasonTag}" + contact);
     }
 
     /// <summary>

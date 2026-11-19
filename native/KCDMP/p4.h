@@ -15,6 +15,8 @@ void note_life_edge(const char* why); // main-thread actual down/up edges fence 
 void invalidate(); // off-main safe: invalidate protection; no engine call
 uint64_t generation();
 uint64_t life_edge_tick(); // cached actual local life edge; no engine read
+uint64_t pvp_life_proof(); // opaque proof of the current native body, zero until bound
+bool pvp_body_matches(void* soul, uint64_t wuid); // main thread, agrees with the proof's observed body
 bool gameplay();
 bool ready_context(Context c);
 void arm_recovery(void* soul); // after full heal/readback, before wake events

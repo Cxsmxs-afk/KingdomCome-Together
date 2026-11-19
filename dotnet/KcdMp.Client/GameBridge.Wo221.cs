@@ -121,9 +121,8 @@ public partial class GameBridge
     {
         try
         {
-            Guid? g = await ResolveLocalSoulGuidAsync(npc, CancellationToken.None);
-            bool ok = g is Guid lg && await _combat.ApplyDeathAsync(lg);
-            Console.WriteLine($"MP-W221 test kill {npc}: {(g is null ? "no soul answers to that name" : ok ? "dead" : "the death call failed")}");
+            var result = await ApplyOwnedNpcDeathAsync(npc, null, null, "bench-kill", CancellationToken.None, bypassDedupe: false);
+            Console.WriteLine($"MP-W221 test kill {npc}: {result}");
         }
         catch (Exception ex) { Console.WriteLine($"MP-W221 test kill {npc} threw: {ex.Message}"); }
     }
@@ -163,7 +162,7 @@ public partial class GameBridge
     private string Wo221StatsLine() =>
         $"MP-W221-STATS {string.Join(' ', W221Switch.Names.Select(n => $"{n}={(W221On(n) ? "on" : "off")}"))}" +
         $" shops: keepers_here={_w221KeepersHere.Count} opened={_w221ShopOpened} already={_w221ShopAlready} no_body={_w221ShopNoBody} no_shop={_w221ShopNoShop} closed={_w221ShopClosed}" +
-        $" talks: held={_w221TalkHeld} released={_w221TalkReleased} renewed={_w221TalkRenewed} talking_now={_w141Talking.Count} choice_signs={Interlocked.Read(ref _w221ChoiceSigns)}" + Wo221HorseStats() + Wo221BagStats() + Wo221RouteStats() + $" orders={_w221Orders} order_refused={_w221OrderRefused} corpse_looks: read={_w221LooksRead} in={_w221LooksIn} set={_w221LooksSet} ragdoll_waits={_w221RagdollWaits} ragdoll_spared={_w221RagdollSpared}";
+        $" talks: held={_w221TalkHeld} released={_w221TalkReleased} renewed={_w221TalkRenewed} talking_now={_w141Talking.Count} choice_signs={Interlocked.Read(ref _w221ChoiceSigns)}" + Wo221HorseStats() + Wo221BagStats() + Wo221RouteStats() + $" orders={_w221Orders} order_refused={_w221OrderRefused} corpse_looks: read={_w221LooksRead} in={_w221LooksIn} set={_w221LooksSet}";
 
     /// <summary>The 4 Hz session tick: the native word every 2 s, the status and the stats every 30 s, the mod told every minute.</summary>
     private void Wo221Tick(long n)
@@ -185,7 +184,6 @@ public partial class GameBridge
     }
 
     private long _w221Orders, _w221OrderRefused;
-    private long _w221RagdollWaits, _w221RagdollSpared;   // mp_ragdoll_once: physics ragdolls that waited; bodies that lay down meanwhile
 
     // ---------------------------------------------------------------- E.1: a dead body's wounds (mp_corpse_look)
 
