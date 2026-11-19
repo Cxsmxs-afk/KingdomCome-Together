@@ -313,12 +313,13 @@ public partial class ClientSession
     private async Task SchedWriteLoopAsync()
     {
         long pruneAt = Environment.TickCount64 + 30_000;
+        Action<byte[], bool> observe = (frame, _) => ObserveOutgoingFrame(frame);
         while (true)
         {
             await _writeSignal.WaitAsync(10);
             try
             {
-                await _writer!.PumpOnceAsync(CancellationToken.None, (f, _) => { if (f.Length >= 3) Meter.CountFrame(true, f[0], f.AsSpan(3)); });
+                await _writer!.PumpOnceAsync(CancellationToken.None, observe);
             }
             catch (Exception ex)
             {
@@ -944,6 +945,7 @@ public partial class ClientSession
                 {
                     var body = new byte[payloadLen];
                     await ReadExactAsync(body);
+                    long readMs = payloadLen == PlayerHitV8.LifeUpLen ? PresentationClock.NowMs() : 0;
                     bool identified = payloadLen >= PlayerHitV8.IdentifiedUpLen;
                     if (identified != LinkPvpContact || (payloadLen == PlayerHitV8.LifeUpLen) != LinkPvpLife)
                     {
@@ -955,6 +957,7 @@ public partial class ClientSession
                         _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-contact-stale-or-duplicate");
                         continue;
                     }
+                    if (readMs != 0) TracePvpRelay("relay-read", Id, body, PlayerHitV8.UpLen, readMs);
                     _broadcastService.RoutePlayerHitV8(this, body);
                     continue;
                 }
@@ -1532,6 +1535,24 @@ public partial class ClientSession
         EnqueueRaw(BuildPacket(Protocol.PvpPeerDown, payload));
     }
 
+    private void ObserveOutgoingFrame(byte[] frame)
+    {
+        if (frame.Length < 3) return;
+        Meter.CountFrame(true, frame[0], frame.AsSpan(3));
+        if (frame[0] == Protocol.PlayerHitV8Down && frame.Length == 3 + PlayerHitV8.LifeDownLen)
+            TracePvpRelay("relay-send", frame[3], frame.AsSpan(3), PlayerHitV8.DownLen, PresentationClock.NowMs());
+    }
+
+    // Matches the Agent's sample selection. The key comes from the existing hit frame.
+    private void TracePvpRelay(string stage, byte source, ReadOnlySpan<byte> body, int identityOffset, long relayMs)
+    {
+        ulong sequence = BinaryPrimitives.ReadUInt64LittleEndian(body[identityOffset..]);
+        if (sequence == 0 || (sequence > 64 && sequence % 32 != 0)) return;
+        ulong life = BinaryPrimitives.ReadUInt64LittleEndian(body[(identityOffset + 2 * sizeof(ulong))..]);
+        _logger.Information("MP-LANE2-FF-TIME stage={Stage} source={Source} contact_seq={Sequence} recipient_life={Life} relay_ms={RelayMs}",
+            stage, source, sequence, life, relayMs);
+    }
+
     /// <summary>Thread-safe: enqueue a PlayerDeathDown (0x24). Idempotent at the receiver.</summary>
     public void EnqueuePlayerDeath(byte sourceId) =>
         EnqueueRaw(BuildPacket(Protocol.PlayerDeathDown, [sourceId]));
@@ -1921,7 +1942,7 @@ public partial class ClientSession
             }
 
             if (packet is null) continue;
-            if (packet.Length >= 3) Meter.CountFrame(true, packet[0], packet.AsSpan(3));   // WO-213 A.1
+            ObserveOutgoingFrame(packet);
 
             try { await _stream.WriteAsync(packet); }
             catch (Exception ex)
