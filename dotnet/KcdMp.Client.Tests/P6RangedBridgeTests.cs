@@ -32,6 +32,9 @@ public sealed class P6RangedBridgeTests
     private static Task Reply(Stream s, byte type, byte seq, byte op, byte[] payload, bool ok = true) => s.WriteAsync(Wire(type, [(byte)(ok ? 1 : 0), seq, op, 0, .. payload])).AsTask();
     private static Task ReplyEdge(Stream stream, byte[] request, EdgeOutcome outcome, params byte[] payload) =>
         stream.WriteAsync(Wire(0xB8, [.. request[..4], (byte)outcome, outcome == EdgeOutcome.Completed ? (byte)0x81 : (byte)0, .. payload])).AsTask();
+    private static Task ReplyHandEdge(Stream stream, byte[] request, byte known = 0, Guid left = default, Guid right = default) =>
+        stream.WriteAsync(Wire(0xB8, [.. request[..4], (byte)EdgeOutcome.Completed, 0xBB, 1, 0, known,
+            .. left.ToByteArray(), .. right.ToByteArray()])).AsTask();
     private sealed class Game : HttpMessageHandler
     {
         public readonly ConcurrentQueue<string> Calls = new();
@@ -123,6 +126,7 @@ public sealed class P6RangedBridgeTests
         public void Receive() => _receive = (Task)Call(Bridge, "ReceiveLoopAsync", Link, Stop.Token)!;
         public async Task StartTimedReceiveAsync(bool friendlyFire = false)
         {
+            Call(Bridge, "OnGameEvent", "ghostid", $"{Peer} 000000DE 00000001");
             Assert.True(await Pipe.EnsureConnectedAsync());
             await Accept;
             Task<bool> probe = Pipe.ProbeEdgeAsync(Stop.Token);
@@ -159,6 +163,44 @@ public sealed class P6RangedBridgeTests
             Assert.Equal(t0, confirmedT0);
             await Until(() => Link.ReadRequestedAfterBytes >= clockReply.Length);
             await Until(() => Bridge.GetType().GetField("_presentationNativeConfig", Private)!.GetValue(Bridge) is not null);
+        }
+
+        public async Task<byte[]> ConfirmBowBeforeFireAsync(byte known = 3, Guid? observedClass = null, RangedWeaponKind weapon = RangedWeaponKind.Bow)
+        {
+            Guid item = weapon == RangedWeaponKind.Bow ? Bow : Crossbow;
+            byte[] up = new LootMsg(Protocol.W203FigureHand, 120, $"v1|1|{item:D}").BuildUp(Protocol.W203Up, 0);
+            Link.Feed(Wire(Protocol.W203Down, [Peer, .. up[3..]]));
+            var declared = await Read(Server);
+            Assert.Equal(0x38, declared.Type);
+            Assert.Equal(0x41, declared.Body[5]);
+            byte[] hand = declared.Body[10..];
+            Assert.Equal(60, hand.Length);
+            Assert.Equal(new byte[] { 1, 0, Peer }, hand[..3]);
+            Assert.Equal(222u, BinaryPrimitives.ReadUInt32LittleEndian(hand.AsSpan(3)));
+            Assert.Equal(item, new Guid(hand.AsSpan(27, 16)));
+            Assert.Equal(1, hand[43] & 1);
+            uint incarnation = BinaryPrimitives.ReadUInt32LittleEndian(hand.AsSpan(44));
+            uint world = BinaryPrimitives.ReadUInt32LittleEndian(hand.AsSpan(48));
+            ulong serial = BinaryPrimitives.ReadUInt64LittleEndian(hand.AsSpan(52));
+            ulong peerSerial = BinaryPrimitives.ReadUInt64LittleEndian(hand.AsSpan(7));
+            uint body = BinaryPrimitives.ReadUInt32LittleEndian(hand.AsSpan(15));
+            ulong revision = BinaryPrimitives.ReadUInt64LittleEndian(hand.AsSpan(19));
+            Assert.Equal(1u, incarnation);
+            Assert.Equal(7u, world);
+            Assert.NotEqual(0ul, peerSerial);
+            Assert.NotEqual(0ul, revision);
+            await ReplyHandEdge(Server, declared.Body);
+
+            string scope = $"{world:X8}{serial:X16}{peerSerial:X16}{body:X8}{revision:X16}";
+            Call(Bridge, "OnGameEvent", "w214_figure_hand", $"{Peer} ok held {incarnation:x8} {scope}");
+            var observed = await Read(Server);
+            Assert.Equal(0x38, observed.Type);
+            Assert.Equal(0x41, observed.Body[5]);
+            byte[] expectedObservation = [1, 1, .. hand[2..43]];
+            Assert.Equal(expectedObservation, observed.Body[10..]);
+            await ReplyHandEdge(Server, observed.Body, known, observedClass ?? item);
+            await Until(() => Get<System.Collections.IDictionary>(Bridge, "_w214EngineHands").Contains(Peer));
+            return [0x82, 1, 2, (byte)weapon, 3, .. item.ToByteArray(), .. hand[7..27]];
         }
         public async ValueTask DisposeAsync()
         {
@@ -372,12 +414,12 @@ public sealed class P6RangedBridgeTests
     {
         await using var r = await Rig.Create();
         await r.StartTimedReceiveAsync();
+        byte[] expected = await r.ConfirmBowBeforeFireAsync();
         r.Link.Feed(TimedFire(r.Peer), Down(Protocol.W164RangedStep, "invalid-after-fire", r.Peer));
 
         var request = await Read(r.Server);
         Assert.Equal((byte)0x38, request.Type);
         Assert.Equal((byte)0x40, request.Body[5]);
-        byte[] expected = [0x82, 1, (byte)RangedWeaponKind.Bow, 3, .. Bow.ToByteArray()];
         Assert.Equal(expected, request.Body[25..]);
         switch (outcome)
         {
@@ -524,6 +566,7 @@ public sealed class P6RangedBridgeTests
         await using var r = await Rig.Create(host);
         await r.StartTimedReceiveAsync();
         Guid itemClass = weapon == RangedWeaponKind.Bow ? Bow : Crossbow;
+        byte[] nativeHand = await r.ConfirmBowBeforeFireAsync(weapon: weapon);
         var fire = Step(seq: 10) with { Kind = weapon, ItemClass = itemClass };
         byte[] first = TimedRanged(r.Peer, fire);
         r.Link.Feed(first, first, TimedRanged(r.Peer, fire with { Epoch = fire.Epoch - 1, Sequence = 11 }),
@@ -536,7 +579,8 @@ public sealed class P6RangedBridgeTests
             Assert.Equal((byte)0x38, request.Type);
             Assert.Equal((byte)0x40, request.Body[5]);
             await ReplyEdge(r.Server, request.Body, EdgeOutcome.Completed, 1, 0, 0);
-            byte[] expected = [0x82, 1, (byte)weapon, phase, .. itemClass.ToByteArray()];
+            byte[] expected = [.. nativeHand];
+            expected[4] = phase;
             Assert.Equal(expected, request.Body[25..]);
         }
 
@@ -545,6 +589,85 @@ public sealed class P6RangedBridgeTests
         Assert.Equal(1, Count(r.Bridge, "ranged_stale"));
         Assert.Equal(2, Get<long>(r.Bridge, "_w201RangedDispatched"));
         Assert.DoesNotContain(r.Game.Calls, call => call.Contains("W201Shot") || call.Contains("ApplyDamage"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_successful_Lua_hand_result_is_not_proof_when_the_native_slot_is_unknown_or_wrong(bool wrongClass)
+    {
+        await using var r = await Rig.Create();
+        await r.StartTimedReceiveAsync();
+        await r.ConfirmBowBeforeFireAsync(wrongClass ? (byte)3 : (byte)0, wrongClass ? Crossbow : Bow);
+        using var quiet = new CancellationTokenSource();
+        byte[] header = new byte[3];
+        Task<bool> pipe = ReadFrameHeaderAsync(r.Server, header, quiet.Token);
+        Task drained = Until(() => Count(r.Bridge, "ranged_malformed") == 1);
+        r.Link.Feed(TimedFire(r.Peer), Down(Protocol.W164RangedStep, "after-unconfirmed-fire", r.Peer));
+        if (await Task.WhenAny(pipe, drained) == pipe)
+            Assert.False(await pipe, "Unknown or wrong physical hand queued a native request.");
+        await drained;
+        quiet.Cancel();
+        Assert.False(await pipe);
+        Assert.Equal(0, Get<long>(r.Bridge, "_w201RangedDispatched"));
+    }
+
+    [Theory]
+    [InlineData(true, "new-eid")]
+    [InlineData(true, "reused-eid")]
+    [InlineData(true, "unchanged")]
+    [InlineData(false, "new-eid")]
+    [InlineData(false, "reused-eid")]
+    [InlineData(false, "unchanged")]
+    public async Task Ranged_fire_queued_by_the_real_reader_targets_only_its_original_body(bool receiverIsHost, string replacement)
+    {
+        await using var r = await Rig.Create(receiverIsHost);
+        await r.StartTimedReceiveAsync();
+        byte[] expected = await r.ConfirmBowBeforeFireAsync();
+        r.Game.BlockHorse = true;
+        r.Http.BatchingEnabled = false;
+        long before = r.Link.ReadRequestedAfterBytes;
+        byte[] horse = Wire(Protocol.HorseInfoDown, r.Peer, 0);
+        r.Link.Feed(horse);
+        await r.Game.HorseEntered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+        byte[] fire = TimedFire(r.Peer);
+        byte[] marker = Down(Protocol.W164RangedStep, "after-queued-fire", r.Peer);
+        r.Link.Feed(fire, marker);
+        await Until(() => r.Link.ReadRequestedAfterBytes >= before + horse.Length + fire.Length + marker.Length);
+        string ghost = r.Peer.ToString();
+        if (replacement == "new-eid") Get<ConcurrentDictionary<string, uint>>(r.Bridge, "_ghostEntityIds")[ghost] = 333;
+        if (replacement != "unchanged") Call(r.Bridge, "BumpGhostGeneration", ghost, "fixture replaced body after read");
+
+        using var quiet = new CancellationTokenSource();
+        byte[] header = new byte[3];
+        Task<bool> nativeRequest = ReadFrameHeaderAsync(r.Server, header, quiet.Token);
+        Task drained = Until(() => Count(r.Bridge, "ranged_malformed") == 1);
+        r.Game.ReleaseHorse.TrySetResult();
+        bool dispatched = await Task.WhenAny(nativeRequest, drained) == nativeRequest && await nativeRequest;
+        if (dispatched)
+        {
+            using var timeout = new CancellationTokenSource(3500);
+            byte[] request = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
+            await r.Server.ReadExactlyAsync(request, timeout.Token);
+            if (request[5] == 0x41) await ReplyHandEdge(r.Server, request);
+            else await ReplyEdge(r.Server, request, EdgeOutcome.Completed, 1, 0, 0);
+            Assert.Equal("unchanged", replacement);
+            Assert.Equal(0x38, header[0]);
+            Assert.Equal(0x40, request[5]);
+            Assert.Equal(expected, request[25..]);
+        }
+        await drained;
+        quiet.Cancel();
+        if (replacement == "unchanged")
+        {
+            Assert.True(dispatched);
+        }
+        else
+        {
+            Assert.False(dispatched, $"An old native hand or Fire request crossed the body boundary ({replacement}).");
+            Assert.Equal(0, Count(r.Bridge, "ranged_in"));
+        }
     }
 
     private static async Task<bool> ReadFrameHeaderAsync(Stream stream, byte[] header, CancellationToken ct)
@@ -571,6 +694,7 @@ public sealed class P6RangedBridgeTests
     public async Task A_ranged_animation_waiting_for_the_physical_writer_loses_authority_after_a_newer_conflicting_state(string change)
     {
         await using var r = await Rig.Create(); await r.StartTimedReceiveAsync();
+        byte[] expected = await r.ConfirmBowBeforeFireAsync();
         uint lastRequest = Get<uint>(r.Pipe, "_edgeNextId");
         long initialRead = r.Link.ReadRequestedAfterBytes;
         var writer = Get<SemaphoreSlim>(r.Pipe, "_writeLock"); await writer.WaitAsync(); byte[] frame = TimedFire(r.Peer); r.Link.Feed(frame);
@@ -580,7 +704,7 @@ public sealed class P6RangedBridgeTests
         if (change == "world") Get<Wo206Epochs>(r.Bridge, "_w206").LearnWorld(8, 2);
         if (change == "eof") { r.Link.End(); await Until(() => Get<Stream?>(r.Bridge, "_p6ReceiveStream") is null); }
         if (change == "scene") { Set(r.Bridge, "_w179Bus", false); byte[] scene = Down(Protocol.W164SceneBus, Wo179Rules.Start(1, 'V', "test_video")); r.Link.Feed(scene); await Until(() => r.Link.ReadRequestedAfterBytes >= initialRead + frame.Length + scene.Length); }
-        if (change == "body") Get<ConcurrentDictionary<string, int>>(r.Bridge, "_ghostBodyGen")[r.Peer.ToString()] = 1;
+        if (change == "body") Call(r.Bridge, "BumpGhostGeneration", r.Peer.ToString(), "fixture retired the confirmed body");
         if (change == "peer") Call(r.Bridge, "P5PeerAtRead", (int)Protocol.Name, new byte[] { r.Peer, 121 });
         if (change is "hand" or "other-class" or "same-class" or "redraw")
         {
@@ -604,7 +728,7 @@ public sealed class P6RangedBridgeTests
             var accepted = await Read(r.Server);
             Assert.Equal((byte)0x38, accepted.Type);
             Assert.Equal((byte)0x40, accepted.Body[5]);
-            Assert.Equal(Bow, new Guid(accepted.Body.AsSpan(29)));
+            Assert.Equal(expected, accepted.Body[25..]);
             await ReplyEdge(r.Server, accepted.Body, EdgeOutcome.Completed, 1, 0, 0);
             await Until(() => Get<long>(r.Bridge, "_w201RangedDispatched") == 1);
             return;
@@ -612,16 +736,23 @@ public sealed class P6RangedBridgeTests
         await Task.Delay(80); Assert.Equal(0, Count(r.Bridge, "ranged_bow_played"));
         using var stop = new CancellationTokenSource(100);
         byte[] header = new byte[3];
-        if (await ReadFrameHeaderAsync(r.Server, header, stop.Token))
+        while (await ReadFrameHeaderAsync(r.Server, header, stop.Token))
         {
-            // EOF resets the presentation controller independently of Fire.
-            Assert.Equal("eof", change);
             Assert.Equal((byte)0x38, header[0]);
             byte[] body = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
             await r.Server.ReadExactlyAsync(body, stop.Token);
-            Assert.Equal((byte)0x3D, body[5]);
-            await ReplyEdge(r.Server, body, EdgeOutcome.Completed, 1, 0, 0);
-            Assert.False(await ReadFrameHeaderAsync(r.Server, header, stop.Token));
+            if (change is "hand" or "other-class" or "redraw")
+            {
+                Assert.Equal(0x41, body[5]);
+                await ReplyHandEdge(r.Server, body);
+            }
+            else
+            {
+                // EOF also resets the controller independently of Fire.
+                Assert.Equal("eof", change);
+                Assert.Equal(0x3D, body[5]);
+                await ReplyEdge(r.Server, body, EdgeOutcome.Completed, 1, 0, 0);
+            }
         }
     }
     [Fact]
@@ -644,6 +775,7 @@ public sealed class P6RangedBridgeTests
     public async Task Reader_deadline_is_not_refreshed_after_a_real_processor_backlog()
     {
         await using var r = await Rig.Create(); Set(r.Bridge, "_t3ProcFrameTimeoutMs", 3000); await r.StartTimedReceiveAsync();
+        await r.ConfirmBowBeforeFireAsync();
         uint lastRequest = Get<uint>(r.Pipe, "_edgeNextId");
         long initialRead = r.Link.ReadRequestedAfterBytes;
         var writer = Get<SemaphoreSlim>(r.Pipe, "_writeLock"); await writer.WaitAsync(); var hit = Hit();

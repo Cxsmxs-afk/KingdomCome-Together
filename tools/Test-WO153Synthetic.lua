@@ -316,30 +316,40 @@ do
     fig.human.HolsterToInventory = function() FIG = nil end
     fig.human.DrawFromInventory = function(self, it) FIG = it end
     local oldG = KCD2MP.ghosts["1"]
-    KCD2MP.ghosts["1"] = { entity = fig }
+    local incarnation = "00000001"
+    KCD2MP.ghosts["1"] = { entity = fig, outfitIncarnation = incarnation }
+    local function figureHand(drawn, cls, number)
+        local revision = string.format("%016X", number)
+        KCD2MP_W214FigureHand("1", drawn, cls, false, incarnation, string.rep("0", 48) .. revision, revision)
+    end
+    local oldCombat = KCD2MP_GhostCombat
+    local holsterRequested = false
+    -- Keep the hand full when the combat request arrives, to exercise the delayed correction.
+    KCD2MP_GhostCombat = function(id, kind) holsterRequested = id == "1" and kind == 1 end
     TIMERS = {}
     local m3 = #LOG
-    KCD2MP_W214FigureHand("1", true, CLS, false)
+    figureHand(true, CLS, 1)
     runTimers(0.4)
     check("F: the figure's own draw, still running, is watched first (nothing touched in its first 0.4 s)", eq == nil and countEvt("w214_figure_hand", "", m3) == 0)
     runTimers(3.0)
     check("F: the figure's hand stayed empty: the class is created, equipped into its weapon set and drawn",
           FIG == 101 and countEvt("w214_figure_hand", "1 fixed equipped+drawn", m3) == 1, lastLog("WO214-HAND figure", m3))
     local m4 = #LOG
-    KCD2MP_W214FigureHand("1", true, CLS, false)
+    figureHand(true, CLS, 1)
     check("F: a figure already holding it: ok at once", countEvt("w214_figure_hand", "1 ok held", m4) == 1, lastLog("WO214-HAND figure", m4))
     KCD2MP.ghostWeaponDrawn["1"] = nil
     local m5 = #LOG
-    KCD2MP_W214FigureHand("1", false, "-", false)
+    figureHand(false, "-", 2)
     runTimers(3.0)
-    check("F: sheathed, the hand still full after 1.5 s: put away", FIG == nil and countEvt("w214_figure_hand", "1 fixed holstered", m5) == 1, lastLog("WO214-HAND figure", m5))
+    check("F: sheathed, the hand still full after 1.5 s: put away", holsterRequested and FIG == nil and countEvt("w214_figure_hand", "1 fixed holstered", m5) == 1, lastLog("WO214-HAND figure", m5))
     W214.on.figure_hands = false   -- the twin: the figure is left to today's path
     FIG, eq, fig._has = nil, nil, nil
     local m6 = #LOG
-    KCD2MP_W214FigureHand("1", true, CLS, false)
+    figureHand(true, CLS, 3)
     runTimers(3.0)
     check("F: the twin (figure_hands off) touches nothing", FIG == nil and eq == nil and countEvt("w214_figure_hand", "", m6) == 0)
     W214.on.figure_hands = nil
+    KCD2MP_GhostCombat = oldCombat
     KCD2MP.ghosts["1"] = oldG
     ItemManager = oldIM
     TIMERS = {}

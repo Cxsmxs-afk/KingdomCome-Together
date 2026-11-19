@@ -201,6 +201,13 @@ public partial class GameBridge(ClientConfig config)
     private void BumpGhostGeneration(string ghostId, string why)
     {
         int now = _ghostBodyGen.AddOrUpdate(ghostId, 1, (_, g) => g + 1);
+        if (byte.TryParse(ghostId, NumberStyles.Integer, CultureInfo.InvariantCulture, out byte peer))
+        {
+            RetireOutfitScope(peer);
+            _outfitDeferred.TryRemove(peer, out _);
+            _outfitHandWrites.TryRemove(peer, out _);
+            _outfitAttempts.TryRemove(peer, out _);
+        }
         Console.WriteLine($"[combatviz] ghost {ghostId} body generation -> {now} ({why})");
     }
 
@@ -1546,6 +1553,10 @@ public partial class GameBridge(ClientConfig config)
         _ghostKnownItemClasses.Clear();
         _ghostNeverEquips.Clear();
         _ghostUnwearable.Clear(); _ghostWantedAppearance.Clear();
+        foreach (var pass in _outfitScopes.Values) pass.Retire();
+        _outfitDeferred.Clear();
+        _outfitHandWrites.Clear();
+        _outfitAttempts.Clear();
         _ghostLastAppearance.Clear();      // WO-88: per-connection, like the sets above
         _reloadConvergeTarget = null;      // WO-88: a convergence belongs to one connection
         // WO-17: ghost ids are reassigned per relay connection; a cached
@@ -2951,22 +2962,29 @@ public partial class GameBridge(ClientConfig config)
         }
         target = target.Distinct().ToArray();
 
-        // WO-135: one apply per avatar at a time, and the newest outfit wins. Every
-        // packet used to start its own apply, so a heartbeat landing mid-verify ran
-        // a second diff and a second 10 s retry loop over the same avatar.
-        _ghostWantedAppearance[ghostId] = target;
+        var wanted = _ghostWantedAppearance.AddOrUpdate(ghostId, target,
+            (_, previous) => previous.SequenceEqual(target) ? previous : target);
+        if (ReferenceEquals(wanted, target)) RetireOutfitScope(ghostId);
+        await RunWantedAppearanceAsync(ghostId, ct);
+    }
+
+    private async Task RunWantedAppearanceAsync(byte ghostId, CancellationToken ct)
+    {
         var gate = _ghostApplyGate.GetOrAdd(ghostId, static _ => new SemaphoreSlim(1, 1));
-        if (!await gate.WaitAsync(0, ct)) return;   // the running apply picks the newest target up when it finishes
-        try
+        Guid[]? handled;
+        do
         {
-            for (int round = 0; round < 3; round++)
+            if (!await gate.WaitAsync(0, ct)) return;
+            handled = null;
+            try
             {
-                if (!_ghostWantedAppearance.TryGetValue(ghostId, out var want)) return;
-                await ConvergeAppearanceAsync(ghostId, want, ct);
-                if (_ghostWantedAppearance.TryGetValue(ghostId, out var now) && ReferenceEquals(now, want)) return;
+                if (!_ghostWantedAppearance.TryGetValue(ghostId, out handled)) return;
+                await ConvergeAppearanceAsync(ghostId, handled, ct);
             }
-        }
-        finally { gate.Release(); }
+            finally { gate.Release(); }
+            // Check after releasing the gate: an outfit arriving between the
+            // final check and release must not lose its one wake-up.
+        } while (_ghostWantedAppearance.TryGetValue(ghostId, out var latest) && !ReferenceEquals(handled, latest));
     }
 
     /// <summary>
@@ -2987,21 +3005,63 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private async Task ConvergeAppearanceAsync(byte ghostId, Guid[] target, CancellationToken ct)
     {
+        var body = Wo214FigureBody(ghostId);
+        var hand = OutfitHand(ghostId);
+        string? incarnation = Wo214OutfitIncarnation(ghostId);
+        _p5Peers.TryGetValue(ghostId, out var peer);
+        var pass = new OutfitScope(ct, peer?.Token ?? default);
+        _outfitScopes[ghostId] = pass;
+        var stop = pass.Token;
+        bool Current() => !stop.IsCancellationRequested && body == Wo214FigureBody(ghostId) &&
+            Wo214SameHandState(hand, OutfitHand(ghostId)) && incarnation == Wo214OutfitIncarnation(ghostId) &&
+            _ghostWantedAppearance.TryGetValue(ghostId, out var latest) && ReferenceEquals(target, latest);
+
+        try
+        {
+            if (!Current()) return;
+            _outfitDeferred.TryRemove(ghostId, out _);
+            if (incarnation is null || _outfitHandWrites.ContainsKey(ghostId))
+            {
+                _outfitDeferred[ghostId] = 1;
+                return;
+            }
+            var scope = new OutfitEngineScope(ghostId, incarnation, hand is null ? "-" : Wo214OutfitHandScope(hand),
+                Interlocked.Increment(ref _outfitOrder));
+            await ConvergeScopedAppearanceAsync(scope, target, hand, Current, stop);
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested && !ct.IsCancellationRequested) { }
+        finally
+        {
+            _outfitScopes.TryRemove(KeyValuePair.Create(ghostId, pass));
+            await pass.FinishAsync();
+        }
+    }
+
+    private async Task ConvergeScopedAppearanceAsync(OutfitEngineScope scope, Guid[] target, FigureHand? hand,
+        Func<bool> current, CancellationToken ct)
+    {
+        byte ghostId = scope.Peer;
         string soulName = $"kcd2mp_{ghostId}";
         // WO-136 Phase 5: the avatar spawns bare (the empty preset) -- nothing is in its inventory until created here.
-        var known = _ghostKnownItemClasses.GetOrAdd(ghostId, static _ => []);
         var applied = _ghostAppearance.GetOrAdd(ghostId, static _ => []);
         var unwearable = _ghostUnwearable.GetOrAdd(ghostId, static _ => new Wo135Rules.Unwearable());
-        var outfitStamp = Wo214OutfitStamp(ghostId);
-        var targetSet = Wo214KeepHeld(ghostId, Wo144WithoutLights(target));   // WO-144 2.4: lights are the torch sync's, never an outfit piece; WO-214 F: the weapon in the partner's hand stays
-        if (!Wo214OutfitCurrent(ghostId, outfitStamp)) return;
+        var targetSet = Wo214KeepHeld(ghostId, Wo144WithoutLights(target));
+        if (!current()) return;
         lock (unwearable) unwearable.OnTarget(targetSet);
         // What the peer wears (the swing catalog resolves its weapon from this).
         lock (applied) { applied.Clear(); applied.UnionWith(targetSet); }
+        if (hand?.Drawn == true)
+        {
+            _outfitDeferred[ghostId] = 1;
+            return;
+        }
 
         await Wo201FigurePropCheckAsync(ghostId, targetSet);   // WO-201 B11: a shown weapon prop goes when the partner no longer has it
+        if (!current()) return;
         await Wo144EnsureLiveSoulAsync(ghostId);   // WO-144 2.1: reads and writes go to the live avatar's own soul
+        if (!current()) return;
         var actual = await ReadGhostSetAsync(soulName, ct);
+        if (!current()) return;
         if (actual is not null) actual = Wo144WithoutLights(actual);
         if (actual is null)
         {
@@ -3017,19 +3077,19 @@ public partial class GameBridge(ClientConfig config)
             toAdd = Wo135Rules.AppearanceAdditions(actual, targetSet).Where(c => !unwearable.Skips(c, nowMs)).ToList();   // WO-144: a refusal backs off, then is tried again
         }
         toAdd = await Wo144InLayerOrderAsync(toAdd);   // WO-144 2.1: under-layers first
-        if (!Wo214OutfitCurrent(ghostId, outfitStamp)) return;
+        if (!current()) return;
         _w202OutfitChangedMs[ghostId] = Environment.TickCount64;   // WO-202 VI: the strip check watches closely for a while
         if (Wo202Rules.OutfitAtomic(W202("outfit_atomic"), Wo144UseInventoryEquip, toAdd.Count))
         {
             // WO-202 VI outfit_atomic: the new pieces go on first, all in one call (one frame), and only then does anything come off -- a piece
             // in a taken slot is swapped by the engine itself. 0.61.9 took the old pieces off first and put the new ones on one call each
             // (a frame and a round trip apiece): the partner stood half dressed or bare between them (session B's host's mark).
-            lock (known) foreach (var c in toAdd) known.Add(c);
-            try { await Wo202EquipAllOnGhostAsync(soulName, toAdd, outfitStamp, ct); }
-            catch (Exception ex) { Console.WriteLine($"[appearance] equip of {toAdd.Count} piece(s) on {soulName} failed: {ex.Message}"); lock (known) foreach (var c in toAdd) known.Remove(c); }
+            try { await OutfitMutationAsync(scope, "atomic", Wo202Rules.OutfitList(toAdd), ct); }
+            catch (Exception ex) { Console.WriteLine($"[appearance] equip of {toAdd.Count} piece(s) on {soulName} failed: {ex.Message}"); }
             foreach (var cls in toRemove)
             {
-                try { await Wo144UnequipOnGhostAsync(soulName, cls, outfitStamp, ct); }
+                if (!current()) return;
+                try { await OutfitMutationAsync(scope, "unequip", cls.ToString("D"), ct); }
                 catch (Exception ex) { Console.WriteLine($"[appearance] unequip {cls} on {soulName} failed: {ex.Message}"); }
             }
         }
@@ -3037,21 +3097,22 @@ public partial class GameBridge(ClientConfig config)
         {
             foreach (var cls in toRemove)
             {
-                try { await Wo144UnequipOnGhostAsync(soulName, cls, outfitStamp, ct); }
+                if (!current()) return;
+                try { await OutfitMutationAsync(scope, "unequip", cls.ToString("D"), ct); }
                 catch (Exception ex) { Console.WriteLine($"[appearance] unequip {cls} on {soulName} failed: {ex.Message}"); }
             }
             foreach (var cls in toAdd)
             {
-                bool createIfMissing;
-                lock (known) createIfMissing = known.Add(cls);
-                try { await Wo144EquipOnGhostAsync(soulName, cls, createIfMissing, outfitStamp, ct); }
-                catch (Exception ex) { Console.WriteLine($"[appearance] equip {cls} on {soulName} failed: {ex.Message}"); lock (known) known.Remove(cls); }
+                if (!current()) return;
+                try { await OutfitMutationAsync(scope, "equip", cls.ToString("D"), ct); }
+                catch (Exception ex) { Console.WriteLine($"[appearance] equip {cls} on {soulName} failed: {ex.Message}"); }
             }
         }
+        if (!current()) return;
         if (toRemove.Count > 0 || toAdd.Count > 0)
             Console.WriteLine($"[appearance] ghost {ghostId}: +{toAdd.Count} -{toRemove.Count} (against its real equipped set of {actual.Count})");
-        if (toAdd.Count == 0 && toRemove.Count == 0) return;
-        await VerifyAndRetryAsync(soulName, ghostId, targetSet, known, unwearable, applied, outfitStamp, ct);
+        if (toAdd.Count == 0 && toRemove.Count == 0) { lock (applied) { applied.Clear(); applied.UnionWith(targetSet); } return; }
+        await VerifyAndRetryAsync(soulName, scope, targetSet, unwearable, applied, current, ct);
     }
 
     /// <summary>The avatar's equipped set, retried once on a timed-out read (a busy game answers late).</summary>
@@ -3080,25 +3141,26 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private static readonly int[] AppearanceRetryDelaysMs = [1000, 1000, 1000, 2000, 2000, 3000];
 
-    private async Task VerifyAndRetryAsync(string soulName, byte ghostId, HashSet<Guid> target, HashSet<Guid> known,
-        Wo135Rules.Unwearable unwearable, HashSet<Guid> applied, FigureOutfitStamp outfitStamp, CancellationToken ct)
+    private async Task VerifyAndRetryAsync(string soulName, OutfitEngineScope scope, HashSet<Guid> target,
+        Wo135Rules.Unwearable unwearable, HashSet<Guid> applied, Func<bool> current, CancellationToken ct)
     {
+        byte ghostId = scope.Peer;
         List<Guid> pending = [];
         HashSet<Guid>? last = null;
         bool presetCleared = false;   // WO-136
         foreach (int delayMs in AppearanceRetryDelaysMs)
         {
             await Task.Delay(delayMs, ct);
-            if (!Wo214OutfitCurrent(ghostId, outfitStamp)) return;
-            if (_ghostWantedAppearance.TryGetValue(ghostId, out var newest) && !new HashSet<Guid>(newest).SetEquals(target)) return;   // a newer outfit: that apply takes over
+            if (!current()) return;
             var actual = await ReadGhostSetAsync(soulName, ct);
+            if (!current()) return;
             if (actual is null) { Console.WriteLine($"[appearance] ghost {ghostId}: verify read failed -- skipping this round"); continue; }
             actual = Wo144WithoutLights(actual);   // WO-144 2.4
             last = actual;
             long vNow = Environment.TickCount64;
             lock (unwearable) pending = Wo135Rules.AppearanceAdditions(actual, target).Where(c => !unwearable.Skips(c, vNow)).ToList();
             pending = await Wo144InLayerOrderAsync(pending);   // WO-144 2.1
-            if (!Wo214OutfitCurrent(ghostId, outfitStamp)) return;
+            if (!current()) return;
             var extra = Wo135Rules.AppearanceRemovals(actual, target);
             if (pending.Count == 0 && extra.Count == 0) { lock (applied) { applied.Clear(); applied.UnionWith(target); } return; }
             Console.WriteLine($"[appearance] ghost {ghostId}: {pending.Count} item(s) still not worn, {extra.Count} still worn that should not be -- retrying");
@@ -3109,33 +3171,38 @@ public partial class GameBridge(ClientConfig config)
             {
                 presetCleared = true;
                 Console.WriteLine($"[appearance] ghost {ghostId}: {extra.Count} piece(s) cannot be unequipped ({string.Join(", ", extra.Take(4))}) -- a preset's; taking the preset off the engine's way (the empty preset), then the outfit again");
-                await Wo136ClearPresetAsync(ghostId, "unremovable pieces", outfitStamp);
+                Interlocked.Increment(ref _w136PresetClears);
+                await OutfitMutationAsync(scope, "preset", "", ct);
                 await Task.Delay(300, ct);
                 foreach (var cls in await Wo144InLayerOrderAsync(target))   // WO-144 2.1: under-layers first
                 {
-                    if (!Wo214OutfitCurrent(ghostId, outfitStamp)) return;
-                    bool create2;
-                    lock (known) create2 = known.Add(cls);
-                    try { await Wo144EquipOnGhostAsync(soulName, cls, createIfMissing: create2, outfitStamp, ct); }
+                    if (!current()) return;
+                    try { await OutfitMutationAsync(scope, "equip", cls.ToString("D"), ct); }
                     catch (Exception ex) { Console.WriteLine($"[appearance] re-equip {cls} on {soulName} failed: {ex.Message}"); }
                 }
                 continue;
             }
             foreach (var cls in extra)
             {
-                try { await Wo144UnequipOnGhostAsync(soulName, cls, outfitStamp, ct); }
+                if (!current()) return;
+                try { await OutfitMutationAsync(scope, "unequip", cls.ToString("D"), ct); }
                 catch (Exception ex) { Console.WriteLine($"[appearance] retry unequip {cls} on {soulName} failed: {ex.Message}"); }
             }
             foreach (var cls in pending)
             {
-                bool create;
-                lock (known) create = known.Add(cls);
-                try { await Wo144EquipOnGhostAsync(soulName, cls, createIfMissing: create, outfitStamp, ct); }
+                if (!current()) return;
+                try { await OutfitMutationAsync(scope, "equip", cls.ToString("D"), ct); }
                 catch (Exception ex) { Console.WriteLine($"[appearance] retry equip {cls} on {soulName} failed: {ex.Message}"); }
             }
         }
+        if (!current()) return;
+        if (!OutfitAttemptedInEngine(scope))
+        {
+            _outfitDeferred[ghostId] = 1;
+            return;
+        }
         if (last is null) { Console.WriteLine($"[appearance] ghost {ghostId}: no verify read answered -- left for the next packet, nothing marked"); return; }
-        if (!Wo214OutfitCurrent(ghostId, outfitStamp)) return;
+        if (!current()) return;
         bool inCombat = _peerLastState2.TryGetValue(ghostId, out var st) && st.CombatMode;
         foreach (var cls in pending)
         {
@@ -3149,7 +3216,7 @@ public partial class GameBridge(ClientConfig config)
             // 10 min -- the partner's outfit heartbeat is the timer), with the game's own reason.
             var idx144 = await SoulIndexAsync();
             string desc = await Wo136DescribeRefusalAsync(cls);
-            if (!Wo214OutfitCurrent(ghostId, outfitStamp)) return;
+            if (!current()) return;
             if (idx144?.UnwearableReason(cls) is not null)
             {
                 bool first;
@@ -4653,11 +4720,11 @@ public partial class GameBridge(ClientConfig config)
         public long P6Serial { get; init; }
         public long P6Life { get; init; }
         public long P6PeerSerial { get; init; }
+        public FigureBody P6RangedBody { get; init; }
         public long P6Deadline { get; init; }
         public long P6VisualSerial { get; init; }
         public bool P6Ready { get; init; }
         public long P6ModeSerial { get; init; }
-        public FigureBody P6RangedBody { get; init; }
         public PvpFrameScope? PvpContact { get; init; }
     }
 
@@ -5208,6 +5275,8 @@ public partial class GameBridge(ClientConfig config)
                 _ghostKnownItemClasses.TryRemove(ghostId, out _);
                 _ghostNeverEquips.TryRemove(ghostId, out _);
                 _ghostUnwearable.TryRemove(ghostId, out _); _ghostWantedAppearance.TryRemove(ghostId, out _);
+                RetireOutfitScope(ghostId);
+                _outfitAttempts.TryRemove(ghostId, out _);
                 _ghostLastAppearance.TryRemove(ghostId, out _);   // WO-88
                 // WO-17: a respawned ghost gets a fresh Soul.Guid, and a
                 // gone ghost has nothing left to detach.
@@ -6075,6 +6144,12 @@ public partial class GameBridge(ClientConfig config)
             return;
         }
 
+        if (name == "w214_outfit_attempt")
+        {
+            Wo214OutfitAttempted(arg);
+            return;
+        }
+
         if (name == "ghostid")
         {
             // WO-46: "<ghostId> <entityIdHex> [luaBirthHex]" from KCD2MP_SpawnGhost. The hex
@@ -6090,9 +6165,17 @@ public partial class GameBridge(ClientConfig config)
                 && rawId is > 0 and <= uint.MaxValue
                 && (giParts.Length == 2 ||
                     (uint.TryParse(giParts[2], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out birth) &&
-                     birth is > 0 and <= 0xFFFFFF)))
+                     birth > 0)))
             {
                 uint? previousEntityId = _ghostEntityIds.TryGetValue(giParts[0], out uint prevId) ? prevId : null;
+                uint lastBirth = _w214FigureBirths.GetValueOrDefault(giParts[0]).Birth;
+                const uint birthMask = 0xFFFFFF;
+                if (birth != 0 && lastBirth != 0 && birth != lastBirth &&
+                    (birth <= birthMask && lastBirth <= birthMask ? ((birth - lastBirth) & birthMask) > birthMask / 2 : birth < lastBirth))
+                {
+                    Console.WriteLine("[appearance] ignored a retired local figure incarnation");
+                    return;
+                }
                 bool incarnationChanged = Wo214NoteFigureBirth(giParts[0], (uint)rawId, birth);
                 _ghostEntityIds[giParts[0]] = (uint)rawId;
                 // WO-100 Phase 4 item 1: a different id is a different body, so
@@ -6102,8 +6185,8 @@ public partial class GameBridge(ClientConfig config)
                 if (previousEntityId != (uint)rawId || incarnationChanged) NotePresentationGhostSpawn(giParts[0], (uint)rawId);
                 Console.WriteLine($"[combatviz] ghost {giParts[0]} entity id 0x{rawId:X} cached for native swings");
 
-                // WO-88 finding 2: a NEW entity id for a ghost we already
-                // dressed is a respawned body (local save load -> RECONCILE ->
+                // WO-88 finding 2: a new body for a ghost we already
+                // dressed is a respawn (local save load -> RECONCILE ->
                 // fresh spawn in its preset). The per-ghost applied/known/
                 // blacklist sets describe the destroyed body; drop them and
                 // re-apply the outfit the peer last sent. Without this the
@@ -6111,8 +6194,8 @@ public partial class GameBridge(ClientConfig config)
                 // and the ghost stayed in default armour for the rest of the
                 // session (both machines, 2026-09-12, after each side's first
                 // reload). Same edge WO-68 uses for civic isolation below.
-                if ((incarnationChanged || ReloadReconcile.RespawnInvalidatesAppearance(previousEntityId, (uint)rawId))
-                    && byte.TryParse(giParts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out byte respawnedId))
+                if (byte.TryParse(giParts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out byte respawnedId)
+                    && (incarnationChanged || ReloadReconcile.RespawnInvalidatesAppearance(previousEntityId, (uint)rawId)))
                 {
                     _ghostAppearance.TryRemove(respawnedId, out _);
                     _ghostKnownItemClasses.TryRemove(respawnedId, out _);
@@ -6134,6 +6217,10 @@ public partial class GameBridge(ClientConfig config)
                     {
                         Console.WriteLine($"[appearance] ghost {respawnedId}: body respawned (entity 0x{prevId:X} -> 0x{rawId:X}) -- no outfit received yet, next packet dresses it");
                     }
+                }
+                else if (birth != 0 && lastBirth != birth && _outfitDeferred.ContainsKey(respawnedId))
+                {
+                    _ = RunWantedAppearanceAsync(respawnedId, CancellationToken.None);
                 }
 
                 // WO-68: this event is the ghost-ready edge -- it fires from

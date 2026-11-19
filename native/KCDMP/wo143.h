@@ -28,6 +28,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
+
+namespace kcdmp::timelineactions { enum class HandSlot : uint8_t; }
 
 namespace kcdmp::wo143 {
 
@@ -62,7 +65,9 @@ bool shot_in_flight(uint32_t eid);
 
 // S2-6: a typed P6 ranged presentation with a matching actual hand item.
 // Only the animation request runs on this body, without a shooting action.
-bool rp_ranged_available(uint32_t eid, const uint8_t itemClass[16]);
-bool rp_ranged(uint32_t eid, uint8_t weapon, uint8_t phase, const uint8_t itemClass[16], uint64_t token);
+bool rp_ranged_available(uint32_t eid, const uint8_t itemClass[16], timelineactions::HandSlot slot);
+uint8_t rp_observe_hands(uint32_t eid, std::array<uint8_t,16>& left, std::array<uint8_t,16>& right);
+bool rp_ranged(uint32_t eid, uint8_t weapon, uint8_t phase, const uint8_t itemClass[16],
+               timelineactions::HandSlot slot, uint64_t token);
 
 } // namespace kcdmp::wo143

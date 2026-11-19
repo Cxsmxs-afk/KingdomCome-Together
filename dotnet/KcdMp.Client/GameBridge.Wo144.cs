@@ -312,7 +312,12 @@ public partial class GameBridge
                 }
                 catch (OperationCanceledException) { return; }
                 catch (Exception ex) { Console.WriteLine($"[appearance] ghost {g}: the outfit check failed: {ex.Message}"); }
-                finally { gate.Release(); }
+                finally
+                {
+                    gate.Release();
+                    if (_ghostWantedAppearance.TryGetValue(g, out var latest) && !ReferenceEquals(latest, want))
+                        await RunWantedAppearanceAsync(g, ct);
+                }
             }
         }
     }

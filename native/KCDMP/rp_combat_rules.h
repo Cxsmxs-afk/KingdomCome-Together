@@ -14,6 +14,8 @@ namespace kcdmp::rpcombat {
 constexpr uint8_t kSwing = 1, kBlock = 6, kDodge = 7, kKo = 0x81, kRanged = 0x82,
                   kParry = 0x83, kHit = 0x84, kRecoil = 0x85;
 constexpr size_t kRegistrationHeader = 10, kActionHeader = timelineactions::kHeader;
+constexpr uint8_t kRangedProtocolVersion = 2;
+constexpr size_t kRangedPayloadSize = 39;
 
 inline bool uses_row(uint8_t kind) {
     return kind == kSwing || kind == kBlock || kind == kDodge || kind == kParry || kind == kHit || kind == kRecoil;
@@ -42,6 +44,7 @@ struct Event {
     uint16_t sequence = 0;
     uint8_t rangedPhase = 0;
     std::array<uint8_t, 16> itemClass{};
+    timelineactions::RangedHandFence rangedHand{};
 };
 
 inline bool decode_event(const uint8_t* body, size_t n, Event& out) {
@@ -64,14 +67,15 @@ inline bool decode_event(const uint8_t* body, size_t n, Event& out) {
         if (size != 1 || payload[0] > 1) return false;
         e.stage = payload[0];
     } else if (e.kind == kRanged) {
-        if (size != 18) return false;
-        e.stage = payload[0]; e.rangedPhase = payload[1];
+        if (size != kRangedPayloadSize || payload[0] != kRangedProtocolVersion) return false;
+        e.stage = payload[1]; e.rangedPhase = payload[2];
         if ((e.stage != 1 && e.stage != 2) || e.rangedPhase < 3 || e.rangedPhase > 5 ||
             (e.rangedPhase == 4 && e.stage != 1)) return false;
-        std::memcpy(e.itemClass.data(), payload + 2, e.itemClass.size());
+        std::memcpy(e.itemClass.data(), payload + 3, e.itemClass.size());
+        e.rangedHand = {read_le(payload + 19, 8), static_cast<uint32_t>(read_le(payload + 27, 4)), read_le(payload + 31, 8)};
         bool nonempty = false;
         for (const uint8_t byte : e.itemClass) nonempty |= byte != 0;
-        if (!nonempty) return false;
+        if (!nonempty || !e.rangedHand.valid()) return false;
     } else return false;
     out = e;
     return true;
