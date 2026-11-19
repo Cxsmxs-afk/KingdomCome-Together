@@ -272,6 +272,7 @@ struct InSample {
     uint32_t senderMs = 0;
     int64_t  arrivalQpc = 0;
     uint64_t hostMs = 0, hostAtArrivalMs = 0, stateHostMs = 0;
+    rangedaim::TimedState ranged{};
     rpmeasure::SampleScope reader{};
     bool     raw = false, rawGhost = false;
     int64_t  stateQpc = 0;
@@ -382,6 +383,7 @@ struct Puppet {
     uint32_t eid = 0;
     void*    ent = nullptr;
     uint64_t wuid = 0;
+    uint64_t rangedAfterMs = 0;
     uint8_t  pendingDrop = kOk;
     bool     tellDrop = false;
     bool     pendingSeatPlace = false;
@@ -580,6 +582,7 @@ void push_sample(const InSample& in, double now) {
             rptimeline::Sample sample;
             sample.hostMs = in.hostMs;
             sample.stateHostMs = in.stateHostMs;
+            sample.ranged = in.ranged;
             sample.x = in.x; sample.y = in.y; sample.z = in.z; sample.yaw = in.rot;
             sample.flags = in.flags;
             if (in.haveSt2) std::memcpy(sample.state.data(), &in.st2, sizeof in.st2);
@@ -1447,11 +1450,13 @@ uint8_t bind_main(const BindRequest& req) {
     if (g_bound.find(key) == g_bound.end() && g_bound.size() >= kMaxBound) return refuse(kTableFull, "");
 
     const double now = now_s();
+    const uint64_t wuid = nativeWuid ? nativeWuid : req.wuid;
     // WO-214 B (one_bind): a bind asked again for a body bound to that same entity changes nothing -- the field re-bound bound bodies
     // every ~3 s (1,266 of 2,894 binds), each time a fresh puppet (its blend, its play-out, its ring for a stream quiet 2 s)
     {
         auto bi = g_bound.find(key);
-        if (bi != g_bound.end() && wo214rules::bind_noop(wo214::on(wo214rules::kBitOneBind), true, bi->second.eid, bi->second.ent, req.eid, e)) {
+        if (bi != g_bound.end() && bi->second.wuid == wuid &&
+            wo214rules::bind_noop(wo214::on(wo214rules::kBitOneBind), true, bi->second.eid, bi->second.ent, req.eid, e)) {
             wo214::note_rebind_noop();
             static uint32_t s_noops = 0;
             if (++s_noops <= 20 || s_noops % 200 == 0)
@@ -1459,11 +1464,11 @@ uint8_t bind_main(const BindRequest& req) {
             return kOk;
         }
     }
-    const uint64_t wuid = nativeWuid ? nativeWuid : req.wuid;
     const auto existing = g_bound.find(key);
     const bool rebind = existing != g_bound.end();
-    if (rebind && (existing->second.eid != req.eid || existing->second.ent != e || existing->second.wuid != wuid) &&
-        !drop(existing, kUnbound, false))
+    const bool sameBody = rebind && existing->second.eid == req.eid && existing->second.ent == e && existing->second.wuid == wuid;
+    const uint64_t rangedAfterMs = sameBody ? existing->second.rangedAfterMs : local_ms(now);
+    if (rebind && !sameBody && !drop(existing, kUnbound, false))
         return refuse(kOwnerBusy, "the previous body is still releasing its engine request");
     Puppet& p = g_bound[key];
     // WO-214 B: how long the stream this bind is for had been silent (a bind for a stream the host no longer sends drops at once)
@@ -1471,6 +1476,7 @@ uint8_t bind_main(const BindRequest& req) {
     { auto si = g_streams.find(key); if (si != g_streams.end() && si->second.lastSampleAt > 0) streamAge = now - si->second.lastSampleAt; }
     p = Puppet{};
     p.key = key; p.name = req.name; p.eid = req.eid; p.ent = e; p.wuid = wuid;
+    p.rangedAfterMs = rangedAfterMs;
     p.beast = beast;
     p.human = npcscan::body_kind(e) == 0;   // WO-215 A
     p.noPhys = noPhys;
@@ -1665,6 +1671,7 @@ void tick() {
         sample.flags = pose.flags; sample.seq = pose.sequence; sample.senderMs = pose.senderMs;
         sample.arrivalQpc = pose.arrivalQpc;
         sample.hostMs = pose.hostMs; sample.hostAtArrivalMs = pose.hostAtArrivalMs; sample.stateHostMs = pose.stateHostMs;
+        sample.ranged = pose.ranged;
         sample.reader = {pose.firstByteQpc, reader, loadStamp};
         sample.raw = true; sample.rawGhost = pose.ghost();
         sample.stateQpc = pose.stateQpc;
@@ -1782,7 +1789,7 @@ void tick() {
             p.blendPending = true;
             p.blendWhy = "timeline-switch";
         }
-        auto timed = useTimeline ? s.timed->render(nowMs) : rptimeline::Output{};
+        auto timed = useTimeline ? s.timed->render(nowMs, p.rangedAfterMs) : rptimeline::Output{};
         if (useTimeline) rptimeline::note_target(p.eid, measuredPeer, timed.targetHostMs);
         const uint8_t flags = timed.ready() ? timed.source.flags : s.flags;
         motion::State2 timelineState{};

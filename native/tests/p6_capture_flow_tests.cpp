@@ -57,9 +57,11 @@ int p6_capture_flow_tests(int* passed){
     on_pipe_closed();playable=true;tick();r=poll();C6(r.b[1]==0,"pipe close invalidates prior presentation queue");
     namespace aim = kcdmp::rangedaim;
     reset();step(aim::Charging);step(aim::Unreadable);
-    C6(sampled_aim(&actorObject).aim,"unreadable step on same body keeps the last draw");
+    C6(sampled_aim(&actorObject).observed && sampled_aim(&actorObject).aim,
+       "unreadable step on same body keeps the last draw");
     changedBody=true;step(aim::Unreadable);
-    C6(!sampled_aim(&otherActor).aim&&poll().b[1]==0,"an unreadable replacement actor cannot publish the retired body's draw or phase rows");
+    C6(!sampled_aim(&otherActor).observed&&!sampled_aim(&otherActor).aim&&poll().b[1]==0,
+       "an unreadable replacement actor cannot publish the retired body's draw or an unconfirmed end");
     reset();for(unsigned i=0;i<33;++i)step(uint8_t(i%2+1));
     C6(sampled_aim(&actorObject).aim,"event queue overflow is not a confirmed draw end");
     reset();step(aim::Firing);changedBody=true;step(aim::Firing);r=poll();
@@ -76,7 +78,7 @@ int p6_capture_flow_tests(int* passed){
     C6(sampled_aim(&actorObject).charge==191,"unreadable charge and subsequent aim retain the measured value for this draw");
     step(aim::Uncharging);
     r=poll();
-    C6(!sampled_aim(&actorObject).aim&&!sampled_aim(&actorObject).charge&&
+    C6(sampled_aim(&actorObject).observed&&!sampled_aim(&actorObject).aim&&!sampled_aim(&actorObject).charge&&
        r.b[1]==2&&r.b[18]==aim::Aiming&&r.b[66]==aim::Uncharging,"abort clears the draw and has no Fire phase");
     if(passed)*passed=passedCount;
     return failedCount;

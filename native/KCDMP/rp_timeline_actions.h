@@ -5,6 +5,8 @@
 
 #include "rp_timeline_action_rules.h"
 
+#include <array>
+
 namespace kcdmp::timelineactions {
 
 // Main thread only. The edge reply proves admission before the native action
@@ -15,6 +17,17 @@ struct Scope {
         return lifecycle == other.lifecycle && connection == other.connection && life == other.life && load == other.load;
     }
 };
+
+using HandItemClass = std::array<uint8_t, 16>;
+
+struct HandObservation {
+    Receipt result = Invalid;
+    uint8_t known = 0;
+    HandItemClass left{}, right{};
+};
+// The accepted declaration enters its scoped Lua action on this same game
+// thread. The separate observation reads the engine's two weapon slots.
+HandObservation handle_ranged_hand(const uint8_t* bytes, size_t size, Scope received);
 
 void configure(bool enabled);
 void reset();
