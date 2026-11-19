@@ -199,19 +199,69 @@ public sealed class P6RangedBridgeTests
         await Until(() => Count(r.Bridge, "ranged_out") == 5); Assert.Equal(1, Count(r.Bridge, "ranged_poll_started")); Assert.False(r.Link.Sent.Reader.TryRead(out _));
         Assert.DoesNotContain(r.Game.Calls, x => x.Contains("W201Shot") || x.Contains("GetItemInHand"));
     }
-    [Fact]
-    public async Task Old_inflight_poll_after_down_then_wake_cannot_publish_or_poison_the_next_poll()
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public async Task Old_inflight_poll_after_down_then_wake_cannot_publish_or_poison_the_next_poll(bool host, bool sequenceKnown)
     {
-        await using var r = await Rig.Create(false); Call(r.Bridge, "Wo201RangedTick"); await r.Accept; await Read(r.Server);
-        await (Task)Call(r.Bridge, "OnLocalDownedAsync", true, (byte)0)!; await (Task)Call(r.Bridge, "OnLocalDownedAsync", false, (byte)0)!;
-        await Reply(r.Server, 0xAC, 0, 86, Poll(r.Generation, 19, 3));
-        await Until(() => Get<SemaphoreSlim>(r.Bridge, "_p6PollGate").CurrentCount == 1); Assert.False(r.Link.Sent.Reader.TryRead(out _));
-        Call(r.Bridge, "Wo201RangedTick"); Assert.Equal(86, (await Read(r.Server)).Body[0]);
-        // The post-wake capture must occur on a later tick than the wake itself.
+        await using var r = await Rig.Create(host);
+        var gate = Get<SemaphoreSlim>(r.Bridge, "_p6PollGate");
+        if (sequenceKnown)
+        {
+            Call(r.Bridge, "Wo201RangedTick");
+            await r.Accept;
+            Assert.Equal(86, (await Read(r.Server)).Body[0]);
+            await Reply(r.Server, 0xAC, 250, 86, Poll(r.Generation, 18));
+            await Until(() => gate.CurrentCount == 1);
+        }
+
+        Call(r.Bridge, "Wo201RangedTick");
+        await r.Accept;
+        Assert.Equal(86, (await Read(r.Server)).Body[0]);
+        await (Task)Call(r.Bridge, "OnLocalDownedAsync", true, (byte)0)!;
+        await (Task)Call(r.Bridge, "OnLocalDownedAsync", false, (byte)0)!;
+        await Until(() => gate.CurrentCount == 1);
+        Assert.False(r.Link.Sent.Reader.TryRead(out _));
+
+        Call(r.Bridge, "Wo201RangedTick");
+        if (sequenceKnown)
+        {
+            Assert.Equal(86, (await Read(r.Server)).Body[0]);
+            // The old reply arrives only after the replacement command reached the native pipe.
+            await Reply(r.Server, 0xAC, 251, 86, Poll(r.Generation, 19, 3));
+        }
+        else
+        {
+            // Cancellation before the first reply leaves no sequence offset to distinguish the old rows.
+            // The ambiguous stream must close before the replacement is written.
+            using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            Assert.Equal(0, await r.Server.ReadAsync(new byte[1], stop.Token));
+            await Until(() => gate.CurrentCount == 1);
+            Assert.False(r.Link.Sent.Reader.TryRead(out _));
+            r.Server.Disconnect();
+            var accepted = r.Server.WaitForConnectionAsync(stop.Token);
+            await Until(() => Environment.TickCount64 >= Get<long>(r.Bridge, "_w201RangedRetryAtMs"));
+            Call(r.Bridge, "Wo201RangedTick");
+            await accepted;
+            Assert.Equal(86, (await Read(r.Server)).Body[0]);
+        }
+
         await Until(() => Environment.TickCount64 > Get<long>(r.Bridge, "_p6VisualModeAtTick"));
-        await Reply(r.Server, 0xAC, 1, 86, Poll(r.Generation, 20, 1, 2, 3));
-        for (int i = 0; i < 3; i++) Assert.Equal(Protocol.W164RangedStep, Message(await r.Link.Next()).Kind);
-        await Until(() => Count(r.Bridge, "ranged_out") == 3);
+        await Reply(r.Server, 0xAC, sequenceKnown ? (byte)252 : (byte)1, 86, Poll(r.Generation, 20, 1, 2, 3));
+        foreach (byte phase in new byte[] { 1, 2, 3 })
+        {
+            var message = Message(await r.Link.Next());
+            Assert.Equal(Protocol.W164RangedStep, message.Kind);
+            Assert.True(RangedStepV2.TryDecode(message.Text, out var step));
+            Assert.Equal(20ul, step.Epoch);
+            Assert.Equal(phase, step.Phase);
+        }
+        await Until(() => gate.CurrentCount == 1);
+        Assert.Equal(3, Count(r.Bridge, "ranged_out"));
+        Assert.Equal(sequenceKnown ? 1 : 0, r.Pipe.StaleRepliesDropped);
+        Assert.False(r.Link.Sent.Reader.TryRead(out _));
     }
     [Theory]
     [InlineData(false)] [InlineData(true)]

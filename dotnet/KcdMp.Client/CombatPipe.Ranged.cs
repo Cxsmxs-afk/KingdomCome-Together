@@ -9,7 +9,10 @@ public sealed partial class CombatPipe
 
     public async Task<RangedPollReply?> RangedPollAsync(bool on, ulong generation, Func<bool> current, CancellationToken ct = default)
     {
-        var (body, _) = await SendAndAwaitAsync(Wo163, [Protocol.Wo201OpRangedPoll, .. RangedCaptureCodec.Request(on, generation)], Wo163Reply, ct, current);
+        // Down and wake can supersede a pending poll without changing the native generation.
+        // Only the wire sequence distinguishes its late reply from the next poll's rows.
+        var (body, _) = await SendAndAwaitAsync(Wo163, [Protocol.Wo201OpRangedPoll, .. RangedCaptureCodec.Request(on, generation)],
+            Wo163Reply, ct, current, exactSequence: true);
         ct.ThrowIfCancellationRequested(); ProcessorFrameScope.ThrowIfAbandoned();
         return current() && body is { Length: >= 4 } && body[0] == 1 && body[2] == Protocol.Wo201OpRangedPoll &&
             RangedCaptureCodec.TryDecode(body.AsSpan(4), out var reply) && reply.Generation == generation ? reply : null;
