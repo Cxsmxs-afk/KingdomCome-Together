@@ -48,7 +48,13 @@ public sealed class ActionRowCatalog
     public const int ActionFailedAttackOnBlock = 27, ActionFailedAttackOnPerfectBlock = 15;
 
     private readonly Dictionary<Guid, Row> _rows;
-    private ActionRowCatalog(Dictionary<Guid, Row> rows) { _rows = rows; }
+    private readonly Dictionary<Guid, Row> _ordinaryBlockStandIns;
+
+    private ActionRowCatalog(Dictionary<Guid, Row> rows)
+    {
+        _rows = rows;
+        _ordinaryBlockStandIns = BuildOrdinaryBlockStandIns(rows);
+    }
 
     public int Count => _rows.Count;
     public bool TryGet(Guid g, out Row r) => _rows.TryGetValue(g, out r);
@@ -89,7 +95,7 @@ public sealed class ActionRowCatalog
                 var frag = (string?)el.Attribute("mn_fragment_id");
                 if (g is null || frag is null || !Guid.TryParse(g, out var guid)) continue;
                 rows[guid] = new Row(table, frag, (string?)el.Attribute("mn_tags") ?? "",
-                    Int((string?)el.Attribute("attack_zone_id") ?? (string?)el.Attribute("block_zone_id")),
+                    AuthoredZone(el, table),
                     Int((string?)el.Attribute("input_class_id")), Int((string?)el.Attribute("attack_type_id")),
                     Int((string?)el.Attribute("action_type_id")), Flt((string?)el.Attribute("attack_time_to_start")),
                     Flt((string?)el.Attribute("attack_time_to_hit")), Long((string?)el.Attribute("actor_class_hash")),
@@ -105,6 +111,14 @@ public sealed class ActionRowCatalog
             }
         }
         return new ActionRowCatalog(rows);
+    }
+
+    private static int AuthoredZone(XElement row, string table)
+    {
+        string? attack = (string?)row.Attribute("attack_zone_id"), block = (string?)row.Attribute("block_zone_id");
+        if (table is not ("combat_action_block" or "combat_action_perfect_block")) return Int(attack ?? block);
+        int zone = Int(block);
+        return attack is null || Int(attack) == zone ? zone : -1;
     }
 
     private static int Int(string? s) => int.TryParse(s, out int v) ? v : -1;
@@ -164,6 +178,86 @@ public sealed class ActionRowCatalog
 
     /// <summary>combat_action_block / _perfect_block action types the copy's own block plays (WO-176 B3): 6 block, 8 block broken, 14 perfect block.</summary>
     public const int ActionBlock = 6, ActionBlockBroken = 8, ActionPerfectBlock = 14;
+
+    /// <summary>The unique authored ordinary block usable for an unflagged Perfect Block on a player's figure.</summary>
+    internal bool TryGetOrdinaryBlockStandIn(Guid perfect, out Row ordinary) => _ordinaryBlockStandIns.TryGetValue(perfect, out ordinary);
+
+    private readonly record struct PlayerBlockContext(long ActorClass, int Zone, int WeaponL, int WeaponR, string LeftTag,
+        string RightTag, int EndGuardZone, int GuardType, string OppClasses, string Variant, string Qualifiers);
+
+    private static Dictionary<Guid, Row> BuildOrdinaryBlockStandIns(Dictionary<Guid, Row> rows)
+    {
+        var ordinary = new Dictionary<PlayerBlockContext, Row?>();
+        foreach (Row row in rows.Values)
+        {
+            if (row is not { Table: "combat_action_block", Fragment: "CombatBlockGen", ActionType: ActionBlock } ||
+                !TryPlayerBlockContext(row, out var context)) continue;
+            if (!ordinary.TryAdd(context, row) && ordinary[context] != row)
+                ordinary[context] = null; // A different authored row makes the context ambiguous, independent of table order.
+        }
+
+        var result = new Dictionary<Guid, Row>();
+        foreach (var (guid, row) in rows)
+        {
+            if (row is { Table: "combat_action_perfect_block", Fragment: "CombatBlockPerfectGen", ActionType: ActionPerfectBlock } &&
+                TryPlayerBlockContext(row, out var context) && ordinary.TryGetValue(context, out var block) && block is { } confirmed)
+                result.Add(guid, confirmed);
+        }
+        return result;
+    }
+
+    private static bool TryPlayerBlockContext(Row row, out PlayerBlockContext context)
+    {
+        context = default;
+        if (row.ActorClass == 0 || row.Zone is < 0 or > 5 || row.WeaponL < 0 || row.WeaponR < 0 ||
+            !string.IsNullOrEmpty(row.ComboId) || row.ComboStep >= 0 || string.IsNullOrEmpty(row.Tags)) return false;
+
+        string? left = null, right = null;
+        bool defendedZone = false, player = false, startingGuard = false, endZone = false;
+        var known = new HashSet<string>(StringComparer.Ordinal);
+        var qualifiers = new List<string>();
+        foreach (string tag in row.Tags.Split('+'))
+        {
+            if (tag.Length == 0 || !tag.All(c => char.IsAsciiLetterOrDigit(c) || c == '_') || !known.Add(tag)) return false;
+            if (tag.StartsWith("l_", StringComparison.Ordinal))
+            {
+                if (left is not null || tag.Length == 2 || tag.AsSpan(2).Equals("any", StringComparison.OrdinalIgnoreCase)) return false;
+                left = tag;
+            }
+            else if (tag.StartsWith("r_", StringComparison.Ordinal))
+            {
+                if (right is not null || tag.Length == 2 || tag.AsSpan(2).Equals("any", StringComparison.OrdinalIgnoreCase)) return false;
+                right = tag;
+            }
+            else if (tag.StartsWith("dZ", StringComparison.Ordinal))
+            {
+                if (defendedZone || tag.Length != 3 || tag[2] - '0' != row.Zone) return false;
+                defendedZone = true;
+            }
+            else if (tag == "player") player = true;
+            else if (tag is "leftGuard" or "rightGuard" || tag.StartsWith("sZ", StringComparison.Ordinal))
+            {
+                // WO-176's ordinary sZ and the Perfect Block's guard side describe each fragment's own start.
+                if (startingGuard || (tag[1] == 'Z' && (tag.Length != 3 || tag[2] is < '0' or > '5'))) return false;
+                startingGuard = true;
+            }
+            else
+            {
+                if (tag.StartsWith("eZ", StringComparison.Ordinal))
+                {
+                    if (endZone || tag.Length != 3 || tag[2] is < '0' or > '5' ||
+                        (row.EndGuardZone >= 0 && row.EndGuardZone != tag[2] - '0')) return false;
+                    endZone = true;
+                }
+                qualifiers.Add(tag);
+            }
+        }
+        if (!player || !defendedZone || left is null || right is null) return false;
+        qualifiers.Sort(StringComparer.Ordinal);
+        context = new(row.ActorClass, row.Zone, row.WeaponL, row.WeaponR, left, right,
+            row.EndGuardZone, row.GuardType, row.OppClasses, row.Variant, string.Join('+', qualifiers));
+        return true;
+    }
 
     /// <summary>
     /// WO-176 (B3a): the defender's own row for a blow the host's NPC blocked / perfectly blocked / had its block broken by -- an NPC row (no

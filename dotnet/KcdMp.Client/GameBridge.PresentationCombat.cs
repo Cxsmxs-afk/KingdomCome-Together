@@ -161,7 +161,20 @@ public partial class GameBridge
         if (action.Phase != ActionPhase.Commit) return true;
         byte peer = action.SourceGhostId;
         uint sourceMs = action.Payload.Length >= 4 ? BinaryPrimitives.ReadUInt32LittleEndian(action.Payload) : 0;
+        string sourceTable = row.Table;
         byte kind = PresentationMeleeKind(action.Kind, row.Table, flags, row.ActionType);
+        bool standIn = false;
+        if (kind == 0 && W221On("rp_combat") && action.Kind == ActionKind.BlockImpulse && flags == 0 &&
+            row is { Table: "combat_action_perfect_block", ActionType: ActionRowCatalog.ActionPerfectBlock } &&
+            RowEvent.TryFromBytes(action.Payload, out var captured) && captured.Flags == flags && captured.Name.Length == 0 &&
+            _rowCatalog.IsCompletedSuccessfully && _rowCatalog.Result is { } catalog &&
+            catalog.TryGet(captured.Row, out var original) && original == row &&
+            catalog.TryGetOrdinaryBlockStandIn(captured.Row, out var ordinary))
+        {
+            row = ordinary;
+            kind = (byte)ActionKind.BlockImpulse;
+            standIn = true;
+        }
         if (kind == 0)
         {
             // The verified native owner installs a single body's row. A paired action needs an engine entry for both bodies.
@@ -182,10 +195,17 @@ public partial class GameBridge
         }
 
         void ReportRow(string disposition) => Console.WriteLine(FormattableString.Invariant(
-            $"MP-RP-MELEE-ROW peer={peer} kind={action.Kind} seq={action.Seq} source_ms={sourceMs} table={row.Table} {disposition}"));
+            $"MP-RP-MELEE-ROW peer={peer} kind={action.Kind} seq={action.Seq} source_ms={sourceMs} table={sourceTable} {disposition}"));
         bool LegacyOwner() => !W221On("rp_combat");
         if (LegacyOwner())
+        {
+            if (standIn)
+            {
+                ReportRow("result=refused reason=typed-owner-retired");
+                return true;
+            }
             return await TryScheduleLegacyPresentationRowAsync(action, eid, row.Spec, stamp, ct, LegacyOwner) || !LegacyOwner();
+        }
         if (stamp.Session is null || stamp.HostAtArrivalMs == 0 || stamp.SampleMs == 0)
         {
             ReportRow("result=refused reason=missing-presentation-clock");
@@ -196,6 +216,7 @@ public partial class GameBridge
             ReportRow("result=refused reason=stale-world-or-pipe-or-body");
             return true;
         }
+        if (standIn) ReportRow("result=mapped reason=authored-ordinary-block-context render_table=combat_action_block");
         _t3Counters.TryAdd(PresentationMeleeUnavailableCounter, 0);
         bool Current() => TryPresentationCombatScope(peer, eid, stamp, out var current) && current == scope;
         var rows = _presentationCombatRows.AddOrUpdate(peer, _ => new(scope),
