@@ -54,12 +54,13 @@ LIVE_FIELDS = re.compile(r'\b([a-z][a-z0-9_]*)=([^\s]+)')
 HOST_CONTACT = re.compile(r'\bWO176-HOSTHIT victim=(0x[0-9A-Fa-f]+) outcome=(\w+)\b')
 NPC_CONTACT = re.compile(r'\bMP-W173 hit npc=(\S+) by_ghost=(\d+) applied=engine verdict=(\S+)')
 PVP = re.compile(r'\bMP-FF (.+)$')
-PVP_APPLY = re.compile(r'\bWO121-HITS friendly-fire hit on the player: hp -([0-9.]+) st -([0-9.]+) unarmed=(\d+) from ghost (\d+) -> applied\b')
+NATIVE_CONTACT = re.compile(r'\bMP-LANE2-COMBAT (.+)$')
 AUTH_READBACK = ('if KCD2MP and KCD2MP.wo102 then System.LogAlways("[LANE2-AUTH] " .. '
                  '(KCD2MP.wo102.authorityHost and KCD2MP.hitSensorOn and "on" or "off")) end')
-RELEVANT_AGENT = ('MP-RP-MELEE-ROW', 'MP-RP-TIMELINE-IN', 'MP-RP-KO-IN', 'MP-FF', 'MP-W173 hit')
-RELEVANT_NATIVE = ('MP-RP-COMBAT-ACTION', 'MP-RP-KO', 'MP-RP-DAMAGE', 'WO121-HITS', 'WO173-HIT', 'WO176-HOSTHIT',
-                   'WO208-DEF', 'WO154-DOWN', 'MP-RESPAWN downed', 'MP-RESPAWN done', 'T3-RECOVERY', 'T3-DEATHCAUSE')
+RELEVANT_AGENT = ('MP-RP-MELEE-ROW', 'MP-RP-TIMELINE-IN', 'MP-RP-KO-IN', 'MP-FF', 'MP-W173 hit', 'WO195-FALL', 'MP-LANE2-H6')
+RELEVANT_NATIVE = ('MP-RP-COMBAT-ACTION', 'MP-RP-KO', 'MP-RP-DAMAGE', 'MP-LANE2-COMBAT', 'WO121-HITS', 'WO173-HIT', 'WO176-HOSTHIT',
+                   'WO208-DEF', 'WO154-DOWN', 'MP-RESPAWN downed', 'MP-RESPAWN done', 'T3-RECOVERY', 'T3-DEATHCAUSE',
+                   'WO221-ACTEND', 'MP-LANE2-H6')
 
 
 def recoil_stage(rig, sender, observed):
@@ -276,7 +277,7 @@ def partner_contacts(outgoing, incoming, attacker, victim):
     for lines, kind, matches, direction, results in (
             (outgoing, 'out', {'ghost': str(victim)}, sent, ('sent',)),
             (incoming, 'in', {'attacker': str(attacker), 'victim': str(victim)}, received,
-             ('applied', 'acknowledged', 'protected_consumed'))):
+             ('applied', 'acknowledged', 'dispatch_unconfirmed', 'observed', 'protected_consumed'))):
         for line in lines:
             if match := PVP.search(line):
                 row = dict(LIVE_FIELDS.findall(match[1]))
@@ -284,6 +285,36 @@ def partner_contacts(outgoing, incoming, attacker, victim):
                         and row.get('result') in results and all(row.get(key) == value for key, value in matches.items())):
                     direction.append(line)
     return sent, received
+
+
+def partner_effect(receiver_native, source_peer, target):
+    rows = []
+    for line in receiver_native:
+        if match := NATIVE_CONTACT.search(line):
+            row = dict(LIVE_FIELDS.findall(match[1]))
+            if row.get('event') == 'contact' and row.get('source') == 'pvp' and number(row, 'peer') == source_peer:
+                rows.append(row)
+    if len(rows) != 1 or not target:
+        return None
+    row = rows[0]
+    eid = row.get('target', '')
+    if not re.fullmatch(r'0x[0-9A-Fa-f]+', eid) or target['eid'] != int(eid, 16):
+        return None
+    if not re.fullmatch(r'\d+/\d+', row.get('scope', '')) or number(row, 'seq') is None:
+        return None
+    try:
+        vitals = {key: float(row[key]) for key in ('hp_before', 'hp_after', 'st_before', 'st_after')}
+    except (KeyError, ValueError):
+        return None
+    if not all(math.isfinite(value) and value >= 0 for value in vitals.values()):
+        return None
+    hp_loss = vitals['hp_before'] - vitals['hp_after']
+    st_loss = vitals['st_before'] - vitals['st_after']
+    outcome = row.get('outcome')
+    if ((outcome == 'observed' and (hp_loss > 0 or st_loss > 0)) or
+            (outcome == 'protected_consumed' and hp_loss == st_loss == 0)):
+        return {'status': outcome, 'scope': row['scope'], 'pipe_seq': int(row['seq']), 'eid': target['eid'], **vitals}
+    return None
 
 
 def authority_contacts(send_role, actor, bandit, eid, host_agent, host_native):
@@ -319,16 +350,15 @@ def case_signal(case, before, after, sent, received, protected, npc_hits, receiv
     fields = ('hp', 'st', 'unarmed')
     if any(key not in outbound or outbound[key] != inbound.get(key) for key in fields):
         return 'partner-contact-values-mismatch'
-    applied = [match for line in receiver_native if (match := PVP_APPLY.search(line)) and int(match[4]) == source_peer]
+    effect = partner_effect(receiver_native, source_peer, before.get('partner'))
     if case == 'protected':
-        return 'protected-consumed-zero' if len(protected) == 1 and not applied else 'protection-unmeasured'
-    if protected or inbound.get('result') == 'protected_consumed':
+        return 'protected-consumed-zero' if effect and effect['status'] == 'protected_consumed' else 'protection-unmeasured'
+    if protected or inbound.get('result') == 'protected_consumed' or effect and effect['status'] == 'protected_consumed':
         return 'protected-instead-of-applied'
-    if len(applied) != 1 or applied[0].groups()[:3] != tuple(inbound[key] for key in fields):
-        return 'partner-damage-apply-unmeasured'
+    if not effect or effect['status'] != 'observed':
+        return 'partner-damage-effect-unmeasured'
     if case == 'exhaustion':
-        return 'exhaustion-observed' if (before.get('partner') and after.get('partner')
-                                         and before['partner']['st'] > 0 and after['partner']['st'] == 0) else 'exhaustion-unmeasured'
+        return 'exhaustion-observed' if effect['st_before'] > 0 and effect['st_after'] == 0 else 'exhaustion-unmeasured'
     if case == 'ko-rise':
         down = next((i for i, line in enumerate(receiver_native) if 'WO154-DOWN the local player is DOWN' in line), None)
         up = down is not None and any('WO154-DOWN the local player is up again' in line for line in receiver_native[down + 1:])
@@ -405,12 +435,16 @@ def observe_combat(S, run, args, send_role):
     stable = ff_after and host_authority and not world_changed
     npc_hits = authority_contacts(send_role, ids[send_role], args.bandit, before['npc']['eid'], *traces['host']) if before.get('npc') else []
     signal = case_signal(case, before, after, sent, received, protected, npc_hits, traces[receive_role][1], ids[send_role])
+    effect = partner_effect(traces[receive_role][1], ids[send_role], before.get('partner'))
+    exact = (effect if target == 'partner' and stable and len(source_actions) == len(sent) == len(received) == 1
+             and signal != 'partner-contact-values-mismatch' else None)
+    exact = exact or {'status': 'grey', 'reason': 'no isolated native effect with a verified actor and before/after values'}
     network = network_evidence(relay, S.pair.POOR_NETWORK, args.netz, S.procs.matches, S.Copy.lines, require_delay=True)
     report = dict(case=case, scope=scope, sender=send_role, receiver=receive_role, target=target, peers=ids,
                   health_stamina_before=before, health_stamina_after=after, window_deltas=deltas, source_actions=source_actions, signal=signal,
                   wrong_partner_contact=wrong_partner, friendly_fire_after=ff_after, host_authority_after=host_authority,
                   partner_sent=sent, partner_acknowledgements=received, protected_consumed_zero=protected, npc_authority_contact=npc_hits,
-                  exact_event_readback={'status': 'grey', 'reason': 'window snapshots have no shared engine contact id'}, network=network,
+                  exact_event_readback=exact, wire_contact_dedup='unmeasured', network=network,
                   traces={role: {'agent': [line for line in alog if any(key in line for key in RELEVANT_AGENT)],
                                  'native': [line for line in nlog if any(key in line for key in RELEVANT_NATIVE)]}
                           for role, (alog, nlog) in traces.items()})
@@ -422,8 +456,8 @@ def observe_combat(S, run, args, send_role):
     reason = 'wrong-partner-contact' if wrong_partner else 'isolated-window-unmeasured'
     if stable and len(source_actions) == 1 and target in deltas and not wrong_partner:
         observed = signal.endswith('-observed') or signal == 'protected-consumed-zero'
-        return observed, signal, {'report': str(path), 'exact_event_readback': 'grey'}
-    return False, reason, {'report': str(path), 'exact_event_readback': 'grey'}
+        return observed, signal, {'report': str(path), 'exact_event_readback': exact['status']}
+    return False, reason, {'report': str(path), 'exact_event_readback': exact['status']}
 
 
 def exercise(S, run, args, send_role):

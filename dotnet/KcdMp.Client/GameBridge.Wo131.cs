@@ -207,16 +207,6 @@ public partial class GameBridge
         });
     }
 
-    /// <summary>1c: right before the host's death is applied to a copy, lift its guard.</summary>
-    private async Task Wo131BeforeDeathAsync(string name)
-    {
-        if (!_w131Guarded.TryRemove(name, out uint eid)) return;
-        try { await _combat.Wo131CopyGuardAsync(false, eid); } catch { }
-        await Wo132DiscardAsync(false, eid);
-        if (_w132Engaged.TryRemove(name, out var eg)) { try { await _combat.Wo132EngageAsync(false, eg.Eid, default); } catch { } }
-        Console.WriteLine($"MP-WO131 copy guard off {name}: the host's death is applied now, at the host's position");
-    }
-
     // -------------------------------------------------------------------- host
 
     /// <summary>1e: an NPC's hit on avatar <paramref name="ghostId"/> was measured and forwarded -- put its health back.</summary>

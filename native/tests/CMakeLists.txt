@@ -13,4 +13,6 @@ target_sources(KCDMP_NativeTests PRIVATE rp_combat_tests.cpp rp_body_action_test
 target_sources(KCDMP_NativeTests PRIVATE edge_console_tests.cpp visual_damage_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE t3_recovery_stats_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE h6_combat_action_tests.cpp)
+target_sources(KCDMP_NativeTests PRIVATE npc_death_release_tests.cpp)
+target_sources(KCDMP_NativeTests PRIVATE rp_timeline_outcome_integration.cpp)
 target_compile_definitions(KCDMP_NativeTests PRIVATE KCDMP_P4_TEST KCDMP_P5_TEST KCDMP_P6_TEST KCDMP_P6_CAPTURE_TEST)

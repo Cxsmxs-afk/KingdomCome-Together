@@ -58,6 +58,11 @@ public partial class ClientSession
     private (long Query, long Received, long Sent) _presentationProbe;
     private PresentationClockSample? _presentationClock;
     private volatile bool _linkPresentationTime, _linkPresentationCombat;
+    private volatile bool _linkPvpContact;
+    private static long s_nextPvpIncarnation;
+    private PvpContactWindow _pvpContacts;
+    internal bool LinkPvpContact => _linkPvpContact;
+    internal ulong PvpIncarnation { get; private set; }
 
     private readonly record struct QueuedWrite(byte[]? Packet, byte? GhostId, string? NpcKey = null, long Ts = 0);
 
@@ -100,13 +105,15 @@ public partial class ClientSession
         (ushort)((W213Switch.TwinOff("link_sched") ? 0 : Protocol.LinkCapLatestWins)
                | (W213Switch.TwinOff("link_sched") || W213Switch.TwinOff("state_unreliable") ? 0 : Protocol.LinkCapUnreliableState)
                | (W213Switch.TwinOff("npc_compact") ? 0 : Protocol.LinkCapCompactNpc)
-               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapWorldSync
+               | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat | Protocol.LinkCapWorldSync | Protocol.LinkCapPvpContact
                | (W213Switch.TwinOff("world_recovery") ? 0 : Protocol.LinkCapWorldRecovery));
 
     private void OnLinkHello(byte[] hello)
     {
         Protocol.TryParseLinkHello(hello, out byte version, out ushort caps, out _, out _);
         ushort both = (ushort)(caps & RelayLinkCaps);
+        // Once enabled the link keeps its contact identity until disconnect.
+        if (_linkPvpContact) both |= Protocol.LinkCapPvpContact;
         if ((both & Protocol.LinkCapWorldSync) == 0) both &= unchecked((ushort)~Protocol.LinkCapWorldRecovery);
         var path = _conn.Path;
         byte transport = _conn.Steam is not null ? Protocol.LinkTransportSteam : path is { Transport: "shaped" } ? Protocol.LinkTransportShaped : Protocol.LinkTransportTcp;
@@ -132,6 +139,11 @@ public partial class ClientSession
         _logger.Information("MP-LINK hello client={Id} version={Version} asked=0x{Asked:X4} both=0x{Both:X4} transport={Transport} rate={Rate}",
             Id, version, caps, both, Protocol.LinkTransportName(transport), rate);
         EnqueueRaw(Protocol.BuildLinkHelloDown(both, transport, rate));
+        if (!_linkPvpContact && (both & Protocol.LinkCapPvpContact) != 0)
+        {
+            _linkPvpContact = true;
+            _broadcastService.AnnouncePvpPeers(this);
+        }
     }
 
     internal bool TryPresentationClock(long now, out PresentationClockSample sample)
@@ -412,6 +424,7 @@ public partial class ClientSession
             // and expects 0xFF -- dropped the connection ("Expected Ack, got
             // packet type ..."). The write queue is FIFO, so first-queued is
             // first-sent. Id is already assigned (TryMarkReady above).
+            PvpIncarnation = (ulong)Interlocked.Increment(ref s_nextPvpIncarnation);
             EnqueueRaw(BuildPacket(Protocol.Ack, [Id]));
             Name = name;
 
@@ -881,10 +894,21 @@ public partial class ClientSession
                 // broadcast), never authority-gated -- any player can hit any
                 // player. Whether friendly fire is on is decided at both ends
                 // (the host's lever), not here.
-                if (type == Protocol.PlayerHitV8Up && payloadLen == PlayerHitV8.UpLen)
+                if (type == Protocol.PlayerHitV8Up)
                 {
-                    var body = new byte[PlayerHitV8.UpLen];
+                    var body = new byte[payloadLen];
                     await ReadExactAsync(body);
+                    bool identified = payloadLen == PlayerHitV8.IdentifiedUpLen;
+                    if (identified != LinkPvpContact)
+                    {
+                        _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-contact-capability");
+                        continue;
+                    }
+                    if (identified && !_pvpContacts.TryClaim(BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(PlayerHitV8.UpLen))))
+                    {
+                        _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-contact-stale-or-duplicate");
+                        continue;
+                    }
                     _broadcastService.RoutePlayerHitV8(this, body);
                     continue;
                 }
@@ -1417,12 +1441,31 @@ public partial class ClientSession
     /// upstream body verbatim (victim id included -- the receiver checks it is
     /// itself).
     /// </summary>
-    public void EnqueuePlayerHitV8(byte attackerId, byte[] upstreamBody)
+    public void EnqueuePlayerHitV8(ClientSession attacker, byte[] upstreamBody)
     {
-        var payload = new byte[PlayerHitV8.DownLen];
-        payload[0] = attackerId;
-        Buffer.BlockCopy(upstreamBody, 0, payload, 1, PlayerHitV8.UpLen);
+        bool identified = upstreamBody.Length == PlayerHitV8.IdentifiedUpLen;
+        // A mixed-capability pair cannot forward an identified contact or strip its ID.
+        if (identified != LinkPvpContact) return;
+        if (identified &&
+            BinaryPrimitives.ReadUInt64LittleEndian(upstreamBody.AsSpan(PlayerHitV8.UpLen + sizeof(ulong))) != PvpIncarnation)
+        {
+            _clientHandler.CountDrop(Protocol.PlayerHitV8Up, "pvp-recipient-retired");
+            return;
+        }
+        var payload = new byte[identified ? PlayerHitV8.IdentifiedDownLen : PlayerHitV8.DownLen];
+        payload[0] = attacker.Id;
+        upstreamBody.CopyTo(payload, 1);
+        if (identified)
+            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(PlayerHitV8.DownLen + sizeof(ulong)), attacker.PvpIncarnation);
         EnqueueRaw(BuildPacket(Protocol.PlayerHitV8Down, payload));
+    }
+
+    internal void EnqueuePvpPeer(ClientSession peer)
+    {
+        var payload = new byte[Protocol.PvpPeerLen];
+        payload[0] = peer.Id;
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(1), peer.PvpIncarnation);
+        EnqueueRaw(BuildPacket(Protocol.PvpPeerDown, payload));
     }
 
     /// <summary>Thread-safe: enqueue a PlayerDeathDown (0x24). Idempotent at the receiver.</summary>

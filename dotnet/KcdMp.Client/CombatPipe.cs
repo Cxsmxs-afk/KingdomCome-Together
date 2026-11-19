@@ -556,12 +556,27 @@ public sealed partial class CombatPipe : IAsyncDisposable
         return SendAsync(ApplyDamage, payload, ct);
     }
 
-    /// <summary>Kill the soul with this SharedSoulGuid. Idempotent in the DLL.</summary>
-    public Task<bool> ApplyDeathAsync(Guid soul, CancellationToken ct = default)
+    internal enum NpcDeathReceipt { Applied, Pending, Uncertain, Stale }
+
+    internal async Task<NpcDeathReceipt> ApplyOwnedNpcDeathAsync(Guid soul, uint eid, ulong lifecycle,
+        ulong attempt, Func<bool> current, CancellationToken ct)
     {
-        var payload = new byte[GuidLen];
+        if (!current()) return NpcDeathReceipt.Stale;
+        var payload = new byte[36];
         WriteSoulGuid(soul, payload);
-        return SendAsync(ApplyDeath, payload, ct);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(16), eid);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(20), lifecycle);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(28), attempt);
+        var (reply, _) = await SendAndAwaitAsync(ApplyDeath, payload, Result, ct,
+            beforeWrite: current, exactSequence: true);
+        if (!current()) return NpcDeathReceipt.Stale;
+        return reply switch
+        {
+            [1, _, 0] => NpcDeathReceipt.Applied,
+            [0, _, 0x70] => NpcDeathReceipt.Pending,
+            [0, _, 0x72] => NpcDeathReceipt.Stale,
+            _ => NpcDeathReceipt.Uncertain
+        };
     }
 
     /// <summary>
@@ -795,13 +810,40 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// damage with no attacker; the flags (unarmed) reach the death guard's
     /// knockdown classifier in the same call.
     /// </summary>
-    public Task<PipeResult> ApplyPvpHitAsync(float stamina, float health, byte flags, byte attackerGhost, CancellationToken ct = default)
+    public async Task<PipeResult> ApplyPvpHitAsync(float stamina, float health, byte flags, byte attackerGhost,
+        CancellationToken ct = default, Func<bool>? recipientCurrent = null, ulong sequence = 0, ulong incarnation = 0,
+        ulong ingressTick = 0)
     {
-        var p = new byte[10];
+        bool identified = sequence != 0;
+        if (identified != (incarnation != 0) || identified != (ingressTick != 0)) return PipeResult.Fail(PipeReason.BadSpec);
+        if (CaptureSource() is not { } source) return PipeResult.Fail(PipeReason.NotConnected);
+        var p = new byte[identified ? 34 : 10];
         BinaryPrimitives.WriteSingleLittleEndian(p.AsSpan(0), stamina);
         BinaryPrimitives.WriteSingleLittleEndian(p.AsSpan(4), health);
         p[8] = flags; p[9] = attackerGhost;
-        return SendForResultAsync(ApplyPvpHit, p, ct);
+        if (identified)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(10), sequence);
+            BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(18), incarnation);
+            BinaryPrimitives.WriteUInt64LittleEndian(p.AsSpan(26), ingressTick);
+        }
+        bool writeAllowed = false, recipientRetired = false;
+        bool AuthorizeWrite()
+        {
+            recipientRetired = recipientCurrent?.Invoke() == false;
+            writeAllowed = !recipientRetired;
+            return writeAllowed;
+        }
+        var (body, fail) = await SendAndAwaitAsync(ApplyPvpHit, p, Result, ct, AuthorizeWrite,
+            exactSequence: true, requiredPipe: source.Pipe);
+        if (recipientRetired) return PipeResult.Fail(PipeReason.PvpRecipientRetired);
+        if (body is null)
+        {
+            if (writeAllowed && fail is PipeReason.NotConnected or PipeReason.NoAnswer)
+                return PipeResult.Fail(PipeReason.PvpDispatchUnconfirmed);
+            return PipeResult.Fail(fail);
+        }
+        return new PipeResult(body[0] == 1, body.Length >= 3 ? (PipeReason)body[2] : PipeReason.Unknown);
     }
 
     /// <summary>WO-121: the movement/combat module's armed pieces and counters (text), or null.</summary>
@@ -1717,18 +1759,6 @@ public sealed partial class CombatPipe : IAsyncDisposable
         if (r is not { Ok: true, Payload.Length: >= 9 } x) return null;
         return (x.Payload[0], System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(x.Payload.AsSpan(1)),
                 System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(x.Payload.AsSpan(5)));
-    }
-
-    /// <summary>WO-172 op 15 (C1): this copy is dead -- the DLL skips it for every activity, tool, retarget and strike. The DLL's text answer.</summary>
-    public async Task<string?> Wo172DeadAsync(string npc, CancellationToken ct = default)
-    {
-        var name = System.Text.Encoding.ASCII.GetBytes(npc);
-        if (name.Length is 0 or > 63) return null;
-        var a = new byte[1 + name.Length];
-        a[0] = (byte)name.Length;
-        name.CopyTo(a, 1);
-        var r = await Wo163Async(15, a, ct);
-        return r is { } x ? (x.Ok ? "" : "refused ") + System.Text.Encoding.ASCII.GetString(x.Payload) : null;
     }
 
     /// <summary>WO-172 op 16: the native half's counters.</summary>

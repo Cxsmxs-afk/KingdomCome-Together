@@ -34,6 +34,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include "damage_invocation.h"
 
 namespace kcdmp::rttr {
 
@@ -439,6 +440,10 @@ void sample_health(void (*on_hit)(const unsigned char guid[16], void* soul, floa
 /// Tell the sampler that a health change was caused by an inbound packet, so it
 /// is not reported back out.
 void note_remote_damage(const unsigned char guid[16], float health_delta);
+// Same-Soul confirmed remote death. Credit its last observed health to the existing sampler.
+void note_remote_death(const unsigned char guid[16], void* soul);
+// Local combat sampler's bounded nearby set. The caller still verifies the live actor and GUID.
+void* tracked_soul_by_guid(const unsigned char guid[16]);
 
 // ---------------------------------------------------------------------------
 // Combat application (WO-4). These are what the network layer ultimately calls.
@@ -465,11 +470,6 @@ void* player_soul();
 /// Apply damage attributed to no one. Returns false if the soul is not loaded.
 bool apply_damage(const unsigned char guid[16], float stamina, float health,
                   bool suppress_hit_reaction);
-
-/// Kill a soul, idempotently: already dead is success, not an error. Death is
-/// its own operation rather than a consequence of health hitting zero, so two
-/// clients cannot disagree about who is alive.
-bool apply_death(const unsigned char guid[16]);
 
 // void wh::rpgmodule::C_FactionBase::SetParent(std::shared_ptr<C_Faction>)
 // Exported from RPGModule.dll. Virtual (UEAA), so calling the exported address
@@ -560,6 +560,10 @@ void* combat_soul_of(void* soul);
 bool apply_damage_soul(void* soul, float stamina, float health, void* attacker);
 
 // ---- WO-151 -----------------------------------------------------------------
+
+/// A pre-invoke refusal is safe to fall back from. A fault or invalid variant during
+/// the reflection call leaves the engine effect unconfirmed. Main thread.
+DamageInvocation invoke_damage_soul(void* soul, float stamina, float health, void* attacker, int suppress);
 
 /// The same with TakeDamage's fourth argument, SuppressHitReaction, given:
 /// suppress < 0 is apply_damage_soul (two or three arguments), 0 or 1 the

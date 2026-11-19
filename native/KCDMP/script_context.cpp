@@ -686,6 +686,11 @@ void disarm(const char* why) {
 
 } // namespace
 
+uint64_t soul_wuid(void* soul) {
+    uint64_t wuid = 0;
+    return soul && read_u64(soul, kOffSoulWuid, &wuid) ? wuid : 0;
+}
+
 void probe_contexts() {
     Config cfg{};
     if (!read_config(&cfg)) {
