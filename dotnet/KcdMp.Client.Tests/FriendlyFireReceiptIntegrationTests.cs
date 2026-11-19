@@ -17,6 +17,93 @@ public sealed class FriendlyFireReceiptIntegrationTests
     private const BindingFlags Instance = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
 
     [Fact]
+    public async Task Pvp_notice_already_read_by_pipe_does_not_follow_the_same_entity_into_a_new_life()
+    {
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var ct = stop.Token;
+        string name = "ff-" + Guid.NewGuid().ToString("N")[..16];
+        using var server = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        await using var pipe = new CombatPipe(name);
+        var listen = server.WaitForConnectionAsync(ct);
+        Assert.True(await pipe.EnsureConnectedAsync(ct));
+        await listen;
+
+        using var wire = new HeldPeerStream();
+        var bridge = BridgeOn(pipe, wire);
+        typeof(GameBridge).GetField("_t3StatsNextMs", Instance)!.SetValue(bridge, long.MaxValue);
+        typeof(GameBridge).GetMethod("Wo121OnConnect", Instance)!.Invoke(bridge, [wire, ct]);
+        const byte victim = 2;
+        const uint entity = 222;
+        const ulong incarnation = 43, formerLife = 1001, currentLife = 1002;
+        var entities = (System.Collections.Concurrent.ConcurrentDictionary<string, uint>)
+            typeof(GameBridge).GetField("_ghostEntityIds", Instance)!.GetValue(bridge)!;
+        var versions = (System.Collections.Concurrent.ConcurrentDictionary<byte, string>)
+            typeof(GameBridge).GetField("_ghostReleaseVersions", Instance)!.GetValue(bridge)!;
+        entities[victim.ToString()] = entity;
+
+        var workerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var workerRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var workerDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pipe.OnLocalAction = _ =>
+        {
+            if (workerEntered.TrySetResult()) return workerRelease.Task.WaitAsync(ct);
+            workerDrained.TrySetResult();
+            return Task.CompletedTask;
+        };
+        var receive = (Task)typeof(GameBridge).GetMethod("ReceiveLoopAsync", Instance)!.Invoke(bridge, [wire, ct])!;
+
+        async Task UpdateRosterAsync(ulong revision, ulong life, byte marker)
+        {
+            byte[] roster = new byte[Protocol.PvpPeerLifeLen];
+            roster[0] = victim;
+            BinaryPrimitives.WriteUInt64LittleEndian(roster.AsSpan(1), incarnation);
+            new PvpLifeState(revision, life).Write(roster.AsSpan(Protocol.PvpPeerLen));
+            wire.Feed(Protocol.PvpPeerDown, roster);
+            wire.Feed(Protocol.ReleaseVersion, [victim, marker]);
+            while (!versions.TryGetValue(victim, out var version) || version != ((char)marker).ToString())
+                await Task.Delay(5, ct);
+        }
+
+        ValueTask SendHitAsync(float damage)
+        {
+            byte[] hit = [0x97, 14, 0, .. new byte[14]];
+            BinaryPrimitives.WriteUInt32LittleEndian(hit.AsSpan(3), entity);
+            BinaryPrimitives.WriteSingleLittleEndian(hit.AsSpan(11), damage);
+            return server.WriteAsync(hit, ct);
+        }
+
+        byte[] barrier = [0x96, 27, 0, .. new byte[27]];
+        try
+        {
+            await UpdateRosterAsync(1, formerLife, (byte)'a');
+            await server.WriteAsync(barrier, ct);
+            await workerEntered.Task.WaitAsync(ct);
+            await SendHitAsync(5);
+            // The following frame updates the physical reader immediately, while
+            // the FIFO callback worker is still blocked on the earlier action.
+            await NativeLifeAsync(pipe, server, FixtureLife + 1, ct);
+            await UpdateRosterAsync(2, currentLife, (byte)'b');
+            await SendHitAsync(7);
+            await server.WriteAsync(barrier, ct);
+            workerRelease.TrySetResult();
+            await workerDrained.Task.WaitAsync(ct);
+
+            var sends = wire.PendingWrites.Where(frame => frame[0] == Protocol.PlayerHitV8Up).ToArray();
+            var evidence = sends.Select(frame => $"hp={BinaryPrimitives.ReadSingleLittleEndian(frame.AsSpan(8))} " +
+                $"life={BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.IdentifiedUpLen))}");
+            Assert.True(sends.Length == 1, $"Expected only the fresh hit. Relay received [{string.Join(", ", evidence)}].");
+            byte[] frame = Assert.Single(sends);
+            Assert.Equal(new PlayerHitV8(victim, 0, 7, 0, 0).BuildUp(1, incarnation, currentLife), frame);
+        }
+        finally
+        {
+            workerRelease.TrySetResult();
+            stop.Cancel();
+            await receive;
+        }
+    }
+
+    [Fact]
     public async Task Contact_held_outside_reader_before_respawn_never_reaches_native_after_respawn_on_same_stream()
     {
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -302,6 +389,7 @@ public sealed class FriendlyFireReceiptIntegrationTests
     private sealed class HeldPeerStream : Stream
     {
         private readonly Channel<byte[]> _frames = Channel.CreateUnbounded<byte[]>();
+        public readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> PendingWrites = new();
         private byte[] _frame = [];
         private int _at;
         private long _read;
@@ -331,13 +419,19 @@ public sealed class FriendlyFireReceiptIntegrationTests
 
         public override bool CanRead => true;
         public override bool CanSeek => false;
-        public override bool CanWrite => false;
+        public override bool CanWrite => true;
         public override long Length => throw new NotSupportedException();
         public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
         public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            PendingWrites.Enqueue(buffer.ToArray());
+            return ValueTask.CompletedTask;
+        }
         public override void Flush() => throw new NotSupportedException();
     }
 }

@@ -58,7 +58,9 @@ public partial class GameBridge
         scope.Life == Interlocked.Read(ref _t3InputLifeRevision) &&
         scope.NativeLife == _combat.PvpNativeLife;
 
-    private sealed class PvpContactSession(Stream relay)
+    internal readonly record struct PvpHitTarget(PvpContactSession Session, byte Ghost, ulong Incarnation, ulong Life);
+
+    internal sealed class PvpContactSession(Stream relay)
     {
         public Stream Relay { get; } = relay;
         private long _sent;
@@ -153,6 +155,7 @@ public partial class GameBridge
         _st2LastSent = null;
         _st2SawAim = false;
         _combat.OnLocalAction = OnLocalActionAsync;
+        _combat.CapturePvpHitTarget = CapturePvpHitTarget;
         _combat.OnPvpHit = OnPvpHitAsync;
         _combat.OnPvpLifeChanged = AdvertisePvpLifeAsync;
         _ = PushWo121ConfigAsync(ct);
@@ -176,6 +179,7 @@ public partial class GameBridge
         _wo121ContactSession = null;
         _wo121Stream = null;
         _combat.OnLocalAction = null;
+        _combat.CapturePvpHitTarget = null;
         _combat.OnPvpHit = null;
         _combat.OnPvpLifeChanged = null;
         _ffFromHost = false;
@@ -410,40 +414,50 @@ public partial class GameBridge
         Console.WriteLine(FormattableString.Invariant($"MP-ACTION section=outbound kind={outKind} gen={_actionOut.Gen} {what} source_ms={ms}"));
     }
 
-    /// <summary>The local player hit a peer's avatar (0x97). The avatar kept nothing; the damage goes to its owner.</summary>
-    private async Task OnPvpHitAsync(uint victimEid, float stamina, float health, byte flags, byte material)
+    private PvpHitTarget? CapturePvpHitTarget(uint victimEid)
     {
-        byte? victim = null;
-        foreach (var kv in _ghostEntityIds)
-            if (kv.Value == victimEid && byte.TryParse(kv.Key, out byte gid)) { victim = gid; break; }
+        if (_wo121ContactSession is not { } session) return null;
+        foreach (var (key, eid) in _ghostEntityIds)
+        {
+            if (eid != victimEid || !byte.TryParse(key, out byte ghost)) continue;
+            var (incarnation, life) = session.FindTarget(ghost, victimEid);
+            return new(session, ghost, incarnation, life);
+        }
+        return null;
+    }
+
+    /// <summary>The local player hit a peer's avatar (0x97). The avatar kept nothing; the damage goes to its owner.</summary>
+    private async Task OnPvpHitAsync(PvpHitTarget? target, uint victimEid, float stamina, float health, byte flags, byte material)
+    {
         string line = FormattableString.Invariant(
-            $"MP-FF dir=out victim_eid=0x{victimEid:X} ghost={(victim is byte v0 ? v0.ToString() : "?")} hp={health:F2} st={stamina:F2} unarmed={((flags & PlayerHitV8.FlagUnarmed) != 0 ? 1 : 0)} missile={((flags & PlayerHitV8.FlagMissile) != 0 ? 1 : 0)} session={On(_ffSession)}");
-        if (!_ffSession || victim is not byte vid || _wo121Stream is not Stream s || (health <= 0 && stamina <= 0))
+            $"MP-FF dir=out victim_eid=0x{victimEid:X} ghost={target?.Ghost.ToString() ?? "?"} hp={health:F2} st={stamina:F2} unarmed={((flags & PlayerHitV8.FlagUnarmed) != 0 ? 1 : 0)} missile={((flags & PlayerHitV8.FlagMissile) != 0 ? 1 : 0)} session={On(_ffSession)}");
+        if (!_ffSession || target is not { } captured || _wo121Stream is not Stream s || (health <= 0 && stamina <= 0))
         {
             _w121FfOutDropped++;
-            Console.WriteLine(line + $" result=dropped reason={(!_ffSession ? "friendly-fire-off" : victim is null ? "unknown-avatar" : _wo121Stream is null ? "no-relay" : "no-damage")}");
+            Console.WriteLine(line + $" result=dropped reason={(!_ffSession ? "friendly-fire-off" : _wo121Stream is null ? "no-relay" : target is null ? "unknown-avatar" : "no-damage")}");
             return;
         }
-        if (_wo121ContactSession is not { } session || !ReferenceEquals(s, session.Relay) ||
+        var (session, vid, incarnation, life) = captured;
+        if (!ReferenceEquals(session, _wo121ContactSession) || !ReferenceEquals(s, session.Relay) ||
             (_w213Caps & Protocol.LinkCapPvpLife) == 0)
         {
             _w121FfOutDropped++;
             Console.WriteLine(line + " result=dropped reason=contact-capability");
             return;
         }
-        var recipient = session.FindTarget(vid, victimEid);
-        if (recipient.Proof == 0 || !_ghostEntityIds.TryGetValue(vid.ToString(), out uint stillBound) || stillBound != victimEid)
+        if (life == 0 || !_ghostEntityIds.TryGetValue(vid.ToString(), out uint stillBound) || stillBound != victimEid ||
+            session.FindTarget(vid, victimEid) != (incarnation, life))
         {
             _w121FfOutDropped++;
-            Console.WriteLine(line + " result=dropped reason=recipient-life-unavailable");
+            Console.WriteLine(line + " result=dropped reason=recipient-life-unavailable-or-changed");
             return;
         }
         ulong contact = session.Next();
         await WritePacketAsync(s, new PlayerHitV8(vid, stamina, health, flags, material)
-            .BuildUp(contact, recipient.Incarnation, recipient.Proof), _wo121Ct);
+            .BuildUp(contact, incarnation, life), _wo121Ct);
         _w121FfOut++;
         Wo155NoteFfSent(vid);   // WO-155: the knockdown this hit causes on his screen is the one his figure falls for here
-        Console.WriteLine(line + $" result=sent contact_seq={contact} recipient={recipient.Incarnation} recipient_life={recipient.Proof}");
+        Console.WriteLine(line + $" result=sent contact_seq={contact} recipient={incarnation} recipient_life={life}");
     }
 
     // =====================================================================

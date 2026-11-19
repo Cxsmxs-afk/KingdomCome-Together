@@ -155,8 +155,9 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// </summary>
     public Func<LocalActionFrame, Task>? OnLocalAction { get; set; }
 
-    /// <summary>WO-121: the local player hit a peer's avatar: victim eid, stamina, health (what the hit took), flags, material.</summary>
-    public Func<uint, float, float, byte, byte, Task>? OnPvpHit { get; set; }
+    // Resolve the victim's life before a 0x97 frame leaves the physical reader.
+    internal Func<uint, GameBridge.PvpHitTarget?>? CapturePvpHitTarget { get; set; }
+    internal Func<GameBridge.PvpHitTarget?, uint, float, float, byte, byte, Task>? OnPvpHit { get; set; }
     internal Func<Task>? OnPvpLifeChanged { get; set; }
     private ulong _pvpNativeLife;
     internal ulong PvpNativeLife => Volatile.Read(ref _pvpNativeLife);
@@ -2304,9 +2305,11 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     // Replies stay on the physical reader; callbacks can themselves need the
     // pipe or the relay. One FIFO worker retains unsolicited event order.
+    private readonly record struct PipeNotice(byte Type, byte[] Body, GameBridge.PvpHitTarget? PvpTarget);
+
     private async Task ReadLoopAsync(NamedPipeClientStream myPipe, ChannelWriter<(byte Type, byte[] Body)> replies)
     {
-        var notices = Channel.CreateUnbounded<(byte Type, byte[] Body)>(new UnboundedChannelOptions
+        var notices = Channel.CreateUnbounded<PipeNotice>(new UnboundedChannelOptions
         {
             SingleReader = true, SingleWriter = true
         });
@@ -2331,7 +2334,10 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 if (type == BatchReply) OnBatchReply(body);
                 else if (IsPipeNotice(type))
                 {
-                    if (!notices.Writer.TryWrite((type, body)))
+                    var pvpTarget = type == PvpHitOut && body.Length == 14
+                        ? CapturePvpHitTarget?.Invoke(BinaryPrimitives.ReadUInt32LittleEndian(body))
+                        : null;
+                    if (!notices.Writer.TryWrite(new(type, body, pvpTarget)))
                         throw new InvalidOperationException("The connection's notice queue has already closed.");
                 }
                 else if (!replies.TryWrite((type, body)))
@@ -2355,17 +2361,17 @@ public sealed partial class CombatPipe : IAsyncDisposable
         or LocalGrave or LocalAction or PvpHitOut or PvpLifeOut or NpcAvatarHit or NpcCombatOut or QuestChangeOut or NpcStreamOut or WorldOut
         or MenuOut or ActivityOut or ExtraOut or SleepOut or CrimeOut or DefenceOut or DiscardedHit or NpcDropped or NpcTraceDone;
 
-    private async Task ReadNoticesAsync(NamedPipeClientStream pipe, ChannelReader<(byte Type, byte[] Body)> notices)
+    private async Task ReadNoticesAsync(NamedPipeClientStream pipe, ChannelReader<PipeNotice> notices)
     {
-        await foreach (var (type, body) in notices.ReadAllAsync())
+        await foreach (var (type, body, pvpTarget) in notices.ReadAllAsync())
         {
             if (!ReferenceEquals(_pipe, pipe)) return;
-            try { await DeliverNoticeAsync(type, body); }
+            try { await DeliverNoticeAsync(type, body, pvpTarget); }
             catch (Exception ex) { Console.WriteLine($"[combat] notice 0x{type:X2} failed: {ex.GetType().Name}: {ex.Message}"); }
         }
     }
 
-    private async Task DeliverNoticeAsync(byte type, byte[] body)
+    private async Task DeliverNoticeAsync(byte type, byte[] body, GameBridge.PvpHitTarget? pvpTarget)
     {
         if (type == LocalHit && body.Length >= 24)
         {
@@ -2452,7 +2458,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             {
                 try
                 {
-                    await h(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)),
+                    await h(pvpTarget, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)),
                             BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
                             BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12], body[13]);
                 }
