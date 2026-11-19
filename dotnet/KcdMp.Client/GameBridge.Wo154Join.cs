@@ -131,44 +131,41 @@ public partial class GameBridge
     }
 
     /// <summary>
-    /// A placed world file the join is done with: deleted now when no load can be reading it, else when the game answers
-    /// from a menu or a world (checked every 3 s, 15 min at most; the next join's sweep removes one left behind).
+    /// A placed world file the join is done with. Once a command could cross the console boundary, an actual
+    /// loaded or failed engine event of this attempt is needed before removing the file.
     /// </summary>
     private bool Wo154RemovePlacedLater(JoinerJoin j, string path)
     {
-        if (j.PlacedVerified && !_retainedJoinWorlds.MayRemove(path, j)) return true;
+        if (!_retainedJoinWorlds.MayRemove(path, j)) return true;
         bool commanded = j.LoadCmdUtc != default;
         bool past = (j.GameplayStarted?.Task.IsCompleted ?? false) || (j.LoadFailed?.Task.IsCompleted ?? false);
-        if ((!j.PlacedVerified && !_w154JoinPatient) || Wo154Rules.PlacedFileMayGo(commanded, past, false, "")) return false;
+        if (!j.LoadDispatchInFlight && Wo154Rules.PlacedFileMayGo(commanded, past, false, "")) return false;
         Interlocked.Increment(ref _w154JoinDeferredRemovals);
         int pl = j.Playline; string name = j.Name; uint id = j.JoinId;
         Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: {SaveDisplay(path)} is kept until no load can be reading it");
         _ = Task.Run(async () =>
         {
             var t0 = DateTime.UtcNow;
-            string told = "";
             while ((DateTime.UtcNow - t0).TotalSeconds < Wo154Rules.JoinLoadWatch.MaxWaitS)
             {
-                string w = await Wo154WhereNowAsync();
-                if (Wo154Rules.PlacedFileMayGo(true, false, false, w))
+                if (!j.LoadDispatchInFlight &&
+                    ((j.GameplayStarted?.Task.IsCompletedSuccessfully ?? false) || (j.LoadFailed?.Task.IsCompletedSuccessfully ?? false)))
                 {
                     bool gone = false;
                     try
                     {
-                        if (j.PlacedVerified) gone = _retainedJoinWorlds.TryDelete(path, j);
-                        else { File.Delete(path); gone = !File.Exists(path); }
+                        gone = TryDeletePlacedJoinWorld(j, path);
                     }
                     catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: could not delete {SaveDisplay(path)}: {ex.Message}"); }
                     if (!gone) return;
                     if (j.PlacedPath == path) j.PlacedPath = null;
                     var after = await _combat.SaveListAsync(3, pl, name);
-                    Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: removed {SaveDisplay(path)} now that the game answers from {(w == "menu" ? "the main menu" : "a world")}; cached listed={(after is null ? "?" : On(after.Listed))} (not refreshed)");
+                    Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: removed {SaveDisplay(path)} after the engine reported completion; cached listed={(after is null ? "?" : On(after.Listed))} (not refreshed)");
                     return;
                 }
-                if (w != told) { told = w; Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: {SaveDisplay(path)} still kept -- the game is {w}"); }
-                await Task.Delay(3000);
+                await Task.Delay(1000);
             }
-            Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: {SaveDisplay(path)} left in place -- the game never answered from a menu or a world (the next join removes it)");
+            Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8}: {SaveDisplay(path)} kept -- no engine confirmation that the load has finished");
         });
         return true;
     }
