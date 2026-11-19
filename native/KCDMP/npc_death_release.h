@@ -22,10 +22,14 @@ struct Scope {
     }
 };
 
-enum class Receipt : uint8_t { Applied = 0, Pending = 0x70, Uncertain = 0x71, Stale = 0x72 };
+enum class Intent : uint8_t { Advance, ObserveOnly, AbortBeforeApply };
+enum class Receipt : uint8_t { Applied = 0, Pending = 0x70, Uncertain = 0x71, Stale = 0x72, Aborted = 0x73 };
 enum class Retirement { Ready, Pending, Uncertain, Stale };
 enum class Life { Alive, Dead, Unreadable };
-enum class Stage { ReleasePending, Ready, DeathPending, Applied, Uncertain, Stale };
+enum class Stage {
+    ReleasePending, ReleaseUncertain, Ready, DeathPending, ApplyUncertain,
+    Applied, Uncertain, Stale, Aborted, AbortedUnadmitted
+};
 
 inline bool nonlethal_health(float requested, float observed, float& allowed) {
     if (!std::isfinite(requested) || !std::isfinite(observed) || requested < 0.0f || observed < 0.0f) return false;
@@ -39,7 +43,7 @@ inline bool nonlethal_health(float requested, float observed, float& allowed) {
 template <class Body>
 class Attempts {
     static constexpr std::size_t kWindow = 512;
-    enum class Phase { Release, Applying, Observe, Done };
+    enum class Phase { Release, Busy, Observe, Done };
 
     struct Entry {
         Scope scope{};
@@ -48,6 +52,7 @@ class Attempts {
         Phase phase = Phase::Release;
         Receipt receipt = Receipt::Stale;
         bool reportedPending = false;
+        bool advanceBlocked = false;
     };
 
     std::array<Entry, kWindow> entries_{};
@@ -56,17 +61,27 @@ class Attempts {
 
 public:
     template <class Backend>
-    Receipt step(const Request& request, const Scope& scope, Backend& backend) {
-        if (!request.attempt || request.lifecycle != scope.lifecycle || !backend.scope_current()) return Receipt::Stale;
+    Receipt step(const Request& request, const Scope& scope, Backend& backend, Intent intent = Intent::Advance) {
+        if (!request.attempt || request.soul == Guid{} || request.lifecycle != scope.lifecycle || !backend.scope_current())
+            return Receipt::Stale;
         if (!(scope == scope_)) { scope_ = scope; highest_ = 0; }
         Entry& entry = entries_[request.attempt % kWindow];
         const bool sameScope = entry.scope == scope;
         if (!sameScope || entry.request.attempt != request.attempt) {
             if (highest_ >= kWindow && request.attempt <= highest_ - kWindow) return Receipt::Stale;
-            if (sameScope && (entry.phase == Phase::Applying || request.attempt < entry.request.attempt))
+            if (intent == Intent::ObserveOnly || entry.phase == Phase::Busy ||
+                (sameScope && request.attempt < entry.request.attempt))
                 return Receipt::Uncertain;
             highest_ = request.attempt > highest_ ? request.attempt : highest_;
-            entry = {scope, request, backend.resolve(request)};
+            if (intent == Intent::AbortBeforeApply) {
+                // A request that never started owns no body fence. Seal only its scoped ID against late Advance.
+                entry = {scope, request, {}, Phase::Done, Receipt::Aborted};
+                backend.report(entry.body, request, Stage::AbortedUnadmitted);
+                return Receipt::Aborted;
+            }
+            entry = {scope, request, {}, Phase::Busy};
+            entry.body = backend.resolve(request);
+            entry.phase = Phase::Release;
         } else if (entry.request.soul != request.soul || entry.request.eid != request.eid) return Receipt::Stale;
 
         auto report = [&](Stage stage) { backend.report(entry.body, request, stage); };
@@ -80,51 +95,70 @@ public:
             if (entry.receipt == Receipt::Applied && !backend.current(entry.body, request, false)) return Receipt::Stale;
             return entry.receipt;
         }
-        if (entry.phase == Phase::Applying) return Receipt::Uncertain;
-        const bool beforeApply = entry.phase == Phase::Release;
-        if (!backend.current(entry.body, request, beforeApply)) {
-            return beforeApply ? finish(Receipt::Stale, Stage::Stale) : finish(Receipt::Uncertain, Stage::Uncertain);
-        }
+        const auto phase = entry.phase;
+        if (phase == Phase::Busy) return Receipt::Uncertain;
+        const bool beforeApply = phase == Phase::Release;
+        if (beforeApply && (intent == Intent::ObserveOnly || (intent == Intent::Advance && entry.advanceBlocked)))
+            return Receipt::Uncertain;
+
+        // Reentry during an engine read, Stop or preparation observes a busy receipt and cannot change the attempt.
+        entry.phase = Phase::Busy;
+        if (beforeApply && !backend.current(entry.body, request, true)) return finish(Receipt::Stale, Stage::Stale);
         auto confirm = [&] {
-            if (!backend.current(entry.body, request, false)) return finish(Receipt::Uncertain, Stage::Uncertain);
             entry.phase = Phase::Done; // a corpse readback/notification must not admit a second mutation
             entry.receipt = Receipt::Applied;
             backend.confirm(entry.body, request);
             report(Stage::Applied);
             return entry.receipt;
         };
-        if (entry.phase == Phase::Observe) {
-            if (backend.life(entry.body) == Life::Dead) return confirm();
-            return Receipt::Pending;
+        auto observe = [&](Receipt continuation, bool first) {
+            if (!backend.current(entry.body, request, false)) continuation = Receipt::Uncertain;
+            else if (backend.life(entry.body) == Life::Dead) {
+                if (backend.current(entry.body, request, false)) return confirm();
+                continuation = Receipt::Uncertain;
+            }
+            const bool reportChange = first || entry.receipt != continuation;
+            entry.receipt = continuation;
+            entry.phase = Phase::Observe;
+            if (reportChange) report(continuation == Receipt::Pending ? Stage::DeathPending : Stage::ApplyUncertain);
+            return intent == Intent::AbortBeforeApply ? Receipt::Uncertain : continuation;
+        };
+        if (phase == Phase::Observe) return observe(entry.receipt, false);
+
+        auto unconfirmed_before_prepare = [&] {
+            entry.phase = Phase::Release;
+            if (!entry.advanceBlocked) report(Stage::ReleaseUncertain);
+            entry.advanceBlocked = true;
+            return Receipt::Uncertain;
+        };
+        if (intent == Intent::AbortBeforeApply) {
+            if (backend.life(entry.body) != Life::Alive || !backend.current(entry.body, request, true) ||
+                !backend.abort(entry.body, request.attempt)) return unconfirmed_before_prepare();
+            return finish(Receipt::Aborted, Stage::Aborted);
         }
 
-        // Record the in-progress state before calling Stop or any engine code that can reenter.
-        entry.phase = Phase::Applying;
         switch (backend.retire(entry.body, request.attempt)) {
             case Retirement::Pending:
                 entry.phase = Phase::Release;
                 if (!entry.reportedPending) { entry.reportedPending = true; report(Stage::ReleasePending); }
                 return Receipt::Pending;
-            case Retirement::Uncertain: return finish(Receipt::Uncertain, Stage::Uncertain);
+            case Retirement::Uncertain: return unconfirmed_before_prepare();
             case Retirement::Stale: return finish(Receipt::Stale, Stage::Stale);
             case Retirement::Ready: break;
         }
-        if (!backend.current(entry.body, request, true) || !backend.ready(entry.body, request.attempt))
+        if (!backend.current(entry.body, request, true))
             return finish(Receipt::Stale, Stage::Stale);
+        if (!backend.ready(entry.body, request.attempt)) return unconfirmed_before_prepare();
         report(Stage::Ready);
         const auto before = backend.life(entry.body);
-        if (before == Life::Dead) return confirm();
-        if (before != Life::Alive) return finish(Receipt::Uncertain, Stage::Uncertain);
+        if (before == Life::Dead)
+            return backend.current(entry.body, request, false) ? confirm() : finish(Receipt::Uncertain, Stage::Uncertain);
+        if (before != Life::Alive) return unconfirmed_before_prepare();
         if (!backend.prepare(entry.body, request, request.attempt)) return finish(Receipt::Uncertain, Stage::Uncertain);
         if (!backend.current(entry.body, request, true) || !backend.ready(entry.body, request.attempt))
             return finish(Receipt::Stale, Stage::Stale);
         const bool admitted = backend.apply(entry.body, request);
-        if (!backend.current(entry.body, request, false)) return finish(Receipt::Uncertain, Stage::Uncertain);
-        if (backend.life(entry.body) == Life::Dead) return confirm();
-        if (!admitted) return finish(Receipt::Uncertain, Stage::Uncertain);
-        entry.phase = Phase::Observe;
-        report(Stage::DeathPending);
-        return Receipt::Pending;
+        return observe(admitted ? Receipt::Pending : Receipt::Uncertain, true);
     }
 };
 

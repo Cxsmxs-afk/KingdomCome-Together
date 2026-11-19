@@ -556,13 +556,15 @@ public sealed partial class CombatPipe : IAsyncDisposable
         return SendAsync(ApplyDamage, payload, ct);
     }
 
-    internal enum NpcDeathReceipt { Applied, Pending, Uncertain, Stale }
+    internal enum NpcDeathReceipt { Applied, Pending, Uncertain, Stale, Aborted }
+    internal enum NpcDeathIntent : byte { Advance, ObserveOnly, AbortBeforeApply }
 
     internal async Task<NpcDeathReceipt> ApplyOwnedNpcDeathAsync(Guid soul, uint eid, ulong lifecycle,
-        ulong attempt, Func<bool> current, CancellationToken ct)
+        ulong attempt, NpcDeathIntent intent, Func<bool> current, CancellationToken ct)
     {
         if (!current()) return NpcDeathReceipt.Stale;
-        var payload = new byte[36];
+        // The original layout advances the attempt. Restricted follow-ups name the same attempt and append the intent.
+        var payload = new byte[intent == NpcDeathIntent.Advance ? 36 : 37];
         WriteSoulGuid(soul, payload);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(16), eid);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(20), lifecycle);
@@ -571,6 +573,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             beforeWrite: current, exactSequence: true);
         if (!current()) return NpcDeathReceipt.Stale;
         return reply switch
+        if (intent != NpcDeathIntent.Advance) payload[36] = (byte)intent;
         {
             [1, _, 0] => NpcDeathReceipt.Applied,
             [0, _, 0x70] => NpcDeathReceipt.Pending,
@@ -579,6 +582,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         };
     }
 
+            [0, _, 0x73] when intent != NpcDeathIntent.Advance => NpcDeathReceipt.Aborted,
     /// <summary>
     /// Attach or detach a locally-spawned ghost's faction node to/from the
     /// mod's one v1 hostile faction (WO-17 reactive aggro). The DLL's own

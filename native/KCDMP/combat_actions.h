@@ -94,6 +94,8 @@ BodyProof observe_body(uint32_t eid);
 // A nonzero attempt fences this physical body against new queues. Pending can only be re-observed with the same body/attempt.
 ReleaseReceipt retire_for_body(const BodyProof& body, const char* why, uint64_t attempt = 0);
 bool release_ready(const BodyProof& body, uint64_t attempt);
+// A confirmed pre-mutation abort relinquishes only its own queue fence. Action retirement continues independently.
+bool abort_release(const BodyProof& body, uint64_t attempt);
 // Exact actions confirmed finished, or -1 for a pending stop, unknown identity or incomplete tracking.
 int end_for_body(const BodyProof& body, const char* why);
 // Legacy ABI. An EID-only request has no body proof and cannot end a tracked action.

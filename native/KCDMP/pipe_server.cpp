@@ -1463,6 +1463,7 @@ struct DeathBackend {
     }
 
     bool ready(const DeathBody& body, uint64_t attempt) const { return combatactions::release_ready(body.actions, attempt); }
+    bool abort(const DeathBody& body, uint64_t attempt) const { return combatactions::abort_release(body.actions, attempt); }
 
     npcdeath::Life life(const DeathBody& body) const {
         bool dead = false;
@@ -1486,7 +1487,15 @@ struct DeathBackend {
     bool apply(const DeathBody& body, const npcdeath::Request& request) const {
         report_tag(body, request, "death-dispatched");
         // The confirmed Soul pointer is used once. An unreadable result never triggers a second invoke or a GUID re-lookup write.
-        return rttr::apply_damage_soul_ex(body.soul, 0.0f, 100000.0f, nullptr, 1);
+        KCDMP_FAULT_CALL(site, "pipe::npc_death/TakeDamage");
+        try {
+            return fault::guarded_or(site, false, [&] {
+                return rttr::apply_damage_soul_ex(body.soul, 0.0f, 100000.0f, nullptr, 1);
+            });
+        } catch (...) {
+            report_tag(body, request, "apply-exception");
+            return false;
+        }
     }
 
     void confirm(const DeathBody& body, const npcdeath::Request& request) const {
@@ -1494,22 +1503,26 @@ struct DeathBackend {
         wo216::p5_copy_dead(body.actions.eid);
     }
 
-    void report_tag(const DeathBody& body, const npcdeath::Request& request, const char* stage) const {
+    void report_tag(const DeathBody& body, const npcdeath::Request& request, const char* stage, const char* reason = nullptr) const {
         logf("MP-LANE2-H6 attempt=%llu eid=0x%X path=%s stage=%s lifecycle=%llu connection=%llu%s",
             static_cast<unsigned long long>(request.attempt), body.actions.eid ? body.actions.eid : request.eid,
             request.eid ? "named" : "guid", stage, static_cast<unsigned long long>(scope.lifecycle),
-            static_cast<unsigned long long>(scope.connection), body.soul ? "" :
+            static_cast<unsigned long long>(scope.connection), reason ? reason : body.soul ? "" :
                 (request.eid ? " reason=named-binding-unproven" : " reason=guid-tracked-binding-unproven"));
     }
 
     void report(const DeathBody& body, const npcdeath::Request& request, npcdeath::Stage stage) const {
         switch (stage) {
             case npcdeath::Stage::ReleasePending: return report_tag(body, request, "release-pending");
+            case npcdeath::Stage::ReleaseUncertain: return report_tag(body, request, "release-uncertain");
             case npcdeath::Stage::Ready: return report_tag(body, request, "ready");
             case npcdeath::Stage::DeathPending: return report_tag(body, request, "death-pending");
             case npcdeath::Stage::Applied: return report_tag(body, request, "applied");
             case npcdeath::Stage::Uncertain: return report_tag(body, request, "uncertain");
             case npcdeath::Stage::Stale: return report_tag(body, request, "stale");
+            case npcdeath::Stage::Aborted: return report_tag(body, request, "aborted-before-apply");
+            case npcdeath::Stage::AbortedUnadmitted: return report_tag(body, request, "aborted-unadmitted", " reason=never-admitted");
+            case npcdeath::Stage::ApplyUncertain: return report_tag(body, request, "apply-uncertain");
         }
     }
 };
@@ -1611,8 +1624,9 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
             }
 
             case kApplyDeath: {
-                if (len != kApplyDeathLen) {
-                    logf("PIPE: ApplyDeath wrong length %u", len);
+                if ((len != kApplyDeathLen && len != kApplyDeathLen + 1) ||
+                    (len == kApplyDeathLen + 1 && body[kApplyDeathLen] > static_cast<uint8_t>(npcdeath::Intent::AbortBeforeApply))) {
+                    logf("PIPE: ApplyDeath refused an invalid request (length %u)", len);
                     send_result(h, false, seq, static_cast<uint8_t>(npcdeath::Receipt::Stale));
                     break;
                 }
@@ -1621,12 +1635,14 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 std::memcpy(&request.eid, body + 16, sizeof request.eid);
                 std::memcpy(&request.lifecycle, body + 20, sizeof request.lifecycle);
                 std::memcpy(&request.attempt, body + 28, sizeof request.attempt);
+                const auto intent = len == kApplyDeathLen ? npcdeath::Intent::Advance :
+                    static_cast<npcdeath::Intent>(body[kApplyDeathLen]);
                 const npcdeath::Scope scope{generation, renderStamp.generation, incoming.loadStamp, renderStamp.life};
                 auto reply = npcdeath::Receipt::Uncertain;
                 const bool ran = run_sync_bounded<npcdeath::Receipt>(
-                    [request, scope, gameplay = renderStamp.gameplay](npcdeath::Receipt& result) {
+                    [request, scope, intent, gameplay = renderStamp.gameplay](npcdeath::Receipt& result) {
                         DeathBackend backend{scope};
-                        result = gameplay ? g_npcDeaths.step(request, scope, backend) : npcdeath::Receipt::Stale;
+                        result = gameplay ? g_npcDeaths.step(request, scope, backend, intent) : npcdeath::Receipt::Stale;
                     }, "ApplyDeath", reply);
                 if (!ran) reply = npcdeath::Receipt::Uncertain; // the task may have entered the engine before the caller timed out
                 send_result(h, reply == npcdeath::Receipt::Applied, seq, static_cast<uint8_t>(reply));
