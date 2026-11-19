@@ -50,7 +50,10 @@ public partial class GameBridge
     private Stream? _wo121Stream;
     private CancellationToken _wo121Ct;
     private volatile PvpContactSession? _wo121ContactSession;
-    private sealed record PvpFrameScope(PvpContactSession Session, long Lifecycle, long Life, long ReadTick, ulong NativeLife = 0);
+    private sealed record PvpFrameScope(PvpContactSession Session, long Lifecycle, long Life, long ReadTick, ulong NativeLife = 0)
+    {
+        public (long Ms, long Rtt) RelayAtRead { get; init; }
+    }
 
     private bool PvpRecipientCurrent(PvpFrameScope scope) =>
         ReferenceEquals(scope.Session, _wo121ContactSession) &&
