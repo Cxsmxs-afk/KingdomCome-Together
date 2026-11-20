@@ -1332,26 +1332,34 @@ bool shot_in_flight(uint32_t eid) {
     return false;
 }
 
-bool rp_ranged_available(uint32_t eid, const uint8_t itemClass[16]) {
+uint8_t rp_observe_hands(uint32_t eid, std::array<uint8_t,16>& left, std::array<uint8_t,16>& right) {
+    K::Hands hands{};
+    const uint8_t known = X::read_body_hands_strict(eid, &hands);
+    if (known & 1) std::memcpy(left.data(), hands.left.b, left.size());
+    if (known & 2) std::memcpy(right.data(), hands.right.b, right.size());
+    return known;
+}
+
+bool rp_ranged_available(uint32_t eid, const uint8_t itemClass[16], timelineactions::HandSlot slot) {
     if (!itemClass || !g_animArmed || !(g_apply.load() & kBitAvatarShots) || !npcdrive::is_bound_eid(eid) ||
         !npcdrive::unparented_body(eid) || wo172::copy_dead(eid)) return false;
     using holders::Holder;
     const auto owner = holders::of(eid);
     if (owner != Holder::Writer && owner != Holder::Driver && owner != Holder::OneShot) return false;
-    K::Hands hands{};
-    K::ClassId requested{};
-    std::memcpy(requested.b, itemClass, sizeof requested.b);
-    if (requested.empty()) return false;
-    const uint8_t known = X::read_body_hands_strict(eid, &hands);
-    return ((known & 1) && hands.left == requested) || ((known & 2) && hands.right == requested);
+    std::array<uint8_t,16> left{}, right{}, requested{};
+    std::memcpy(requested.data(), itemClass, requested.size());
+    if (requested == std::array<uint8_t,16>{}) return false;
+    const auto known = rp_observe_hands(eid, left, right);
+    return timelineactions::class_in_confirmed_slot(slot, known, left, right, requested);
 }
 
-bool rp_ranged(uint32_t eid, uint8_t weapon, uint8_t phase, const uint8_t itemClass[16], uint64_t token) {
+bool rp_ranged(uint32_t eid, uint8_t weapon, uint8_t phase, const uint8_t itemClass[16],
+               timelineactions::HandSlot slot, uint64_t token) {
     const uint64_t loadStamp = loadsequence::stamp();
     synchronize_load(loadStamp);
     if (!loadsequence::allows(loadStamp, loadsequence::Access::Live)) return false;
     const char* fragment = rpbodyactions::ranged_fragment(weapon, phase);
-    if (!token || !fragment || !rp_ranged_available(eid, itemClass)) return false;
+    if (!token || !fragment || !rp_ranged_available(eid, itemClass, slot)) return false;
     void* e = engine::entity_by_id(eid);
     const char* name = e ? engine::entity_name(e) : nullptr;
     if (!name || std::strncmp(name, "kcd2mp_", 7)) return false;

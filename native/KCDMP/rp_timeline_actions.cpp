@@ -4,6 +4,7 @@
 #include "rp_timeline_actions.h"
 
 #include "combat_swing.h"
+#include "edge_console_rules.h"
 #include "engine.h"
 #include "hits.h"
 #include "load_sequence.h"
@@ -63,6 +64,7 @@ bool terminal(Dispatch dispatch) {
 struct Typed {
     rpcombat::Event wire;
     rttr::CombatRow row;
+    HandSlot handSlot = HandSlot::Unknown;
 };
 struct Pending {
     uint64_t hostMs, readMs;
@@ -76,6 +78,15 @@ struct Row {
     std::string spec;
     rttr::CombatRow descriptor;
 };
+struct RangedHand {
+    RangedHandFence fence;
+    HandItemClass expected;
+    uint64_t session = 0;
+    uint32_t world = 0;
+    uint8_t flags = 0;
+    HandSlot slot = HandSlot::Unknown;
+    bool entered = false, uncertain = false;
+};
 struct Body {
     void* entity;
     void* actor;
@@ -85,6 +96,7 @@ struct Body {
     rpcombat::Receipts typedRecent{};
     std::unordered_map<uint32_t, Row> rows{};
     uint64_t replayLoggedMs = 0;
+    RangedHand rangedHand{};
 };
 struct Observation {
     uint32_t eid;
@@ -238,17 +250,28 @@ bool tracked_wake(const rpcombat::Event& event, const Body& body) {
     });
 }
 
-bool ready_to_dispatch(const rpcombat::Event& event) {
+bool ready_to_dispatch(const rpcombat::Event& event, const Body& body) {
     if (rpcombat::uses_row(event.kind)) return hits::visual_damage_ready(event.eid);
     if (event.kind == rpcombat::kKo) return wo131::rp_knockout_available(event.eid, event.stage != 0);
-    return wo143::rp_ranged_available(event.eid, event.itemClass.data());
+    return wo143::rp_ranged_available(event.eid, event.itemClass.data(), body.rangedHand.slot);
+}
+
+bool ranged_hand_current(const rpcombat::Event& event, const Body& body) {
+    const auto& hand = body.rangedHand;
+    return event.kind != rpcombat::kRanged ||
+        (hand.slot != HandSlot::Unknown && hand.fence == event.rangedHand && hand.expected == event.itemClass);
 }
 
 void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, bool livePose, uint64_t now) {
     const auto& typed = *action.typed;
     const auto& event = typed.wire;
+    if (!ranged_hand_current(event, body) ||
+        (event.kind == rpcombat::kRanged && typed.handSlot != body.rangedHand.slot)) {
+        settle(eid, body.peer, action, Dispatch::NotStarted, "refused", "ranged-hand-stale");
+        return;
+    }
     if (!(scope_now() == g_scope) || g_observing.size() >= kMaxPending ||
-        wo208::probe_owned(eid) || !ready_to_dispatch(event)) {
+        wo208::probe_owned(eid) || !ready_to_dispatch(event, body)) {
         settle(eid, body.peer, action, Dispatch::NotStarted, "refused", "runtime-gate");
         return;
     }
@@ -261,7 +284,7 @@ void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, bool l
     if (event.kind == rpcombat::kKo) {
         watching = wo131::rp_knockout(eid, event.stage != 0, token);
     } else if (event.kind == rpcombat::kRanged) {
-        watching = wo143::rp_ranged(eid, event.stage, event.rangedPhase, event.itemClass.data(), token);
+        watching = wo143::rp_ranged(eid, event.stage, event.rangedPhase, event.itemClass.data(), typed.handSlot, token);
     } else {
         const auto result = rttr::queue_ghost_row(eid, typed.row, token, &watching);
         if (result == rttr::SwingResult::Ok) {
@@ -284,7 +307,80 @@ void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, bool l
     }
 }
 
+Receipt declare_ranged_hand(const RangedHandRequest& request, const HandItemClass& expected, Scope received) {
+    const auto eid = request.eid;
+    const auto peer = request.peer;
+    const auto& fence = request.fence;
+    const Scope current = synchronize();
+    if (!current.connection || !(current == received) || !fence.valid() ||
+        !loadsequence::allows(current.load, loadsequence::Access::Live)) return Invalid;
+    void* entity = engine::entity_by_id(eid);
+    void* actor = motion::actor_of(eid);
+    if (!actor || !body_matches(eid, peer, entity, actor)) return Invalid;
+    Body* body = lookup_body(eid, peer, entity, actor);
+    if (!body) return Unavailable;
+    auto& hand = body->rangedHand;
+    if (fence.revision <= hand.fence.revision) {
+        if (!(fence == hand.fence) || expected != hand.expected || hand.uncertain ||
+            hand.session != request.session || hand.world != request.world ||
+            hand.flags != request.flags) return Blocked;
+    } else hand = {fence, expected, request.session, request.world, request.flags};
+    const auto presented = edgeconsole::present_ranged_hand(request, expected.data());
+    const auto bound = g_bodies.find(eid);
+    if (bound == g_bodies.end() || !(bound->second.rangedHand.fence == fence)) return Blocked;
+    auto& latest = bound->second.rangedHand;
+    if (presented == edgeconsole::Result::Returned) {
+        latest.entered = true;
+        return Accepted;
+    }
+    if (presented == edgeconsole::Result::Uncertain) {
+        latest.uncertain = true;
+        latest.slot = HandSlot::Unknown;
+    }
+    return presented == edgeconsole::Result::NotEntered ? Unavailable : Blocked;
+}
+
+HandObservation observe_ranged_hand(const RangedHandRequest& request, const HandItemClass& expected, Scope received) {
+    const auto eid = request.eid;
+    const auto peer = request.peer;
+    const auto& fence = request.fence;
+    const Scope current = synchronize();
+    if (!current.connection || !(current == received) ||
+        !loadsequence::allows(current.load, loadsequence::Access::Live)) return {};
+    const auto entry = g_bodies.find(eid);
+    if (entry == g_bodies.end() || entry->second.peer != peer) return {Blocked};
+    auto& body = entry->second;
+    auto& hand = body.rangedHand;
+    if (!(hand.fence == fence) || hand.expected != expected || !hand.entered || hand.uncertain ||
+        !body_matches(eid, peer, body.entity, body.actor)) return {Blocked};
+    HandObservation result{Accepted};
+    result.known = wo143::rp_observe_hands(eid, result.left, result.right);
+    if (!(scope_now() == current) || !body_matches(eid, peer, body.entity, body.actor)) return {Blocked};
+    if (expected == HandItemClass{} ||
+        !class_in_confirmed_slot(hand.slot, result.known, result.left, result.right, expected)) {
+        hand.slot = HandSlot::Unknown;
+        if (expected != HandItemClass{}) {
+            if (class_in_confirmed_slot(HandSlot::Left, result.known, result.left, result.right, expected))
+                hand.slot = HandSlot::Left;
+            else if (class_in_confirmed_slot(HandSlot::Right, result.known, result.left, result.right, expected))
+                hand.slot = HandSlot::Right;
+        }
+    }
+    return result;
+}
+
 } // namespace
+
+HandObservation handle_ranged_hand(const uint8_t* bytes, size_t size, Scope received) {
+    RangedHandRequest request;
+    if (!decode_ranged_hand_request(bytes, size, request)) return {};
+    HandItemClass expected{};
+    std::copy_n(bytes + 31, expected.size(), expected.begin());
+    if (request.operation == HandOperation::Observe) return observe_ranged_hand(request, expected, received);
+    const bool drawn = (request.flags & kHandDrawn) != 0;
+    if (drawn != (expected != HandItemClass{})) return {};
+    return {declare_ranged_hand(request, expected, received)};
+}
 
 void configure(bool enabled) {
     synchronize();
@@ -381,7 +477,7 @@ Receipt submit_combat(const uint8_t* bytes, size_t size, Scope received, uint64_
     Body* body = lookup_body(eid, event.peer, entity, actor);
     if (!body) return Blocked;
     const auto key = rpcombat::key(event);
-    if (const auto old = body->typedRecent.find(key)) return *old;
+    if (const auto old = body->typedRecent.find(key)) return ranged_hand_current(event, *body) ? *old : Blocked;
 
     const bool recovering = tracked_wake(event, *body);
     if (!recovering && ((!g_enabled || !g_remoteCombat) || (event.kind == rpcombat::kKo && event.stage == 0)))
@@ -393,7 +489,7 @@ Receipt submit_combat(const uint8_t* bytes, size_t size, Scope received, uint64_
         if (const auto pose = matched_live_pose(eid, *body)) body->typedRecent.observe_target(pose->sourceHostMs);
     }
     if (body->typedRecent.full()) return recovering ? Unavailable : Blocked;
-    Typed typed{event, {}};
+    Typed typed{event, {}, event.kind == rpcombat::kRanged ? body->rangedHand.slot : HandSlot::Unknown};
     if (rpcombat::uses_row(event.kind)) {
         const auto row = body->rows.find(event.rowKey);
         if (row == body->rows.end()) return RowNotRegistered;
@@ -415,7 +511,8 @@ Receipt submit_combat(const uint8_t* bytes, size_t size, Scope received, uint64_
         return Blocked;
     }
     const bool refuse = wo208::probe_owned(eid) || g_pending >= kMaxPending || body->pending.size() >= kMaxPerBody;
-    const bool ready = !refuse && ready_to_dispatch(event);
+    const bool handReady = ranged_hand_current(event, *body);
+    const bool ready = !refuse && handReady && ready_to_dispatch(event, *body);
     // A recovery rejected before scheduling stays retryable on this exact
     // body. The provider proves its down state again when eventually invoked.
     if (recovering && !ready) return Unavailable;
@@ -423,7 +520,8 @@ Receipt submit_combat(const uint8_t* bytes, size_t size, Scope received, uint64_
     ++g_combat.actions_in;
     report(eid, event.peer, action, "in");
     if (!ready) {
-        report(eid, event.peer, action, "refused", 0, refuse ? "admission-gate" : "provider-unavailable", Dispatch::Rejected);
+        report(eid, event.peer, action, "refused", 0,
+            refuse ? "admission-gate" : !handReady ? "ranged-hand-unconfirmed" : "provider-unavailable", Dispatch::Rejected);
         body->typedRecent.remember(key, Blocked);
         return !refuse && !rpcombat::uses_row(event.kind) ? Unavailable : Blocked;
     }

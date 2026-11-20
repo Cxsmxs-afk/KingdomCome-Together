@@ -269,7 +269,7 @@ public partial class GameBridge
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, peer.Token);
         long capturedAt = Environment.TickCount64 - step.AgeMs - (long)Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds;
         if (BowHandProof.IsDrawnPhase(step.Phase))
-            await Wo214OnRangedHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, capturedAt, Current, linked.Token);
+            await Wo214OnRangedHandAsync(src, step.ItemClass, context, frame.P6ModeSerial, frame.P6PeerSerial, body, capturedAt, Current, linked.Token, message.Tok);
         else if (step.Kind == RangedWeaponKind.Crossbow && !linked.IsCancellationRequested && Current())
             Wo214OnOtherRangedHand(src, step.ItemClass, capturedAt);
         // Charge and Aim still lack a verified animation entry. Crossbow reload tags vary by subclass.
@@ -282,19 +282,20 @@ public partial class GameBridge
             return;
         }
         if (!_w214FigureHand.TryGetValue(src, out var hand) || !hand.Drawn || hand.Cls != step.ItemClass ||
-            hand.Body != body || !Wo214HandCurrent(src, hand))
+            hand.Body != body || !Wo214HandCurrent(src, hand) || !Wo214ConfirmedRangedHand(src, hand, step.ItemClass))
         {
-            Wo201RangedRefused(src, step, "no-current-hand-revision");
+            Wo201RangedRefused(src, step, "hand-readback-unconfirmed");
             return;
         }
 
         // The hand record is intent. The typed native provider reads the actual hands before applying.
-        bool CurrentHand() => Current() && W214On("figure_hands") &&
-            _w214FigureHand.TryGetValue(src, out var latest) && Wo214SameHandState(latest, hand);
-        var data = new byte[18];
-        data[0] = (byte)step.Kind;
-        data[1] = step.Phase;
-        step.ItemClass.TryWriteBytes(data.AsSpan(2));
+        bool CurrentHand() => Current() && Wo214ConfirmedRangedHand(src, hand, step.ItemClass);
+        var data = new byte[43];
+        data[0] = 3;
+        data[1] = (byte)step.Kind;
+        data[2] = step.Phase;
+        step.ItemClass.TryWriteBytes(data.AsSpan(3));
+        CombatPipe.PutRangedHandFence(data.AsSpan(19), hand.PeerSerial, hand.Body.Generation, hand.Body.LuaBirth, hand.Revision);
         var admission = await TrySubmitPresentationCombatAsync(src, body.Entity, frame.Presentation,
             unchecked((ushort)step.Sequence), 0x82, data, linked.Token, beforeWrite: CurrentHand);
         if (admission != PresentationCombatAdmission.Accepted)

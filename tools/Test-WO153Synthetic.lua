@@ -419,6 +419,79 @@ do
     check("H4: the reattached current body can equip before the next hand report",
           KCD2MP_W202EquipAll(name, newClass, body, noHand, g.outfitBirth) == 1 and mutations == 3 and equipped == newClass)
     local currentBirth = g.outfitBirth
+    -- The old holster was confirmed and its outfit was queued before the combat
+    -- draw cue. The cue reaches Lua before its next typed hand revision.
+    local holstered, nextHolster = "0000000000000003", "0000000000000004"
+    equipped, slotOne = nil, nil
+    ghost.human.HolsterWeapon = function() equipped, slotOne = nil, nil end
+    local function confirmHolster(revision)
+        local timers = #TIMERS
+        assert(KCD2MP_W214FigureHand(id, false, "-", false, body, revision, currentBirth))
+        assert(#TIMERS == timers + 1)
+        local observe = table.remove(TIMERS)
+        observe.f()
+    end
+    confirmHolster(holstered)
+    KCD2MP_GhostCombat(id, 0)
+    check("H4 draw-cue: the next class is still pending with both hands empty",
+          KCD2MP.ghostWeaponDrawn[id] == true and equipped == nil and slotOne == nil)
+    local function operations(revision, scopedBirth)
+        return {
+            { "Equip", function() return KCD2MP_W144Equip(name, newClass, body, revision, scopedBirth) end,
+              function() return equipped == newClass end },
+            { "Unequip", function() return KCD2MP_W144Unequip(name, oldClass, body, revision, scopedBirth) end,
+              function() return removals > 0 end },
+            { "Atomic", function() return KCD2MP_W202EquipAll(name, oldClass .. "," .. newClass, body, revision, scopedBirth) == 2 end,
+              function() return equipped == newClass end },
+            { "Preset", function() return KCD2MP_W136ClearPreset(id, "test", body, revision, scopedBirth) end,
+              function() return cleared > 0 end },
+        }
+    end
+    for _, row in ipairs(operations(holstered, currentBirth)) do
+        equipped, slotOne = nil, nil
+        local before = mutations + removals + cleared
+        local ran = row[2]()
+        local changed = mutations + removals + cleared - before
+        check("H4 draw-pending: delayed " .. row[1] .. " has zero mutations",
+              not ran and changed == 0 and equipped == nil, "mutations=" .. changed)
+    end
+    equipped, slotOne = nil, nil
+    local beforeAck, oldTimer = mutations, W214.hand.gen[id]
+    check("H4 draw-pending: repeated ack keeps the pending cue on the same owner",
+          KCD2MP_W214ReportGhostId(id, agent, body) and g.outfitBirth == currentBirth and
+          W214.hand.gen[id] == oldTimer and
+          not KCD2MP_W144Equip(name, newClass, body, holstered, currentBirth) and mutations == beforeAck)
+    check("H4 draw-pending: duplicate old holster cannot cancel the new cue",
+          not KCD2MP_W214FigureHand(id, false, "-", false, body, holstered, currentBirth) and KCD2MP.ghostWeaponDrawn[id] == true)
+    local beforeHolster = #LOG
+    confirmHolster(nextHolster)
+    check("H4 draw-pending: current holster reports both modeled hands empty",
+          not KCD2MP.ghostWeaponDrawn[id] and equipped == nil and slotOne == nil and
+          countEvt("w214_figure_hand", id .. " ok empty", beforeHolster) == 1)
+    for _, row in ipairs(operations(nextHolster, currentBirth)) do
+        equipped, slotOne = nil, nil
+        local before = mutations + removals + cleared
+        local ran = row[2]()
+        local changed = mutations + removals + cleared - before
+        check("H4 draw-pending: confirmed current " .. row[1] .. " converges",
+              ran and changed == (row[1] == "Atomic" and 2 or 1) and row[3](), "mutations=" .. changed)
+    end
+
+    -- An owner change on the same entity ID retires even a pending cue from the
+    -- previous incarnation. The new owner may repair with its own stamp.
+    equipped, slotOne = nil, nil
+    KCD2MP_GhostCombat(id, 0)
+    local pendingBirth = currentBirth
+    check("H4 draw-pending: reconnect replaces the old cue owner",
+          KCD2MP_W214ReportGhostId(id, "fresh-outfit-owner", body) and g.outfitBirth ~= pendingBirth)
+    currentBirth = g.outfitBirth
+    local beforeReconnect = mutations
+    check("H4 draw-pending: the previous owner cannot equip the reattached body",
+          not KCD2MP_W144Equip(name, oldClass, body, nextHolster, pendingBirth) and mutations == beforeReconnect)
+    check("H4 draw-pending: reattached current owner can repair its outfit",
+          KCD2MP_W144Equip(name, newClass, body, noHand, currentBirth) and
+          mutations == beforeReconnect + 1 and equipped == newClass)
+    agent = "fresh-outfit-owner"
     KCD2MP_W214FigureHand(id, true, newClass, false, body, newRevision, currentBirth)
     local currentHandTimer = W214.hand.gen[id]
     local beforeDuplicate = #LOG
@@ -431,6 +504,68 @@ do
 
     ENTS[name], KCD2MP.ghosts[id], ItemManager = nil, nil, oldIM
     noErrs("H4")
+end
+
+-- H4: a new stamped holster intent can arrive before the actual hold ends.
+do
+    local id, name, body = "8", "kcd2mp_8", "01FFAA08"
+    local oldRevision, holsterRevision = "0000000000000001", "0000000000000002"
+    local bow = "11111111-1111-1111-1111-111111111111"
+    local sword = "22222222-2222-2222-2222-222222222222"
+    local function stamp(revision) return string.rep("0", 48) .. revision end
+    local oldIM = ItemManager
+    ItemManager = { GetItem = function(it) if it ~= 0 then return { class = it } end end }
+    for _, operation in ipairs({"Equip", "Atomic"}) do
+        for slot = 0, 1 do
+            local held, mutations, holsters = nil, 0, 0
+            local ghost = mkEntity(name, 0, 0, 0)
+            ghost.id = "0x" .. body
+            ghost.inventory = { FindItem = function(_, cls) return cls end }
+            local canReadHands = true
+            ghost.human.GetItemInHand = function(_, which)
+                if not canReadHands then error("hand unreadable") end
+                if which == slot then return held end
+            end
+            ghost.human.HolsterWeapon = function() holsters = holsters + 1 end
+            ghost.actor.EquipInventoryItem = function(_, it) mutations, held = mutations + 1, it end
+            ENTS[name] = ghost
+            KCD2MP.ghosts[id] = { entity = ghost }
+            KCD2MP.ghostWeaponDrawn[id] = nil
+            assert(KCD2MP_W214ReportGhostId(id))
+            local birth = KCD2MP.ghosts[id].outfitBirth
+            assert(KCD2MP_W214FigureHand(id, false, "-", false, body, oldRevision, birth, stamp(oldRevision)))
+            table.remove(TIMERS).f()
+            KCD2MP_GhostCombat(id, 0)
+            assert(KCD2MP.ghostWeaponDrawn[id] and not held)
+            held = bow
+            local before = #LOG
+            assert(KCD2MP_W214FigureHand(id, false, "-", false, body, holsterRevision, birth, stamp(holsterRevision)))
+            local label = "H4 actual holster pending: " .. operation .. " slot=" .. slot
+            check(label .. " sent once without changing actual hand", holsters == 1 and held == bow and
+                  countEvt("w214_figure_hand", id .. " ok empty", before) == 0)
+            local function apply(revision)
+                if operation == "Equip" then return KCD2MP_W144Equip(name, sword, body, revision, birth) end
+                return KCD2MP_W202EquipAll(name, sword, body, revision, birth) == 1
+            end
+            check(label .. " rejects old revision", not apply(oldRevision) and held == bow and mutations == 0)
+            check(label .. " current revision cannot displace still-held class",
+                  not apply(holsterRevision) and held == bow and mutations == 0,
+                  "mutations=" .. mutations .. " actual=" .. tostring(held))
+            local beforeRead = mutations
+            canReadHands = false
+            check(label .. " cannot treat an unreadable hand as empty", not apply(holsterRevision) and mutations == beforeRead,
+                  "mutations=" .. (mutations - beforeRead))
+            canReadHands = true
+            held = slot == 1 and 0 or nil
+            table.remove(TIMERS).f()
+            local beforeCurrent = mutations
+            check(label .. " converges after actual empty observation",
+                  countEvt("w214_figure_hand", id .. " ok empty " .. birth .. " " .. stamp(holsterRevision), before) == 1
+                  and apply(holsterRevision) and mutations == beforeCurrent + 1 and held == sword,
+                  "mutations=" .. (mutations - beforeCurrent) .. " actual=" .. tostring(held))
+        end
+    end
+    ENTS[name], KCD2MP.ghosts[id], KCD2MP.ghostWeaponDrawn[id], ItemManager = nil, nil, nil, oldIM
 end
 
 -- (C) the tester pages' marker words are registered (typing an unregistered one printed "unknown command") ------------------
