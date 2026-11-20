@@ -537,31 +537,5 @@ public sealed partial class HenryStore
         };
     }
 
-    /// <summary>
-    /// Move a file out of a playline into henry/swept (never deleted outright:
-    /// the newest 8 swept files are kept). Returns true when it is gone from
-    /// the playline.
-    /// </summary>
-    public bool MoveOut(string path, string why)
-    {
-        string swept = Path.Combine(Root, "swept");
-        try
-        {
-            Directory.CreateDirectory(swept);
-            string pl = Path.GetFileName(Path.GetDirectoryName(path)) ?? "playline?";
-            string dest = Path.Combine(swept, $"{_now():yyyyMMddHHmmssfff}-{pl}-{Path.GetFileName(path)}");
-            File.Move(path, dest);
-            _log($"MP-HENRY moved {GameBridge.SaveDisplay(path)} out of the playline -> <data>/henry/swept ({why})");
-            foreach (var old in new DirectoryInfo(swept).GetFiles().OrderByDescending(f => f.Name, StringComparer.Ordinal).Skip(8))
-                TryDelete(old.FullName);
-            return !File.Exists(path);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            _log($"MP-HENRY could not move {GameBridge.SaveDisplay(path)} out ({why}): {ex.Message}");
-            return false;
-        }
-    }
-
     private static void TryDelete(string p) { try { File.Delete(p); } catch (IOException) { } catch (UnauthorizedAccessException) { } }
 }

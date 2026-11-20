@@ -484,6 +484,7 @@ public sealed partial class JoinCalendarIntegrationTests
         byte[] replacement = WhsSaveTests.SyntheticSave();
         if (replaceAfterHash)
         {
+            engine.DeferExitFileRead = true;
             engine.BeforeOwnLoadQuiet = () =>
             {
                 engine.BeforeOwnLoadQuiet = null;
@@ -493,11 +494,21 @@ public sealed partial class JoinCalendarIntegrationTests
             };
         }
         Task<string> dispatched = engine.WaitForOwnLoadAsync(ct);
-        Task first = await Task.WhenAny(dispatched, engine.ExitMenu).WaitAsync(ct);
+        Task first = await Task.WhenAny(dispatched, engine.ExitLoad).WaitAsync(ct);
         if (replaceAfterHash)
         {
-            Assert.True(ReferenceEquals(first, engine.ExitMenu), "The game received a load for the replacement after the original SHA-256 check.");
+            Assert.True(ReferenceEquals(first, engine.ExitLoad), "The game received a load for the replacement after the original SHA-256 check.");
             Assert.Equal(0, engine.OwnLoadsIssued);
+            string exit = await engine.ExitLoad;
+            byte[] exitBytes = File.ReadAllBytes(exit);
+            Assert.Equal(0, guest.Wo125Sweep("agent start"));
+            Assert.Equal(exitBytes, File.ReadAllBytes(exit));
+            if (OperatingSystem.IsWindows())
+                Assert.Throws<IOException>(() => File.Move(exit, exit + ".replacement"));
+            Console.WriteLine("H21-HOME exit audit: pending engine read stayed present through the startup sweep");
+            engine.CompleteExitLoad(exit);
+            await engine.ExitMenu.WaitAsync(ct);
+            await WaitAsync(() => !File.Exists(exit), "only the owned exit copy to retire after its engine terminal", ct);
             Assert.Equal(original, File.ReadAllBytes(held));
             Assert.Equal(replacement, File.ReadAllBytes(ownSave));
             return;

@@ -902,17 +902,11 @@ public partial class GameBridge
     // WO-184: the snapshot itself is GameBridge.Wo184.cs (Wo184OnHostSaveIn -> Wo184TakeAsync): asked at every host save, two hard blocks only,
     // the engine's own "not now" asked again every 2 s, stuck after 60 s, a final snapshot at every leave (WO-183's gate and its owed list are gone).
 
-    /// <summary>
-    /// A verified save landed in a playline while this game is joined. The
-    /// snapshot's own QuickSave completes the waiter; anything else is a leak
-    /// (a console QuickSave, WO-124 s9.1): ledgered, then moved out at once.
-    /// Returns true when handled here.
-    /// </summary>
-    private bool Wo125OnJoinerSaveObserved(string path, string md5)
+    /// <summary>The folder watch may serve the legacy snapshot reader. It never authorizes a file move.</summary>
+    private bool Wo125OnJoinerSaveObserved(string path)
     {
         var id = WorldSaved.ParsePath(path);
-        // The scoped owner consumes only an engine write receipt plus a
-        // request marker in the same file. A watch observation alone is read-only.
+        // The scoped owner consumes only an engine write receipt plus a request marker in the file.
         if (Volatile.Read(ref _joinedCharacter) is not null) return _joinedWorld;
         lock (_snapGate)
         {
@@ -923,19 +917,10 @@ public partial class GameBridge
                 return true;
             }
         }
-        if (Wo184TakeLateFile(path)) return true;   // WO-184: a snapshot whose wait ended still pairs (0.50.9 moved it out as a "leak")
+        if (Wo184TakeLateFile(path)) return true;
         if (!_joinedWorld) return false;
-        var led = _henry.LedgerAdd(new HenryStore.LedgerEntry
-        {
-            Playline = id?.Playline ?? -1, SinceUtc = DateTime.UtcNow, File = Path.GetFileName(path), Md5 = md5, WorldTag = _joinedTag ?? "", Kind = "leak", State = "written",
-        });
-        Console.WriteLine($"MP-SAVELOCK LEAK a save of the host's world was written on this joiner: {SaveDisplay(path)} -- moving it out of the playline");
-        _ = Task.Run(() =>
-        {
-            bool gone = _henry.MoveOut(path, "written while in the host's world (a leak)");
-            if (gone) _henry.LedgerSet(led.Id, e => e.State = "done");
-            Console.WriteLine($"MP-HENRY leak cleanup: moved out={On(gone)}; engine cache refresh deferred until a load");
-        });
+        if (Warned.TryAdd("unowned-guest-save:" + path, 0))
+            Console.WriteLine($"MP-SAVELOCK retained {SaveDisplay(path)} reason=unconfirmed-engine-save-owner");
         return true;
     }
 
@@ -949,75 +934,29 @@ public partial class GameBridge
     // ---------------------------------------------------------------- sweeps (agent start, before every join)
 
     private readonly JoinWorldJournal _joinWorldJournal = new();
-    private static readonly Regex TransientExit = new(@"^mpexit[0-9a-f]{1,8}\.(whs|part)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private string? _wo125ActiveExitPath;
 
-    /// <summary>
-    /// Remove journaled pre-load join copies at startup, and move out transient
-    /// exit files and ledgered saves. A join-looking name alone never authorizes
-    /// moving or deleting a save. Returns how many files left the playlines.
-    /// </summary>
+    /// <summary>At startup retire only agent-owned copies with proven file identity and no submitted load.</summary>
     internal int Wo125Sweep(string why)
     {
         string? saves = ResolveSavesDirForJoin();
         if (saves is null) return 0;
         saves = Path.GetFullPath(saves);
         if (!_joinWorldJournal.CanSweepPath(saves, directory: true)) return 0;
-        var scopedGuestSave = Wo125ScopedGuestSaveFilter(saves);
-        bool IsScopedGuestSave(int playline, string file) =>
-            scopedGuestSave?.Invoke(new(playline, Path.GetFileName(file), file, 0)) == true;
         int n = 0;
         if (why == "agent start")
         {
-            // Reserve/publish takes the same join gate. Copy the live leases
-            // before entering the journal so its sweep cannot invert cleanup's lock order.
             lock (_joinGate)
             {
                 var protectedPaths = _retainedJoinWorlds.ProtectedPaths();
                 if (_jj?.PlacedPath is string pending) protectedPaths.Add(pending);
+                if (_wo125ActiveExitPath is string exit) protectedPaths.Add(exit);
                 n = _joinWorldJournal.Sweep(saves, protectedPaths.Contains);
             }
         }
-        for (int pl = 0; pl <= 4; pl++)
-        {
-            string dir = Path.Combine(saves, $"playline{pl}");
-            if (!_joinWorldJournal.CanSweepPath(dir, directory: true)) continue;
-            foreach (var f in Directory.EnumerateFiles(dir))
-                if (TransientExit.IsMatch(Path.GetFileName(f)) && _joinWorldJournal.CanSweepPath(f, directory: false)
-                    && !_retainedJoinWorlds.Protects(f) && (_jj?.PlacedPath is not string keep || !string.Equals(keep, f, StringComparison.OrdinalIgnoreCase))
-                    && _henry.MoveOut(f, $"a transient file of the mod ({why})")) n++;
-        }
-        foreach (var e in _henry.Ledger().Where(x => x.State != "done" && x.Kind != "scoped-guest"))
-        {
-            string dir = Path.Combine(saves, $"playline{e.Playline}");
-            bool exists = Directory.Exists(dir);
-            if (exists && (e.Playline is < 0 or > 4 || !_joinWorldJournal.CanSweepPath(dir, directory: true))) continue;
-            if (e.File is string ledgered && (!string.Equals(ledgered, Path.GetFileName(ledgered), StringComparison.Ordinal) ||
-                ledgered.StartsWith("mpworld", StringComparison.OrdinalIgnoreCase))) continue;
-            bool done = true;
-            if (e.File is string f && File.Exists(Path.Combine(dir, f)))
-            {
-                string p = Path.Combine(dir, f);
-                if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p) || IsScopedGuestSave(e.Playline, p)) continue;
-                var v = WhsSave.VerifyFile(p);
-                if (e.Md5 is null || string.Equals(v.Md5, e.Md5, StringComparison.OrdinalIgnoreCase))
-                { if (_henry.MoveOut(p, $"a {e.Kind} save the mod made or saw while joined ({why})")) n++; else done = false; }
-                else Console.WriteLine($"MP-HENRY sweep: {SaveDisplay(p)} changed since it was ledgered (a save of the player's own now) -- left alone");
-            }
-            else if (e.File is null && exists)
-            {
-                // A snapshot whose file was never seen (a crash between the request and the file): a save of
-                // the host's world (its seed) that landed in that playline within two minutes of the request.
-                foreach (var p in Directory.EnumerateFiles(dir, "*.whs"))
-                {
-                    if (!_joinWorldJournal.CanSweepPath(p, directory: false) || _retainedJoinWorlds.Protects(p) || IsScopedGuestSave(e.Playline, p)) continue;
-                    var t = File.GetLastWriteTimeUtc(p);
-                    if (t < e.SinceUtc || t > e.SinceUtc.AddMinutes(2) || WorldSaved.ParsePath(p) is null) continue;
-                    if (WhsSave.ReadSeedFromFile(p) is uint s && WhsSave.SeedTag(s) == _henry.BaseTagOf(e.WorldTag))
-                    { if (_henry.MoveOut(p, $"a snapshot's QuickSave left by a crash ({why})")) n++; else done = false; }
-                }
-            }
-            if (done) _henry.LedgerSet(e.Id, x => x.State = "done");
-        }
+        if (why == "agent start" && _henry.Ledger().Any(e => e.State != "done" && e.Kind != "scoped-guest") &&
+            Warned.TryAdd("legacy-save-ledger-retained", 0))
+            Console.WriteLine("MP-HENRY sweep retained reason=legacy-ledger-has-no-bound-engine-file");
         // A copy of a host world placed by hand: warn (once per file per agent run), never touch.
         var known = _henry.Worlds().Select(w => _henry.BaseTagOf(w.Tag)).ToHashSet();
         known.ExceptWith(_henry.Hosted());   // WO-157: this install's own playthrough of a world it also joined is no copy
@@ -1062,63 +1001,95 @@ public partial class GameBridge
         BinaryPrimitives.WriteUInt32LittleEndian(raw, 23);
         BinaryPrimitives.WriteUInt16LittleEndian(raw.AsSpan(4), 0x01FA);
         var file = WhsSave.Deflate(_lastWorldDesc, raw, new byte[44]);
-        string name = $"mpexit{Random.Shared.Next(1, int.MaxValue):x8}";
+        uint exitId = (uint)Random.Shared.Next(1, int.MaxValue);
+        string name = $"mpexit{exitId:x8}";
         string path = Path.Combine(saves, $"playline{pl}", name + ".whs");
+        byte[] sha = System.Security.Cryptography.SHA256.HashData(file);
+        bool registered = false, admitted = false;
+        JoinEngineReceipt? exitReceipt = null;
+        HomeSaveReadLease? exitLease = null;
         try
         {
-            using (var fs = new FileStream(path + ".part", FileMode.CreateNew, FileAccess.Write)) fs.Write(file);
-            File.Move(path + ".part", path);
+            lock (_joinGate)
+            {
+                _joinWorldJournal.Register(saves, path, "menu-exit", exitId, sha, isExit: true);
+                registered = true;
+                _wo125ActiveExitPath = path;
+            }
+            using (var stage = _joinWorldJournal.CreateStage(saves, path, exitId, sha, isExit: true)) stage.Write(file);
+            _joinWorldJournal.SealStage(saves, path, exitId, sha, isExit: true);
+            _joinWorldJournal.Publish(saves, path, exitId, sha, isExit: true);
+
             var listed = await _combat.SaveListAsync(1, pl, name);
-            if (listed is null || !listed.Listed) { Console.WriteLine($"MP-HENRY exit file not listed after the rescan -- removed; staying ({why})"); _henry.MoveOut(path, "exit file not listed"); return false; }
+            if (listed is null || !listed.Listed) { Console.WriteLine($"MP-HENRY exit file not listed after the rescan -- staying ({why})"); return false; }
             Console.WriteLine($"MP-HENRY no own save to go back to ({why}) -- loading an empty file ({SaveDisplay(path)}, {file.Length} B, no world in it): the engine fails the load and returns to the MAIN MENU");
             SetJoinUi("exit-menu", "You have no save of your own to go back to, so the game returns to the main menu. It shows \"Game load failed\" -- press OK.");
-            if (!await Wo177WaitQuietAsync("exit-to-menu"))   // WO-177 A5: never a load while a fight is running
+            if (!await Wo177WaitQuietAsync("exit-to-menu"))
             {
-                _henry.MoveOut(path, "a fight is still on: nothing was loaded");
-                Console.WriteLine("MP-HENRY exit cancelled: file moved out; cached list not refreshed");
+                Console.WriteLine("MP-HENRY exit cancelled: the engine's pre-load gate refused");
                 return false;
             }
-            using var exitReceipt = _transport is LogTailGameTransport tail
-                ? new JoinEngineReceipt(tail, _combat, path, saves) : null;
-            bool submitted;
-            try { submitted = await P5LoadGameAsync(pl, name, "exit-to-menu", ct); }
+            // Pin the name and its parents on Windows before proving the journal's
+            // identity. Keep that exact path for the engine's asynchronous read.
+            exitLease = HomeSaveReadLease.TryAcquire(saves, new(pl, name + ".whs", path, 0), Convert.ToHexString(sha));
+            using (var submittedLease = exitLease is null ? null :
+                _joinWorldJournal.PrepareLoadSubmission(saves, path, exitId, sha, isExit: true))
+            {
+                if (submittedLease is null)
+                {
+                    Console.WriteLine("MP-HENRY exit refused reason=unverified-owned-file");
+                    return false;
+                }
+            }
+            bool sent;
+            try
+            {
+                sent = await P5LoadGameCoreAsync(pl, name, "exit-to-menu", () =>
+                {
+                    if (_transport is LogTailGameTransport tail)
+                        exitReceipt = new JoinEngineReceipt(tail, _combat, path, saves);
+                    admitted = true;
+                    return true;
+                }, ct);
+            }
             catch (OperationCanceledException) when (exitReceipt?.MatchesTerminal(loaded: false) == true)
             {
                 // A fast, confirmed menu return can retire the transport before its response.
-                submitted = true;
+                sent = true;
             }
-            if (!submitted)
-            {
-                _henry.MoveOut(path, "exit load was not submitted");
-                return false;
-            }
-            if (exitReceipt is not null)
-            {
-                bool loaded = await WaitForJoinReceiptAsync(exitReceipt.Terminal.Task,
-                    "MP-HENRY waiting for the exit load to settle after the relay closed");
-                if (!loaded && _leaveInProgress && OwnLoadExpected) Wo124OnLoadFailedToMenu();
-                _henry.MoveOut(path, "exit load finished");
-                return !loaded;
-            }
-            _ = Task.Run(async () =>
-            {
-                for (int i = 0; i < 120 && _where != GameWhere.Menu; i++) await Task.Delay(1000);
-                await Task.Delay(1500);
-                _henry.MoveOut(path, "the exit file (its load failed as meant)");
-                if (!LoadSequenceEnabled) _ownLoadExpected = false;
-                Console.WriteLine($"MP-HENRY back at the main menu after the exit file: {(_where == GameWhere.Menu ? "yes" : "NOT SEEN")}; exit file moved out");
-            });
-            return true;
+            if (!sent) return false;
+            if (exitReceipt is null) return true;
+
+            bool loaded = await WaitForJoinReceiptAsync(exitReceipt.Terminal.Task,
+                "MP-HENRY waiting for the exact exit load to settle; its file stays protected");
+            if (!loaded && _leaveInProgress && OwnLoadExpected) Wo124OnLoadFailedToMenu();
+            return !loaded;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or HttpRequestException)
         {
-            Console.WriteLine($"MP-HENRY exit file failed: {ex.Message}");
+            Console.WriteLine($"MP-HENRY exit file failed: {ex.GetType().Name}");
             return false;
         }
-        catch (OperationCanceledException) when (relayClosed)
+        catch (OperationCanceledException) when (relayClosed || exitReceipt?.Terminal.Task.IsCanceled == true)
         {
-            Console.WriteLine("MP-HENRY exit load interrupted; its file stays protected");
+            Console.WriteLine("MP-HENRY exit load interrupted; unconfirmed files stay protected");
             return false;
+        }
+        finally
+        {
+            exitReceipt?.Dispose();
+            exitLease?.Dispose();
+            if (registered)
+            {
+                if (!admitted || exitReceipt?.CanRemoveFile == true)
+                {
+                    bool released = _joinWorldJournal.TryDeleteOwned(saves, path, exitId, sha, isExit: true);
+                    Console.WriteLine($"MP-HENRY exit cleanup reservation_released={On(released)} reason={(admitted ? "engine-terminal" : "pre-dispatch")}");
+                }
+                else Console.WriteLine("MP-HENRY exit file retained reason=no-terminal-engine-receipt");
+                lock (_joinGate)
+                    if (_wo125ActiveExitPath == path) _wo125ActiveExitPath = null;
+            }
         }
     }
 

@@ -13,6 +13,8 @@ public sealed partial class JoinCalendarIntegrationTests
     [InlineData("manual")]
     [InlineData("unconfirmed")]
     [InlineData("leave")]
+    [InlineData("rotated-log")]
+    [InlineData("pipe-reconnect")]
     public async Task Scoped_snapshot_waits_for_the_engine_save_of_its_own_attempt(string firstFile)
     {
         using var fixture = new SaveFixture();
@@ -56,6 +58,20 @@ public sealed partial class JoinCalendarIntegrationTests
         await aTask.WaitAsync(ct);
         Assert.Null(new HenryStore(HenryStore.DefaultRoot()).PickScoped(scope, []));
 
+        if (firstFile == "rotated-log")
+        {
+            long incarnation = engine.Transport.EngineLogIncarnation;
+            engine.Feed("Log Started at 2026-11-20 02:00:00");
+            Assert.NotEqual(incarnation, engine.Transport.EngineLogIncarnation);
+        }
+        if (firstFile == "pipe-reconnect")
+        {
+            long connection = pipe.Pipe.EdgeConnectionRevision;
+            typeof(CombatPipe).GetMethod("Drop", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(pipe.Pipe, [null]);
+            Assert.True(await pipe.Pipe.EnsureConnectedAsync(ct));
+            Assert.NotEqual(connection, pipe.Pipe.EdgeConnectionRevision);
+        }
+
         Task bTask;
         if (firstFile == "leave")
         {
@@ -72,14 +88,19 @@ public sealed partial class JoinCalendarIntegrationTests
         string bMarker = await command;
         Assert.NotEqual(aMarker, bMarker);
         string wrong = Path.Combine(dir, "quicksave001.whs"), right = Path.Combine(dir, "quicksave002.whs");
-        string marker = firstFile == "expired" ? aMarker : firstFile == "unconfirmed" ? bMarker : "";
+        string marker = firstFile switch
+        {
+            "expired" or "rotated-log" or "pipe-reconnect" => aMarker,
+            "unconfirmed" => bMarker,
+            _ => "",
+        };
         byte[] wrongBytes = WriteSnapshot(wrong, seed, 111, marker, 1);
         if (firstFile != "unconfirmed") engine.Feed($"SaveGame: '{wrong}' done.");
-        _ = Call(bridge, "Wo125OnJoinerSaveObserved", wrong, WhsSave.Verify(wrongBytes).Md5);
+        _ = Call(bridge, "Wo125OnJoinerSaveObserved", wrong);
         Console.WriteLine($"H21-SNAPSHOT probe: {firstFile} file observed before B");
         byte[] rightBytes = WriteSnapshot(right, seed, 222, bMarker, 2);
         engine.Feed($"SaveGame: '{right}' done.");
-        _ = Call(bridge, "Wo125OnJoinerSaveObserved", right, WhsSave.Verify(rightBytes).Md5);
+        _ = Call(bridge, "Wo125OnJoinerSaveObserved", right);
         await bTask.WaitAsync(ct);
 
         var saved = Assert.IsType<HenryStore.Pick>(new HenryStore(HenryStore.DefaultRoot()).PickScoped(scope with { HostSaveMd5 = bHash }, []));

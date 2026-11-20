@@ -25,6 +25,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private readonly Channel<string> _joinLoads = Channel.CreateUnbounded<string>();
     private readonly Channel<string> _ownLoads = Channel.CreateUnbounded<string>();
     private readonly TaskCompletionSource _exitMenu = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<string> _exitLoad = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Channel<string> _saveLockQueries = Channel.CreateUnbounded<string>();
     private readonly TaskCompletionSource<string> _loadIssued = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<string> _resumed = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -52,6 +53,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public Action<string>? RequestLegacySnapshot { get; set; }
     public bool DeferJoinFileRead { get; set; }
     public bool DeferOwnFileRead { get; set; }
+    public bool DeferExitFileRead { get; set; }
     public bool DeferSaveLockReply { get; set; }
     public int JoinLoadsIssued => Volatile.Read(ref _joinLoadsIssued);
     public int JoinFilesRead => Volatile.Read(ref _joinFilesRead);
@@ -60,6 +62,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public Task<string> Resumed => _resumed.Task;
     public Task JoinedNotification => _joinedNotification.Task;
     public Task ExitMenu => _exitMenu.Task;
+    public Task<string> ExitLoad => _exitLoad.Task;
     public Task<string> WaitForJoinLoadAsync(CancellationToken ct = default) => _joinLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForOwnLoadAsync(CancellationToken ct = default) => _ownLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForSaveLockAsync(CancellationToken ct = default) => _saveLockQueries.Reader.ReadAsync(ct).AsTask();
@@ -72,6 +75,20 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public void CompleteOwnLoad()
     {
         lock (_logGate) ReadLoadedFile(_pendingOwnReads.Dequeue(), joined: false);
+    }
+
+    public void CompleteExitLoad(string path)
+    {
+        lock (_logGate)
+        {
+            Assert.True(File.Exists(path));
+            Feed($"Loading saved game '{path}'");
+            Feed($"[CryAction] LoadGame: '{path}'");
+            Feed("Exiting to main menu because save game loading failed");
+            Feed("PlayVideoOnly 'main_menu'");
+            _where = "menu";
+            _exitMenu.TrySetResult();
+        }
     }
 
     public void ReleaseSaveLock()
@@ -117,12 +134,8 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         {
             string path = Path.Combine(_saves, $"playline{exit.Groups[1].Value}", exit.Groups[2].Value + ".whs");
             Assert.True(File.Exists(path));
-            Feed($"Loading saved game '{path}'");
-            Feed($"[CryAction] LoadGame: '{path}'");
-            Feed("Exiting to main menu because save game loading failed");
-            Feed("PlayVideoOnly 'main_menu'");
-            _where = "menu";
-            _exitMenu.TrySetResult();
+            _exitLoad.TrySetResult(path);
+            if (!DeferExitFileRead) CompleteExitLoad(path);
         }
 
         var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry|KCD2MP_W154Where)\("([0-9a-f]{8})"\)""");

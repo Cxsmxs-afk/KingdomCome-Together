@@ -439,24 +439,38 @@ public class Wo125Tests : IDisposable
         Assert.Equal(M(1), st.PickFor(tag, [M(1)])!.Snapshot.Md5);
     }
 
-    [Fact]
-    public void MoveOut_keeps_the_newest_eight_swept_files()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Exit_copy_respects_the_same_ownership_and_read_lifetime_as_join_worlds(bool submitted)
     {
-        var st = Store();
-        string pl = Path.Combine(_root, "saves", "playline2");
+        string saves = Path.Combine(_root, "saves");
+        string pl = Path.Combine(saves, "playline2");
         Directory.CreateDirectory(pl);
-        for (int i = 0; i < 10; i++)
+        string owned = Path.Combine(pl, "mpexit00000001.whs"), foreign = Path.Combine(pl, "mpexit00000002.whs");
+        byte[] bytes = "controlled menu fallback"u8.ToArray();
+        byte[] sha = SHA256.HashData(bytes);
+        File.WriteAllBytes(foreign, bytes);
+        var journal = new JoinWorldJournal();
+        journal.Register(saves, owned, "menu-exit", 1, sha, isExit: true);
+        using (var stage = journal.CreateStage(saves, owned, 1, sha, isExit: true)) stage.Write(bytes);
+        journal.SealStage(saves, owned, 1, sha, isExit: true);
+        journal.Publish(saves, owned, 1, sha, isExit: true);
+        if (submitted)
+            Assert.IsType<FileStream>(journal.PrepareLoadSubmission(saves, owned, 1, sha, isExit: true)).Dispose();
+        var restarted = new JoinWorldJournal();
+        Assert.Equal(submitted ? 0 : 1, restarted.Sweep(saves, _ => false));
+        Assert.Equal(submitted, File.Exists(owned));
+        Assert.Equal(bytes, File.ReadAllBytes(foreign));
+        if (submitted)
         {
-            string f = Path.Combine(pl, $"quicksave{i:D3}.whs");
-            File.WriteAllText(f, "x");
-            Assert.True(st.MoveOut(f, "test"));
-            Assert.False(File.Exists(f));
-            _now = _now.AddSeconds(1);
+            string original = Path.Combine(pl, "original.whs");
+            File.Move(owned, original);
+            File.WriteAllBytes(owned, bytes);
+            Assert.False(restarted.TryDeleteOwned(saves, owned, 1, sha, isExit: true));
+            Assert.Equal(bytes, File.ReadAllBytes(owned));
+            Assert.Equal(bytes, File.ReadAllBytes(original));
         }
-        var swept = Directory.GetFiles(Path.Combine(st.Root, "swept"));
-        Assert.Equal(8, swept.Length);
-        Assert.Contains(swept, s => s.EndsWith("playline2-quicksave009.whs", StringComparison.Ordinal));
-        Assert.All(_log.Where(l => l.Contains("moved")), l => Assert.DoesNotContain(_root, l));   // playlineN/file only
     }
 
     [Fact]

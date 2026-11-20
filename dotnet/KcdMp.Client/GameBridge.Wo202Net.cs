@@ -267,14 +267,3 @@ public partial class GameBridge
         await LeaveSharedWorldAsync("rejoin-declined", "You left your host's world (the reload didn't reach you).");
     }
 }
-
-// WO-202 VI: files the mod itself moved out of a playline (the joiner's Henry pipeline: a snapshot's QuickSave). The save check skips them.
-public partial class GameBridge
-{
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _w202MovedOut = new(StringComparer.OrdinalIgnoreCase);
-
-    private void Wo202NoteMovedOut(string path) => _w202MovedOut[Wo202Rules.SavePathKey(path)] = DateTime.UtcNow;
-
-    private bool Wo202MovedByUs(string path) =>
-        _w202MovedOut.TryGetValue(Wo202Rules.SavePathKey(path), out var at) && Wo202Rules.MovedRecently(at, DateTime.UtcNow) && !File.Exists(path);
-}
