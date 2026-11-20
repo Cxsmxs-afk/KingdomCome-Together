@@ -104,6 +104,13 @@ public:
     uint64_t generation() const { return counts_.world_gen; }
     uint64_t connection() const { return connection_; }
 
+    bool snapshot_allowed(uint64_t received, uint64_t expectedGeneration, bool final) const {
+        if (!connection_ || !expectedGeneration || expectedGeneration != generation() ||
+            received != stamp_ || flags_) return false;
+        // On an explicit leave only the final save may cross the Exit fence.
+        return phase_ == Phase::Play || phase_ == Phase::Settle || (final && phase_ == Phase::Exit);
+    }
+
     bool apply(const Request& request, uint64_t connection, uint64_t now) {
         if (!connection) return false;
         if (request.phase == Phase::Query) return true;

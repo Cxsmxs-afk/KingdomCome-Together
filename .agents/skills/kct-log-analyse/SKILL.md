@@ -60,6 +60,8 @@ Such die Zeile mit `rg -n "<fester Textteil>"` im zum Log gehörigen Build. Fehl
 
 Bei H6 zeigen `WO221-ACTEND` mit `attempt`, `receipt`, `waiting` und `active` sowie `MP-LANE2-H6` mit `attempt`, `eid`, `stage`, `lifecycle` und `connection` denselben Versuch. `receipt=1` bestätigt die Aktionsfreigabe. `ready` → `death-dispatched` → `applied` belegt die Reihenfolge und den bestätigten Engine-Zustand. Das Gate `tools/rig/scen_lane2_h6.py` prüft beide Rollenzuordnungen.
 
+Für H21 den zugehörigen `SaveGame`-Abschluss mit `MP-H21-SNAPSHOT result=paired`, Run, Generation, `host_seq` und dem gekürzten Hash abgleichen. Bei der Heimkehr belegen `MP-H21-HOME result=held` und das anschließende `result=confirmed loaded=True` den passenden privaten Load. Bei ersetztem Ziel sind `result=menu` und null private Load-Aufträge zu erwarten.
+
 `stage=apply-uncertain` kennzeichnet die weitere reine Beobachtung desselben H6-Versuchs nach einem unklaren Engine-Aufruf. `stage=aborted-before-apply` steht für die bestätigte Wiederfreigabe eines lebenden Körpers vor Guard- und Todesmutation. `stage=aborted-unadmitted` verbraucht eine zuvor nicht angenommene Versuch-ID ohne Freigabe an einem Körper.
 
 `prepare-unchanged` belegt die Fehlergrenze vor der ersten Vorbereitungsmutation. Erst ein nachfolgendes `aborted-before-apply` belegt die Wiederfreigabe. Nach `prepare-uncertain` bleibt selbst `prepare-observed-dead` eine Zustandsbeobachtung ohne Todesgutschrift für den Versuch.

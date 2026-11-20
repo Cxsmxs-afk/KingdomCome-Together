@@ -44,7 +44,8 @@ namespace kcdmp::wo178 {
 
 constexpr uint8_t kOpOffer = 24, kOpStatus = 25, kOpConfig = 26, kOpSaveManual = 27, kOpHeldResult = 28, kOpTrace = 29;
 constexpr uint8_t kOpSaveState = 34, kOpSaveCancel = 35;   // WO-184
-constexpr uint8_t kOpScopedSnapshot = 200;               // H21 [16 opaque bytes] -> [save admission]
+constexpr uint8_t kOpScopedSnapshot = 200;               // H21 [attempt:16][generation:8][final:1] -> [save admission]
+constexpr size_t kScopedSnapshotBytes = 1 + 16 + 8 + 1;
 
 // The duel trace (research, read-only; op 29 [secs:2]): every frame the local player's combat model and his opponent's are read and each
 // change is logged with its time, with the combat actions entering for either (motion's capture point). WO178-TRACE t=<ms> ...

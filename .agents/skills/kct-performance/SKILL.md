@@ -25,6 +25,8 @@ Zahlen am H0-Stand `6c8a63e` geprüft. Am aktuellen Tip erneut prüfen.
 
 H6 benutzt pro Todesversuch den vorhandenen Main-Pipe-Pfad. Der Tracker prüft einen Actor-Bucket. Die Nachbeobachtung läuft im Abstand von 40 ms bis zu 2,5 Sekunden. Für den einmaligen Abbruchnachweis folgen höchstens 500 ms. Nach unklarem Apply liest derselbe Versuch nur den Engine-Zustand. Der Release-Hook läuft ohne wartendes Lock oder `Stop`-Aufruf. `FRAME ours_us_p95` bleibt das Live-Gate.
 
+H21 liest den Save-Header und die bestätigten Snapshot-Bytes im Agent-Arbeitsthread. SHA-256 und Windows-Dateilease der Heimkehr laufen beim Verlassen der Sitzung. Für jeden expliziten Snapshot gibt es einen nativen Save-Auftrag. Bei der Zwei-PC-Abnahme den Save- und Ladeabschnitt im Frame-Profil separat korrelieren und `ours_us_p95 < 2000` sowie null zusätzliche, dem Fehlerpfad zugerechnete Frames über 50 ms belegen.
+
 Friendly Fire nutzt weiter das native Beobachtungsfenster von 600 ms. `0x97` trägt einmal pro Messwert 32 zusätzliche lokale Pipe-Bytes. Die bestehende Agent-FIFO nimmt höchstens 64 ausstehende Friendly-Fire-Meldungen pro Pipe an. Zwei Sekunden sind das Altersbudget ab dem ursprünglichen Kontakt. Das Relay-Paket behält Größe und Ereignistakt. Die Transport-Telemetrie erfasst die ersten 64 Kontaktfolgen und danach jede 32. Folge ohne eine eigene Warteschlange. [Messplan](../../../docs/ABNAHME-LANE2-NAHKAMPF.md)
 
 ## 3. Netz: Rate, Bandbreite, Latenz

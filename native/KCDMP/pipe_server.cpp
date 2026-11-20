@@ -648,14 +648,16 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
             return op == wo163::kOpReplay || op == wo163::kOpSkirmishPair ||
                    op == wo173::kOpRealHit || op == wo197::kOpPair || op == wo197::kOpSyncGuard ||
                    op == wo197::kOpEnsureGuard || op == wo187::kOpOpponent || op == wo187::kOpGuardHold ||
-                   op == wo200::kOpReplay || op == wo216::kOpRouteIn ||
-                   op == wo178::kOpScopedSnapshot ? LoadAccess::Live : LoadAccess::Control;
+                   op == wo200::kOpReplay || op == wo216::kOpRouteIn ? LoadAccess::Live : LoadAccess::Control;
         default:
             return LoadAccess::Read;
     }
 }
 
 bool load_allows(uint8_t type, const uint8_t* body, size_t n, uint64_t stamp, LoadAccess access) {
+    if (type == kWo163 && n && body[0] == wo178::kOpScopedSnapshot)
+        return n == wo178::kScopedSnapshotBytes && body[25] <= 1 &&
+            loadsequence::snapshot_allowed(stamp, loadsequence::read_le(body + 17, 8), body[25] == 1);
     if (!loadsequence::allows(stamp, access)) return false;
     // Off-main lifecycle control cannot be smuggled through Bulk/batches.
     if (type == kWo163 && n && body[0] == loadsequence::kOp) return false;

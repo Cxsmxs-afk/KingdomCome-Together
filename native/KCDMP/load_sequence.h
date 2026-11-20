@@ -15,6 +15,7 @@ bool allows(uint64_t received, Access access);
 // The verified pre-load calendar follower is prepared for the offered
 // world before Play. Keep it closed for a private save, menu or exit.
 bool calendar_allowed();
+bool snapshot_allowed(uint64_t received, uint64_t generation, bool final);
 void note_stale(uint64_t n = 1);
 Counts snapshot();
 

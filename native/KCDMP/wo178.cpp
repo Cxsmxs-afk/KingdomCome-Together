@@ -28,6 +28,7 @@
 #include "wo176.h"
 #include "wo210.h"
 #include "wo210_rules.h"
+#include "wo216.h"
 
 namespace kcdmp::wo178 {
 namespace {
@@ -1011,8 +1012,8 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
             return wo163::kROk;
         }
         case kOpScopedSnapshot:
-            if (len != 17 || cap < 1) return wo163::kRBadRequest;
-            out[0] = save_scoped_snapshot(body + 1);
+            if (len != kScopedSnapshotBytes || cap < 1) return wo163::kRBadRequest;
+            out[0] = wo216::lifecycle_gameplay() ? save_scoped_snapshot(body + 1) : 0;
             *outLen = 1;
             return wo163::kROk;
         default:

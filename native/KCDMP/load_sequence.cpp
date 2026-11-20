@@ -87,6 +87,11 @@ bool calendar_allowed() {
     return calendar_allowed(g_state.phase(), g_state.flags());
 }
 
+bool snapshot_allowed(uint64_t received, uint64_t generation, bool final) {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    return g_state.snapshot_allowed(received, generation, final);
+}
+
 void note_stale(uint64_t n) { if (n) g_stale.fetch_add(n, std::memory_order_relaxed); }
 
 Counts snapshot() {

@@ -49,6 +49,19 @@ int load_sequence_tests(int* passed) {
           !calendar_allowed(Phase::Load, kPrivateHold) && !calendar_allowed(Phase::Menu, 0) &&
           !calendar_allowed(Phase::Exit, 0), "calendar can prepare the offered save without overwriting a private world");
 
+    State save;
+    check(save.apply({Phase::Settle, 0, gen, 1}, 1, 100) && save.snapshot_allowed(save.stamp(), gen, false) &&
+          !save.snapshot_allowed(save.stamp(), gen - 1, false), "a snapshot is bound to the actual settled world generation");
+    const auto saveBeforeExit = save.stamp();
+    check(save.apply({Phase::Exit, 0, gen, 2}, 1, 150) && save.snapshot_allowed(save.stamp(), gen, true) &&
+          !save.snapshot_allowed(save.stamp(), gen, false) && !save.snapshot_allowed(saveBeforeExit, gen, true) &&
+          !allowed(save.stamp(), save.stamp(), Access::Live), "only the newly queued final save crosses Exit without opening any world writers");
+    check(save.apply({Phase::Load, kPrivateHold, gen + 1, 3}, 1, 160) &&
+          !save.snapshot_allowed(save.stamp(), gen, true) && !save.snapshot_allowed(save.stamp(), gen + 1, true),
+          "a private load or a new generation retires every snapshot command of the previous world");
+    save.disconnect(1, 170);
+    check(!save.snapshot_allowed(save.stamp(), gen + 1, true), "a retired pipe cannot authorize a final save in Exit");
+
     State state;
     check(gate(state.stamp()) == Gate::Legacy && allowed(0, state.stamp(), Access::Live),
           "older Agent pairs until optional load control is negotiated");
