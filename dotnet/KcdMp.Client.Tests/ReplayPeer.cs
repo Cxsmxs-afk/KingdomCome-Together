@@ -30,12 +30,12 @@ internal sealed class ReplayRelay : IAsyncDisposable
 
     public int Port { get; }
 
-    public static async Task<ReplayRelay> StartAsync(CancellationToken ct = default)
+    public static async Task<ReplayRelay> StartAsync(CancellationToken ct = default, string logLevel = "Fatal")
     {
         ct.ThrowIfCancellationRequested();
         // Reuse the shipped relay's services. The test owns its TCP listener so
         // the OS assigns a loopback-only port without a free-port/bind gap.
-        var app = Server.Program.CreateApp(["--Echo", "false", "--Serilog:MinimumLevel:Default", "Fatal"]);
+        var app = Server.Program.CreateApp(["--Echo", "false", "--Serilog:MinimumLevel:Default", logLevel]);
         var listener = new TcpListener(IPAddress.Loopback, 0);
         try
         {

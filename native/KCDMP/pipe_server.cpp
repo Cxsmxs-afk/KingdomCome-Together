@@ -115,6 +115,9 @@ struct Tx {
     std::deque<std::vector<uint8_t>> edgeRealtime, edgeAdmission;
     size_t edgeBytes = 0;
     unsigned edgeTurn = 0;
+    std::array<hits::PvpTrace, 64> pvpTraces{};
+    size_t pvpTraceHead = 0, pvpTraceCount = 0;
+    std::atomic<uint64_t> pvpTraceDropped{0};
     HANDLE handle = INVALID_HANDLE_VALUE;
     uint64_t generation = 0;
     bool connected = false, writing = false, failed = false;
@@ -225,30 +228,46 @@ void write_loop() {
         std::vector<uint8_t> frame;
         HANDLE h = INVALID_HANDLE_VALUE;
         uint64_t generation = 0;
-        bool failed = false;
-        bool report = false;
+        bool failed = false, write = false;
+        hits::PvpTrace trace{};
         {
             std::unique_lock<std::mutex> lock(g_tx.mutex);
-            g_tx.cv.wait(lock, [] { return !g_running || (g_tx.connected &&
+            g_tx.cv.wait(lock, [] { return !g_running || g_tx.pvpTraceCount || (g_tx.connected &&
                 (g_tx.failed || !g_tx.queue.empty() || !g_tx.edgeAdmission.empty() || !g_tx.edgeRealtime.empty())); });
             if (!g_running) break;
-            h = g_tx.handle; generation = g_tx.generation; failed = g_tx.failed;
-            if (!failed && !pop_tx(frame)) continue;
-            g_tx.writing = true;
-        }
-        const bool ok = !failed && write_physical(h, frame.data(), static_cast<DWORD>(frame.size()));
-        const DWORD error = ok ? 0 : (failed ? ERROR_NOT_ENOUGH_MEMORY : GetLastError());
-        {
-            std::lock_guard<std::mutex> lock(g_tx.mutex);
-            if (!ok && pipeout::same_connection(generation, g_tx.generation, g_tx.connected)) {
-                g_tx.connected = false; g_tx.failed = true;
-                CancelIoEx(h, nullptr); // wake serve() and let its normal disconnect path reconcile the session
-                report = true;
+            if (g_tx.pvpTraceCount) {
+                trace = g_tx.pvpTraces[g_tx.pvpTraceHead];
+                g_tx.pvpTraceHead = (g_tx.pvpTraceHead + 1) % g_tx.pvpTraces.size();
+                --g_tx.pvpTraceCount;
             }
-            g_tx.writing = false;
+            if (g_tx.connected) {
+                h = g_tx.handle; generation = g_tx.generation; failed = g_tx.failed;
+                write = failed || pop_tx(frame);
+                g_tx.writing = write;
+            }
         }
-        g_tx.cv.notify_all();
-        if (report) logf("PIPE: outbound connection failed (%s, error=%lu); queued reliable data requires session recovery", failed ? "queue full" : "write", error);
+        if (write) {
+            bool report = false;
+            const bool ok = !failed && write_physical(h, frame.data(), static_cast<DWORD>(frame.size()));
+            const DWORD error = ok ? 0 : (failed ? ERROR_NOT_ENOUGH_MEMORY : GetLastError());
+            {
+                std::lock_guard<std::mutex> lock(g_tx.mutex);
+                if (!ok && pipeout::same_connection(generation, g_tx.generation, g_tx.connected)) {
+                    g_tx.connected = false; g_tx.failed = true;
+                    CancelIoEx(h, nullptr); // wake serve() and let its normal disconnect path reconcile the session
+                    report = true;
+                }
+                g_tx.writing = false;
+            }
+            g_tx.cv.notify_all();
+            if (report) logf("PIPE: outbound connection failed (%s, error=%lu); queued reliable data requires session recovery", failed ? "queue full" : "write", error);
+        }
+        if (trace.result) {
+            hits::log_pvp_trace(trace);
+            const auto dropped = g_tx.pvpTraceDropped.exchange(0, std::memory_order_relaxed);
+            if (dropped)
+                logf("WO121-HITS trace_dropped=%llu reason=writer-busy-or-full", static_cast<unsigned long long>(dropped));
+        }
     }
 }
 
@@ -348,7 +367,7 @@ void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* 
     const bool sent = send_frame(g_pipe, type, body, len, generation);
     const DWORD err = sent ? 0 : GetLastError();
     LeaveCriticalSection(&g_write_lock);
-    if (!sent) logf("PIPE: %s enqueue failed: %lu", what, err);
+    if (!sent && what) logf("PIPE: %s enqueue failed: %lu", what, err);
 }
 
 // ---- WO-218 A.1: the pipe's batch (wo218_rules.h) -------------------------------------------------------------------------------
@@ -949,7 +968,7 @@ void send_local_action(uint8_t kind, uint8_t phase, int8_t ic, int8_t zone, int8
 void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material,
                   const wo155rules::Observation& observation, uint64_t connection) {
     const auto body = wo155rules::encode_notice(victimEid, st, hp, flags, material, observation);
-    send_unsolicited(kPvpHitOut, body.data(), static_cast<uint16_t>(body.size()), "PvpHit", connection);
+    send_unsolicited(kPvpHitOut, body.data(), static_cast<uint16_t>(body.size()), nullptr, connection);
 }
 
 // WO-210 E.2: the local player's blow on a copy, filtered here (main thread, wo210_hit's tick): the LocalHit frame with no numbers and
@@ -2803,6 +2822,20 @@ void stop() {
 
 bool connected() { return g_connected; }
 uint64_t observation_connection() { return g_connected ? g_connGen.load() + 1 : 0; }
+
+void queue_pvp_trace(const hits::PvpTrace& trace) {
+    if (!g_running) return;
+    // Telemetry must never wait on the writer or compete for an unbounded queue.
+    std::unique_lock<std::mutex> lock(g_tx.mutex, std::try_to_lock);
+    if (!lock || g_tx.pvpTraceCount == g_tx.pvpTraces.size()) {
+        g_tx.pvpTraceDropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const size_t tail = (g_tx.pvpTraceHead + g_tx.pvpTraceCount) % g_tx.pvpTraces.size();
+    g_tx.pvpTraces[tail] = trace;
+    ++g_tx.pvpTraceCount;
+    g_tx.cv.notify_one();
+}
 
 void publish_pvp_life() {
     const uint64_t connection = observation_connection();

@@ -212,6 +212,8 @@
 
 #include <cstdint>
 
+namespace kcdmp::hits { struct PvpTrace; }
+
 namespace kcdmp::pipe {
 
 constexpr uint8_t kApplyDamage        = 0x01;
@@ -378,5 +380,6 @@ void stop();
 bool connected();
 uint64_t observation_connection(); // zero disconnected, otherwise stable for the current pipe
 void publish_pvp_life(); // game tick, emits only when proof or pipe changes
+void queue_pvp_trace(const hits::PvpTrace& trace); // bounded and best effort
 
 } // namespace kcdmp::pipe

@@ -66,6 +66,8 @@ Für H21 den zugehörigen `SaveGame`-Abschluss mit `MP-H21-SNAPSHOT result=paire
 
 `prepare-unchanged` belegt die Fehlergrenze vor der ersten Vorbereitungsmutation. Erst ein nachfolgendes `aborted-before-apply` belegt die Wiederfreigabe. Nach `prepare-uncertain` bleibt selbst `prepare-observed-dead` eine Zustandsbeobachtung ohne Todesgutschrift für den Versuch.
 
+`WO121-HITS` über `measurement_id` an `MP-FF dir=out` anbinden. `publication=bounded` kennzeichnet ein laufendes Messfenster. `publication=final` kennzeichnet das Ende der Beobachtung. Positive Deltas und `missile` beziehen sich auf das ganze Fenster. Für eindeutig einzelne Kontakte getrennte Messwerte führen. Die expliziten Tickfelder verwenden, da der Pipe-Writer zeitversetzt loggt. `trace_dropped` zeigt eine Lücke in der Messreihe.
+
 `MP-LANE2-FF-TIME` über `source`, `contact_seq` und `recipient_life` innerhalb derselben Sitzung verbinden. `relay-read` und `relay-send` benutzen die Relay-Uhr. Bei `client-send` und `client-read` ist `relay_ms` eine Schätzung mit `clock_rtt_ms`. `relay_ms=0` zeigt einen fehlenden Zeitabgleich an. `MP-LANE2-COMBAT event=contact source=pvp` liefert die lokale Ziel-Queue und Engine-Zeit zusammen mit dem Vital-Readback. [Messplan](../../../docs/ABNAHME-LANE2-NAHKAMPF.md)
 
 ## 5. „Fleck für Fleck“-Audit
