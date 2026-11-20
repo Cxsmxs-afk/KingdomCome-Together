@@ -19776,8 +19776,10 @@ function KCD2MP_W144Equip(name, cls, body, revision, birth)
     local w = KCD2MP.w144
     name, cls = tostring(name), tostring(cls)
     local e
+    local id
     if body then
-        e = KCD2MP_W214OutfitEntity(name:match("^kcd2mp_(%d+)$"), body, revision, birth)
+        id = name:match("^kcd2mp_(%d+)$")
+        e = KCD2MP_W214OutfitEntity(id, body, revision, birth)
         if not e then return false end
     else
         e = System.GetEntityByName(name)
@@ -19787,6 +19789,7 @@ function KCD2MP_W144Equip(name, cls, body, revision, birth)
     local it, how = nil, "own"
     pcall(function() it = e.inventory:FindItem(cls) end)
     if not it then
+        if body and not KCD2MP_W214OutfitCanEquip(id, e, body, revision, birth, cls) then return false end
         pcall(function() e.inventory:CreateItem(cls, 1, 1) end)
         pcall(function() it = e.inventory:FindItem(cls) end)
         how = "made"
@@ -19797,6 +19800,7 @@ function KCD2MP_W144Equip(name, cls, body, revision, birth)
         mp_log(string.format("WO144-DRESS %s %s -> no item (CreateItem made nothing)", name, cls))
         return false
     end
+    if body and not KCD2MP_W214OutfitCanEquip(id, e, body, revision, birth, cls) then return false end
     local ok = pcall(function() e.actor:EquipInventoryItem(it) end)
     if ok then w.lightStats.dressed = w.lightStats.dressed + 1 else w.lightStats.dressFail = w.lightStats.dressFail + 1 end
     mp_log(string.format("WO144-DRESS %s %s -> %s (%s) ok=%s", name, cls, tostring(it), how, tostring(ok)))
@@ -36559,21 +36563,31 @@ do
         return g.entity
     end
 
-    function KCD2MP_W214OutfitHandsClear(id, e, item, cls)
+    function KCD2MP_W214OutfitHandsClear(id, e, item, cls, equipClass)
         local g = KCD2MP.ghosts[tostring(id)]
-        if g.w214HandClass and (not cls or g.w214HandClass == cls) then
+        if g.w214HandClass and g.w214HandClass ~= equipClass and (not cls or g.w214HandClass == cls) then
             w214OutfitRefused(id, "requested-hand")
             return false
         end
         for slot = 0, 1 do
             local ok, held = pcall(function() return e.human:GetItemInHand(slot) end)
             local occupied = held and held ~= 0 and tostring(held) ~= "userdata: 0000000000000000"
-            if not ok or (occupied and (not item or held == item or KCD2MP.w136.handClass(e, slot) == cls)) then
+            if not ok or (not equipClass and occupied and (not item or held == item or KCD2MP.w136.handClass(e, slot) == cls)) then
                 w214OutfitRefused(id, "occupied-hand")
                 return false
             end
         end
         return true
+    end
+
+    function KCD2MP_W214OutfitCanEquip(id, e, body, revision, birth, cls)
+        if KCD2MP_W214OutfitEntity(id, body, revision, birth) ~= e then return false end
+        if not KCD2MP_W214On("figure_hands") then return true end
+        -- Read both slots before each mutation. The existing pending-holster
+        -- gate above requires empty hands. Once it clears, the engine owns
+        -- the order of inventory equips within the same confirmed outfit.
+        if not KCD2MP_W214OutfitHandsClear(id, e, nil, nil, cls) then return false end
+        return KCD2MP_W214OutfitEntity(id, body, revision, birth) == e
     end
 
     function KCD2MP_W214OwnHandTick(now, drawn)

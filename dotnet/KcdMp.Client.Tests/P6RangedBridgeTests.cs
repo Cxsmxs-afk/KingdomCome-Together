@@ -615,6 +615,76 @@ public sealed class P6RangedBridgeTests
         Assert.Equal(1, Count(r.Bridge, "ranged_animation_refused"));
         Assert.Equal(0, Get<long>(r.Bridge, "_w201RangedDispatched"));
     }
+
+    [Theory]
+    [InlineData(true, "new-eid")]
+    [InlineData(true, "reused-eid")]
+    [InlineData(true, "unchanged")]
+    [InlineData(false, "new-eid")]
+    [InlineData(false, "reused-eid")]
+    [InlineData(false, "unchanged")]
+    public async Task Ranged_fire_queued_by_the_real_reader_targets_only_its_original_body(bool receiverIsHost, string replacement)
+    {
+        await using var r = await Rig.Create(receiverIsHost);
+        Set(r.Bridge, "_ghostIsolate", false);
+        await r.StartTimedReceiveAsync();
+        byte[] fence = await r.PrimeHandAsync(Bow);
+        r.Game.BlockHorse = true;
+        r.Http.BatchingEnabled = false;
+        long before = r.Link.ReadRequestedAfterBytes;
+        byte[] horse = Wire(Protocol.HorseInfoDown, r.Peer, 0);
+        r.Link.Feed(horse);
+        await r.Game.HorseEntered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+        byte[] fire = TimedFire(r.Peer);
+        byte[] marker = Down(Protocol.W164RangedStep, "after-queued-fire", r.Peer);
+        r.Link.Feed(fire, marker);
+        await Until(() => r.Link.ReadRequestedAfterBytes >= before + horse.Length + fire.Length + marker.Length);
+        if (replacement != "unchanged")
+        {
+            string ghost = r.Peer.ToString();
+            int oldGeneration = (int)Call(r.Bridge, "GhostGeneration", ghost)!;
+            uint newEntity = replacement == "new-eid" ? 333u : 222u;
+            Call(r.Bridge, "OnGameEvent", "ghostid", $"{ghost} {newEntity:X8} B0B219");
+            Assert.Equal(newEntity, Get<ConcurrentDictionary<string, uint>>(r.Bridge, "_ghostEntityIds")[ghost]);
+            Assert.Equal(oldGeneration + 1, (int)Call(r.Bridge, "GhostGeneration", ghost)!);
+        }
+
+        using var quiet = new CancellationTokenSource();
+        byte[] header = new byte[3];
+        Task<bool> nativeRequest = ReadFrameHeaderAsync(r.Server, header, quiet.Token);
+        Task drained = Until(() => Count(r.Bridge, "ranged_malformed") == 1);
+        r.Game.ReleaseHorse.TrySetResult();
+        try
+        {
+            if (replacement == "unchanged")
+            {
+                Assert.Same(nativeRequest, await Task.WhenAny(nativeRequest, drained));
+                Assert.True(await nativeRequest);
+                using var bodyDeadline = new CancellationTokenSource(3500);
+                byte[] request = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
+                await r.Server.ReadExactlyAsync(request, bodyDeadline.Token);
+                AssertRangedFire(header[0], request, RangedWeaponKind.Bow, 3, Bow, fence);
+                await ReplyEdge(r.Server, request, EdgeOutcome.Completed, 1, 0, 0);
+                await drained;
+                Assert.Equal(1, Get<long>(r.Bridge, "_w201RangedDispatched"));
+            }
+            else
+            {
+                Assert.Same(drained, await Task.WhenAny(nativeRequest, drained));
+                await drained;
+                Assert.False(nativeRequest.IsCompleted);
+                Assert.Equal(0, Count(r.Bridge, "ranged_in"));
+                Assert.Equal(0, Get<long>(r.Bridge, "_w201RangedDispatched"));
+            }
+        }
+        finally
+        {
+            quiet.Cancel();
+            await nativeRequest;
+        }
+    }
+
     [Theory]
     [InlineData("unknown")] [InlineData("legacy")] [InlineData("mismatch")] [InlineData("world")] [InlineData("aim")]
     public async Task Unknown_legacy_mismatch_old_world_and_unsupported_aim_never_start_an_animation(string mode)
