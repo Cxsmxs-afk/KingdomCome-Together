@@ -42,13 +42,15 @@ public partial class GameBridge
         foreach (var x in _w154Coalescer.TakeReady(Environment.TickCount64, all))
         {
             var merged = Wo154Rules.WorkerCoalescer.Merged(x);
+            var scope = Wo137CaptureActionScope();
+            if (merged.WorldEpoch != scope.World) continue;
             var more = x.Toks.Skip(1).ToList();
             Console.WriteLine(FormattableString.Invariant(
                 $"MP-W154 host: {x.Path}: {x.Toks.Count} step(s) of an AI behaviour merged -> {x.FirstOld}->{x.LastNew} ({x.LastPort}), judged now"));
             Wo137Post(async () =>
             {
                 _w154AlsoToks.Value = more.Count > 0 ? more : null;
-                try { await Wo137HostRequestAsync(x.Src, x.Toks[0], merged); }
+                try { await Wo137HostRequestAsync(x.Src, x.Toks[0], merged, scope); }
                 finally { _w154AlsoToks.Value = null; }
             });
         }

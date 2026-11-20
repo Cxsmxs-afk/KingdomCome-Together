@@ -613,10 +613,12 @@ public partial class GameBridge
     /// itself (the NPC really died or went down here, this world's own graph led there) = already; else it
     /// is refused and the joiner's copy goes back. True = handled here (the caller does nothing more).
     /// </summary>
-    private async Task<bool> Wo147DestructiveGateAsync(byte src, uint tok, QuestChange req, int hostVal, string hostPort, string head)
+    private async Task<bool> Wo147DestructiveGateAsync(byte src, uint tok, QuestChange req, int hostVal, string hostPort, string head,
+        Wo137ActionScope scope, Func<bool> current)
     {
         if (!_w147QuestSafety) return false;
         var idx = await Wo147QuestIndexAsync();
+        if (!current()) return true;
         string? type = null;
         try
         {
@@ -644,6 +646,7 @@ public partial class GameBridge
             while (sw.ElapsedMilliseconds < Wo147Rules.DestructiveWaitMs)
             {
                 await Task.Delay(500);
+                if (!current()) return;
                 try
                 {
                     var reads = await _combat.Wo137ReadStatesAsync([req.Path]);
@@ -659,15 +662,16 @@ public partial class GameBridge
             var verdict = Wo147Rules.JudgeDestructive(reached, false);
             Wo137Post(async () =>
             {
+                if (!current()) return;
                 if (verdict == Wo147Rules.DestructiveVerdict.Already)
                 {
                     Interlocked.Increment(ref _w147DestructiveAlready); Interlocked.Increment(ref _w137VerdictAlready);
-                    await Wo137ReplyAsync(src, tok, "already", last, hostPort, req.Path);
+                    await Wo137ReplyAsync(src, tok, "already", last, hostPort, req.Path, scope);
                     Console.WriteLine(FormattableString.Invariant($"{head}: this world reached {last} by itself in {sw.ElapsedMilliseconds / 1000.0:F1} s -- already (counted once)"));
                     return;
                 }
                 Interlocked.Increment(ref _w147DestructiveRefused); Interlocked.Increment(ref _w137VerdictRefused);
-                await Wo137ReplyAsync(src, tok, "refused", last, hostPort, req.Path);
+                await Wo137ReplyAsync(src, tok, "refused", last, hostPort, req.Path, scope);
                 Console.WriteLine(FormattableString.Invariant(
                     $"{head}: REFUSED -- this world is still at {last} after {sw.ElapsedMilliseconds / 1000.0:F1} s ({Wo147Rules.DestructionName(kind)} happened only on the joiner's copy); the joiner's copy goes back"));
             });

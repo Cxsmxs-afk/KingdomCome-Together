@@ -1402,12 +1402,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
         return r is { Ok: true } x ? System.Text.Encoding.ASCII.GetString(x.Payload) : null;
     }
 
-    public async Task<(bool Ok, byte Reason, byte[] Payload)?> Wo163Async(byte op, byte[] args, CancellationToken ct = default)
+    public async Task<(bool Ok, byte Reason, byte[] Payload)?> Wo163Async(byte op, byte[] args, CancellationToken ct = default,
+        Func<bool>? beforeWrite = null)
     {
         var p = new byte[1 + args.Length];
         p[0] = op; args.CopyTo(p, 1);
-        var (body, _) = await SendAndAwaitAsync(Wo163, p, Wo163Reply, ct);
-        if (body is null || body.Length < 4) return null;
+        var (body, _) = await SendAndAwaitAsync(Wo163, p, Wo163Reply, ct, beforeWrite, exactSequence: beforeWrite is not null);
+        if (body is null || body.Length < 4 || (beforeWrite is not null && body[2] != op)) return null;
         return (body[0] == 1, body[3], body.AsSpan(4).ToArray());
     }
 
@@ -2134,12 +2135,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
     // ---- WO-137 (native wo137.h) ---------------------------------------------
 
     /// <summary>One WO-137 op: (ok, reason, payload after the 4-byte head), or null when the DLL did not answer.</summary>
-    public async Task<(bool Ok, byte Reason, byte[] Payload)?> Wo137Async(byte op, byte[] args, CancellationToken ct = default)
+    public async Task<(bool Ok, byte Reason, byte[] Payload)?> Wo137Async(byte op, byte[] args, CancellationToken ct = default,
+        Func<bool>? beforeWrite = null)
     {
         var p = new byte[1 + args.Length];
         p[0] = op; args.CopyTo(p, 1);
-        var (body, _) = await SendAndAwaitAsync(Wo137, p, Wo137Reply, ct);
-        if (body is null || body.Length < 4) return null;
+        var (body, _) = await SendAndAwaitAsync(Wo137, p, Wo137Reply, ct, beforeWrite, exactSequence: beforeWrite is not null);
+        if (body is null || body.Length < 4 || (beforeWrite is not null && body[2] != op)) return null;
         return (body[0] == 1, body[3], body.AsSpan(4).ToArray());
     }
 
@@ -2160,19 +2162,36 @@ public sealed partial class CombatPipe : IAsyncDisposable
     public readonly record struct QuestApplied(byte Result, bool OldOk, int Old, bool NewOk, int New, string Type);
 
     /// <summary>op 2: one Set&lt;Value&gt; pulse on a quest State (null = the DLL did not answer).</summary>
-    public async Task<QuestApplied?> Wo137ApplyAsync(uint tag, string path, string port, CancellationToken ct = default, bool mirrorTalker = false)
+    public Task<QuestApplied?> Wo137ApplyAsync(uint tag, string path, string port, CancellationToken ct = default, bool mirrorTalker = false) =>
+        Wo137ApplyCoreAsync(tag, path, port, ct, mirrorTalker, null, null);
+
+    // A host decision is authorized against a specific value. An older DLL
+    // refuses this op without falling back to the unguarded mirror operation.
+    internal Task<QuestApplied?> Wo137ApplyExpectedAsync(uint tag, string path, string port, int expected, int target,
+        Func<bool> current, CancellationToken ct) =>
+        Wo137ApplyCoreAsync(tag, path, port, ct, false, (expected, target), current);
+
+    private async Task<QuestApplied?> Wo137ApplyCoreAsync(uint tag, string path, string port, CancellationToken ct, bool mirrorTalker,
+        (int Expected, int Target)? compare, Func<bool>? beforeWrite)
     {
         byte[] pb = Encoding.ASCII.GetBytes(path), qb = Encoding.ASCII.GetBytes(port);
         if (pb.Length == 0 || pb.Length > 400 || qb.Length == 0 || qb.Length > 100) return null;
         // WO-200: [flags:1] after the port -- 1 = the host's own conversation made this change (wo137.h kApplyMirrorTalker)
-        var a = new byte[4 + 2 + pb.Length + 1 + qb.Length + (mirrorTalker ? 1 : 0)];
+        int tail = 7 + pb.Length + qb.Length;
+        var a = new byte[tail + (compare.HasValue ? 8 : mirrorTalker ? 1 : 0)];
         if (mirrorTalker) a[^1] = 1;
         BinaryPrimitives.WriteUInt32LittleEndian(a, tag);
         BinaryPrimitives.WriteUInt16LittleEndian(a.AsSpan(4), (ushort)pb.Length);
         pb.CopyTo(a, 6);
         a[6 + pb.Length] = (byte)qb.Length;
         qb.CopyTo(a, 7 + pb.Length);
-        var r = await Wo137Async(2, a, ct);
+        if (compare is { } values)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(a.AsSpan(tail), values.Expected);
+            BinaryPrimitives.WriteInt32LittleEndian(a.AsSpan(tail + 4), values.Target);
+        }
+        byte op = compare.HasValue ? Wo137Rules.ApplyExpectedOp : (byte)2;
+        var r = await Wo137Async(op, a, ct, beforeWrite);
         if (r is not { Ok: true } v || v.Payload.Length < 12) return null;
         var b = v.Payload;
         string type = Wo137Rules.ReplyType(b);   // WO-166: the length is byte 11 (it was read at 10: every type printed empty)
@@ -2952,7 +2971,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         await _writeLock.WaitAsync(deadline.Token);
         try
         {
-            if (beforeWrite is not null && !beforeWrite()) throw new OperationCanceledException("teleport proof superseded", ct);
+            if (beforeWrite is not null && !beforeWrite()) throw new OperationCanceledException("pipe write proof superseded", ct);
             return await WriteFrameLockedAsync(type, payload, deadline.Token, expectedPipe);
         }
         finally { _writeLock.Release(); }

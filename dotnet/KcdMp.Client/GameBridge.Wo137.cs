@@ -53,7 +53,7 @@ public partial class GameBridge
     private readonly ConcurrentDictionary<uint, (QuestChange Req, long AtMs)> _w137Asked = new();
     private readonly ConcurrentDictionary<string, string> _w137HostPort = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, (byte Peer, DateTime Since, uint Tok)> _w137TalkHolds = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentQueue<(byte Src, uint Tok, QuestChange Req)> _w137HeldRequests = new();
+    private readonly ConcurrentQueue<(byte Src, uint Tok, QuestChange Req, Wo137ActionScope Scope)> _w137HeldRequests = new();
     private readonly ConcurrentDictionary<string, int> _w137Retries = new(StringComparer.Ordinal);
     private long _w137Out, _w137In, _w137Applied, _w137Unchanged, _w137ApplyFail, _w137AsksOut, _w137AsksIn, _w137Vetoed,
                  _w137Mismatch, _w137Corrected, _w137VerdictApplied, _w137VerdictAlready, _w137VerdictRefused, _w137Checkpoints,
@@ -302,11 +302,21 @@ public partial class GameBridge
             _w137HostSeen.TryRemove(k, out _);
     }
 
-    private async Task Wo137SendAsync(byte type, byte target, byte kind, uint tok, string text)
+    private async Task Wo137SendAsync(byte type, byte target, byte kind, uint tok, string text, Wo137ActionScope? scope = null)
     {
         try
         {
-            await WriteJoinAsync(new LootMsg(kind, tok, text).BuildUp(type, target));
+            var packet = new LootMsg(kind, tok, text).BuildUp(type, target);
+            if (scope is { } action)
+            {
+                if (!Wo137ActionCurrent(action) || action.Relay is not Stream stream) return;
+                await WriteScopedPacketAsync(stream, packet, action.RelayStop, new(
+                    () => Wo137ActionCurrent(action) ? null : "host world or relay changed",
+                    reason => Wo206LogDrop($"quest reply #{tok} to ghost {target}: {reason}"),
+                    () => { if (type == Protocol.QuestHostUp) Interlocked.Increment(ref _w137Out); }));
+                return;
+            }
+            await WriteJoinAsync(packet);
             if (type == Protocol.QuestHostUp) Interlocked.Increment(ref _w137Out);
         }
         catch (Exception ex)
@@ -402,7 +412,8 @@ public partial class GameBridge
                 {
                     Interlocked.Increment(ref _w137AsksIn);
                     var sreq = req with { WorldEpoch = _w206FrameStamp };   // WO-206 E: the world this joiner knew when it asked
-                    Wo137Post(() => Wo137HostRequestAsync(src, m.Tok, sreq));
+                    var scope = Wo137CaptureActionScope();
+                    Wo137Post(() => Wo137HostRequestAsync(src, m.Tok, sreq, scope));
                     return;
                 }
                 case Protocol.QuestAskTalk when Wo137Rules.TryParseTalkText(m.Text, out bool on, out string npc):
@@ -632,32 +643,53 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- host: requests, checkpoints, talk
 
-    private async Task Wo137HostRequestAsync(byte src, uint tok, QuestChange req)
+    private readonly record struct Wo137ActionScope(Stream? Relay, uint World, ulong LoadGeneration,
+        CancellationToken LoadStop, CancellationToken RelayStop);
+
+    private Wo137ActionScope Wo137CaptureActionScope()
+    {
+        var load = LoadSequenceCapture();
+        return new(_wo122Stream, _w206.World, load.Generation, load.Token, _wo122Ct);
+    }
+
+    private bool Wo137ActionCurrent(Wo137ActionScope scope) =>
+        W137Host && scope.Relay is not null && ReferenceEquals(_wo122Stream, scope.Relay) &&
+        scope.World == _w206.World && !scope.RelayStop.IsCancellationRequested &&
+        (!LoadSequenceEnabled || (_worldLoad.Current.Generation == scope.LoadGeneration && !scope.LoadStop.IsCancellationRequested));
+
+    private async Task Wo137HostRequestAsync(byte src, uint tok, QuestChange req, Wo137ActionScope scope)
     {
         // WO-206 E: asked of a world this host has since left (a load: also one that waited out the load in _w137HeldRequests)
-        if (!Wo206Admit(Wo206Cat.Quest, req.WorldEpoch, $"request #{tok} from ghost {src} {req.Path}")) return;
+        if (!Wo137ActionCurrent(scope) || !Wo206Admit(Wo206Cat.Quest, req.WorldEpoch, $"request #{tok} from ghost {src} {req.Path}")) return;
         string head = FormattableString.Invariant($"MP-W137 host: request #{tok} from ghost {src}: {req.Path} {req.Port} {req.Old}->{req.New}");
-        if (!_w137SyncOn) { await Wo137ReplyAsync(src, tok, "off", 0, "", req.Path); Console.WriteLine($"{head}: refused (mp_quest_sync off)"); return; }
-        if (_w137HostPlayer != 0) { await Wo137ReplyAsync(src, tok, "held", 0, "", req.Path); Console.WriteLine($"{head}: held (this game plays player {_w137HostPlayer}, not Henry)"); return; }
+        if (!_w137SyncOn) { await Wo137ReplyAsync(src, tok, "off", 0, "", req.Path, scope); Console.WriteLine($"{head}: refused (mp_quest_sync off)"); return; }
+        if (_w137HostPlayer != 0) { await Wo137ReplyAsync(src, tok, "held", 0, "", req.Path, scope); Console.WriteLine($"{head}: held (this game plays player {_w137HostPlayer}, not Henry)"); return; }
         if (Wo136Holding)
         {
-            _w137HeldRequests.Enqueue((src, tok, req));
+            _w137HeldRequests.Enqueue((src, tok, req, scope));
             Console.WriteLine($"{head}: waits (the host's world is loading)");
             return;
         }
-        if (Wo137Rules.IsDlc(req.Path) || Wo137Rules.PerMachine(req)) { await Wo137ReplyAsync(src, tok, "notquest", 0, "", req.Path); Console.WriteLine($"{head}: refused (not a shared quest State)"); return; }
+        if (Wo137Rules.IsDlc(req.Path) || Wo137Rules.PerMachine(req)) { await Wo137ReplyAsync(src, tok, "notquest", 0, "", req.Path, scope); Console.WriteLine($"{head}: refused (not a shared quest State)"); return; }
         if (_w154Contest.IsContested(req.Path))
         {
             // WO-154 1: this world puts it back by itself -- each world keeps its own
-            await Wo137ReplyAsync(src, tok, Wo154Rules.VerdictContested, 0, "", req.Path);
+            await Wo137ReplyAsync(src, tok, Wo154Rules.VerdictContested, 0, "", req.Path, scope);
             Console.WriteLine($"{head}: contested -- this world re-derives it (a per-player trigger); each world keeps its own value");
             return;
         }
-        if (Wo154CoalesceWorkerRequest(src, tok, req, head)) return;   // WO-154 1: an AI behaviour's steps are judged as their net result
-        var reads = await _combat.Wo137ReadStatesAsync([req.Path]);
+        if (Wo154CoalesceWorkerRequest(src, tok, req with { WorldEpoch = scope.World }, head)) return;   // WO-154 1: an AI behaviour's steps are judged as their net result
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(scope.LoadStop, scope.RelayStop);
+        if (!await _combat.EnsureConnectedAsync(stop.Token)) return;
+        long connection = _combat.EdgeConnectionRevision;
+        bool Current() => Wo137ActionCurrent(scope) && _w137SyncOn && _w137HostPlayer == 0 && !Wo136Holding &&
+            connection == _combat.EdgeConnectionRevision;
+        if (!Current()) return;
+        var reads = await _combat.Wo137ReadStatesAsync([req.Path], stop.Token);
+        if (!Current()) return;
         if (reads is not { Count: 1 } || !reads[0].Found)
         {
-            await Wo137ReplyAsync(src, tok, "notquest", 0, "", req.Path);
+            await Wo137ReplyAsync(src, tok, "notquest", 0, "", req.Path, scope);
             Console.WriteLine($"{head}: refused (no such quest State in the host's world)");
             return;
         }
@@ -669,7 +701,7 @@ public partial class GameBridge
             // WO-151 3.1: a value this State has already passed in the host's world -- never applied again
             Interlocked.Increment(ref _w137VerdictAlready);
             Interlocked.Increment(ref _w151PassedVerdicts);
-            await Wo137ReplyAsync(src, tok, "already", h.Val, hostPort, req.Path);
+            await Wo137ReplyAsync(src, tok, "already", h.Val, hostPort, req.Path, scope);
             Console.WriteLine(FormattableString.Invariant($"{head}: already -- the host's world has passed {req.New} (now {h.Val}): never run again here"));
             return;
         }
@@ -677,47 +709,60 @@ public partial class GameBridge
         {
             case Wo137Rules.Verdict.Already:
                 Interlocked.Increment(ref _w137VerdictAlready);
-                await Wo137ReplyAsync(src, tok, "already", h.Val, hostPort, req.Path);
+                await Wo137ReplyAsync(src, tok, "already", h.Val, hostPort, req.Path, scope);
                 Console.WriteLine(FormattableString.Invariant($"{head}: already done in the host's world (host value {h.Val}) -- counted once"));
                 return;
             case Wo137Rules.Verdict.Refused when W164EscortAccepts(src, req, h.Val, head):
-                await Wo137ApplyRequestAsync(src, tok, req, h.Val, hostPort, head);   // WO-164 ESC: the joiner leads this quest's NPC
+                await Wo137ApplyRequestAsync(src, tok, req, h.Val, hostPort, head, scope, Current, stop.Token);   // WO-164 ESC: the joiner leads this quest's NPC
                 return;
             case Wo137Rules.Verdict.Refused:
                 Interlocked.Increment(ref _w137VerdictRefused);
-                await Wo137ReplyAsync(src, tok, "refused", h.Val, hostPort, req.Path);
+                await Wo137ReplyAsync(src, tok, "refused", h.Val, hostPort, req.Path, scope);
                 Console.WriteLine(FormattableString.Invariant($"{head}: refused -- the host's world is at {h.Val}, not {req.Old} (a step already past, or not reached)"));
                 return;
         }
         // WO-147: a step that fails a quest, cancels an objective or marks someone dead or down is checked
         // against this world first (the field: the joiner's copy of a fist-fight opponent "died" there
         // while he was only down here, and SetNpcIsDead / SetNone / SetFailed failed the quest here).
-        if (await Wo147DestructiveGateAsync(src, tok, req, h.Val, hostPort, head)) return;
-        await Wo137ApplyRequestAsync(src, tok, req, h.Val, hostPort, head);
+        if (await Wo147DestructiveGateAsync(src, tok, req, h.Val, hostPort, head, scope, Current)) return;
+        await Wo137ApplyRequestAsync(src, tok, req, h.Val, hostPort, head, scope, Current, stop.Token);
     }
 
     /// <summary>The apply half of a joiner's request (WO-147: also after a destructive step's check).</summary>
-    private async Task Wo137ApplyRequestAsync(byte src, uint tok, QuestChange req, int hostVal, string hostPort, string head)
+    private async Task Wo137ApplyRequestAsync(byte src, uint tok, QuestChange req, int hostVal, string hostPort, string head,
+        Wo137ActionScope scope, Func<bool> current, CancellationToken stop)
     {
-        var h = (Val: hostVal, Ok: true);
-        var a = await _combat.Wo137ApplyAsync(tok, req.Path, req.Port);
-        if (a is { Result: 0 })
+        if (!current()) return;
+        var a = await _combat.Wo137ApplyExpectedAsync(tok, req.Path, req.Port, hostVal, req.New, current, stop);
+        if (!current())
+        {
+            Wo206LogDrop($"quest request #{tok} from ghost {src} left its host world or pipe before confirmation");
+            return;
+        }
+        if (a is { Result: 0, OldOk: true, NewOk: true } applied && applied.Old == hostVal && applied.New == req.New)
         {
             Interlocked.Increment(ref _w137VerdictApplied);
-            Wo206NoteApplied("quest", req.Path, "joiner-request", Wo206Applied.Sv(a.Value.Old), Wo206Applied.Sv(a.Value.New), req.WorldEpoch);   // WO-206 Part C
-            _w154Contest.NoteImposed(req.Path, a.Value.Old, a.Value.New, Environment.TickCount64);   // WO-154 1
-            await Wo137ReplyAsync(src, tok, "applied", a.Value.New, req.Port, req.Path);
-            Console.WriteLine(FormattableString.Invariant($"{head}: APPLIED to the host's world ({a.Value.Old}->{a.Value.New}); its consequences reach every joiner as changes"));
+            Wo206NoteApplied("quest", req.Path, "joiner-request", Wo206Applied.Sv(applied.Old), Wo206Applied.Sv(applied.New), scope.World);   // WO-206 Part C
+            _w154Contest.NoteImposed(req.Path, applied.Old, applied.New, Environment.TickCount64);   // WO-154 1
+            await Wo137ReplyAsync(src, tok, "applied", applied.New, req.Port, req.Path, scope);
+            Console.WriteLine(FormattableString.Invariant($"{head}: APPLIED to the host's world ({applied.Old}->{applied.New}); its consequences reach every joiner as changes"));
         }
-        else if (a is { Result: 1 })
+        else if (a is { Result: 1, NewOk: true } already && already.New == req.New)
         {
             Interlocked.Increment(ref _w137VerdictAlready);
-            await Wo137ReplyAsync(src, tok, "already", a.Value.New, req.Port, req.Path);
+            await Wo137ReplyAsync(src, tok, "already", already.New, req.Port, req.Path, scope);
             Console.WriteLine($"{head}: already (the engine's own no-op)");
+        }
+        else if (a is { Result: Wo137Rules.ApplyStale, NewOk: true } stale)
+        {
+            Interlocked.Increment(ref _w137VerdictRefused);
+            // This value was read at the mutation boundary. The previous port belongs to an older value.
+            await Wo137ReplyAsync(src, tok, "refused", stale.New, "", req.Path, scope);
+            Console.WriteLine(FormattableString.Invariant($"{head}: refused -- predecessor changed before engine apply ({hostVal}->{stale.New})"));
         }
         else
         {
-            await Wo137ReplyAsync(src, tok, "failed", h.Val, hostPort, req.Path);
+            await Wo137ReplyAsync(src, tok, "failed", hostVal, hostPort, req.Path, scope);
             Console.WriteLine($"{head}: FAILED on the host ({(a is { } x ? Wo137Rules.AppliedName(x.Result) : "no answer from the DLL")})");
         }
     }
@@ -725,16 +770,16 @@ public partial class GameBridge
     private void Wo137ReleaseHeldRequests()
     {
         int n = 0;
-        while (_w137HeldRequests.TryDequeue(out var r)) { var rr = r; Wo137Post(() => Wo137HostRequestAsync(rr.Src, rr.Tok, rr.Req)); n++; }
+        while (_w137HeldRequests.TryDequeue(out var r)) { var rr = r; Wo137Post(() => Wo137HostRequestAsync(rr.Src, rr.Tok, rr.Req, rr.Scope)); n++; }
         if (n > 0) Console.WriteLine($"MP-W137 host: the world has loaded -- {n} joiner request(s) that waited are judged now, in order");
     }
 
-    private async Task Wo137ReplyAsync(byte peer, uint tok, string verdict, int hostVal, string hostPort, string path)
+    private async Task Wo137ReplyAsync(byte peer, uint tok, string verdict, int hostVal, string hostPort, string path, Wo137ActionScope? scope = null)
     {
-        await Wo137SendAsync(Protocol.QuestHostUp, peer, Protocol.QuestHostResult, tok, Wo137Rules.ResultText(verdict, hostVal, hostPort, path));
+        await Wo137SendAsync(Protocol.QuestHostUp, peer, Protocol.QuestHostResult, tok, Wo137Rules.ResultText(verdict, hostVal, hostPort, path), scope);
         // WO-154 1: a merged request answers every step it merged
         if (_w154AlsoToks.Value is { } more)
-            foreach (uint t in more) await Wo137SendAsync(Protocol.QuestHostUp, peer, Protocol.QuestHostResult, t, Wo137Rules.ResultText(verdict, hostVal, hostPort, path));
+            foreach (uint t in more) await Wo137SendAsync(Protocol.QuestHostUp, peer, Protocol.QuestHostResult, t, Wo137Rules.ResultText(verdict, hostVal, hostPort, path), scope);
     }
 
     private Task Wo137SendCheckpointAsync() => Wo137SendCheckpointAsync(null, "periodic");

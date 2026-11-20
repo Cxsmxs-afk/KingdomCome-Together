@@ -104,7 +104,7 @@ public static class Wo154Rules
     public sealed class WorkerCoalescer
     {
         public const long QuietMs = 1500, MaxWaitMs = 5000;
-        public sealed record Item(byte Src, string Path, int FirstOld, int LastNew, string LastPort, byte Flags, int QuestLen,
+        public sealed record Item(byte Src, string Path, int FirstOld, int LastNew, string LastPort, byte Flags, int QuestLen, uint WorldEpoch,
                                   List<uint> Toks, long FirstAtMs, long LastAtMs);
         private readonly List<Item> _items = new();
         public int Count { get { lock (_items) return _items.Count; } }
@@ -114,10 +114,10 @@ public static class Wo154Rules
         {
             lock (_items)
             {
-                int i = _items.FindIndex(x => x.Src == src && x.Path == req.Path);
+                int i = _items.FindIndex(x => x.Src == src && x.Path == req.Path && x.WorldEpoch == req.WorldEpoch);
                 if (i < 0)
                 {
-                    _items.Add(new Item(src, req.Path, req.Old, req.New, req.Port, req.Flags, req.QuestLen, new List<uint> { tok }, nowMs, nowMs));
+                    _items.Add(new Item(src, req.Path, req.Old, req.New, req.Port, req.Flags, req.QuestLen, req.WorldEpoch, new List<uint> { tok }, nowMs, nowMs));
                     return false;
                 }
                 var x = _items[i];
@@ -140,7 +140,7 @@ public static class Wo154Rules
 
         /// <summary>The merged request (its worker flag cleared: judged as one step, never merged again).</summary>
         public static QuestChange Merged(Item x) =>
-            new(0, (byte)(x.Flags & ~QuestChange.FWorker), x.FirstOld, x.LastNew, x.LastPort, "", x.Path, x.QuestLen);
+            new(0, (byte)(x.Flags & ~QuestChange.FWorker), x.FirstOld, x.LastNew, x.LastPort, "", x.Path, x.QuestLen) { WorldEpoch = x.WorldEpoch };
     }
 
     /// <summary>

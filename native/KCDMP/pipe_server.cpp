@@ -639,7 +639,7 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
             return op == wo132::kOpEngage || op == wo132::kOpAvatarSwing || op == wo132::kOpHostThreat ||
                    op == wo132::kOpPlayerFight || op == wo132::kOpHandOver ? LoadAccess::Live : LoadAccess::Control;
         case kWo137:
-            return op == wo137::kOpApply || op == wo137::kOpSetValue ? LoadAccess::Live : LoadAccess::Control;
+            return op == wo137::kOpApply || op == wo137::kOpSetValue || op == wo137::kOpApplyExpected ? LoadAccess::Live : LoadAccess::Control;
         case kWo138:
             return LoadAccess::Control;
         case kWo139:
