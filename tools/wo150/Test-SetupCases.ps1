@@ -191,10 +191,11 @@ function Invoke-ForeignFolderCase($label, $c, [string] $markerKind) {
         New-Item -ItemType Junction -Path $target -Target $dataFolder | Out-Null
     }
     New-Dir "$dataFolder\Data"
-    if ($markerKind -eq 'junction') {
-        Copy-Item "$mirror\kdcmp\mod.manifest" $dataFolder
-    } else {
+    if ($markerKind -eq 'same') {
         Set-Content "$dataFolder\mod.manifest" "other publisher" -Encoding ascii
+    } else {
+        # Keep the packaged manifest so the marker or directory check is the only failing proof.
+        Copy-Item "$mirror\kdcmp\mod.manifest" $dataFolder
     }
     Set-Content "$dataFolder\Data\kdcmp.pak" "other mod payload" -Encoding ascii
     Set-Content "$dataFolder\Data\keep.bin" "unrelated bytes" -Encoding ascii
