@@ -63,6 +63,7 @@ public partial class GameBridge
 
     private bool EngineNoticeBelongsToAnotherJoin(string? path)
     {
+        if (path is not null && Volatile.Read(ref _pinnedHomeLoad) is { } home) return !home.Matches(path);
         if (path is null || _jj is not { } active || OwnLoadExpected) return false;
         var file = path.AsSpan((path.LastIndexOf('/') + 1)..);
         if (file.Length != 19 || !file.StartsWith("mpworld", StringComparison.OrdinalIgnoreCase) ||
@@ -71,6 +72,9 @@ public partial class GameBridge
     }
 
     private bool IgnoreEngineTerminal(LogTailGameTransport engine) =>
+        // The private load worker publishes only the matching terminal, after
+        // giving the file back. Generic or stale gameplay cannot unpin it.
+        Volatile.Read(ref _pinnedHomeLoad) is not null ||
         (!OwnLoadExpected && _jj is not null && engine.DispatchingAmbiguousSaveTerminal) ||
         EngineNoticeBelongsToAnotherJoin(engine.DispatchingTerminalSave);
 }

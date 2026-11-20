@@ -87,6 +87,64 @@ public class Wo124Tests : IDisposable
 
     // ---------------------------------------------------------------- Phase 3: the transient file
 
+    [Theory]
+    [InlineData("unmarked-exit")]
+    [InlineData("legacy-filename")]
+    [InlineData("legacy-hash")]
+    [InlineData("legacy-window")]
+    public void Sweep_preserves_files_without_a_bound_engine_owner(string source)
+    {
+        const uint seed = 417;
+        string p = Header("playline2", source == "unmarked-exit" ? "mpexit01020304.whs" : "quicksave012.whs", 10);
+        byte[] bytes = WhsSaveTests.File(new WhsSaveTests.Spec { Seed = seed });
+        File.WriteAllBytes(p, bytes);
+        DateTime observed = File.GetLastWriteTimeUtc(p);
+        string data = Path.Combine(_saves, "data");
+        var store = new HenryStore(Path.Combine(data, "henry"));
+        if (source != "unmarked-exit")
+            store.LedgerAdd(new HenryStore.LedgerEntry
+            {
+                Playline = 2, SinceUtc = observed.AddSeconds(-1), WorldTag = WhsSave.SeedTag(seed), Kind = "snapshot",
+                File = source == "legacy-window" ? null : Path.GetFileName(p),
+                Md5 = source == "legacy-hash" ? WhsSave.Verify(bytes).Md5 : null,
+            });
+        int moved = SweepWithData("before a join");
+        Console.WriteLine($"SAVE-AUDIT source={source} moved={moved} source_exists={File.Exists(p)}");
+        Assert.Equal(0, moved);
+        Assert.Equal(bytes, File.ReadAllBytes(p));
+    }
+
+    [Fact]
+    public void Sweep_cannot_trigger_rotation_of_unowned_archived_files()
+    {
+        string data = Path.Combine(_saves, "data");
+        string swept = Path.Combine(data, "henry", "swept");
+        Directory.CreateDirectory(swept);
+        var archived = Enumerable.Range(0, 10).Select(i => Path.Combine(swept, $"old-profile-{i}.whs")).ToArray();
+        for (int i = 0; i < archived.Length; i++) File.WriteAllText(archived[i], $"fixture {i}");
+        Header("playline2", "mpexit01020304.whs", 10);
+        int moved = SweepWithData("agent start");
+        Console.WriteLine($"SAVE-AUDIT source=rotation moved={moved} archived_remaining={archived.Count(File.Exists)}");
+        for (int i = 0; i < archived.Length; i++) Assert.Equal($"fixture {i}", File.ReadAllText(archived[i]));
+    }
+
+    private int SweepWithData(string reason)
+    {
+        const string saveVar = "KCDMP_JOIN_SAVES_DIR", dataVar = "KCDMP_DATA_DIR";
+        string? oldSaves = Environment.GetEnvironmentVariable(saveVar), oldData = Environment.GetEnvironmentVariable(dataVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(saveVar, _saves);
+            Environment.SetEnvironmentVariable(dataVar, Path.Combine(_saves, "data"));
+            return new GameBridge(new ClientConfig()).Wo125Sweep(reason);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(saveVar, oldSaves);
+            Environment.SetEnvironmentVariable(dataVar, oldData);
+        }
+    }
+
     [Fact]
     public void Startup_sweep_removes_the_marked_join_world_and_preserves_unmarked_files()
     {
@@ -114,7 +172,7 @@ public class Wo124Tests : IDisposable
             Environment.SetEnvironmentVariable(saveVar, _saves);
             Environment.SetEnvironmentVariable(dataVar, data);
             var restarted = new GameBridge(new ClientConfig());
-            Assert.Equal(1, restarted.Wo125Sweep("before a join")); // Legacy mpexit handling still runs.
+            Assert.Equal(0, restarted.Wo125Sweep("before a join"));
             Assert.True(File.Exists(marked));
             Assert.Equal(1, restarted.Wo125Sweep("agent start"));
         }
@@ -127,9 +185,8 @@ public class Wo124Tests : IDisposable
         Assert.Equal(ownBytes, File.ReadAllBytes(personal));
         Assert.Equal(joinBytes, File.ReadAllBytes(unmarked));
         Assert.True(File.Exists(copiedFolder));
-        Assert.False(File.Exists(oldExit));
-        string sweptExit = Assert.Single(Directory.EnumerateFiles(Path.Combine(data, "henry", "swept")));
-        Assert.Equal(exitBytes, File.ReadAllBytes(sweptExit));
+        Assert.Equal(exitBytes, File.ReadAllBytes(oldExit));
+        Assert.False(Directory.Exists(Path.Combine(data, "henry", "swept")));
     }
 
     [Fact]

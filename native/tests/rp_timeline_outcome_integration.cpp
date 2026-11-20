@@ -31,6 +31,9 @@ struct Simulation {
     bool mode = true, protectedVisual = true;
     rttr::SwingResult providerResult = rttr::SwingResult::Ok;
     unsigned typedCalls = 0, legacyCalls = 0;
+    unsigned rangedCalls = 0;
+    timelineactions::HandSlot handSlot = timelineactions::HandSlot::Left;
+    timelineactions::HandItemClass hand{0xA7};
     std::vector<std::string> logs;
 } sim;
 
@@ -74,6 +77,50 @@ bool begin(bool admit = true, uint8_t kind = rpcombat::kSwing) {
 
 void pose_pulse(uint64_t ageMs = 0, uint64_t hostMs = kHostMs) {
     sim.pose = {sim.scope.lifecycle, sim.scope.connection, sim.scope.life, sim.scope.load, ageMs, hostMs};
+}
+
+bool confirm_ranged_hand(uint64_t revision, timelineactions::HandSlot slot) {
+    using namespace timelineactions;
+    sim.handSlot = slot;
+    if (slot == HandSlot::Unknown) sim.hand = {};
+    else sim.hand = {0xA7};
+    std::array<uint8_t, kRangedHandDeclareSize> bytes{};
+    bytes[0] = kRangedHandVersion;
+    bytes[1] = static_cast<uint8_t>(HandOperation::Declare);
+    bytes[2] = kPeer;
+    loadsequence::write_le(bytes.data() + 3, kEid, 4);
+    loadsequence::write_le(bytes.data() + 7, 19, 8);
+    loadsequence::write_le(bytes.data() + 15, 2, 4);
+    loadsequence::write_le(bytes.data() + 19, 0x1234AA, 4);
+    loadsequence::write_le(bytes.data() + 23, revision, 8);
+    std::copy(sim.hand.begin(), sim.hand.end(), bytes.begin() + 31);
+    bytes[47] = slot == HandSlot::Unknown ? 0 : kHandDrawn;
+    loadsequence::write_le(bytes.data() + 48, 1, 4);
+    loadsequence::write_le(bytes.data() + 52, 1, 8);
+    if (handle_ranged_hand(bytes.data(), bytes.size(), sim.scope).result != Accepted) return false;
+    bytes[1] = static_cast<uint8_t>(HandOperation::Observe);
+    const auto actual = handle_ranged_hand(bytes.data(), kRangedHandObserveSize, sim.scope);
+    return actual.result == Accepted && actual.known == 3 &&
+        (slot == HandSlot::Left ? actual.left : actual.right) == sim.hand;
+}
+
+timelineactions::Receipt submit_ranged(uint64_t revision, uint16_t sequence) {
+    std::array<uint8_t, rpcombat::kActionHeader + rpcombat::kRangedPayloadSize> bytes{};
+    bytes[0] = kPeer;
+    loadsequence::write_le(bytes.data() + 1, kEid, 4);
+    loadsequence::write_le(bytes.data() + 5, kHostMs, 8);
+    loadsequence::write_le(bytes.data() + 13, sequence, 2);
+    bytes[15] = rpcombat::kRanged;
+    bytes[16] = timelineactions::kCommit;
+    bytes[17] = rpcombat::kRangedProtocolVersion;
+    bytes[18] = 1;
+    bytes[19] = 3;
+    bytes[20] = 0xA7;
+    loadsequence::write_le(bytes.data() + 36, 19, 8);
+    loadsequence::write_le(bytes.data() + 44, 2, 4);
+    loadsequence::write_le(bytes.data() + 48, 0x1234AA, 4);
+    loadsequence::write_le(bytes.data() + 52, revision, 8);
+    return timelineactions::submit_combat(bytes.data(), bytes.size(), sim.scope, sim.now);
 }
 
 unsigned logs_with(const char* result, const char* reason, const char* dispatch, const char* terminal = "1") {
@@ -147,8 +194,26 @@ bool rp_knockout(uint32_t, bool, uint64_t) { return false; }
 void rp_knockout_tick() {}
 }
 namespace kcdmp::wo143 {
-bool rp_ranged_available(uint32_t, const uint8_t[16]) { return false; }
-bool rp_ranged(uint32_t, uint8_t, uint8_t, const uint8_t[16], uint64_t) { return false; }
+bool rp_ranged_available(uint32_t eid, const uint8_t expected[16], timelineactions::HandSlot slot) {
+    return eid == kEid && slot != timelineactions::HandSlot::Unknown && sim.handSlot == slot &&
+           std::equal(sim.hand.begin(), sim.hand.end(), expected);
+}
+uint8_t rp_observe_hands(uint32_t eid, std::array<uint8_t, 16>& left, std::array<uint8_t, 16>& right) {
+    if (eid != kEid) return 0;
+    left = sim.handSlot == timelineactions::HandSlot::Left ? sim.hand : timelineactions::HandItemClass{};
+    right = sim.handSlot == timelineactions::HandSlot::Right ? sim.hand : timelineactions::HandItemClass{};
+    return 3;
+}
+bool rp_ranged(uint32_t eid, uint8_t, uint8_t, const uint8_t expected[16],
+               timelineactions::HandSlot slot, uint64_t token) {
+    if (!rp_ranged_available(eid, expected, slot)) return false;
+    sim.token = token;
+    ++sim.rangedCalls;
+    return true;
+}
+}
+namespace kcdmp::edgeconsole {
+Result present_ranged_hand(const timelineactions::RangedHandRequest&, const uint8_t[16]) { return Result::Returned; }
 }
 namespace kcdmp::wo187 {
 void note_move(uint32_t) {}
@@ -186,6 +251,43 @@ int rp_timeline_outcome_integration(int* passed) {
         if (ok) ++ok_count;
         else { ++failed; std::printf("H15 FAIL %s\n", name); }
     };
+
+    check(begin(false) && confirm_ranged_hand(1, HandSlot::Left) && submit_ranged(1, kSequence) == Accepted,
+          "H4 confirmed left hand admits the typed Fire");
+    tick();
+    check(kcdmp::rpcombat::snapshot().actions_pending == 1 && sim.rangedCalls == 0,
+          "H4 accepted Fire waits for the timeline before the engine call");
+    check(confirm_ranged_hand(2, HandSlot::Unknown) && confirm_ranged_hand(3, HandSlot::Right),
+          "H4 the same GUID is confirmed in the right slot after holster");
+    sim.target = sim.applied = kHostMs;
+    tick();
+    check(sim.rangedCalls == 0 && logs_with("refused", "ranged-hand-stale", "not-started") == 1,
+          "H4 old accepted Fire reaches the engine zero times after a same-GUID redraw");
+    check(submit_ranged(3, kSequence + 1) == Accepted, "H4 the current right-hand Fire is admitted");
+    tick();
+    observed(sim.token, true);
+    check(submit_ranged(3, kSequence + 1) == Accepted && sim.rangedCalls == 1 &&
+          kcdmp::rpcombat::snapshot().actions_played == 1,
+          "H4 the current Fire installs exactly once despite a repeated submit");
+
+    // On that same binding, H15 must still play a typed melee row when
+    // the target clock is missing and a recent matching pose is available.
+    sim.target = sim.applied = 0;
+    const uint64_t meleeHostMs = kHostMs + 20;
+    const uint16_t meleeSequence = kSequence + 2;
+    check(submit(sim.scope, sim.now, meleeHostMs, meleeSequence) == Accepted,
+          "H4/H15 shared binding admits a melee row after the fenced Fire");
+    sim.now += kPoseWaitMs;
+    pose_pulse(0, meleeHostMs);
+    tick();
+    observed(sim.token, true);
+    const bool meleeInstalledFromLivePose = std::any_of(sim.logs.begin(), sim.logs.end(), [](const std::string& line) {
+        return line.find(" result=installed ") != std::string::npos &&
+               line.find(" reason=guarded-live-pose ") != std::string::npos;
+    });
+    check(meleeInstalledFromLivePose && sim.typedCalls == 1 && sim.rangedCalls == 1 &&
+          kcdmp::rpcombat::snapshot().actions_played == 2,
+          "H4/H15 guarded-live-pose plays once without disturbing the hand-fenced ranged result");
 
     check(begin(), "admit ordinary action");
     check(kcdmp::rpcombat::snapshot().actions_in == 1 && kcdmp::rpcombat::snapshot().actions_played == 0 &&
@@ -263,6 +365,64 @@ int rp_timeline_outcome_integration(int* passed) {
     pose_pulse(0, 0);
     check(submit(sim.scope, sim.now) == Blocked && sim.typedCalls == actionCount,
           "target and pose stamp loss cannot reopen a retired action ID");
+
+    check(begin(false), "register row for prolonged loss of both presentation clocks");
+    constexpr uint16_t unclockedCapacity = 256;
+    bool unclockedAdmitted = true, unclockedSettled = true;
+    for (uint16_t i = 0; i < unclockedCapacity; ++i) {
+        const uint64_t hostMs = kHostMs + static_cast<uint64_t>(i) * kPoseWaitMs;
+        pose_pulse(0, 0);
+        unclockedAdmitted &= submit(sim.scope, sim.now, hostMs, kSequence + i) == Accepted;
+        sim.now += kPoseWaitMs;
+        pose_pulse(0, 0);
+        tick();
+        observed(sim.token, true);
+        const auto counts = kcdmp::rpcombat::snapshot();
+        unclockedSettled &= counts.actions_pending == 0 && counts.actions_played == static_cast<unsigned>(i) + 1;
+    }
+    check(unclockedAdmitted && unclockedSettled && sim.typedCalls == unclockedCapacity && sim.legacyCalls == 0,
+          "256 unstamped live poses each complete one action without retaining pending work");
+
+    const uint16_t nextSequence = kSequence + unclockedCapacity;
+    const uint64_t nextHostMs = kHostMs + unclockedCapacity * kPoseWaitMs;
+    pose_pulse(0, 0);
+    const auto saturated = submit(sim.scope, sim.now, nextHostMs, nextSequence);
+    const auto knownDuplicate = submit(sim.scope, sim.now);
+    tick();
+    check(saturated == Blocked && knownDuplicate == Accepted && sim.typedCalls == unclockedCapacity &&
+          kcdmp::rpcombat::snapshot().actions_in == unclockedCapacity && kcdmp::rpcombat::snapshot().actions_pending == 0,
+          "receipt capacity rejects action 257 and duplicate lookup creates no new work");
+
+    pose_pulse(0, nextHostMs);
+    --sim.pose.life;
+    check(submit(sim.scope, sim.now, nextHostMs, nextSequence) == Blocked && sim.typedCalls == unclockedCapacity,
+          "a stamp from another life cannot reopen receipt capacity");
+
+    // Use a new sequence for the recovery input. The earlier saturation refusal was never queued.
+    pose_pulse(0, nextHostMs);
+    const auto recovered = submit(sim.scope, sim.now, nextHostMs, nextSequence + 1);
+    check(recovered == Accepted && submit(sim.scope, sim.now) == Blocked,
+          "a live stamp in the current scope reopens admission and leaves retired IDs stale");
+    sim.now += kPoseWaitMs;
+    pose_pulse(0, nextHostMs);
+    tick();
+    observed(sim.token, true);
+    sim.target = sim.applied = nextHostMs + kPoseWaitMs;
+    const auto timedAfterRecovery = submit(sim.scope, sim.now, sim.target, nextSequence + 2);
+    tick();
+    observed(sim.token, true);
+    const auto recoveredCounts = kcdmp::rpcombat::snapshot();
+    check(timedAfterRecovery == Accepted && sim.typedCalls == unclockedCapacity + 2 && sim.legacyCalls == 0 &&
+          recoveredCounts.actions_in == unclockedCapacity + 2 && recoveredCounts.actions_played == unclockedCapacity + 2 &&
+          recoveredCounts.actions_pending == 0 && submit(sim.scope, sim.now) == Blocked,
+          "guarded and timed work both resume once without replay or backlog");
+    std::printf("H15 unstamped_capacity=%u blocked_257=%u cached_duplicate=%u recovery=%u timed_recovery=%u "
+                "typed_calls=%u legacy_calls=%u admitted=%llu installed=%llu pending=%llu\n",
+                static_cast<unsigned>(unclockedCapacity), static_cast<unsigned>(saturated), static_cast<unsigned>(knownDuplicate),
+                static_cast<unsigned>(recovered), static_cast<unsigned>(timedAfterRecovery), sim.typedCalls, sim.legacyCalls,
+                static_cast<unsigned long long>(recoveredCounts.actions_in),
+                static_cast<unsigned long long>(recoveredCounts.actions_played),
+                static_cast<unsigned long long>(recoveredCounts.actions_pending));
 
     check(begin(), "admit action with an old-life pose");
     sim.now += kPoseWaitMs;

@@ -14,6 +14,7 @@ namespace kcdmp::edgelanes {
 constexpr uint8_t kReply = 0xB8, kRawPose = 0x39, kProbe = 0x3A, kProbeReply = 0xBA;
 constexpr uint8_t kTimedAction = 0x3B, kTimedPose = 0x3C, kTimelineConfig = 0x3D;
 constexpr uint8_t kRemoteRelocation = 0x3E, kCombatRow = 0x3F, kCombatEvent = 0x40;
+constexpr uint8_t kRangedHand = 0x41, kRangedHandReply = 0xBB;
 constexpr uint8_t kVersion = 1;
 constexpr size_t kRequestHeader = 10, kReplyHeader = 6;
 constexpr size_t kRtLimit = 192, kBulkLimit = 256;
@@ -23,6 +24,14 @@ constexpr auto kPendingAfter = std::chrono::milliseconds(30);
 constexpr auto kNoticeWaitSlice = std::chrono::milliseconds(5);
 enum class Lane : uint8_t { Realtime = 1, Bulk = 2, Latest = 3 };
 enum class Status : uint8_t { Completed = 0, Busy = 1, Unsupported = 2, Superseded = 3, Invalid = 4, Faulted = 5, Pending = 6 };
+
+constexpr uint8_t typed_reply(uint8_t request) {
+    switch (request) {
+        case kProbe: return kProbeReply;
+        case kRangedHand: return kRangedHandReply;
+        default: return 0;
+    }
+}
 
 inline uint32_t read_u32(const uint8_t* b) {
     return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);

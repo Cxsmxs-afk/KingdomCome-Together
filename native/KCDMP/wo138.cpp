@@ -693,6 +693,8 @@ double g_joinSince = 0, g_joinDeadline = 0;
 }
 
 bool join_hold(bool on, double maxS) {
+    // Also covers the nested PauseGame hook, cold instance scan and fault trace.
+    deferred_log::Scope diagnostic;
     void* ca = g_cryAction.load();
     if (!ca && (ca = scan_cryaction()) != nullptr) g_cryAction = ca;
     if (!g_gateArmed || !ca) { logf("WO151-JOINHOLD %s refused: %s", on ? "on" : "off", !g_gateArmed ? "the PauseGame gate is not armed" : "no CCryAction instance yet"); return false; }
@@ -718,6 +720,7 @@ uint16_t pause_sources() { return held_mask(); }
 void tick() {
     const double now = now_s();
     if (g_joinHeld.load() && now > g_joinDeadline) {   // WO-151: the DLL's own deadline -- never a stuck world
+        deferred_log::Scope diagnostic;
         logf("WO151-JOINHOLD the deadline passed -- released by the DLL");
         join_hold(false, 0);
     }
@@ -732,7 +735,11 @@ void tick() {
 }
 
 void on_pipe_closed(bool releaseLegacyHold) {
-    if (releaseLegacyHold && g_joinHeld.load()) main_thread::post([] { logf("WO151-JOINHOLD the agent went away -- released"); join_hold(false, 0); });
+    if (releaseLegacyHold && g_joinHeld.load()) main_thread::post([] {
+        deferred_log::Scope diagnostic;
+        logf("WO151-JOINHOLD the agent went away -- released");
+        join_hold(false, 0);
+    });
     if (g_on.exchange(false)) logf("WO138-SEND off (the agent went away)");
     if (g_leversOn.exchange(false)) logf("WO138-LEVERS off (the agent went away): menus pause again");
     npcdrive::set_hold_all(false);

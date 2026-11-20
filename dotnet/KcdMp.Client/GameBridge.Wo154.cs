@@ -42,13 +42,15 @@ public partial class GameBridge
         foreach (var x in _w154Coalescer.TakeReady(Environment.TickCount64, all))
         {
             var merged = Wo154Rules.WorkerCoalescer.Merged(x);
+            var scope = Wo137CaptureActionScope();
+            if (merged.WorldEpoch != scope.World) continue;
             var more = x.Toks.Skip(1).ToList();
             Console.WriteLine(FormattableString.Invariant(
                 $"MP-W154 host: {x.Path}: {x.Toks.Count} step(s) of an AI behaviour merged -> {x.FirstOld}->{x.LastNew} ({x.LastPort}), judged now"));
             Wo137Post(async () =>
             {
                 _w154AlsoToks.Value = more.Count > 0 ? more : null;
-                try { await Wo137HostRequestAsync(x.Src, x.Toks[0], merged); }
+                try { await Wo137HostRequestAsync(x.Src, x.Toks[0], merged, scope); }
                 finally { _w154AlsoToks.Value = null; }
             });
         }
@@ -255,8 +257,7 @@ public partial class GameBridge
             // WO-155 live check: this player's friendly-fire hit on that avatar, as the DLL's 0x97 frame reports one
             // (sent to the relay, noted as the cause of the knockdown that follows on his screen)
             float hpv = float.Parse(p[2], CultureInfo.InvariantCulture), stv = float.Parse(p[3], CultureInfo.InvariantCulture);
-            await OnPvpHitAsync(CapturePvpHitTarget(ffEid), ffEid, stv, hpv,
-                p.Length > 4 && p[4] == "unarmed" ? PlayerHitV8.FlagUnarmed : (byte)0, 0);
+            await SendDiagnosticPvpHitAsync(ffEid, stv, hpv, p.Length > 4 && p[4] == "unarmed" ? PlayerHitV8.FlagUnarmed : (byte)0);
             Console.WriteLine($"MP-W154 check: friendly-fire hit on ghost {p[1]}: hp={hpv} st={stv} (the same path as a real hit)");
         }
         else Console.WriteLine("MP-W154 check: hostfight <w154_npc> [secs] | hostfight off | pursue <w154_npc> <ghost> on|off | ffhit <ghost> <hp> <st> [unarmed] | where | status");

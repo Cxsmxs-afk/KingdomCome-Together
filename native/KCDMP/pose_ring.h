@@ -163,6 +163,7 @@ struct Pose {
     uint64_t hostMs = 0, hostAtArrivalMs = 0, stateHostMs = 0;
     uint64_t readerLife = 0;
     std::array<uint8_t, kStateBytes> state{};
+    rangedaim::TimedState ranged{};
     bool ghost() const { return kind == kGhost; }
 };
 
@@ -211,6 +212,7 @@ inline bool decode(const uint8_t* bytes, size_t size, Pose& pose, bool timed = f
             std::memcpy(pose.state.data(), payload + tail, kStateBytes);
             pose.stateQpc = pose.arrivalQpc;
             pose.stateHostMs = pose.hostMs;
+            pose.ranged = rangedaim::decode_state(pose.state.data(), pose.stateHostMs);
             tail += kStateBytes;
         }
         if ((ghostFlags & 0x08) && length == tail + 4) pose.senderMs = u32(payload + tail);
@@ -281,11 +283,14 @@ public:
         if (it != pending_.end()) {
             const Pose& old = it->second.pose;
             if (!newer(pose, old, senderClock)) return Put::Superseded;
-            if (!pose.stateQpc && old.stateQpc && pose.kind == old.kind && pose.source == old.source &&
+            if (pose.kind == old.kind && pose.source == old.source &&
                 (pose.hostMs == 0) == (old.hostMs == 0)) {
-                pose.state = old.state;
-                pose.stateQpc = old.stateQpc;
-                pose.stateHostMs = old.stateHostMs;
+                if (!pose.stateQpc && old.stateQpc) {
+                    pose.state = old.state;
+                    pose.stateQpc = old.stateQpc;
+                    pose.stateHostMs = old.stateHostMs;
+                }
+                if (pose.ranged.hostMs < old.ranged.hostMs) pose.ranged = old.ranged;
             }
             it->second = {pose, ++next_};
         } else {

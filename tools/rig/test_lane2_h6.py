@@ -88,7 +88,7 @@ class H6EvidenceTests(unittest.TestCase):
     def test_failed_preparation_cannot_count_or_later_dispatch_for_the_same_attempt(self):
         rows = death_rows()
         dispatched = next(i for i, row in enumerate(rows) if 'attempt=1 ' in row and 'stage=death-dispatched' in row)
-        for marker in ('preparation-not-started', 'preparation-uncertain'):
+        for marker in h6.FAILED_PREPARATION:
             failed_preparation = rows[dispatched].replace('stage=death-dispatched', f'stage={marker}')
             incomplete = [*rows[:dispatched], failed_preparation, *rows[dispatched + 3:]]
             report = self.check(incomplete)

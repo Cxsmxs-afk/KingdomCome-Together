@@ -115,6 +115,8 @@ add_library(KCDMP SHARED
 
 target_include_directories(KCDMP PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(KCDMP PROPERTIES OUTPUT_NAME "KCDMP")
+# The Windows pipe smoke locates the real dispatcher without adding exports to the player DLL.
+target_link_options(KCDMP PRIVATE "/MAP:${CMAKE_CURRENT_BINARY_DIR}/KCDMP.map")
 # WO-211 0.2: the build id (tools/Write-BuildId.ps1 writes the repo root's git-ignored BUILD_ID: the short commit and the build time);
 # a change re-runs the configure step. No file: "dev".
 set(KCDMP_BUILD_ID_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../BUILD_ID")

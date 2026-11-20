@@ -54,7 +54,8 @@ public partial class GameBridge
     private readonly List<W200Quiet> _w200Quiet = new();
 
     // the host's replay queue (behind a load or a catch-up)
-    private readonly ConcurrentQueue<(byte Src, uint Tok, uint Closure, uint Seq, string Port, string Path, long AtMs)> _w200HostQueue = new();
+    private sealed record W200HostReplay(byte Src, uint Tok, uint Closure, string Port, string Path, long AtMs, Wo137ActionScope Scope);
+    private ConcurrentQueue<W200HostReplay> _w200HostQueue = new();
 
     private long _w200Captured, _w200CapturedOwn, _w200ReplaysSent, _w200AckRan, _w200AckRefused, _w200Suppressed, _w200FellBack,
                  _w200QuietDrops, _w200QuietAgreed, _w200QuietDiffers, _w200ReplaysIn, _w200ReplaysRan, _w200ReplaysRefused, _w200Parks;
@@ -159,7 +160,7 @@ public partial class GameBridge
         _w200Caps.Clear();
         lock (_w200DlgLock) { _w200DudeConv.Clear(); _w200DudeMono.Clear(); _w200DlgSent = (-1, -1); }
         lock (_w200Lock) { _w200Parked.Clear(); _w200Quiet.Clear(); }
-        while (_w200HostQueue.TryDequeue(out _)) { }
+        Interlocked.Exchange(ref _w200HostQueue, new());
     }
 
     private Wo200QuestGraph? Wo200Graph()
@@ -420,20 +421,21 @@ public partial class GameBridge
 
     private void Wo200OnReplayAsk(byte src, uint tok, string text)
     {
-        if (!Wo200Rules.TryParseReplayText(text, out uint closure, out uint seq, out string port, out string path))
+        if (!Wo200Rules.TryParseReplayText(text, out uint closure, out _, out string port, out string path))
         {
             Console.WriteLine($"MP-W200 host: a replay from ghost {src} refused (malformed)");
             return;
         }
-        Wo221NoteReplay(src, closure);   // WO-221 D.1: a horse node the gate passes in this closure is this joiner's
+        var scope = Wo137CaptureActionScope();
+        if (!Wo137ActionCurrent(scope) || !Wo206Admit(Wo206Cat.Quest, _w206FrameStamp, $"replay #{tok} from ghost {src} {path}")) return;
         Interlocked.Increment(ref _w200ReplaysIn);
         if (!W200("s1_replay"))
         {
-            _ = Wo137SendAsync(Protocol.QuestHostUp, src, Protocol.QuestHostReplayAck, tok, Wo200Rules.AckText(closure, "off", -1, path));
+            _ = Wo137SendAsync(Protocol.QuestHostUp, src, Protocol.QuestHostReplayAck, tok, Wo200Rules.AckText(closure, "off", -1, path), scope);
             Console.WriteLine($"MP-W200 host: replay {closure:X8} from ghost {src} ({path} :: {port}) refused -- s1_replay is off here");
             return;
         }
-        _w200HostQueue.Enqueue((src, tok, closure, seq, port, path, W200Now()));
+        _w200HostQueue.Enqueue(new(src, tok, closure, port, path, W200Now(), scope));
         _ = Wo200HostQueueTickAsync();
     }
 
@@ -443,20 +445,26 @@ public partial class GameBridge
         if (Interlocked.Exchange(ref _w200HostBusy, 1) == 1) return;
         try
         {
-            while (_w200HostQueue.TryPeek(out var q))
+            var queue = _w200HostQueue;
+            while (queue.TryPeek(out var q))
             {
+                if (!Wo137ActionCurrent(q.Scope))
+                {
+                    queue.TryDequeue(out _);
+                    Wo206LogDrop($"quest replay #{q.Tok} from ghost {q.Src} left host world {q.Scope.World}");
+                    continue;
+                }
                 if (Wo136Holding || (_w151CatchUp && !_w151CaughtUp && W137JoinerSession))   // behind a load or a catch-up
                 {
                     if (W200Now() - q.AtMs > 120_000)
                     {
-                        _w200HostQueue.TryDequeue(out _);
-                        _ = Wo137SendAsync(Protocol.QuestHostUp, q.Src, Protocol.QuestHostReplayAck, q.Tok, Wo200Rules.AckText(q.Closure, "refused-notloaded", -1, q.Path));
+                        queue.TryDequeue(out _);
+                        _ = Wo137SendAsync(Protocol.QuestHostUp, q.Src, Protocol.QuestHostReplayAck, q.Tok, Wo200Rules.AckText(q.Closure, "refused-notloaded", -1, q.Path), q.Scope);
                     }
                     return;
                 }
-                _w200HostQueue.TryDequeue(out _);
+                queue.TryDequeue(out _);
                 uint hc = Wo200Rules.HostClosure(q.Src, q.Closure);
-                Wo221NoteReplay(q.Src, hc);   // WO-221 D.1: the gate names the closure this world runs the replay in
                 byte[] pb = Encoding.ASCII.GetBytes(q.Path), qb = Encoding.ASCII.GetBytes(q.Port);
                 var a = new byte[4 + 2 + pb.Length + 1 + qb.Length];
                 BinaryPrimitives.WriteUInt32LittleEndian(a, hc);
@@ -464,14 +472,29 @@ public partial class GameBridge
                 pb.CopyTo(a, 6);
                 a[6 + pb.Length] = (byte)qb.Length;
                 qb.CopyTo(a, 7 + pb.Length);
-                var r = await _combat.Wo163Async(Protocol.Wo200OpReplay, a);
+                using var stop = CancellationTokenSource.CreateLinkedTokenSource(q.Scope.RelayStop, q.Scope.LoadStop);
+                bool Current() => Wo137ActionCurrent(q.Scope) && !Wo136Holding;
+                (bool Ok, byte Reason, byte[] Payload)? r;
+                try
+                {
+                    r = await _combat.Wo163Async(Protocol.Wo200OpReplay, a, stop.Token, beforeWrite: () =>
+                    {
+                        if (!Current()) return false;
+                        // WO-221 D.1: any horse node passed by this closure belongs to the requester.
+                        Wo221NoteReplay(q.Src, q.Closure);
+                        Wo221NoteReplay(q.Src, hc);
+                        return true;
+                    });
+                }
+                catch (OperationCanceledException) when (stop.IsCancellationRequested) { continue; }
+                if (!Current()) continue;
                 byte res = r is { Ok: true, Payload.Length: >= 2 } x ? x.Payload[0] : (byte)6;
                 int rt = r is { Ok: true, Payload.Length: >= 2 } y ? y.Payload[1] : -1;
                 string verdict = Wo200Rules.VerdictOf(res);
                 if (verdict == "ran") Interlocked.Increment(ref _w200ReplaysRan); else Interlocked.Increment(ref _w200ReplaysRefused);
                 Console.WriteLine(FormattableString.Invariant(
                     $"MP-W200 host: replay {q.Closure:X8} from ghost {q.Src} ({q.Path} :: {q.Port}) -> {verdict} (closure {hc:X8}{(verdict == "ran" ? "; its consequences run in this world and reach every joiner as changes" : "; the joiner falls back to its requests")})"));
-                await Wo137SendAsync(Protocol.QuestHostUp, q.Src, Protocol.QuestHostReplayAck, q.Tok, Wo200Rules.AckText(q.Closure, verdict, rt, q.Path));
+                await Wo137SendAsync(Protocol.QuestHostUp, q.Src, Protocol.QuestHostReplayAck, q.Tok, Wo200Rules.AckText(q.Closure, verdict, rt, q.Path), q.Scope);
             }
         }
         finally { Interlocked.Exchange(ref _w200HostBusy, 0); }

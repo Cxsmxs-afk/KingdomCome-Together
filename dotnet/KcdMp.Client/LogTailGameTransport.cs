@@ -25,8 +25,8 @@ namespace KcdMp.Client;
 /// Three things the tail has to survive, all of them observed rather than
 /// hypothetical: the log is huge (3.5 MB during testing) and flooded with
 /// unrelated engine chatter, so it is opened at the end and never re-read; the
-/// game truncates or replaces it on restart, so shrinkage is detected and the
-/// handle reopened; and lines are written while we read, so a trailing partial
+/// game truncates or replaces it on restart, so shrinkage and a new file identity
+/// start a new log incarnation; and lines are written while we read, so a trailing partial
 /// line is held back until its newline arrives.
 /// </summary>
 public sealed class LogTailGameTransport : IGameTransport
@@ -390,6 +390,8 @@ public sealed class LogTailGameTransport : IGameTransport
 
     internal readonly record struct EngineSaveTerminal(string Path, long Incarnation, bool Loaded);
     internal event Action<EngineSaveTerminal>? EngineSaveFinished;
+    internal readonly record struct EngineSaveWrite(string Path, long Incarnation);
+    internal event Action<EngineSaveWrite>? EngineSaveWritten;
     private long _engineLogIncarnation = 1;
     private string? _engineAcceptedSave, _engineReadSave;
     private bool _engineSaveAmbiguous;
@@ -903,6 +905,22 @@ public sealed class LogTailGameTransport : IGameTransport
             }
         }
 
+        if (EngineSaveWritten is { } written)
+        {
+            const string prefix = "SaveGame: '";
+            var saveLine = line.StartsWith("[SAVE GAME] ", StringComparison.Ordinal) ? line[12..] : line;
+            if (saveLine.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                var pathAndResult = saveLine[prefix.Length..];
+                int end = pathAndResult.IndexOf('\'');
+                if (end > 0 && pathAndResult[(end + 1)..].StartsWith(" done.", StringComparison.Ordinal))
+                {
+                    try { written.Invoke(new(QuotedEngineSave(pathAndResult)!, EngineLogIncarnation)); }
+                    catch (Exception ex) { Console.WriteLine($"[save] write receipt handler threw: {ex.GetType().Name}"); }
+                }
+            }
+        }
+
         if (line.StartsWith("CSystem::Quit invoked", StringComparison.Ordinal))
         {
             NewEngineLogIncarnation();
@@ -1016,6 +1034,20 @@ public sealed class LogTailGameTransport : IGameTransport
     private static bool IsEarlyDelivered(string text, int start, int len, string? early) =>
         early is not null && text.AsSpan(start, len).TrimEnd('\r').SequenceEqual(early.AsSpan());
 
+    private static bool RequiresActiveLog(ReadOnlySpan<char> line) =>
+        line.StartsWith("Log Started at ", StringComparison.Ordinal) ||
+        line.StartsWith("CSystem::Quit invoked", StringComparison.Ordinal) ||
+        line.StartsWith("[CryAction] LoadGame: '", StringComparison.Ordinal) ||
+        line.StartsWith("Loading saved game '", StringComparison.Ordinal) ||
+        line.StartsWith("PlayVideoOnly 'main_menu", StringComparison.Ordinal) ||
+        line.StartsWith("Gameplay started", StringComparison.Ordinal) ||
+        line.StartsWith("Exiting to main menu because save game loading failed", StringComparison.Ordinal) ||
+        line.StartsWith("SaveGame: '", StringComparison.Ordinal) ||
+        line.StartsWith("[SAVE GAME] SaveGame: '", StringComparison.Ordinal) ||
+        line.Contains("[KCD2-MP] MOD INIT", StringComparison.Ordinal) ||
+        line.Contains("Sending concept notification 'EntityModuleOnPostLoadGame'", StringComparison.Ordinal) ||
+        line.Contains("Loading screen timeouted while still in post load reconstruction", StringComparison.Ordinal);
+
     private async Task TailLoopAsync(CancellationToken ct)
     {
         var decoder = Encoding.UTF8.GetDecoder();
@@ -1032,56 +1064,109 @@ public sealed class LogTailGameTransport : IGameTransport
         string? earlyDone = null;
         DateTime partialSince = DateTime.MinValue;
 
+        const long PathProbeIntervalMs = 250;
+        long nextPathProbe = 0;
+        bool identityUnavailableLogged = false;
         FileStream? fs = null;
+        FileIdentity? identity = null;
+
+        FileStream OpenLog() => new(_logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
+        static FileIdentity? LogIdentity(FileStream stream)
+        {
+            try { return FileIdentity.TryRead(stream.SafeFileHandle, out var found) ? found : null; }
+            catch (EntryPointNotFoundException) { return null; }
+        }
+
+        void AdoptLog(FileStream stream, FileIdentity? nextIdentity)
+        {
+            // An attach or replacement may contain history from an unrelated run.
+            // Only bytes written after this exact handle was adopted can raise events.
+            stream.Seek(0, SeekOrigin.End);
+            if (nextIdentity is null && !identityUnavailableLogged)
+            {
+                identityUnavailableLogged = true;
+                Console.WriteLine("[logtail] stable file identity unavailable; engine load and save events suppressed");
+            }
+            fs?.Dispose();
+            fs = stream;
+            identity = nextIdentity;
+            NewEngineLogIncarnation();
+            partial.Clear();
+            decoder.Reset();
+            earlyDone = null;
+            partialSince = DateTime.MinValue;
+            nextPathProbe = Environment.TickCount64 + PathProbeIntervalMs;
+        }
+
+        bool PathStillNamesCurrentLog()
+        {
+            nextPathProbe = Environment.TickCount64 + PathProbeIntervalMs;
+            if (identity is not { } held) return false;
+            FileStream? candidate = null;
+            try
+            {
+                candidate = OpenLog();
+                if (LogIdentity(candidate) is not { } current) return false;
+                if (current == held && candidate.Length >= fs!.Position) return true;
+                AdoptLog(candidate, current);
+                candidate = null;
+                return false;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
+            finally { candidate?.Dispose(); }
+        }
+
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 if (fs is null)
                 {
+                    FileStream? opened = null;
                     try
                     {
-                        // FileShare.ReadWrite|Delete: the game holds this open and
-                        // may replace it; refusing to share would fail the open or
-                        // block the game's own writes.
-                        fs = new FileStream(_logPath, FileMode.Open, FileAccess.Read,
-                            FileShare.ReadWrite | FileShare.Delete);
-                        fs.Seek(0, SeekOrigin.End); // only new lines matter
-                        NewEngineLogIncarnation();
-                        partial.Clear();
-                        decoder.Reset();
+                        opened = OpenLog();
+                        AdoptLog(opened, LogIdentity(opened));
+                        opened = null;
                     }
-                    catch
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                     {
                         await Task.Delay(500, ct);
                         continue;
                     }
+                    finally { opened?.Dispose(); }
                 }
 
-                // Rotation or truncation on game restart: the file got shorter
-                // than where we are, so our offset is meaningless. Start over.
+                var reading = fs!;
+                if (Environment.TickCount64 >= nextPathProbe)
+                {
+                    PathStillNamesCurrentLog();
+                    if (!ReferenceEquals(reading, fs)) continue;
+                }
+
                 try
                 {
-                    if (fs.Length < fs.Position)
+                    if (reading.Length < reading.Position)
                     {
                         NewEngineLogIncarnation();
-                        fs.Dispose();
+                        reading.Dispose();
                         fs = null;
                         continue;
                     }
                 }
-                catch
+                catch (IOException)
                 {
                     NewEngineLogIncarnation();
-                    fs.Dispose();
+                    reading.Dispose();
                     fs = null;
                     continue;
                 }
 
                 int read;
-                try { read = await fs.ReadAsync(buffer.AsMemory(0, buffer.Length), ct); }
+                try { read = await reading.ReadAsync(buffer.AsMemory(0, buffer.Length), ct); }
                 catch (OperationCanceledException) { break; }
-                catch { fs.Dispose(); fs = null; continue; }
+                catch (IOException) { reading.Dispose(); fs = null; continue; }
 
                 if (read == 0)
                 {
@@ -1110,10 +1195,16 @@ public sealed class LogTailGameTransport : IGameTransport
                 for (int i = 0; i < text.Length; i++)
                 {
                     if (text[i] != '\n') continue;
-                    if (!IsEarlyDelivered(text, start, i - start, earlyDone)) ProcessLine(text.AsSpan(start, i - start));   // WO-124
+                    // Engine lifecycle also requires the current handle before the next regular probe.
+                    if (!RequiresActiveLog(text.AsSpan(start, i - start)) || PathStillNamesCurrentLog())
+                    {
+                        if (!IsEarlyDelivered(text, start, i - start, earlyDone)) ProcessLine(text.AsSpan(start, i - start));
+                    }
+                    if (!ReferenceEquals(reading, fs)) break;
                     earlyDone = null;
                     start = i + 1;
                 }
+                if (!ReferenceEquals(reading, fs)) continue;
 
                 partial.Clear();
                 if (start < text.Length)

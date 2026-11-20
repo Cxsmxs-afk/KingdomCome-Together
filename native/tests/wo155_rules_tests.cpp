@@ -18,6 +18,19 @@ constexpr double kNever = -1e9;
 int wo155_rules_tests(int* passed) {
     HCHECK(kWindowS == 5.0, "the window is 5 s");
 
+    const Observation capture{0x0807060504030201, 0x1817161514131211, 0x2827262524232221, 0x3837363534333231};
+    const std::array<uint8_t, 46> expectedMelee{
+        0xA1, 0xA2, 0xA3, 0xA4, 0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x40, 0x00, 0x51,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38
+    };
+    HCHECK(encode_notice(0xA4A3A2A1, 1.0f, 2.0f, 0, 0x51, capture) == expectedMelee,
+           "melee native notice keeps HP and stamina and serializes capture start, completion, source life and ID");
+    auto expectedMissile = expectedMelee;
+    expectedMissile[12] = 0x02;
+    HCHECK(encode_notice(0xA4A3A2A1, 1.0f, 2.0f, 0x02, 0x51, capture) == expectedMissile,
+           "avatar missile has its existing flag and the same capture evidence layout as melee");
+
     using kcdmp::rttr::DamageInvocation;
     const Recipient recipient{8, 10, 2, true};
     HCHECK(recipient.matches({8, 10, 2, true}, 11), "the current player life is allowed");
@@ -31,6 +44,50 @@ int wo155_rules_tests(int* passed) {
     HCHECK(!bound.matches({8, 10, 2, true, 52}, 12), "a packet held before the reader cannot use a new native life");
     HCHECK(!bound.matches({8, 10, 2, true, 0}, 12), "an unavailable native life proves no recipient");
     HCHECK(bound.matches({8, 10, 2, true, 51}, 12), "the exact proved life is accepted");
+
+    {
+        WatchSeries series;
+        const WatchCapture first{1000, 19, bound, 44, 0, 3};
+        const WatchCapture lastBeforePublication{1590, 19, bound, 44, 0x02, 5};
+        series.add(lastBeforePublication);
+        series.add(first);  // another hook was queued first
+        const auto initial = series.evidence();
+        HCHECK(!series.due(1599) && series.due(1600) && !initial.ambiguous && initial.tick == 1000 &&
+               initial.flags == 0x02 && initial.material == 3 && initial.source.proof == 51,
+               "latest contact does not extend the publication deadline and cannot replace the earliest evidence");
+        series.advance(1600);
+        const auto trailing = series.evidence();
+        HCHECK(!series.due(2199) && series.due(2200) && trailing.tick == 1000 && trailing.source.proof == 51,
+               "late engine effects keep the previous window's original evidence");
+
+        series.add({2000, 19, bound, 44, 0, 7});
+        series.advance(2200);
+        const auto continued = series.evidence();
+        HCHECK(series.due(2800) && continued.tick == 2000 && continued.flags == 0 && continued.material == 7,
+               "continuous contacts drop the settled window's timestamp and flags");
+    }
+    {
+        const WatchCapture before{1000, 19, bound, 44, 0, 3};
+        const std::array<WatchCapture, 4> changed{{
+            {1700, 19, {8, 1650, 2, true, 52}, 44, 0, 3},
+            {1700, 23, bound, 44, 0, 3},
+            {1700, 19, {8, 10, 3, true, 51}, 44, 0, 3},
+            {1700, 19, bound, 45, 0, 3},
+        }};
+        for (const auto& after : changed) {
+            WatchSeries series;
+            series.add(before);
+            series.advance(1600);
+            series.add(after);
+            const auto mixed = series.evidence();
+            HCHECK(mixed.ambiguous && mixed.tick == before.tick && mixed.source.proof == before.source.proof,
+                   "pending effects spanning a life, world, pipe or victim change cannot adopt the new scope");
+            series.advance(2200);
+            const auto settled = series.evidence();
+            HCHECK(!settled.ambiguous && settled.tick == after.tick && settled.source.proof == after.source.proof,
+                   "fresh evidence is eligible once the preceding attribution window has settled");
+        }
+    }
 
     struct DamageDouble {
         float hp = 95, st = 85;

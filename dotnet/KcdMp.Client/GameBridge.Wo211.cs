@@ -351,8 +351,7 @@ public partial class GameBridge
             var listed = await _combat.SaveListAsync(1, own.Playline, name);
             if (listed is null || !listed.Listed)
             {
-                _henry.MoveOut(path, "a home splice the game did not list");
-                Console.WriteLine($"WO211-HOME the spliced save was not listed after the rescan -- moved out; the own save as it is");
+                Console.WriteLine("WO211-HOME splice retained reason=no-engine-file-proof; the own save as it is");
                 Interlocked.Increment(ref _w211HomeSpliceFails);
                 return null;
             }

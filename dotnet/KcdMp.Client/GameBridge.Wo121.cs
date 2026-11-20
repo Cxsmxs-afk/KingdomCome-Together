@@ -50,7 +50,10 @@ public partial class GameBridge
     private Stream? _wo121Stream;
     private CancellationToken _wo121Ct;
     private volatile PvpContactSession? _wo121ContactSession;
-    private sealed record PvpFrameScope(PvpContactSession Session, long Lifecycle, long Life, long ReadTick, ulong NativeLife = 0);
+    private sealed record PvpFrameScope(PvpContactSession Session, long Lifecycle, long Life, long ReadTick, ulong NativeLife = 0)
+    {
+        public (long Ms, long Rtt) RelayAtRead { get; init; }
+    }
 
     private bool PvpRecipientCurrent(PvpFrameScope scope) =>
         ReferenceEquals(scope.Session, _wo121ContactSession) &&
@@ -58,15 +61,18 @@ public partial class GameBridge
         scope.Life == Interlocked.Read(ref _t3InputLifeRevision) &&
         scope.NativeLife == _combat.PvpNativeLife;
 
-    internal readonly record struct PvpHitTarget(PvpContactSession Session, byte Ghost, ulong Incarnation, ulong Life);
+    internal readonly record struct PvpHitTarget(PvpContactSession Session, byte Ghost, ulong Incarnation, ulong Life, ulong ObservedTick);
 
     internal sealed class PvpContactSession(Stream relay)
     {
         public Stream Relay { get; } = relay;
         private long _sent;
         private readonly (ulong Incarnation, PvpContactWindow Window)[] _received = new (ulong, PvpContactWindow)[256];
-        private readonly (ulong Incarnation, PvpLifeState Life, uint RetiredEntity, bool Detached)[] _targets =
-            new (ulong, PvpLifeState, uint, bool)[256];
+        private readonly (ulong Incarnation, PvpLifeState Life, uint RetiredEntity, bool Detached, ulong ObservedTick)[] _targets =
+            new (ulong, PvpLifeState, uint, bool, ulong)[256];
+        private readonly ulong[] _bodyBoundary = new ulong[256];
+        private ulong _measurementLife;
+        private PvpContactWindow _measurements;
         private PvpLifeState _localLife;
 
         public ulong Next() => (ulong)Interlocked.Increment(ref _sent);
@@ -82,25 +88,49 @@ public partial class GameBridge
             }
         }
 
-        public void NoteTarget(byte ghost, ulong incarnation, uint currentEntity, PvpLifeState life)
+        public bool TryClaimMeasurement(CombatPipe pipe, PvpHitNotice notice)
+        {
+            lock (_received)
+            {
+                if (!pipe.PvpCaptureCurrent(notice)) return false;
+                if (_measurementLife != notice.SourceLifeProof)
+                {
+                    _measurementLife = notice.SourceLifeProof;
+                    _measurements = default;
+                }
+                return _measurements.TryClaim(notice.MeasurementId);
+            }
+        }
+
+        public void NoteTarget(byte ghost, ulong incarnation, uint currentEntity, PvpLifeState life, ulong observedTick)
         {
             lock (_received)
             {
                 ref var target = ref _targets[ghost];
                 if (incarnation > target.Incarnation)
-                    target = (incarnation, life, target.Incarnation != 0 && !target.Detached ? currentEntity : 0, false);
+                    target = (incarnation, life, target.Incarnation != 0 && !target.Detached ? currentEntity : 0, false, observedTick);
                 else if (incarnation == target.Incarnation && life.Revision > target.Life.Revision)
+                {
                     target.Life = life;
+                    target.ObservedTick = Math.Max(target.ObservedTick, observedTick);
+                }
             }
         }
 
-        public (ulong Incarnation, ulong Proof) FindTarget(byte ghost, uint entity)
+        public (ulong Incarnation, ulong Proof, ulong ObservedTick) FindTarget(byte ghost, uint entity)
         {
             lock (_received)
             {
                 var target = _targets[ghost];
-                return entity != target.RetiredEntity ? (target.Incarnation, target.Life.Proof) : default;
+                return entity != target.RetiredEntity
+                    ? (target.Incarnation, target.Life.Proof, Math.Max(target.ObservedTick, _bodyBoundary[ghost]))
+                    : default;
             }
+        }
+
+        public void NoteBodyBinding(byte ghost)
+        {
+            lock (_received) _bodyBoundary[ghost] = (ulong)Environment.TickCount64;
         }
 
         public void NoteBodyDetached(byte ghost)
@@ -110,6 +140,7 @@ public partial class GameBridge
                 ref var target = ref _targets[ghost];
                 target.RetiredEntity = 0;
                 target.Detached = true;
+                _bodyBoundary[ghost] = (ulong)Environment.TickCount64;
             }
         }
 
@@ -136,7 +167,10 @@ public partial class GameBridge
     // The v8 state-block change gate (sender).
     private BodyState2? _st2LastSent;
     private long _st2LastSentTs;
+    private BodyState2? _st2LastRanged;
+    private long _st2LastRangedTs;
     private bool _st2SawAim;
+    private const int RangedPositionIntervalMs = 50; // The native shooting sampler's cadence.
 
     // Whether the local DLL captures committed attacks (Wo121Status) -- when it
     // does, the Lua "combat swing" cue (0x2C) is not sent: the v8 Attack event
@@ -153,6 +187,7 @@ public partial class GameBridge
         _wo121Ct = ct;
         _wo121ContactSession = new(stream);
         _st2LastSent = null;
+        _st2LastRanged = null;
         _st2SawAim = false;
         _combat.OnLocalAction = OnLocalActionAsync;
         _combat.CapturePvpHitTarget = CapturePvpHitTarget;
@@ -306,7 +341,8 @@ public partial class GameBridge
     /// <summary>
     /// The state block to put on this Position packet, or null. Change-gated:
     /// a field change (speed by 10 cm/s or more, direction by 3 units, any
-    /// bit/zone), or the 1 s heartbeat while anything is non-zero.
+    /// bit/zone), or the 1 s heartbeat while anything is non-zero. Ranged
+    /// edges wake this same position loop, with held updates paced at 50 ms.
     /// <paramref name="due"/> is true when a packet should go out for the
     /// state alone (the body stood still but, say, raised a block).
     /// </summary>
@@ -322,18 +358,27 @@ public partial class GameBridge
             || (c.SpeedCm == 0 && l.SpeedCm != 0);
         bool nonZero = c.SpeedCm != 0 || (c.Bits & ~ranged) != BodyState2Bits.None;
         bool elapsed = Stopwatch.GetElapsedTime(_st2LastSentTs, nowTs).TotalMilliseconds >= Protocol.BodyState2HeartbeatMs;
-        due = changed || (nonZero && elapsed);
-        // A position the caller was already going to send carries changed aim values and repeats
-        // the last stance. Continued idle heartbeats also repair a lost or superseded confirmed end.
+        bool carryRanged = c.RangedHeld || (_st2SawAim && c.RangedOff);
+        bool wasHeld = _st2LastRanged is BodyState2 prior && prior.RangedHeld;
+        bool rangedEdge = carryRanged && c.RangedHeld != wasHeld;
+        double rangedAge = carryRanged ? Stopwatch.GetElapsedTime(_st2LastRangedTs, nowTs).TotalMilliseconds : 0;
+        bool rangedDue = carryRanged && (rangedEdge || rangedAge >= Protocol.BodyState2HeartbeatMs ||
+            (rangedAge >= RangedPositionIntervalMs && _st2LastRanged is BodyState2 lastRanged &&
+                Wo201Rules.AimChanged(lastRanged, c)));
+        due = changed || (nonZero && elapsed) || rangedDue;
         if (!consume) return due ? c : null;
-        bool held = (c.Bits & BodyState2Bits.RangedAim) != 0;
-        bool wasHeld = _st2LastSent is BodyState2 last && (last.Bits & BodyState2Bits.RangedAim) != 0;
-        bool aimChanged = _st2LastSent is BodyState2 prior && Wo201Rules.AimChanged(prior, c);
-        if (!due && !aimChanged && !(_st2SawAim && elapsed)) return null;
-        if (held != wasHeld)
+        // Every replacement position can carry the latest confirmed ranged state.
+        // Missing reads leave the receiver's last observation untouched.
+        if (!due && !carryRanged) return null;
+        if (rangedEdge)
             Console.WriteLine(FormattableString.Invariant(
-                $"MP-BOW send held={(held ? 1 : 0)} charge_known={((c.Bits & BodyState2Bits.RangedChargeKnown) != 0 ? 1 : 0)} charge={c.Charge} angles={(held && c.AimYaw != BodyState2.AimAngleUnavailable && c.AimPitch != BodyState2.AimAngleUnavailable ? "measured" : "unavailable")}"));
-        _st2SawAim |= held;
+                $"MP-BOW send held={(c.RangedHeld ? 1 : 0)} charge_known={((c.Bits & BodyState2Bits.RangedChargeKnown) != 0 ? 1 : 0)} charge={c.Charge} angles={(c.RangedHeld && c.AimYaw != BodyState2.AimAngleUnavailable && c.AimPitch != BodyState2.AimAngleUnavailable ? "measured" : "unavailable")}"));
+        if (carryRanged)
+        {
+            _st2SawAim |= c.RangedHeld;
+            _st2LastRanged = c;
+            _st2LastRangedTs = nowTs;
+        }
         _st2LastSent = c;
         _st2LastSentTs = nowTs;
         return c;
@@ -420,44 +465,107 @@ public partial class GameBridge
         foreach (var (key, eid) in _ghostEntityIds)
         {
             if (eid != victimEid || !byte.TryParse(key, out byte ghost)) continue;
-            var (incarnation, life) = session.FindTarget(ghost, victimEid);
-            return new(session, ghost, incarnation, life);
+            var (incarnation, life, observedTick) = session.FindTarget(ghost, victimEid);
+            return new(session, ghost, incarnation, life, observedTick);
         }
         return null;
     }
 
-    /// <summary>The local player hit a peer's avatar (0x97). The avatar kept nothing; the damage goes to its owner.</summary>
-    private async Task OnPvpHitAsync(PvpHitTarget? target, uint victimEid, float stamina, float health, byte flags, byte material)
+    /// <summary>The native watcher measured contact on an avatar. The victim's game owns the effect.</summary>
+    private Task OnPvpHitAsync(PvpHitTarget? target, PvpHitNotice hit) => SendPvpHitAsync(target, hit, diagnostic: false);
+
+    private Task SendDiagnosticPvpHitAsync(uint victimEid, float stamina, float health, byte flags)
     {
+        ulong now = (ulong)Environment.TickCount64;
+        return SendPvpHitAsync(CapturePvpHitTarget(victimEid), new(victimEid, stamina, health, flags, 0, now, now, _combat.PvpNativeLife, 0, now),
+            diagnostic: true);
+    }
+
+    private async Task SendPvpHitAsync(PvpHitTarget? target, PvpHitNotice hit, bool diagnostic)
+    {
+        uint victimEid = hit.VictimEid;
+        float stamina = hit.Stamina, health = hit.Health;
+        byte flags = hit.Flags;
+        ulong callbackTick = (ulong)Environment.TickCount64;
+        byte source = Volatile.Read(ref _myGhostId);
+        long lifecycle = Interlocked.Read(ref _p1Serial);
+        long senderLife = Interlocked.Read(ref _t3InputLifeRevision);
         string line = FormattableString.Invariant(
             $"MP-FF dir=out victim_eid=0x{victimEid:X} ghost={target?.Ghost.ToString() ?? "?"} hp={health:F2} st={stamina:F2} unarmed={((flags & PlayerHitV8.FlagUnarmed) != 0 ? 1 : 0)} missile={((flags & PlayerHitV8.FlagMissile) != 0 ? 1 : 0)} session={On(_ffSession)}");
         if (!_ffSession || target is not { } captured || _wo121Stream is not Stream s || (health <= 0 && stamina <= 0))
         {
-            _w121FfOutDropped++;
+            Interlocked.Increment(ref _w121FfOutDropped);
             Console.WriteLine(line + $" result=dropped reason={(!_ffSession ? "friendly-fire-off" : _wo121Stream is null ? "no-relay" : target is null ? "unknown-avatar" : "no-damage")}");
             return;
         }
-        var (session, vid, incarnation, life) = captured;
+        var (session, vid, incarnation, life, observedTick) = captured;
+        string targetKey = vid.ToString();
         if (!ReferenceEquals(session, _wo121ContactSession) || !ReferenceEquals(s, session.Relay) ||
             (_w213Caps & Protocol.LinkCapPvpLife) == 0)
         {
-            _w121FfOutDropped++;
+            Interlocked.Increment(ref _w121FfOutDropped);
             Console.WriteLine(line + " result=dropped reason=contact-capability");
             return;
         }
-        if (life == 0 || !_ghostEntityIds.TryGetValue(vid.ToString(), out uint stillBound) || stillBound != victimEid ||
-            session.FindTarget(vid, victimEid) != (incarnation, life))
+        bool SourceCurrent() => diagnostic
+            ? hit.SourceLifeProof != 0 && hit.SourceLifeProof == _combat.PvpNativeLife
+            : _combat.PvpCaptureCurrent(hit);
+        bool TargetCurrent() => life != 0 &&
+            _ghostEntityIds.TryGetValue(targetKey, out uint stillBound) && stillBound == victimEid &&
+            session.FindTarget(vid, victimEid) == (incarnation, life, observedTick);
+        if (!hit.FreshAt(callbackTick) || !SourceCurrent())
         {
-            _w121FfOutDropped++;
+            Interlocked.Increment(ref _w121FfOutDropped);
+            Console.WriteLine(line + $" result=dropped reason=stale-native-capture measurement={hit.MeasurementId}");
+            return;
+        }
+        if (!diagnostic && !session.TryClaimMeasurement(_combat, hit))
+        {
+            Interlocked.Increment(ref _w121FfOutDropped);
+            Console.WriteLine(line + $" result=dropped reason=measurement-stale-or-duplicate measurement={hit.MeasurementId}");
+            return;
+        }
+        if (!TargetCurrent())
+        {
+            Interlocked.Increment(ref _w121FfOutDropped);
             Console.WriteLine(line + " result=dropped reason=recipient-life-unavailable-or-changed");
             return;
         }
+        if (observedTick == 0 || hit.CapturedTick <= observedTick)
+        {
+            Interlocked.Increment(ref _w121FfOutDropped);
+            Console.WriteLine(line + $" result=dropped reason=capture-before-recipient-life measurement={hit.MeasurementId} captured_tick={hit.CapturedTick} recipient_tick={observedTick}");
+            return;
+        }
         ulong contact = session.Next();
-        await WritePacketAsync(s, new PlayerHitV8(vid, stamina, health, flags, material)
-            .BuildUp(contact, incarnation, life), _wo121Ct);
-        _w121FfOut++;
-        Wo155NoteFfSent(vid);   // WO-155: the knockdown this hit causes on his screen is the one his figure falls for here
-        Console.WriteLine(line + $" result=sent contact_seq={contact} recipient={incarnation} recipient_life={life}");
+        CancellationToken lifetime = _wo121Ct;
+        await WriteScopedPacketAsync(s, new PlayerHitV8(vid, stamina, health, flags, hit.Material)
+            .BuildUp(contact, incarnation, life), lifetime, new RelayWriteScope(Refusal, Rejected, AfterWrite));
+
+        bool SessionCurrent() => ReferenceEquals(session, _wo121ContactSession) && ReferenceEquals(s, _wo121Stream);
+        // The physical relay writer may have been held behind other frames.
+        string? Refusal()
+        {
+            if (lifetime.IsCancellationRequested || !SessionCurrent()) return "relay-retired";
+            if (!_ffSession || (_w213Caps & Protocol.LinkCapPvpLife) == 0) return "friendly-fire-disabled";
+            if (!hit.FreshAt((ulong)Environment.TickCount64) || !SourceCurrent() ||
+                lifecycle != Interlocked.Read(ref _p1Serial) || senderLife != Interlocked.Read(ref _t3InputLifeRevision))
+                return "stale-native-capture";
+            return TargetCurrent() ? null : "recipient-life-unavailable-or-changed";
+        }
+
+        void Rejected(string reason)
+        {
+            Interlocked.Increment(ref _w121FfOutDropped);
+            Console.WriteLine(line + $" stage=relay-write result=dropped reason={reason} measurement={hit.MeasurementId}");
+        }
+        void AfterWrite()
+        {
+            Interlocked.Increment(ref _w121FfOut);
+            if (SessionCurrent() && TargetCurrent())
+                Wo155NoteFfSent(vid);   // WO-155: only this victim's current figure may recognize the ensuing knockdown
+            Console.WriteLine(line + $" result=sent contact_seq={contact} recipient={incarnation} recipient_life={life} source={source} measurement={hit.MeasurementId} captured_tick={hit.CapturedTick} measured_tick={hit.MeasuredTick} pipe_read_tick={hit.ReadTick} callback_tick={callbackTick} native_ms={hit.MeasuredTick - hit.CapturedTick} pipe_ms={hit.ReadTick - hit.MeasuredTick} queue_ms={callbackTick - hit.ReadTick}");
+        }
     }
 
     // =====================================================================
@@ -687,13 +795,13 @@ public partial class GameBridge
         }
     }
 
-    private void OnPvpPeer(byte[] frame, PvpContactSession? session)
+    private void OnPvpPeer(byte[] frame, PvpFrameScope? scope)
     {
-        if (session is null || !ReferenceEquals(session, _wo121ContactSession) ||
+        if (scope is null || !ReferenceEquals(scope.Session, _wo121ContactSession) ||
             (_w213Caps & Protocol.LinkCapPvpLife) == 0 || frame.Length != Protocol.PvpPeerLifeLen ||
             !Protocol.TryReadPvpPeer(frame, out byte ghost, out ulong incarnation, out var life)) return;
         _ghostEntityIds.TryGetValue(ghost.ToString(), out uint currentEntity);
-        session.NoteTarget(ghost, incarnation, currentEntity, life);
+        scope.Session.NoteTarget(ghost, incarnation, currentEntity, life, (ulong)scope.ReadTick);
     }
 
     /// <summary>0x45: a partner's friendly-fire hit on our Henry.</summary>
@@ -736,6 +844,7 @@ public partial class GameBridge
             Console.WriteLine(line + " result=recipient_retired reason=recipient-life" + contact);
             return;
         }
+        TracePvpRead(scope, attacker, sequence, recipientLife);
         var r = await _combat.ApplyPvpHitAsync(hit.Stamina, hit.Health, Wo155PvpFlags(hit.Flags), attacker, ct,
             recipientCurrent: () => _ffSession && hit.Victim == Volatile.Read(ref _myGhostId) &&
                 PvpRecipientCurrent(scope), sequence: sequence, incarnation: incarnation,

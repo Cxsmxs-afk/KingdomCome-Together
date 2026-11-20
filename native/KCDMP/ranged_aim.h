@@ -20,8 +20,27 @@ enum Phase : uint8_t {
 
 enum class Edge : uint8_t { Same, Held, Ended, Ignored };
 
-struct Block { bool aim = false; std::optional<uint8_t> charge; };
+struct Block { bool aim = false; std::optional<uint8_t> charge; bool observed = false; };
 struct Sample { uint8_t phase = Unreadable; std::optional<uint8_t> charge; };
+
+// Carries one confirmed observation independently of the normal body block.
+// hostMs is zero for an omitted or unreadable ranged sample.
+struct TimedState {
+    uint64_t hostMs = 0;
+    uint8_t bits = 0, charge = 0;
+    int16_t yaw = 0, pitch = 0;
+    bool held() const { return hostMs && (bits & kHeldBit) != 0; }
+};
+
+inline TimedState decode_state(const uint8_t* body, uint64_t stamp) {
+    const uint8_t bits = body[3] & (kHeldBit | kChargeKnownBit);
+    const uint8_t charge = body[7];
+    const auto yaw = static_cast<int16_t>(body[8] | (body[9] << 8));
+    const auto pitch = static_cast<int16_t>(body[10] | (body[11] << 8));
+    if ((bits & kHeldBit) || (!bits && !charge && yaw == kAngleUnavailable && pitch == kAngleUnavailable))
+        return {stamp, bits, charge, yaw, pitch};
+    return {};
+}
 
 inline bool is_hold_phase(uint8_t phase) { return phase == Charging || phase == Aiming; }
 
@@ -36,12 +55,12 @@ inline Edge apply(const Sample& sample, Block& held) {
     if (is_hold_phase(sample.phase)) {
         const auto charge = sample.charge ? sample.charge : held.charge;
         const bool changed = !held.aim || held.charge != charge;
-        held = {true, charge};
+        held = {true, charge, true};
         return changed ? Edge::Held : Edge::Same;
     }
-    if (!held.aim) return Edge::Same;
-    held = {};
-    return Edge::Ended;
+    const bool wasHeld = held.aim;
+    held = {false, {}, true};
+    return wasHeld ? Edge::Ended : Edge::Same;
 }
 
 } // namespace kcdmp::rangedaim

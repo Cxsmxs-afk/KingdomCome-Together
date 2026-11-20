@@ -28,6 +28,7 @@
 #include "anchors.h"
 #include "buffs.h"
 #include "engine.h"
+#include "load_sequence.h"
 #include "log.h"
 #include "motion.h"
 #include "npc_drive.h"
@@ -122,7 +123,8 @@ std::atomic<bool> g_ff{true}, g_attribution{true}, g_pvpHook{true};
 
 // ---- avatars (main thread writes, any thread reads) --------------------------------
 struct AvatarSlot { std::atomic<uint32_t> eid{0}; std::atomic<void*> soul{nullptr}; };
-AvatarSlot g_avatars[16];
+constexpr size_t kAvatarSlots = 16;
+AvatarSlot g_avatars[kAvatarSlots];
 
 void* avatar_soul(uint32_t eid) {
     if (!eid) return nullptr;
@@ -145,10 +147,22 @@ std::atomic<unsigned> g_visualCount{0};
 std::atomic<uint64_t> c_visualBlocked{0}, c_visualEscape{0};
 
 // ---- the hook's queue (any thread -> main thread) -----------------------------------
-struct PvpHit { uint32_t victimEid; float st, hp; uint8_t flags, material; };
+wo155rules::Recipient pvp_scope() {
+    return {p4::generation(), p4::life_edge_tick(), pipe::observation_connection(), p4::gameplay(), p4::pvp_life_proof()};
+}
+bool current_pvp_capture(const wo155rules::WatchCapture& capture) {
+    return capture.tick && !capture.ambiguous && capture.source.proof &&
+        capture.source.matches(pvp_scope(), capture.tick) &&
+        loadsequence::allowed(capture.load, loadsequence::stamp(), loadsequence::Access::Live);
+}
+struct PvpHit {
+    float st, hp;
+    wo155rules::WatchCapture capture;
+    uint64_t measuredTick, measurementId;
+};
+uint64_t g_pvpMeasurementId = 0;  // main thread only, one ID per published measurement
 struct PlayerHitMark { uint32_t victimEid; double at; bool invalidate=false; };
 std::mutex g_qMutex;
-std::vector<PvpHit> g_pvp;
 std::vector<PlayerHitMark> g_marks;
 // A player's hit on an avatar, watched until its queued damage has landed.
 // WO-132: also an NPC's hit on an avatar (kind kWatchNpc: measured and put back
@@ -164,12 +178,38 @@ std::vector<PlayerHitMark> g_marks;
 // verdict read from the record it built, +0x54..+0x57) and its damage is KEPT; measured from the lowest point (as a replay), reported to
 // the agent (DefenceFn), which tells the host -- the host holds its own judgement of that blow for it (WO208-DEF).
 enum WatchKind : uint8_t { kWatchPvp = 0, kWatchNpc = 1, kWatchDiscard = 2, kWatchReplay = 3, kWatchFigure = 4, kWatchDefence = 5 };
-struct NewWatch { void* soul; uint32_t eid; float hp0, st0; uint8_t flags, material; uint8_t kind; uint32_t attackerEid; uint8_t outcome = 0; };
+struct NewWatch { void* soul; uint32_t eid; float hp0, st0; uint8_t flags, material; uint8_t kind; uint32_t attackerEid; uint8_t outcome = 0;
+                  wo155rules::WatchCapture pvp{}; };
 std::vector<NewWatch> g_newWatches;
 struct Watch { void* soul; uint32_t eid; float hp0, st0, dh = 0, ds = 0; uint8_t flags, material; double t0; int frames = 0, landedAt = -1;
-               uint8_t kind = 0; uint32_t attackerEid = 0; bool fatal = false; uint8_t outcome = 0; };
+               uint8_t kind = 0; uint32_t attackerEid = 0; bool fatal = false; uint8_t outcome = 0;
+               wo155rules::WatchSeries pvp{}; uint64_t pvpFirstEffectTick = 0;
+               float pvpObservedHp = 0, pvpObservedSt = 0; uint32_t pvpRestoreIncomplete = 0; };
 std::vector<Watch> g_watches;   // main thread only
 constexpr double kWatchS = 0.6;
+
+bool observe_pvp_vital(void* soul, const char* state, float current, float restoreTo, float tolerance,
+                       float& observed, float& loss, uint32_t& incomplete) {
+    const float sample = (std::min)(current, restoreTo);
+    const bool dropped = sample < observed - tolerance;
+    if (dropped) loss += observed - sample;
+    if (dropped || sample > observed) observed = sample;
+    if (sample >= restoreTo - tolerance) return dropped;
+
+    // The reflection receipt does not establish the effect of SetState.
+    // Read back this attempt. If unreadable, keep the measured deficit so
+    // the next update cannot report it again as a fresh hit.
+    observed = sample;
+    rttr::soul_set_state(soul, state, restoreTo);
+    float restored = 0;
+    if (rttr::soul_state(soul, state, &restored)) {
+        observed = (std::min)(restored, restoreTo);
+        if (observed >= restoreTo - tolerance) return dropped;
+    }
+    ++incomplete;
+    return dropped;
+}
+
 std::atomic<uint64_t> g_playerWuid{0};
 std::atomic<uint32_t> g_playerEid{0};
 std::atomic<PvpFn> g_pvpFn{nullptr};
@@ -240,7 +280,11 @@ void* hit_common(bool missile, HitFn orig, void* self, void* out, const uint8_t*
     (missile ? c_missile : c_melee).fetch_add(1, std::memory_order_relaxed);
     uint64_t aw = 0, vw = 0; uint32_t aeid = 0, veid = 0; uint8_t mat = 0;
     if (!g_pvpHook.load(std::memory_order_relaxed) || !read_hit(data, &aw, &aeid, &vw, &veid, &mat)) return orig(self, out, data);
-    const bool measuredMissile=p6::contact(missile,aeid,veid,self,aw!=0&&aw==g_playerWuid.load(std::memory_order_relaxed)); // always run original cause producer
+    const bool byPlayer = aw != 0 && aw == g_playerWuid.load(std::memory_order_relaxed);
+    const uint64_t contactTick = byPlayer && veid ? GetTickCount64() : 0;
+    const auto source = contactTick ? pvp_scope() : wo155rules::Recipient{};
+    const uint64_t contactLoad = contactTick ? loadsequence::stamp() : 0;
+    const bool measuredMissile = p6::contact(missile, aeid, veid, self, byPlayer); // always run original cause producer
     // WO-165: our own replay of a blow (wo165.cpp) -- on the thread that opened the window, this attacker on this victim. Exempt from
     // the discard (WO-162 Q1.3 #9: a replay from an engaged copy would be put back) and from every other branch: the record the engine
     // built is copied (the probe's reads: block +0x54/+0x55, perfect +0x56, broken +0x57, zone mismatch +0x61), the victim is watched
@@ -321,6 +365,8 @@ void* hit_common(bool missile, HitFn orig, void* self, void* out, const uint8_t*
     if (vsoul) {
         // A hit on a peer's avatar. NEVER skipped: the caller expects a cause
         // back (session 1: an empty one crashed the game). Measured and put back.
+        const uint8_t flags = missile ? 0x02 : 0;
+        const wo155rules::WatchCapture capture{contactTick, contactLoad, source, veid, flags, mat};
         const uint32_t nHit = c_avatarHits.fetch_add(1, std::memory_order_relaxed);
         if (nHit < 12) {
             // S_CombatHitData, as 0x70ce00 copies it (0x90 bytes): the damage
@@ -340,9 +386,8 @@ void* hit_common(bool missile, HitFn orig, void* self, void* out, const uint8_t*
         // update (session 4: hp/stamina unchanged across the call, every
         // time). And S_CombatHitData holds no damage amount (the dump above).
         // So a player's hit is WATCHED: the avatar's health/stamina are read
-        // every frame for kWatchS, every drop is put back at once, and the
-        // total is what friendly fire forwards. Other attackers: untouched.
-        const bool byPlayer = aw != 0 && aw == g_playerWuid.load(std::memory_order_relaxed);
+        // every frame until the quiet window ends. Each drop is put back at
+        // once and measured loss is forwarded at bounded intervals.
         // WO-132: an NPC's hit is watched the same way, so the owner gets the
         // hit's own damage -- never a bleed tick or any other drop between hits.
         const bool byNpc = !byPlayer && aeid != 0 && g_npcWatch.load(std::memory_order_relaxed);
@@ -352,8 +397,8 @@ void* hit_common(bool missile, HitFn orig, void* self, void* out, const uint8_t*
         void* res = orig(self, out, data);
         if (r0) {
             std::lock_guard<std::mutex> lock(g_qMutex);
-            g_newWatches.push_back({vsoul, veid, hp0, st0, static_cast<uint8_t>(missile ? 0x02 : 0), mat,
-                                    static_cast<uint8_t>(byPlayer ? kWatchPvp : kWatchNpc), byPlayer ? 0u : aeid});
+            g_newWatches.push_back({vsoul, veid, hp0, st0, flags, mat,
+                                    static_cast<uint8_t>(byPlayer ? kWatchPvp : kWatchNpc), byPlayer ? 0u : aeid, 0, capture});
         }
         return res;
     }
@@ -802,9 +847,9 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
     const uint8_t flags = body[8], attacker = body[9];
     constexpr uint8_t kPvpNoKnockdown = 0x80;   // WO-155: the agent's mp_ff_knockdown off (a pipe bit, not a wire flag)
     if (!std::isfinite(st) || !std::isfinite(hp) || st < 0 || hp < 0) return HitResult::Refused;
+    const uint64_t nativeEntryTick = GetTickCount64();
     const auto recipientCurrent = [&] {
-        return recipient.matches({p4::generation(), p4::life_edge_tick(),
-                                  pipe::observation_connection(), p4::gameplay(), p4::pvp_life_proof()}, ingressTick);
+        return recipient.matches(pvp_scope(), ingressTick);
     };
     if (!recipientCurrent()) return HitResult::RecipientRetired;
     void* player = rttr::read_player_soul();
@@ -849,6 +894,7 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
     bool recipientRetired = false;
     bool viaOld = false;
     bool hintSent = false;
+    uint64_t applyTick = 0;
     auto outcome = wo155rules::dispatch(protectedPlayer, suppress, [&](bool suppressReaction) {
         if (recipientRetired || !recipientCurrent() || !bodyCurrent()) {
             recipientRetired = true;
@@ -860,6 +906,7 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
             hintSent = true;
         }
         viaOld = suppress && !suppressReaction;
+        if (!applyTick) applyTick = GetTickCount64();
         return rttr::invoke_damage_soul(player, st, hp, nullptr, suppressReaction ? 1 : -1);
     });
     if (recipientRetired) return HitResult::RecipientRetired;
@@ -872,6 +919,10 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
     const bool measured = afterEntity && afterEntity == entity && actions::entity_wuid(afterEntity) == wuid &&
         p4::generation() == recipient.generation && rttr::read_player_soul() == player &&
         readVitals(hpAfter, stAfter);
+    const uint64_t measuredTick = GetTickCount64();
+    const uint64_t queueEndTick = applyTick ? applyTick : nativeEntryTick;
+    const uint64_t receiveQueueMs = queueEndTick >= ingressTick ? queueEndTick - ingressTick : 0;
+    const uint64_t engineMs = applyTick && measuredTick >= applyTick ? measuredTick - applyTick : 0;
     const bool acknowledged = outcome == HitResult::Acknowledged;
     if (acknowledged) {
         // Preserve the existing figure-watch correction until the engine confirms
@@ -884,18 +935,23 @@ wo155rules::HitResult apply_pvp_hit(const uint8_t* body, size_t len, wo155rules:
         outcome == HitResult::ProtectedConsumed ? "protected_consumed" :
         outcome == HitResult::DispatchUnconfirmed ? "dispatch_unconfirmed" :
         acknowledged ? "acknowledged" : "refused";
+    char timing[192];
+    std::snprintf(timing, sizeof timing, "recv_tick=%llu pipe_read_tick=%llu apply_tick=%llu receive_queue_ms=%llu engine_ms=%llu missile=%u",
+                  static_cast<unsigned long long>(ingressTick), static_cast<unsigned long long>(readTick),
+                  static_cast<unsigned long long>(applyTick), static_cast<unsigned long long>(receiveQueueMs),
+                  static_cast<unsigned long long>(engineMs), (flags & 0x02) ? 1u : 0u);
     if (measured) {
-        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X hp_before=%.4f hp_after=%.4f st_before=%.4f st_after=%.4f contact=%llu/%llu recipient_life=%llu",
+        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X hp_before=%.4f hp_after=%.4f st_before=%.4f st_after=%.4f contact=%llu/%llu recipient_life=%llu %s",
              status, attacker, sequence, static_cast<unsigned long long>(recipient.generation),
              static_cast<unsigned long long>(recipient.life), eid, hpBefore, hpAfter, stBefore, stAfter,
              static_cast<unsigned long long>(incarnation), static_cast<unsigned long long>(contactSequence),
-             static_cast<unsigned long long>(recipient.proof));
+             static_cast<unsigned long long>(recipient.proof), timing);
     } else {
-        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X vitals=unavailable contact=%llu/%llu recipient_life=%llu",
+        logf("MP-LANE2-COMBAT event=contact source=pvp outcome=%s peer=%u seq=%u scope=%llu/%llu target=0x%X vitals=unavailable contact=%llu/%llu recipient_life=%llu %s",
              status, attacker, sequence, static_cast<unsigned long long>(recipient.generation),
              static_cast<unsigned long long>(recipient.life), eid,
              static_cast<unsigned long long>(incarnation), static_cast<unsigned long long>(contactSequence),
-             static_cast<unsigned long long>(recipient.proof));
+             static_cast<unsigned long long>(recipient.proof), timing);
     }
     if (!protectedPlayer) {
         logf("WO121-HITS friendly-fire hit on the player: hp -%.2f st -%.2f unarmed=%d from ghost %u -> %s",
@@ -1066,6 +1122,19 @@ void mark_player_hit(uint32_t victimEid) {
     if (g_marks.size() < 128) g_marks.push_back({victimEid, 0});
 }
 
+void log_pvp_trace(const PvpTrace& trace) {
+    const auto& observed = trace.observation;
+    const uint64_t duration = observed.capturedTick && observed.measuredTick >= observed.capturedTick
+        ? observed.measuredTick - observed.capturedTick : 0;
+    logf("WO121-HITS player hit on avatar eid=0x%X measured hp -%.2f st -%.2f (landed at frame %d of %d) -> %s"
+         " measurement_id=%llu capture_tick=%llu first_effect_tick=%llu measured_tick=%llu native_observe_ms=%llu missile=%u publication=%s restore_incomplete=%u",
+         trace.victim, trace.health, trace.stamina, trace.landedAt, trace.frames, trace.result,
+         static_cast<unsigned long long>(observed.measurementId), static_cast<unsigned long long>(observed.capturedTick),
+         static_cast<unsigned long long>(trace.firstEffectTick), static_cast<unsigned long long>(observed.measuredTick),
+         static_cast<unsigned long long>(duration), (trace.flags & 0x02) ? 1u : 0u, trace.final ? "final" : "bounded",
+         trace.restoreIncomplete);
+}
+
 void tick() {
     pipe::publish_pvp_life();
     p6::tick(); // contact measurements precede the legacy health sampler
@@ -1078,13 +1147,13 @@ void tick() {
         if (void* e = engine::entity_by_id(0x7777)) { g_playerWuid = actions::entity_wuid(e); g_playerEid = engine::entity_id(e); }
         retire_missing_figures();
     }
-    std::vector<PvpHit> pvp;
+    std::array<PvpHit, kAvatarSlots> pvp{};
+    size_t pvpCount = 0; // one live PvP watch per avatar soul
     std::vector<PlayerHitMark> marks;
     std::vector<NewWatch> nw;
     std::vector<uint32_t> cancelFig;
     {
         std::lock_guard<std::mutex> lock(g_qMutex);
-        pvp.swap(g_pvp);
         marks.swap(g_marks);
         nw.swap(g_newWatches);
         cancelFig.swap(g_cancelFigure);
@@ -1114,7 +1183,9 @@ void tick() {
                 w.t0 = now - 10.0;   // ends this frame
                 continue;
             }
-            w.t0 = now; w.flags |= n.flags; merged = true; break;
+            if (n.kind == kWatchPvp) w.pvp.add(n.pvp);
+            else w.flags |= n.flags;
+            w.t0 = now; merged = true; break;
         }
         if (merged && n.kind == kWatchFigure) g_figureWatchesOpen.fetch_sub(1, std::memory_order_relaxed);   // WO-170: the open watch carries it
         // WO-165: a second replay on the same victim inside the window shares the first one's measure (one soul, one baseline); its
@@ -1126,6 +1197,11 @@ void tick() {
         if (!merged) {
             Watch w{n.soul, n.eid, n.hp0, n.st0, 0, 0, n.flags, n.material, now};
             w.kind = n.kind; w.attackerEid = n.attackerEid; w.outcome = n.outcome;
+            if (n.kind == kWatchPvp) {
+                w.pvp.add(n.pvp);
+                w.pvpObservedHp = n.hp0;
+                w.pvpObservedSt = n.st0;
+            }
             if (n.kind == kWatchDefence) g_defLanded[n.attackerEid] = now;   // WO-208 B: wo166's window asks
             g_watches.push_back(w);
         }
@@ -1156,18 +1232,30 @@ void tick() {
             if (w.st0 - st > w.ds + 0.25f) { w.ds = w.st0 - st; if (w.landedAt < 0) w.landedAt = w.frames; }
         } else if (live && rttr::soul_state(w.soul, "health", &hp) && rttr::soul_state(w.soul, "stamina", &st)) {
             bool dropped = false;
-            if (hp < w.hp0 - 0.01f) { w.dh += w.hp0 - hp; rttr::soul_set_state(w.soul, "health", w.hp0); dropped = true; }
-            // WO-157 3b.1: an NPC's blow on an avatar keeps the stamina it cost (only the health is put back -- the joiner's
-            // game takes both). Refilled after every blow, the figure never tired: its stamina soaked every blow, 14 of 16
-            // measured hp 0, and the joiner was never hurt. Measured from its lowest point, so a blow is counted once.
-            if (st < w.st0 - 0.25f) {
-                w.ds += w.st0 - st;
-                if (w.kind == kWatchNpc) w.st0 = st; else rttr::soul_set_state(w.soul, "stamina", w.st0);
-                dropped = true;
+            if (w.kind == kWatchPvp) {
+                const bool hpDrop = observe_pvp_vital(w.soul, "health", hp, w.hp0, 0.01f, w.pvpObservedHp, w.dh, w.pvpRestoreIncomplete);
+                const bool stDrop = observe_pvp_vital(w.soul, "stamina", st, w.st0, 0.25f, w.pvpObservedSt, w.ds, w.pvpRestoreIncomplete);
+                dropped = hpDrop || stDrop;
+            } else {
+                if (hp < w.hp0 - 0.01f) { w.dh += w.hp0 - hp; rttr::soul_set_state(w.soul, "health", w.hp0); dropped = true; }
+                // WO-157 3b.1: an NPC's blow on an avatar keeps the stamina it cost (only the health is put back -- the joiner's
+                // game takes both). Refilled after every blow, the figure never tired: its stamina soaked every blow, 14 of 16
+                // measured hp 0, and the joiner was never hurt. Measured from its lowest point, so a blow is counted once.
+                if (st < w.st0 - 0.25f) {
+                    w.ds += w.st0 - st;
+                    if (w.kind == kWatchNpc) w.st0 = st; else rttr::soul_set_state(w.soul, "stamina", w.st0);
+                    dropped = true;
+                }
             }
-            if (dropped) { c_restored.fetch_add(1); if (w.landedAt < 0) w.landedAt = w.frames; }
+            if (dropped) {
+                c_restored.fetch_add(1);
+                if (w.landedAt < 0) w.landedAt = w.frames;
+            }
         }
-        if (live && now - w.t0 < (w.kind == kWatchFigure ? wo170rules::kPutBackS : kWatchS)) { ++it; continue; }
+        const uint64_t measuredTick = w.kind == kWatchPvp ? GetTickCount64() : 0;
+        if (measuredTick && w.landedAt >= 0 && !w.pvpFirstEffectTick) w.pvpFirstEffectTick = measuredTick;
+        const bool keepWatching = live && now - w.t0 < (w.kind == kWatchFigure ? wo170rules::kPutBackS : kWatchS);
+        if (keepWatching && (w.kind != kWatchPvp || !w.pvp.due(measuredTick))) { ++it; continue; }
         if (w.kind == kWatchFigure) {
             char vn[64]{}, an[64]{};
             copy_name(w.eid, vn, sizeof vn); copy_name(w.attackerEid, an, sizeof an);
@@ -1197,9 +1285,30 @@ void tick() {
                  w.landedAt, w.frames, live ? "" : " -- victim gone");
             if (ReplayDmgFn fn = g_replayDmgFn.load()) fn(w.attackerEid, w.eid, w.dh, w.ds, live);
         } else if (w.kind == kWatchPvp) {
-            logf("WO121-HITS player hit on avatar eid=0x%X measured hp -%.2f st -%.2f (landed at frame %d of %d) -> %s", w.eid, w.dh, w.ds,
-                 w.landedAt, w.frames, !live ? "avatar gone, dropped" : (w.dh > 0 || w.ds > 0) ? (g_ff.load() ? "forwarded" : "dropped (friendly fire off)") : "no damage, nothing sent");
-            if (live && (w.dh > 0 || w.ds > 0)) pvp.push_back({w.eid, w.ds, w.dh, w.flags, w.material});
+            const bool damage = w.dh > 0 || w.ds > 0;
+            if (damage || !keepWatching || w.pvpRestoreIncomplete) {
+                const auto capture = w.pvp.evidence();
+                const bool current = capture.victim == w.eid && capture.tick <= measuredTick && current_pvp_capture(capture);
+                const bool send = live && damage && current && g_ff.load() && pvpCount < pvp.size();
+                const auto measurementId = send ? ++g_pvpMeasurementId : 0;
+                const char* result = !live ? "avatar gone, dropped" : !damage ? "no measured loss in this window" :
+                    !current ? "dropped (capture scope retired)" : send ? "measured for forwarding" :
+                    !g_ff.load() ? "dropped (friendly fire off)" : "dropped (avatar observation capacity)";
+                pipe::queue_pvp_trace({{capture.tick, measuredTick, capture.source.proof, measurementId},
+                    w.pvpFirstEffectTick, w.eid, w.dh, w.ds, w.landedAt, w.frames, capture.flags, !keepWatching, result,
+                    w.pvpRestoreIncomplete});
+                if (send) pvp[pvpCount++] = {w.ds, w.dh, capture, measuredTick, measurementId};
+            }
+            if (keepWatching) {
+                w.pvp.advance(measuredTick);
+                w.dh = w.ds = 0;
+                w.pvpRestoreIncomplete = 0;
+                w.pvpFirstEffectTick = 0;
+                w.frames = 0;
+                w.landedAt = -1;
+                ++it;
+                continue;
+            }
         } else if (w.kind == kWatchNpc) {
             logf("WO132-HITS npc hit on avatar eid=0x%X by eid=0x%X measured hp -%.2f st -%.2f (landed at frame %d of %d) -> %s", w.eid, w.attackerEid,
                  w.dh, w.ds, w.landedAt, w.frames, !live ? "avatar gone, dropped" : (w.dh > 0 || w.ds > 0) ? "to the agent" : "no damage, nothing sent");
@@ -1238,15 +1347,20 @@ void tick() {
     if (g_hitSouls.size() > 256)
         for (auto it = g_hitSouls.begin(); it != g_hitSouls.end();) it = (now - it->second > 5.0) ? g_hitSouls.erase(it) : ++it;
     if (PvpFn fn = g_pvpFn.load()) {
-        for (auto& h : pvp) {
+        for (size_t i = 0; i < pvpCount; ++i) {
+            const auto& h = pvp[i];
             // Unarmed = the local player had no weapon in hand when the hit landed.
             bool armed = true;
             if (void* ps = rttr::read_player_soul()) {
                 bool inHand = true;
                 if (rttr::combat_bool(ps, "HasWeaponInHand", &inHand)) armed = inHand;
             }
-            if (!armed) h.flags |= 0x01;
-            if (g_ff.load()) { fn(h.victimEid, h.st, h.hp, h.flags, h.material); c_ffQueued.fetch_add(1); }
+            if (g_ff.load() && current_pvp_capture(h.capture)) {
+                const wo155rules::Observation observation{h.capture.tick, h.measuredTick, h.capture.source.proof, h.measurementId};
+                const uint8_t flags = h.capture.flags | (armed ? 0 : 0x01);
+                fn(h.capture.victim, h.st, h.hp, flags, h.capture.material, observation, h.capture.source.connection);
+                c_ffQueued.fetch_add(1);
+            }
         }
     }
 }

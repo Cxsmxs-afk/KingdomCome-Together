@@ -58,6 +58,7 @@
 #include "wo147.h"
 #include "wo151.h"
 #include "wo163.h"
+#include "wo178.h"
 #include "wo203.h"
 #include "wo213.h"
 #include "wo201.h"
@@ -114,6 +115,9 @@ struct Tx {
     std::deque<std::vector<uint8_t>> edgeRealtime, edgeAdmission;
     size_t edgeBytes = 0;
     unsigned edgeTurn = 0;
+    std::array<hits::PvpTrace, 64> pvpTraces{};
+    size_t pvpTraceHead = 0, pvpTraceCount = 0;
+    std::atomic<uint64_t> pvpTraceDropped{0};
     HANDLE handle = INVALID_HANDLE_VALUE;
     uint64_t generation = 0;
     bool connected = false, writing = false, failed = false;
@@ -224,30 +228,46 @@ void write_loop() {
         std::vector<uint8_t> frame;
         HANDLE h = INVALID_HANDLE_VALUE;
         uint64_t generation = 0;
-        bool failed = false;
-        bool report = false;
+        bool failed = false, write = false;
+        hits::PvpTrace trace{};
         {
             std::unique_lock<std::mutex> lock(g_tx.mutex);
-            g_tx.cv.wait(lock, [] { return !g_running || (g_tx.connected &&
+            g_tx.cv.wait(lock, [] { return !g_running || g_tx.pvpTraceCount || (g_tx.connected &&
                 (g_tx.failed || !g_tx.queue.empty() || !g_tx.edgeAdmission.empty() || !g_tx.edgeRealtime.empty())); });
             if (!g_running) break;
-            h = g_tx.handle; generation = g_tx.generation; failed = g_tx.failed;
-            if (!failed && !pop_tx(frame)) continue;
-            g_tx.writing = true;
-        }
-        const bool ok = !failed && write_physical(h, frame.data(), static_cast<DWORD>(frame.size()));
-        const DWORD error = ok ? 0 : (failed ? ERROR_NOT_ENOUGH_MEMORY : GetLastError());
-        {
-            std::lock_guard<std::mutex> lock(g_tx.mutex);
-            if (!ok && pipeout::same_connection(generation, g_tx.generation, g_tx.connected)) {
-                g_tx.connected = false; g_tx.failed = true;
-                CancelIoEx(h, nullptr); // wake serve() and let its normal disconnect path reconcile the session
-                report = true;
+            if (g_tx.pvpTraceCount) {
+                trace = g_tx.pvpTraces[g_tx.pvpTraceHead];
+                g_tx.pvpTraceHead = (g_tx.pvpTraceHead + 1) % g_tx.pvpTraces.size();
+                --g_tx.pvpTraceCount;
             }
-            g_tx.writing = false;
+            if (g_tx.connected) {
+                h = g_tx.handle; generation = g_tx.generation; failed = g_tx.failed;
+                write = failed || pop_tx(frame);
+                g_tx.writing = write;
+            }
         }
-        g_tx.cv.notify_all();
-        if (report) logf("PIPE: outbound connection failed (%s, error=%lu); queued reliable data requires session recovery", failed ? "queue full" : "write", error);
+        if (write) {
+            bool report = false;
+            const bool ok = !failed && write_physical(h, frame.data(), static_cast<DWORD>(frame.size()));
+            const DWORD error = ok ? 0 : (failed ? ERROR_NOT_ENOUGH_MEMORY : GetLastError());
+            {
+                std::lock_guard<std::mutex> lock(g_tx.mutex);
+                if (!ok && pipeout::same_connection(generation, g_tx.generation, g_tx.connected)) {
+                    g_tx.connected = false; g_tx.failed = true;
+                    CancelIoEx(h, nullptr); // wake serve() and let its normal disconnect path reconcile the session
+                    report = true;
+                }
+                g_tx.writing = false;
+            }
+            g_tx.cv.notify_all();
+            if (report) logf("PIPE: outbound connection failed (%s, error=%lu); queued reliable data requires session recovery", failed ? "queue full" : "write", error);
+        }
+        if (trace.result) {
+            hits::log_pvp_trace(trace);
+            const auto dropped = g_tx.pvpTraceDropped.exchange(0, std::memory_order_relaxed);
+            if (dropped)
+                logf("WO121-HITS trace_dropped=%llu reason=writer-busy-or-full", static_cast<unsigned long long>(dropped));
+        }
     }
 }
 
@@ -340,14 +360,14 @@ void send_local_hit(const unsigned char guid[16], void* soul, float health_delta
 // WO-113: unsolicited respawn frames, written from the game thread under the
 // same write lock as LocalHit. A missing agent is logged by respawn.cpp's own
 // lines; here only a failed write is.
-void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what) {
+void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what, uint64_t expectedConnection = 0) {
     const uint64_t generation = g_connGen.load();
-    if (!g_connected || g_pipe == INVALID_HANDLE_VALUE) return;
+    if (!g_connected || (expectedConnection && generation + 1 != expectedConnection) || g_pipe == INVALID_HANDLE_VALUE) return;
     EnterCriticalSection(&g_write_lock);
     const bool sent = send_frame(g_pipe, type, body, len, generation);
     const DWORD err = sent ? 0 : GetLastError();
     LeaveCriticalSection(&g_write_lock);
-    if (!sent) logf("PIPE: %s enqueue failed: %lu", what, err);
+    if (!sent && what) logf("PIPE: %s enqueue failed: %lu", what, err);
 }
 
 // ---- WO-218 A.1: the pipe's batch (wo218_rules.h) -------------------------------------------------------------------------------
@@ -477,7 +497,7 @@ bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) 
                             request.frame.body[0] == pipecontrol::kEdgeCapabilities);
     const bool latest = nested == kSetPartner || nested == kReadBodyState || nested == kReadLocalState;
     const bool presentation = nested == kTimedAction || nested == kTimedPose || nested == kTimelineConfig ||
-                              nested == kRemoteRelocation || nested == kCombatEvent;
+                              nested == kRemoteRelocation || nested == kCombatEvent || nested == kRangedHand;
     const bool bulk = nested == kProbe || nested == kCombatRow;
     if (lifecycle || (nested > kPinLabel && nested != kRawPose && !bulk && !presentation) ||
         (request.lane == Lane::Latest && !latest) ||
@@ -603,7 +623,7 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
         case kAvatarEvent: case kAttributedDamage: case kApplyPvpHit: case kNpcHold:
         case kNpcSamples: case kLeashSample: case kSetPartner:
         case edgelanes::kRawPose: case edgelanes::kTimedPose: case edgelanes::kTimedAction:
-        case edgelanes::kRemoteRelocation: case edgelanes::kCombatEvent: case edgelanes::kCombatRow:
+        case edgelanes::kRemoteRelocation: case edgelanes::kCombatEvent: case edgelanes::kCombatRow: case edgelanes::kRangedHand:
             return LoadAccess::Live;
         case kJoinPlace: case kGhostIsolate: case kMirrorGrave:
             return LoadAccess::Setup;
@@ -619,7 +639,7 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
             return op == wo132::kOpEngage || op == wo132::kOpAvatarSwing || op == wo132::kOpHostThreat ||
                    op == wo132::kOpPlayerFight || op == wo132::kOpHandOver ? LoadAccess::Live : LoadAccess::Control;
         case kWo137:
-            return op == wo137::kOpApply || op == wo137::kOpSetValue ? LoadAccess::Live : LoadAccess::Control;
+            return op == wo137::kOpApply || op == wo137::kOpSetValue || op == wo137::kOpApplyExpected ? LoadAccess::Live : LoadAccess::Control;
         case kWo138:
             return LoadAccess::Control;
         case kWo139:
@@ -655,6 +675,9 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
 }
 
 bool load_allows(uint8_t type, const uint8_t* body, size_t n, uint64_t stamp, LoadAccess access) {
+    if (type == kWo163 && n && body[0] == wo178::kOpScopedSnapshot)
+        return n == wo178::kScopedSnapshotBytes && body[25] <= 1 &&
+            loadsequence::snapshot_allowed(stamp, loadsequence::read_le(body + 17, 8), body[25] == 1);
     if (!loadsequence::allows(stamp, access)) return false;
     // Off-main lifecycle control cannot be smuggled through Bulk/batches.
     if (type == kWo163 && n && body[0] == loadsequence::kOp) return false;
@@ -942,13 +965,10 @@ void send_local_action(uint8_t kind, uint8_t phase, int8_t ic, int8_t zone, int8
 }
 
 // WO-121: the local player's hit on a peer's avatar (main thread, hits::tick).
-void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material) {
-    BYTE body[14]{};
-    std::memcpy(body, &victimEid, 4);
-    std::memcpy(body + 4, &st, 4);
-    std::memcpy(body + 8, &hp, 4);
-    body[12] = flags; body[13] = material;
-    send_unsolicited(kPvpHitOut, body, sizeof(body), "PvpHit");
+void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material,
+                  const wo155rules::Observation& observation, uint64_t connection) {
+    const auto body = wo155rules::encode_notice(victimEid, st, hp, flags, material, observation);
+    send_unsolicited(kPvpHitOut, body.data(), static_cast<uint16_t>(body.size()), nullptr, connection);
 }
 
 // WO-210 E.2: the local player's blow on a copy, filtered here (main thread, wo210_hit's tick): the LocalHit frame with no numbers and
@@ -1474,17 +1494,26 @@ struct DeathBackend {
     npcdeath::Preparation prepare(const DeathBody& body, const npcdeath::Request& request, uint64_t attempt) const {
         using Preparation = npcdeath::Preparation;
         const uint32_t eid = body.actions.eid;
-        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::NotStarted;
-        // Release can change native holds. From here on, a failed readback must retain the fence.
-        wo195::release(eid, "verified remote NPC death");
-        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::Uncertain;
-        hits::discard_from(eid, false);
-        uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
-        std::memcpy(payload + 2, &eid, sizeof eid);
-        uint8_t guard[32]{};
-        size_t used = 0;
-        return wo131::handle(payload, sizeof payload, guard, sizeof guard, &used) == wo131::kROk && used == 1 && guard[0] == 1
-            ? Preparation::Ready : Preparation::Uncertain;
+        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::Unchanged;
+        // WO195 can remove engagement, wish and motion holds. From its first
+        // call onward, a fault or refused readback cannot prove unchanged state.
+        KCDMP_FAULT_CALL(site, "pipe::npc_death/prepare");
+        try {
+            return fault::guarded_or(site, Preparation::Uncertain, [&] {
+                wo195::release(eid, "verified remote NPC death");
+                if (!current(body, request, true) || !ready(body, attempt) || !hits::discard_from(eid, false))
+                    return Preparation::Uncertain;
+                uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
+                std::memcpy(payload + 2, &eid, sizeof eid);
+                uint8_t guard[32]{};
+                size_t used = 0;
+                const auto result = wo131::handle(payload, sizeof payload, guard, sizeof guard, &used);
+                return result == wo131::kROk && used == 1 && guard[0] == 1 ? Preparation::Ready : Preparation::Uncertain;
+            });
+        } catch (...) {
+            report_tag(body, request, "prepare-exception");
+            return Preparation::Uncertain;
+        }
     }
 
     bool apply(const DeathBody& body, const npcdeath::Request& request) const {
@@ -1519,6 +1548,9 @@ struct DeathBackend {
             case npcdeath::Stage::ReleasePending: return report_tag(body, request, "release-pending");
             case npcdeath::Stage::ReleaseUncertain: return report_tag(body, request, "release-uncertain");
             case npcdeath::Stage::Ready: return report_tag(body, request, "ready");
+            case npcdeath::Stage::PrepareUnchanged: return report_tag(body, request, "prepare-unchanged");
+            case npcdeath::Stage::PrepareUncertain: return report_tag(body, request, "prepare-uncertain");
+            case npcdeath::Stage::PrepareObservedDead: return report_tag(body, request, "prepare-observed-dead");
             case npcdeath::Stage::DeathPending: return report_tag(body, request, "death-pending");
             case npcdeath::Stage::Applied: return report_tag(body, request, "applied");
             case npcdeath::Stage::Uncertain: return report_tag(body, request, "uncertain");
@@ -1526,8 +1558,6 @@ struct DeathBackend {
             case npcdeath::Stage::Aborted: return report_tag(body, request, "aborted-before-apply");
             case npcdeath::Stage::AbortedUnadmitted: return report_tag(body, request, "aborted-unadmitted", " reason=never-admitted");
             case npcdeath::Stage::ApplyUncertain: return report_tag(body, request, "apply-uncertain");
-            case npcdeath::Stage::PreparationNotStarted: return report_tag(body, request, "preparation-not-started");
-            case npcdeath::Stage::PreparationUncertain: return report_tag(body, request, "preparation-uncertain");
         }
     }
 };
@@ -2001,6 +2031,17 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 send_result(h, r == npcdrive::kOk, seq, r);
                 break;
             }
+            case edgelanes::kRangedHand: {
+                using namespace timelineactions;
+                const Scope scope{incoming.readerObservation, generation + 1, incoming.readerLife, incoming.loadStamp};
+                const auto receipt = t_edgeReply ? handle_ranged_hand(body, len, scope) : HandObservation{};
+                uint8_t out[kRangedHandReplySize]{static_cast<uint8_t>(receipt.result == Accepted), 0,
+                    kRangedHandVersion, receipt.result, receipt.known};
+                std::copy(receipt.left.begin(), receipt.left.end(), out + 5);
+                std::copy(receipt.right.begin(), receipt.right.end(), out + 21);
+                send_frame(h, edgelanes::typed_reply(type), out, sizeof out, generation);
+                break;
+            }
             case edgelanes::kProbe: {
                 BYTE out[10]{};
                 if (t_edgeReply && len == 9 && body[0] == 1) {
@@ -2010,7 +2051,7 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                     edgelanes::put_u32(out + 2, nonce);
                     edgelanes::put_u32(out + 6, frames);
                 }
-                send_frame(h, edgelanes::kProbeReply, out, sizeof out, generation);
+                send_frame(h, edgelanes::typed_reply(type), out, sizeof out, generation);
                 break;
             }
             case kNpcHold: {
@@ -2549,6 +2590,7 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
 
 uint8_t direct_reply_type(uint8_t request) {
     if (wo218rules::batchable(request)) return wo218rules::reply_type(request);
+    if (const uint8_t reply = edgelanes::typed_reply(request)) return reply;
     switch (request) {
         case kPing: return kPong;
         case kResolveLuaClosure: return kClosureInfo;
@@ -2563,7 +2605,6 @@ uint8_t direct_reply_type(uint8_t request) {
         case kSaveList: return kSaveListReply;
         case kJoinGuard: return kJoinGuardReply;
         case kLeashSample: return kLeashReply;
-        case edgelanes::kProbe: return edgelanes::kProbeReply;
         default: return kResult;
     }
 }
@@ -2781,6 +2822,20 @@ void stop() {
 
 bool connected() { return g_connected; }
 uint64_t observation_connection() { return g_connected ? g_connGen.load() + 1 : 0; }
+
+void queue_pvp_trace(const hits::PvpTrace& trace) {
+    if (!g_running) return;
+    // Telemetry must never wait on the writer or compete for an unbounded queue.
+    std::unique_lock<std::mutex> lock(g_tx.mutex, std::try_to_lock);
+    if (!lock || g_tx.pvpTraceCount == g_tx.pvpTraces.size()) {
+        g_tx.pvpTraceDropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const size_t tail = (g_tx.pvpTraceHead + g_tx.pvpTraceCount) % g_tx.pvpTraces.size();
+    g_tx.pvpTraces[tail] = trace;
+    ++g_tx.pvpTraceCount;
+    g_tx.cv.notify_one();
+}
 
 void publish_pvp_life() {
     const uint64_t connection = observation_connection();

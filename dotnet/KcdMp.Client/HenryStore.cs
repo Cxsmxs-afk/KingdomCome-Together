@@ -5,6 +5,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using KcdMp.Wire;
 
 namespace KcdMp.Client;
 
@@ -18,7 +19,7 @@ namespace KcdMp.Client;
 ///   henry/&lt;worldTag&gt;/snap-&lt;yyyyMMddHHmmssfff&gt;-&lt;md5&gt;-&lt;source&gt;.hblk   a Henry block (WhsSave.SerializeBlock)
 ///   henry/&lt;worldTag&gt;/world.json                                  last joined + log-only pair details
 ///   henry/ledger.json                                             saves the mod made or saw land in a playline
-///   henry/swept/                                                  files moved out of a playline (newest 8 kept)
+///   henry/swept/                                                  legacy archives, retained
 /// </code>
 ///
 /// The world tag is <see cref="WhsSave.SeedTag"/> of the playthrough seed: the
@@ -55,6 +56,7 @@ public sealed partial class HenryStore
     private readonly Func<DateTime> _now;
     private readonly Action<string> _log;
     private readonly object _gate = new();
+    private readonly JoinWorldJournal _archiveRetirement = new();
 
     public string Root { get; }
 
@@ -207,10 +209,7 @@ public sealed partial class HenryStore
             File.Move(part, final);
             var back = File.ReadAllBytes(final);
             if (!SHA256.HashData(back).AsSpan().SequenceEqual(SHA256.HashData(data)))
-            {
-                TryDelete(final);
                 throw new IOException("the snapshot does not read back as written");
-            }
             WhsSave.ParseBlock(back);   // throws if it would not load later
             var snap = new Snapshot(tag, name, md5, t, source, data.Length);
             UpdateWorld(tag, w =>
@@ -268,6 +267,7 @@ public sealed partial class HenryStore
 
     private void Prune(string tag)
     {
+        var manifest = ReadWorld(tag);
         // newest first: the pairs of the newest KeepPerWorld host saves, at most KeepPerHostSave of each (WO-184)
         var kept = new Dictionary<string, int>(StringComparer.Ordinal);   // md5 -> kept so far; -1 = past the newest KeepPerWorld host saves
         int hostSaves = 0;
@@ -283,11 +283,52 @@ public sealed partial class HenryStore
             else if (n < 0) why = $"keeping the pairs of the newest {KeepPerWorld} host saves";
             else if (n >= KeepPerHostSave) why = $"keeping the newest {KeepPerHostSave} of host save {s.Md5[..8]}";
             else { kept[s.Md5] = n + 1; continue; }
-            TryDelete(Path.Combine(WorldDir(tag), s.File));
-            TryDelete(ChestLedgerPath(s));
-            UpdateWorld(tag, w => w.Pairs.Remove(s.File));
-            _log($"MP-HENRY world {tag}: pruned snapshot {s.Short} ({why})");
+            try
+            {
+                if (manifest.Pairs is null || !manifest.Pairs.ContainsKey(s.File))
+                    throw new IOException("unindexed snapshot");
+                string block = Path.Combine(WorldDir(tag), s.File), sidecar = ChestLedgerPath(s);
+                byte[] blockHash = ArchiveFileHash(block, snapshot: true);
+                byte[]? sidecarHash = File.Exists(sidecar) ? ArchiveFileHash(sidecar, snapshot: false) : null;
+                RetireArchiveFile(block, blockHash);
+                if (sidecarHash is not null) RetireArchiveFile(sidecar, sidecarHash);
+                UpdateWorld(tag, w => w.Pairs.Remove(s.File));
+                _log($"MP-HENRY world {tag}: pruned snapshot {s.Short} ({why})");
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or JsonException)
+            {
+                _log($"MP-HENRY world {tag}: snapshot {s.Short} retained reason=unverified-archive-file ({ex.GetType().Name})");
+            }
         }
+    }
+
+    private static byte[] ReadArchiveFile(string file)
+    {
+        if (!LocalStartCheckpointStore.SafeDirectory(Path.GetDirectoryName(file)!) || !LocalStartCheckpointStore.SafeFile(file))
+            throw new IOException("archive file unavailable");
+        using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read);
+        if (stream.Length is <= 0 or > Protocol.WorldMaxBytes) throw new IOException("archive file length out of bounds");
+        var bytes = new byte[(int)stream.Length];
+        stream.ReadExactly(bytes);
+        return bytes;
+    }
+
+    private static byte[] ArchiveFileHash(string file, bool snapshot)
+    {
+        byte[] bytes = ReadArchiveFile(file);
+        if (snapshot) WhsSave.ParseBlock(bytes);
+        else
+        {
+            using var json = JsonDocument.Parse(bytes);
+            if (json.RootElement.ValueKind != JsonValueKind.Object) throw new InvalidDataException("not a chest ledger");
+        }
+        return SHA256.HashData(bytes);
+    }
+
+    private void RetireArchiveFile(string file, byte[] hash)
+    {
+        if (_archiveRetirement.RetireVerifiedArchiveFile(file, Path.Combine(Root, ".archive-retired"), hash) != 1)
+            throw new IOException("checked archive file disappeared before retirement");
     }
 
     public void MarkJoined(string tag) => UpdateWorld(tag, w => w.LastJoinedUtc = _now());
@@ -430,11 +471,41 @@ public sealed partial class HenryStore
     {
         CheckTag(tag);
         var dir = WorldDir(tag);
-        if (!Directory.Exists(dir)) return false;
-        int n = Snapshots(tag).Count;
-        Directory.Delete(dir, recursive: true);
-        _log($"MP-HENRY world {tag}: DELETED ({n} snapshot(s)) -- {why}");
-        return true;
+        lock (_gate)
+        {
+            if (!Directory.Exists(dir)) return false;
+            try
+            {
+                string index = Path.Combine(dir, "world.json");
+                byte[] manifestBytes = ReadArchiveFile(index);
+                if (JsonSerializer.Deserialize<WorldFile>(manifestBytes) is not { Pairs: not null } manifest)
+                    throw new InvalidDataException("unreadable snapshot index");
+                var snapshots = manifest.Pairs.Keys.Where(name => SnapRx.IsMatch(name)).ToHashSet(StringComparer.Ordinal);
+                var sidecars = snapshots.Select(name => $"chests-{Path.GetFileNameWithoutExtension(name)}.json").ToHashSet(StringComparer.Ordinal);
+                var verified = new List<(string File, byte[] Hash)>();
+                int count = 0;
+                foreach (string path in Directory.EnumerateFileSystemEntries(dir))
+                {
+                    string name = Path.GetFileName(path);
+                    if (name == "world.json") continue;
+                    bool snapshot = snapshots.Contains(name);
+                    if (!snapshot && !sidecars.Contains(name))
+                        throw new IOException("unowned entry in snapshot directory");
+                    verified.Add((path, ArchiveFileHash(path, snapshot)));
+                    if (snapshot) count++;
+                }
+                foreach (var (file, hash) in verified) RetireArchiveFile(file, hash);
+                RetireArchiveFile(index, SHA256.HashData(manifestBytes));
+                Directory.Delete(dir); // A late foreign file is never part of this operation.
+                _log($"MP-HENRY world {tag}: DELETED ({count} snapshot(s)) -- {why}");
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or JsonException)
+            {
+                _log($"MP-HENRY world {tag}: retained reason=unverified-archive-contents ({ex.GetType().Name})");
+                return false;
+            }
+        }
     }
 
     /// <summary>The 90-day rule: every world not joined for <see cref="StaleDays"/> days goes. Returns the tags deleted.</summary>
@@ -537,31 +608,4 @@ public sealed partial class HenryStore
         };
     }
 
-    /// <summary>
-    /// Move a file out of a playline into henry/swept (never deleted outright:
-    /// the newest 8 swept files are kept). Returns true when it is gone from
-    /// the playline.
-    /// </summary>
-    public bool MoveOut(string path, string why)
-    {
-        string swept = Path.Combine(Root, "swept");
-        try
-        {
-            Directory.CreateDirectory(swept);
-            string pl = Path.GetFileName(Path.GetDirectoryName(path)) ?? "playline?";
-            string dest = Path.Combine(swept, $"{_now():yyyyMMddHHmmssfff}-{pl}-{Path.GetFileName(path)}");
-            File.Move(path, dest);
-            _log($"MP-HENRY moved {GameBridge.SaveDisplay(path)} out of the playline -> <data>/henry/swept ({why})");
-            foreach (var old in new DirectoryInfo(swept).GetFiles().OrderByDescending(f => f.Name, StringComparer.Ordinal).Skip(8))
-                TryDelete(old.FullName);
-            return !File.Exists(path);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            _log($"MP-HENRY could not move {GameBridge.SaveDisplay(path)} out ({why}): {ex.Message}");
-            return false;
-        }
-    }
-
-    private static void TryDelete(string p) { try { File.Delete(p); } catch (IOException) { } catch (UnauthorizedAccessException) { } }
 }

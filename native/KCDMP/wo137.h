@@ -76,6 +76,9 @@ constexpr uint8_t kOpHold      = 7;
 constexpr uint8_t kOpReadStateTyped = 8;
 // WO-164 T6: the direct write of an int / bool quest State: [tag:4][pathLen:2][path][value:4] -> op 2's reply shape
 constexpr uint8_t kOpSetValue = 9;
+// Host-side adjudication applies only against the observed predecessor.
+// Op 10 has op 2's tag/path/port, followed by [expected:4][target:4].
+constexpr uint8_t kOpApplyExpected = 10;
 
 constexpr uint8_t kROk         = 0;
 constexpr uint8_t kRBadRequest = 1;
@@ -96,6 +99,7 @@ enum class Applied : uint8_t {
     NotAQuest = 9,    // not under a C_Quest: never pulsed
     TypeRefused = 10, // WO-164: op 9 writes an int, uint or bool State only (WO-166: uint)
     ChangedHibernated = 11, // WO-166 T2: op 9 wrote the value of a hibernated (loaded, dormant) State: the graph reads it when it wakes
+    Stale = 12,       // op 10's predecessor changed or became unreadable before the pulse
 };
 
 // Flags on 0x9E.

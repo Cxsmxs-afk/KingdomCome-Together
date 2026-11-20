@@ -239,6 +239,7 @@ public partial class GameBridge
         CancellationTokenSource? loadLife = null;
         var previous = _worldLoad.Current;
         WorldLoadSnapshot prepared = previous;
+        WorldLoadSnapshot dispatchScope = default;
         if (own) // the P1 pending mode must already know this is the private-world load
         {
             if (!LoadSequenceEnabled) _ownLoadExpected = true;
@@ -262,10 +263,16 @@ public partial class GameBridge
                 if (current.Generation != prepared.Generation || current.OwnIntentRevision != prepared.OwnIntentRevision) return false;
                 if (authorizeDispatch is null)
                     LoadSequenceBeginLoad();
+                else if (own)
+                {
+                    if (!LoadSequenceChange(s => s.Generation == prepared.Generation && s.OwnIntentRevision == prepared.OwnIntentRevision &&
+                        _worldLoad.TryBegin(s.Generation, WorldLoadStart.LocalLoad, out dispatchScope))) return false;
+                }
                 else if (!LoadSequenceChange(s => s.Generation == prepared.Generation &&
                     s.HostWorld == prepared.HostWorld && s.OwnIntentRevision == prepared.OwnIntentRevision &&
                     s.Phase == WorldLoadPhase.Offer && _worldLoad.TryAdvance(s, WorldLoadPhase.Load)))
                     return false;
+                else dispatchScope = prepared;
             }
             var dispatchLife = loadLife = CancellationTokenSource.CreateLinkedTokenSource(ct);
             if (authorizeDispatch is null)
@@ -292,8 +299,8 @@ public partial class GameBridge
                     if (LoadSequenceEnabled)
                     {
                         var load = _worldLoad.Current;
-                        if (load.Generation != prepared.Generation || load.HostWorld != prepared.HostWorld ||
-                            load.OwnIntentRevision != prepared.OwnIntentRevision || load.Phase != WorldLoadPhase.Load)
+                        if (load.Generation != dispatchScope.Generation || load.HostWorld != dispatchScope.HostWorld ||
+                            load.OwnIntentRevision != dispatchScope.OwnIntentRevision || load.Phase != WorldLoadPhase.Load)
                             return null;
                     }
                     if (!authorizeDispatch()) return null;
@@ -324,7 +331,8 @@ public partial class GameBridge
             {
                 loadLife?.Dispose();
                 if (!LoadSequenceEnabled) { _ownLoadExpected = previousOwn; _loadGraceOwn = previousGrace; }
-                else if (own && _worldLoad.TryRestoreOwnIntent(prepared, previous)) _ = LoadSequenceSyncNativeAsync();
+                else if (own && (_worldLoad.TryRestoreOwnIntent(prepared, previous) ||
+                    _worldLoad.TryUpdateOwnIntent(dispatchScope, previous.OwnIntent, previous.OwnIntentDeadlineMs))) _ = LoadSequenceSyncNativeAsync();
             }
         }
     }

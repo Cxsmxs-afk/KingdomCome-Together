@@ -20,19 +20,29 @@ uint64_t g_hostHoldAttempt = 0, g_hostHoldConnection = 0;
 bool control(const uint8_t* body, size_t size, uint64_t connection, uint8_t* ack) {
     Request request;
     const bool decoded = decode(body, size, request);
-    std::lock_guard<std::mutex> lock(g_stateMutex);
-    const auto previous = g_state.stamp();
-    const bool accepted = decoded && g_state.apply(request, connection, GetTickCount64());
-    const auto next = g_state.stamp();
-    if (previous != next) {
-        g_stamp.store(next, std::memory_order_release);
-        logf("MP-LOAD-NATIVE phase=%u flags=%u world_gen=%llu revision=%llu", static_cast<unsigned>(g_state.phase()), static_cast<unsigned>(g_state.flags()),
-             static_cast<unsigned long long>(g_state.generation()), static_cast<unsigned long long>(next >> 2));
+    bool accepted, changed;
+    uint64_t revision, generation;
+    Phase phase;
+    uint8_t flags;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        const auto previous = g_state.stamp();
+        accepted = decoded && g_state.apply(request, connection, GetTickCount64());
+        revision = g_state.stamp();
+        changed = previous != revision;
+        if (changed) g_stamp.store(revision, std::memory_order_release);
+        phase = g_state.phase();
+        flags = g_state.flags();
+        generation = g_state.generation();
+        const bool effectCurrent = wo138::join_held() == (g_state.hold_seconds() != 0);
+        const bool mainApplied = revision && effectCurrent && g_applied.load(std::memory_order_acquire) == revision;
+        encode_ack(ack, phase, flags | (mainApplied ? kMainApplied : 0), generation, request.id);
     }
-    uint8_t flags = g_state.flags();
-    const bool effectCurrent = wo138::join_held() == (g_state.hold_seconds() != 0);
-    if (next && effectCurrent && g_applied.load(std::memory_order_acquire) == next) flags |= kMainApplied;
-    encode_ack(ack, g_state.phase(), flags, g_state.generation(), request.id);
+    if (changed) {
+        deferred_log::Scope diagnostic;
+        logf("MP-LOAD-NATIVE phase=%u flags=%u world_gen=%llu revision=%llu", static_cast<unsigned>(phase), static_cast<unsigned>(flags),
+             static_cast<unsigned long long>(generation), static_cast<unsigned long long>(revision >> 2));
+    }
     return accepted;
 }
 
@@ -52,17 +62,22 @@ void tick() {
         holdSeconds = g_state.hold_seconds();
     }
     if (g_hostHoldOwned && (!holdSeconds || g_hostHoldConnection != connection)) {
+        deferred_log::Scope diagnostic;
         if (!wo138::join_hold(false, 0)) return;
         g_hostHoldOwned = false;
         g_hostHoldConnection = 0;
         logf("MP-LOAD-NATIVE host_offer=release actuator=ok");
     }
     if (!holdSeconds) {
-        if (gate(revision) != Gate::Legacy && wo138::join_held() && !wo138::join_hold(false, 0)) return;
+        if (gate(revision) != Gate::Legacy && wo138::join_held()) {
+            deferred_log::Scope diagnostic;
+            if (!wo138::join_hold(false, 0)) return;
+        }
         g_applied.store(revision, std::memory_order_release);
         return;
     }
     if (!g_hostHoldOwned && g_hostHoldAttempt != revision) {
+        deferred_log::Scope diagnostic;
         g_hostHoldAttempt = revision;
         g_hostHoldOwned = wo138::join_hold(true, holdSeconds);
         if (g_hostHoldOwned) g_hostHoldConnection = connection;
@@ -85,6 +100,11 @@ bool allows(uint64_t received, Access access) {
 bool calendar_allowed() {
     std::lock_guard<std::mutex> lock(g_stateMutex);
     return calendar_allowed(g_state.phase(), g_state.flags());
+}
+
+bool snapshot_allowed(uint64_t received, uint64_t generation, bool final) {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    return g_state.snapshot_allowed(received, generation, final);
 }
 
 void note_stale(uint64_t n) { if (n) g_stale.fetch_add(n, std::memory_order_relaxed); }

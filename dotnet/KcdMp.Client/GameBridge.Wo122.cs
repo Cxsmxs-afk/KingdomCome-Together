@@ -433,7 +433,7 @@ public partial class GameBridge
         bool snapWaiting;
         lock (_snapGate) snapWaiting = _snapWait is not null;
         if (snapWaiting && !_wo122Connected && W211Fix("snapshot_after_drop")
-            && Wo125OnJoinerSaveObserved(s.FullPath, Convert.ToHexString(s.Md5).ToLowerInvariant()))
+            && Wo125OnJoinerSaveObserved(s.FullPath))
         {
             Interlocked.Increment(ref _w211SnapAfterDrop);
             Console.WriteLine($"MP-WORLDSAVE observed {s.Display} ({kind}, {s.Bytes} B, verify ok) -- the final snapshot of a leave after the link dropped (WO-211 A.2)");
@@ -441,8 +441,8 @@ public partial class GameBridge
         }
         if (_combatRoleApplied && _wo122Connected && !_isDamageAuthority)
         {
-            // WO-125: the snapshot's own QuickSave, or a leak moved out at once.
-            if (Wo125OnJoinerSaveObserved(s.FullPath, Convert.ToHexString(s.Md5).ToLowerInvariant())) return;
+            // WO-125: the snapshot reader or a retained guest save.
+            if (Wo125OnJoinerSaveObserved(s.FullPath)) return;
             // The lock should make this impossible on the joiner (QuickSave passes a
             // script lock, and nothing in the mod calls it). Loud, for the next WO.
             Console.WriteLine($"MP-SAVELOCK LEAK a {kind} was written on this joiner: {s.Display} (lock held={On(_lockHeld)})");

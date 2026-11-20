@@ -33,17 +33,20 @@ struct Sample {
     uint64_t hostMs = 0, stateHostMs = 0;
     float x = 0, y = 0, z = 0, yaw = 0;
     std::array<uint8_t, 12> state{};
+    rangedaim::TimedState ranged{};
+    uint64_t rangedLocalMs = 0;
     uint8_t flags = 0;
 };
 
 struct Output {
     uint64_t targetHostMs = 0, appliedHostMs = 0;
     uint64_t rangedStateHostMs = 0;
+    rangedaim::TimedState ranged{};
     uint32_t bufferMs = 0, extrapMs = 0;
     float x = 0, y = 0, z = 0, yaw = 0, vx = 0, vy = 0, vz = 0;
     Sample source;
     bool ready() const { return appliedHostMs != 0; }
-    bool ranged_held() const { return rangedStateHostMs && (source.state[3] & rangedaim::kHeldBit) != 0; }
+    bool ranged_held() const { return ranged.held(); }
 };
 
 enum class Ingest { Rejected, Accepted, Late, Restarted };
@@ -113,11 +116,20 @@ public:
         if (nDelay_ < kDelayCount) ++nDelay_;
 
         if (sample.stateHostMs > sample.hostMs) sample.stateHostMs = 0;
+        if (sample.ranged.hostMs > sample.hostMs) sample.ranged = {};
+        if (sample.ranged.hostMs) {
+            const uint64_t age = hostAtArrival > sample.ranged.hostMs ? hostAtArrival - sample.ranged.hostMs : 0;
+            sample.rangedLocalMs = age < localArrival ? localArrival - age : 0;
+        }
         if (size_) {
             const auto& previous = samples_[size_ - 1];
             if (previous.stateHostMs && sample.stateHostMs <= previous.stateHostMs) {
                 sample.stateHostMs = previous.stateHostMs;
                 sample.state = previous.state;
+            }
+            if (sample.ranged.hostMs <= previous.ranged.hostMs) {
+                sample.ranged = previous.ranged;
+                sample.rangedLocalMs = previous.rangedLocalMs;
             }
             const float dx = sample.x - previous.x, dy = sample.y - previous.y;
             if (dx * dx + dy * dy > walkhold::kPlaceM * walkhold::kPlaceM) size_ = 0;
@@ -133,7 +145,7 @@ public:
     bool live(uint64_t local) const { return size_ && local >= lastArrival_; }
     bool fresh(uint64_t local) const { return live(local) && local - lastArrival_ <= kPoseHoldMs; }
 
-    Output render(uint64_t local) {
+    Output render(uint64_t local, uint64_t rangedAfterLocalMs = 0) {
         Output out;
         if (!live(local)) return out;
         const uint32_t desired = wanted_buffer();
@@ -177,8 +189,13 @@ public:
                 out.appliedHostMs = advance(before->hostMs, out.extrapMs);
             }
         }
-        // Keep the latest confirmed draw independently of the time limits for crouch, guard, and movement.
-        if (out.source.stateHostMs <= out.appliedHostMs) out.rangedStateHostMs = out.source.stateHostMs;
+        // Keep ranged state independent of body freshness. At a new binding,
+        // ignore observations within the host clock's allowed future skew.
+        const uint64_t rangedCutoff = rangedAfterLocalMs ? advance(rangedAfterLocalMs, kFutureToleranceMs) : 0;
+        if (before->ranged.hostMs <= out.appliedHostMs && before->rangedLocalMs > rangedCutoff) {
+            out.ranged = before->ranged;
+            out.rangedStateHostMs = out.ranged.hostMs;
+        }
         if (out.source.stateHostMs > out.appliedHostMs || out.targetHostMs - out.source.stateHostMs >= kStateFreshMs)
             out.source.stateHostMs = 0;
         return out;

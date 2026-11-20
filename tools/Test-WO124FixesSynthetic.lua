@@ -271,6 +271,107 @@ do
     check("i: no Lua errors", #ERRS == 0, ERRS[1])
 end
 
+-- A caller that cannot observe the detach has to retain its horse and rider fence.
+do
+    reset(); NOW = 1700
+    KCD2MP.interpRunning = true; KCD2MP._interpAliveAt = NOW
+    local rider, state = mkGhost("12", true)
+    local horse = mkEntity("kcd2mp_horse_12", 91, 90, 0)
+    local native = { name = "kcd2mp_horse_12", dz = 1.5, at = NOW, bound = true, paused = false }
+    local horseRow = { entity = horse, entityId = horse.id, native = native, renderX = 91, renderY = 90, renderZ = 0 }
+    KCD2MP.horseGhosts["12"] = horseRow
+    state.isRiding, state.nativeMounted = true, true
+    rider.dismountTakes = false
+    rider.human.IsMounted = function() error("held engine read is unavailable") end
+    gtick("12", 90.2, false)
+    local readback = lastLog("MP-DISMOUNT id=12")
+    check("i5: unreadable Riding STOP retains the rider fence and horse", state.dismountPending == true
+        and state.nativeMounted == true and KCD2MP.horseGhosts["12"] == horseRow and binds("12") == 0,
+        "pending=" .. tostring(state.dismountPending) .. " horse=" .. tostring(KCD2MP.horseGhosts["12"] == horseRow) .. " " .. tostring(readback))
+    KCD2MP_ApplyHorseTransforms()
+    check("i5: unconfirmed detach retains horse ownership", horseRow.native == native and #evts("w154_ride") == 0
+        and #horse.writes == 0, "horse_native=" .. tostring(horseRow.native ~= nil)
+        .. " ride_events=" .. tostring(#evts("w154_ride")) .. " lua_writes=" .. tostring(#horse.writes))
+    rider.human.IsMounted = function() return nil end
+    NOW = NOW + 0.6
+    gtick("12", 90.3, false)
+    check("i5: nil readback is still unconfirmed", state.dismountPending == true and binds("12") == 0)
+    rider.dismountTakes = true
+    rider.human.IsMounted = function() return rider.mounted end
+    NOW = NOW + 0.6
+    gtick("12", 90.4, false)
+    check("i5: observed detach clears the fence and releases its horse", state.dismountPending == nil
+        and state.nativeMounted == false and KCD2MP.horseGhosts["12"] == nil and ENTS.kcd2mp_horse_12 == nil
+        and rider.dismounts >= 2 and horseRow.native == nil and #evts("w154_ride") == 1, "calls=" .. tostring(rider.dismounts))
+end
+
+-- Script timers can outlive the row, body or session which issued them.
+do
+    for _, change in ipairs({"rider entity with same ID", "horse entity with same ID", "reconnect"}) do
+        reset(); NOW = NOW + 100
+        local id = "13"
+        local oldSession = string.rep("a", 32)
+        local newSession = string.rep("b", 32)
+        KCD2MP.w136.loadSequence, KCD2MP.w136.loadSequenceRetired = nil, nil
+        assert(KCD2MP_LoadSequence(oldSession, 1, "1", 5, 0))
+        local rider, state = mkGhost(id, false)
+        local ghost = KCD2MP.ghosts[id]
+        local human = rider.human
+        local horse = mkEntity("horse_13", 91, 90, 0)
+        local horseRow = { entity = horse, entityId = horse.id }
+        KCD2MP.horseGhosts[id] = horseRow
+        state.isRiding = true
+        rider.human = nil
+        KCD2MP_MountNPCOnHorse(id)
+        local retry = TIMERS[#TIMERS]
+        assert(retry and retry.ms == 1000)
+        rider.human = human
+        if change == "rider entity with same ID" then
+            local replacement = mkGhost(id, false)
+            replacement.id = rider.id
+            ghost.entity, KCD2MP.ghosts[id], rider = replacement, ghost, replacement
+        elseif change == "horse entity with same ID" then
+            local replacement = mkEntity("horse_13", 91, 90, 0)
+            replacement.id = horse.id
+            horseRow.entity = replacement
+        else
+            assert(KCD2MP_LoadSequence(newSession, 1, "1", 5, 0))
+        end
+        NOW = NOW + 1
+        retry.f()
+        check("i6: stale mount retry stops after " .. change, rider.mounted == false,
+              "mounted=" .. tostring(rider.mounted))
+        rider.mounted = false
+        KCD2MP_MountNPCOnHorse(id)
+        check("i6: fresh mount works after " .. change, rider.mounted == true)
+    end
+    KCD2MP.w136.loadSequence, KCD2MP.w136.loadSequenceRetired = nil, nil
+end
+
+do
+    reset(); NOW = 2100
+    local id = "14"
+    local rider, state = mkGhost(id, false)
+    local ghost = KCD2MP.ghosts[id]
+    local horse = mkEntity("horse_14", 91, 90, 0)
+    local horseRow = { entity = horse, entityId = horse.id }
+    KCD2MP.horseGhosts[id] = horseRow
+    state.isRiding = true
+    KCD2MP_MountNPCOnHorse(id)
+    local confirm = TIMERS[#TIMERS]
+    assert(confirm and confirm.ms == 300)
+    local newRider = mkGhost(id, true)
+    newRider.id = rider.id
+    ghost.entity, KCD2MP.ghosts[id] = newRider, ghost
+    local newHorse = mkEntity("horse_14", 91, 90, 0)
+    newHorse.id = horse.id
+    horseRow.entity = newHorse
+    confirm.f()
+    check("i7: late mount readback cannot signal success on replacement bodies", state.nativeMounted ~= true
+        and logCount("NATIVE MOUNT SUCCESS id=14") == 0,
+        "mounted=" .. tostring(state.nativeMounted) .. " success=" .. tostring(logCount("NATIVE MOUNT SUCCESS id=14")))
+end
+
 -- Summary, in the shared driver's contract (Test-NpcSmoothSynthetic.ps1 reads
 -- OUT: one PASS/FAIL line per check, then the totals).
 local pass, fail = 0, 0

@@ -21,6 +21,7 @@
     <Using Include="Xunit" />
     <Using Include="KcdMp.Client" />
     <None Update="Fixtures/Replay/*.kcdrec" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Fixtures/FriendlyFire/*.hex" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../kdcmp/Data/Scripts/Startup/kdcmp.lua" Link="Fixtures/Lua/kdcmp.lua" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

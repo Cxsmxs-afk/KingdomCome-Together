@@ -97,10 +97,10 @@ void note_pose(uint32_t eid, uint8_t peer, const Output& sample) {
         ++g_total.pose_n;
         row.display.appliedHostMs = sample.appliedHostMs;
     }
-    if (sample.rangedStateHostMs && row.rangedHostMs != sample.rangedStateHostMs) {
+    if (row.rangedHostMs != sample.rangedStateHostMs) {
         row.rangedHostMs = sample.rangedStateHostMs;
-        row.rangedBits = sample.source.state[3];
-        row.rangedCharge = sample.source.state[7];
+        row.rangedBits = sample.ranged.bits;
+        row.rangedCharge = sample.ranged.charge;
     }
     const uint64_t now = GetTickCount64();
     if (row.lastReport == 0 || now - row.lastReport >= 4000) {

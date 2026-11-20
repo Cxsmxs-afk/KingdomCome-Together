@@ -24,6 +24,8 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private readonly Queue<string> _pendingLockReplies = new();
     private readonly Channel<string> _joinLoads = Channel.CreateUnbounded<string>();
     private readonly Channel<string> _ownLoads = Channel.CreateUnbounded<string>();
+    private readonly TaskCompletionSource _exitMenu = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<string> _exitLoad = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Channel<string> _saveLockQueries = Channel.CreateUnbounded<string>();
     private readonly TaskCompletionSource<string> _loadIssued = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<string> _resumed = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -47,8 +49,12 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
 
     public LogTailGameTransport Transport { get; }
     public Action<string>? SaveWritten { get; set; }
+    public Action? BeforeOwnLoadQuiet { get; set; }
+    public Action<string>? RequestLegacySnapshot { get; set; }
     public bool DeferJoinFileRead { get; set; }
     public bool DeferOwnFileRead { get; set; }
+    public bool DeferExitFileRead { get; set; }
+    public bool FailExitResponse { get; set; }
     public bool DeferSaveLockReply { get; set; }
     public int JoinLoadsIssued => Volatile.Read(ref _joinLoadsIssued);
     public int JoinFilesRead => Volatile.Read(ref _joinFilesRead);
@@ -56,6 +62,8 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public Task<string> LoadIssued => _loadIssued.Task;
     public Task<string> Resumed => _resumed.Task;
     public Task JoinedNotification => _joinedNotification.Task;
+    public Task ExitMenu => _exitMenu.Task;
+    public Task<string> ExitLoad => _exitLoad.Task;
     public Task<string> WaitForJoinLoadAsync(CancellationToken ct = default) => _joinLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForOwnLoadAsync(CancellationToken ct = default) => _ownLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForSaveLockAsync(CancellationToken ct = default) => _saveLockQueries.Reader.ReadAsync(ct).AsTask();
@@ -68,6 +76,20 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public void CompleteOwnLoad()
     {
         lock (_logGate) ReadLoadedFile(_pendingOwnReads.Dequeue(), joined: false);
+    }
+
+    public void CompleteExitLoad(string path)
+    {
+        lock (_logGate)
+        {
+            Assert.True(File.Exists(path));
+            Feed($"Loading saved game '{path}'");
+            Feed($"[CryAction] LoadGame: '{path}'");
+            Feed("Exiting to main menu because save game loading failed");
+            Feed("PlayVideoOnly 'main_menu'");
+            _where = "menu";
+            _exitMenu.TrySetResult();
+        }
     }
 
     public void ReleaseSaveLock()
@@ -108,12 +130,34 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         if (load.Success) AcceptLoad(load, joined: true);
         var ownLoad = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"([A-Za-z0-9_]+)","leave-command"\)""");
         if (ownLoad.Success) AcceptLoad(ownLoad, joined: false);
+        var exit = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"(mpexit[0-9a-f]{8})","exit-to-menu"\)""");
+        if (exit.Success)
+        {
+            string path = Path.Combine(_saves, $"playline{exit.Groups[1].Value}", exit.Groups[2].Value + ".whs");
+            Assert.True(File.Exists(path));
+            _exitLoad.TrySetResult(path);
+            if (!DeferExitFileRead) CompleteExitLoad(path);
+        }
 
         var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry|KCD2MP_W154Where)\("([0-9a-f]{8})"\)""");
         if (query.Success) AnswerQuery(query.Groups[1].Value, query.Groups[2].Value);
+        if (RequestLegacySnapshot is { } snapshot)
+        {
+            var request = Regex.Match(command, """KCD2MP_Wo125Snapshot\("([0-9a-f]{8})"\)""");
+            if (request.Success)
+            {
+                string token = request.Groups[1].Value;
+                Emit("wo124_reply", $"{token} ok=true");
+                snapshot(token);
+            }
+        }
 
         var quiet = Regex.Match(command, """KCD2MP_W177LoadQuiet\("([a-z-]+)"\)""");
-        if (quiet.Success) Emit("w177_load_quiet", $"{quiet.Groups[1].Value} ok");
+        if (quiet.Success)
+        {
+            if (quiet.Groups[1].Value == "leave") BeforeOwnLoadQuiet?.Invoke();
+            Emit("w177_load_quiet", $"{quiet.Groups[1].Value} ok");
+        }
 
         var resume = Regex.Match(command, """KCD2MP_JoinResume\("[0-9a-f]{8}",\s*"([^"]+)"\)""");
         if (resume.Success) _resumed.TrySetResult(resume.Groups[1].Value);
@@ -191,9 +235,12 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested();
-            if (request.RequestUri is { } uri)
-                engine.ConsoleCommand(Uri.UnescapeDataString(uri.Query));
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("ok") });
+            string command = Uri.UnescapeDataString(request.RequestUri?.Query ?? "");
+            engine.ConsoleCommand(command);
+            bool failed = engine.FailExitResponse && command.Contains(",\"exit-to-menu\")", StringComparison.Ordinal);
+            if (failed) Console.WriteLine("H21-HOME exit audit: HTTP 503 after delivering the engine command");
+            return Task.FromResult(new HttpResponseMessage(failed ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK)
+                { Content = new StringContent(failed ? "unavailable" : "ok") });
         }
     }
 }

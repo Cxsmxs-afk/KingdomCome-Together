@@ -211,7 +211,7 @@ void reset_for_tests(){std::lock_guard<std::mutex> lk(g_lock);g_on=false;g_reset
 
 rangedaim::Block sampled_aim(const void* actor) {
     if (!actor || actor != g_lastActor || g_q.generation != generation() ||
-        !g_on.load(std::memory_order_relaxed) || g_reset.load(std::memory_order_relaxed)) return {};
+        !gameplay() || !g_on.load(std::memory_order_relaxed) || g_reset.load(std::memory_order_relaxed)) return {};
     return g_aim;
 }
 

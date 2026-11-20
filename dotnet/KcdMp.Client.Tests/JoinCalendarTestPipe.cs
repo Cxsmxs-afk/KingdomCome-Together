@@ -37,6 +37,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
 
     public CombatPipe Pipe { get; }
     public Action? BeforeCalendarArm { get; set; }
+    public Action<string>? RequestScopedSnapshot { get; set; }
     public Task ArmObserved => _arm.Task;
     public int ArmRequests => Volatile.Read(ref _armRequests);
     public Task VerifyObserved => _verify.Task;
@@ -209,8 +210,19 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         Protocol.Wo216OpBrains when request.Length == 1 => [1, seq, request[0], 0, .. "decision_gate=armed story_gate=armed"u8],
         Protocol.Wo200OpConfig when request.Length == 7 => [1, seq, request[0], 0, request[1], request[2]],
         Protocol.Wo184OpSaveState when request.Length == 1 => [1, seq, request[0], 0, 1, 0, 0, 1],
+        Protocol.H21OpSnapshot when request.Length == 26 => ScopedSnapshot(seq, request[1..]),
         _ => [0, seq, request[0], (byte)PipeReason.UnknownCommand],
     };
+
+    private byte[] ScopedSnapshot(byte seq, ReadOnlySpan<byte> body)
+    {
+        bool phase = _loadPhase is (byte)WorldLoadPhase.Settle or (byte)WorldLoadPhase.Play ||
+            _loadPhase == (byte)WorldLoadPhase.Exit && body[24] == 1;
+        if (!phase || _loadFlags != 0 || _loadGeneration != BinaryPrimitives.ReadUInt64LittleEndian(body[16..]))
+            return [0, seq, Protocol.H21OpSnapshot, 20];
+        RequestScopedSnapshot?.Invoke("kct_h21_" + Convert.ToHexString(body[..16]).ToLowerInvariant());
+        return [1, seq, Protocol.H21OpSnapshot, 0, 1];
+    }
 
     private byte[] LoadSequence(byte seq, ReadOnlySpan<byte> request)
     {

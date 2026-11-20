@@ -2955,10 +2955,20 @@ public partial class GameBridge(ClientConfig config)
         // packet used to start its own apply, so a heartbeat landing mid-verify ran
         // a second diff and a second 10 s retry loop over the same avatar.
         _ghostWantedAppearance[ghostId] = target;
+        await ConvergeWantedAppearanceAsync(ghostId, ct);
+    }
+
+    private async Task ConvergeWantedAppearanceAsync(byte ghostId, CancellationToken ct, Func<bool>? afterHolster = null)
+    {
+        if (!_ghostWantedAppearance.ContainsKey(ghostId)) return;
         var gate = _ghostApplyGate.GetOrAdd(ghostId, static _ => new SemaphoreSlim(1, 1));
-        if (!await gate.WaitAsync(0, ct)) return;   // the running apply picks the newest target up when it finishes
+        if (afterHolster is not null)
+            await gate.WaitAsync(ct);   // a queued old outfit can still be leaving the previous hand's scope
+        else if (!await gate.WaitAsync(0, ct))
+            return;   // the running apply picks the newest target up when it finishes
         try
         {
+            if (afterHolster?.Invoke() == false) return;
             for (int round = 0; round < 3; round++)
             {
                 if (!_ghostWantedAppearance.TryGetValue(ghostId, out var want)) return;
@@ -4756,6 +4766,10 @@ public partial class GameBridge(ClientConfig config)
                 var pvpScope = pvpSession is not null && type is (Protocol.PlayerHitV8Down or Protocol.PvpPeerDown or Protocol.Disconnect)
                     ? new PvpFrameScope(pvpSession, Interlocked.Read(ref _p1Serial), Interlocked.Read(ref _t3InputLifeRevision),
                         Environment.TickCount64, type == Protocol.PlayerHitV8Down ? _combat.PvpNativeLife : 0)
+                    {
+                        RelayAtRead = type == Protocol.PlayerHitV8Down && payloadLen == PlayerHitV8.LifeDownLen
+                            ? PvpRelayTime(stream, Stopwatch.GetTimestamp()) : default
+                    }
                     : null;
                 long arrival   = Stopwatch.GetTimestamp();
                 var load = LoadSequenceCapture();
@@ -5161,7 +5175,7 @@ public partial class GameBridge(ClientConfig config)
             }
             else if (type == Protocol.PvpPeerDown)
             {
-                OnPvpPeer(payload, frame.PvpContact?.Session);
+                OnPvpPeer(payload, frame.PvpContact);
             }
             else if (type == Protocol.PlayerHitV8Down)
             {
@@ -6094,6 +6108,8 @@ public partial class GameBridge(ClientConfig config)
             {
                 uint? previousEntityId = _ghostEntityIds.TryGetValue(giParts[0], out uint prevId) ? prevId : null;
                 bool incarnationChanged = Wo214NoteFigureBirth(giParts[0], (uint)rawId, birth);
+                if ((previousEntityId != (uint)rawId || incarnationChanged) && byte.TryParse(giParts[0], out byte boundGhost))
+                    _wo121ContactSession?.NoteBodyBinding(boundGhost);
                 _ghostEntityIds[giParts[0]] = (uint)rawId;
                 // WO-100 Phase 4 item 1: a different id is a different body, so
                 // every event still in flight for the old one is now invalid.
@@ -7506,8 +7522,12 @@ public partial class GameBridge(ClientConfig config)
                 if (npc.StartsWith("kcd2mp_", StringComparison.Ordinal) && byte.TryParse(npc.AsSpan(7), out byte bindGhost))
                 {
                     nativeGhost = bindGhost.ToString(CultureInfo.InvariantCulture);
-                    if (_ghostEntityIds.TryAdd(nativeGhost, eid))
-                        Console.WriteLine($"[wo121] ghost {bindGhost} entity id 0x{eid:X} learned from its native bind");
+                    if (!_ghostEntityIds.ContainsKey(nativeGhost))
+                    {
+                        _wo121ContactSession?.NoteBodyBinding(bindGhost);
+                        if (_ghostEntityIds.TryAdd(nativeGhost, eid))
+                            Console.WriteLine($"[wo121] ghost {bindGhost} entity id 0x{eid:X} learned from its native bind");
+                    }
                 }
                 NativeBindInOrder(async () =>
                 {
@@ -8190,26 +8210,51 @@ public partial class GameBridge(ClientConfig config)
         }
     }
 
-    private async Task WritePacketAsync(Stream stream, byte[] packet, CancellationToken ct = default)
+    private sealed record RelayWriteScope(Func<string?> Refusal, Action<string> Rejected, Action Completed);
+
+    private Task WritePacketAsync(Stream stream, byte[] packet, CancellationToken ct = default) =>
+        WriteScopedPacketAsync(stream, packet, ct);
+
+    private async Task WriteScopedPacketAsync(Stream stream, byte[] packet, CancellationToken ct,
+        RelayWriteScope? scope = null)
     {
         ProcessorFrameScope.ThrowIfAbandoned();
-        if (Wo213TryQueue(stream, packet, ct)) return;   // WO-213 C: the scheduler is this link's writer (it counts what it sends)
+        if (Wo213TryQueueScoped(stream, packet, ct, scope)) return;
         using var frameLink = ProcessorFrameScope.Link(ct);
         ct = frameLink.Token;
         long t0 = Stopwatch.GetTimestamp();
         await _tcpWriteLock.WaitAsync(ct);
         long t1 = Stopwatch.GetTimestamp();
+        bool pvpTiming = ShouldTracePvpSend(packet);
+        byte pvpSource = pvpTiming ? _myGhostId : (byte)0;
+        LinkWriteStamp? pvpStarted = null, pvpCompleted = null;
+        string? rejection = null;
         try
         {
             ProcessorFrameScope.ThrowIfAbandoned();
-            await stream.WriteAsync(packet, ct);
-            if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
+            rejection = scope?.Refusal();
+            if (rejection is null)
+            {
+                if (pvpTiming) pvpStarted = LinkWriteStamp.Capture();
+                await stream.WriteAsync(packet, ct);
+                if (pvpTiming) pvpCompleted = LinkWriteStamp.Capture();
+                if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
+            }
         }
         finally
         {
             _tcpWriteLock.Release();
-            Wo213NoteOut(packet, Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds, Stopwatch.GetElapsedTime(t1).TotalMilliseconds);   // WO-213 A.1/A.2
+            if (rejection is null)
+                Wo213NoteOut(packet, Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds, Stopwatch.GetElapsedTime(t1).TotalMilliseconds);   // WO-213 A.1/A.2
+            if (pvpStarted is { } stamp)
+                TracePvpWrite(stream, pvpSource, packet, stream is KcdMp.Steam.SteamConnectionStream, stamp, pvpCompleted);
         }
+        if (rejection is not null)
+        {
+            scope!.Rejected(rejection);
+            return;
+        }
+        scope?.Completed();
     }
 
     private static bool IntervalElapsed(ref long lastTimestamp, TimeSpan interval, long nowTimestamp)

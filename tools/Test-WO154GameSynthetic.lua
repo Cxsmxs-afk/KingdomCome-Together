@@ -445,6 +445,9 @@ end
 do
     ERRS = {}; CMDS = {}
     local e, g = mkAvatar(5, 100, 200, 81.5)
+    e.mounted = true
+    e.human = { IsMounted = function() return e.mounted end,
+        ForceDismount = function() e.mounted = false end }
     local horse = { class = "Horse", id = 777, px = 100, py = 200, pz = 80.0, writes = 0 }
     horse.GetName = function() return "ttkc_horse_3" end
     horse.GetWorldPos = function(self) return { x = self.px, y = self.py, z = self.pz } end
@@ -468,8 +471,9 @@ do
     check("D1: bound -> this file no longer writes it", horse.writes == 1, tostring(horse.writes))
     check("D1: a second mount call changes nothing", KCD2MP_W154RideNative("5", true) == false)
     mark = #LOG
-    KCD2MP_GhostDismount("5", g, "riding-stop")
-    check("D1: the dismount lets it go first: the agent, the writer, the brain", countEvt("w154_ride", "5 off", mark) == 1
+    local detached = KCD2MP_GhostDismount("5", g, "riding-stop")
+    check("D1: confirmed dismount lets it go: the agent, the writer, the brain", detached and not e.mounted
+        and countEvt("w154_ride", "5 off", mark) == 1
         and countEvt("npc_native", "ttkc_horse_3 off", mark) == 1 and CMDS[#CMDS] == "wh_ai_ResumeNPC ttkc_horse_3", CMDS[#CMDS])
     check("D1: ...and this file writes it again", KCD2MP.horseGhosts["5"].native == nil)
     KCD2MP_W154SetRideNative("off")

@@ -189,11 +189,14 @@ public static class Wo137Rules
 
     public static string VerdictName(Verdict v) => v switch { Verdict.Apply => "applied", Verdict.Already => "already", _ => "refused" };
 
+    internal const byte ApplyExpectedOp = 10, ApplyStale = 12;
+
     /// <summary>The DLL's apply results (native wo137.h Applied).</summary>
     public static string AppliedName(byte r) => r switch
     {
         0 => "changed", 1 => "unchanged", 2 => "no-node", 3 => "not-a-state", 4 => "no-port", 5 => "port-refused",
-        6 => "asleep", 7 => "fault", 8 => "unarmed", 9 => "not-a-quest", 10 => "type-refused", 11 => "changed-hibernated", _ => $"code-{r}",
+        6 => "asleep", 7 => "fault", 8 => "unarmed", 9 => "not-a-quest", 10 => "type-refused", 11 => "changed-hibernated",
+        ApplyStale => "predecessor-changed", _ => $"code-{r}",
     };
 
     /// <summary>WO-166 T2: the op 2 / op 9 write took (11 = written into a hibernated State: the graph reads it when it wakes).</summary>

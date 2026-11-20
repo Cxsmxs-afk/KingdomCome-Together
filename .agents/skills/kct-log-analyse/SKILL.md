@@ -60,7 +60,17 @@ Such die Zeile mit `rg -n "<fester Textteil>"` im zum Log gehörigen Build. Fehl
 
 Bei H6 zeigen `WO221-ACTEND` mit `attempt`, `receipt`, `waiting` und `active` sowie `MP-LANE2-H6` mit `attempt`, `eid`, `stage`, `lifecycle` und `connection` denselben Versuch. `receipt=1` bestätigt die Aktionsfreigabe. `ready` → `death-dispatched` → `applied` belegt die Reihenfolge und den bestätigten Engine-Zustand. Das Gate `tools/rig/scen_lane2_h6.py` prüft beide Rollenzuordnungen.
 
+Für H21 den zugehörigen `SaveGame`-Abschluss mit `MP-H21-SNAPSHOT result=paired`, Run, Generation, `host_seq` und dem gekürzten Hash abgleichen. Bei der Heimkehr belegen `MP-H21-HOME result=held` und das anschließende `result=confirmed loaded=True` den passenden privaten Load. Bei ersetztem Ziel sind `result=menu` und null private Load-Aufträge zu erwarten.
+
+`MP-HENRY exit file retained reason=no-terminal-engine-receipt` kennzeichnet eine offene Ladeanforderung für eine eigene Menüdatei. `MP-HENRY sweep retained reason=legacy-ledger-has-no-bound-engine-file` kennzeichnet erhaltene Altdateien ohne gebundenen Nachweis. Für die Freigabe einer konkreten Datei die zugehörige Engine-Pfadzeile und terminale Menü- oder Gameplay-Meldung verbinden.
+
 `stage=apply-uncertain` kennzeichnet die weitere reine Beobachtung desselben H6-Versuchs nach einem unklaren Engine-Aufruf. `stage=aborted-before-apply` steht für die bestätigte Wiederfreigabe eines lebenden Körpers vor Guard- und Todesmutation. `stage=aborted-unadmitted` verbraucht eine zuvor nicht angenommene Versuch-ID ohne Freigabe an einem Körper.
+
+`prepare-unchanged` belegt die Fehlergrenze vor der ersten Vorbereitungsmutation. Erst ein nachfolgendes `aborted-before-apply` belegt die Wiederfreigabe. Nach `prepare-uncertain` bleibt selbst `prepare-observed-dead` eine Zustandsbeobachtung ohne Todesgutschrift für den Versuch.
+
+`WO121-HITS` über `measurement_id` an `MP-FF dir=out` anbinden. `publication=bounded` kennzeichnet ein laufendes Messfenster. `publication=final` kennzeichnet das Ende der Beobachtung. Positive Deltas und `missile` beziehen sich auf das ganze Fenster. Für eindeutig einzelne Kontakte getrennte Messwerte führen. `restore_incomplete` zählt Rücksetzversuche mit fehlender oder unvollständiger Rücklesung für HP und Ausdauer im Fenster. Die expliziten Tickfelder verwenden, da der Pipe-Writer zeitversetzt loggt. `trace_dropped` zeigt eine Lücke in der Messreihe.
+
+`MP-LANE2-FF-TIME` über `source`, `contact_seq` und `recipient_life` innerhalb derselben Sitzung verbinden. `*-write-start` markiert den Aufruf des Transportadapters. `*-write-complete` bestätigt dessen abgeschlossenen TCP-Write, `*-sdk-accepted` dessen lokale Annahme durch das Steam-SDK. Den tatsächlichen Empfang über die passende `*-read`-Zeile belegen. Je Prozess die erfassten `local_qpc_ms` für Write-Dauern verwenden. Bei Client-Zeilen ist `relay_ms` eine Schätzung mit `clock_rtt_ms`. `relay_ms=0` zeigt einen fehlenden oder für diese Zeitmarke nicht verwendbaren Abgleich an. `MP-LANE2-COMBAT event=contact source=pvp` liefert die lokale Ziel-Queue und Engine-Zeit zusammen mit dem Vital-Readback. [Messplan](../../../docs/ABNAHME-LANE2-NAHKAMPF.md)
 
 ## 5. „Fleck für Fleck“-Audit
 Für jedes Feature (z. B. Bogen: Hand → Zielen → Schuss → Pfeil → Treffer; Join: Rolle → Uhr → Welt → Laden → In-Welt) eine Zeile:

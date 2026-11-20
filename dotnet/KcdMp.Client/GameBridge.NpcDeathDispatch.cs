@@ -156,8 +156,10 @@ public partial class GameBridge
     {
         try
         {
+            // The pipe checks the binding after reading the reply, too.
+            // The cancellation token bounds the I/O without retiring that binding.
             return await _combat.ApplyOwnedNpcDeathAsync(attempt.Soul, attempt.Body?.Eid ?? 0,
-                attempt.Scope.Lifecycle, attempt.Id, intent, () => !ct.IsCancellationRequested && NpcDeathAttemptCurrent(attempt), ct);
+                attempt.Scope.Lifecycle, attempt.Id, intent, () => NpcDeathAttemptCurrent(attempt), ct);
         }
         catch (OperationCanceledException)
         {

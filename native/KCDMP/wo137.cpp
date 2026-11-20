@@ -424,7 +424,7 @@ std::atomic<bool> g_send_on{false};    // frames to the agent
 std::atomic<bool> g_hold{false};       // records kept back (the agent's load hold)
 std::atomic<uint32_t> g_seq{0};
 std::atomic<uint32_t> c_recorded{0}, c_sent{0}, c_dropped{0}, c_foreign{0}, c_noPath{0};
-std::atomic<uint32_t> c_apply[10]{};
+std::atomic<uint32_t> c_apply[13]{};
 DWORD g_mainTid = 0;
 uint8_t g_role = 0;
 
@@ -606,7 +606,17 @@ bool swap_slot(void* const* vft, size_t slot, void* repl, void** orig) {
 // ---------------------------------------------------------------------------
 // Apply: one Set<Value> pulse on a quest State (the engine's own entry).
 // ---------------------------------------------------------------------------
-Applied apply(const char* path, const char* portNm, Val* before, Val* after) {
+struct ApplyExpectation { int32_t old, target; };
+
+bool check_expected(const ApplyExpectation& expected, const Val& value, Applied& verdict) {
+    if (value.ok && value.i == expected.target) { verdict = Applied::Unchanged; return false; }
+    if (value.ok && value.i == expected.old) return true;
+    verdict = Applied::Stale;
+    return false;
+}
+
+Applied apply(const char* path, const char* portNm, Val* before, Val* after,
+              const ApplyExpectation* expected = nullptr) {
     *before = Val{}; *after = Val{};
     if (!A.apply) return Applied::Unarmed;
     void* node = find_node(path);
@@ -620,6 +630,7 @@ Applied apply(const char* path, const char* portNm, Val* before, Val* after) {
             if (!node_path(node, qp, sizeof qp, &qe) || qe == 0) { res = Applied::NotAQuest; break; }
         }
         decode(static_cast<char*>(node) + kOffStateValue, before);
+        if (expected && !check_expected(*expected, *before, res)) { *after = *before; break; }
         if (node_runtime(node) == 1) wake_for_host(node, path);   // WO-209 D.4: the host has it awake (its change came)
         if (node_runtime(node) == 1) { res = Applied::Asleep; break; }   // 1 = Hibernating (C_Node::Execute's branch)
         port = find_port(node, portNm);
@@ -629,6 +640,12 @@ Applied apply(const char* path, const char* portNm, Val* before, Val* after) {
         if ((pv != A.inTrigVft && pv != A.autoTrigVft) || trig != A.inTrigTrigger) { res = Applied::PortRefused; break; }
         int dir = -1;
         if (A.portDirection && (!call_int(A.portDirection, port, &dir) || dir != 1)) { res = Applied::PortRefused; break; }
+        // Waking or preparing a port can itself run engine code. Check at
+        // the last point before the actual graph pulse on the main thread.
+        if (expected) {
+            decode(static_cast<char*>(node) + kOffStateValue, before);
+            if (!check_expected(*expected, *before, res)) { *after = *before; break; }
+        }
         ++t_applyDepth;   // WO-154: per thread (a worker's own change during this pulse is no mirror)
         const bool ran = call_void(trig, port);
         --t_applyDepth;
@@ -640,7 +657,7 @@ Applied apply(const char* path, const char* portNm, Val* before, Val* after) {
     } while (false);
     call_release(port);
     call_release(node);
-    c_apply[static_cast<size_t>(res) < 10 ? static_cast<size_t>(res) : 7].fetch_add(1);
+    c_apply[static_cast<size_t>(res)].fetch_add(1);
     return res;
 }
 
@@ -744,6 +761,7 @@ const char* applied_text(Applied a) {
         case Applied::NotAQuest: return "not under a quest";
         case Applied::TypeRefused: return "type refused (only int / uint / bool are written directly)";
         case Applied::ChangedHibernated: return "changed (the State's module is hibernated: read when it wakes)";
+        case Applied::Stale: return "predecessor-changed";
     }
     return "?";
 }
@@ -1369,8 +1387,10 @@ uint8_t handle(const uint8_t* req, size_t n, uint8_t* out, size_t cap, size_t* o
         logf("WO137-HOLD %s (queued %zu)", g_hold.load() ? "on" : "off", g_queue.size());
         return kROk;
     }
-    case kOpApply: {
+    case kOpApply:
+    case kOpApplyExpected: {
         if (n < 1 + 4 + 2) return kRBadRequest;
+        if (cap < 12 + 48) return kRFailed;
         uint32_t tag; std::memcpy(&tag, req + 1, 4);
         const uint16_t pl = get_u16(req + 5);
         if (pl == 0 || pl > kMaxPath || n < 7u + pl + 1u) return kRBadRequest;
@@ -1379,14 +1399,23 @@ uint8_t handle(const uint8_t* req, size_t n, uint8_t* out, size_t cap, size_t* o
         if (portLen == 0 || portLen > 100 || n < 8u + pl + portLen) return kRBadRequest;
         char port[128]{}; std::memcpy(port, req + 8 + pl, portLen);
         if (std::strncmp(path, "Barbora.", 8) != 0) return kRBadRequest;   // quests only
+        const size_t tail = 8u + pl + portLen;
+        const bool compare = op == kOpApplyExpected;
+        ApplyExpectation expected{};
+        if (compare) {
+            if (n != tail + 8) return kRBadRequest;
+            std::memcpy(&expected.old, req + tail, 4);
+            std::memcpy(&expected.target, req + tail + 4, 4);
+        }
         // WO-200: [flags:1] after the port -- the host's own conversation made this change: its talker-only rules hold while it applies
-        const uint8_t aflags = n > 8u + pl + portLen ? req[8 + pl + portLen] : 0;
+        const uint8_t aflags = !compare && n > tail ? req[tail] : 0;
         Val b{}, a{};
         if (aflags & kApplyMirrorTalker) wo200::set_mirror_talker(true);
-        const Applied r = apply(path, port, &b, &a);
+        const Applied r = apply(path, port, &b, &a, compare ? &expected : nullptr);
         if (aflags & kApplyMirrorTalker) wo200::set_mirror_talker(false);
-        logf("WO137-APPLY tag=%u %s :: %s -> %s (from %d to %d, %s)", tag, path, port, applied_text(r), b.i, a.i, a.type);
-        if (cap < 12 + 48) return kRFailed;
+        const uint32_t count = c_apply[static_cast<size_t>(r)].load(std::memory_order_relaxed);
+        if (r != Applied::Stale || count <= 10 || count % 100 == 0)
+            logf("WO137-APPLY tag=%u %s :: %s -> %s (from %d to %d, %s)", tag, path, port, applied_text(r), b.i, a.i, a.type);
         size_t o = 0;
         out[o++] = static_cast<uint8_t>(r);
         out[o++] = b.ok; std::memcpy(out + o, &b.i, 4); o += 4;

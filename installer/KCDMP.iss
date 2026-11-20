@@ -113,6 +113,9 @@ FinishedLabel=Setup has finished installing [name] on your computer. The applica
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
+; Ownership check before placing or pruning an existing mod folder.
+Source: "..\kdcmp\mod.manifest"; DestDir: "{tmp}"; DestName: "kct-ownership-mod.manifest"; Flags: dontcopy
+
 ; The whole Publish-Release.ps1 output: launcher, agent, relay, native DLL,
 ; injector, and the self-contained .NET runtime beside them. The launcher
 ; resolves relative DllPath/AgentPath/RelayPath against its own directory,
@@ -240,6 +243,7 @@ procedure ExitProcess(uExitCode: UINT); external 'ExitProcess@kernel32.dll stdca
   Files-section comment for what one read-only file did to a whole install. }
 const
   FILE_ATTR_NORMAL = $00000080;
+  FILE_ATTR_REPARSE_POINT = $00000400;
 
 function SetFileAttributesW(lpFileName: String; dwFileAttributes: LongInt): Boolean;
   external 'SetFileAttributesW@kernel32.dll stdcall';
@@ -355,6 +359,40 @@ end;
 function HaveGameExe(): Boolean;
 begin
   Result := DetectedGameExe <> '';
+end;
+
+function IsPlainDirectory(const Path: String): Boolean;
+var
+  Entry: TFindRec;
+begin
+  Result := False;
+  if not FindFirst(Path, Entry) then Exit;
+  try
+    Result := ((Entry.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+              ((Entry.Attributes and FILE_ATTR_REPARSE_POINT) = 0);
+  finally
+    FindClose(Entry);
+  end;
+end;
+
+function OwnsModFolder(const Target: String): Boolean;
+var
+  PreviousTarget, Manifest, PackagedManifest, Expected: String;
+begin
+  Result := False;
+  if not RegQueryStringValue(HKCU, 'Software\KCDMP', 'ModsPath', PreviousTarget) then Exit;
+  if CompareText(RemoveBackslashUnlessRoot(PreviousTarget), RemoveBackslashUnlessRoot(Target)) <> 0 then Exit;
+  Manifest := Target + '\mod.manifest';
+  if not FileExists(Manifest) then Exit;
+  try
+    PackagedManifest := ExpandConstant('{tmp}\kct-ownership-mod.manifest');
+    if not FileExists(PackagedManifest) then
+      ExtractTemporaryFile('kct-ownership-mod.manifest');
+    Expected := GetSHA256OfFile(PackagedManifest);
+    Result := (Expected <> '') and (CompareText(GetSHA256OfFile(Manifest), Expected) = 0);
+  except
+    Log('install: unable to verify existing mod ownership');
+  end;
 end;
 
 { DelTree is the normal path, but it was observed failing once on this folder
@@ -782,18 +820,29 @@ begin
   Target := GetKdcmpTargetDir('');
   if DirExists(Target) then
   begin
-    { Our own marker means this is an upgrade; anything else is somebody
-      else's kdcmp and gets an explicit ask before it is replaced. }
-    if not RegValueExists(HKCU, 'Software\KCDMP', 'ModsPath') then
+    if not IsPlainDirectory(Target) or (DirExists(Target + '\Data') and not IsPlainDirectory(Target + '\Data')) then
     begin
-      if not WizardSilent then
-        if MsgBox('There is already a mod folder at:' + #13#10#13#10 + Target + #13#10#13#10 +
-                  'It was not put there by this installer. Replace it?',
-                  mbConfirmation, MB_YESNO) <> IDYES then
-        begin
-          Result := 'Setup was cancelled so the existing mod folder could be kept.';
-          Exit;
-        end;
+      Log('install: refusing to change existing mod folder with a directory link');
+      Result := 'Setup left the existing mod folder untouched because it contains a directory link.';
+      Exit;
+    end;
+
+    { A registered directory and our manifest together identify the upgrade. }
+    if not OwnsModFolder(Target) then
+    begin
+      if WizardSilent then
+      begin
+        Log('install: refusing to change existing mod folder without ownership');
+        Result := 'Setup left the existing mod folder untouched. Run Setup interactively to confirm replacement.';
+        Exit;
+      end;
+      if MsgBox('There is already a mod folder at:' + #13#10#13#10 + Target + #13#10#13#10 +
+                'Setup could not verify that it owns this folder. Replace it?',
+                mbConfirmation, MB_YESNO) <> IDYES then
+      begin
+        Result := 'Setup was cancelled so the existing mod folder could be kept.';
+        Exit;
+      end;
 
       if not RemoveModFolder(Target) then
       begin

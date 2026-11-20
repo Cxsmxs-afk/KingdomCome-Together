@@ -80,7 +80,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
     private const byte Wo121StatusReply  = 0x8A;
     private const byte AttributedReply   = 0x8B;   // [ok][seq][steps][attackerWuid:8][victimWuid:8]
     private const byte LocalAction       = 0x96;   // unsolicited, LocalActionFrame
-    private const byte PvpHitOut         = 0x97;   // unsolicited: [victimEid:4][stamina:4f][health:4f][flags][material]
+    private const byte PvpHitOut         = 0x97;   // unsolicited measured PvpHitNotice
     private const byte PvpLifeOut        = 0xBC;   // unsolicited: [nativeLifeProof:8]
     // WO-124: the joiner's side of the join (native/KCDMP/join_native.h, savelist.h)
     private const byte JoinPlace         = 0x1C;   // [hostX:4f][hostY:4f][hostZ:4f][dist:4f] -> 0x8C
@@ -157,10 +157,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     // Resolve the victim's life before a 0x97 frame leaves the physical reader.
     internal Func<uint, GameBridge.PvpHitTarget?>? CapturePvpHitTarget { get; set; }
-    internal Func<GameBridge.PvpHitTarget?, uint, float, float, byte, byte, Task>? OnPvpHit { get; set; }
+    internal Func<GameBridge.PvpHitTarget?, PvpHitNotice, Task>? OnPvpHit { get; set; }
     internal Func<Task>? OnPvpLifeChanged { get; set; }
     private ulong _pvpNativeLife;
     internal ulong PvpNativeLife => Volatile.Read(ref _pvpNativeLife);
+    internal bool PvpCaptureCurrent(PvpHitNotice notice) =>
+        notice.Origin is not null && notice.SourceLifeProof != 0 && notice.SourceLifeProof == PvpNativeLife &&
+        ReferenceEquals(Volatile.Read(ref _pipe), notice.Origin);
 
     /// <summary>WO-132: an NPC hit a peer's avatar (measured over the hit window, put back): victim eid, stamina, health, attacker eid, flags, attacker name.</summary>
     public Func<uint, float, float, uint, byte, string, Task>? OnNpcAvatarHit { get; set; }
@@ -583,7 +586,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             [1, _, 0] => NpcDeathReceipt.Applied,
             [0, _, 0x70] => NpcDeathReceipt.Pending,
             [0, _, 0x72] => NpcDeathReceipt.Stale,
-            [0, _, 0x73] when intent != NpcDeathIntent.Advance => NpcDeathReceipt.Aborted,
+            [0, _, 0x73] => NpcDeathReceipt.Aborted,
             _ => NpcDeathReceipt.Uncertain
         };
     }
@@ -1399,12 +1402,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
         return r is { Ok: true } x ? System.Text.Encoding.ASCII.GetString(x.Payload) : null;
     }
 
-    public async Task<(bool Ok, byte Reason, byte[] Payload)?> Wo163Async(byte op, byte[] args, CancellationToken ct = default)
+    public async Task<(bool Ok, byte Reason, byte[] Payload)?> Wo163Async(byte op, byte[] args, CancellationToken ct = default,
+        Func<bool>? beforeWrite = null)
     {
         var p = new byte[1 + args.Length];
         p[0] = op; args.CopyTo(p, 1);
-        var (body, _) = await SendAndAwaitAsync(Wo163, p, Wo163Reply, ct);
-        if (body is null || body.Length < 4) return null;
+        var (body, _) = await SendAndAwaitAsync(Wo163, p, Wo163Reply, ct, beforeWrite, exactSequence: beforeWrite is not null);
+        if (body is null || body.Length < 4 || (beforeWrite is not null && body[2] != op)) return null;
         return (body[0] == 1, body[3], body.AsSpan(4).ToArray());
     }
 
@@ -1414,6 +1418,16 @@ public sealed partial class CombatPipe : IAsyncDisposable
         var r = await Wo163Async(Protocol.Wo184OpSaveState, [], ct);
         if (r is not { Ok: true, Payload.Length: >= 4 } x || x.Payload[0] == 0) return null;
         return (x.Payload[1] != 0, x.Payload[2] != 0, x.Payload[3] != 0);
+    }
+
+    internal async Task<byte?> H21RequestSnapshotAsync(Guid attempt, ulong worldGeneration, bool final, CancellationToken ct)
+    {
+        var body = new byte[25];
+        attempt.TryWriteBytes(body);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(16), worldGeneration);
+        body[24] = final ? (byte)1 : (byte)0;
+        var r = await Wo163Async(Protocol.H21OpSnapshot, body, ct);
+        return r is { Ok: true, Payload.Length: 1 } x ? x.Payload[0] : null;
     }
 
     /// <summary>WO-184 op 35: the engine's own cancel of a pending save. Result 1 cancelled, 0 nothing pending, 2 not armed, 3 fault, 4 still pending; null = no answer.</summary>
@@ -2121,12 +2135,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
     // ---- WO-137 (native wo137.h) ---------------------------------------------
 
     /// <summary>One WO-137 op: (ok, reason, payload after the 4-byte head), or null when the DLL did not answer.</summary>
-    public async Task<(bool Ok, byte Reason, byte[] Payload)?> Wo137Async(byte op, byte[] args, CancellationToken ct = default)
+    public async Task<(bool Ok, byte Reason, byte[] Payload)?> Wo137Async(byte op, byte[] args, CancellationToken ct = default,
+        Func<bool>? beforeWrite = null)
     {
         var p = new byte[1 + args.Length];
         p[0] = op; args.CopyTo(p, 1);
-        var (body, _) = await SendAndAwaitAsync(Wo137, p, Wo137Reply, ct);
-        if (body is null || body.Length < 4) return null;
+        var (body, _) = await SendAndAwaitAsync(Wo137, p, Wo137Reply, ct, beforeWrite, exactSequence: beforeWrite is not null);
+        if (body is null || body.Length < 4 || (beforeWrite is not null && body[2] != op)) return null;
         return (body[0] == 1, body[3], body.AsSpan(4).ToArray());
     }
 
@@ -2147,19 +2162,36 @@ public sealed partial class CombatPipe : IAsyncDisposable
     public readonly record struct QuestApplied(byte Result, bool OldOk, int Old, bool NewOk, int New, string Type);
 
     /// <summary>op 2: one Set&lt;Value&gt; pulse on a quest State (null = the DLL did not answer).</summary>
-    public async Task<QuestApplied?> Wo137ApplyAsync(uint tag, string path, string port, CancellationToken ct = default, bool mirrorTalker = false)
+    public Task<QuestApplied?> Wo137ApplyAsync(uint tag, string path, string port, CancellationToken ct = default, bool mirrorTalker = false) =>
+        Wo137ApplyCoreAsync(tag, path, port, ct, mirrorTalker, null, null);
+
+    // A host decision is authorized against a specific value. An older DLL
+    // refuses this op without falling back to the unguarded mirror operation.
+    internal Task<QuestApplied?> Wo137ApplyExpectedAsync(uint tag, string path, string port, int expected, int target,
+        Func<bool> current, CancellationToken ct) =>
+        Wo137ApplyCoreAsync(tag, path, port, ct, false, (expected, target), current);
+
+    private async Task<QuestApplied?> Wo137ApplyCoreAsync(uint tag, string path, string port, CancellationToken ct, bool mirrorTalker,
+        (int Expected, int Target)? compare, Func<bool>? beforeWrite)
     {
         byte[] pb = Encoding.ASCII.GetBytes(path), qb = Encoding.ASCII.GetBytes(port);
         if (pb.Length == 0 || pb.Length > 400 || qb.Length == 0 || qb.Length > 100) return null;
         // WO-200: [flags:1] after the port -- 1 = the host's own conversation made this change (wo137.h kApplyMirrorTalker)
-        var a = new byte[4 + 2 + pb.Length + 1 + qb.Length + (mirrorTalker ? 1 : 0)];
+        int tail = 7 + pb.Length + qb.Length;
+        var a = new byte[tail + (compare.HasValue ? 8 : mirrorTalker ? 1 : 0)];
         if (mirrorTalker) a[^1] = 1;
         BinaryPrimitives.WriteUInt32LittleEndian(a, tag);
         BinaryPrimitives.WriteUInt16LittleEndian(a.AsSpan(4), (ushort)pb.Length);
         pb.CopyTo(a, 6);
         a[6 + pb.Length] = (byte)qb.Length;
         qb.CopyTo(a, 7 + pb.Length);
-        var r = await Wo137Async(2, a, ct);
+        if (compare is { } values)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(a.AsSpan(tail), values.Expected);
+            BinaryPrimitives.WriteInt32LittleEndian(a.AsSpan(tail + 4), values.Target);
+        }
+        byte op = compare.HasValue ? Wo137Rules.ApplyExpectedOp : (byte)2;
+        var r = await Wo137Async(op, a, ct, beforeWrite);
         if (r is not { Ok: true } v || v.Payload.Length < 12) return null;
         var b = v.Payload;
         string type = Wo137Rules.ReplyType(b);   // WO-166: the length is byte 11 (it was read at 10: every type printed empty)
@@ -2305,7 +2337,21 @@ public sealed partial class CombatPipe : IAsyncDisposable
 
     // Replies stay on the physical reader; callbacks can themselves need the
     // pipe or the relay. One FIFO worker retains unsolicited event order.
-    private readonly record struct PipeNotice(byte Type, byte[] Body, GameBridge.PvpHitTarget? PvpTarget);
+    private readonly record struct PipeNotice(byte Type, byte[] Body, ulong ReadTick, GameBridge.PvpHitTarget? PvpTarget);
+
+    private const int MaxQueuedPvpNotices = 64;
+    private sealed class PvpNoticeBudget
+    {
+        public int Pending;
+        private long _nextLogTick;
+
+        public void NoteDrop(long now, string reason)
+        {
+            if (now < _nextLogTick) return;
+            _nextLogTick = now + 1000;
+            Console.WriteLine($"MP-FF dir=out stage=pipe result=dropped reason={reason}");
+        }
+    }
 
     private async Task ReadLoopAsync(NamedPipeClientStream myPipe, ChannelWriter<(byte Type, byte[] Body)> replies)
     {
@@ -2313,7 +2359,8 @@ public sealed partial class CombatPipe : IAsyncDisposable
         {
             SingleReader = true, SingleWriter = true
         });
-        _ = RunDetached(() => ReadNoticesAsync(myPipe, notices.Reader));
+        var pvpBudget = new PvpNoticeBudget();
+        _ = RunDetached(() => ReadNoticesAsync(myPipe, notices.Reader, pvpBudget));
         try
         {
             while (myPipe.IsConnected)
@@ -2334,10 +2381,26 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 if (type == BatchReply) OnBatchReply(body);
                 else if (IsPipeNotice(type))
                 {
-                    var pvpTarget = type == PvpHitOut && body.Length == 14
+                    long readTick = 0;
+                    if (type == PvpHitOut)
+                    {
+                        readTick = Environment.TickCount64;
+                        if (body.Length != PvpHitNotice.Length)
+                        {
+                            pvpBudget.NoteDrop(readTick, "missing-native-capture");
+                            continue;
+                        }
+                        if (Interlocked.Increment(ref pvpBudget.Pending) > MaxQueuedPvpNotices)
+                        {
+                            Interlocked.Decrement(ref pvpBudget.Pending);
+                            pvpBudget.NoteDrop(readTick, "pvp-notice-backlog");
+                            continue;
+                        }
+                    }
+                    var pvpTarget = type == PvpHitOut
                         ? CapturePvpHitTarget?.Invoke(BinaryPrimitives.ReadUInt32LittleEndian(body))
                         : null;
-                    if (!notices.Writer.TryWrite(new(type, body, pvpTarget)))
+                    if (!notices.Writer.TryWrite(new(type, body, (ulong)readTick, pvpTarget)))
                         throw new InvalidOperationException("The connection's notice queue has already closed.");
                 }
                 else if (!replies.TryWrite((type, body)))
@@ -2361,17 +2424,19 @@ public sealed partial class CombatPipe : IAsyncDisposable
         or LocalGrave or LocalAction or PvpHitOut or PvpLifeOut or NpcAvatarHit or NpcCombatOut or QuestChangeOut or NpcStreamOut or WorldOut
         or MenuOut or ActivityOut or ExtraOut or SleepOut or CrimeOut or DefenceOut or DiscardedHit or NpcDropped or NpcTraceDone;
 
-    private async Task ReadNoticesAsync(NamedPipeClientStream pipe, ChannelReader<PipeNotice> notices)
+    private async Task ReadNoticesAsync(NamedPipeClientStream pipe,
+        ChannelReader<PipeNotice> notices, PvpNoticeBudget pvpBudget)
     {
-        await foreach (var (type, body, pvpTarget) in notices.ReadAllAsync())
+        await foreach (var (type, body, readTick, pvpTarget) in notices.ReadAllAsync())
         {
             if (!ReferenceEquals(_pipe, pipe)) return;
-            try { await DeliverNoticeAsync(type, body, pvpTarget); }
+            try { await DeliverNoticeAsync(pipe, type, body, readTick, pvpTarget); }
             catch (Exception ex) { Console.WriteLine($"[combat] notice 0x{type:X2} failed: {ex.GetType().Name}: {ex.Message}"); }
+            finally { if (type == PvpHitOut) Interlocked.Decrement(ref pvpBudget.Pending); }
         }
     }
 
-    private async Task DeliverNoticeAsync(byte type, byte[] body, GameBridge.PvpHitTarget? pvpTarget)
+    private async Task DeliverNoticeAsync(NamedPipeClientStream pipe, byte type, byte[] body, ulong readTick, GameBridge.PvpHitTarget? pvpTarget)
     {
         if (type == LocalHit && body.Length >= 24)
         {
@@ -2452,18 +2517,9 @@ public sealed partial class CombatPipe : IAsyncDisposable
         {
             if (OnPvpLifeChanged is { } h) await h();
         }
-        else if (type == PvpHitOut && body.Length == 14)
+        else if (type == PvpHitOut)
         {
-            if (OnPvpHit is { } h)
-            {
-                try
-                {
-                    await h(pvpTarget, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)),
-                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
-                            BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12], body[13]);
-                }
-                catch (Exception ex) { Console.WriteLine($"[wo121] pvp hit not sent: {ex.Message}"); }
-            }
+            if (OnPvpHit is { } h) await h(pvpTarget, PvpHitNotice.Read(body, readTick, pipe));
         }
         else if (type == NpcAvatarHit && body.Length >= 18 && body.Length == 18 + body[17])
         {
@@ -2915,7 +2971,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         await _writeLock.WaitAsync(deadline.Token);
         try
         {
-            if (beforeWrite is not null && !beforeWrite()) throw new OperationCanceledException("teleport proof superseded", ct);
+            if (beforeWrite is not null && !beforeWrite()) throw new OperationCanceledException("pipe write proof superseded", ct);
             return await WriteFrameLockedAsync(type, payload, deadline.Token, expectedPipe);
         }
         finally { _writeLock.Release(); }
@@ -3028,6 +3084,26 @@ public sealed partial class CombatPipe : IAsyncDisposable
         // here could strand existing waiters or fault their finally blocks.
     }
 
+}
+
+/// <summary>A native measurement and its local monotonic timing. The measurement ID is scoped to the sender's native life.</summary>
+internal readonly record struct PvpHitNotice(uint VictimEid, float Stamina, float Health, byte Flags, byte Material,
+    ulong CapturedTick, ulong MeasuredTick, ulong SourceLifeProof, ulong MeasurementId, ulong ReadTick,
+    NamedPipeClientStream? Origin = null)
+{
+    internal const int Length = 14 + 4 * sizeof(ulong);
+    // The native watcher measures over 600 ms. Allow normal delivery plus bounded queue delay.
+    private const ulong CaptureBudgetMs = 2000;
+
+    internal bool FreshAt(ulong now) =>
+        CapturedTick != 0 && MeasuredTick >= CapturedTick && ReadTick >= MeasuredTick &&
+        now >= ReadTick && now - CapturedTick <= CaptureBudgetMs;
+
+    internal static PvpHitNotice Read(ReadOnlySpan<byte> bytes, ulong readTick, NamedPipeClientStream origin) =>
+        new(BinaryPrimitives.ReadUInt32LittleEndian(bytes), BinaryPrimitives.ReadSingleLittleEndian(bytes[4..]),
+            BinaryPrimitives.ReadSingleLittleEndian(bytes[8..]), bytes[12], bytes[13],
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes[14..]), BinaryPrimitives.ReadUInt64LittleEndian(bytes[22..]),
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes[30..]), BinaryPrimitives.ReadUInt64LittleEndian(bytes[38..]), readTick, origin);
 }
 
 

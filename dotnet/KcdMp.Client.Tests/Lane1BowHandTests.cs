@@ -1,14 +1,16 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.IO.Pipes;
 using System.Net;
 using System.Reflection;
+using System.Threading.Channels;
 using KcdMp.Wire;
 
 namespace KcdMp.Client.Tests;
 
 [Collection("T3 connection lifecycle")]
-public sealed class Lane1BowHandTests
+public sealed partial class Lane1BowHandTests
 {
     private const BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
     private const byte Peer = 1;
@@ -218,8 +220,10 @@ public sealed class Lane1BowHandTests
         await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
         var bridge = await CreateHostAsync(link);
         Field("_transport").SetValue(bridge, transport);
+        await using var native = await HandPipe.StartAsync(bridge);
 
         await ReceiveRangedBowAsync(bridge, Environment.TickCount64);
+        await native.ExpectAsync(Bow);
         await ReceiveRangedBowAsync(bridge, Environment.TickCount64);
         await ReceiveFigureHandAsync(bridge, "v1|1|-");
 
@@ -227,10 +231,11 @@ public sealed class Lane1BowHandTests
         var kept = (HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, outfit)!;
         Assert.Contains(Bow, kept);
         Assert.DoesNotContain(Bow, outfit);
-        string command = Assert.Single(game.Requests);
-        Assert.Contains($"KCD2MP_W214FigureHand(\"{Peer}\", true, \"{Bow:D}\"", command);
+        Assert.False(native.Declarations.TryRead(out _));
+        Assert.Empty(game.Requests);
 
         await ReceiveFigureHandAsync(bridge, "v1|0|-");
+        await native.ExpectAsync(null);
         Assert.DoesNotContain(Bow, (HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, outfit)!);
     }
 
@@ -242,7 +247,9 @@ public sealed class Lane1BowHandTests
         await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
         var bridge = await CreateHostAsync(link);
         Field("_transport").SetValue(bridge, transport);
+        await using var native = await HandPipe.StartAsync(bridge);
         await ReceiveRangedBowAsync(bridge, Environment.TickCount64);
+        await native.ExpectAsync(Bow);
 
         // Advance the receipt timestamp past the ordinary 25-second WO-214 deadline.
         AgeFigureHand(bridge);
@@ -254,7 +261,8 @@ public sealed class Lane1BowHandTests
         Assert.Equal(Bow, Assert.Single(kept));
         var hand = FigureHand(bridge);
         Assert.True((long)hand.GetType().GetProperty("AtMs")!.GetValue(hand)! >= receivedAt);
-        Assert.Single(game.Requests);
+        Assert.False(native.Declarations.TryRead(out _));
+        Assert.Empty(game.Requests);
 
         Call(bridge, "P6VisualModeChanged");
         Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
@@ -271,7 +279,9 @@ public sealed class Lane1BowHandTests
         await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
         var bridge = await CreateHostAsync(link);
         Field("_transport").SetValue(bridge, transport);
+        await using var native = await HandPipe.StartAsync(bridge);
         await ReceiveRangedBowAsync(bridge, Environment.TickCount64);
+        await native.ExpectAsync(Bow);
         AgeFigureHand(bridge);
 
         var kept = (HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!;
@@ -288,9 +298,9 @@ public sealed class Lane1BowHandTests
             case "sheathed":
                 await ReceiveFigureHandAsync(bridge, "v1|0|-");
                 await ReceiveFigureHandAsync(bridge, "v1|0|-");
-                string command = Assert.Single(game.Requests.Where(request => request.Contains($"KCD2MP_W214FigureHand(\"{Peer}\", false, \"-\"", StringComparison.Ordinal)));
-                Assert.DoesNotContain("KCD2MP_GhostCombat", command); // Lua holsters only after the scoped hand passes its check.
-                Assert.Contains("\"0000000000000002\"", command);
+                await native.ExpectAsync(null);
+                Assert.False(native.Declarations.TryRead(out _));
+                Assert.Empty(game.Requests);
                 break;
         }
 
@@ -363,6 +373,7 @@ public sealed class Lane1BowHandTests
         await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
         var bridge = await CreateHostAsync(link);
         Field("_transport").SetValue(bridge, transport);
+        await using var native = await HandPipe.StartAsync(bridge);
 
         byte[] older = HandPayload(10, $"v1|1|{Bow:D}");
         byte[] newer = HandPayload(11, "v1|0|-");
@@ -376,7 +387,9 @@ public sealed class Lane1BowHandTests
 
         await (Task)Call(bridge, "Wo203OnSideFrameAsync", Peer, newer[(1 + Protocol.JoinHeaderLen)..])!;
 
-        Assert.Contains($"KCD2MP_W214FigureHand(\"{Peer}\", false, \"-\"", Assert.Single(game.Requests));
+        await native.ExpectAsync(null);
+        Assert.False(native.Declarations.TryRead(out _));
+        Assert.Empty(game.Requests);
         Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
 
     }
@@ -389,6 +402,7 @@ public sealed class Lane1BowHandTests
         await using var transport = new HttpGameTransport("http://localhost:1403", 1000, game);
         var bridge = await CreateHostAsync(link);
         Field("_transport").SetValue(bridge, transport);
+        await using var native = await HandPipe.StartAsync(bridge);
         byte[] confirmed = HandPayload(10, $"v1|1|{Bow:D}");
         byte[] empty = HandPayload(11, "v1|1|-");
         Call(bridge, "P6NoteVisualAtRead", (int)Protocol.W203Down, confirmed);
@@ -397,7 +411,9 @@ public sealed class Lane1BowHandTests
         await (Task)Call(bridge, "Wo203OnSideFrameAsync", Peer, confirmed[(1 + Protocol.JoinHeaderLen)..])!;
         await (Task)Call(bridge, "Wo203OnSideFrameAsync", Peer, empty[(1 + Protocol.JoinHeaderLen)..])!;
 
-        Assert.Contains(Bow.ToString("D"), Assert.Single(game.Requests));
+        await native.ExpectAsync(Bow);
+        Assert.False(native.Declarations.TryRead(out _));
+        Assert.Empty(game.Requests);
         Assert.Equal(Bow, Assert.Single((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!));
     }
 
@@ -410,28 +426,21 @@ public sealed class Lane1BowHandTests
         var bridge = await CreateHostAsync(link);
         Field("_transport").SetValue(bridge, transport);
         string ghost = Peer.ToString();
-        string[] GearCalls() => game.Requests.Where(request => request.Contains("KCD2MP_W214FigureHand(", StringComparison.Ordinal) ||
-            request.Contains("KCD2MP_W144Equip(", StringComparison.Ordinal)).ToArray();
         Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE");
         Assert.Equal(222u, ((ConcurrentDictionary<string, uint>)Field("_ghostEntityIds").GetValue(bridge)!)[ghost]);
-        Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE 012345");
+        await using var native = await HandPipe.StartAsync(bridge);
         await ReceiveFigureHandAsync(bridge, $"v1|1|{Bow:D}");
         Assert.Equal(Bow, Assert.Single((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!));
-        Assert.Contains("\"000000DE\",\"0000000000000001\",\"012345\"", Assert.Single(GearCalls()));
+        await native.ExpectAsync(Bow);
 
         Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE 012346");
 
         Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
         await (Task)Call(bridge, "Wo214PreDrawAsync", Peer, CancellationToken.None)!;
-        Assert.Single(GearCalls());
+        Assert.Empty(game.Requests.Where(request => request.Contains("KCD2MP_W144Equip(", StringComparison.Ordinal)));
         await ReceiveFigureHandAsync(bridge, $"v1|1|{Sword:D}");
-        Assert.Collection(GearCalls(),
-            old => Assert.Contains(Bow.ToString("D"), old),
-            current =>
-            {
-                Assert.Contains(Sword.ToString("D"), current);
-                Assert.Contains("\"000000DE\",\"0000000000000002\",\"012346\"", current);
-            });
+        await native.ExpectAsync(Sword, 0x012346);
+        Assert.False(native.Declarations.TryRead(out _));
     }
 
     [Fact]
@@ -514,6 +523,114 @@ public sealed class Lane1BowHandTests
         Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
     }
 
+    private sealed class HandPipe : IAsyncDisposable
+    {
+        private readonly CancellationTokenSource _stop = new();
+        private readonly NamedPipeServerStream _server;
+        private readonly CombatPipe _client;
+        private readonly Channel<byte[]> _requests = Channel.CreateUnbounded<byte[]>();
+        private Task? _pump;
+
+        private HandPipe()
+        {
+            string name = "kct-h4-hand-" + Guid.NewGuid().ToString("N");
+            _server = new(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            _client = new(name) { BatchOn = false };
+        }
+
+        public ChannelReader<byte[]> Declarations => _requests.Reader;
+        public volatile byte ObservedKnown;
+
+        public static async Task<HandPipe> StartAsync(GameBridge bridge)
+        {
+            var native = new HandPipe();
+            try
+            {
+                Field("_ghostIsolate").SetValue(bridge, false);
+                Call(bridge, "OnGameEvent", "ghostid", $"{Peer} 000000DE 012345");
+                Field("_combat").SetValue(bridge, native._client);
+                Task accepted = native._server.WaitForConnectionAsync(native._stop.Token);
+                Assert.True(await native._client.EnsureConnectedAsync(native._stop.Token));
+                await accepted;
+                native._pump = native.PumpAsync();
+                Assert.True(await native._client.ProbeEdgeAsync(native._stop.Token));
+                return native;
+            }
+            catch
+            {
+                await native.DisposeAsync();
+                throw;
+            }
+        }
+
+        public async Task<byte[]> ExpectAsync(Guid? cls, uint incarnation = 0x012345)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+            byte[] body = await Declarations.ReadAsync(timeout.Token);
+            Assert.Equal(60, body.Length);
+            Assert.Equal(new byte[] { 2, 0, Peer }, body[..3]);
+            Assert.Equal(222u, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(3)));
+            Assert.Equal(cls ?? Guid.Empty, new Guid(body.AsSpan(31, 16)));
+            Assert.Equal(cls.HasValue, (body[47] & 1) != 0);
+            Assert.Equal(incarnation, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(19)));
+            Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(48)));
+            return body;
+        }
+
+        private async Task PumpAsync()
+        {
+            try
+            {
+                var header = new byte[3];
+                while (await _server.ReadAsync(header.AsMemory(0, 1), _stop.Token) != 0)
+                {
+                    await _server.ReadExactlyAsync(header.AsMemory(1), _stop.Token);
+                    var body = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
+                    await _server.ReadExactlyAsync(body, _stop.Token);
+                    if (header[0] == 0x2B)
+                    {
+                        Assert.Equal(new byte[] { 255 }, body);
+                        await _server.WriteAsync(new byte[] { 0xAC, 5, 0, 1, 0, 255, 0, 1 }, _stop.Token);
+                        continue;
+                    }
+                    Assert.Equal(0x38, header[0]);
+                    Assert.Equal(0x41, body[5]);
+                    byte[] declaration = body[10..];
+                    if (declaration[1] == 0) Assert.Equal(60, declaration.Length);
+                    else
+                    {
+                        Assert.Equal(1, declaration[1]);
+                        Assert.Equal(47, declaration.Length);
+                    }
+                    var reply = new byte[46];
+                    reply[0] = 0xB8;
+                    reply[1] = 43;
+                    body.AsSpan(0, 4).CopyTo(reply.AsSpan(3));
+                    reply[8] = 0xBB;
+                    reply[9] = 1;
+                    reply[11] = 2;
+                    if (declaration[1] == 1) reply[13] = ObservedKnown;
+                    await _server.WriteAsync(reply, _stop.Token);
+                    if (declaration[1] == 0) _requests.Writer.TryWrite(declaration);
+                }
+            }
+            catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+            finally { _requests.Writer.TryComplete(); }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _stop.CancelAsync();
+            try { if (_pump is not null) await _pump; }
+            finally
+            {
+                await _client.DisposeAsync();
+                await _server.DisposeAsync();
+                _stop.Dispose();
+            }
+        }
+    }
+
     private static async Task<GameBridge> CreateHostAsync(Stream link)
     {
         byte phase = 0;
@@ -590,7 +707,7 @@ public sealed class Lane1BowHandTests
         var serial = (long)Call(bridge, "P6PeerAtRead", (int)Protocol.W164Down, new byte[] { Peer })!;
         Assert.NotEqual(0, serial);
         return (Task)Call(bridge, "Wo214OnRangedHandAsync", Peer, Bow, Call(bridge, "P6GetContext"),
-            0L, serial, capturedAt, (Func<bool>)(() => true), CancellationToken.None)!;
+            0L, serial, Call(bridge, "Wo214FigureBody", Peer), capturedAt, (Func<bool>)(() => true), CancellationToken.None, null)!;
     }
 
     private static Task ReceiveFigureHandAsync(GameBridge bridge, string report)

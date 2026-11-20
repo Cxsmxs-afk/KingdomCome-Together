@@ -30,12 +30,15 @@ public partial class GameBridge
     private readonly ConcurrentDictionary<string, (uint Entity, uint Birth)> _w214FigureBirths = new();
     private readonly string _w214OutfitAgent = Guid.NewGuid().ToString("N");
     private sealed record FigureHand(bool Drawn, Guid? Cls, long AtMs, long ChangedAtMs, long RequestedAtMs,
-        P6Context Context, long PeerSerial, FigureBody Body, long Revision, long? RangedMode = null);
+        P6Context Context, long PeerSerial, FigureBody Body, long Revision, long? RangedMode = null, uint? SourceToken = null);
     private sealed record OwnBow(P6Context Context, long Mode, BowHandProof Proof);
     private sealed record OwnHand(P6Context Context, bool Drawn, Guid? Cls, long Revision);
     private sealed record HandRepeat(OwnHand Hand, long PeerSerial, Guid? Cls, long Attempt);
     private readonly ConcurrentDictionary<byte, FigureHand> _w214FigureHand = new();
     private readonly ConcurrentDictionary<byte, FigureHand> _w214LastHeld = new();
+    private sealed record EngineHand(FigureHand Desired, long Connection, Wo214NativeHands Actual);
+    private readonly ConcurrentDictionary<byte, EngineHand> _w214EngineHands = new();
+    private long _w214OutfitRefused;
     private readonly record struct FigureHandReceipt(Stream Stream, long PeerSerial, uint Token, FigureBody Body,
         Guid? DrawnClass, uint? PreviousStateToken);
     private readonly ConcurrentDictionary<byte, FigureHandReceipt> _w214HandAtRead = new();
@@ -260,6 +263,13 @@ public partial class GameBridge
         unchecked((int)(receipt.Token - token)) <= 0 ||
         (receipt.DrawnClass == cls && (receipt.PreviousStateToken is not uint previous || unchecked((int)(previous - token)) <= 0));
 
+    private bool Wo214HandReceiptChanged(byte src, FigureHand hand) =>
+        hand.SourceToken is uint token && _w214HandAtRead.TryGetValue(src, out var receipt) &&
+        ReferenceEquals(receipt.Stream, hand.Context.Stream) && receipt.PeerSerial == hand.PeerSerial &&
+        receipt.Body == hand.Body && unchecked((int)(receipt.Token - token)) > 0 &&
+        (receipt.DrawnClass != (hand.Drawn ? hand.Cls : null) ||
+         (receipt.PreviousStateToken is uint previous && unchecked((int)(previous - token)) > 0));
+
     /// <summary>The partner's hand (a W203 FigureHand row from <paramref name="src"/>): his figure here is made to hold it.</summary>
     private void Wo214OnFigureHand(byte src, LootMsg m)
     {
@@ -287,9 +297,9 @@ public partial class GameBridge
         long now = Environment.TickCount64;
         if (_w214FigureHand.TryGetValue(src, out var hand) && Wo214HandCurrent(src, hand))
         {
-            if (livenessOnly || (drawn == hand.Drawn && cls == hand.Cls))
+            if (livenessOnly || (drawn == hand.Drawn && cls == hand.Cls && !Wo214HandReceiptChanged(src, hand)))
             {
-                var heard = hand with { AtMs = now };
+                var heard = hand with { AtMs = now, SourceToken = livenessOnly ? hand.SourceToken : m.Tok };
                 if (!_w214FigureHand.TryUpdate(src, heard, hand)) return;
                 if (!livenessOnly && now - hand.RequestedAtMs >= Wo214GameRequestIntervalMs)
                     _ = Wo214ApplyWireHandAsync(src, heard with { RequestedAtMs = now }, peer.Token);
@@ -298,7 +308,7 @@ public partial class GameBridge
         }
         if (livenessOnly) return;
         _ = Wo214ApplyWireHandAsync(src, new(drawn, cls, now, now, now, context, peer.Serial, body,
-            Interlocked.Increment(ref _w214FigureHandRevision)), peer.Token);
+            Interlocked.Increment(ref _w214FigureHandRevision), SourceToken: m.Tok), peer.Token);
     }
 
     private async Task Wo214ApplyWireHandAsync(byte src, FigureHand hand, CancellationToken peerToken)
@@ -343,8 +353,19 @@ public partial class GameBridge
 
     private bool Wo214OutfitCurrent(byte src, FigureOutfitStamp stamp)
     {
-        if (Wo214OutfitStamp(src) == stamp) return true;
-        Console.WriteLine($"[appearance] ghost {src}: outfit superseded by a new body or hand");
+        string reason = "old-body-or-hand";
+        if (Wo214OutfitStamp(src) == stamp)
+        {
+            if (!W214On("figure_hands") || stamp.HandRevision == 0) return true;
+            reason = "hand-readback-unconfirmed";
+            if (_w214FigureHand.TryGetValue(src, out var hand) && hand.Revision == stamp.HandRevision &&
+                !hand.Drawn && _w214EngineHands.TryGetValue(src, out var proof) && proof.Actual.ConfirmedEmpty &&
+                Wo214SameHandState(proof.Desired, hand) && Wo214EngineHandCurrent(src, hand, proof.Connection))
+                return true;
+        }
+        long count = Interlocked.Increment(ref _w214OutfitRefused);
+        if (count <= 12 || count % 128 == 0)
+            Console.WriteLine(FormattableString.Invariant($"MP-LANE1-BOW outfit refused peer={src} reason={reason} n={count}"));
         return false;
     }
 
@@ -366,23 +387,23 @@ public partial class GameBridge
     }
 
     private async Task Wo214OnRangedHandAsync(byte src, Guid cls, P6Context context, long mode, long peerSerial,
-        long capturedAt, Func<bool> current, CancellationToken ct)
+        FigureBody body, long capturedAt, Func<bool> current, CancellationToken ct, uint? sourceToken)
     {
         if (!W214On("figure_hands") || cls == Guid.Empty || !current() || ct.IsCancellationRequested) return;
         long now = Environment.TickCount64;
-        var hand = new FigureHand(true, cls, now, now, now, context, peerSerial, Wo214FigureBody(src),
-            Interlocked.Increment(ref _w214FigureHandRevision), mode);
+        var hand = new FigureHand(true, cls, now, now, now, context, peerSerial, body,
+            Interlocked.Increment(ref _w214FigureHandRevision), mode, sourceToken);
         if (_w214FigureHand.TryGetValue(src, out var previous) && Wo214HandCurrent(src, previous))
         {
             if (previous.ChangedAtMs > capturedAt &&
                 (!previous.Drawn || (previous.Cls is Guid held && held != cls))) return;
-            if (previous.Drawn && previous.Cls == cls)
+            if (previous.Drawn && previous.Cls == cls && !Wo214HandReceiptChanged(src, previous))
             {
                 hand = hand with { ChangedAtMs = previous.ChangedAtMs, Revision = previous.Revision };
-                if (previous.RangedMode.HasValue && now - previous.RequestedAtMs < Wo214GameRequestIntervalMs)
+                if (now - previous.RequestedAtMs < Wo214GameRequestIntervalMs)
                 {
                     // The Lua owner verifies asynchronously. A second request cancels its pending check.
-                    _w214FigureHand.TryUpdate(src, previous with { AtMs = now }, previous);
+                    _w214FigureHand.TryUpdate(src, previous with { AtMs = now, SourceToken = sourceToken ?? previous.SourceToken }, previous);
                     return;
                 }
             }
@@ -403,31 +424,49 @@ public partial class GameBridge
         }
     }
 
-    private Task Wo214SetFigureHandAsync(byte src, FigureHand hand, CancellationToken ct = default)
+    private async Task Wo214SetFigureHandAsync(byte src, FigureHand hand, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
         if (!Wo214HandCurrent(src, hand))
-            return Task.FromException(new OperationCanceledException("figure hand belongs to a different body"));
+            throw new OperationCanceledException("figure hand belongs to a different body");
         _w214FigureHand[src] = hand;
         if (hand.Drawn && hand.Cls.HasValue)
         {
             var held = _w214LastHeld.GetValueOrDefault(src);
             if (!Wo214SameHandState(held, hand) || held?.RangedMode != hand.RangedMode) _w214LastHeld[src] = hand;
         }
-        string c = hand.Cls is Guid g ? g.ToString("D") : "-";
         bool oversized = false;
         if (hand.Drawn && hand.Cls is Guid gc && _swingCatalog.IsCompletedSuccessfully && _swingCatalog.Result is { } cat)
             oversized = cat.OversizedItemOf([gc]) is not null;
-        Console.WriteLine($"WO214-HAND figure kcd2mp_{src} told drawn={(hand.Drawn ? 1 : 0)} cls={c}{(oversized ? " (oversized)" : "")}");
-        var stamp = new FigureOutfitStamp(hand.Body, hand.Revision);
-        return _transport.ExecuteNowAsync(
-            $"if KCD2MP_W214FigureHand then KCD2MP_W214FigureHand(\"{src}\", {(hand.Drawn ? "true" : "false")}, \"{c}\", {(oversized ? "true" : "false")}, {stamp.LuaArguments}) end", ct);
+        if (hand.Body.LuaBirth == 0) return;
+        long connection = _combat.EdgeConnectionRevision;
+        bool Current() => Wo214EngineHandCurrent(src, hand, connection);
+        if (!Current()) return;
+        byte flags = (byte)((hand.Drawn ? 1 : 0) | (oversized ? 2 : 0));
+        var declared = await _combat.RequestRangedHandAsync(src, hand.Body.Entity, hand.PeerSerial, hand.Body.Generation,
+            hand.Body.LuaBirth, hand.Revision, hand.Cls ?? Guid.Empty, connection, Current, ct,
+            new Wo214HandDeclaration(flags, hand.Context.World, hand.Context.Serial));
+        if (declared is not null && Current())
+            Console.WriteLine(FormattableString.Invariant($"WO214-HAND figure kcd2mp_{src} told drawn={(hand.Drawn ? 1 : 0)} cls={hand.Cls?.ToString("D") ?? "-"} birth={hand.Body.LuaBirth:X6} revision={hand.Revision}"));
     }
 
-    /// <summary>The mod's verdict on one figure ("w214_figure_hand": "&lt;id&gt; &lt;ok|fixed|failed&gt; &lt;how&gt;").</summary>
+    private bool Wo214EngineHandCurrent(byte peer, FigureHand hand, long connection) =>
+        hand.Body.Entity != 0 && hand.Body.LuaBirth != 0 && W214On("figure_hands") &&
+        connection == _combat.EdgeConnectionRevision && Wo214HandCurrent(peer, hand) &&
+        _w214FigureHand.TryGetValue(peer, out var latest) && Wo214SameHandState(latest, hand) &&
+        !Wo214HandReceiptChanged(peer, latest);
+
+    private bool Wo214ConfirmedRangedHand(byte peer, FigureHand hand, Guid cls) =>
+        _w214EngineHands.TryGetValue(peer, out var proof) && Wo214SameHandState(proof.Desired, hand) &&
+        Wo214EngineHandCurrent(peer, hand, proof.Connection) && proof.Actual.Holds(cls);
+
+    private static string Wo214ObservationScope(FigureHand hand) => FormattableString.Invariant(
+        $"{hand.Context.World:X8}{hand.Context.Serial:X16}{hand.PeerSerial:X16}{hand.Body.Generation:X8}{hand.Revision:X16}");
+
+    // Lua disposition permits a native readback. Only the native read observes both weapon slots.
     private void Wo214OnFigureHandResult(string? arg)
     {
-        var p = (arg ?? "").Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        var p = (arg ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (p.Length < 2) return;
         long k = p[1] switch
         {
@@ -436,6 +475,39 @@ public partial class GameBridge
             _ => Interlocked.Increment(ref _w214HandFailed),
         };
         if (k <= 200 || k % 50 == 0) Console.WriteLine($"WO214-HAND figure kcd2mp_{p[0]} {p[1]} ({(p.Length > 2 ? p[2] : "-")}) [n={k}]");
+        if (p.Length == 5 && p[1] is "ok" or "fixed" or "failed" &&
+            byte.TryParse(p[0], NumberStyles.None, CultureInfo.InvariantCulture, out byte peer) &&
+            uint.TryParse(p[3], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint birth) &&
+            _w214FigureHand.TryGetValue(peer, out var hand) && hand.Body.LuaBirth == birth && p[4] == Wo214ObservationScope(hand) &&
+            _p5Peers.TryGetValue(peer, out var binding) && binding.Serial == hand.PeerSerial)
+            _ = Wo214ObserveFigureHandAsync(peer, hand, binding.Token);
+    }
+
+    private async Task Wo214ObserveFigureHandAsync(byte peer, FigureHand hand, CancellationToken peerToken)
+    {
+        long connection = _combat.EdgeConnectionRevision;
+        bool Current() => Wo214EngineHandCurrent(peer, hand, connection);
+        if (!Current()) return;
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(hand.Context.Cancellation, peerToken);
+        try
+        {
+            var result = await _combat.RequestRangedHandAsync(peer, hand.Body.Entity, hand.PeerSerial, hand.Body.Generation,
+                hand.Body.LuaBirth, hand.Revision, hand.Cls ?? Guid.Empty, connection, Current, stop.Token);
+            if (result is not { } actual || !Current()) return;
+            bool alreadyEmpty = _w214EngineHands.TryGetValue(peer, out var previous) && previous.Connection == connection &&
+                Wo214SameHandState(previous.Desired, hand) && previous.Actual.ConfirmedEmpty;
+            _w214EngineHands[peer] = new(hand, connection, actual);
+            string left = actual.Left == Guid.Empty ? "-" : actual.Left.ToString("D");
+            string right = actual.Right == Guid.Empty ? "-" : actual.Right.ToString("D");
+            Console.WriteLine(FormattableString.Invariant($"WO214-HAND native peer={peer} world={hand.Context.World:X8} body_generation={hand.Body.Generation} birth={hand.Body.LuaBirth:X6} revision={hand.Revision} known={actual.Known} left={left} right={right}"));
+            if (!hand.Drawn && actual.ConfirmedEmpty && !alreadyEmpty)
+                await ConvergeWantedAppearanceAsync(peer, stop.Token, Current);
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine(FormattableString.Invariant($"WO214-HAND figure kcd2mp_{peer} native observation failed ({ex.GetType().Name})"));
+        }
     }
 
     /// <summary>F: the converge's target for figure <paramref name="ghostId"/> keeps the class its partner holds drawn.</summary>
@@ -482,6 +554,7 @@ public partial class GameBridge
     {
         _w214FigureHand.Clear();
         _w214LastHeld.Clear();
+        _w214EngineHands.Clear();
         _w214HandAtRead.Clear();
         Wo214ResetOwnBow("session", Environment.TickCount64);
     }

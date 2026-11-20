@@ -8,6 +8,8 @@
 
 #include <windows.h>
 #include <share.h>
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdarg>
 #include <mutex>
@@ -134,7 +136,97 @@ inline void crash_ring_note(const char* prefix, const char* text) {   // under t
     r.next = r.next + 1;
 }
 
-inline void logf(const char* fmt, ...) {
+// The lifecycle and PauseGame paths use this bounded queue when they cannot
+// wait for the log file. The normal logger and its ordering are unchanged.
+namespace deferred_log {
+struct Record {
+    SYSTEMTIME time{};
+    DWORD thread = 0;
+    char text[512]{};
+};
+
+class Queue {
+    static constexpr size_t kCapacity = 64;
+    struct Slot {
+        std::atomic<size_t> turn{0};
+        Record record;
+    };
+    static_assert(std::atomic<size_t>::is_always_lock_free && std::atomic<uint32_t>::is_always_lock_free);
+    std::array<Slot, kCapacity> slots_{};
+    alignas(64) std::atomic<size_t> tail_{0};
+    alignas(64) size_t head_ = 0; // Only the diagnostics consumer.
+    std::atomic<uint32_t> dropped_{0}, truncated_{0};
+
+public:
+    Queue() {
+        for (size_t i = 0; i < slots_.size(); ++i)
+            slots_[i].turn.store(i, std::memory_order_relaxed);
+    }
+
+    void push(const char* fmt, va_list args) {
+        size_t ticket = tail_.load(std::memory_order_relaxed);
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            auto& slot = slots_[ticket % slots_.size()];
+            if (slot.turn.load(std::memory_order_acquire) != ticket) {
+                const size_t next = tail_.load(std::memory_order_relaxed);
+                if (ticket == next) break; // The consumer has not freed this slot.
+                ticket = next;
+                continue;
+            }
+            if (!tail_.compare_exchange_strong(ticket, ticket + 1, std::memory_order_relaxed)) continue;
+            auto& record = slot.record;
+            GetLocalTime(&record.time);
+            record.thread = GetCurrentThreadId();
+            const int n = std::vsnprintf(record.text, sizeof record.text, fmt, args);
+            if (n < 0) record.text[0] = '\0';
+            if (n < 0 || static_cast<size_t>(n) >= sizeof record.text)
+                truncated_.fetch_add(1, std::memory_order_relaxed);
+            slot.turn.store(ticket + 1, std::memory_order_release);
+            return;
+        }
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool pop(Record& record) {
+        auto& slot = slots_[head_ % slots_.size()];
+        if (slot.turn.load(std::memory_order_acquire) != head_ + 1) return false;
+        record = slot.record;
+        slot.turn.store(head_ + slots_.size(), std::memory_order_release);
+        ++head_;
+        return true;
+    }
+
+    uint32_t take_dropped() { return dropped_.exchange(0, std::memory_order_relaxed); }
+    uint32_t take_truncated() { return truncated_.exchange(0, std::memory_order_relaxed); }
+};
+
+inline Queue queue;
+inline thread_local bool active = false;
+#ifdef _WIN32
+static_assert(std::atomic<HANDLE>::is_always_lock_free);
+inline std::atomic<HANDLE> wake{nullptr};
+#endif
+
+class Scope {
+    bool previous_ = active;
+public:
+    Scope() noexcept { active = true; }
+    ~Scope() { active = previous_; }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+};
+
+inline void enqueue(const char* fmt, va_list args) {
+    queue.push(fmt, args);
+#ifdef _WIN32
+    // Signal at capture, so an engine call can hang after logging without
+    // hiding the last diagnostic until its enclosing scope returns.
+    if (const auto event = wake.load(std::memory_order_acquire)) SetEvent(event);
+#endif
+}
+} // namespace deferred_log
+
+inline void write_log(const deferred_log::Record* event, const char* fmt, va_list args) {
     std::lock_guard<std::mutex> lock(log_mutex());
     static FILE* f = nullptr;
     static FILE* mirror = nullptr;
@@ -158,10 +250,11 @@ inline void logf(const char* fmt, ...) {
     }
     if (!f && !mirror) return;
     SYSTEMTIME st{};
-    GetLocalTime(&st);
+    if (event) st = event->time;
+    else GetLocalTime(&st);
     char prefix[48];
     format_log_prefix(prefix, sizeof prefix, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                      static_cast<unsigned long>(GetCurrentThreadId()), launch_id());
+                      static_cast<unsigned long>(event ? event->thread : GetCurrentThreadId()), launch_id());
     if (note_rotation) {
         note_rotation = false;
         for (FILE* dst : { f, mirror }) {
@@ -176,10 +269,10 @@ inline void logf(const char* fmt, ...) {
     // WO-202 I.1: the line is formatted once, written to both files and kept in the crash ring (the last lines a crash report
     // carries). A line longer than the buffer is written whole the old way; the ring keeps its start.
     static char text[4096];
-    va_list args;
-    va_start(args, fmt);
-    const int n = std::vsnprintf(text, sizeof text, fmt, args);
-    va_end(args);
+    va_list copy;
+    va_copy(copy, args);
+    const int n = std::vsnprintf(text, sizeof text, fmt, copy);
+    va_end(copy);
     crash_ring_note(prefix, text);
     for (FILE* dst : { f, mirror }) {
         if (!dst) continue;
@@ -187,13 +280,55 @@ inline void logf(const char* fmt, ...) {
         if (n >= 0 && n < static_cast<int>(sizeof text)) {
             fputs(text, dst);
         } else {
-            va_start(args, fmt);
-            vfprintf(dst, fmt, args);
-            va_end(args);
+            va_copy(copy, args);
+            vfprintf(dst, fmt, copy);
+            va_end(copy);
         }
         fputc('\n', dst);
         fflush(dst);
     }
 }
+
+inline void logf(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    if (deferred_log::active) deferred_log::enqueue(fmt, args);
+    else write_log(nullptr, fmt, args);
+    va_end(args);
+}
+
+namespace deferred_log {
+inline void write_event(const Record& record, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    write_log(&record, fmt, args);
+    va_end(args);
+}
+
+inline void drain() {
+    Record record;
+    while (queue.pop(record))
+        write_event(record, "%s", record.text);
+    const uint32_t dropped = queue.take_dropped(), truncated = queue.take_truncated();
+    if (dropped || truncated)
+        logf("MP-LOAD-LOG deferred_dropped=%u deferred_truncated=%u", dropped, truncated);
+}
+
+#ifdef _WIN32
+inline void prepare() {
+    wake.store(CreateEventW(nullptr, FALSE, FALSE, nullptr), std::memory_order_release);
+}
+
+// The plugin's process-lifetime start thread is otherwise idle after its hooks
+// and pipe are installed. Never drain on a transport or game thread.
+[[noreturn]] inline void run() {
+    const auto event = wake.load(std::memory_order_acquire);
+    for (;;) {
+        drain();
+        if (!event || WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0) Sleep(100);
+    }
+}
+#endif
+} // namespace deferred_log
 
 } // namespace kcdmp

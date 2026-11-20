@@ -1,5 +1,21 @@
 # tools/perf — the frame-rate soak and the stat-stack reader (WO-151)
 
+## Latenzabnahme mit zwei PCs
+
+`latency_gate.py` wertet bereits korrelierte Beobachtungen aus. Die Rohbelege für dieselbe Build-ID, Szene, Hardware, Framerate und Netzphase gehören zur Abnahme. Sichtbare Bewegung und Aktionsbeginn brauchen synchronisiertes Video. Bei einzeln zugeordneten Treffern den Engine-Readback der Ziel-Vitals und dieselbe Kontakt-ID vom Capture bis zur Wirkung sichern. Die Fensterdeltas einer Trefferserie haben eine eigene Auswertung. Beginn und Rückkehr des TCP-Writes sowie die lokale Annahme durch Steam getrennt von der Reaktion auf dem Zielsystem aufzeichnen.
+
+Pro Rolle, Transport, Teilnehmerzahl und Netzprofil einen Datensatz erfassen. Beim Rollentausch gewinnt der andere physische PC die Host-Rolle. Die JSON-Datei beschreibt zwei Messstationen `A` und `B`. Weitere Teilnehmer können mit eigenen Messpaaren erfasst werden. Verwendet werden `host_pc`, `players`, `transport`, `source`, `profile`, `pcs`, `clock`, `rtt_ms`, optional `jitter_ms` und `loss_percent` sowie `directions`.
+
+- In `pcs.A` und `pcs.B` stehen `build`, `fps_min`, `ours_us_p95`, `rp_owner_n`, `owner_violations` und `extra_slow_frames`. Die Zurechnung zusätzlicher Frames über 50 ms beruht auf einem Szenenvergleich mit Vanilla und den betroffenen Einzel-Frames.
+- `clock.method` beschreibt die Zeitbasis. `clock.error_ms` ist die obere Unsicherheit der ausgerichteten Differenz einschließlich Kameraauflösung oder Uhrenabgleich. WAN-Laufzeit und lokale Mod-Wartezeit separat aus den Rohstufen ausweisen.
+- `directions.host_to_joiner` und `directions.joiner_to_host` enthalten je drei Reihen `movement_visible`, `action_visible` und `isolated_hit_effect`. Ein Eintrag je Versuch ist ein Objekt mit `id`, `capture_ms` und `effect_ms` auf derselben monotonen Skala. Für fehlende Zielbeobachtungen bleibt der Versuch erhalten und `effect_ms` ist `null`. Die IDs bezeichnen die zugehörigen Log- und Videomarker.
+
+```sh
+python tools/perf/latency_gate.py --build <Push-Build-ID> pc-a-host.json pc-b-host.json
+```
+
+Das Tool gibt p50, p95, p99, Maximum, Stichprobenzahl und fehlende Werte je Reihe aus. `profile=reference_lan` und `source=live` setzen die Referenzbedingungen mit RTT bis 10 ms und einer gemessenen Mindestbildrate von 60 FPS voraus. Der konservative p95 einschließlich Uhrenunsicherheit hat 40 ms als Obergrenze. Das Ziel unter 30 ms erscheint separat. Exitcode 1 markiert eine verletzte Schranke. Exitcode 2 markiert offene Nachweise, einschließlich eines fehlenden vergleichbaren Rollentauschs. Exitcode 0 bewertet die gelieferten Gruppen. Funktionale Spielparität und die Abdeckung weiterer Netzprofile brauchen eigene Rohbelege.
+
 Why: 0.42.5–0.42.7 lost the frame rate in every fight and crowd (75 → 4.5 FPS within
 minutes) and nothing measured it; the cause was a reflection argument that outlived its
 value, faulting inside the game's stat getter thousands of times behind a silent guard

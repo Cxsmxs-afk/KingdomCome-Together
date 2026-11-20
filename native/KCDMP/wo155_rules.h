@@ -2,7 +2,10 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #pragma once
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include "damage_invocation.h"
 // WO-155: the engine-free rule of the friendly-fire knockdown window (hits.cpp). native/tests/wo155_rules_tests.cpp
 // pins it.
@@ -15,6 +18,28 @@
 
 namespace kcdmp::wo155rules {
 
+// Native local-pipe notice 0x97. Times share the Windows boot clock with the
+// Agent. The native life and measurement identifier bind the observed event.
+struct Observation {
+    uint64_t capturedTick = 0, measuredTick = 0, sourceLifeProof = 0, measurementId = 0;
+};
+
+constexpr size_t kNoticeBytes = 46;
+inline std::array<uint8_t, kNoticeBytes> encode_notice(uint32_t victim, float stamina, float health,
+                                                      uint8_t flags, uint8_t material, const Observation& observation) {
+    std::array<uint8_t, kNoticeBytes> body{};
+    std::memcpy(body.data(), &victim, 4);
+    std::memcpy(body.data() + 4, &stamina, 4);
+    std::memcpy(body.data() + 8, &health, 4);
+    body[12] = flags;
+    body[13] = material;
+    std::memcpy(body.data() + 14, &observation.capturedTick, 8);
+    std::memcpy(body.data() + 22, &observation.measuredTick, 8);
+    std::memcpy(body.data() + 30, &observation.sourceLifeProof, 8);
+    std::memcpy(body.data() + 38, &observation.measurementId, 8);
+    return body;
+}
+
 struct Recipient {
     uint64_t generation;
     uint64_t life;
@@ -26,6 +51,57 @@ struct Recipient {
             generation == current.generation && life == current.life &&
             connection == current.connection && readTick > life &&
             (!proof || proof == current.proof);
+    }
+};
+
+// One measurement may include several queued contacts. Keep the oldest
+// possible cause and refuse a batch that spans different bodies or scopes.
+struct WatchCapture {
+    uint64_t tick = 0, load = 0;
+    Recipient source{};
+    uint32_t victim = 0;
+    uint8_t flags = 0, material = 0;
+    bool ambiguous = false;
+
+    void add(WatchCapture other) {
+        if (!other.tick) return;
+        if (!tick) { *this = other; return; }
+        const bool mixed = ambiguous || other.ambiguous || victim != other.victim || load != other.load ||
+            !source.matches(other.source, tick) || !other.source.matches(source, other.tick);
+        const uint8_t combinedFlags = flags | other.flags;
+        if (other.tick < tick) *this = other;
+        flags = combinedFlags;
+        ambiguous = mixed;
+    }
+};
+
+constexpr uint64_t kWatchPublishMs = 600;
+
+struct WatchSeries {
+    WatchCapture recent{}, carried{};
+    uint64_t publishFrom = 0;
+
+    void add(WatchCapture contact) {
+        recent.add(contact);
+        if (!publishFrom || (!carried.tick && recent.tick < publishFrom)) publishFrom = recent.tick;
+    }
+
+    bool due(uint64_t now) const {
+        return publishFrom && now >= publishFrom && now - publishFrom >= kWatchPublishMs;
+    }
+
+    WatchCapture evidence() const {
+        auto result = carried;
+        result.add(recent);
+        return result;
+    }
+
+    void advance(uint64_t now) {
+        // A contact immediately before a publication can take effect in the
+        // next window. Retain its provenance, never the already measured loss.
+        carried = recent;
+        recent = {};
+        publishFrom = now;
     }
 };
 

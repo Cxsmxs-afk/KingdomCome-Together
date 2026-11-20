@@ -15,7 +15,6 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
     private static readonly StringComparison PathComparison = OperatingSystem.IsWindows()
         ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
     private readonly HashSet<string> _reported = new(StringComparer.Ordinal);
-    private readonly record struct FileIdentity(ulong Volume, ulong Low, ulong High, long BirthSeconds, uint BirthNanoseconds);
 
     private sealed record Entry
     {
@@ -25,17 +24,18 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
         public required uint JoinId { get; init; }
         public required string Sha256 { get; init; }
         public required bool LoadSubmitted { get; init; }
+        public bool IsExit { get; init; }
         public Guid? StageId { get; init; }
         public bool? StageReady { get; init; }
         public FileIdentity? Identity { get; init; }
     }
 
-    public string Register(string savesRoot, string path, string worldTag, uint joinId, ReadOnlySpan<byte> sha256)
+    public string Register(string savesRoot, string path, string worldTag, uint joinId, ReadOnlySpan<byte> sha256, bool isExit = false)
     {
         lock (Gate)
         {
             string root = Path.GetFullPath(savesRoot);
-            int playline = FindPlayline(root, path, joinId);
+            int playline = FindPlayline(root, path, joinId, isExit);
             if (!ValidTag(worldTag) || sha256.Length != 32) throw new IOException("invalid join world identity");
             if (!SafeDirectory(root)) throw new IOException("join saves root does not exist");
             string journal = Path.Combine(root, DirectoryName);
@@ -43,8 +43,8 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
             if (!SafeDirectory(journal)) throw new IOException("join journal directory does not exist");
 
             var entry = new Entry { Version = 2, WorldTag = worldTag, Playline = playline, JoinId = joinId,
-                Sha256 = Convert.ToHexString(sha256), LoadSubmitted = false, StageId = Guid.NewGuid(), StageReady = false };
-            string file = SavePath(root, playline, joinId);
+                Sha256 = Convert.ToHexString(sha256), LoadSubmitted = false, IsExit = isExit, StageId = Guid.NewGuid(), StageReady = false };
+            string file = SavePath(root, playline, joinId, isExit);
             SafeDirectory(Path.GetDirectoryName(file)!);
             if (HasPath(file, directory: false) || HasPath(Path.ChangeExtension(file, ".part"), directory: false))
                 throw new IOException("the join path already exists");
@@ -57,11 +57,11 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
         }
     }
 
-    public void SealStage(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256)
+    public void SealStage(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256, bool isExit = false)
     {
         lock (Gate)
         {
-            if (FindRegistered(savesRoot, path, joinId, sha256) is not { } owned ||
+            if (FindRegistered(savesRoot, path, joinId, sha256, isExit) is not { } owned ||
                 owned.Entry.StageReady != false || owned.Entry.Identity is not { } identity)
                 throw new IOException("join save has no bound unpublished reservation");
             string staged = StagePath(owned.Marker, owned.Entry);
@@ -74,11 +74,11 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
         }
     }
 
-    public FileStream CreateStage(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256)
+    public FileStream CreateStage(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256, bool isExit = false)
     {
         lock (Gate)
         {
-            if (FindRegistered(savesRoot, path, joinId, sha256) is not { } owned ||
+            if (FindRegistered(savesRoot, path, joinId, sha256, isExit) is not { } owned ||
                 owned.Entry.StageReady != false || owned.Entry.Identity.HasValue)
                 throw new IOException("join save has no unbound stage reservation");
             string staged = StagePath(owned.Marker, owned.Entry);
@@ -94,11 +94,11 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
         }
     }
 
-    public void Publish(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256)
+    public void Publish(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256, bool isExit = false)
     {
         lock (Gate)
         {
-            if (FindRegistered(savesRoot, path, joinId, sha256) is not { } owned ||
+            if (FindRegistered(savesRoot, path, joinId, sha256, isExit) is not { } owned ||
                 owned.Entry.StageReady != true || owned.Entry.LoadSubmitted)
                 throw new IOException("join save has no sealed stage");
             MoveNoReplace(StagePath(owned.Marker, owned.Entry), owned.File);
@@ -146,14 +146,14 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
     }
 
     /// <summary>Verify and durably reserve the file, pinning it against replacement on Windows until dispatch.</summary>
-    public FileStream? PrepareLoadSubmission(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256)
+    public FileStream? PrepareLoadSubmission(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256, bool isExit = false)
     {
         lock (Gate)
         {
             FileStream? save = null;
             try
             {
-                if (FindRegistered(savesRoot, path, joinId, sha256) is not { } owned) return null;
+                if (FindRegistered(savesRoot, path, joinId, sha256, isExit) is not { } owned) return null;
                 if (owned.Entry.Version == 2 && (owned.Entry.StageReady != true ||
                     HasPath(StagePath(owned.Marker, owned.Entry), directory: false))) return null;
                 if (HasPath(RetiredPath(owned.Marker, owned.Entry), directory: false)) return null;
@@ -174,13 +174,13 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
     }
 
     /// <summary>The caller already proved no engine request can still be reading this copy.</summary>
-    public bool TryDeleteOwned(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256)
+    public bool TryDeleteOwned(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256, bool isExit = false)
     {
         lock (Gate)
         {
             try
             {
-                if (FindRegistered(savesRoot, path, joinId, sha256) is not { } owned) return false;
+                if (FindRegistered(savesRoot, path, joinId, sha256, isExit) is not { } owned) return false;
                 Delete(owned.File, owned.Marker, owned.Entry);
                 return true;
             }
@@ -205,7 +205,7 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
                 foreach (string marker in Directory.EnumerateFiles(journal, "*.json"))
                 {
                     if (Read(marker) is not { } entry) continue;
-                    string file = SavePath(root, entry.Playline, entry.JoinId);
+                    string file = SavePath(root, entry.Playline, entry.JoinId, entry.IsExit);
                     if (entry.LoadSubmitted || protects(file)) continue;
                     try { removed += Delete(file, marker, entry); }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -232,16 +232,27 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
         }
     }
 
-    private (string File, string Marker, Entry Entry)? FindRegistered(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256)
+    internal int RetireVerifiedArchiveFile(string file, string quarantineDirectory, ReadOnlySpan<byte> sha256)
+    {
+        lock (Gate)
+        {
+            if (!SafeDirectory(quarantineDirectory)) Directory.CreateDirectory(quarantineDirectory);
+            if (!SafeDirectory(quarantineDirectory)) throw new IOException("no safe archive quarantine");
+            string quarantine = Path.Combine(quarantineDirectory, $"{Guid.NewGuid():N}.retired");
+            return RetireChecked(file, quarantine, Convert.ToHexString(sha256));
+        }
+    }
+
+    private (string File, string Marker, Entry Entry)? FindRegistered(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256, bool isExit)
     {
         string root = Path.GetFullPath(savesRoot);
-        int playline = FindPlayline(root, path, joinId);
-        string file = SavePath(root, playline, joinId);
+        int playline = FindPlayline(root, path, joinId, isExit);
+        string file = SavePath(root, playline, joinId, isExit);
         string journal = Path.Combine(root, DirectoryName);
-        string marker = MarkerPath(journal, playline, joinId);
-        if (SafeDirectory(journal) && Read(marker) is { } entry &&
+        string marker = MarkerPath(journal, playline, joinId, isExit);
+        if (SafeDirectory(journal) && Read(marker) is { } entry && entry.IsExit == isExit &&
             string.Equals(entry.Sha256, Convert.ToHexString(sha256), StringComparison.Ordinal)) return (file, marker, entry);
-        Report("ownership-unconfirmed", $"playline{playline}/mpworld{joinId:x8}.whs");
+        Report("ownership-unconfirmed", GameBridge.SaveDisplay(file));
         return null;
     }
 
@@ -392,7 +403,7 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
             if (!HasPath(marker, directory: false)) return null;
             using var stream = new FileStream(marker, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
             if (stream.Length <= 4096 && JsonSerializer.Deserialize<Entry>(stream) is { } entry &&
-                (entry.Version == 1 && entry.StageId is null && entry.StageReady is null && entry.Identity is null ||
+                (entry.Version == 1 && !entry.IsExit && entry.StageId is null && entry.StageReady is null && entry.Identity is null ||
                  entry.Version == 2 && entry.StageId is Guid stageId && stageId != Guid.Empty && entry.StageReady.HasValue &&
                     (entry.StageReady == false || entry.Identity.HasValue) && (!entry.LoadSubmitted || entry.StageReady == true)) &&
                 entry.Playline is >= 0 and <= 4 && entry.JoinId != 0 && ValidTag(entry.WorldTag) &&
@@ -420,11 +431,11 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
         finally { if (File.Exists(pending)) File.Delete(pending); }
     }
 
-    private static int FindPlayline(string root, string path, uint joinId)
+    private static int FindPlayline(string root, string path, uint joinId, bool isExit)
     {
         string full = Path.GetFullPath(path);
         for (int pl = 0; joinId != 0 && pl <= 4; pl++)
-            if (string.Equals(full, SavePath(root, pl, joinId), PathComparison)) return pl;
+            if (string.Equals(full, SavePath(root, pl, joinId, isExit), PathComparison)) return pl;
         throw new IOException("join path is outside the five playlines or does not match its join ID");
     }
 
@@ -451,13 +462,16 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
 
     private static bool ValidTag(string? tag) => tag is { Length: > 0 and <= 96 } &&
         tag.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');
-    private static string SaveName(Entry entry) => $"playline{entry.Playline}/mpworld{entry.JoinId:x8}.whs";
-    private static string SavePath(string root, int playline, uint joinId) => Path.Combine(root, $"playline{playline}", $"mpworld{joinId:x8}.whs");
+    private static string SaveBase(uint joinId, bool isExit) => $"{(isExit ? "mpexit" : "mpworld")}{joinId:x8}";
+    private static string SaveName(Entry entry) => $"playline{entry.Playline}/{SaveBase(entry.JoinId, entry.IsExit)}.whs";
+    private static string SavePath(string root, int playline, uint joinId, bool isExit) =>
+        Path.Combine(root, $"playline{playline}", SaveBase(joinId, isExit) + ".whs");
     private static string StagePath(string marker, Entry entry) => Path.Combine(Path.GetDirectoryName(marker)!, $"{entry.StageId:N}.partial");
     private static string RetiredPath(string marker, Entry entry) => entry.StageId.HasValue
         ? Path.Combine(Path.GetDirectoryName(marker)!, $"{entry.StageId:N}.retired") : marker + ".retired";
-    private static string MarkerPath(string journal, Entry entry) => MarkerPath(journal, entry.Playline, entry.JoinId);
-    private static string MarkerPath(string journal, int playline, uint joinId) => Path.Combine(journal, $"playline{playline}-mpworld{joinId:x8}.json");
+    private static string MarkerPath(string journal, Entry entry) => MarkerPath(journal, entry.Playline, entry.JoinId, entry.IsExit);
+    private static string MarkerPath(string journal, int playline, uint joinId, bool isExit) =>
+        Path.Combine(journal, $"playline{playline}-{SaveBase(joinId, isExit)}.json");
 
     private void Report(string reason, string detail)
     {
@@ -466,21 +480,9 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
 
     private static FileIdentity ReadIdentity(SafeFileHandle handle)
     {
-        const int FileIdInfo = 18, AtEmptyPath = 0x1000;
-        const uint StatxInode = 0x100, StatxBirthTime = 0x800;
         try
         {
-            if (OperatingSystem.IsWindows() && GetFileInformationByHandleEx(handle, FileIdInfo, out var id, 24))
-                return new(id.Volume, id.Low, id.High, 0, 0);
-            if (OperatingSystem.IsLinux() &&
-                Statx(handle.DangerousGetHandle().ToInt32(), "", AtEmptyPath, StatxInode | StatxBirthTime, out var info) == 0 &&
-                (info.Mask & StatxInode) != 0)
-            {
-                ulong volume = ((ulong)info.DeviceMajor << 32) | info.DeviceMinor;
-                return (info.Mask & StatxBirthTime) != 0
-                    ? new(volume, info.Inode, 0, info.BirthSeconds, info.BirthNanoseconds)
-                    : new(volume, info.Inode, 0, 0, 0);
-            }
+            if (FileIdentity.TryRead(handle, out var identity)) return identity;
         }
         catch (EntryPointNotFoundException ex)
         { throw new IOException("the filesystem does not expose stable join file identity", ex); }
@@ -527,28 +529,4 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
     private static extern int RenameAt2(int sourceDirectory, [MarshalAs(UnmanagedType.LPUTF8Str)] string source,
         int targetDirectory, [MarshalAs(UnmanagedType.LPUTF8Str)] string target, uint flags);
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct WindowsFileId
-    {
-        public ulong Volume, Low, High;
-    }
-
-    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int informationClass, out WindowsFileId id, uint bytes);
-
-    // Linux's statx ABI carries its device/inode and optional birth time independently of libc's stat layout.
-    [StructLayout(LayoutKind.Explicit, Size = 256)]
-    private struct LinuxFileId
-    {
-        [FieldOffset(0)] public uint Mask;
-        [FieldOffset(32)] public ulong Inode;
-        [FieldOffset(80)] public long BirthSeconds;
-        [FieldOffset(88)] public uint BirthNanoseconds;
-        [FieldOffset(136)] public uint DeviceMajor;
-        [FieldOffset(140)] public uint DeviceMinor;
-    }
-
-    [DllImport("libc", EntryPoint = "statx", SetLastError = true)]
-    private static extern int Statx(int fd, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags, uint mask, out LinuxFileId info);
 }

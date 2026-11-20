@@ -272,12 +272,24 @@ public partial class GameBridge
         var sched = new LinkScheduler(new LinkSchedOptions { Budget = !W213Switch.TwinOff("link_budget") });
         // D.4: this player's own position is the top band; everything else this agent sends is its own few bodies
         if (!W213Switch.TwinOff("figure_band")) sched.BandOf = p => p.Kind == "pos" ? 0 : null;
-        var w = new LinkWriter(sched, path);
+        byte pvpSource = _myGhostId;
+        bool steam = link.Steam is not null;
+        var w = new LinkWriter(sched, path)
+        {
+            WriteObservation = (ShouldTracePvpSend, (frame, started, completed) =>
+                TracePvpWrite(stream, pvpSource, frame, steam, started, completed))
+        };
         var cts = new CancellationTokenSource();
         _w213WriterCts = cts; _w213Stream = stream; _w213Writer = w;
         async Task RunWriter()
         {
-            try { await w.RunAsync(cts.Token, (f, _) => { if (f.Length >= 3) _w213Meter.CountFrame(true, f[0], f.AsSpan(3)); }); }
+            try
+            {
+                await w.RunAsync(cts.Token, (f, _) =>
+                {
+                    if (f.Length >= 3) _w213Meter.CountFrame(true, f[0], f.AsSpan(3));
+                });
+            }
             catch (Exception ex) { Console.WriteLine($"MP-LINK the writer stopped: {ex.GetType().Name}: {ex.Message}"); try { link.Dispose(); } catch { } }
         }
         if (ExecutionContext.IsFlowSuppressed()) _ = Task.Run(RunWriter);
@@ -341,16 +353,63 @@ public partial class GameBridge
     }
 
     /// <summary>A frame through the scheduler when it runs on this stream; false = write it the old way.</summary>
-    private bool Wo213TryQueue(Stream stream, byte[] packet, CancellationToken ct = default)
+    private bool Wo213TryQueue(Stream stream, byte[] packet, CancellationToken ct = default) =>
+        Wo213TryQueueScoped(stream, packet, ct, null);
+
+    private bool Wo213TryQueueScoped(Stream stream, byte[] packet, CancellationToken ct, RelayWriteScope? scope)
     {
         ProcessorFrameScope.ThrowIfAbandoned();
         ct.ThrowIfCancellationRequested();
         if (_w213Writer is not { } w || !ReferenceEquals(stream, _w213Stream)) return false;
         var lease = ProcessorFrameScope.Capture();
         bool Current() => !ct.IsCancellationRequested && lease?.IsAbandoned != true && lease?.Token.IsCancellationRequested != true;
-        w.Enqueue(packet, Current);   // throws when the writer died: the caller's write failed, as before
+        w.Enqueue(packet, Current, scope?.Completed, startWrite: scope is null ? null : Admit);
         return true;
+
+        ValueTask? Admit(Func<ValueTask> send)
+        {
+            if (scope!.Refusal() is not { } reason) return send();
+            scope.Rejected(reason);
+            return null;
+        }
     }
+
+    private static bool ShouldTracePvpSend(byte[] frame) =>
+        frame.Length == 3 + PlayerHitV8.LifeUpLen && frame[0] == Protocol.PlayerHitV8Up &&
+        TracePvpSequence(BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.UpLen)));
+
+    private (long Ms, long Rtt) PvpRelayTime(Stream stream, long qpc)
+    {
+        if (Volatile.Read(ref _presentationSession) is { } session && ReferenceEquals(session.Relay, stream) &&
+            !session.Lifetime.IsCancellationRequested &&
+            session.Clock.TryRelayAt(PresentationClock.QpcToMs(qpc), out long mapped, out long rtt))
+            return (mapped, rtt);
+        return default;
+    }
+
+    private void TracePvpWrite(Stream stream, byte source, byte[] frame, bool steam, LinkWriteStamp started, LinkWriteStamp? completed)
+    {
+        ulong sequence = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.UpLen));
+        ulong life = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.IdentifiedUpLen));
+        TracePvpTransport("client-write-start", source, sequence, life, started.Tick, PvpRelayTime(stream, started.Qpc), started.Qpc);
+        if (completed is { } done)
+            TracePvpTransport(steam ? "client-sdk-accepted" : "client-write-complete", source, sequence, life,
+                done.Tick, PvpRelayTime(stream, done.Qpc), done.Qpc);
+    }
+
+    private static void TracePvpRead(PvpFrameScope scope, byte source, ulong sequence, ulong life)
+    {
+        if (TracePvpSequence(sequence))
+            TracePvpTransport("client-read", source, sequence, life, scope.ReadTick, scope.RelayAtRead);
+    }
+
+    // Match the relay's sample selection without retaining per-contact telemetry state.
+    private static bool TracePvpSequence(ulong sequence) => sequence != 0 && (sequence <= 64 || sequence % 32 == 0);
+
+    private static void TracePvpTransport(string stage, byte source, ulong sequence, ulong life, long tick,
+        (long Ms, long Rtt) relay, long qpc = 0) =>
+        Console.WriteLine(FormattableString.Invariant(
+            $"MP-LANE2-FF-TIME stage={stage} source={source} contact_seq={sequence} recipient_life={life} local_tick={tick} relay_ms={relay.Ms} clock_rtt_ms={relay.Rtt} local_qpc_ms={PresentationClock.QpcToMs(qpc)}"));
 
     private bool _w213SteamConfigLogged;
 
