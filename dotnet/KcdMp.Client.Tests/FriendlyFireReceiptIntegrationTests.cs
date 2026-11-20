@@ -95,6 +95,8 @@ public sealed class FriendlyFireReceiptIntegrationTests
             await UpdateRosterAsync(2, currentLife, (byte)'b');
             await Task.Delay(2, ct);
             await SendHitAsync(7, 2);
+            await SendHitAsync(11, 3);
+            await SendHitAsync(13, 4);
             await server.WriteAsync(barrier, ct);
             workerRelease.TrySetResult();
             await workerDrained.Task.WaitAsync(ct);
@@ -102,9 +104,10 @@ public sealed class FriendlyFireReceiptIntegrationTests
             var sends = wire.UpstreamHits.ToArray();
             var evidence = sends.Select(frame => $"hp={BinaryPrimitives.ReadSingleLittleEndian(frame.AsSpan(8))} " +
                 $"life={BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.IdentifiedUpLen))}");
-            Assert.True(sends.Length == 1, $"Expected only the fresh hit. Relay received [{string.Join(", ", evidence)}].");
-            byte[] frame = Assert.Single(sends);
-            Assert.Equal(new PlayerHitV8(victim, 0, 7, 0, 0).BuildUp(1, incarnation, currentLife), frame);
+            Assert.True(sends.Length == 3, $"Expected the three fresh hits. Relay received [{string.Join(", ", evidence)}].");
+            float[] damage = [7, 11, 13];
+            for (int i = 0; i < damage.Length; i++)
+                Assert.Equal(new PlayerHitV8(victim, 0, damage[i], 0, 0).BuildUp((ulong)i + 1, incarnation, currentLife), sends[i]);
         }
         finally
         {
@@ -365,7 +368,7 @@ public sealed class FriendlyFireReceiptIntegrationTests
             (marker == 2 ? drained : recovered).SetResult();
             return Task.CompletedTask;
         };
-        pipe.OnPvpHit = hit =>
+        pipe.OnPvpHit = (_, hit) =>
         {
             delivered.Enqueue(hit.MeasurementId);
             return Task.CompletedTask;
