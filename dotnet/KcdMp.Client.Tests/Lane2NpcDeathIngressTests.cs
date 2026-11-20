@@ -164,6 +164,26 @@ public sealed class Lane2NpcDeathIngressTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Expired_poll_budget_is_stale_only_when_the_body_scope_was_retired(bool retireBinding)
+    {
+        await using var fixture = await Fixture.OpenAsync();
+        Task ingress = fixture.Ingress("fatal");
+        fixture.AssertBound(await fixture.ReadRequestAsync(), Eid);
+        if (retireBinding) fixture.Retire("eid-reuse");
+
+        // Keep the first real pipe request outstanding. A canceled local
+        // observer must classify its binding without sending another write.
+        var expected = retireBinding ? CombatPipe.NpcDeathReceipt.Stale : CombatPipe.NpcDeathReceipt.Uncertain;
+        Assert.Equal(expected, await fixture.ObserveWithExpiredBudgetAsync());
+        await fixture.ReplyAsync(1, 0x73);
+        await ingress.WaitAsync(fixture.Token);
+        Assert.False(fixture.Dead);
+        await fixture.AssertNoWriteAsync();
+    }
+
+    [Theory]
     [InlineData((byte)0x73)]
     [InlineData((byte)0x71)]
     [InlineData(null)]
@@ -196,6 +216,22 @@ public sealed class Lane2NpcDeathIngressTests
         Assert.False(fixture.Dead);
         Assert.Equal(0L, fixture.Releases);
         await fixture.Ingress("guid").WaitAsync(fixture.Token);
+        await fixture.AssertNoWriteAsync();
+    }
+
+    [Fact]
+    public async Task Initial_abort_receipt_closes_the_attempt_without_followup_or_replacement()
+    {
+        await using var fixture = await Fixture.OpenAsync();
+        Task ingress = fixture.Ingress("fatal");
+        fixture.AssertBound(await fixture.ReadRequestAsync(), Eid);
+        await fixture.ReplyAsync(1, 0x73);
+
+        await fixture.AssertCompletedWithoutWriteAsync(ingress);
+        Assert.False(fixture.Dead);
+        Assert.Equal(0L, fixture.Releases);
+        await fixture.Ingress("named");
+        await fixture.Ingress("guid");
         await fixture.AssertNoWriteAsync();
     }
 
@@ -305,6 +341,13 @@ public sealed class Lane2NpcDeathIngressTests
             }
         }
 
+        public Task<CombatPipe.NpcDeathReceipt> ObserveWithExpiredBudgetAsync()
+        {
+            var attempts = (System.Collections.IDictionary)Field("_npcDeathAttempts").GetValue(_bridge)!;
+            return (Task<CombatPipe.NpcDeathReceipt>)Method("ObserveNpcDeathAsync").Invoke(_bridge,
+                [attempts[_soul], new CancellationToken(canceled: true), CombatPipe.NpcDeathIntent.Advance])!;
+        }
+
         public Task Ingress(string route)
         {
             if (route == "named")
@@ -395,6 +438,17 @@ public sealed class Lane2NpcDeathIngressTests
         public async Task WaitForDeadAsync()
         {
             while (!Dead) await Task.Delay(10, Token);
+        }
+
+        public async Task AssertCompletedWithoutWriteAsync(Task ingress)
+        {
+            using var wait = CancellationTokenSource.CreateLinkedTokenSource(Token);
+            Task read = _wire.ReadExactlyAsync(new byte[1], wait.Token).AsTask();
+            Task first = await Task.WhenAny(ingress, read).WaitAsync(Token);
+            Assert.Same(ingress, first);
+            await ingress;
+            await wait.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await read);
         }
 
         public async Task AssertNoWriteAsync()

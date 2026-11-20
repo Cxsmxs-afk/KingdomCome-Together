@@ -286,9 +286,10 @@ public partial class GameBridge
     /// One snapshot, paired with host save <paramref name="w"/>: the engine is asked (Game.QuickSave), the file awaited (the engine's readiness
     /// may wait), verified and stored, the QuickSave moved out of the playline. <paramref name="owed"/> receives the reason when not taken.
     /// </summary>
-    private async Task<W184Take> Wo184TakeAsync(WorldSaved w, W184Want? owed, string purpose, long waitMs)
+    private async Task<W184Take> Wo184TakeAsync(WorldSaved w, W184Want? owed, string purpose, long waitMs, bool final = false)
     {
         var character = Volatile.Read(ref _joinedCharacter);
+        bool CurrentCharacter() => H21SnapshotCurrent(character);
         string md5 = Convert.ToHexString(w.Md5).ToLowerInvariant();
         long tIn = Environment.TickCount64;
         void NotNow(string why, long retryMs)
@@ -329,36 +330,61 @@ public partial class GameBridge
             await Wo192SceneNoteAsync(purpose, w.Seq);
             // The engine allocates the next QuickSave ID from its cache. Keep that cache:
             // moved-out snapshots still count conservatively toward the rotation guard above.
-            if (!ReferenceEquals(character, Volatile.Read(ref _joinedCharacter))) return W184Take.Failed;
-            led = _henry.LedgerAdd(new HenryStore.LedgerEntry { Playline = pl, SinceUtc = DateTime.UtcNow.AddSeconds(-1),
-                WorldTag = _joinedTag!, Kind = "snapshot", State = character is null ? "pending" : "done" });
-            var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!CurrentCharacter()) return W184Take.Failed;
+            if (character is not null && (!await LoadSequenceSyncNativeAsync() || !CurrentCharacter()))
+            {
+                NotNow("the engine has not acknowledged the snapshot's world", Wo184Rules.EngineRetryMs);
+                return W184Take.NotNow;
+            }
+            using var scopeReceipt = character is not null && _transport is LogTailGameTransport engine ? new H21SnapshotReceipt(engine) : null;
+            if (character is not null && scopeReceipt is null)
+            {
+                _w184Health.Reason(w.Seq, "no local engine write receipt");
+                Console.WriteLine("MP-H21-SNAPSHOT refused reason=no-engine-write-receipt");
+                return W184Take.Failed;
+            }
             var since = DateTime.UtcNow.AddSeconds(-1);
-            lock (_snapGate) _snapWait = (pl, since, tcs, character);
+            Task<SnapshotFile> fileTask;
+            if (scopeReceipt is not null) fileTask = scopeReceipt.WaitAsync(saves, pl, CurrentCharacter);
+            else
+            {
+                led = _henry.LedgerAdd(new HenryStore.LedgerEntry { Playline = pl, SinceUtc = since, WorldTag = _joinedTag!, Kind = "snapshot" });
+                var tcs = new TaskCompletionSource<SnapshotFile>(TaskCreationOptions.RunContinuationsAsynchronously);
+                lock (_snapGate) _snapWait = (pl, since, tcs);
+                fileTask = tcs.Task;
+            }
             _w184ReadySeen = false;
             long tReq = Environment.TickCount64;
             Volatile.Write(ref _w184ReqAtMs, tReq);
             Interlocked.Increment(ref _w184Asked);
-            string r = await AskModAsync("KCD2MP_Wo125Snapshot", 6000);
+            string r;
+            if (scopeReceipt is null) r = await AskModAsync("KCD2MP_Wo125Snapshot", 6000);
+            else
+            {
+                var restricted = await _combat.H21RequestSnapshotAsync(scopeReceipt.Id, character!.Scope.WorldGeneration,
+                    final, _joinEngineLifetime);
+                r = restricted == 1 ? "ok=true" : $"scoped-write-{restricted?.ToString() ?? "unavailable"}";
+            }
             if (!r.StartsWith("ok=true", StringComparison.Ordinal))
             {
-                _henry.LedgerSet(led.Id, e => e.State = "done");
+                if (led is not null) _henry.LedgerSet(led.Id, e => e.State = "done");
                 Interlocked.Increment(ref _w184EngineNotNow);
                 NotNow($"the engine refused the QuickSave ({(r.Length > 0 ? r : "no answer from the mod")})", Wo184Rules.EngineRetryMs);
                 return W184Take.NotNow;
             }
             // the file -- or stuck (B3). The engine's readiness may make it wait: that is the game's own "not now".
-            string? path = null;
+            SnapshotFile? file = null;
             bool named = false;
-            while (path is null)
+            while (file is null)
             {
-                var done = await Task.WhenAny(tcs.Task, Task.Delay(500));
-                if (done == tcs.Task) { path = tcs.Task.Result; break; }
+                var done = await Task.WhenAny(fileTask, Task.Delay(500));
+                if (!CurrentCharacter()) return W184Take.Failed;
+                if (done == fileTask) { file = await fileTask; break; }
                 long now = Environment.TickCount64;
                 if (!named && !_w184ReadySeen && now - tReq >= Wo189Rules.PendingNameMs) { named = true; await Wo189NamePendingAsync($"the {purpose}'s save", tReq); }   // WO-189 F
-                if (_w184ReadySeen && now - tReq > 8_000 && Wo184FindSnapshotFile(dir, since) is string found)
+                if (scopeReceipt is null && _w184ReadySeen && now - tReq > 8_000 && Wo184FindSnapshotFile(dir, since) is string found)
                 {
-                    path = found;   // the engine wrote it and said ready; the folder watch missed the file
+                    file = new(found);   // legacy save whose folder watch missed the file
                     Console.WriteLine($"WO184-SNAP host save seq={w.Seq}: the engine said ready but the folder watch saw no file -- found {SaveDisplay(found)} in the playline");
                     break;
                 }
@@ -366,20 +392,20 @@ public partial class GameBridge
                 {
                     if (waitMs < Wo184Rules.StuckMs)
                     {
-                        Wo184LateWindow(pl, since, w, led, purpose, character);   // a file that still lands pairs (never a leak)
+                        if (led is not null) Wo184LateWindow(pl, since, w, led, purpose);
                         await Wo189CancelAfterWaitAsync(purpose, tReq);   // WO-189 A1: never left pending (the field: 21 minutes, every later save refused)
                         NotNow("its file had not come when the leave went on", 0);
                         return W184Take.NotNow;
                     }
-                    bool landed = await Wo184StuckAsync(w, tReq, tcs.Task, purpose);
-                    if (landed) { path = tcs.Task.Result; break; }
+                    bool landed = await Wo184StuckAsync(w, tReq, fileTask, purpose);
+                    if (landed) { file = await fileTask; break; }
                     Console.WriteLine(Wo189Rules.CancelLine(purpose, Environment.TickCount64 - tReq, "B3's stuck handling made the engine's own cancel (WO184-SNAP lines)"));   // WO-189 A1
                     if (owed is not null) { owed.Why = "the previous snapshot got stuck (cleared: asked again)"; owed.NextTryMs = 0; }
-                    Wo184LateWindow(pl, since, w, led, purpose, character);
+                    if (led is not null) Wo184LateWindow(pl, since, w, led, purpose);
                     return W184Take.Stuck;
                 }
             }
-            return Wo184Pair(w, md5, path!, pl, saves, led, tIn, tReq, purpose, character);
+            return Wo184Pair(w, md5, file, pl, led, tIn, tReq, purpose, character);
         }
         catch (Exception ex)
         {
@@ -399,34 +425,32 @@ public partial class GameBridge
 
     // A taken request whose wait ended without its file (stuck, or a leave that went on): a QuickSave that still lands in that playline
     // within LateFileMs is that snapshot's -- paired with its host save (the late rule), never moved out as a "leak" (0.50.9 did that).
-    private (int Playline, DateTime Since, WorldSaved W, HenryStore.LedgerEntry Led, string Purpose, long UntilMs, JoinedCharacter? Character)? _w184Late;
+    private (int Playline, DateTime Since, WorldSaved W, HenryStore.LedgerEntry Led, string Purpose, long UntilMs)? _w184Late;
 
-    private void Wo184LateWindow(int pl, DateTime since, WorldSaved w, HenryStore.LedgerEntry led, string purpose, JoinedCharacter? character)
+    private void Wo184LateWindow(int pl, DateTime since, WorldSaved w, HenryStore.LedgerEntry led, string purpose)
     {
-        lock (_snapGate) _w184Late = (pl, since, w, led, purpose, Environment.TickCount64 + Wo184Rules.LateFileMs, character);
-        _henry.LedgerSet(led.Id, e => e.State = character is null ? "pending" : "done");
+        lock (_snapGate) _w184Late = (pl, since, w, led, purpose, Environment.TickCount64 + Wo184Rules.LateFileMs);
+        _henry.LedgerSet(led.Id, e => e.State = "pending");
     }
 
     /// <summary>Wo125OnJoinerSaveObserved: a QuickSave that is the late file of a request whose wait ended -- paired now. True = taken.</summary>
     private bool Wo184TakeLateFile(string path)
     {
-        (int Playline, DateTime Since, WorldSaved W, HenryStore.LedgerEntry Led, string Purpose, long UntilMs, JoinedCharacter? Character) late;
+        (int Playline, DateTime Since, WorldSaved W, HenryStore.LedgerEntry Led, string Purpose, long UntilMs) late;
         lock (_snapGate)
         {
             if (_w184Late is not { } l || Environment.TickCount64 > l.UntilMs ||
-                !ReferenceEquals(l.Character, Volatile.Read(ref _joinedCharacter))) return false;
+                Volatile.Read(ref _joinedCharacter) is not null) return false;
             var id = WorldSaved.ParsePath(path);
             if (id is not { } i || i.Playline != l.Playline || i.Kind != Protocol.SaveKindQuick || File.GetLastWriteTimeUtc(path) < l.Since) return false;
             late = l;
             _w184Late = null;
         }
-        string? saves = ResolveSavesDirForJoin();
-        if (saves is null) return false;
         string md5 = Convert.ToHexString(late.W.Md5).ToLowerInvariant();
         Console.WriteLine($"WO184-SNAP the {late.Purpose}'s file landed late ({SaveDisplay(path)}) -- paired with host save seq={late.W.Seq} all the same (never a leak)");
         _ = Task.Run(() =>
         {
-            try { Wo184Pair(late.W, md5, path, late.Playline, saves, late.Led, Environment.TickCount64, Environment.TickCount64, late.Purpose + ", late", late.Character); }
+            try { Wo184Pair(late.W, md5, new(path), late.Playline, late.Led, Environment.TickCount64, Environment.TickCount64, late.Purpose + ", late", null); }
             catch (Exception ex) { Console.WriteLine($"WO184-SNAP the late file could not be paired: {ex.GetType().Name}: {ex.Message}"); }
         });
         return true;
@@ -444,15 +468,20 @@ public partial class GameBridge
     }
 
     /// <summary>The snapshot's file: verified, its Henry stored paired with host save <paramref name="w"/>, the QuickSave moved out.</summary>
-    private W184Take Wo184Pair(WorldSaved w, string md5, string path, int pl, string saves, HenryStore.LedgerEntry led, long tIn, long tReq, string purpose,
+    private W184Take Wo184Pair(WorldSaved w, string md5, SnapshotFile file, int pl, HenryStore.LedgerEntry? led, long tIn, long tReq, string purpose,
         JoinedCharacter? character)
     {
-        bool CurrentCharacter() => ReferenceEquals(character, Volatile.Read(ref _joinedCharacter));
-        if (!CurrentCharacter()) return W184Take.Failed;
+        bool CurrentCharacter() => H21SnapshotCurrent(character);
+        if (!CurrentCharacter() || character is not null && file.ConfirmedBytes is null)
+        {
+            Console.WriteLine("MP-H21-SNAPSHOT refused reason=no-current-confirmed-snapshot");
+            return W184Take.Failed;
+        }
+        string path = file.Path;
         long tFile = Environment.TickCount64;
-        byte[] bytes = WhsSave.ReadShared(path);
+        byte[] bytes = file.ConfirmedBytes ?? WhsSave.ReadShared(path);
         var v = WhsSave.Verify(bytes);
-        if (character is null)
+        if (led is not null)
             _henry.LedgerSet(led.Id, e => { e.File = Path.GetFileName(path); e.Md5 = v.Md5; e.State = "written"; });
         else if (v.Ok)
             Wo125RecordScopedGuestSave(path, v.Md5);
@@ -483,6 +512,11 @@ public partial class GameBridge
             _w184StuckRun = 0;
             _w184StuckTold = false;
             _w184LastNotNow = "";   // the next "not now" is logged again
+            if (character is not null)
+            {
+                string sha = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes))[..12].ToLowerInvariant();
+                Console.WriteLine($"MP-H21-SNAPSHOT result=paired run={character.Scope.Run.RunId.ToString("N")[..8]} generation={character.Scope.WorldGeneration} host_seq={w.Seq} sha={sha}");
+            }
             Console.WriteLine(FormattableString.Invariant(
                 $"MP-HENRY joiner: PAIRED host save seq={w.Seq} md5={md5[..8]} with snapshot {snap.Short} ({purpose}): gate-open -> request {(tReq - tIn) / 1000.0:F2} s, -> file verified {(tFile - tReq) / 1000.0:F2} s ({SaveDisplay(path)}, {bytes.Length} B)"));
             // WO-157 3b.8: "does my inventory save?" -- said on screen; its words are about a host save (a leave's or the menu's snapshot is not one)
@@ -507,7 +541,7 @@ public partial class GameBridge
             var after = await _combat.SaveListAsync(3, pl, Path.GetFileNameWithoutExtension(path));
             Console.WriteLine($"MP-HENRY joiner: snapshot file {SaveDisplay(path)} moved out={On(gone)}; cached listed={(after is null ? "?" : On(after.Listed))}; cached Continue entry=playline{after?.ContinuePlayline}/{after?.ContinueName ?? "?"} (not refreshed)");
         });
-        if (gone) _henry.LedgerSet(led.Id, e => e.State = "done");
+        if (gone && led is not null) _henry.LedgerSet(led.Id, e => e.State = "done");
         return res;
     }
 
@@ -517,7 +551,7 @@ public partial class GameBridge
     /// A taken request with no file and no "ready" in 60 s. Logged; the engine's own cancel clears it (mp_save_recover); the players are told
     /// when it cannot be cleared, or when it sticks again (a restart clears what the cancel cannot). True = the file landed meanwhile.
     /// </summary>
-    private async Task<bool> Wo184StuckAsync(WorldSaved w, long tReq, Task<string> fileTask, string purpose)
+    private async Task<bool> Wo184StuckAsync(WorldSaved w, long tReq, Task fileTask, string purpose)
     {
         Interlocked.Increment(ref _w184Stuck);
         int run = Interlocked.Increment(ref _w184StuckRun);
@@ -588,7 +622,7 @@ public partial class GameBridge
         var hw = host!.Value;
         Console.WriteLine($"WO184-FINAL {why}: one final snapshot, paired with host save seq={hw.Seq} md5={Convert.ToHexString(hw.Md5)[..8].ToLowerInvariant()} (the newest host save it follows){(owed ? " -- it takes the owed one" : "")}");
         var probe = new W184Want { W = hw, SinceMs = Environment.TickCount64 };
-        var res = await Wo184TakeAsync(hw, probe, "final snapshot (" + why + ")", Wo184Rules.FinalWaitMs);
+        var res = await Wo184TakeAsync(hw, probe, "final snapshot (" + why + ")", Wo184Rules.FinalWaitMs, final: true);
         if (res == W184Take.Paired) return "";
         lock (_w184Lock) _w184Want ??= was ?? probe;   // still owed (a later chance: the tick, the next host save)
         Interlocked.Increment(ref _w184FinalNot);

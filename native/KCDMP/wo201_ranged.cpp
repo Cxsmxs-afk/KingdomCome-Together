@@ -132,23 +132,24 @@ rangedaim::Sample read_step(void* actor) {
     if (!rd(exp, kExpMain, &main)) return {};
     if (!main) return {rangedaim::None, {}};
     if (!is_a(main, g_vftMain)) return {};
-    void* step = nullptr;
-    if (!rd(main, kMainStep, &step)) return {};
-    if (!step) return {rangedaim::None, {}};
-    void* vp = nullptr;
-    if (!rd(step, 0, &vp)) return {};
-    for (const auto& s : g_steps) {
-        if (!s.vft || vp != static_cast<const void*>(s.vft)) continue;
-        float charge = 0, min = 0, max = 0;
-        const auto measured = s.measuresCharge &&
-            rd(step, kBowCharge, &charge) && rd(step, kBowMinCharge, &min) && rd(step, kBowMaxCharge, &max)
-            ? rangedaim::quantize_charge(charge, min, max) : std::nullopt;
-        return {s.phase, measured};
-    }
-    static uint32_t s_unknown = 0;
-    if (vp && s_unknown++ < 5)
-        logf("WO201-RANGED step class not in the bow/crossbow list (vt=%p) -- a bow step this build names differently [n=%u]", vp, s_unknown);
-    return {}; // unknown RTTI is unreadable
+    return read_step_phase(
+        [main](void** step) { return rd(main, kMainStep, step); },
+        [](void* step) -> rangedaim::Sample {
+            void* vp = nullptr;
+            if (!rd(step, 0, &vp)) return {};
+            for (const auto& s : g_steps) {
+                if (!s.vft || vp != static_cast<const void*>(s.vft)) continue;
+                float charge = 0, min = 0, max = 0;
+                const auto measured = s.measuresCharge &&
+                    rd(step, kBowCharge, &charge) && rd(step, kBowMinCharge, &min) && rd(step, kBowMaxCharge, &max)
+                    ? rangedaim::quantize_charge(charge, min, max) : std::nullopt;
+                return {s.phase, measured};
+            }
+            static uint32_t s_unknown = 0;
+            if (vp && s_unknown++ < 5)
+                logf("WO201-RANGED step class not in the bow/crossbow list (vt=%p) -- a bow step this build names differently [n=%u]", vp, s_unknown);
+            return {}; // unknown RTTI is unreadable
+        }, rangedaim::Sample{rangedaim::None, {}}, rangedaim::Sample{});
 }
 
 #endif

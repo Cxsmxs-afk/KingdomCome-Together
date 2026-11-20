@@ -1,5 +1,6 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Reflection;
@@ -64,36 +65,49 @@ public sealed class FriendlyFireReceiptIntegrationTests
                 await Task.Delay(5, ct);
         }
 
-        ValueTask SendHitAsync(float damage)
+        ValueTask SendHitAsync(float damage, ulong id)
         {
-            byte[] hit = [0x97, 14, 0, .. new byte[14]];
-            BinaryPrimitives.WriteUInt32LittleEndian(hit.AsSpan(3), entity);
-            BinaryPrimitives.WriteSingleLittleEndian(hit.AsSpan(11), damage);
+            ulong tick = (ulong)Environment.TickCount64;
+            byte[] hit = NativeContact(entity, 0, damage, tick, tick, FixtureLife, id);
+            BinaryPrimitives.WriteSingleLittleEndian(hit.AsSpan(7), 0);
+            hit[16] = 0;
             return server.WriteAsync(hit, ct);
         }
+
+        var targetAtRead = new TaskCompletionSource<GameBridge.PvpHitTarget?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var capture = pipe.CapturePvpHitTarget!;
+        pipe.CapturePvpHitTarget = eid =>
+        {
+            var captured = capture(eid);
+            targetAtRead.TrySetResult(captured);
+            return captured;
+        };
 
         byte[] barrier = [0x96, 27, 0, .. new byte[27]];
         try
         {
+            await NativeLifeAsync(pipe, server, FixtureLife, ct);
             await UpdateRosterAsync(1, formerLife, (byte)'a');
             await server.WriteAsync(barrier, ct);
             await workerEntered.Task.WaitAsync(ct);
-            await SendHitAsync(5);
-            // The following frame updates the physical reader immediately, while
-            // the FIFO callback worker is still blocked on the earlier action.
-            await NativeLifeAsync(pipe, server, FixtureLife + 1, ct);
+            await SendHitAsync(5, 1);
+            Assert.Equal(formerLife, (await targetAtRead.Task.WaitAsync(ct))?.Life);
             await UpdateRosterAsync(2, currentLife, (byte)'b');
-            await SendHitAsync(7);
+            await Task.Delay(2, ct);
+            await SendHitAsync(7, 2);
+            await SendHitAsync(11, 3);
+            await SendHitAsync(13, 4);
             await server.WriteAsync(barrier, ct);
             workerRelease.TrySetResult();
             await workerDrained.Task.WaitAsync(ct);
 
-            var sends = wire.PendingWrites.Where(frame => frame[0] == Protocol.PlayerHitV8Up).ToArray();
+            var sends = wire.UpstreamHits.ToArray();
             var evidence = sends.Select(frame => $"hp={BinaryPrimitives.ReadSingleLittleEndian(frame.AsSpan(8))} " +
                 $"life={BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.IdentifiedUpLen))}");
-            Assert.True(sends.Length == 1, $"Expected only the fresh hit. Relay received [{string.Join(", ", evidence)}].");
-            byte[] frame = Assert.Single(sends);
-            Assert.Equal(new PlayerHitV8(victim, 0, 7, 0, 0).BuildUp(1, incarnation, currentLife), frame);
+            Assert.True(sends.Length == 3, $"Expected the three fresh hits. Relay received [{string.Join(", ", evidence)}].");
+            float[] damage = [7, 11, 13];
+            for (int i = 0; i < damage.Length; i++)
+                Assert.Equal(new PlayerHitV8(victim, 0, damage[i], 0, 0).BuildUp((ulong)i + 1, incarnation, currentLife), sends[i]);
         }
         finally
         {
@@ -161,6 +175,234 @@ public sealed class FriendlyFireReceiptIntegrationTests
             stop.Cancel();
             await receive;
         }
+    }
+
+    [Theory]
+    [InlineData((byte)0)]
+    [InlineData(PlayerHitV8.FlagMissile)]
+    public async Task Native_contact_held_before_callback_cannot_adopt_new_target_life(byte flags)
+    {
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = stop.Token;
+        string name = "ff-source-" + Guid.NewGuid().ToString("N")[..16];
+        using var server = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        await using var pipe = new CombatPipe(name);
+        var listen = server.WaitForConnectionAsync(ct);
+        Assert.True(await pipe.EnsureConnectedAsync(ct));
+        await listen;
+
+        using var wire = new HeldPeerStream();
+        var bridge = BridgeOn(pipe, wire);
+        typeof(GameBridge).GetField("_t3StatsNextMs", Instance)!.SetValue(bridge, long.MaxValue);
+        typeof(GameBridge).GetMethod("Wo121OnConnect", Instance)!.Invoke(bridge, [wire, ct]);
+        const byte ghost = 2;
+        const uint eid = 0x2345;
+        const ulong incarnation = 43, formerLife = 1001, currentLife = 1002, sourceLife = 9001;
+        var entities = (ConcurrentDictionary<string, uint>)typeof(GameBridge).GetField("_ghostEntityIds", Instance)!.GetValue(bridge)!;
+        entities["2"] = eid;
+        var markers = (ConcurrentDictionary<byte, string>)typeof(GameBridge).GetField("_ghostReleaseVersions", Instance)!.GetValue(bridge)!;
+        var blocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var unblock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var oldProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var freshProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Let real pipe events queue without replacing the combat callback under test.
+        pipe.OnLocalDowned = (_, marker) =>
+        {
+            if (marker == 1)
+            {
+                blocked.TrySetResult();
+                return unblock.Task.WaitAsync(ct);
+            }
+            (marker == 2 ? oldProcessed : freshProcessed).TrySetResult();
+            return Task.CompletedTask;
+        };
+        string targetName = "ff-target-" + Guid.NewGuid().ToString("N")[..16];
+        using var targetServer = new NamedPipeServerStream(targetName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        await using var targetPipe = new CombatPipe(targetName);
+        var targetListen = targetServer.WaitForConnectionAsync(ct);
+        Assert.True(await targetPipe.EnsureConnectedAsync(ct));
+        await targetListen;
+        using var targetWire = new HeldPeerStream();
+        var targetBridge = BridgeOn(targetPipe, targetWire, ownGhost: ghost);
+        typeof(GameBridge).GetField("_t3StatsNextMs", Instance)!.SetValue(targetBridge, long.MaxValue);
+        var targetMarkers = (ConcurrentDictionary<byte, string>)typeof(GameBridge).GetField("_ghostReleaseVersions", Instance)!.GetValue(targetBridge)!;
+        var reader = typeof(GameBridge).GetMethod("ReceiveLoopAsync", Instance)!;
+        var receive = (Task)reader.Invoke(bridge, [wire, ct])!;
+        var targetReceive = (Task)reader.Invoke(targetBridge, [targetWire, ct])!;
+        try
+        {
+            await wire.ReaderWaiting.Task.WaitAsync(ct);
+            await targetWire.ReaderWaiting.Task.WaitAsync(ct);
+            await NativeLifeAsync(pipe, server, sourceLife, ct);
+            await NativeLifeAsync(targetPipe, targetServer, currentLife, ct);
+            await AnnounceTargetAsync(1, formerLife, 'a');
+            await server.WriteAsync(new byte[] { 0x91, 2, 0, 1, 1 }, ct);
+            await blocked.Task.WaitAsync(ct);
+            ulong captured = (ulong)Environment.TickCount64;
+            // Exercise the former encoding against the unmodified baseline and ensure it cannot bypass the new fence.
+            await server.WriteAsync(NativeContact(eid, flags, health: 7), ct);
+            while ((ulong)Environment.TickCount64 <= captured) await Task.Delay(1, ct);
+            await AnnounceTargetAsync(2, currentLife, 'b');
+            Assert.Equal(eid, entities["2"]);
+            Assert.Equal(sourceLife, pipe.PvpNativeLife);
+            // The original impact preceded publication. The measurement and callback can finish after it.
+            await server.WriteAsync(NativeContact(eid, flags, health: 7, captured,
+                (ulong)Environment.TickCount64, sourceLife, measurement: 17), ct);
+            await server.WriteAsync(new byte[] { 0x91, 2, 0, 0, 2 }, ct);
+            unblock.SetResult();
+            await oldProcessed.Task.WaitAsync(ct);
+            var stale = wire.UpstreamHits.ToArray();
+            var firstApply = ReadHitAsync(targetServer, ct);
+            foreach (byte[] premature in stale) ForwardToTarget(premature);
+            Assert.True(stale.Length == 0, stale.Length == 0 ? "" :
+                $"Old native contact was sent on the same ghost/body as {stale.Length} new upstream hit(s), " +
+                $"first recipient life={BinaryPrimitives.ReadUInt64LittleEndian(stale[0].AsSpan(3 + PlayerHitV8.IdentifiedUpLen))}.");
+            await AssertNoApplyBeforeMarkerAsync(firstApply, 'a');
+
+            ulong publishedBy = (ulong)Environment.TickCount64;
+            while ((ulong)Environment.TickCount64 <= publishedBy) await Task.Delay(1, ct);
+            ulong freshTick = (ulong)Environment.TickCount64;
+            byte[] fresh = NativeContact(eid, flags, health: 13, freshTick, freshTick, sourceLife, measurement: 18);
+            await server.WriteAsync(fresh, ct);
+            await server.WriteAsync(fresh, ct);
+            await server.WriteAsync(new byte[] { 0x91, 2, 0, 0, 3 }, ct);
+            await freshProcessed.Task.WaitAsync(ct);
+            byte[] packet = Assert.Single(wire.UpstreamHits);
+            Assert.Equal((byte)2, packet[3]);
+            Assert.Equal(13f, BinaryPrimitives.ReadSingleLittleEndian(packet.AsSpan(8)));
+            Assert.Equal(flags, packet[12]);
+            Assert.Equal(currentLife, BinaryPrimitives.ReadUInt64LittleEndian(packet.AsSpan(3 + PlayerHitV8.IdentifiedUpLen)));
+
+            ForwardToTarget(packet);
+            ForwardToTarget(packet);
+            byte[] apply = await firstApply;
+            Assert.Equal(42, apply.Length);
+            Assert.Equal(13f, BinaryPrimitives.ReadSingleLittleEndian(apply.AsSpan(4)));
+            Assert.Equal(flags, (byte)(apply[8] & 0x7F));
+            Assert.Equal(currentLife, BinaryPrimitives.ReadUInt64LittleEndian(apply.AsSpan(34)));
+            await targetServer.WriteAsync(new byte[] { 0x81, 3, 0, 1, 1, 24 }, ct);
+            await AssertNoApplyBeforeMarkerAsync(ReadHitAsync(targetServer, ct), 'b');
+        }
+        finally
+        {
+            stop.Cancel();
+            unblock.TrySetResult();
+            await Task.WhenAll(receive, targetReceive);
+        }
+
+        // Match the relay's source prefix and authenticated-incarnation rewrite.
+        void ForwardToTarget(byte[] upstream)
+        {
+            var down = new byte[PlayerHitV8.LifeDownLen];
+            down[0] = 1;
+            upstream.AsSpan(3).CopyTo(down.AsSpan(1));
+            BinaryPrimitives.WriteUInt64LittleEndian(down.AsSpan(PlayerHitV8.DownLen + sizeof(ulong)), 79);
+            targetWire.Feed(Protocol.PlayerHitV8Down, down);
+        }
+
+        async Task AssertNoApplyBeforeMarkerAsync(Task<byte[]> apply, char marker)
+        {
+            targetWire.Feed(Protocol.ReleaseVersion, [1, (byte)marker]);
+            while (targetMarkers.GetValueOrDefault((byte)1) != marker.ToString() && !apply.IsCompleted)
+                await Task.Delay(5, ct);
+            Assert.False(apply.IsCompleted, $"The target sent an unexpected native Apply before marker {marker}.");
+        }
+
+        async Task AnnounceTargetAsync(ulong revision, ulong proof, char marker)
+        {
+            var roster = new byte[Protocol.PvpPeerLifeLen];
+            roster[0] = ghost;
+            BinaryPrimitives.WriteUInt64LittleEndian(roster.AsSpan(1), incarnation);
+            new PvpLifeState(revision, proof).Write(roster.AsSpan(Protocol.PvpPeerLen));
+            wire.Feed(Protocol.PvpPeerDown, roster);
+            wire.Feed(Protocol.ReleaseVersion, [ghost, (byte)marker]);
+            while (markers.GetValueOrDefault(ghost) != marker.ToString()) await Task.Delay(5, ct);
+        }
+    }
+
+    private static byte[] NativeContact(uint eid, byte flags, float health, ulong captured = 0,
+        ulong measured = 0, ulong sourceLife = 0, ulong measurement = 0)
+    {
+        var frame = new byte[captured == 0 ? 17 : 49];
+        frame[0] = 0x97;
+        frame[1] = (byte)(frame.Length - 3);
+        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(3), eid);
+        BinaryPrimitives.WriteSingleLittleEndian(frame.AsSpan(7), 10f);
+        BinaryPrimitives.WriteSingleLittleEndian(frame.AsSpan(11), health);
+        frame[15] = flags;
+        frame[16] = 3;
+        if (captured != 0)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(17), captured);
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(25), measured);
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(33), sourceLife);
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(41), measurement);
+        }
+        return frame;
+    }
+
+    [Fact]
+    public async Task Full_contact_notice_queue_leaves_pipe_replies_and_later_notices_live()
+    {
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var ct = stop.Token;
+        string name = "ff-queue-" + Guid.NewGuid().ToString("N")[..16];
+        using var server = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        await using var pipe = new CombatPipe(name);
+        var listen = server.WaitForConnectionAsync(ct);
+        Assert.True(await pipe.EnsureConnectedAsync(ct));
+        await listen;
+
+        var blocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var unblock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var recovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delivered = new ConcurrentQueue<ulong>();
+        pipe.OnLocalDowned = (_, marker) =>
+        {
+            if (marker == 1)
+            {
+                blocked.SetResult();
+                return unblock.Task.WaitAsync(ct);
+            }
+            (marker == 2 ? drained : recovered).SetResult();
+            return Task.CompletedTask;
+        };
+        pipe.OnPvpHit = (_, hit) =>
+        {
+            delivered.Enqueue(hit.MeasurementId);
+            return Task.CompletedTask;
+        };
+
+        const ulong burst = 96, sourceLife = 9001;
+        try
+        {
+            await server.WriteAsync(new byte[] { 0x91, 2, 0, 1, 1 }, ct);
+            await blocked.Task.WaitAsync(ct);
+            for (ulong id = 1; id <= burst; ++id)
+                await server.WriteAsync(NativeContact(0x2345, 0, 7f, 1, 2, sourceLife, id), ct);
+
+            var pong = pipe.PingAsync(ct);
+            var ping = new byte[3];
+            await server.ReadExactlyAsync(ping, ct);
+            Assert.Equal(new byte[] { 0x03, 0, 0 }, ping);
+            await server.WriteAsync(new byte[] { 0x83, 0, 0 }, ct);
+            Assert.True(await pong.WaitAsync(ct));
+            Assert.Empty(delivered);
+
+            await server.WriteAsync(new byte[] { 0x91, 2, 0, 0, 2 }, ct);
+            unblock.SetResult();
+            await drained.Task.WaitAsync(ct);
+            var accepted = Enumerable.Range(1, 64).Select(id => (ulong)id).ToArray();
+            Assert.Equal(accepted, delivered.ToArray());
+
+            ulong now = (ulong)Environment.TickCount64;
+            await server.WriteAsync(NativeContact(0x2345, 0, 13f, now, now, sourceLife, burst + 1), ct);
+            await server.WriteAsync(new byte[] { 0x91, 2, 0, 0, 3 }, ct);
+            await recovered.Task.WaitAsync(ct);
+            Assert.Equal(accepted.Append(burst + 1), delivered.ToArray());
+        }
+        finally { unblock.TrySetResult(); }
     }
 
     [Theory]
@@ -327,11 +569,11 @@ public sealed class FriendlyFireReceiptIntegrationTests
 
     private const ulong FixtureLife = 41;
 
-    private static GameBridge BridgeOn(CombatPipe pipe, Stream? stream = null)
+    private static GameBridge BridgeOn(CombatPipe pipe, Stream? stream = null, byte ownGhost = 1)
     {
         var bridge = new GameBridge(new ClientConfig());
         typeof(GameBridge).GetField("_combat", Instance)!.SetValue(bridge, pipe);
-        typeof(GameBridge).GetField("_myGhostId", Instance)!.SetValue(bridge, (byte)1);
+        typeof(GameBridge).GetField("_myGhostId", Instance)!.SetValue(bridge, ownGhost);
         typeof(GameBridge).GetField("_ffSession", Instance)!.SetValue(bridge, true);
         typeof(GameBridge).GetField("_w213Caps", Instance)!.SetValue(bridge, (ushort)(Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife));
         typeof(CombatPipe).GetField("_pvpNativeLife", Instance)!.SetValue(pipe, FixtureLife);
@@ -389,7 +631,7 @@ public sealed class FriendlyFireReceiptIntegrationTests
     private sealed class HeldPeerStream : Stream
     {
         private readonly Channel<byte[]> _frames = Channel.CreateUnbounded<byte[]>();
-        public readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> PendingWrites = new();
+        public ConcurrentQueue<byte[]> UpstreamHits { get; } = new();
         private byte[] _frame = [];
         private int _at;
         private long _read;
@@ -425,11 +667,13 @@ public sealed class FriendlyFireReceiptIntegrationTests
         public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) =>
+            WriteAsync(buffer.AsMemory(offset, count)).GetAwaiter().GetResult();
+
         public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            PendingWrites.Enqueue(buffer.ToArray());
+            if (!buffer.IsEmpty && buffer.Span[0] == Protocol.PlayerHitV8Up) UpstreamHits.Enqueue(buffer.ToArray());
             return ValueTask.CompletedTask;
         }
         public override void Flush() => throw new NotSupportedException();

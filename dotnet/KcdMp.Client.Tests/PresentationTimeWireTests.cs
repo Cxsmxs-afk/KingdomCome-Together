@@ -26,11 +26,14 @@ public sealed class PresentationTimeWireTests
         Assert.False(clock.TryComplete(reply.AsSpan(3), 1028, out _));
         Assert.True(clock.TryHostAt(1034, -800, out ulong host));
         Assert.Equal(4234ul, host);
+        Assert.True(clock.TryRelayAt(1034, out long relay, out long roundTrip));
+        Assert.Equal((5034L, 20L), (relay, roundTrip));
         Assert.False(clock.TryHostAt(1027, -800, out _));
         Assert.False(clock.TryHostAt(1028 + PresentationClock.FreshMs + 1, -800, out _));
 
         clock.Reset();
         Assert.False(clock.TryHostAt(1034, -800, out _));
+        Assert.False(clock.TryRelayAt(1034, out _, out _));
     }
 
     [Fact]

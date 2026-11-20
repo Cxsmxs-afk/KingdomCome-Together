@@ -58,6 +58,7 @@
 #include "wo147.h"
 #include "wo151.h"
 #include "wo163.h"
+#include "wo178.h"
 #include "wo203.h"
 #include "wo213.h"
 #include "wo201.h"
@@ -340,9 +341,9 @@ void send_local_hit(const unsigned char guid[16], void* soul, float health_delta
 // WO-113: unsolicited respawn frames, written from the game thread under the
 // same write lock as LocalHit. A missing agent is logged by respawn.cpp's own
 // lines; here only a failed write is.
-void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what) {
+void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what, uint64_t expectedConnection = 0) {
     const uint64_t generation = g_connGen.load();
-    if (!g_connected || g_pipe == INVALID_HANDLE_VALUE) return;
+    if (!g_connected || (expectedConnection && generation + 1 != expectedConnection) || g_pipe == INVALID_HANDLE_VALUE) return;
     EnterCriticalSection(&g_write_lock);
     const bool sent = send_frame(g_pipe, type, body, len, generation);
     const DWORD err = sent ? 0 : GetLastError();
@@ -477,7 +478,7 @@ bool edge_admit(HANDLE h, uint64_t generation, const pipecontrol::Frame& outer) 
                             request.frame.body[0] == pipecontrol::kEdgeCapabilities);
     const bool latest = nested == kSetPartner || nested == kReadBodyState || nested == kReadLocalState;
     const bool presentation = nested == kTimedAction || nested == kTimedPose || nested == kTimelineConfig ||
-                              nested == kRemoteRelocation || nested == kCombatEvent;
+                              nested == kRemoteRelocation || nested == kCombatEvent || nested == kRangedHand;
     const bool bulk = nested == kProbe || nested == kCombatRow;
     if (lifecycle || (nested > kPinLabel && nested != kRawPose && !bulk && !presentation) ||
         (request.lane == Lane::Latest && !latest) ||
@@ -603,7 +604,7 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
         case kAvatarEvent: case kAttributedDamage: case kApplyPvpHit: case kNpcHold:
         case kNpcSamples: case kLeashSample: case kSetPartner:
         case edgelanes::kRawPose: case edgelanes::kTimedPose: case edgelanes::kTimedAction:
-        case edgelanes::kRemoteRelocation: case edgelanes::kCombatEvent: case edgelanes::kCombatRow:
+        case edgelanes::kRemoteRelocation: case edgelanes::kCombatEvent: case edgelanes::kCombatRow: case edgelanes::kRangedHand:
             return LoadAccess::Live;
         case kJoinPlace: case kGhostIsolate: case kMirrorGrave:
             return LoadAccess::Setup;
@@ -655,6 +656,9 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
 }
 
 bool load_allows(uint8_t type, const uint8_t* body, size_t n, uint64_t stamp, LoadAccess access) {
+    if (type == kWo163 && n && body[0] == wo178::kOpScopedSnapshot)
+        return n == wo178::kScopedSnapshotBytes && body[25] <= 1 &&
+            loadsequence::snapshot_allowed(stamp, loadsequence::read_le(body + 17, 8), body[25] == 1);
     if (!loadsequence::allows(stamp, access)) return false;
     // Off-main lifecycle control cannot be smuggled through Bulk/batches.
     if (type == kWo163 && n && body[0] == loadsequence::kOp) return false;
@@ -942,13 +946,10 @@ void send_local_action(uint8_t kind, uint8_t phase, int8_t ic, int8_t zone, int8
 }
 
 // WO-121: the local player's hit on a peer's avatar (main thread, hits::tick).
-void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material) {
-    BYTE body[14]{};
-    std::memcpy(body, &victimEid, 4);
-    std::memcpy(body + 4, &st, 4);
-    std::memcpy(body + 8, &hp, 4);
-    body[12] = flags; body[13] = material;
-    send_unsolicited(kPvpHitOut, body, sizeof(body), "PvpHit");
+void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material,
+                  const wo155rules::Observation& observation, uint64_t connection) {
+    const auto body = wo155rules::encode_notice(victimEid, st, hp, flags, material, observation);
+    send_unsolicited(kPvpHitOut, body.data(), static_cast<uint16_t>(body.size()), "PvpHit", connection);
 }
 
 // WO-210 E.2: the local player's blow on a copy, filtered here (main thread, wo210_hit's tick): the LocalHit frame with no numbers and
@@ -1474,17 +1475,26 @@ struct DeathBackend {
     npcdeath::Preparation prepare(const DeathBody& body, const npcdeath::Request& request, uint64_t attempt) const {
         using Preparation = npcdeath::Preparation;
         const uint32_t eid = body.actions.eid;
-        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::NotStarted;
-        // Release can change native holds. From here on, a failed readback must retain the fence.
-        wo195::release(eid, "verified remote NPC death");
-        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::Uncertain;
-        hits::discard_from(eid, false);
-        uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
-        std::memcpy(payload + 2, &eid, sizeof eid);
-        uint8_t guard[32]{};
-        size_t used = 0;
-        return wo131::handle(payload, sizeof payload, guard, sizeof guard, &used) == wo131::kROk && used == 1 && guard[0] == 1
-            ? Preparation::Ready : Preparation::Uncertain;
+        if (!current(body, request, true) || !ready(body, attempt)) return Preparation::Unchanged;
+        // WO195 can remove engagement, wish and motion holds. From its first
+        // call onward, a fault or refused readback cannot prove unchanged state.
+        KCDMP_FAULT_CALL(site, "pipe::npc_death/prepare");
+        try {
+            return fault::guarded_or(site, Preparation::Uncertain, [&] {
+                wo195::release(eid, "verified remote NPC death");
+                if (!current(body, request, true) || !ready(body, attempt) || !hits::discard_from(eid, false))
+                    return Preparation::Uncertain;
+                uint8_t payload[]{wo131::kOpCopyGuard, wo131::kGuardOff, 0, 0, 0, 0};
+                std::memcpy(payload + 2, &eid, sizeof eid);
+                uint8_t guard[32]{};
+                size_t used = 0;
+                const auto result = wo131::handle(payload, sizeof payload, guard, sizeof guard, &used);
+                return result == wo131::kROk && used == 1 && guard[0] == 1 ? Preparation::Ready : Preparation::Uncertain;
+            });
+        } catch (...) {
+            report_tag(body, request, "prepare-exception");
+            return Preparation::Uncertain;
+        }
     }
 
     bool apply(const DeathBody& body, const npcdeath::Request& request) const {
@@ -1519,6 +1529,9 @@ struct DeathBackend {
             case npcdeath::Stage::ReleasePending: return report_tag(body, request, "release-pending");
             case npcdeath::Stage::ReleaseUncertain: return report_tag(body, request, "release-uncertain");
             case npcdeath::Stage::Ready: return report_tag(body, request, "ready");
+            case npcdeath::Stage::PrepareUnchanged: return report_tag(body, request, "prepare-unchanged");
+            case npcdeath::Stage::PrepareUncertain: return report_tag(body, request, "prepare-uncertain");
+            case npcdeath::Stage::PrepareObservedDead: return report_tag(body, request, "prepare-observed-dead");
             case npcdeath::Stage::DeathPending: return report_tag(body, request, "death-pending");
             case npcdeath::Stage::Applied: return report_tag(body, request, "applied");
             case npcdeath::Stage::Uncertain: return report_tag(body, request, "uncertain");
@@ -1526,8 +1539,6 @@ struct DeathBackend {
             case npcdeath::Stage::Aborted: return report_tag(body, request, "aborted-before-apply");
             case npcdeath::Stage::AbortedUnadmitted: return report_tag(body, request, "aborted-unadmitted", " reason=never-admitted");
             case npcdeath::Stage::ApplyUncertain: return report_tag(body, request, "apply-uncertain");
-            case npcdeath::Stage::PreparationNotStarted: return report_tag(body, request, "preparation-not-started");
-            case npcdeath::Stage::PreparationUncertain: return report_tag(body, request, "preparation-uncertain");
         }
     }
 };
@@ -1999,6 +2010,16 @@ void dispatch_frame(HANDLE h, uint64_t generation, const pipecontrol::Frame& inc
                 const uint8_t r = t_edgeReply ? npcdrive::authorize_remote_relocation(body, len,
                     {incoming.readerQpc, {incoming.readerObservation, generation + 1}, incoming.loadStamp}) : npcdrive::kBadRequest;
                 send_result(h, r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case edgelanes::kRangedHand: {
+                using namespace timelineactions;
+                const Scope scope{incoming.readerObservation, generation + 1, incoming.readerLife, incoming.loadStamp};
+                const auto receipt = t_edgeReply ? handle_ranged_hand(body, len, scope) : HandObservation{};
+                uint8_t out[kRangedHandReplySize]{kRangedHandVersion, receipt.result, receipt.known};
+                std::copy(receipt.left.begin(), receipt.left.end(), out + 3);
+                std::copy(receipt.right.begin(), receipt.right.end(), out + 19);
+                send_frame(h, edgelanes::kRangedHandReply, out, sizeof out, generation);
                 break;
             }
             case edgelanes::kProbe: {

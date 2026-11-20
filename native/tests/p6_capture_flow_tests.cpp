@@ -11,19 +11,29 @@ uint64_t clockMs=1000,gen=1,life=11;
 bool playable=true,hasActor=true,hasSoul=true,changeDuringHand=false,changedBody=false;
 bool chargeReadable=false;
 float playerCharge=0;
+bool useStepRead=false,stepReadFailed=false;
 uint8_t phase=0,known=3,left=0x11,right=0;
 int actorObject=0,otherActor=0,soulObject=0,passedCount=0,failedCount=0;
 #define C6(c,label) do{if(c)++passedCount;else{++failedCount;std::printf("FAIL P6 capture %d: %s\n",__LINE__,label);}}while(false)
 uint64_t now(){return clockMs;}uint64_t generation(){return gen;}uint64_t epoch(){return life;}bool gameplay(){return playable;}
 void* actor(uint32_t* eid){*eid=hasActor?44:0;return hasActor?(changedBody?&otherActor:&actorObject):nullptr;}
 void* soul(){return hasSoul?&soulObject:nullptr;}
-uint8_t readPhase(void*){return phase;}
+uint8_t readPhase(void*) {
+    if (!useStepRead) return phase;
+    return kcdmp::wo201ranged::read_step_phase(
+        [](void** step) {
+            if (stepReadFailed) return false;
+            *step = phase ? &actorObject : nullptr;
+            return true;
+        },
+        [](void*) { return phase; }, uint8_t{0}, uint8_t{255});
+}
 bool readCharge(void*,float* charge,float* min,float* max){*charge=playerCharge;*min=0;*max=1;return chargeReadable;}
 uint8_t hands(uint32_t,uint8_t* l,uint8_t* r){std::memset(l,0,16);std::memset(r,0,16);l[0]=left;r[0]=right;if(changeDuringHand)++life;return known;}
 struct Reply {uint8_t code=255;size_t size=0;std::array<uint8_t,512> b{};};
 Reply poll(bool on=true,uint64_t expected=0){uint8_t b[11]={86,2,uint8_t(on?1:0)};kcdmp::p6rules::put64(b+3,expected?expected:gen);Reply r;r.code=kcdmp::wo201ranged::handle(b,sizeof b,r.b.data(),r.b.size(),&r.size);return r;}
 void step(uint8_t p,uint64_t ms=50){phase=p;clockMs+=ms;kcdmp::wo201ranged::tick();}
-void reset(){clockMs=1000;gen=1;life=11;playable=hasActor=hasSoul=true;changeDuringHand=changedBody=chargeReadable=false;playerCharge=0;phase=0;known=3;left=0x11;right=0;kcdmp::wo201ranged::set_test_backend({now,generation,epoch,gameplay,actor,soul,readPhase,hands,readCharge});kcdmp::wo201ranged::reset_for_tests();C6(poll().code==0,"current gameplay enables native v2 capture");}
+void reset(){clockMs=1000;gen=1;life=11;playable=hasActor=hasSoul=true;changeDuringHand=changedBody=chargeReadable=false;useStepRead=stepReadFailed=false;playerCharge=0;phase=0;known=3;left=0x11;right=0;kcdmp::wo201ranged::set_test_backend({now,generation,epoch,gameplay,actor,soul,readPhase,hands,readCharge});kcdmp::wo201ranged::reset_for_tests();C6(poll().code==0,"current gameplay enables native v2 capture");}
 }
 namespace kcdmp::wo201ranged {void test_trace(const char*,...){} }
 int p6_capture_flow_tests(int* passed){
@@ -41,6 +51,18 @@ int p6_capture_flow_tests(int* passed){
     reset();step(1,600);step(2,600);step(3,600);r=poll();C6(r.b[1]==3,"long but stable gameplay frames do not restart an endless5second settle");
     reset();hasActor=false;step(1);t3_counts(counts);C6(counts[0]==1&&poll().b[1]==0,"missing actor is distinct from a proved none phase");
     hasActor=true;phase=255;clockMs+=50;tick();t3_counts(counts);C6(counts[1]==1,"unreadable phase has separate diagnostic and no idle fabrication");
+    reset();
+    useStepRead = true;
+    step(2);
+    stepReadFailed = true;
+    step(0);
+    r = poll();
+    t3_counts(counts);
+    C6(r.b[1] == 1 && r.b[18] == 2 && counts[1] == 1, "a faulted step read after aim increments unreadable and queues no idle edge");
+    stepReadFailed = false;
+    step(0);
+    r = poll();
+    C6(r.b[1] == 1 && r.b[18] == 0, "a proven null step after aim queues the actual idle edge");
     reset();step(1);++life;r=poll();C6(r.b[1]==0,"life change drops old queued phase before drain");t3_counts(counts);C6(counts[5]==1,"life drop is visible in cached lifecycle counter");
     reset();step(3);clockMs+=2001;r=poll();C6(r.b[1]==0,"old capture is expired rather than restamped at poll");t3_counts(counts);C6(counts[4]==1,"expiry counter counts discarded row");
     reset();const auto firstEpoch=u64(poll().b.data()+10);for(unsigned i=0;i<33;++i)step(uint8_t(i%2+1));r=poll();t3_counts(counts);

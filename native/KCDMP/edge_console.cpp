@@ -98,4 +98,10 @@ Result present_dialog_vote(const char* token, int index, int current, bool right
     return run(command, false);
 }
 
+Result present_ranged_hand(const timelineactions::RangedHandRequest& request, const uint8_t item[16]) {
+    Command command{};
+    if (!ranged_hand_command(request, item, command)) return Result::NotEntered;
+    return run(command, false);
+}
+
 } // namespace kcdmp::edgeconsole

@@ -350,7 +350,12 @@ public partial class GameBridge
         else if (p.Length == 3 && p[0] == "torch" && byte.TryParse(p[1], out byte tg) && p[2] is "on" or "off")
             await ExecLuaAsync($"if KCD2MP_W136AvatarTorch then KCD2MP_W136AvatarTorch(\"{tg}\", {B(p[2] == "on")}) end");
         else if (p.Length == 2 && p[0] == "clear" && byte.TryParse(p[1], out byte cg))
-            await ExecLuaAsync($"if KCD2MP_W136ClearPreset then KCD2MP_W136ClearPreset(\"{cg}\", \"live check\") end");
+        {
+            if (Wo214OutfitIncarnation(cg) is not { } incarnation) return;
+            var hand = OutfitHand(cg);
+            await OutfitMutationAsync(new(cg, incarnation, hand is null ? "-" : Wo214OutfitHandScope(hand),
+                Interlocked.Increment(ref _outfitOrder)), "preset", "", CancellationToken.None);
+        }
         else if (p.Length == 1 && p[0] == "status")
         {
             Console.WriteLine(Wo136StatsLine());
@@ -377,17 +382,6 @@ public partial class GameBridge
         W164NoteTorchShown(ghost, on);   // WO-164 TR: the side-channel does not apply this edge twice
         Console.WriteLine($"MP-W136 peer {ghost} torch {(on ? "OUT" : "away")} -> its avatar {(on ? "holds and lights the game's torch" : "puts it away")}");
         _ = ExecLuaAsync($"if KCD2MP_W136AvatarTorch then KCD2MP_W136AvatarTorch(\"{ghost}\", {B(on)}) end");
-    }
-
-    /// <summary>
-    /// The appearance converge found pieces that stay worn after unequips: a
-    /// preset's pieces (not inventory items). The engine's own way off: the empty
-    /// preset; the target outfit is then applied over it.
-    /// </summary>
-    private async Task Wo136ClearPresetAsync(byte ghostId, string why, FigureOutfitStamp stamp)
-    {
-        Interlocked.Increment(ref _w136PresetClears);
-        await ExecLuaAsync($"if KCD2MP_W136ClearPreset then KCD2MP_W136ClearPreset(\"{ghostId}\", \"{why}\", {stamp.LuaArguments}) end");
     }
 
     /// <summary>A refused class, named from the item table where it can be (the belt case).</summary>

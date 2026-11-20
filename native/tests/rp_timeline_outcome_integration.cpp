@@ -147,8 +147,12 @@ bool rp_knockout(uint32_t, bool, uint64_t) { return false; }
 void rp_knockout_tick() {}
 }
 namespace kcdmp::wo143 {
-bool rp_ranged_available(uint32_t, const uint8_t[16]) { return false; }
-bool rp_ranged(uint32_t, uint8_t, uint8_t, const uint8_t[16], uint64_t) { return false; }
+bool rp_ranged_available(uint32_t, const uint8_t[16], timelineactions::HandSlot) { return false; }
+bool rp_ranged(uint32_t, uint8_t, uint8_t, const uint8_t[16], timelineactions::HandSlot, uint64_t) { return false; }
+uint8_t rp_observe_hands(uint32_t, std::array<uint8_t, 16>&, std::array<uint8_t, 16>&) { return 0; }
+}
+namespace kcdmp::edgeconsole {
+Result present_ranged_hand(const timelineactions::RangedHandRequest&, const uint8_t[16]) { return {}; }
 }
 namespace kcdmp::wo187 {
 void note_move(uint32_t) {}
@@ -263,6 +267,64 @@ int rp_timeline_outcome_integration(int* passed) {
     pose_pulse(0, 0);
     check(submit(sim.scope, sim.now) == Blocked && sim.typedCalls == actionCount,
           "target and pose stamp loss cannot reopen a retired action ID");
+
+    check(begin(false), "register row for prolonged loss of both presentation clocks");
+    constexpr uint16_t unclockedCapacity = 256;
+    bool unclockedAdmitted = true, unclockedSettled = true;
+    for (uint16_t i = 0; i < unclockedCapacity; ++i) {
+        const uint64_t hostMs = kHostMs + static_cast<uint64_t>(i) * kPoseWaitMs;
+        pose_pulse(0, 0);
+        unclockedAdmitted &= submit(sim.scope, sim.now, hostMs, kSequence + i) == Accepted;
+        sim.now += kPoseWaitMs;
+        pose_pulse(0, 0);
+        tick();
+        observed(sim.token, true);
+        const auto counts = kcdmp::rpcombat::snapshot();
+        unclockedSettled &= counts.actions_pending == 0 && counts.actions_played == static_cast<unsigned>(i) + 1;
+    }
+    check(unclockedAdmitted && unclockedSettled && sim.typedCalls == unclockedCapacity && sim.legacyCalls == 0,
+          "256 unstamped live poses each complete one action without retaining pending work");
+
+    const uint16_t nextSequence = kSequence + unclockedCapacity;
+    const uint64_t nextHostMs = kHostMs + unclockedCapacity * kPoseWaitMs;
+    pose_pulse(0, 0);
+    const auto saturated = submit(sim.scope, sim.now, nextHostMs, nextSequence);
+    const auto knownDuplicate = submit(sim.scope, sim.now);
+    tick();
+    check(saturated == Blocked && knownDuplicate == Accepted && sim.typedCalls == unclockedCapacity &&
+          kcdmp::rpcombat::snapshot().actions_in == unclockedCapacity && kcdmp::rpcombat::snapshot().actions_pending == 0,
+          "receipt capacity rejects action 257 and duplicate lookup creates no new work");
+
+    pose_pulse(0, nextHostMs);
+    --sim.pose.life;
+    check(submit(sim.scope, sim.now, nextHostMs, nextSequence) == Blocked && sim.typedCalls == unclockedCapacity,
+          "a stamp from another life cannot reopen receipt capacity");
+
+    // Use a new sequence for the recovery input. The earlier saturation refusal was never queued.
+    pose_pulse(0, nextHostMs);
+    const auto recovered = submit(sim.scope, sim.now, nextHostMs, nextSequence + 1);
+    check(recovered == Accepted && submit(sim.scope, sim.now) == Blocked,
+          "a live stamp in the current scope reopens admission and leaves retired IDs stale");
+    sim.now += kPoseWaitMs;
+    pose_pulse(0, nextHostMs);
+    tick();
+    observed(sim.token, true);
+    sim.target = sim.applied = nextHostMs + kPoseWaitMs;
+    const auto timedAfterRecovery = submit(sim.scope, sim.now, sim.target, nextSequence + 2);
+    tick();
+    observed(sim.token, true);
+    const auto recoveredCounts = kcdmp::rpcombat::snapshot();
+    check(timedAfterRecovery == Accepted && sim.typedCalls == unclockedCapacity + 2 && sim.legacyCalls == 0 &&
+          recoveredCounts.actions_in == unclockedCapacity + 2 && recoveredCounts.actions_played == unclockedCapacity + 2 &&
+          recoveredCounts.actions_pending == 0 && submit(sim.scope, sim.now) == Blocked,
+          "guarded and timed work both resume once without replay or backlog");
+    std::printf("H15 unstamped_capacity=%u blocked_257=%u cached_duplicate=%u recovery=%u timed_recovery=%u "
+                "typed_calls=%u legacy_calls=%u admitted=%llu installed=%llu pending=%llu\n",
+                static_cast<unsigned>(unclockedCapacity), static_cast<unsigned>(saturated), static_cast<unsigned>(knownDuplicate),
+                static_cast<unsigned>(recovered), static_cast<unsigned>(timedAfterRecovery), sim.typedCalls, sim.legacyCalls,
+                static_cast<unsigned long long>(recoveredCounts.actions_in),
+                static_cast<unsigned long long>(recoveredCounts.actions_played),
+                static_cast<unsigned long long>(recoveredCounts.actions_pending));
 
     check(begin(), "admit action with an old-life pose");
     sim.now += kPoseWaitMs;
