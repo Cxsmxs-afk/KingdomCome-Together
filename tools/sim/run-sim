@@ -96,6 +96,7 @@ EOF
     printf 'FF native 0x97 capture replays: %d passed, 0 skipped\n' "${#ff_captures[@]}"
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_rpcombat.py'
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_latency_gate.py'
+    pwsh -NoLogo -NoProfile -NonInteractive -File tools/Test-DirectInstall.ps1
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_lane2_melee.py'
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_lane2_h6.py'
     PYTHONDONTWRITEBYTECODE=1 python3 tools/sim/run-required-python.py discover -s tools/rig -p 'test_load_sequence.py'
