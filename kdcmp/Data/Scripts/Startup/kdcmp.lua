@@ -12414,7 +12414,6 @@ function KCD2MP_GhostDismount(id, ghost, why)
     if not st then return false end
     local binding = st.dismountBinding or KCD2MP_RideBinding(id)
     if not KCD2MP_RideBindingCurrent(id, binding) or not rawequal(ghost, binding.ghost) then return false end
-    if KCD2MP_W154RideNative then pcall(KCD2MP_W154RideNative, id, false) end   -- WO-154 5: the writer lets the horse go first
     local live = KCD2MP_GhostIsMounted(ghost)
     local flag = st.nativeMounted == true
     if (flag or live ~= false) and KCD2MP_NpcNativeLeaseBusy("kcd2mp_" .. tostring(id)) then
@@ -12441,6 +12440,7 @@ function KCD2MP_GhostDismount(id, ghost, why)
     else
         st.nativeMounted = false
         st.dismountPending, st.dismountBinding, st.dismountGaveUp = nil, nil, nil
+        if KCD2MP_W154RideNative then pcall(KCD2MP_W154RideNative, id, false) end
         if wasPending then
             mp_log(string.format("MP-DISMOUNT id=%s off the horse (read back) %.1f s after the stop, %d tries -- the native writer may have it now",
                 tostring(id), os.clock() - (st.dismountSince or os.clock()), (st.dismountTries or 0) + 1))
@@ -12830,7 +12830,9 @@ function KCD2MP_ApplyHorseTransforms()
     local now = os.clock()
     local sp, sa = SCRATCH.HORSE_SETPOS, SCRATCH.HORSE_SETANG
     for id, horseData in pairs(KCD2MP.horseGhosts) do
-        if horseData.entity and horseData.renderX and not (horseData.native and horseData.native.bound) then   -- WO-154 5: the DLL writes it
+        local ghost = KCD2MP.ghosts[id]
+        local detaching = ghost and ghost.istate and ghost.istate.dismountPending
+        if horseData.entity and horseData.renderX and not detaching and not (horseData.native and horseData.native.bound) then
             -- The render target only moves on the 20 ms ghost tick. Chasing it
             -- every frame turns that step into a short glide. Once the chase
             -- has landed (within 1 mm), further identical writes are skipped:

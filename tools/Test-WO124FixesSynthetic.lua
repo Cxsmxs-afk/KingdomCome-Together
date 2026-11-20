@@ -277,7 +277,8 @@ do
     KCD2MP.interpRunning = true; KCD2MP._interpAliveAt = NOW
     local rider, state = mkGhost("12", true)
     local horse = mkEntity("kcd2mp_horse_12", 91, 90, 0)
-    local horseRow = { entity = horse, entityId = horse.id }
+    local native = { name = "kcd2mp_horse_12", dz = 1.5, at = NOW, bound = true, paused = false }
+    local horseRow = { entity = horse, entityId = horse.id, native = native, renderX = 91, renderY = 90, renderZ = 0 }
     KCD2MP.horseGhosts["12"] = horseRow
     state.isRiding, state.nativeMounted = true, true
     rider.dismountTakes = false
@@ -287,6 +288,10 @@ do
     check("i5: unreadable Riding STOP retains the rider fence and horse", state.dismountPending == true
         and state.nativeMounted == true and KCD2MP.horseGhosts["12"] == horseRow and binds("12") == 0,
         "pending=" .. tostring(state.dismountPending) .. " horse=" .. tostring(KCD2MP.horseGhosts["12"] == horseRow) .. " " .. tostring(readback))
+    KCD2MP_ApplyHorseTransforms()
+    check("i5: unconfirmed detach retains horse ownership", horseRow.native == native and #evts("w154_ride") == 0
+        and #horse.writes == 0, "horse_native=" .. tostring(horseRow.native ~= nil)
+        .. " ride_events=" .. tostring(#evts("w154_ride")) .. " lua_writes=" .. tostring(#horse.writes))
     rider.human.IsMounted = function() return nil end
     NOW = NOW + 0.6
     gtick("12", 90.3, false)
@@ -297,7 +302,7 @@ do
     gtick("12", 90.4, false)
     check("i5: observed detach clears the fence and releases its horse", state.dismountPending == nil
         and state.nativeMounted == false and KCD2MP.horseGhosts["12"] == nil and ENTS.kcd2mp_horse_12 == nil
-        and rider.dismounts >= 2, "calls=" .. tostring(rider.dismounts))
+        and rider.dismounts >= 2 and horseRow.native == nil and #evts("w154_ride") == 1, "calls=" .. tostring(rider.dismounts))
 end
 
 -- Script timers can outlive the row, body or session which issued them.
