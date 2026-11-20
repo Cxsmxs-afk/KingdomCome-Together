@@ -1034,11 +1034,19 @@ public sealed class LogTailGameTransport : IGameTransport
     private static bool IsEarlyDelivered(string text, int start, int len, string? early) =>
         early is not null && text.AsSpan(start, len).TrimEnd('\r').SequenceEqual(early.AsSpan());
 
-    private static bool IsSaveReceiptLine(ReadOnlySpan<char> line) =>
+    private static bool RequiresActiveLog(ReadOnlySpan<char> line) =>
+        line.StartsWith("Log Started at ", StringComparison.Ordinal) ||
+        line.StartsWith("CSystem::Quit invoked", StringComparison.Ordinal) ||
+        line.StartsWith("[CryAction] LoadGame: '", StringComparison.Ordinal) ||
+        line.StartsWith("Loading saved game '", StringComparison.Ordinal) ||
+        line.StartsWith("PlayVideoOnly 'main_menu", StringComparison.Ordinal) ||
         line.StartsWith("Gameplay started", StringComparison.Ordinal) ||
         line.StartsWith("Exiting to main menu because save game loading failed", StringComparison.Ordinal) ||
         line.StartsWith("SaveGame: '", StringComparison.Ordinal) ||
-        line.StartsWith("[SAVE GAME] SaveGame: '", StringComparison.Ordinal);
+        line.StartsWith("[SAVE GAME] SaveGame: '", StringComparison.Ordinal) ||
+        line.Contains("[KCD2-MP] MOD INIT", StringComparison.Ordinal) ||
+        line.Contains("Sending concept notification 'EntityModuleOnPostLoadGame'", StringComparison.Ordinal) ||
+        line.Contains("Loading screen timeouted while still in post load reconstruction", StringComparison.Ordinal);
 
     private async Task TailLoopAsync(CancellationToken ct)
     {
@@ -1058,6 +1066,7 @@ public sealed class LogTailGameTransport : IGameTransport
 
         const long PathProbeIntervalMs = 250;
         long nextPathProbe = 0;
+        bool identityUnavailableLogged = false;
         FileStream? fs = null;
         FileIdentity? identity = null;
 
@@ -1074,6 +1083,11 @@ public sealed class LogTailGameTransport : IGameTransport
             // An attach or replacement may contain history from an unrelated run.
             // Only bytes written after this exact handle was adopted can raise events.
             stream.Seek(0, SeekOrigin.End);
+            if (nextIdentity is null && !identityUnavailableLogged)
+            {
+                identityUnavailableLogged = true;
+                Console.WriteLine("[logtail] stable file identity unavailable; engine load and save events suppressed");
+            }
             fs?.Dispose();
             fs = stream;
             identity = nextIdentity;
@@ -1088,7 +1102,7 @@ public sealed class LogTailGameTransport : IGameTransport
         bool PathStillNamesCurrentLog()
         {
             nextPathProbe = Environment.TickCount64 + PathProbeIntervalMs;
-            if (identity is not { } held) return true;
+            if (identity is not { } held) return false;
             FileStream? candidate = null;
             try
             {
@@ -1181,8 +1195,8 @@ public sealed class LogTailGameTransport : IGameTransport
                 for (int i = 0; i < text.Length; i++)
                 {
                     if (text[i] != '\n') continue;
-                    // Even before the next regular probe, a retired handle cannot release a save lease.
-                    if (!IsSaveReceiptLine(text.AsSpan(start, i - start)) || PathStillNamesCurrentLog())
+                    // Engine lifecycle also requires the current handle before the next regular probe.
+                    if (!RequiresActiveLog(text.AsSpan(start, i - start)) || PathStillNamesCurrentLog())
                     {
                         if (!IsEarlyDelivered(text, start, i - start, earlyDone)) ProcessLine(text.AsSpan(start, i - start));
                     }

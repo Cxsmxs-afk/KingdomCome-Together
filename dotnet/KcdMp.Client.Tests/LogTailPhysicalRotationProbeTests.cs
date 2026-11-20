@@ -28,19 +28,27 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
             var firstRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var scanned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var receipts = new ConcurrentQueue<LogTailGameTransport.EngineSaveTerminal>();
+            var reads = new ConcurrentQueue<string?>();
+            var accepts = new ConcurrentQueue<string>();
             var quits = 0;
+            var menus = 0;
             tail.LoadStarted += () =>
             {
+                reads.Enqueue(tail.EngineReadSave);
                 if (firstRead.TrySetResult()) releaseRead.Wait(deadline.Token);
             };
+            tail.SaveLoadAccepted += accepts.Enqueue;
             tail.EngineSaveFinished += receipts.Enqueue;
             tail.ModInitDetected += () => scanned.TrySetResult();
             tail.GameQuit += () => Interlocked.Increment(ref quits);
+            tail.MainMenuShown += () => Interlocked.Increment(ref menus);
             long beforeAttach = tail.EngineLogIncarnation;
             await tail.StartAsync(deadline.Token);
             while (tail.EngineLogIncarnation == beforeAttach) await Task.Delay(2, deadline.Token);
-            File.AppendAllText(path, "[CryAction] LoadGame: 'playline1/old-save'\n" +
-                (bufferedTerminal ? "Gameplay started\n" : ""));
+            const string retired = "Loading saved game 'playline1/retired-save'\n" +
+                "[CryAction] LoadGame: 'playline1/retired-save'\nPlayVideoOnly 'main_menu.bk2'\n" +
+                "CSystem::Quit invoked\nLog Started at 2026-11-20  01:20:00\nGameplay started\n";
+            File.AppendAllText(path, "[CryAction] LoadGame: 'playline1/old-save'\n" + (bufferedTerminal ? retired : ""));
             await firstRead.Task.WaitAsync(deadline.Token);
             long oldIncarnation = tail.EngineLogIncarnation;
             try
@@ -69,15 +77,19 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
                     Assert.True(tail.EngineLogIncarnation > oldIncarnation, "Tail did not adopt the active log.");
                 }
             }
-            string newRead = changed ? "Log Started at 2026-11-20  02:20:00\n[CryAction] LoadGame: 'playline1/new-save'\n" : "";
+            string newRead = changed ? "Log Started at 2026-11-20  02:20:00\nLoading saved game 'playline1/new-save'\n" +
+                "[CryAction] LoadGame: 'playline1/new-save'\n" : "";
             File.AppendAllText(path, newRead + "Gameplay started\n[KCD2-MP] MOD INIT\n");
             await scanned.Task.WaitAsync(deadline.Token);
-            output.WriteLine($"transition={transition} buffered_terminal={bufferedTerminal} old_incarnation={oldIncarnation} current_incarnation={tail.EngineLogIncarnation} receipts={string.Join(',', receipts.Select(r => r.Path))} quits={quits}");
+            output.WriteLine($"transition={transition} buffered_terminal={bufferedTerminal} old_incarnation={oldIncarnation} current_incarnation={tail.EngineLogIncarnation} receipts={string.Join(',', receipts.Select(r => r.Path))} quits={quits} menus={menus} reads={string.Join(',', reads)} accepts={string.Join(',', accepts)}");
             var receipt = Assert.Single(receipts);
             Assert.Equal(changed ? "playline1/new-save" : "playline1/old-save", receipt.Path);
             Assert.Equal(changed, receipt.Incarnation > oldIncarnation);
             Assert.True(receipt.Loaded);
             Assert.Equal(0, quits);
+            Assert.Equal(0, menus);
+            Assert.Equal(changed ? ["playline1/old-save", "playline1/new-save"] : new[] { "playline1/old-save" }, reads.ToArray());
+            Assert.Equal(changed ? ["playline1/new-save"] : Array.Empty<string>(), accepts.ToArray());
         }
         finally { folder.Delete(recursive: true); }
     }
