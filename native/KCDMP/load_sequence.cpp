@@ -38,10 +38,11 @@ bool control(const uint8_t* body, size_t size, uint64_t connection, uint8_t* ack
         const bool mainApplied = revision && effectCurrent && g_applied.load(std::memory_order_acquire) == revision;
         encode_ack(ack, phase, flags | (mainApplied ? kMainApplied : 0), generation, request.id);
     }
-    // The game tick also takes g_stateMutex. File output may stall independently.
-    if (changed)
+    if (changed) {
+        deferred_log::Scope diagnostic;
         logf("MP-LOAD-NATIVE phase=%u flags=%u world_gen=%llu revision=%llu", static_cast<unsigned>(phase), static_cast<unsigned>(flags),
              static_cast<unsigned long long>(generation), static_cast<unsigned long long>(revision >> 2));
+    }
     return accepted;
 }
 
@@ -61,17 +62,22 @@ void tick() {
         holdSeconds = g_state.hold_seconds();
     }
     if (g_hostHoldOwned && (!holdSeconds || g_hostHoldConnection != connection)) {
+        deferred_log::Scope diagnostic;
         if (!wo138::join_hold(false, 0)) return;
         g_hostHoldOwned = false;
         g_hostHoldConnection = 0;
         logf("MP-LOAD-NATIVE host_offer=release actuator=ok");
     }
     if (!holdSeconds) {
-        if (gate(revision) != Gate::Legacy && wo138::join_held() && !wo138::join_hold(false, 0)) return;
+        if (gate(revision) != Gate::Legacy && wo138::join_held()) {
+            deferred_log::Scope diagnostic;
+            if (!wo138::join_hold(false, 0)) return;
+        }
         g_applied.store(revision, std::memory_order_release);
         return;
     }
     if (!g_hostHoldOwned && g_hostHoldAttempt != revision) {
+        deferred_log::Scope diagnostic;
         g_hostHoldAttempt = revision;
         g_hostHoldOwned = wo138::join_hold(true, holdSeconds);
         if (g_hostHoldOwned) g_hostHoldConnection = connection;

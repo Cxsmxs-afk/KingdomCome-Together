@@ -208,6 +208,9 @@ DWORD WINAPI plugin_main(LPVOID) {
     // WO-137: the quest State detector (two C_StateVariable vftable slots) and the
     // Set<Value> apply. Fails closed (WO137-BUILD); silent until the agent turns it on.
     kcdmp::wo137::install();
+    // Publish a wake signal before the PauseGame hook or Pipe can capture a
+    // diagnostic. The queue is safe even while startup has yet to drain it.
+    kcdmp::deferred_log::prepare();
     // WO-138: the PauseGame gate (CCryAction::PauseGame; off until the agent turns
     // the levers on for a session with a partner). Fails closed (WO138-GATE).
     kcdmp::wo138::install();
@@ -306,7 +309,7 @@ DWORD WINAPI plugin_main(LPVOID) {
 
     kcdmp::main_thread::post_repeating("posering::tick", &kcdmp::posering::tick);
     kcdmp::pipe::start();
-    return 0;
+    kcdmp::deferred_log::run();
 }
 
 } // namespace
