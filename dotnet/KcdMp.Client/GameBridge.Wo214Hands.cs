@@ -23,10 +23,6 @@ public partial class GameBridge
     // Retry at the former WO-214 hand cadence, after Lua's draw/holster checks can finish.
     private const int Wo214GameRequestIntervalMs = 10_000;
     private readonly record struct FigureBody(uint Entity, int Generation, uint LuaBirth);
-    private readonly record struct FigureOutfitStamp(FigureBody Body, long HandRevision)
-    {
-        public string LuaArguments => FormattableString.Invariant($"\"{Body.Entity:X8}\",\"{HandRevision:X16}\",\"{Body.LuaBirth:X6}\"");
-    }
     private readonly ConcurrentDictionary<string, (uint Entity, uint Birth)> _w214FigureBirths = new();
     private readonly string _w214OutfitAgent = Guid.NewGuid().ToString("N");
     private sealed record FigureHand(bool Drawn, Guid? Cls, long AtMs, long ChangedAtMs, long RequestedAtMs,
@@ -341,20 +337,6 @@ public partial class GameBridge
         var previous = _w214FigureBirths.GetValueOrDefault(id);
         _w214FigureBirths[id] = (entity, birth);
         return previous.Entity == entity && previous.Birth != 0 && previous.Birth != birth;
-    }
-
-    private FigureOutfitStamp Wo214OutfitStamp(byte src)
-    {
-        var body = Wo214FigureBody(src);
-        return new(body, _w214FigureHand.TryGetValue(src, out var hand) && hand.Body == body &&
-            Wo214HandCurrent(src, hand) ? hand.Revision : 0);
-    }
-
-    private bool Wo214OutfitCurrent(byte src, FigureOutfitStamp stamp)
-    {
-        if (Wo214OutfitStamp(src) == stamp) return true;
-        Console.WriteLine($"[appearance] ghost {src}: outfit superseded by a new body or hand");
-        return false;
     }
 
     private bool Wo214HandCurrent(byte src, FigureHand hand) =>

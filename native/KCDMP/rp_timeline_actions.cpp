@@ -267,7 +267,7 @@ void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, bool l
     const auto& event = typed.wire;
     if (!ranged_hand_current(event, body) ||
         (event.kind == rpcombat::kRanged && typed.handSlot != body.rangedHand.slot)) {
-        settle(eid, body.peer, action, "refused", "ranged-hand-stale");
+        settle(eid, body.peer, action, Dispatch::NotStarted, "refused", "ranged-hand-stale");
         return;
     }
     if (!(scope_now() == g_scope) || g_observing.size() >= kMaxPending ||

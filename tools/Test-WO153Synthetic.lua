@@ -356,90 +356,101 @@ do
     noErrs("F")
 end
 
--- (H4) Execute an already queued outfit operation after the next hand revision arrived.
+-- (H4) Execute queued work across actual hand, body and agent changes.
 do
     ERRS = {}
-    local id, name, body, birth = "7", "kcd2mp_7", "01FFAA01", "123456"
+    local id, name, body, birth = "7", "kcd2mp_7", "01FFAA01", "00123456"
     local oldRevision, newRevision = "0000000000000001", "0000000000000002"
     local oldClass = "11111111-1111-1111-1111-111111111111"
     local newClass = "22222222-2222-2222-2222-222222222222"
-    local equipped, slotOne, mutations = nil, nil, 0
-    local removals, cleared = 0, 0
+    local equipped, left, right, mutations, removals, cleared = nil, nil, nil, 0, 0, 0
     local ghost = mkEntity(name, 0, 0, 0)
     ghost.id = "0x" .. body
     ghost.inventory = { FindItem = function(_, cls) return cls end }
     ghost.actor.EquipInventoryItem = function(_, item) mutations, equipped = mutations + 1, item end
     ghost.actor.UnequipInventoryItem = function() removals = removals + 1 end
     ghost.actor.EquipClothingPreset = function() cleared = cleared + 1 end
-    ghost.human.GetItemInHand = function(_, slot)
-        if slot == 0 then return equipped end
-        return slotOne
+    ghost.human.GetItemInHand = function(_, slot) if slot == 0 then return right end return left end
+    local function scope(revision) return string.rep("0", 48) .. revision end
+    local function hand(incarnation, revision, drawn, cls)
+        return KCD2MP_W214FigureHand(id, drawn, cls, false, incarnation, scope(revision), revision)
+    end
+    local function outfit(incarnation, handScope, number, operation, item)
+        return KCD2MP_W214OutfitApply(id, incarnation, handScope, string.format("%016X", number), operation, item or "")
     end
     local oldIM = ItemManager
     ItemManager = { GetItem = function(it) return { class = it } end }
     ENTS[name] = ghost
-    KCD2MP.ghosts[id] = { entity = ghost, outfitBirth = birth }
+    KCD2MP.ghosts[id] = { entity = ghost, outfitIncarnation = birth }
 
-    equipped = oldClass
-    KCD2MP_W214FigureHand(id, true, oldClass, false, body, oldRevision, birth)
-    local alreadyQueued = function() return KCD2MP_W202EquipAll(name, oldClass, body, oldRevision, birth) end
-    local queuedPreset = function() return KCD2MP_W136ClearPreset(id, "test", body, oldRevision, birth) end
-    equipped = newClass
-    KCD2MP_W214FigureHand(id, true, newClass, false, body, newRevision, birth)
-    check("H4: a queued old outfit cannot touch the newer hand", alreadyQueued() == 0 and mutations == 0 and equipped == newClass,
-          "mutations=" .. mutations .. " hand=" .. tostring(equipped))
-
-    equipped, mutations = nil, 0
-    check("H4: the current outfit may equip the confirmed weapon", KCD2MP_W202EquipAll(name, newClass, body, newRevision, birth) == 1 and mutations == 1 and equipped == newClass,
-          "mutations=" .. mutations .. " hand=" .. tostring(equipped))
-    check("H4: the queued old preset clear cannot touch the new hand", not queuedPreset() and cleared == 0, "engine_clears=" .. cleared)
+    right = oldClass
+    hand(birth, oldRevision, true, oldClass)
+    local queuedEquip = function() return outfit(birth, scope(oldRevision), 1, "atomic", oldClass) end
+    local queuedPreset = function() return outfit(birth, scope(oldRevision), 2, "preset") end
+    right = newClass
+    hand(birth, newRevision, true, newClass)
+    check("H4: a queued old outfit cannot touch the newer hand",
+          not queuedEquip() and mutations == 0 and right == newClass)
+    check("H4: the queued old preset clear cannot touch the new hand", not queuedPreset() and cleared == 0)
     check("H4: a delayed old holster cannot replace the engine hand revision",
-          not KCD2MP_W214FigureHand(id, false, "-", false, body, oldRevision, birth) and equipped == newClass)
-    slotOne = oldClass
-    check("H4: the current outfit cannot remove the left-hand item",
-          not KCD2MP_W144Unequip(name, oldClass, body, newRevision, birth) and removals == 0)
-    check("H4: the current outfit cannot remove the right-hand item",
-          not KCD2MP_W144Unequip(name, newClass, body, newRevision, birth) and removals == 0)
-    slotOne = nil
-    check("H4: the current outfit may remove an unheld item",
-          KCD2MP_W144Unequip(name, oldClass, body, newRevision, birth) and removals == 1, "engine_unequips=" .. removals)
+          not hand(birth, oldRevision, false, "-") and right == newClass)
 
-    -- The body ID is unchanged but the spawn incarnation is no longer the one
-    -- authorized for this command. Even a revision of zero cannot match it.
-    local oldBirth, noHand = birth, "0000000000000000"
-    KCD2MP.ghosts[id] = { entity = ghost, outfitBirth = "123457" }
+    local holstered = "0000000000000003"
+    hand(birth, holstered, false, "-")
+    KCD2MP_W214NativeHandProof(id, birth, scope(holstered), 3, "-", "-")
+    KCD2MP.ghostWeaponDrawn[id] = nil
+    right, left = nil, oldClass
+    check("H4: the current outfit cannot remove an item physically in the left hand",
+          not outfit(birth, scope(holstered), 3, "unequip", oldClass) and removals == 0)
+    right, left = newClass, nil
+    check("H4: the current outfit cannot remove an item physically in the right hand",
+          not outfit(birth, scope(holstered), 4, "unequip", newClass) and removals == 0)
+    right = nil
+    check("H4: the current outfit may remove an unheld item",
+          outfit(birth, scope(holstered), 5, "unequip", oldClass) and removals == 1)
+    check("H4: the current outfit can equip with a confirmed holster",
+          outfit(birth, scope(holstered), 6, "equip", newClass) and mutations == 1 and equipped == newClass)
+
+    -- Same numeric ID and entity handle, different incarnation.
+    local nextBirth = "00123457"
+    KCD2MP.ghosts[id] = { entity = ghost, outfitIncarnation = nextBirth }
     W214.on.figure_hands = false
     check("H4: a recycled entity ID cannot accept the preceding outfit",
-          KCD2MP_W202EquipAll(name, oldClass, body, noHand, oldBirth) == 0 and mutations == 1)
-    check("H4: with the hand toggle off, a current outfit still equips",
-          KCD2MP_W202EquipAll(name, oldClass, body, noHand, "123457") == 1 and mutations == 2 and equipped == oldClass)
+          not outfit(birth, "-", 7, "atomic", oldClass) and mutations == 1)
+    check("H4: with the hand toggle off, a current outfit still equips into a clear body",
+          outfit(nextBirth, "-", 8, "atomic", oldClass) and mutations == 2 and equipped == oldClass)
     W214.on.figure_hands = nil
+
     local g = KCD2MP.ghosts[id]
     local agent = "aec8dbb6a1e84d0d932670fbe98917d9"
-    local beforeReattach = #LOG
+    local beforeAttach = #LOG
     check("H4: a delayed attach cannot rotate a different body's incarnation",
-          not KCD2MP_W214ReportGhostId(id, agent, "0ABBABCD") and g.outfitBirth == "123457")
-    KCD2MP_W214FigureHand(id, true, oldClass, false, body, oldRevision, g.outfitBirth)
+          not KCD2MP_W214ReportGhostId(id, agent, "0ABBABCD") and g.outfitIncarnation == nextBirth)
+    right = oldClass
+    hand(nextBirth, oldRevision, true, oldClass)
     local attached = KCD2MP_W214ReportGhostId(id, agent, body)
+    local currentBirth = g.outfitIncarnation
     check("H4: the existing-body attach emits its new scoped ghost ID",
-          attached and g.outfitBirth ~= "123457" and g.w214HandRevision == nil and
-          countEvt("ghostid", id .. " " .. body .. " " .. g.outfitBirth, beforeReattach) == 1)
+          attached and currentBirth ~= nextBirth and KCD2MP_W214HandScope(id) == nil and
+          countEvt("ghostid", id .. " " .. body .. " " .. currentBirth, beforeAttach) == 1)
     check("H4: the old agent's already queued outfit is refused after attach",
-          KCD2MP_W202EquipAll(name, newClass, body, oldRevision, "123457") == 0 and mutations == 2)
-    check("H4: the reattached current body can equip before the next hand report",
-          KCD2MP_W202EquipAll(name, newClass, body, noHand, g.outfitBirth) == 1 and mutations == 3 and equipped == newClass)
-    local currentBirth = g.outfitBirth
-    KCD2MP_W214FigureHand(id, true, newClass, false, body, newRevision, currentBirth)
-    local currentHandTimer = W214.hand.gen[id]
+          not outfit(nextBirth, scope(oldRevision), 9, "atomic", newClass) and mutations == 2)
+    right = nil
+    check("H4: the reattached current body can equip on its first order before the next hand report",
+          outfit(currentBirth, "-", 1, "equip", newClass) and mutations == 3 and equipped == newClass)
+    right = newClass
+    hand(currentBirth, newRevision, true, newClass)
+    local currentHand = KCD2MP_W214HandScope(id)
+    local currentTimer = W214.hand.gen[id]
     local beforeDuplicate = #LOG
     local repeated = KCD2MP_W214ReportGhostId(id, agent, body)
     check("H4: a repeated attach from the same agent keeps the current hand and re-emits its scope",
-          repeated and g.outfitBirth == currentBirth and g.w214HandRevision == newRevision and
-          W214.hand.gen[id] == currentHandTimer and
-          countEvt("ghostid", id .. " " .. body .. " " .. currentBirth, beforeDuplicate) == 1,
-          "birth=" .. currentBirth .. "->" .. tostring(g.outfitBirth) .. " revision=" .. tostring(g.w214HandRevision))
+          repeated and g.outfitIncarnation == currentBirth and KCD2MP_W214HandScope(id) == currentHand and
+          currentHand.revision == newRevision and W214.hand.gen[id] == currentTimer and
+          countEvt("ghostid", id .. " " .. body .. " " .. currentBirth, beforeDuplicate) == 1)
 
     ENTS[name], KCD2MP.ghosts[id], ItemManager = nil, nil, oldIM
+    TIMERS = {}
     noErrs("H4")
 end
 

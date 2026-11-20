@@ -147,8 +147,12 @@ bool rp_knockout(uint32_t, bool, uint64_t) { return false; }
 void rp_knockout_tick() {}
 }
 namespace kcdmp::wo143 {
-bool rp_ranged_available(uint32_t, const uint8_t[16]) { return false; }
-bool rp_ranged(uint32_t, uint8_t, uint8_t, const uint8_t[16], uint64_t) { return false; }
+bool rp_ranged_available(uint32_t, const uint8_t[16], timelineactions::HandSlot) { return false; }
+bool rp_ranged(uint32_t, uint8_t, uint8_t, const uint8_t[16], timelineactions::HandSlot, uint64_t) { return false; }
+uint8_t rp_observe_hands(uint32_t, std::array<uint8_t, 16>&, std::array<uint8_t, 16>&) { return 0; }
+}
+namespace kcdmp::edgeconsole {
+Result present_ranged_hand(const timelineactions::RangedHandRequest&, const uint8_t[16]) { return {}; }
 }
 namespace kcdmp::wo187 {
 void note_move(uint32_t) {}

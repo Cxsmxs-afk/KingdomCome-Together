@@ -436,17 +436,15 @@ public sealed class Lane1BowHandTests
         Field("_transport").SetValue(bridge, transport);
         await using var native = await HandPipe.StartAsync(bridge);
         string ghost = Peer.ToString();
-        string[] GearCalls() => game.Requests.Where(request => request.Contains("KCD2MP_W214FigureHand(", StringComparison.Ordinal) ||
-            request.Contains("KCD2MP_W144Equip(", StringComparison.Ordinal)).ToArray();
         Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE");
         Assert.Equal(222u, ((ConcurrentDictionary<string, uint>)Field("_ghostEntityIds").GetValue(bridge)!)[ghost]);
-        Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE 012345");
+        Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE 1234AA12");
         await ReceiveFigureHandAsync(bridge, $"v1|1|{Bow:D}");
-        await native.ExpectAsync(Bow);
+        await native.ExpectAsync(Bow, 0x1234AA12);
         Assert.Equal(Bow, Assert.Single((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!));
-        Assert.Contains("\"000000DE\",\"0000000000000001\",\"012345\"", Assert.Single(GearCalls()));
+        Assert.Empty(game.Requests);
 
-        Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE 012346");
+        Call(bridge, "OnGameEvent", "ghostid", $"{ghost} DE 1234AA13");
 
         Assert.Empty((HashSet<Guid>)Call(bridge, "Wo214KeepHeld", Peer, new HashSet<Guid>())!);
         await (Task)Call(bridge, "Wo214PreDrawAsync", Peer, CancellationToken.None)!;
@@ -808,7 +806,7 @@ public sealed class Lane1BowHandTests
         await using var transport = new HttpGameTransport("http://localhost:1403", 5000, game);
         var bridge = await CreateHostAsync(link);
         Field("_transport").SetValue(bridge, transport);
-        Field("_w144Dress").SetValue(bridge, false);
+        ((ConcurrentDictionary<string, bool>)Field("_w202On").GetValue(bridge)!)["outfit_atomic"] = false;
         ReportOutfitBody(bridge, 1);
         game.ReleaseRead.TrySetResult();
         OutfitItemIndex(bridge);

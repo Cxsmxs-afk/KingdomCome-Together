@@ -7932,14 +7932,10 @@ end
 -- sync); the agent clears again if an unremovable piece ever shows up.
 --   WO136-OUTFIT clear id=<n> why=<w> ok=<pcall>
 KCD2MP.w136.PRESET_BARE = "dc000004-0000-0000-0000-000000000000"
-function KCD2MP_W136ClearPreset(id, why, body, revision, birth)
+function KCD2MP_W136ClearPreset(id, why)
     local g = KCD2MP.ghosts and KCD2MP.ghosts[tostring(id)]
     local e = g and g.entity
-    if body then
-        e = KCD2MP_W214OutfitEntity(id, body, revision, birth)
-        if not e then return false end
-        if KCD2MP_W214On("figure_hands") and not KCD2MP_W214OutfitHandsClear(id, e) then return false end
-    end
+    if g and g.outfitIncarnation then return false end
     if not (e and e.actor) then mp_log("WO136-OUTFIT clear id=" .. tostring(id) .. " -- no avatar"); return false end
     local ok, err = pcall(function() e.actor:EquipClothingPreset(KCD2MP.w136.PRESET_BARE) end)
     mp_log(string.format("WO136-OUTFIT clear id=%s why=%s ok=%s%s -- the spawn preset is off; only the partner's own items are worn",
@@ -11577,17 +11573,16 @@ function KCD2MP_W214ReportGhostId(id, agent, expectedEntity)
     local hexid = string.match(tostring(g.entity.id), "(%x+)%s*$")
     if not hexid then return false end
     if expectedEntity and hexid:upper():gsub("^0+", "") ~= expectedEntity:gsub("^0+", "") then return false end
-    if not g.outfitBirth or (agent and g.outfitAgent ~= agent) then
+    if not g.outfitIncarnation or (agent and g.outfitAgent ~= agent) then
         -- A new agent takes a fresh incarnation. Repeated acknowledgements
         -- from that agent must leave the accepted hand and its timers intact.
         g.outfitAgent = agent or nil
         KCD2MP_W214GhostBirth = (KCD2MP_W214GhostBirth or 0) % 0xFFFFFF + 1
-        g.outfitBirth = string.format("%06X", KCD2MP_W214GhostBirth)
         g.outfitIncarnation = string.format("%08X", KCD2MP_W214GhostBirth)
-        g.w214HandRevision, g.w214HandClass = nil, nil
+        g.outfitOrder, g.outfitAttemptedOrder, g.outfitDeferral = nil, nil, nil
         if W214 and W214.hand then W214.hand.gen[id] = (W214.hand.gen[id] or 0) + 1 end
     end
-    KCD2MP_EmitEvent("ghostid", id .. " " .. hexid .. " " .. g.outfitBirth)
+    KCD2MP_EmitEvent("ghostid", id .. " " .. hexid .. " " .. g.outfitIncarnation)
     return true
 end
 
@@ -19733,16 +19728,13 @@ KCD2MP.w144.LIGHTS = {
 KCD2MP.w144.lightStats = KCD2MP.w144.lightStats or { took = 0, holstered = 0, dressed = 0, made = 0, dressFail = 0 }
 KCD2MP.w144.lightLogged = KCD2MP.w144.lightLogged or {}
 
-function KCD2MP_W144Equip(name, cls, body, revision, birth)
+function KCD2MP_W144Equip(name, cls)
     local w = KCD2MP.w144
     name, cls = tostring(name), tostring(cls)
-    local e
-    if body then
-        e = KCD2MP_W214OutfitEntity(name:match("^kcd2mp_(%d+)$"), body, revision, birth)
-        if not e then return false end
-    else
-        e = System.GetEntityByName(name)
-    end
+    local id = name:match("^kcd2mp_(%d+)$")
+    local g = id and KCD2MP.ghosts and KCD2MP.ghosts[id]
+    if g and g.outfitIncarnation then return false end
+    local e = System.GetEntityByName(name)
     if not (e and e.inventory and e.actor) then mp_log("WO144-DRESS " .. name .. " " .. cls .. " -- no avatar"); return false end
     if w.lights and w.LIGHTS[cls] then return false end   -- a light is the torch sync's, never an outfit piece
     local it, how = nil, "own"
@@ -19762,16 +19754,6 @@ function KCD2MP_W144Equip(name, cls, body, revision, birth)
     if ok then w.lightStats.dressed = w.lightStats.dressed + 1 else w.lightStats.dressFail = w.lightStats.dressFail + 1 end
     mp_log(string.format("WO144-DRESS %s %s -> %s (%s) ok=%s", name, cls, tostring(it), how, tostring(ok)))
     return ok
-end
-
-function KCD2MP_W144Unequip(name, cls, body, revision, birth)
-    local id = tostring(name):match("^kcd2mp_(%d+)$")
-    local e = KCD2MP_W214OutfitEntity(id, body, revision, birth)
-    if not (e and e.inventory and e.actor) then return false end
-    local ok, item = pcall(function() return e.inventory:FindItem(cls) end)
-    if not ok or not item then return false end
-    if KCD2MP_W214On("figure_hands") and not KCD2MP_W214OutfitHandsClear(id, e, item, cls) then return false end
-    return pcall(function() e.actor:UnequipInventoryItem(item) end)
 end
 
 -- The agent asks which soul is the live avatar's: its entity GUID's four 16-bit parts, as the last
@@ -34861,11 +34843,11 @@ do
 
     -- VI outfit_atomic: the partner's new pieces all go on in this one call (one frame), each through WO-144's own inventory equip;
     -- the agent takes off what is left over only after it. "cls1,cls2,..." in layer order (under-layers first).
-    function KCD2MP_W202EquipAll(name, list, body, revision, birth)
+    function KCD2MP_W202EquipAll(name, list)
         local n, ok = 0, 0
         for cls in string.gmatch(tostring(list or ""), "[^,]+") do
             n = n + 1
-            if KCD2MP_W144Equip(name, cls, body, revision, birth) then ok = ok + 1 end
+            if KCD2MP_W144Equip(name, cls) then ok = ok + 1 end
         end
         mp_log(string.format("WO202-OUTFIT %s: %d of %d piece(s) on in one frame (the old ones come off after)", tostring(name), ok, n))
         return ok
@@ -36484,49 +36466,6 @@ do
     --   WO214-HAND figure=<id> want=<class|-> held=<class|-> -> ok|fixed|failed <how> (<ms> ms)
     W214.hand = W214.hand or { sentDrawn = nil, sentCls = nil, sentAt = -1e9, drawSince = nil, gen = {}, stats = { sent = 0, ok = 0, fixed = 0, failed = 0 } }
 
-    local function w214BodyMatches(g, body, birth)
-        if not (g and g.entity and g.outfitBirth and g.outfitBirth == birth) then return false end
-        local hex = string.match(tostring(g.entity.id), "(%x+)%s*$")
-        return hex ~= nil and body ~= "00000000"
-            and hex:upper():gsub("^0+", "") == tostring(body):gsub("^0+", "")
-    end
-
-    local function w214OutfitRefused(id, reason)
-        W214.hand.outfitRefused = (W214.hand.outfitRefused or 0) + 1
-        local n = W214.hand.outfitRefused
-        if n <= 12 or n % 128 == 0 then
-            mp_log(string.format("MP-LANE1-BOW outfit refused peer=%s reason=%s n=%d", tostring(id), reason, n))
-        end
-    end
-
-    -- The outfit request may already be in the HTTP or Lua queue when the
-    -- hand changes. Recheck the stamp at the entry to the engine mutation.
-    function KCD2MP_W214OutfitEntity(id, body, revision, birth)
-        local g = KCD2MP.ghosts and KCD2MP.ghosts[tostring(id)]
-        if not w214BodyMatches(g, body, birth) then w214OutfitRefused(id, "old-body"); return nil end
-        if KCD2MP_W214On("figure_hands") and revision ~= (g.w214HandRevision or "0000000000000000") then
-            w214OutfitRefused(id, "old-hand")
-            return nil
-        end
-        return g.entity
-    end
-
-    function KCD2MP_W214OutfitHandsClear(id, e, item, cls)
-        local g = KCD2MP.ghosts[tostring(id)]
-        if g.w214HandClass and (not cls or g.w214HandClass == cls) then
-            w214OutfitRefused(id, "requested-hand")
-            return false
-        end
-        for slot = 0, 1 do
-            local ok, held = pcall(function() return e.human:GetItemInHand(slot) end)
-            if not ok or (held and (not item or held == item or KCD2MP.w136.handClass(e, slot) == cls)) then
-                w214OutfitRefused(id, "occupied-hand")
-                return false
-            end
-        end
-        return true
-    end
-
     function KCD2MP_W214OwnHandTick(now, drawn)
         if not KCD2MP_W214On("figure_hands") then return end
         if not (player and player.human and KCD2MP.w136 and KCD2MP.w136.handClass) then return end
@@ -36704,7 +36643,7 @@ do
             elseif g.outfitOrder and order < g.outfitOrder then reason = "older-outfit"
             elseif not KCD2MP_W214HandScope then reason = "hand-owner-unavailable"
             else
-                local hand = KCD2MP_W214HandScope(id)
+                local hand = KCD2MP_W214On("figure_hands") and KCD2MP_W214HandScope(id) or nil
                 -- The combat draw reaches Lua before WO-214 learns the class.
                 -- Empty slots can still belong to a draw already in progress.
                 if KCD2MP.ghostWeaponDrawn and KCD2MP.ghostWeaponDrawn[id] then reason = "draw-pending"

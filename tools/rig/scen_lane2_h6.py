@@ -25,9 +25,10 @@ EID = re.compile(r'0x[0-9a-fA-F]+\Z')
 CRASH = re.compile(r'\bWO202-CRASH 0x[0-9a-fA-F]+\b')
 PLAYBACK_STAGES = ('ready', 'death-dispatched', 'applied')
 ABORTED = ('aborted-before-apply', 'aborted-unadmitted')
-TERMINAL_STAGES = ('applied', 'uncertain', 'preparation-uncertain', 'stale', *ABORTED)
+TERMINAL_STAGES = ('applied', 'uncertain', 'preparation-uncertain', 'prepare-observed-dead', 'stale', *ABORTED)
 AWAITING_READBACK = ('death-pending', 'apply-uncertain')
-FAILED_PREPARATION = ('preparation-not-started', 'preparation-uncertain')
+FAILED_PREPARATION = ('preparation-not-started', 'preparation-uncertain', 'prepare-unchanged',
+                      'prepare-uncertain', 'prepare-observed-dead', 'prepare-exception')
 PHASES = {*PLAYBACK_STAGES, *TERMINAL_STAGES, *AWAITING_READBACK, *FAILED_PREPARATION,
           'release-pending', 'release-uncertain', 'apply-exception'}
 FRAME_P95 = re.compile(r'\bFRAME .*\bframes=([1-9]\d*) .*\bours_us_p95=(\d+)\b')
