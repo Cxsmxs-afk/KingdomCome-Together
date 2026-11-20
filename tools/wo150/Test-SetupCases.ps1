@@ -3,7 +3,7 @@
 # content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 <#
 .SYNOPSIS
-    WO-150 Part 3: the installer's four cases, end to end, on fake Steam
+    WO-150 Part 3: the installer's cases, end to end, on fake Steam
     libraries -- with a Setup compiled from the real installer\KCDMP.iss.
 
 .DESCRIPTION
@@ -16,6 +16,8 @@
       2  the Modding Tools installed, workspace not linked
       3  linked, no mod
       4  everything in place (the maintainer's and today's testers' machines)
+      5  foreign mod, missing, stale or same-path registry marker
+      6  registered path replaced by a junction
 
     It must be safe on a machine with a real install, so the Setup under test
     is the real script with exactly five things changed in a scratch copy
@@ -177,11 +179,68 @@ function Invoke-Case($label, $c, [bool] $expectPlaced, [switch] $PreplaceMod) {
     Assert-That "the test install uninstalls cleanly" (($un.ExitCode -eq 0) -and -not (Test-Path $regKey)) "exit $($un.ExitCode)"
 }
 
+function Invoke-ForeignFolderCase($label, $c, [string] $markerKind) {
+    Write-Host ""
+    Write-Host $label
+    $target = "$($c.Mt)\Mods\kdcmp"
+    $dataFolder = $target
+    if ($markerKind -eq 'junction') {
+        $dataFolder = "$WorkDir\$label\UnrelatedMod"
+        New-Dir $dataFolder
+        New-Dir (Split-Path $target -Parent)
+        New-Item -ItemType Junction -Path $target -Target $dataFolder | Out-Null
+    }
+    New-Dir "$dataFolder\Data"
+    if ($markerKind -eq 'junction') {
+        Copy-Item "$mirror\kdcmp\mod.manifest" $dataFolder
+    } else {
+        Set-Content "$dataFolder\mod.manifest" "other publisher" -Encoding ascii
+    }
+    Set-Content "$dataFolder\Data\kdcmp.pak" "other mod payload" -Encoding ascii
+    Set-Content "$dataFolder\Data\keep.bin" "unrelated bytes" -Encoding ascii
+    $files = @("mod.manifest", "Data\kdcmp.pak", "Data\keep.bin")
+    $before = @($files | ForEach-Object { (Get-FileHash "$dataFolder\$_" -Algorithm SHA256).Hash })
+
+    $marker = $null
+    if ($markerKind -eq 'stale') { $marker = "$WorkDir\$label\OldLibrary\Mods\kdcmp" }
+    if ($markerKind -in @('same', 'junction')) { $marker = $target }
+    if ($marker) {
+        New-Item -Path $regKey -Force | Out-Null
+        Set-ItemProperty -Path $regKey -Name ModsPath -Value $marker
+    }
+
+    $logPath = "$WorkDir\$label.log"
+    $p = Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$($c.App)", "/STEAMROOT=$($c.Steam)", "/LOG=$logPath" -Wait -PassThru
+    $log = Get-Content $logPath -Raw
+    $after = @($files | ForEach-Object {
+        if (Test-Path "$dataFolder\$_" -PathType Leaf) { (Get-FileHash "$dataFolder\$_" -Algorithm SHA256).Hash } else { 'missing' }
+    })
+    Write-Host "  exit=$($p.ExitCode) before=$($before -join ',') after=$($after -join ',')"
+    Assert-That "Setup refuses the unattended replacement" ($p.ExitCode -ne 0) "exit $($p.ExitCode)"
+    Assert-That "Setup reached the linked target and refused its folder" ($log -match 'detect: steam=1 .* place_mod=1' -and $log -match 'install: refusing to change existing mod folder') $logPath
+    Assert-That "the foreign payload and extra file remain byte-for-byte" (-not (Compare-Object $before $after -SyncWindow 0)) $target
+    Assert-That "Setup keeps the registration of the previous install" ((Get-ItemProperty $regKey -ErrorAction SilentlyContinue).ModsPath -eq $marker) $regKey
+    Assert-That "the launcher payload was never copied" (-not (Test-Path "$($c.App)\KCDMP_launcher.exe")) $c.App
+    if ($markerKind -eq 'junction') {
+        Assert-That "the target still points at the original junction" ((Get-Item $target).LinkType -eq 'Junction') $target
+    }
+    $unins = "$($c.App)\unins000.exe"
+    if (Test-Path $unins) {
+        Start-Process $unins -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+    }
+    if (Test-Path $regKey) { Remove-Item $regKey -Recurse -Force }
+}
+
 if (Test-Path $regKey) { Remove-Item $regKey -Recurse -Force }
 Invoke-Case "case1-nothing-installed"       (New-Case case1)                     $false
 Invoke-Case "case2-mt-installed-not-linked" (New-Case case2 -Game -Mt)           $false
 Invoke-Case "case3-linked-no-mod"           (New-Case case3 -Game -Mt -Link)     $true
 Invoke-Case "case4-everything-in-place"     (New-Case case4 -Game -Mt -Link)     $true -PreplaceMod
+Invoke-ForeignFolderCase "case5-no-marker"    (New-Case "case5-no-marker" -Game -Mt -Link) 'missing'
+Invoke-ForeignFolderCase "case5-stale-marker" (New-Case "case5-stale-marker" -Game -Mt -Link) 'stale'
+Invoke-ForeignFolderCase "case5-same-marker"  (New-Case "case5-same-marker" -Game -Mt -Link) 'same'
+Invoke-ForeignFolderCase "case6-junction"     (New-Case "case6-junction" -Game -Mt -Link) 'junction'
+
 
 Write-Host ""
 Write-Host ("{0}/{1} passed" -f $pass, ($pass + $fail))
