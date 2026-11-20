@@ -580,26 +580,9 @@ public partial class GameBridge
         return (null, "no loadable save of this player's own (with a different playthrough than the host's)");
     }
 
-    private async Task<(HenrySource? Save, string Why)> Wo125CapturedHomeAsync(HenrySource source, string fingerprint)
+    private async Task<(HenrySource? Save, string Why)> Wo125ListedHomeAsync(HenrySource source)
     {
-        const string refused = "the selected character's original save is no longer verified";
-        if (ResolveSavesDirForJoin() is not string saves) return (null, refused);
-        bool matches = await Task.Run(() =>
-        {
-            try
-            {
-                string folder = Path.Combine(Path.GetFullPath(saves), $"playline{source.Playline}");
-                string path = Path.Combine(folder, source.File);
-                var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-                if (!string.Equals(path, source.FullPath, comparison) ||
-                    ((File.GetAttributes(saves) | File.GetAttributes(folder) | File.GetAttributes(path)) & FileAttributes.ReparsePoint) != 0)
-                    return false;
-                return string.Equals(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(WhsSave.ReadShared(path))),
-                    fingerprint, StringComparison.OrdinalIgnoreCase);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return false; }
-        });
-        if (!matches) return (null, refused);
+        // File identity is proved by the read lease after these engine calls.
         var listed = await _combat.SaveListAsync(3, source.Playline, source.Base);
         if (listed is { Listed: false }) listed = await _combat.SaveListAsync(1, source.Playline, source.Base);
         if (listed is { Listed: false }) return (null, "the selected character's original save is absent from the engine list");
@@ -911,7 +894,7 @@ public partial class GameBridge
 
     private int _snapBusy;
     private readonly object _snapGate = new();
-    private (int Playline, DateTime Since, TaskCompletionSource<string> Tcs, JoinedCharacter? Character)? _snapWait;
+    private (int Playline, DateTime Since, TaskCompletionSource<SnapshotFile> Tcs)? _snapWait;
 
     /// <summary>Guard: a playline near the engine's 100-quicksave rotation is never snapshotted into (the rotation could remove the player's oldest).</summary>
     public const int SnapshotQuicksaveGuard = 95;
@@ -928,21 +911,20 @@ public partial class GameBridge
     private bool Wo125OnJoinerSaveObserved(string path, string md5)
     {
         var id = WorldSaved.ParsePath(path);
-        if (_joinedWorld && Volatile.Read(ref _joinedCharacter) is not null)
-            Wo125RecordScopedGuestSave(path, md5);
+        // The scoped owner consumes only an engine write receipt plus a
+        // request marker in the same file. A watch observation alone is read-only.
+        if (Volatile.Read(ref _joinedCharacter) is not null) return _joinedWorld;
         lock (_snapGate)
         {
-            if (_snapWait is { } w && ReferenceEquals(w.Character, Volatile.Read(ref _joinedCharacter)) &&
+            if (_snapWait is { } w &&
                 id is { } i && i.Playline == w.Playline && i.Kind == Protocol.SaveKindQuick && File.GetLastWriteTimeUtc(path) >= w.Since)
             {
-                w.Tcs.TrySetResult(path);
+                w.Tcs.TrySetResult(new(path));
                 return true;
             }
         }
         if (Wo184TakeLateFile(path)) return true;   // WO-184: a snapshot whose wait ended still pairs (0.50.9 moved it out as a "leak")
         if (!_joinedWorld) return false;
-        // An unexpected file has no character-scoped engine receipt. Leave it in place.
-        if (Volatile.Read(ref _joinedCharacter) is not null) return true;
         var led = _henry.LedgerAdd(new HenryStore.LedgerEntry
         {
             Playline = id?.Playline ?? -1, SinceUtc = DateTime.UtcNow, File = Path.GetFileName(path), Md5 = md5, WorldTag = _joinedTag ?? "", Kind = "leak", State = "written",
@@ -1096,9 +1078,16 @@ public partial class GameBridge
                 Console.WriteLine("MP-HENRY exit cancelled: file moved out; cached list not refreshed");
                 return false;
             }
-            using var exitReceipt = relayClosed && _transport is LogTailGameTransport tail
+            using var exitReceipt = _transport is LogTailGameTransport tail
                 ? new JoinEngineReceipt(tail, _combat, path, saves) : null;
-            if (!await P5LoadGameAsync(pl, name, "exit-to-menu", ct))
+            bool submitted;
+            try { submitted = await P5LoadGameAsync(pl, name, "exit-to-menu", ct); }
+            catch (OperationCanceledException) when (exitReceipt?.MatchesTerminal(loaded: false) == true)
+            {
+                // A fast, confirmed menu return can retire the transport before its response.
+                submitted = true;
+            }
+            if (!submitted)
             {
                 _henry.MoveOut(path, "exit load was not submitted");
                 return false;

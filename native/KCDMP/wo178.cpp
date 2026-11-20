@@ -709,6 +709,31 @@ SaveState save_state() {
     return s;
 }
 
+static uint8_t save_scoped_snapshot(const uint8_t* attempt) {
+    if (!resolve_save() || !g_isAnyPending || !g_isSaving) return 2;
+    void* mgr = manager();
+    if (!mgr) return 2;
+    constexpr char prefix[] = "kct_h21_";
+    constexpr char hex[] = "0123456789abcdef";
+    bool nonzero = false;
+    for (size_t i = 0; i < 16; ++i) nonzero |= attempt[i] != 0;
+    if (!nonzero) return 0;
+    KCDMP_FAULT_CALL(site, "wo184::save_scoped_snapshot");
+    return fault::guarded_or(site, uint8_t{3}, [&]() -> uint8_t {
+        if (g_isAnyPending(mgr) || g_isSaving(mgr) || !g_canSave(mgr, kSaveTypeQuick)) return 0;
+        // This parameter is the save description's QuestNameOverride. Keep the
+        // storage alive throughout the engine's asynchronous save. This operation
+        // runs on the game thread and reuses it only once the engine is idle.
+        static char marker[sizeof prefix + 32]{};
+        std::memcpy(marker, prefix, sizeof prefix - 1);
+        for (size_t i = 0; i < 16; ++i) {
+            marker[sizeof prefix - 1 + 2 * i] = hex[attempt[i] >> 4];
+            marker[sizeof prefix + 2 * i] = hex[attempt[i] & 15];
+        }
+        return g_initiate(mgr, kSaveTypeQuick, -1, marker) ? 1 : 0;
+    });
+}
+
 uint8_t save_cancel(const char* why, bool* pendingBefore, bool* pendingAfter) {
     why = why && *why ? why : "?";
     *pendingBefore = *pendingAfter = false;
@@ -985,6 +1010,11 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
             *outLen = 3;
             return wo163::kROk;
         }
+        case kOpScopedSnapshot:
+            if (len != 17 || cap < 1) return wo163::kRBadRequest;
+            out[0] = save_scoped_snapshot(body + 1);
+            *outLen = 1;
+            return wo163::kROk;
         default:
             return wo163::kRBadRequest;
     }

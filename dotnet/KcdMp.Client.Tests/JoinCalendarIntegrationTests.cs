@@ -116,13 +116,23 @@ public sealed partial class JoinCalendarIntegrationTests
     public Task Whole_relay_EOF_keeps_the_private_return_pending_until_the_gameplay_confirmation(bool worldRecovery) =>
         RunAsync("A", "B", dropFirstSnapshot: false, relayEofWorldRecovery: worldRecovery);
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public Task Private_return_loads_only_the_selected_bytes_or_uses_the_menu(bool relayEof, bool replaceAfterHash) =>
+        RunAsync(relayEof ? "B" : "A", relayEof ? "A" : "B", dropFirstSnapshot: false,
+            relayEofWorldRecovery: relayEof ? true : null, homeProbe: replaceAfterHash);
+
     private sealed record BoundaryProbe(string Edge, bool HostLoss, bool GuestLoss = false);
 
     private static Task RunBoundaryAsync(string host, string edge, bool hostLoss) =>
         RunAsync(host, host == "A" ? "B" : "A", dropFirstSnapshot: false, boundary: new(edge, hostLoss));
 
     private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None,
-        BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false, bool? relayEofWorldRecovery = null)
+        BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false, bool? relayEofWorldRecovery = null,
+        bool? homeProbe = null)
     {
         using var fixture = new SaveFixture();
         string? checkpointPath = probe == JoinProbe.LocalFresh ? fixture.RecordLocalCheckpoint() : null;
@@ -323,8 +333,17 @@ public sealed partial class JoinCalendarIntegrationTests
                 var observed = await observer.DrainAsync(ct);
                 Assert.DoesNotContain(observed, packet => packet.Type is Protocol.WorldOfferDown or Protocol.WorldChunkDown or Protocol.JoinerReadyDown);
             }
+            if (homeProbe.HasValue) Set(guest, "_w184SaveOnLeave", false);
             if (relayEofWorldRecovery is bool worldRecovery)
-                await CheckClosedRelayAsync(relay, fixture.GuestOwnSave, guest, guestLink, guestGame, guestPipe, guestRead, worldRecovery, ct);
+                await CheckClosedRelayAsync(relay, fixture.GuestOwnSave, guest, guestLink, guestGame, guestPipe, guestRead, worldRecovery, ct, homeProbe);
+            else if (homeProbe is bool replace)
+            {
+                guestGame.DeferOwnFileRead = true;
+                var check = CheckPrivateReturnFileAsync(fixture.GuestOwnSave, guest, guestGame, replace, ct);
+                Task leave = InvokeAsync(guest, "LeaveSharedWorldAsync", "fixture", "leaving");
+                await check;
+                await leave.WaitAsync(ct);
+            }
             if (pauseAfterJoin)
             {
                 byte[] ownBefore = File.ReadAllBytes(fixture.GuestOwnSave);
@@ -384,7 +403,8 @@ public sealed partial class JoinCalendarIntegrationTests
     }
 
     private static async Task CheckClosedRelayAsync(ReplayRelay relay, string ownSave, GameBridge guest, JoinWire guestLink,
-        JoinCalendarTestEngine engine, JoinCalendarTestPipe pipe, Task guestRead, bool worldRecovery, CancellationToken ct)
+        JoinCalendarTestEngine engine, JoinCalendarTestPipe pipe, Task guestRead, bool worldRecovery, CancellationToken ct,
+        bool? homeProbe = null)
     {
         byte[] ownBefore = File.ReadAllBytes(ownSave);
         if (!worldRecovery) Get<ConcurrentDictionary<string, bool>>(guest, "_w221On")["world_recovery"] = false;
@@ -424,6 +444,7 @@ public sealed partial class JoinCalendarIntegrationTests
         // Advance only the elapsed duration. The productive hold loop decides on
         // timeout and issues the home load through the ordinary game transport.
         engine.DeferOwnFileRead = true;
+        Task? checkFile = homeProbe is bool replace ? CheckPrivateReturnFileAsync(ownSave, guest, engine, replace, ct) : null;
         long serial = Get<long>(guest, "_w211HoldSerial");
         var attempt = (WorldReconnectAttempt?)Call(guest, "WorldReconnectPending", serial);
         if (worldRecovery)
@@ -435,6 +456,11 @@ public sealed partial class JoinCalendarIntegrationTests
         {
             Assert.Null(attempt);
             Set(guest, "_w211HoldSinceUtc", DateTime.UtcNow.AddSeconds(-Wo211Rules.HoldWindowS - 1));
+        }
+        if (checkFile is not null)
+        {
+            await checkFile;
+            return;
         }
         Assert.Equal(ownSave, await engine.WaitForOwnLoadAsync(ct));
         Assert.True(Get<bool>(guest, "_leaveInProgress"));
@@ -448,6 +474,44 @@ public sealed partial class JoinCalendarIntegrationTests
         Assert.Equal(1, engine.OwnLoadsIssued);
         Assert.Equal(ownBefore, File.ReadAllBytes(ownSave));
         Console.WriteLine($"relay_eof_reconnect_end=own_gameplay join_loads=1 own_loads=1 own_save_unchanged=1 world_recovery={(worldRecovery ? 1 : 0)}");
+    }
+
+    private static async Task CheckPrivateReturnFileAsync(string ownSave, GameBridge guest, JoinCalendarTestEngine engine,
+        bool replaceAfterHash, CancellationToken ct)
+    {
+        byte[] original = File.ReadAllBytes(ownSave);
+        string held = ownSave + ".fixture-original";
+        byte[] replacement = WhsSaveTests.SyntheticSave();
+        if (replaceAfterHash)
+        {
+            engine.BeforeOwnLoadQuiet = () =>
+            {
+                engine.BeforeOwnLoadQuiet = null;
+                File.Move(ownSave, held);
+                File.WriteAllBytes(ownSave, replacement);
+                Console.WriteLine("H21-HOME probe: replaced save after the source hash and before HTTP handoff");
+            };
+        }
+        Task<string> dispatched = engine.WaitForOwnLoadAsync(ct);
+        Task first = await Task.WhenAny(dispatched, engine.ExitMenu).WaitAsync(ct);
+        if (replaceAfterHash)
+        {
+            Assert.True(ReferenceEquals(first, engine.ExitMenu), "The game received a load for the replacement after the original SHA-256 check.");
+            Assert.Equal(0, engine.OwnLoadsIssued);
+            Assert.Equal(original, File.ReadAllBytes(held));
+            Assert.Equal(replacement, File.ReadAllBytes(ownSave));
+            return;
+        }
+
+        Assert.Equal(ownSave, await dispatched);
+        Assert.True(Get<bool>(guest, "_leaveInProgress"));
+        if (OperatingSystem.IsWindows())
+            Assert.Throws<IOException>(() => File.Move(ownSave, held));
+        engine.CompleteOwnLoad();
+        await WaitAsync(() => !Get<bool>(guest, "_leaveInProgress"), "the same private save's engine receipt", ct);
+        Assert.Equal(1, engine.OwnLoadsIssued);
+        Assert.Equal(original, File.ReadAllBytes(ownSave));
+        using var released = File.Open(ownSave, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
     }
 
     private static async Task CheckReturningHostAsync(int port, string hostName, GameBridge host, GameBridge guest, byte guestId,
