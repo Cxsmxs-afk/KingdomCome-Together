@@ -1041,7 +1041,7 @@ public partial class GameBridge
                     return false;
                 }
             }
-            bool sent;
+            bool sent = false;
             try
             {
                 sent = await P5LoadGameCoreAsync(pl, name, "exit-to-menu", () =>
@@ -1052,13 +1052,12 @@ public partial class GameBridge
                     return true;
                 }, ct);
             }
-            catch (OperationCanceledException) when (exitReceipt?.MatchesTerminal(loaded: false) == true)
+            catch (Exception ex) when (admitted && (ex is IOException or OperationCanceledException or HttpRequestException))
             {
-                // A fast, confirmed menu return can retire the transport before its response.
-                sent = true;
+                // The engine can receive the load before HTTP reports a failed response.
+                Console.WriteLine($"MP-HENRY exit handoff uncertain transport={ex.GetType().Name}");
             }
-            if (!sent) return false;
-            if (exitReceipt is null) return true;
+            if (exitReceipt is null) return sent;
 
             bool loaded = await WaitForJoinReceiptAsync(exitReceipt.Terminal.Task,
                 "MP-HENRY waiting for the exact exit load to settle; its file stays protected");
@@ -1070,7 +1069,7 @@ public partial class GameBridge
             Console.WriteLine($"MP-HENRY exit file failed: {ex.GetType().Name}");
             return false;
         }
-        catch (OperationCanceledException) when (relayClosed || exitReceipt?.Terminal.Task.IsCanceled == true)
+        catch (OperationCanceledException) when (relayClosed || exitReceipt?.Terminal.Task.IsCanceled == true || _joinEngineLifetime.IsCancellationRequested)
         {
             Console.WriteLine("MP-HENRY exit load interrupted; unconfirmed files stay protected");
             return false;

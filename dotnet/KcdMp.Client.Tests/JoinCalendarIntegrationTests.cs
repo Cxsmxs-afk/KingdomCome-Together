@@ -125,6 +125,10 @@ public sealed partial class JoinCalendarIntegrationTests
         RunAsync(relayEof ? "B" : "A", relayEof ? "A" : "B", dropFirstSnapshot: false,
             relayEofWorldRecovery: relayEof ? true : null, homeProbe: replaceAfterHash);
 
+    [Fact]
+    public Task Menu_exit_keeps_the_read_lease_when_the_dispatched_http_response_fails() =>
+        RunAsync("A", "B", dropFirstSnapshot: false, homeProbe: true, failExitResponse: true);
+
     private sealed record BoundaryProbe(string Edge, bool HostLoss, bool GuestLoss = false);
 
     private static Task RunBoundaryAsync(string host, string edge, bool hostLoss) =>
@@ -132,7 +136,7 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None,
         BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false, bool? relayEofWorldRecovery = null,
-        bool? homeProbe = null)
+        bool? homeProbe = null, bool failExitResponse = false)
     {
         using var fixture = new SaveFixture();
         string? checkpointPath = probe == JoinProbe.LocalFresh ? fixture.RecordLocalCheckpoint() : null;
@@ -339,6 +343,7 @@ public sealed partial class JoinCalendarIntegrationTests
             else if (homeProbe is bool replace)
             {
                 guestGame.DeferOwnFileRead = true;
+                guestGame.FailExitResponse = failExitResponse;
                 var check = CheckPrivateReturnFileAsync(fixture.GuestOwnSave, guest, guestGame, replace, ct);
                 Task leave = InvokeAsync(guest, "LeaveSharedWorldAsync", "fixture", "leaving");
                 await check;
@@ -501,6 +506,13 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.Equal(0, engine.OwnLoadsIssued);
             string exit = await engine.ExitLoad;
             byte[] exitBytes = File.ReadAllBytes(exit);
+            if (engine.FailExitResponse)
+            {
+                // Give the HTTP failure a chance to clear the leave early with no engine terminal.
+                Task prematurelyReleased = WaitAsync(() => !Get<bool>(guest, "_leaveInProgress"), "premature menu-exit release", ct);
+                Task stillWaiting = Task.Delay(500, ct);
+                Assert.Same(stillWaiting, await Task.WhenAny(prematurelyReleased, stillWaiting));
+            }
             Assert.Equal(0, guest.Wo125Sweep("agent start"));
             Assert.Equal(exitBytes, File.ReadAllBytes(exit));
             if (OperatingSystem.IsWindows())

@@ -54,6 +54,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public bool DeferJoinFileRead { get; set; }
     public bool DeferOwnFileRead { get; set; }
     public bool DeferExitFileRead { get; set; }
+    public bool FailExitResponse { get; set; }
     public bool DeferSaveLockReply { get; set; }
     public int JoinLoadsIssued => Volatile.Read(ref _joinLoadsIssued);
     public int JoinFilesRead => Volatile.Read(ref _joinFilesRead);
@@ -234,9 +235,12 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested();
-            if (request.RequestUri is { } uri)
-                engine.ConsoleCommand(Uri.UnescapeDataString(uri.Query));
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("ok") });
+            string command = Uri.UnescapeDataString(request.RequestUri?.Query ?? "");
+            engine.ConsoleCommand(command);
+            bool failed = engine.FailExitResponse && command.Contains(",\"exit-to-menu\")", StringComparison.Ordinal);
+            if (failed) Console.WriteLine("H21-HOME exit audit: HTTP 503 after delivering the engine command");
+            return Task.FromResult(new HttpResponseMessage(failed ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK)
+                { Content = new StringContent(failed ? "unavailable" : "ok") });
         }
     }
 }
