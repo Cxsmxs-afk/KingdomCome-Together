@@ -210,13 +210,17 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         Protocol.Wo216OpBrains when request.Length == 1 => [1, seq, request[0], 0, .. "decision_gate=armed story_gate=armed"u8],
         Protocol.Wo200OpConfig when request.Length == 7 => [1, seq, request[0], 0, request[1], request[2]],
         Protocol.Wo184OpSaveState when request.Length == 1 => [1, seq, request[0], 0, 1, 0, 0, 1],
-        Protocol.H21OpSnapshot when request.Length == 17 => ScopedSnapshot(seq, request[1..]),
+        Protocol.H21OpSnapshot when request.Length == 26 => ScopedSnapshot(seq, request[1..]),
         _ => [0, seq, request[0], (byte)PipeReason.UnknownCommand],
     };
 
-    private byte[] ScopedSnapshot(byte seq, ReadOnlySpan<byte> attempt)
+    private byte[] ScopedSnapshot(byte seq, ReadOnlySpan<byte> body)
     {
-        RequestScopedSnapshot?.Invoke("kct_h21_" + Convert.ToHexString(attempt).ToLowerInvariant());
+        bool phase = _loadPhase is (byte)WorldLoadPhase.Settle or (byte)WorldLoadPhase.Play ||
+            _loadPhase == (byte)WorldLoadPhase.Exit && body[24] == 1;
+        if (!phase || _loadFlags != 0 || _loadGeneration != BinaryPrimitives.ReadUInt64LittleEndian(body[16..]))
+            return [0, seq, Protocol.H21OpSnapshot, 20];
+        RequestScopedSnapshot?.Invoke("kct_h21_" + Convert.ToHexString(body[..16]).ToLowerInvariant());
         return [1, seq, Protocol.H21OpSnapshot, 0, 1];
     }
 

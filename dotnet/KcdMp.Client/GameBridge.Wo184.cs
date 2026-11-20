@@ -286,11 +286,10 @@ public partial class GameBridge
     /// One snapshot, paired with host save <paramref name="w"/>: the engine is asked (Game.QuickSave), the file awaited (the engine's readiness
     /// may wait), verified and stored, the QuickSave moved out of the playline. <paramref name="owed"/> receives the reason when not taken.
     /// </summary>
-    private async Task<W184Take> Wo184TakeAsync(WorldSaved w, W184Want? owed, string purpose, long waitMs)
+    private async Task<W184Take> Wo184TakeAsync(WorldSaved w, W184Want? owed, string purpose, long waitMs, bool final = false)
     {
         var character = Volatile.Read(ref _joinedCharacter);
-        bool CurrentCharacter() => ReferenceEquals(character, Volatile.Read(ref _joinedCharacter)) &&
-            (character is null || _joinedWorld && (!LoadSequenceEnabled || _worldLoad.IsCurrent(character.Scope.WorldGeneration)));
+        bool CurrentCharacter() => H21SnapshotCurrent(character);
         string md5 = Convert.ToHexString(w.Md5).ToLowerInvariant();
         long tIn = Environment.TickCount64;
         void NotNow(string why, long retryMs)
@@ -332,6 +331,11 @@ public partial class GameBridge
             // The engine allocates the next QuickSave ID from its cache. Keep that cache:
             // moved-out snapshots still count conservatively toward the rotation guard above.
             if (!CurrentCharacter()) return W184Take.Failed;
+            if (character is not null && (!await LoadSequenceSyncNativeAsync() || !CurrentCharacter()))
+            {
+                NotNow("the engine has not acknowledged the snapshot's world", Wo184Rules.EngineRetryMs);
+                return W184Take.NotNow;
+            }
             using var scopeReceipt = character is not null && _transport is LogTailGameTransport engine ? new H21SnapshotReceipt(engine) : null;
             if (character is not null && scopeReceipt is null)
             {
@@ -357,7 +361,8 @@ public partial class GameBridge
             if (scopeReceipt is null) r = await AskModAsync("KCD2MP_Wo125Snapshot", 6000);
             else
             {
-                var restricted = await _combat.H21RequestSnapshotAsync(scopeReceipt.Id, _joinEngineLifetime);
+                var restricted = await _combat.H21RequestSnapshotAsync(scopeReceipt.Id, character!.Scope.WorldGeneration,
+                    final, _joinEngineLifetime);
                 r = restricted == 1 ? "ok=true" : $"scoped-write-{restricted?.ToString() ?? "unavailable"}";
             }
             if (!r.StartsWith("ok=true", StringComparison.Ordinal))
@@ -466,8 +471,7 @@ public partial class GameBridge
     private W184Take Wo184Pair(WorldSaved w, string md5, SnapshotFile file, int pl, HenryStore.LedgerEntry? led, long tIn, long tReq, string purpose,
         JoinedCharacter? character)
     {
-        bool CurrentCharacter() => ReferenceEquals(character, Volatile.Read(ref _joinedCharacter)) &&
-            (character is null || _joinedWorld && (!LoadSequenceEnabled || _worldLoad.IsCurrent(character.Scope.WorldGeneration)));
+        bool CurrentCharacter() => H21SnapshotCurrent(character);
         if (!CurrentCharacter() || character is not null && file.ConfirmedBytes is null)
         {
             Console.WriteLine("MP-H21-SNAPSHOT refused reason=no-current-confirmed-snapshot");
@@ -618,7 +622,7 @@ public partial class GameBridge
         var hw = host!.Value;
         Console.WriteLine($"WO184-FINAL {why}: one final snapshot, paired with host save seq={hw.Seq} md5={Convert.ToHexString(hw.Md5)[..8].ToLowerInvariant()} (the newest host save it follows){(owed ? " -- it takes the owed one" : "")}");
         var probe = new W184Want { W = hw, SinceMs = Environment.TickCount64 };
-        var res = await Wo184TakeAsync(hw, probe, "final snapshot (" + why + ")", Wo184Rules.FinalWaitMs);
+        var res = await Wo184TakeAsync(hw, probe, "final snapshot (" + why + ")", Wo184Rules.FinalWaitMs, final: true);
         if (res == W184Take.Paired) return "";
         lock (_w184Lock) _w184Want ??= was ?? probe;   // still owed (a later chance: the tick, the next host save)
         Interlocked.Increment(ref _w184FinalNot);

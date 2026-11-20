@@ -12,6 +12,7 @@ public sealed partial class JoinCalendarIntegrationTests
     [InlineData("expired")]
     [InlineData("manual")]
     [InlineData("unconfirmed")]
+    [InlineData("leave")]
     public async Task Scoped_snapshot_waits_for_the_engine_save_of_its_own_attempt(string firstFile)
     {
         using var fixture = new SaveFixture();
@@ -50,13 +51,25 @@ public sealed partial class JoinCalendarIntegrationTests
 
         var a = new WorldSaved(1, 0, Protocol.SaveKindAuto, 0, 1, Convert.FromHexString(aHash));
         var b = new WorldSaved(2, 0, Protocol.SaveKindAuto, 0, 2, Convert.FromHexString(bHash));
-        var aTask = (Task)Call(bridge, "Wo184TakeAsync", a, null!, "test A", 1L)!;
+        var aTask = (Task)Call(bridge, "Wo184TakeAsync", a, null!, "test A", 1L, false)!;
         string aMarker = await commands.Reader.ReadAsync(ct);
         await aTask.WaitAsync(ct);
         Assert.Null(new HenryStore(HenryStore.DefaultRoot()).PickScoped(scope, []));
 
-        var bTask = (Task)Call(bridge, "Wo184TakeAsync", b, null!, "test B", 5000L)!;
-        string bMarker = await commands.Reader.ReadAsync(ct);
+        Task bTask;
+        if (firstFile == "leave")
+        {
+            engine.Emit("wo124_where", "world");
+            Set(bridge, "_leaveInProgress", true);
+            Set(bridge, "_w184LastHost", b);
+            Call(bridge, "LoadSequenceOnExit");
+            Assert.Equal(WorldLoadPhase.Exit, Get<WorldLoadSequence>(bridge, "_worldLoad").Current.Phase);
+            bTask = (Task)Call(bridge, "Wo184FinalSnapshotAsync", "test leave", false, false)!;
+        }
+        else bTask = (Task)Call(bridge, "Wo184TakeAsync", b, null!, "test B", 5000L, false)!;
+        var command = commands.Reader.ReadAsync(ct).AsTask();
+        Assert.Same(command, await Task.WhenAny(command, bTask).WaitAsync(ct));
+        string bMarker = await command;
         Assert.NotEqual(aMarker, bMarker);
         string wrong = Path.Combine(dir, "quicksave001.whs"), right = Path.Combine(dir, "quicksave002.whs");
         string marker = firstFile == "expired" ? aMarker : firstFile == "unconfirmed" ? bMarker : "";

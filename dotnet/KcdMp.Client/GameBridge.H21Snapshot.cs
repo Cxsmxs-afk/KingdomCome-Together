@@ -10,6 +10,16 @@ public partial class GameBridge
 {
     private sealed record SnapshotFile(string Path, byte[]? ConfirmedBytes = null);
 
+    private bool H21SnapshotCurrent(JoinedCharacter? captured)
+    {
+        if (!ReferenceEquals(captured, Volatile.Read(ref _joinedCharacter))) return false;
+        if (captured is null) return true;
+        var load = _worldLoad.Current;
+        return _joinedWorld && load.Generation == captured.Scope.WorldGeneration &&
+            (load.Phase is WorldLoadPhase.Settle or WorldLoadPhase.Play ||
+             load.Phase == WorldLoadPhase.Exit && _leaveInProgress);
+    }
+
     // The write-completion log identifies the path. The engine's saved
     // description identifies the request. Both are required for this scope.
     private sealed class H21SnapshotReceipt : IDisposable

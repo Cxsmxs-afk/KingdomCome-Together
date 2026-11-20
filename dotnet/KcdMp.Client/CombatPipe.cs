@@ -1419,9 +1419,13 @@ public sealed partial class CombatPipe : IAsyncDisposable
         return (x.Payload[1] != 0, x.Payload[2] != 0, x.Payload[3] != 0);
     }
 
-    internal async Task<byte?> H21RequestSnapshotAsync(Guid attempt, CancellationToken ct)
+    internal async Task<byte?> H21RequestSnapshotAsync(Guid attempt, ulong worldGeneration, bool final, CancellationToken ct)
     {
-        var r = await Wo163Async(Protocol.H21OpSnapshot, attempt.ToByteArray(), ct);
+        var body = new byte[25];
+        attempt.TryWriteBytes(body);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(16), worldGeneration);
+        body[24] = final ? (byte)1 : (byte)0;
+        var r = await Wo163Async(Protocol.H21OpSnapshot, body, ct);
         return r is { Ok: true, Payload.Length: 1 } x ? x.Payload[0] : null;
     }
 
