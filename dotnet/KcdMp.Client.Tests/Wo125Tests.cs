@@ -473,6 +473,49 @@ public class Wo125Tests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Stale_world_cleanup_preserves_foreign_saves_and_their_world_folder(bool nested)
+    {
+        var store = Store();
+        string tag = WhsSave.SeedTag(25);
+        var snapshot = store.Store(tag, Parts(), M(1), HenryStore.SourceSnapshot, "owned fixture");
+        string world = store.WorldDir(tag);
+        string owned = Path.Combine(world, snapshot.File);
+        byte[] ownedBytes = File.ReadAllBytes(owned);
+        store.MarkJoined(tag);
+        _now = _now.AddDays(HenryStore.StaleDays + 1);
+        string foreignDir = nested ? Directory.CreateDirectory(Path.Combine(world, "private-copy")).FullName : world;
+        string foreign = Path.Combine(foreignDir, "quicksave012.whs");
+        byte[] bytes = F(new Spec { Seed = 141 });
+        File.WriteAllBytes(foreign, bytes);
+
+        var deleted = store.CleanupStale();
+        Console.WriteLine($"SAVE-AUDIT source=stale-world nested={nested} retired={deleted.Count} foreign_exists={File.Exists(foreign)}");
+        Assert.Empty(deleted);
+        Assert.Equal(bytes, File.ReadAllBytes(foreign));
+        Assert.Equal(ownedBytes, File.ReadAllBytes(owned));
+    }
+
+    [Fact]
+    public void Snapshot_pruning_preserves_a_save_that_replaced_the_indexed_pair()
+    {
+        var store = Store();
+        string tag = WhsSave.SeedTag(26);
+        var first = store.Store(tag, Parts(), M(1), HenryStore.SourceSnapshot, "owned fixture");
+        string replaced = Path.Combine(store.WorldDir(tag), first.File);
+        byte[] bytes = F(new Spec { Seed = 142 });
+        File.WriteAllBytes(replaced, bytes);
+        for (int i = 0; i < 2; i++)
+        {
+            _now = _now.AddSeconds(1);
+            store.Store(tag, Parts(), M(1), HenryStore.SourceSnapshot, "rotation fixture");
+        }
+        Console.WriteLine($"SAVE-AUDIT source=snapshot-path-replacement foreign_exists={File.Exists(replaced)}");
+        Assert.Equal(bytes, File.ReadAllBytes(replaced));
+    }
+
     [Fact]
     public void The_ledger_round_trips_and_forgets_old_done_entries()
     {

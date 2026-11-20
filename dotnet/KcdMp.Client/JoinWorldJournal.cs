@@ -233,6 +233,17 @@ internal sealed class JoinWorldJournal(Action<string>? beforeRetire = null, Acti
         }
     }
 
+    internal int RetireVerifiedArchiveFile(string file, string quarantineDirectory, ReadOnlySpan<byte> sha256)
+    {
+        lock (Gate)
+        {
+            if (!SafeDirectory(quarantineDirectory)) Directory.CreateDirectory(quarantineDirectory);
+            if (!SafeDirectory(quarantineDirectory)) throw new IOException("no safe archive quarantine");
+            string quarantine = Path.Combine(quarantineDirectory, $"{Guid.NewGuid():N}.retired");
+            return RetireChecked(file, quarantine, Convert.ToHexString(sha256));
+        }
+    }
+
     private (string File, string Marker, Entry Entry)? FindRegistered(string savesRoot, string path, uint joinId, ReadOnlySpan<byte> sha256, bool isExit)
     {
         string root = Path.GetFullPath(savesRoot);
