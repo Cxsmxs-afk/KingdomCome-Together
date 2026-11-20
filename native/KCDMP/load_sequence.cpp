@@ -20,19 +20,28 @@ uint64_t g_hostHoldAttempt = 0, g_hostHoldConnection = 0;
 bool control(const uint8_t* body, size_t size, uint64_t connection, uint8_t* ack) {
     Request request;
     const bool decoded = decode(body, size, request);
-    std::lock_guard<std::mutex> lock(g_stateMutex);
-    const auto previous = g_state.stamp();
-    const bool accepted = decoded && g_state.apply(request, connection, GetTickCount64());
-    const auto next = g_state.stamp();
-    if (previous != next) {
-        g_stamp.store(next, std::memory_order_release);
-        logf("MP-LOAD-NATIVE phase=%u flags=%u world_gen=%llu revision=%llu", static_cast<unsigned>(g_state.phase()), static_cast<unsigned>(g_state.flags()),
-             static_cast<unsigned long long>(g_state.generation()), static_cast<unsigned long long>(next >> 2));
+    bool accepted, changed;
+    uint64_t revision, generation;
+    Phase phase;
+    uint8_t flags;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        const auto previous = g_state.stamp();
+        accepted = decoded && g_state.apply(request, connection, GetTickCount64());
+        revision = g_state.stamp();
+        changed = previous != revision;
+        if (changed) g_stamp.store(revision, std::memory_order_release);
+        phase = g_state.phase();
+        flags = g_state.flags();
+        generation = g_state.generation();
+        const bool effectCurrent = wo138::join_held() == (g_state.hold_seconds() != 0);
+        const bool mainApplied = revision && effectCurrent && g_applied.load(std::memory_order_acquire) == revision;
+        encode_ack(ack, phase, flags | (mainApplied ? kMainApplied : 0), generation, request.id);
     }
-    uint8_t flags = g_state.flags();
-    const bool effectCurrent = wo138::join_held() == (g_state.hold_seconds() != 0);
-    if (next && effectCurrent && g_applied.load(std::memory_order_acquire) == next) flags |= kMainApplied;
-    encode_ack(ack, g_state.phase(), flags, g_state.generation(), request.id);
+    // The game tick also takes g_stateMutex. File output may stall independently.
+    if (changed)
+        logf("MP-LOAD-NATIVE phase=%u flags=%u world_gen=%llu revision=%llu", static_cast<unsigned>(phase), static_cast<unsigned>(flags),
+             static_cast<unsigned long long>(generation), static_cast<unsigned long long>(revision >> 2));
     return accepted;
 }
 

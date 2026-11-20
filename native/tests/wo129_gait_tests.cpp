@@ -77,6 +77,7 @@ int rp_combat_tests(int* passed);
 int rp_timeline_outcome_integration(int* passed);
 int rp_body_action_tests(int* passed);
 int load_sequence_tests(int* passed);
+int load_sequence_log_stall_tests(int* passed);
 int motion_remote_tests(int* passed);
 int edge_console_tests(int* passed);
 int visual_damage_tests(int* passed);
@@ -497,6 +498,7 @@ int main() {
     { int pp = 0; const int pf = rp_timeline_outcome_integration(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = rp_body_action_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = load_sequence_tests(&pp); g_pass += pp; g_fail += pf; }
+    { int pp = 0; const int pf = load_sequence_log_stall_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = motion_remote_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = edge_console_tests(&pp); g_pass += pp; g_fail += pf; }
     { int pp = 0; const int pf = visual_damage_tests(&pp); g_pass += pp; g_fail += pf; }

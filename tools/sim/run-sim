@@ -30,6 +30,7 @@ int rp_timeline_outcome_integration(int* passed);
 int rp_body_action_tests(int* passed);
 int visual_damage_tests(int* passed);
 int load_sequence_tests(int* passed);
+int load_sequence_log_stall_tests(int* passed);
 int wo203_conv_tests(int* passed);
 int t3_recovery_stats_tests(int* passed);
 int h6_combat_action_tests(int* passed);
@@ -56,6 +57,7 @@ int main() {
     passed &= run_tests("remote knockout and ranged animation", &rp_body_action_tests);
     passed &= run_tests("visual replica damage authority", &visual_damage_tests);
     passed &= run_tests("world load scope and frame fence", &load_sequence_tests);
+    passed &= run_tests("load gate during blocked native logging", &load_sequence_log_stall_tests);
     passed &= run_tests("ordered dialog votes and apply receipts", &wo203_conv_tests);
     passed &= run_tests("scoped recovery and reconnect diagnostics", &t3_recovery_stats_tests);
     passed &= run_tests("combat action incarnation and retirement", &h6_combat_action_tests);
@@ -64,18 +66,19 @@ int main() {
     return passed ? 0 : 1;
 }
 EOF
-    "${CXX:-c++}" -std=c++17 -DKCDMP_P6_CAPTURE_TEST -I native/KCDMP "$native_tmp/main.cpp" \
+    "${CXX:-c++}" -std=c++17 -pthread -DKCDMP_P6_CAPTURE_TEST -I native/KCDMP -I native/tests/ff-platform "$native_tmp/main.cpp" \
         native/tests/p6_capture_flow_tests.cpp native/KCDMP/wo201_ranged.cpp \
         native/tests/holder_contract_tests.cpp native/tests/edge_lanes_tests.cpp \
         native/tests/rp_timeline_tests.cpp native/tests/ranged_aim_tests.cpp native/tests/rp_timeline_action_tests.cpp \
         native/tests/rp_controller_tests.cpp native/tests/rp_combat_tests.cpp \
         native/tests/rp_timeline_outcome_integration.cpp \
         native/tests/rp_body_action_tests.cpp native/tests/visual_damage_tests.cpp native/tests/load_sequence_tests.cpp \
+        native/tests/load_sequence_log_stall_tests.cpp native/KCDMP/load_sequence.cpp \
         native/tests/wo203_conv_tests.cpp native/tests/t3_recovery_stats_tests.cpp \
         native/tests/h6_combat_action_tests.cpp \
         native/tests/npc_death_release_tests.cpp native/tests/wo155_rules_tests.cpp \
         -o "$native_tmp/native-contracts"
-    if ! native_result="$("$native_tmp/native-contracts")"; then
+    if ! native_result="$(cd "$native_tmp" && ./native-contracts)"; then
         printf '%s\n' "$native_result" >&2
         exit 1
     fi
