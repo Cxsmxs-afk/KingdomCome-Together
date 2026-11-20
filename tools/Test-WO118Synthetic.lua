@@ -520,6 +520,14 @@ do
     KCD2MP._chainLeakSeen = {}; KCD2MP._chainProbe = {}
     KCD2MP.interpRunning = true; KCD2MP._interpAliveAt = NOW; KCD2MP.interpGen = KCD2MP.interpGen or 1
     local e = mkEntity("kcd2mp_7", 90, 90, 0)
+    local mount = { active = false, canDetach = false, requests = 0 }
+    e.human = {
+        IsMounted = function() return mount.active end,
+        ForceDismount = function()
+            mount.requests = mount.requests + 1
+            if mount.canDetach then mount.active = false end
+        end,
+    }
     local ist = { px = 90, py = 90, pz = 0, pr = 0, tx = 90, ty = 90, tz = 0, tr = 0, cx = 90, cy = 90, cz = 0, cr = 0,
                   alpha = 1.0, alphaStep = 0.25, vx = 0, vy = 0, vz = 0, lastPacketX = 90, lastPacketY = 90,
                   ticksSincePacket = 0, packetCount = 0, animTag = "idle", smoothedSpeed = 0,
@@ -551,11 +559,19 @@ do
     check("n: one hold per one-shot window", #evts("npc_native_hold") == 1)
     ist.oneShotUntil = nil
     alive(); gtick(90.7, true)
+    mount.active = true
     ev = evts("npc_native")
     check("n: a riding ghost unbinds", (ev[#ev] or ""):find("kcd2mp_7 off ghost", 1, true) ~= nil and ist.nativeOwned == false, ev[#ev])
     alive(); gtick(90.8, false)
+    local held = evts("npc_native")
+    check("n: riding stop keeps the writer off until the engine confirms detach", #held == #ev
+        and ist.dismountPending == true and mount.active and mount.requests == 1, held[#held])
+    mount.canDetach = true
+    NOW = NOW + 0.5
+    alive(); gtick(90.9, false)
     ev = evts("npc_native")
-    check("n: dismounted -> bound again", (ev[#ev] or ""):find("^kcd2mp_7 on ") ~= nil, ev[#ev])
+    check("n: dismounted -> bound again", mount.requests == 2 and not mount.active and not ist.dismountPending
+        and #ev == #held + 1 and (ev[#ev] or ""):find("^kcd2mp_7 on ") ~= nil, ev[#ev])
     KCD2MP_NpcNativeAck("kcd2mp_7", 0, "entity-gone")
     check("n: a drop hands the ghost back to Lua", ist.nativeOwned == false and ist.nativeRetryAt ~= nil)
     check("n: no Lua errors", #ERRS == 0, ERRS[1])
