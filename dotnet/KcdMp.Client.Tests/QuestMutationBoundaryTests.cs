@@ -44,12 +44,18 @@ public sealed class QuestMutationBoundaryTests
         if (reload) f.Reload();
         f.SetWhere("World");
 
-        await f.TickReplayAsync();
-        var replies = await f.DrainQuestRepliesAsync();
-        Console.WriteLine($"QUEST-REPLAY-RELOAD reload={(reload ? 1 : 0)} replays={f.Replays} acks={replies.Length}");
+        await f.FinishReplayQueueAsync();
+        // A Pong from the guest's drain does not wait for the host's write.
+        // In the live case, wait for the actual ACK before checking for extras.
+        if (!reload)
+        {
+            var reply = await f.ReadQuestReplyAsync(Protocol.QuestHostReplayAck);
+            Assert.Equal((9u, "7 ran 0 " + Dialogue), (reply.Tok, reply.Text));
+        }
+        var extraReplies = await f.DrainQuestRepliesAsync();
+        Console.WriteLine($"QUEST-REPLAY-RELOAD reload={(reload ? 1 : 0)} replays={f.Replays} acks={extraReplies.Length + (reload ? 0 : 1)}");
         Assert.Equal(reload ? 0 : 1, f.Replays);
-        if (reload) Assert.Empty(replies);
-        else Assert.Equal("7 ran 0 " + Dialogue, Assert.Single(replies).Text);
+        Assert.Empty(extraReplies);
         Assert.Equal(0, f.QueuedReplays);
 
         await f.SendAsync(Protocol.QuestAskOutPortReplay, 10, Wo200Rules.ReplayText(8, 2, "Out", Dialogue));
@@ -123,10 +129,23 @@ public sealed class QuestMutationBoundaryTests
             Epochs.NoteAck(_guest.Id, Epochs.World);
         }
 
-        public Task TickReplayAsync() => (Task)Call("Wo200HostQueueTickAsync");
+        private bool ReplayQueueBusy => (int)Get("_w200HostBusy") != 0;
+
+        public async Task FinishReplayQueueAsync()
+        {
+            // The Reader can already own this tick. Wait for that worker
+            // as well, including the old-world case that sends no reply.
+            while (true)
+            {
+                await (Task)Call("Wo200HostQueueTickAsync");
+                if (QueuedReplays == 0 && !ReplayQueueBusy) return;
+                await Task.Delay(1, _stop.Token);
+            }
+        }
+
         public async Task WaitForQueuedReplayAsync()
         {
-            while (QueuedReplays == 0 || (int)Get("_w200HostBusy") != 0)
+            while (QueuedReplays == 0 || ReplayQueueBusy)
                 await Task.Delay(1, _stop.Token);
         }
 
