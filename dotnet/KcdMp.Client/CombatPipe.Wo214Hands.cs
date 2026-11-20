@@ -5,6 +5,8 @@ namespace KcdMp.Client;
 
 internal readonly record struct Wo214NativeHands(byte Known, Guid Left, Guid Right)
 {
+    public bool ConfirmedEmpty => Known == 3 && Left == Guid.Empty && Right == Guid.Empty;
+
     public bool Holds(Guid cls) => cls != Guid.Empty &&
         (((Known & 1) != 0 && Left == cls) || ((Known & 2) != 0 && Right == cls));
 }

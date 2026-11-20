@@ -38,6 +38,7 @@ public partial class GameBridge
     private readonly ConcurrentDictionary<byte, FigureHand> _w214LastHeld = new();
     private sealed record EngineHand(FigureHand Desired, long Connection, Wo214NativeHands Actual);
     private readonly ConcurrentDictionary<byte, EngineHand> _w214EngineHands = new();
+    private long _w214OutfitRefused;
     private readonly record struct FigureHandReceipt(Stream Stream, long PeerSerial, uint Token, FigureBody Body,
         Guid? DrawnClass, uint? PreviousStateToken);
     private readonly ConcurrentDictionary<byte, FigureHandReceipt> _w214HandAtRead = new();
@@ -352,8 +353,19 @@ public partial class GameBridge
 
     private bool Wo214OutfitCurrent(byte src, FigureOutfitStamp stamp)
     {
-        if (Wo214OutfitStamp(src) == stamp) return true;
-        Console.WriteLine($"[appearance] ghost {src}: outfit superseded by a new body or hand");
+        string reason = "old-body-or-hand";
+        if (Wo214OutfitStamp(src) == stamp)
+        {
+            if (!W214On("figure_hands") || stamp.HandRevision == 0) return true;
+            reason = "hand-readback-unconfirmed";
+            if (_w214FigureHand.TryGetValue(src, out var hand) && hand.Revision == stamp.HandRevision &&
+                !hand.Drawn && _w214EngineHands.TryGetValue(src, out var proof) && proof.Actual.ConfirmedEmpty &&
+                Wo214SameHandState(proof.Desired, hand) && Wo214EngineHandCurrent(src, hand, proof.Connection))
+                return true;
+        }
+        long count = Interlocked.Increment(ref _w214OutfitRefused);
+        if (count <= 12 || count % 128 == 0)
+            Console.WriteLine(FormattableString.Invariant($"MP-LANE1-BOW outfit refused peer={src} reason={reason} n={count}"));
         return false;
     }
 
@@ -482,10 +494,14 @@ public partial class GameBridge
             var result = await _combat.RequestRangedHandAsync(peer, hand.Body.Entity, hand.PeerSerial, hand.Body.Generation,
                 hand.Body.LuaBirth, hand.Revision, hand.Cls ?? Guid.Empty, connection, Current, stop.Token);
             if (result is not { } actual || !Current()) return;
+            bool alreadyEmpty = _w214EngineHands.TryGetValue(peer, out var previous) && previous.Connection == connection &&
+                Wo214SameHandState(previous.Desired, hand) && previous.Actual.ConfirmedEmpty;
             _w214EngineHands[peer] = new(hand, connection, actual);
             string left = actual.Left == Guid.Empty ? "-" : actual.Left.ToString("D");
             string right = actual.Right == Guid.Empty ? "-" : actual.Right.ToString("D");
             Console.WriteLine(FormattableString.Invariant($"WO214-HAND native peer={peer} world={hand.Context.World:X8} body_generation={hand.Body.Generation} birth={hand.Body.LuaBirth:X6} revision={hand.Revision} known={actual.Known} left={left} right={right}"));
+            if (!hand.Drawn && actual.ConfirmedEmpty && !alreadyEmpty)
+                await ConvergeWantedAppearanceAsync(peer, stop.Token, Current);
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
         catch (Exception ex)

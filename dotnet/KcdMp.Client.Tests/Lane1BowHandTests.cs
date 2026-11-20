@@ -10,7 +10,7 @@ using KcdMp.Wire;
 namespace KcdMp.Client.Tests;
 
 [Collection("T3 connection lifecycle")]
-public sealed class Lane1BowHandTests
+public sealed partial class Lane1BowHandTests
 {
     private const BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
     private const byte Peer = 1;
@@ -539,6 +539,7 @@ public sealed class Lane1BowHandTests
         }
 
         public ChannelReader<byte[]> Declarations => _requests.Reader;
+        public volatile byte ObservedKnown;
 
         public static async Task<HandPipe> StartAsync(GameBridge bridge)
         {
@@ -562,7 +563,7 @@ public sealed class Lane1BowHandTests
             }
         }
 
-        public async Task ExpectAsync(Guid? cls, uint incarnation = 0x012345)
+        public async Task<byte[]> ExpectAsync(Guid? cls, uint incarnation = 0x012345)
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
             byte[] body = await Declarations.ReadAsync(timeout.Token);
@@ -573,6 +574,7 @@ public sealed class Lane1BowHandTests
             Assert.Equal(cls.HasValue, (body[47] & 1) != 0);
             Assert.Equal(incarnation, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(19)));
             Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(48)));
+            return body;
         }
 
         private async Task PumpAsync()
@@ -594,7 +596,12 @@ public sealed class Lane1BowHandTests
                     Assert.Equal(0x38, header[0]);
                     Assert.Equal(0x41, body[5]);
                     byte[] declaration = body[10..];
-                    Assert.Equal(60, declaration.Length);
+                    if (declaration[1] == 0) Assert.Equal(60, declaration.Length);
+                    else
+                    {
+                        Assert.Equal(1, declaration[1]);
+                        Assert.Equal(47, declaration.Length);
+                    }
                     var reply = new byte[46];
                     reply[0] = 0xB8;
                     reply[1] = 43;
@@ -602,8 +609,9 @@ public sealed class Lane1BowHandTests
                     reply[8] = 0xBB;
                     reply[9] = 1;
                     reply[11] = 2;
+                    if (declaration[1] == 1) reply[13] = ObservedKnown;
                     await _server.WriteAsync(reply, _stop.Token);
-                    _requests.Writer.TryWrite(declaration);
+                    if (declaration[1] == 0) _requests.Writer.TryWrite(declaration);
                 }
             }
             catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }

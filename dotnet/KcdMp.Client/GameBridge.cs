@@ -2955,10 +2955,20 @@ public partial class GameBridge(ClientConfig config)
         // packet used to start its own apply, so a heartbeat landing mid-verify ran
         // a second diff and a second 10 s retry loop over the same avatar.
         _ghostWantedAppearance[ghostId] = target;
+        await ConvergeWantedAppearanceAsync(ghostId, ct);
+    }
+
+    private async Task ConvergeWantedAppearanceAsync(byte ghostId, CancellationToken ct, Func<bool>? afterHolster = null)
+    {
+        if (!_ghostWantedAppearance.ContainsKey(ghostId)) return;
         var gate = _ghostApplyGate.GetOrAdd(ghostId, static _ => new SemaphoreSlim(1, 1));
-        if (!await gate.WaitAsync(0, ct)) return;   // the running apply picks the newest target up when it finishes
+        if (afterHolster is not null)
+            await gate.WaitAsync(ct);   // a queued old outfit can still be leaving the previous hand's scope
+        else if (!await gate.WaitAsync(0, ct))
+            return;   // the running apply picks the newest target up when it finishes
         try
         {
+            if (afterHolster?.Invoke() == false) return;
             for (int round = 0; round < 3; round++)
             {
                 if (!_ghostWantedAppearance.TryGetValue(ghostId, out var want)) return;
