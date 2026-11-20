@@ -54,6 +54,57 @@ struct Recipient {
     }
 };
 
+// One measurement may include several queued contacts. Keep the oldest
+// possible cause and refuse a batch that spans different bodies or scopes.
+struct WatchCapture {
+    uint64_t tick = 0, load = 0;
+    Recipient source{};
+    uint32_t victim = 0;
+    uint8_t flags = 0, material = 0;
+    bool ambiguous = false;
+
+    void add(WatchCapture other) {
+        if (!other.tick) return;
+        if (!tick) { *this = other; return; }
+        const bool mixed = ambiguous || other.ambiguous || victim != other.victim || load != other.load ||
+            !source.matches(other.source, tick) || !other.source.matches(source, other.tick);
+        const uint8_t combinedFlags = flags | other.flags;
+        if (other.tick < tick) *this = other;
+        flags = combinedFlags;
+        ambiguous = mixed;
+    }
+};
+
+constexpr uint64_t kWatchPublishMs = 600;
+
+struct WatchSeries {
+    WatchCapture recent{}, carried{};
+    uint64_t publishFrom = 0;
+
+    void add(WatchCapture contact) {
+        recent.add(contact);
+        if (!publishFrom || (!carried.tick && recent.tick < publishFrom)) publishFrom = recent.tick;
+    }
+
+    bool due(uint64_t now) const {
+        return publishFrom && now >= publishFrom && now - publishFrom >= kWatchPublishMs;
+    }
+
+    WatchCapture evidence() const {
+        auto result = carried;
+        result.add(recent);
+        return result;
+    }
+
+    void advance(uint64_t now) {
+        // A contact immediately before a publication can take effect in the
+        // next window. Retain its provenance, never the already measured loss.
+        carried = recent;
+        recent = {};
+        publishFrom = now;
+    }
+};
+
 enum class HitResult : uint8_t {
     Refused, Acknowledged, ProtectedConsumed, DispatchUnconfirmed, RecipientRetired, EffectObserved
 };

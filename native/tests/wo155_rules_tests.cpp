@@ -45,6 +45,50 @@ int wo155_rules_tests(int* passed) {
     HCHECK(!bound.matches({8, 10, 2, true, 0}, 12), "an unavailable native life proves no recipient");
     HCHECK(bound.matches({8, 10, 2, true, 51}, 12), "the exact proved life is accepted");
 
+    {
+        WatchSeries series;
+        const WatchCapture first{1000, 19, bound, 44, 0, 3};
+        const WatchCapture lastBeforePublication{1590, 19, bound, 44, 0x02, 5};
+        series.add(lastBeforePublication);
+        series.add(first);  // another hook was queued first
+        const auto initial = series.evidence();
+        HCHECK(!series.due(1599) && series.due(1600) && !initial.ambiguous && initial.tick == 1000 &&
+               initial.flags == 0x02 && initial.material == 3 && initial.source.proof == 51,
+               "latest contact does not extend the publication deadline and cannot replace the earliest evidence");
+        series.advance(1600);
+        const auto trailing = series.evidence();
+        HCHECK(!series.due(2199) && series.due(2200) && trailing.tick == 1000 && trailing.source.proof == 51,
+               "late engine effects keep the previous window's original evidence");
+
+        series.add({2000, 19, bound, 44, 0, 7});
+        series.advance(2200);
+        const auto continued = series.evidence();
+        HCHECK(series.due(2800) && continued.tick == 2000 && continued.flags == 0 && continued.material == 7,
+               "continuous contacts drop the settled window's timestamp and flags");
+    }
+    {
+        const WatchCapture before{1000, 19, bound, 44, 0, 3};
+        const std::array<WatchCapture, 4> changed{{
+            {1700, 19, {8, 1650, 2, true, 52}, 44, 0, 3},
+            {1700, 23, bound, 44, 0, 3},
+            {1700, 19, {8, 10, 3, true, 51}, 44, 0, 3},
+            {1700, 19, bound, 45, 0, 3},
+        }};
+        for (const auto& after : changed) {
+            WatchSeries series;
+            series.add(before);
+            series.advance(1600);
+            series.add(after);
+            const auto mixed = series.evidence();
+            HCHECK(mixed.ambiguous && mixed.tick == before.tick && mixed.source.proof == before.source.proof,
+                   "pending effects spanning a life, world, pipe or victim change cannot adopt the new scope");
+            series.advance(2200);
+            const auto settled = series.evidence();
+            HCHECK(!settled.ambiguous && settled.tick == after.tick && settled.source.proof == after.source.proof,
+                   "fresh evidence is eligible once the preceding attribution window has settled");
+        }
+    }
+
     struct DamageDouble {
         float hp = 95, st = 85;
         int dispatched = 0;

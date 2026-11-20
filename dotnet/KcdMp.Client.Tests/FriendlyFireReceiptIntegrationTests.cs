@@ -221,13 +221,13 @@ public sealed class FriendlyFireReceiptIntegrationTests
     }
 
     private static byte[] NativeContact(uint eid, byte flags, float health, ulong captured = 0,
-        ulong measured = 0, ulong sourceLife = 0, ulong measurement = 0)
+        ulong measured = 0, ulong sourceLife = 0, ulong measurement = 0, float stamina = 10f)
     {
         var frame = new byte[captured == 0 ? 17 : 49];
         frame[0] = 0x97;
         frame[1] = (byte)(frame.Length - 3);
         BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(3), eid);
-        BinaryPrimitives.WriteSingleLittleEndian(frame.AsSpan(7), 10f);
+        BinaryPrimitives.WriteSingleLittleEndian(frame.AsSpan(7), stamina);
         BinaryPrimitives.WriteSingleLittleEndian(frame.AsSpan(11), health);
         frame[15] = flags;
         frame[16] = 3;
@@ -239,6 +239,291 @@ public sealed class FriendlyFireReceiptIntegrationTests
             BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(41), measurement);
         }
         return frame;
+    }
+
+    [Theory]
+    [InlineData("melee", (byte)0, 4, 15, 14)]
+    [InlineData("missile", PlayerHitV8.FlagMissile, 4, 15, 14)]
+    [InlineData("single", (byte)0, 1, 1, 2)]
+    [InlineData("boundary", (byte)0, 2, 3, 5)]
+    [InlineData("continuous", (byte)0, 9, 150, 149)]
+    [InlineData("life", (byte)0, 2, 9, 5)]
+    [InlineData("late", (byte)0, 1, 1, 2)]
+    public async Task Native_measured_series_reaches_the_authenticated_target_once(
+        string scenario, byte flags, int applied, int expectedHealth, int expectedStamina)
+    {
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var ct = stop.Token;
+        const uint eid = 0x2345;
+        const ulong sourceLife = 73, oldTargetLife = 9101, newTargetLife = 9102, fixtureClockStart = 10_000;
+        bool switchLife = scenario == "life", delay = scenario == "late";
+        ulong targetLife = switchLife ? oldTargetLife : newTargetLife;
+        string name = "ff-series-" + Guid.NewGuid().ToString("N");
+        using var sourceServer = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        using var targetServer = new NamedPipeServerStream(name + "-target", PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        await using var sourcePipe = new CombatPipe(name);
+        await using var targetPipe = new CombatPipe(name + "-target");
+        var sourceConnection = sourceServer.WaitForConnectionAsync(ct);
+        var targetConnection = targetServer.WaitForConnectionAsync(ct);
+        Assert.True(await sourcePipe.EnsureConnectedAsync(ct));
+        Assert.True(await targetPipe.EnsureConnectedAsync(ct));
+        await Task.WhenAll(sourceConnection, targetConnection);
+
+        string? evidencePath = Environment.GetEnvironmentVariable("KCT_TEST_FF_SERIES");
+        await using var relay = await ReplayRelay.StartAsync(ct, evidencePath is null ? "Fatal" : "Information");
+        await using var host = await ReplayPeer.ConnectAsync(relay.Port, "SeriesHost", ct);
+        await using var guest = await ReplayPeer.ConnectAsync(relay.Port, "SeriesGuest", ct);
+        var (source, target) = flags == PlayerHitV8.FlagMissile ? (guest, host) : (host, guest);
+        const ushort caps = Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife | Protocol.LinkCapPresentationTime;
+        foreach (var peer in new[] { host, guest })
+        {
+            await peer.SendAsync(Protocol.BuildLinkHelloUp(caps), ct);
+            Assert.True(Protocol.TryParseLinkHello(await peer.ReadUntilAsync(Protocol.LinkHelloDown, ct),
+                out _, out ushort accepted, out _, out _));
+            Assert.Equal(caps, (ushort)(accepted & caps));
+            await peer.BarrierAsync(ct);
+        }
+        await source.SendAsync(new PvpLifeState(1, sourceLife).BuildUp(), ct);
+        await source.BarrierAsync(ct);
+
+        using var sourceWire = new HeldPeerStream();
+        using var targetWire = new HeldPeerStream();
+        var sourceBridge = BridgeOn(sourcePipe, sourceWire, source.Id);
+        var targetBridge = BridgeOn(targetPipe, targetWire, target.Id);
+        foreach (var bridge in new[] { sourceBridge, targetBridge })
+        {
+            typeof(GameBridge).GetField("_t3StatsNextMs", Instance)!.SetValue(bridge, long.MaxValue);
+            typeof(GameBridge).GetField("_w213Caps", Instance)!.SetValue(bridge, caps);
+        }
+        await NativeLifeAsync(sourcePipe, sourceServer, sourceLife, ct);
+        using var sourceWriter = new SemaphoreSlim(1);
+        var configured = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var nativeReplies = ReplyToSourceCommandsAsync();
+        typeof(GameBridge).GetMethod("Wo121OnConnect", Instance)!.Invoke(sourceBridge, [sourceWire, ct]);
+        var entities = (ConcurrentDictionary<string, uint>)typeof(GameBridge).GetField("_ghostEntityIds", Instance)!.GetValue(sourceBridge)!;
+        entities[target.Id.ToString()] = eid;
+        var pipeProcessed = Channel.CreateUnbounded<byte>();
+        sourcePipe.OnLocalDowned = (_, marker) =>
+        {
+            Assert.True(pipeProcessed.Writer.TryWrite(marker));
+            return Task.CompletedTask;
+        };
+        var reader = typeof(GameBridge).GetMethod("ReceiveLoopAsync", Instance)!;
+        var sourceReceive = (Task)reader.Invoke(sourceBridge, [sourceWire, ct])!;
+        var targetReceive = (Task)reader.Invoke(targetBridge, [targetWire, ct])!;
+        var requests = new List<byte[]>();
+        float hp = 200f, st = 200f;
+        byte pipeMarker = 0;
+        try
+        {
+            await configured.Task.WaitAsync(ct);
+            await CalibrateAsync(source, sourceWire);
+            await CalibrateAsync(target, targetWire);
+            await NativeLifeAsync(targetPipe, targetServer, targetLife, ct);
+            await AnnounceTargetLifeAsync(1, targetLife);
+            ulong anchor = (ulong)Environment.TickCount64 + 5;
+            byte[]? lastDown = null;
+            var notices = SeriesNotices(scenario, eid, flags, sourceLife, fixtureClockStart);
+            foreach (var frame in notices)
+            {
+                ulong captured = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(17));
+                ulong measured = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(25));
+                Assert.True(captured >= fixtureClockStart && measured >= captured);
+                captured = anchor + (captured - fixtureClockStart);
+                measured = anchor + (measured - fixtureClockStart);
+                await UntilAsync(delay ? Math.Max(measured, captured + 2100) : measured);
+                BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(17), captured);
+                BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(25), measured);
+
+                var forwarded = await ForwardNoticeAsync(frame);
+                if (switchLife && targetLife == oldTargetLife)
+                {
+                    // Reliable output already left the relay before the recipient rotates its life.
+                    byte[] held = Assert.Single(forwarded);
+                    targetLife = newTargetLife;
+                    await NativeLifeAsync(targetPipe, targetServer, targetLife, ct);
+                    await AnnounceTargetLifeAsync(2, targetLife);
+                    targetWire.Feed(Protocol.PlayerHitV8Down, held);
+                    continue;
+                }
+                if (delay) Assert.Empty(forwarded);
+                foreach (byte[] down in forwarded)
+                {
+                    await ApplyAsync(down);
+                    lastDown = down;
+                }
+            }
+            if (delay)
+            {
+                ulong fresh = (ulong)Environment.TickCount64;
+                lastDown = Assert.Single(await ForwardNoticeAsync(NativeContact(eid, flags, 1, fresh, fresh,
+                    sourceLife, measurement: 99, stamina: 2)));
+                await ApplyAsync(lastDown);
+            }
+            Assert.True((requests.Count, hp, st) == (applied, 200f - expectedHealth, 200f - expectedStamina),
+                $"{scenario} actual target apply={requests.Count} hp={hp} st={st}. Expected {applied}, {200 - expectedHealth}, {200 - expectedStamina}.");
+
+            // Replay an accepted downstream packet across the Agent's own reader fence.
+            var unexpected = ReadHitAsync(targetServer, ct);
+            targetWire.Feed(Protocol.PlayerHitV8Down, lastDown!);
+            await ReadMarkerAsync(targetBridge, targetWire, source.Id, 'z', unexpected);
+            Assert.False(unexpected.IsCompleted);
+            Assert.Equal(0, sourcePipe.TimedOut);
+
+            if (evidencePath is not null)
+                await File.WriteAllBytesAsync(Path.Combine(evidencePath, scenario + ".1a"), requests.SelectMany(body => body).ToArray(), ct);
+            Console.WriteLine($"FF-SERIES scenario={scenario} apply={requests.Count} hp_before=200 hp_after={hp} st_before=200 st_after={st}");
+        }
+        finally
+        {
+            stop.Cancel();
+            await Task.WhenAll(sourceReceive, targetReceive, nativeReplies);
+        }
+
+        async Task ReplyToSourceCommandsAsync()
+        {
+            // The Windows pipe flush waits for the other end to read commands.
+            // Serve the normal WO-121 startup and heartbeat during the entire series.
+            var header = new byte[3];
+            byte sequence = 0;
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    await sourceServer.ReadExactlyAsync(header, ct);
+                    var body = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
+                    await sourceServer.ReadExactlyAsync(body, ct);
+                    ++sequence;
+                    byte[] reply = (header[0], body.Length) switch
+                    {
+                        (0x16, 7) or (0x18, 3) => [0x81, 3, 0, 1, sequence, 0],
+                        (0x1B, 0) => [0x8A, 2, 0, 0, sequence],
+                        _ => throw new InvalidDataException($"Unexpected FF fixture command 0x{header[0]:X2}/{body.Length}.")
+                    };
+                    await WriteSourceAsync(reply);
+                    if (header[0] == 0x18)
+                    {
+                        Assert.Equal(1, body[0]);
+                        configured.TrySetResult();
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        }
+
+        async Task WriteSourceAsync(byte[] frame)
+        {
+            await sourceWriter.WaitAsync(ct);
+            try { await sourceServer.WriteAsync(frame, ct); }
+            finally { sourceWriter.Release(); }
+        }
+
+        async Task UntilAsync(ulong time)
+        {
+            while (true)
+            {
+                ulong now = (ulong)Environment.TickCount64;
+                if (now >= time) return;
+                await Task.Delay((int)Math.Min(time - now, 20), ct);
+            }
+        }
+
+        async Task CalibrateAsync(ReplayPeer peer, HeldPeerStream wire)
+        {
+            byte[] query = await wire.ClockFrames.Reader.ReadAsync(ct);
+            Assert.Equal(PresentationClock.QueryLength + 3, query.Length);
+            await peer.SendAsync(query, ct);
+            wire.Feed(Protocol.PresentationClockDown, await peer.ReadUntilAsync(Protocol.PresentationClockDown, ct));
+            byte[] confirmation = await wire.ClockFrames.Reader.ReadAsync(ct);
+            Assert.Equal(PresentationClock.ConfirmLength + 3, confirmation.Length);
+            await peer.SendAsync(confirmation, ct);
+            await peer.BarrierAsync(ct);
+        }
+
+        async Task AnnounceTargetLifeAsync(ulong revision, ulong proof)
+        {
+            await target.SendAsync(new PvpLifeState(revision, proof).BuildUp(), ct);
+            await target.BarrierAsync(ct);
+            var roster = (await source.DrainAsync(ct)).Last(packet => packet.Type == Protocol.PvpPeerDown &&
+                Protocol.TryReadPvpPeer(packet.Payload, out byte ghost, out _, out var life) &&
+                ghost == target.Id && life == new PvpLifeState(revision, proof));
+            sourceWire.Feed(roster.Type, roster.Payload);
+            await ReadMarkerAsync(sourceBridge, sourceWire, target.Id, (char)('a' + revision));
+        }
+
+        async Task<byte[][]> ForwardNoticeAsync(byte[] frame)
+        {
+            await WriteSourceAsync(frame);
+            await WriteSourceAsync(frame);
+            await WriteSourceAsync([0x91, 2, 0, 0, ++pipeMarker]);
+            Assert.Equal(pipeMarker, await pipeProcessed.Reader.ReadAsync(ct));
+            var upstream = sourceWire.UpstreamHits.TryDequeue(out byte[]? hit) ? hit : null;
+            Assert.Empty(sourceWire.UpstreamHits);
+            if (upstream is not null)
+            {
+                await source.SendAsync(upstream, ct);
+                await source.SendAsync(upstream, ct);
+                await source.BarrierAsync(ct);
+            }
+            byte[][] packets = (await target.DrainAsync(ct)).Where(packet => packet.Type == Protocol.PlayerHitV8Down)
+                .Select(packet => packet.Payload).ToArray();
+            Assert.Equal(upstream is null ? 0 : 1, packets.Length);
+            return packets;
+        }
+
+        async Task ApplyAsync(byte[] down)
+        {
+            Assert.True(PlayerHitV8.TryDecodeDown(down, out byte from, out var hit, out ulong seq, out ulong incarnation, out ulong proof));
+            Assert.Equal(source.Id, from);
+            Assert.Equal(target.Id, hit.Victim);
+            Assert.Equal(targetLife, proof);
+            Assert.NotEqual(0UL, incarnation);
+            targetWire.Feed(Protocol.PlayerHitV8Down, down);
+            byte[] request = await ReadHitAsync(targetServer, ct);
+            Assert.Equal(42, request.Length);
+            Assert.Equal(seq, BinaryPrimitives.ReadUInt64LittleEndian(request.AsSpan(10)));
+            Assert.Equal(targetLife, BinaryPrimitives.ReadUInt64LittleEndian(request.AsSpan(34)));
+            Assert.Equal(flags, (byte)(request[8] & 0x7F));
+            Assert.Equal(hit.Health, BinaryPrimitives.ReadSingleLittleEndian(request.AsSpan(4)));
+            Assert.Equal(hit.Stamina, BinaryPrimitives.ReadSingleLittleEndian(request));
+            hp -= hit.Health;
+            st -= hit.Stamina;
+            requests.Add(request);
+            await targetServer.WriteAsync(new byte[] { 0x81, 3, 0, 1, (byte)requests.Count, 24 }, ct);
+        }
+
+        async Task ReadMarkerAsync(GameBridge bridge, HeldPeerStream wire, byte ghost, char marker, Task? unexpected = null)
+        {
+            var markers = (ConcurrentDictionary<byte, string>)typeof(GameBridge).GetField("_ghostReleaseVersions", Instance)!.GetValue(bridge)!;
+            wire.Feed(Protocol.ReleaseVersion, [ghost, (byte)marker]);
+            while (markers.GetValueOrDefault(ghost) != marker.ToString() && unexpected?.IsCompleted != true)
+                await Task.Delay(2, ct);
+        }
+    }
+
+    private static byte[][] SeriesNotices(string scenario, uint eid, byte flags, ulong sourceLife, ulong start)
+    {
+        string capture = scenario switch { "life" => "melee", "late" => "single", _ => scenario };
+        string? path = Environment.GetEnvironmentVariable("KCT_TEST_FF_SERIES");
+        if (path is not null)
+        {
+            // Optionally replay byte-for-byte measurements from the Linux native engine double.
+            var frames = File.ReadAllBytes(Path.Combine(path, capture + ".bin")).Chunk(49).ToArray();
+            Assert.NotEmpty(frames);
+            Assert.All(frames, frame => Assert.Equal(new byte[] { 0x97, 46, 0 }, frame[..3]));
+            return frames;
+        }
+        (uint Capture, uint Measured, int Health, int Stamina)[] times = capture switch
+        {
+            "single" => [(0, 600, 1, 2)],
+            "boundary" => [(0, 600, 1, 2), (0, 1200, 2, 3)],
+            "continuous" => [(0, 600, 16, 18), (0, 1200, 17, 18), (700, 1800, 18, 18),
+                (1300, 2400, 19, 18), (1900, 3000, 20, 18), (2500, 3600, 16, 18),
+                (3100, 4200, 17, 18), (3700, 4800, 18, 18), (4300, 5400, 9, 5)],
+            _ => [(0, 600, 3, 5), (0, 1200, 3, 4), (1000, 1800, 4, 2), (1500, 2400, 5, 3)],
+        };
+        return times.Select((hit, idx) => NativeContact(eid, flags, hit.Health, start + hit.Capture,
+            start + hit.Measured, sourceLife, (ulong)idx + 1, hit.Stamina)).ToArray();
     }
 
     [Fact]
@@ -253,20 +538,14 @@ public sealed class FriendlyFireReceiptIntegrationTests
         Assert.True(await pipe.EnsureConnectedAsync(ct));
         await listen;
 
-        var blocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var unblock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var recovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var unblocks = new[] { new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+            new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) };
+        var steps = Channel.CreateUnbounded<byte>();
         var delivered = new ConcurrentQueue<ulong>();
         pipe.OnLocalDowned = (_, marker) =>
         {
-            if (marker == 1)
-            {
-                blocked.SetResult();
-                return unblock.Task.WaitAsync(ct);
-            }
-            (marker == 2 ? drained : recovered).SetResult();
-            return Task.CompletedTask;
+            Assert.True(steps.Writer.TryWrite(marker));
+            return marker is 1 or 4 ? unblocks[(marker - 1) / 3].Task.WaitAsync(ct) : Task.CompletedTask;
         };
         pipe.OnPvpHit = hit =>
         {
@@ -274,35 +553,46 @@ public sealed class FriendlyFireReceiptIntegrationTests
             return Task.CompletedTask;
         };
 
-        const ulong burst = 96, sourceLife = 9001;
+        const int burst = 96, capacity = 64;
+        const ulong sourceLife = 9001;
+        var accepted = new List<ulong>();
         try
         {
-            await server.WriteAsync(new byte[] { 0x91, 2, 0, 1, 1 }, ct);
-            await blocked.Task.WaitAsync(ct);
-            for (ulong id = 1; id <= burst; ++id)
-                await server.WriteAsync(NativeContact(0x2345, 0, 7f, 1, 2, sourceLife, id), ct);
+            for (int round = 0; round < unblocks.Length; round++)
+            {
+                byte marker = (byte)(round * 3 + 1);
+                await server.WriteAsync(new byte[] { 0x91, 2, 0, 1, marker }, ct);
+                Assert.Equal(marker, await steps.Reader.ReadAsync(ct));
+                int first = round * (burst + 1) + 1;
+                for (int id = first; id < first + burst; ++id)
+                    await server.WriteAsync(NativeContact(0x2345, 0, 7f, 1, 2, sourceLife, (ulong)id), ct);
 
-            var pong = pipe.PingAsync(ct);
-            var ping = new byte[3];
-            await server.ReadExactlyAsync(ping, ct);
-            Assert.Equal(new byte[] { 0x03, 0, 0 }, ping);
-            await server.WriteAsync(new byte[] { 0x83, 0, 0 }, ct);
-            Assert.True(await pong.WaitAsync(ct));
-            Assert.Empty(delivered);
+                var pong = pipe.PingAsync(ct);
+                var ping = new byte[3];
+                await server.ReadExactlyAsync(ping, ct);
+                Assert.Equal(new byte[] { 0x03, 0, 0 }, ping);
+                await server.WriteAsync(new byte[] { 0x83, 0, 0 }, ct);
+                Assert.True(await pong.WaitAsync(ct));
+                Assert.Equal(accepted, delivered.ToArray());
 
-            await server.WriteAsync(new byte[] { 0x91, 2, 0, 0, 2 }, ct);
-            unblock.SetResult();
-            await drained.Task.WaitAsync(ct);
-            var accepted = Enumerable.Range(1, 64).Select(id => (ulong)id).ToArray();
-            Assert.Equal(accepted, delivered.ToArray());
+                await server.WriteAsync(new byte[] { 0x91, 2, 0, 0, ++marker }, ct);
+                unblocks[round].SetResult();
+                Assert.Equal(marker, await steps.Reader.ReadAsync(ct));
+                accepted.AddRange(Enumerable.Range(first, capacity).Select(id => (ulong)id));
+                Assert.Equal(accepted, delivered.ToArray());
 
-            ulong now = (ulong)Environment.TickCount64;
-            await server.WriteAsync(NativeContact(0x2345, 0, 13f, now, now, sourceLife, burst + 1), ct);
-            await server.WriteAsync(new byte[] { 0x91, 2, 0, 0, 3 }, ct);
-            await recovered.Task.WaitAsync(ct);
-            Assert.Equal(accepted.Append(burst + 1), delivered.ToArray());
+                ulong now = (ulong)Environment.TickCount64, next = (ulong)(first + burst);
+                await server.WriteAsync(NativeContact(0x2345, 0, 13f, now, now, sourceLife, next), ct);
+                await server.WriteAsync(new byte[] { 0x91, 2, 0, 0, ++marker }, ct);
+                Assert.Equal(marker, await steps.Reader.ReadAsync(ct));
+                accepted.Add(next);
+                Assert.Equal(accepted, delivered.ToArray());
+            }
         }
-        finally { unblock.TrySetResult(); }
+        finally
+        {
+            foreach (var unblock in unblocks) unblock.TrySetResult();
+        }
     }
 
     [Theory]
@@ -531,6 +821,7 @@ public sealed class FriendlyFireReceiptIntegrationTests
     private sealed class HeldPeerStream : Stream
     {
         private readonly Channel<byte[]> _frames = Channel.CreateUnbounded<byte[]>();
+        public Channel<byte[]> ClockFrames { get; } = Channel.CreateUnbounded<byte[]>();
         public ConcurrentQueue<byte[]> UpstreamHits { get; } = new();
         private byte[] _frame = [];
         private int _at;
@@ -574,6 +865,8 @@ public sealed class FriendlyFireReceiptIntegrationTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!buffer.IsEmpty && buffer.Span[0] == Protocol.PlayerHitV8Up) UpstreamHits.Enqueue(buffer.ToArray());
+            if (!buffer.IsEmpty && buffer.Span[0] == Protocol.PresentationClockUp)
+                Assert.True(ClockFrames.Writer.TryWrite(buffer.ToArray()));
             return ValueTask.CompletedTask;
         }
         public override void Flush() => throw new NotSupportedException();

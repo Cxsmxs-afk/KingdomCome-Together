@@ -73,6 +73,8 @@ Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op 
 
 **Lane 2 · Restfälle nach `824293a7`:** Die H6-Vorbereitung unterscheidet einen Fehler vor der ersten Mutation von einer möglicherweise teilweise ausgeführten Vorbereitung. Nach Teilwirkung beobachtet der Ledger nur denselben Körper. Beim Friendly Fire erfasst `hits.cpp` die ursprüngliche Messzeit für Nahkampf und Geschoss. Der Agent bildet `0x44` nur, wenn Ziel-Lebensnachweis und Körperbindung zu dieser Zeit bereits beobachtet waren. `0x97` ist die lokale DLL-/Agent-Schnittstelle. Relay und native Zielanwendung prüfen weiterhin den bereits gebundenen Kontakt. [Zwei-PC-Nachweise](../../../docs/ABNAHME-LANE2-NAHKAMPF.md)
 
+**Lane 2 · Friendly-Fire-Trefferserien:** `hits.cpp` zählt und veröffentlicht HP-/Ausdauerverluste im selben Watch. Neue Treffer verlängern die Beobachtung, während die Veröffentlichung nach jeweils 600 ms weiterläuft. `wo155_rules.h` hält den ältesten möglichen Capture und erkennt widersprüchliche Lebens-, Welt- oder Körpernachweise. Jede Veröffentlichung hat eine eigene Mess-ID. Der Agent verwirft Meldungen nach zwei Sekunden ab ursprünglichem Capture. [Abnahme und Messzeiten](../../../docs/ABNAHME-LANE2-NAHKAMPF.md)
+
 ## Bekannte Fallen (Live-Test 18.11.2026, 22:09–22:40 Europe/Berlin)
 1. **Stilles Verwerfen:** `GameBridge.cs:4881` und Ablehnungen in `T3TryDeferSideChannel` (`GameBridge.T3SideChannels.cs:47–50`) haben dort keine Logzeile. Der Live-Test zeigte `MP-LINK in=w164:18` und `clock_in=0`. H20 muss den konkreten Ablehnungsgrund nachweisen. Regel: Jeder Drop loggt seinen Grund (gedrosselt).
 2. **LoadScoped-Seitenkanäle in Phase Menu:** Alles, was vor dem Laden gebraucht wird (Uhr-Snapshot), darf nicht am WorldSync-Gate hängen.
