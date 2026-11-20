@@ -272,7 +272,7 @@ public partial class ClientSession
             _sched = new LinkScheduler(opts);
             if (!W213Switch.TwinOff("npc_bands")) _sched.BandOf = BandOf;
             ILinkPath path = conn.Path ?? (conn.Steam is { } sc ? new KcdMp.Steam.SteamLinkPath(sc) : new StreamLinkPath(_stream));
-            _writer = new LinkWriter(_sched, path);
+            _writer = new LinkWriter(_sched, path) { WriteObservation = (ShouldTracePvpWrite, TracePvpRelayWrite) };
         }
     }
 
@@ -1539,15 +1539,27 @@ public partial class ClientSession
     {
         if (frame.Length < 3) return;
         Meter.CountFrame(true, frame[0], frame.AsSpan(3));
-        if (frame[0] == Protocol.PlayerHitV8Down && frame.Length == 3 + PlayerHitV8.LifeDownLen)
-            TracePvpRelay("relay-send", frame[3], frame.AsSpan(3), PlayerHitV8.DownLen, PresentationClock.NowMs());
     }
 
     // Matches the Agent's sample selection. The key comes from the existing hit frame.
+    private static bool TracePvpSequence(ulong sequence) => sequence != 0 && (sequence <= 64 || sequence % 32 == 0);
+
+    private static bool ShouldTracePvpWrite(byte[] frame) =>
+        frame.Length == 3 + PlayerHitV8.LifeDownLen && frame[0] == Protocol.PlayerHitV8Down &&
+        TracePvpSequence(BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.DownLen)));
+
+    private void TracePvpRelayWrite(byte[] frame, LinkWriteStamp started, LinkWriteStamp? completed)
+    {
+        TracePvpRelay("relay-write-start", frame[3], frame.AsSpan(3), PlayerHitV8.DownLen, PresentationClock.QpcToMs(started.Qpc));
+        if (completed is { } done)
+            TracePvpRelay(_conn.Transport == "steam" ? "relay-sdk-accepted" : "relay-write-complete", frame[3], frame.AsSpan(3),
+                PlayerHitV8.DownLen, PresentationClock.QpcToMs(done.Qpc));
+    }
+
     private void TracePvpRelay(string stage, byte source, ReadOnlySpan<byte> body, int identityOffset, long relayMs)
     {
         ulong sequence = BinaryPrimitives.ReadUInt64LittleEndian(body[identityOffset..]);
-        if (sequence == 0 || (sequence > 64 && sequence % 32 != 0)) return;
+        if (!TracePvpSequence(sequence)) return;
         ulong life = BinaryPrimitives.ReadUInt64LittleEndian(body[(identityOffset + 2 * sizeof(ulong))..]);
         _logger.Information("MP-LANE2-FF-TIME stage={Stage} source={Source} contact_seq={Sequence} recipient_life={Life} relay_ms={RelayMs}",
             stage, source, sequence, life, relayMs);
@@ -1944,7 +1956,14 @@ public partial class ClientSession
             if (packet is null) continue;
             ObserveOutgoingFrame(packet);
 
-            try { await _stream.WriteAsync(packet); }
+            LinkWriteStamp? started = null, completed = null;
+            try
+            {
+                bool trace = ShouldTracePvpWrite(packet);
+                if (trace) started = LinkWriteStamp.Capture();
+                await _stream.WriteAsync(packet);
+                if (trace) completed = LinkWriteStamp.Capture();
+            }
             catch (Exception ex)
             {
                 // Normal on a disconnect -- the peer's read side of the same
@@ -1956,6 +1975,10 @@ public partial class ClientSession
                 _logger.Debug(ex, "[!] Write loop for {Name} stopped", Name ?? $"id={Id}");
                 AbortWriteQueue(null);
                 break;
+            }
+            finally
+            {
+                if (started is { } stamp) TracePvpRelayWrite(packet, stamp, completed);
             }
         }
     }

@@ -441,6 +441,12 @@ public sealed class LinkScheduler
     }
 }
 
+/// <summary>Clock readings at the write boundary. QPC measures durations even where the boot tick is coarse.</summary>
+public readonly record struct LinkWriteStamp(long Qpc, long Tick)
+{
+    public static LinkWriteStamp Capture() => new(Stopwatch.GetTimestamp(), Environment.TickCount64);
+}
+
 /// <summary>
 /// WO-213 C/D: the one writer of a link: takes from the scheduler and sends on the path, events reliable, state the path's unreliable
 /// way when the options say so. The budget (D.1) is a token bucket refilled from the path's own rate (Steam's send rate, the shaper's)
@@ -461,6 +467,9 @@ public sealed class LinkWriter
 
     /// <summary>WO-213 D.3: rewrites a frame just before it is sent (null = as it is).</summary>
     public Func<byte[], byte[]>? Transform { get; set; }
+
+    /// <summary>Observe selected writes after the path returns. An incomplete attempt has no completion stamp.</summary>
+    public (Predicate<byte[]> Select, Action<byte[], LinkWriteStamp, LinkWriteStamp?> Report)? WriteObservation { get; init; }
 
     public LinkScheduler Scheduler => _sched;
     public ILinkPath Path => _path;
@@ -523,16 +532,48 @@ public sealed class LinkWriter
             }
             if (stillValid is not null && !stillValid()) continue;
             bool unreliable = isState && _sched.Options.Unreliable;
-            var write = startWrite is null ? _path.SendAsync(frame, unreliable, ct) : StartScopedWrite(startWrite, frame, unreliable, ct);
-            if (write is not { } admitted) continue;
-            await admitted;
-            afterWrite?.Invoke(); // complete physical send, never queue acceptance / pre-send observer
+            if (WriteObservation is { } observer && observer.Select(frame))
+            {
+                if (!await ObserveWriteAsync(frame, unreliable, ct, startWrite, observer.Report)) continue;
+            }
+            else
+            {
+                var write = startWrite is null ? _path.SendAsync(frame, unreliable, ct) : StartScopedWrite(startWrite, frame, unreliable, ct);
+                if (write is not { } admitted) continue;
+                await admitted;
+            }
+            afterWrite?.Invoke(); // The transport operation returned successfully.
             Written++; WrittenBytes += frame.Length;
         }
     }
 
     private ValueTask? StartScopedWrite(LinkWriteAdmission startWrite, byte[] frame, bool unreliable, CancellationToken ct) =>
         startWrite(() => _path.SendAsync(frame, unreliable, ct));
+
+    private async ValueTask<bool> ObserveWriteAsync(byte[] frame, bool unreliable, CancellationToken ct,
+        LinkWriteAdmission? startWrite, Action<byte[], LinkWriteStamp, LinkWriteStamp?> report)
+    {
+        LinkWriteStamp? started = null, completed = null;
+        ValueTask Begin()
+        {
+            started = LinkWriteStamp.Capture();
+            return _path.SendAsync(frame, unreliable, ct);
+        }
+
+        try
+        {
+            var write = startWrite is null ? Begin() : startWrite(Begin);
+            if (write is not { } admitted) return false;
+            await admitted;
+            completed = LinkWriteStamp.Capture();
+            return true;
+        }
+        finally
+        {
+            // Keep logging outside both the admission fence and the transport call.
+            if (started is { } stamp) report(frame, stamp, completed);
+        }
+    }
 
     public void Wake() { if (_signal.CurrentCount == 0) _signal.Release(); }
 }

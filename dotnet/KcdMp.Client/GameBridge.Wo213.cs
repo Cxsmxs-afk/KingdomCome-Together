@@ -272,10 +272,15 @@ public partial class GameBridge
         var sched = new LinkScheduler(new LinkSchedOptions { Budget = !W213Switch.TwinOff("link_budget") });
         // D.4: this player's own position is the top band; everything else this agent sends is its own few bodies
         if (!W213Switch.TwinOff("figure_band")) sched.BandOf = p => p.Kind == "pos" ? 0 : null;
-        var w = new LinkWriter(sched, path);
+        byte pvpSource = _myGhostId;
+        bool steam = link.Steam is not null;
+        var w = new LinkWriter(sched, path)
+        {
+            WriteObservation = (ShouldTracePvpSend, (frame, started, completed) =>
+                TracePvpWrite(stream, pvpSource, frame, steam, started, completed))
+        };
         var cts = new CancellationTokenSource();
         _w213WriterCts = cts; _w213Stream = stream; _w213Writer = w;
-        byte pvpSource = _myGhostId;
         async Task RunWriter()
         {
             try
@@ -283,8 +288,6 @@ public partial class GameBridge
                 await w.RunAsync(cts.Token, (f, _) =>
                 {
                     if (f.Length >= 3) _w213Meter.CountFrame(true, f[0], f.AsSpan(3));
-                    if (IsPvpLifeSend(f))
-                        TracePvpSend(stream, pvpSource, f, Stopwatch.GetTimestamp(), Environment.TickCount64);
                 });
             }
             catch (Exception ex) { Console.WriteLine($"MP-LINK the writer stopped: {ex.GetType().Name}: {ex.Message}"); try { link.Dispose(); } catch { } }
@@ -361,8 +364,9 @@ public partial class GameBridge
         return true;
     }
 
-    private static bool IsPvpLifeSend(byte[] frame) =>
-        frame.Length == 3 + PlayerHitV8.LifeUpLen && frame[0] == Protocol.PlayerHitV8Up;
+    private static bool ShouldTracePvpSend(byte[] frame) =>
+        frame.Length == 3 + PlayerHitV8.LifeUpLen && frame[0] == Protocol.PlayerHitV8Up &&
+        TracePvpSequence(BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.UpLen)));
 
     private (long Ms, long Rtt) PvpRelayTime(Stream stream, long qpc)
     {
@@ -373,12 +377,14 @@ public partial class GameBridge
         return default;
     }
 
-    private void TracePvpSend(Stream stream, byte source, byte[] frame, long qpc, long tick)
+    private void TracePvpWrite(Stream stream, byte source, byte[] frame, bool steam, LinkWriteStamp started, LinkWriteStamp? completed)
     {
         ulong sequence = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.UpLen));
-        if (!TracePvpSequence(sequence)) return;
         ulong life = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(3 + PlayerHitV8.IdentifiedUpLen));
-        TracePvpTransport("client-send", source, sequence, life, tick, PvpRelayTime(stream, qpc));
+        TracePvpTransport("client-write-start", source, sequence, life, started.Tick, PvpRelayTime(stream, started.Qpc), started.Qpc);
+        if (completed is { } done)
+            TracePvpTransport(steam ? "client-sdk-accepted" : "client-write-complete", source, sequence, life,
+                done.Tick, PvpRelayTime(stream, done.Qpc), done.Qpc);
     }
 
     private static void TracePvpRead(PvpFrameScope scope, byte source, ulong sequence, ulong life)
@@ -391,9 +397,9 @@ public partial class GameBridge
     private static bool TracePvpSequence(ulong sequence) => sequence != 0 && (sequence <= 64 || sequence % 32 == 0);
 
     private static void TracePvpTransport(string stage, byte source, ulong sequence, ulong life, long tick,
-        (long Ms, long Rtt) relay) =>
+        (long Ms, long Rtt) relay, long qpc = 0) =>
         Console.WriteLine(FormattableString.Invariant(
-            $"MP-LANE2-FF-TIME stage={stage} source={source} contact_seq={sequence} recipient_life={life} local_tick={tick} relay_ms={relay.Ms} clock_rtt_ms={relay.Rtt}"));
+            $"MP-LANE2-FF-TIME stage={stage} source={source} contact_seq={sequence} recipient_life={life} local_tick={tick} relay_ms={relay.Ms} clock_rtt_ms={relay.Rtt} local_qpc_ms={PresentationClock.QpcToMs(qpc)}"));
 
     private bool _w213SteamConfigLogged;
 

@@ -8209,21 +8209,24 @@ public partial class GameBridge(ClientConfig config)
         long t0 = Stopwatch.GetTimestamp();
         await _tcpWriteLock.WaitAsync(ct);
         long t1 = Stopwatch.GetTimestamp();
-        bool pvpTiming = IsPvpLifeSend(packet);
-        long pvpTick = pvpTiming ? Environment.TickCount64 : 0;
+        bool pvpTiming = ShouldTracePvpSend(packet);
         byte pvpSource = pvpTiming ? _myGhostId : (byte)0;
+        LinkWriteStamp? pvpStarted = null, pvpCompleted = null;
         try
         {
             ProcessorFrameScope.ThrowIfAbandoned();
+            if (pvpTiming) pvpStarted = LinkWriteStamp.Capture();
             await stream.WriteAsync(packet, ct);
+            if (pvpTiming) pvpCompleted = LinkWriteStamp.Capture();
             if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
         }
         finally
         {
             _tcpWriteLock.Release();
             Wo213NoteOut(packet, Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds, Stopwatch.GetElapsedTime(t1).TotalMilliseconds);   // WO-213 A.1/A.2
+            if (pvpStarted is { } stamp)
+                TracePvpWrite(stream, pvpSource, packet, stream is KcdMp.Steam.SteamConnectionStream, stamp, pvpCompleted);
         }
-        if (pvpTiming) TracePvpSend(stream, pvpSource, packet, t1, pvpTick);
     }
 
     private static bool IntervalElapsed(ref long lastTimestamp, TimeSpan interval, long nowTimestamp)
