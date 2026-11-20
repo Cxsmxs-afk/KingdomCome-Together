@@ -136,7 +136,10 @@ public partial class GameBridge
     // The v8 state-block change gate (sender).
     private BodyState2? _st2LastSent;
     private long _st2LastSentTs;
+    private BodyState2? _st2LastRanged;
+    private long _st2LastRangedTs;
     private bool _st2SawAim;
+    private const int RangedPositionIntervalMs = 50; // The native shooting sampler's cadence.
 
     // Whether the local DLL captures committed attacks (Wo121Status) -- when it
     // does, the Lua "combat swing" cue (0x2C) is not sent: the v8 Attack event
@@ -153,6 +156,7 @@ public partial class GameBridge
         _wo121Ct = ct;
         _wo121ContactSession = new(stream);
         _st2LastSent = null;
+        _st2LastRanged = null;
         _st2SawAim = false;
         _combat.OnLocalAction = OnLocalActionAsync;
         _combat.CapturePvpHitTarget = CapturePvpHitTarget;
@@ -306,7 +310,8 @@ public partial class GameBridge
     /// <summary>
     /// The state block to put on this Position packet, or null. Change-gated:
     /// a field change (speed by 10 cm/s or more, direction by 3 units, any
-    /// bit/zone), or the 1 s heartbeat while anything is non-zero.
+    /// bit/zone), or the 1 s heartbeat while anything is non-zero. Ranged
+    /// edges wake this same position loop, with held updates paced at 50 ms.
     /// <paramref name="due"/> is true when a packet should go out for the
     /// state alone (the body stood still but, say, raised a block).
     /// </summary>
@@ -322,18 +327,27 @@ public partial class GameBridge
             || (c.SpeedCm == 0 && l.SpeedCm != 0);
         bool nonZero = c.SpeedCm != 0 || (c.Bits & ~ranged) != BodyState2Bits.None;
         bool elapsed = Stopwatch.GetElapsedTime(_st2LastSentTs, nowTs).TotalMilliseconds >= Protocol.BodyState2HeartbeatMs;
-        due = changed || (nonZero && elapsed);
-        // A position the caller was already going to send carries changed aim values and repeats
-        // the last stance. Continued idle heartbeats also repair a lost or superseded confirmed end.
+        bool carryRanged = c.RangedHeld || (_st2SawAim && c.RangedOff);
+        bool wasHeld = _st2LastRanged is BodyState2 prior && prior.RangedHeld;
+        bool rangedEdge = carryRanged && c.RangedHeld != wasHeld;
+        double rangedAge = carryRanged ? Stopwatch.GetElapsedTime(_st2LastRangedTs, nowTs).TotalMilliseconds : 0;
+        bool rangedDue = carryRanged && (rangedEdge || rangedAge >= Protocol.BodyState2HeartbeatMs ||
+            (rangedAge >= RangedPositionIntervalMs && _st2LastRanged is BodyState2 lastRanged &&
+                Wo201Rules.AimChanged(lastRanged, c)));
+        due = changed || (nonZero && elapsed) || rangedDue;
         if (!consume) return due ? c : null;
-        bool held = (c.Bits & BodyState2Bits.RangedAim) != 0;
-        bool wasHeld = _st2LastSent is BodyState2 last && (last.Bits & BodyState2Bits.RangedAim) != 0;
-        bool aimChanged = _st2LastSent is BodyState2 prior && Wo201Rules.AimChanged(prior, c);
-        if (!due && !aimChanged && !(_st2SawAim && elapsed)) return null;
-        if (held != wasHeld)
+        // Every replacement position can carry the latest confirmed ranged state.
+        // Missing reads leave the receiver's last observation untouched.
+        if (!due && !carryRanged) return null;
+        if (rangedEdge)
             Console.WriteLine(FormattableString.Invariant(
-                $"MP-BOW send held={(held ? 1 : 0)} charge_known={((c.Bits & BodyState2Bits.RangedChargeKnown) != 0 ? 1 : 0)} charge={c.Charge} angles={(held && c.AimYaw != BodyState2.AimAngleUnavailable && c.AimPitch != BodyState2.AimAngleUnavailable ? "measured" : "unavailable")}"));
-        _st2SawAim |= held;
+                $"MP-BOW send held={(c.RangedHeld ? 1 : 0)} charge_known={((c.Bits & BodyState2Bits.RangedChargeKnown) != 0 ? 1 : 0)} charge={c.Charge} angles={(c.RangedHeld && c.AimYaw != BodyState2.AimAngleUnavailable && c.AimPitch != BodyState2.AimAngleUnavailable ? "measured" : "unavailable")}"));
+        if (carryRanged)
+        {
+            _st2SawAim |= c.RangedHeld;
+            _st2LastRanged = c;
+            _st2LastRangedTs = nowTs;
+        }
         _st2LastSent = c;
         _st2LastSentTs = nowTs;
         return c;
