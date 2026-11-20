@@ -4843,6 +4843,7 @@ public partial class GameBridge(ClientConfig config)
                 // Capture the target before the processor's wait. A respawn can replace it without changing the peer or world.
                 FigureBody p6RangedBody = p6Frame && p6Message.Kind == Protocol.W164RangedStep
                     ? Wo214FigureBody(p6Source) : default;
+                long p6Peer = p6Frame ? P6PeerAtRead(p6Source) : 0;
                 long p6Deadline = p6Frame ? p6ReadTick + Protocol.MeasuredMissileApplyBudgetMs : 0;
                 long markerPeer = P5PeerAtRead(type, payload);
                 P6NoteVisualAtRead(type, payload);
@@ -4896,7 +4897,7 @@ public partial class GameBridge(ClientConfig config)
                     Wo207Queue(frames.Writer, inFrame with
                     {
                         P6Generation = p6State.Generation, P6Serial = p6Serial, P6Life = p6Life,
-                        P6PeerSerial = P6PeerAtRead(type, payload), P6Deadline = p6Deadline, P6RangedBody = p6RangedBody,
+                        P6PeerSerial = p6Peer, P6Deadline = p6Deadline, P6RangedBody = p6RangedBody,
                         P6VisualSerial = Interlocked.Read(ref _p6VisualSerial), P6Ready = p6Ready, P6ModeSerial = p6ModeSerial,
                         Presentation = presentation
                     }, type);
