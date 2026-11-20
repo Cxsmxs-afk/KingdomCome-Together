@@ -295,6 +295,10 @@ public sealed class FriendlyFireReceiptIntegrationTests
             typeof(GameBridge).GetField("_t3StatsNextMs", Instance)!.SetValue(bridge, long.MaxValue);
             typeof(GameBridge).GetField("_w213Caps", Instance)!.SetValue(bridge, caps);
         }
+        await NativeLifeAsync(sourcePipe, sourceServer, sourceLife, ct);
+        using var sourceWriter = new SemaphoreSlim(1);
+        var configured = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var nativeReplies = ReplyToSourceCommandsAsync();
         typeof(GameBridge).GetMethod("Wo121OnConnect", Instance)!.Invoke(sourceBridge, [sourceWire, ct]);
         var entities = (ConcurrentDictionary<string, uint>)typeof(GameBridge).GetField("_ghostEntityIds", Instance)!.GetValue(sourceBridge)!;
         entities[target.Id.ToString()] = eid;
@@ -312,9 +316,9 @@ public sealed class FriendlyFireReceiptIntegrationTests
         byte pipeMarker = 0;
         try
         {
+            await configured.Task.WaitAsync(ct);
             await CalibrateAsync(source, sourceWire);
             await CalibrateAsync(target, targetWire);
-            await NativeLifeAsync(sourcePipe, sourceServer, sourceLife, ct);
             await NativeLifeAsync(targetPipe, targetServer, targetLife, ct);
             await AnnounceTargetLifeAsync(1, targetLife);
             ulong anchor = (ulong)Environment.TickCount64 + 5;
@@ -364,6 +368,7 @@ public sealed class FriendlyFireReceiptIntegrationTests
             targetWire.Feed(Protocol.PlayerHitV8Down, lastDown!);
             await ReadMarkerAsync(targetBridge, targetWire, source.Id, 'z', unexpected);
             Assert.False(unexpected.IsCompleted);
+            Assert.Equal(0, sourcePipe.TimedOut);
 
             if (evidencePath is not null)
                 await File.WriteAllBytesAsync(Path.Combine(evidencePath, scenario + ".1a"), requests.SelectMany(body => body).ToArray(), ct);
@@ -372,7 +377,45 @@ public sealed class FriendlyFireReceiptIntegrationTests
         finally
         {
             stop.Cancel();
-            await Task.WhenAll(sourceReceive, targetReceive);
+            await Task.WhenAll(sourceReceive, targetReceive, nativeReplies);
+        }
+
+        async Task ReplyToSourceCommandsAsync()
+        {
+            // The Windows pipe flush waits for the other end to read commands.
+            // Serve the normal WO-121 startup and heartbeat during the entire series.
+            var header = new byte[3];
+            byte sequence = 0;
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    await sourceServer.ReadExactlyAsync(header, ct);
+                    var body = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
+                    await sourceServer.ReadExactlyAsync(body, ct);
+                    ++sequence;
+                    byte[] reply = (header[0], body.Length) switch
+                    {
+                        (0x16, 7) or (0x18, 3) => [0x81, 3, 0, 1, sequence, 0],
+                        (0x1B, 0) => [0x8A, 2, 0, 0, sequence],
+                        _ => throw new InvalidDataException($"Unexpected FF fixture command 0x{header[0]:X2}/{body.Length}.")
+                    };
+                    await WriteSourceAsync(reply);
+                    if (header[0] == 0x18)
+                    {
+                        Assert.Equal(1, body[0]);
+                        configured.TrySetResult();
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        }
+
+        async Task WriteSourceAsync(byte[] frame)
+        {
+            await sourceWriter.WaitAsync(ct);
+            try { await sourceServer.WriteAsync(frame, ct); }
+            finally { sourceWriter.Release(); }
         }
 
         async Task UntilAsync(ulong time)
@@ -410,9 +453,9 @@ public sealed class FriendlyFireReceiptIntegrationTests
 
         async Task<byte[][]> ForwardNoticeAsync(byte[] frame)
         {
-            await sourceServer.WriteAsync(frame, ct);
-            await sourceServer.WriteAsync(frame, ct);
-            await sourceServer.WriteAsync(new byte[] { 0x91, 2, 0, 0, ++pipeMarker }, ct);
+            await WriteSourceAsync(frame);
+            await WriteSourceAsync(frame);
+            await WriteSourceAsync([0x91, 2, 0, 0, ++pipeMarker]);
             Assert.Equal(pipeMarker, await pipeProcessed.Reader.ReadAsync(ct));
             var upstream = sourceWire.UpstreamHits.TryDequeue(out byte[]? hit) ? hit : null;
             Assert.Empty(sourceWire.UpstreamHits);
