@@ -21,6 +21,9 @@ Vitals target, local;
 struct Contact { uint64_t at; float hp, stamina; bool missile = false; };
 constexpr uint64_t effectDelayMs = 20;
 size_t causes = 0;
+enum class RestoreFault { None, Refused, AcknowledgedWithoutEffect, Partial, AppliedWithoutReceipt };
+RestoreFault restoreFault = RestoreFault::None;
+uint64_t restoreFaultAt = 0;
 
 void* engine_cause(void*, void* out, const uint8_t*) {
     ++causes;
@@ -70,7 +73,19 @@ bool soul_state(void* soul, const char* state, float* value) {
 }
 bool soul_set_state(void* soul, const char* state, float value) {
     auto& vitals = *static_cast<Vitals*>(soul);
-    (std::strcmp(state, "health") == 0 ? vitals.hp : vitals.stamina) = value;
+    float& current = std::strcmp(state, "health") == 0 ? vitals.hp : vitals.stamina;
+    const auto fault = soul == &target && tickMs == restoreFaultAt ? restoreFault : RestoreFault::None;
+    if (fault != RestoreFault::None)
+        std::fprintf(stderr, "FF-RESTORE tick=%llu state=%s fault=%d before=%.2f target=%.2f\n",
+                     static_cast<unsigned long long>(tickMs), state, static_cast<int>(fault), current, value);
+    if (fault == RestoreFault::Refused) return false;
+    if (fault == RestoreFault::AcknowledgedWithoutEffect) return true;
+    if (fault == RestoreFault::Partial) {
+        current += (value - current) / 2;
+        return false;
+    }
+    current = value;
+    if (fault == RestoreFault::AppliedWithoutReceipt) return false;
     return true;
 }
 bool combat_bool(void*, const char*, bool* out) { *out = true; return true; }
@@ -126,6 +141,19 @@ int main(int argc, char** argv) {
             contacts.push_back({100 * i, float(1 + i % 5), float(1 + (i + 1) % 5)});
     } else if (scenario == "recovery" || scenario == "native-life") {
         contacts = {{0, 7, 5}, {3000, 1, 2}};
+    } else if (scenario == "restore-refused" || scenario == "restore-no-effect" || scenario == "restore-partial") {
+        contacts = {{0, 1, 2}};
+        restoreFaultAt = startTick + effectDelayMs;
+        restoreFault = scenario == "restore-refused" ? RestoreFault::Refused :
+                       scenario == "restore-no-effect" ? RestoreFault::AcknowledgedWithoutEffect : RestoreFault::Partial;
+    } else if (scenario == "restore-receipt-lost") {
+        contacts = {{0, 1, 2}, {10, 2, 3}};
+        restoreFaultAt = startTick + effectDelayMs;
+        restoreFault = RestoreFault::AppliedWithoutReceipt;
+    } else if (scenario == "restore-boundary") {
+        contacts = {{0, 1, 2}, {580, 2, 3}, {590, 3, 4}};
+        restoreFaultAt = startTick + 600;
+        restoreFault = RestoreFault::Refused;
     } else {
         return 2;
     }
@@ -152,7 +180,11 @@ int main(int argc, char** argv) {
             target.stamina -= hit.stamina;
         }
         kcdmp::hits::tick();
-        if (target.hp != 200 || target.stamina != 200) return 1;
+        if (tickMs != restoreFaultAt && (target.hp != 200 || target.stamina != 200)) {
+            std::fprintf(stderr, "FF-RESTORE target not restored at tick=%llu hp=%.2f stamina=%.2f\n",
+                         static_cast<unsigned long long>(tickMs), target.hp, target.stamina);
+            return 1;
+        }
     }
     return causes == contacts.size() && nextEffect == contacts.size() ? 0 : 1;
 }

@@ -183,9 +183,33 @@ struct NewWatch { void* soul; uint32_t eid; float hp0, st0; uint8_t flags, mater
 std::vector<NewWatch> g_newWatches;
 struct Watch { void* soul; uint32_t eid; float hp0, st0, dh = 0, ds = 0; uint8_t flags, material; double t0; int frames = 0, landedAt = -1;
                uint8_t kind = 0; uint32_t attackerEid = 0; bool fatal = false; uint8_t outcome = 0;
-               wo155rules::WatchSeries pvp{}; uint64_t pvpFirstEffectTick = 0; };
+               wo155rules::WatchSeries pvp{}; uint64_t pvpFirstEffectTick = 0;
+               float pvpObservedHp = 0, pvpObservedSt = 0; uint32_t pvpRestoreIncomplete = 0; };
 std::vector<Watch> g_watches;   // main thread only
 constexpr double kWatchS = 0.6;
+
+bool observe_pvp_vital(void* soul, const char* state, float current, float restoreTo, float tolerance,
+                       float& observed, float& loss, uint32_t& incomplete) {
+    const float sample = (std::min)(current, restoreTo);
+    const bool dropped = sample < observed - tolerance;
+    if (dropped) loss += observed - sample;
+    if (dropped || sample > observed) observed = sample;
+    if (sample >= restoreTo - tolerance) return dropped;
+
+    // The reflection receipt does not establish the effect of SetState.
+    // Read back this attempt. If unreadable, keep the measured deficit so
+    // the next update cannot report it again as a fresh hit.
+    observed = sample;
+    rttr::soul_set_state(soul, state, restoreTo);
+    float restored = 0;
+    if (rttr::soul_state(soul, state, &restored)) {
+        observed = (std::min)(restored, restoreTo);
+        if (observed >= restoreTo - tolerance) return dropped;
+    }
+    ++incomplete;
+    return dropped;
+}
+
 std::atomic<uint64_t> g_playerWuid{0};
 std::atomic<uint32_t> g_playerEid{0};
 std::atomic<PvpFn> g_pvpFn{nullptr};
@@ -1103,11 +1127,12 @@ void log_pvp_trace(const PvpTrace& trace) {
     const uint64_t duration = observed.capturedTick && observed.measuredTick >= observed.capturedTick
         ? observed.measuredTick - observed.capturedTick : 0;
     logf("WO121-HITS player hit on avatar eid=0x%X measured hp -%.2f st -%.2f (landed at frame %d of %d) -> %s"
-         " measurement_id=%llu capture_tick=%llu first_effect_tick=%llu measured_tick=%llu native_observe_ms=%llu missile=%u publication=%s",
+         " measurement_id=%llu capture_tick=%llu first_effect_tick=%llu measured_tick=%llu native_observe_ms=%llu missile=%u publication=%s restore_incomplete=%u",
          trace.victim, trace.health, trace.stamina, trace.landedAt, trace.frames, trace.result,
          static_cast<unsigned long long>(observed.measurementId), static_cast<unsigned long long>(observed.capturedTick),
          static_cast<unsigned long long>(trace.firstEffectTick), static_cast<unsigned long long>(observed.measuredTick),
-         static_cast<unsigned long long>(duration), (trace.flags & 0x02) ? 1u : 0u, trace.final ? "final" : "bounded");
+         static_cast<unsigned long long>(duration), (trace.flags & 0x02) ? 1u : 0u, trace.final ? "final" : "bounded",
+         trace.restoreIncomplete);
 }
 
 void tick() {
@@ -1172,7 +1197,11 @@ void tick() {
         if (!merged) {
             Watch w{n.soul, n.eid, n.hp0, n.st0, 0, 0, n.flags, n.material, now};
             w.kind = n.kind; w.attackerEid = n.attackerEid; w.outcome = n.outcome;
-            if (n.kind == kWatchPvp) w.pvp.add(n.pvp);
+            if (n.kind == kWatchPvp) {
+                w.pvp.add(n.pvp);
+                w.pvpObservedHp = n.hp0;
+                w.pvpObservedSt = n.st0;
+            }
             if (n.kind == kWatchDefence) g_defLanded[n.attackerEid] = now;   // WO-208 B: wo166's window asks
             g_watches.push_back(w);
         }
@@ -1203,14 +1232,20 @@ void tick() {
             if (w.st0 - st > w.ds + 0.25f) { w.ds = w.st0 - st; if (w.landedAt < 0) w.landedAt = w.frames; }
         } else if (live && rttr::soul_state(w.soul, "health", &hp) && rttr::soul_state(w.soul, "stamina", &st)) {
             bool dropped = false;
-            if (hp < w.hp0 - 0.01f) { w.dh += w.hp0 - hp; rttr::soul_set_state(w.soul, "health", w.hp0); dropped = true; }
-            // WO-157 3b.1: an NPC's blow on an avatar keeps the stamina it cost (only the health is put back -- the joiner's
-            // game takes both). Refilled after every blow, the figure never tired: its stamina soaked every blow, 14 of 16
-            // measured hp 0, and the joiner was never hurt. Measured from its lowest point, so a blow is counted once.
-            if (st < w.st0 - 0.25f) {
-                w.ds += w.st0 - st;
-                if (w.kind == kWatchNpc) w.st0 = st; else rttr::soul_set_state(w.soul, "stamina", w.st0);
-                dropped = true;
+            if (w.kind == kWatchPvp) {
+                const bool hpDrop = observe_pvp_vital(w.soul, "health", hp, w.hp0, 0.01f, w.pvpObservedHp, w.dh, w.pvpRestoreIncomplete);
+                const bool stDrop = observe_pvp_vital(w.soul, "stamina", st, w.st0, 0.25f, w.pvpObservedSt, w.ds, w.pvpRestoreIncomplete);
+                dropped = hpDrop || stDrop;
+            } else {
+                if (hp < w.hp0 - 0.01f) { w.dh += w.hp0 - hp; rttr::soul_set_state(w.soul, "health", w.hp0); dropped = true; }
+                // WO-157 3b.1: an NPC's blow on an avatar keeps the stamina it cost (only the health is put back -- the joiner's
+                // game takes both). Refilled after every blow, the figure never tired: its stamina soaked every blow, 14 of 16
+                // measured hp 0, and the joiner was never hurt. Measured from its lowest point, so a blow is counted once.
+                if (st < w.st0 - 0.25f) {
+                    w.ds += w.st0 - st;
+                    if (w.kind == kWatchNpc) w.st0 = st; else rttr::soul_set_state(w.soul, "stamina", w.st0);
+                    dropped = true;
+                }
             }
             if (dropped) {
                 c_restored.fetch_add(1);
@@ -1251,7 +1286,7 @@ void tick() {
             if (ReplayDmgFn fn = g_replayDmgFn.load()) fn(w.attackerEid, w.eid, w.dh, w.ds, live);
         } else if (w.kind == kWatchPvp) {
             const bool damage = w.dh > 0 || w.ds > 0;
-            if (damage || !keepWatching) {
+            if (damage || !keepWatching || w.pvpRestoreIncomplete) {
                 const auto capture = w.pvp.evidence();
                 const bool current = capture.victim == w.eid && capture.tick <= measuredTick && current_pvp_capture(capture);
                 const bool send = live && damage && current && g_ff.load() && pvpCount < pvp.size();
@@ -1260,12 +1295,14 @@ void tick() {
                     !current ? "dropped (capture scope retired)" : send ? "measured for forwarding" :
                     !g_ff.load() ? "dropped (friendly fire off)" : "dropped (avatar observation capacity)";
                 pipe::queue_pvp_trace({{capture.tick, measuredTick, capture.source.proof, measurementId},
-                    w.pvpFirstEffectTick, w.eid, w.dh, w.ds, w.landedAt, w.frames, capture.flags, !keepWatching, result});
+                    w.pvpFirstEffectTick, w.eid, w.dh, w.ds, w.landedAt, w.frames, capture.flags, !keepWatching, result,
+                    w.pvpRestoreIncomplete});
                 if (send) pvp[pvpCount++] = {w.ds, w.dh, capture, measuredTick, measurementId};
             }
             if (keepWatching) {
                 w.pvp.advance(measuredTick);
                 w.dh = w.ds = 0;
+                w.pvpRestoreIncomplete = 0;
                 w.pvpFirstEffectTick = 0;
                 w.frames = 0;
                 w.landedAt = -1;

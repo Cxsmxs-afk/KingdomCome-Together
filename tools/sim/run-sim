@@ -87,7 +87,8 @@ EOF
     "${CXX:-c++}" -std=c++17 -O2 -ffunction-sections -fdata-sections \
         -I native/tests/ff-platform -I native/KCDMP native/tests/ff_capture_fixture.cpp \
         -Wl,--gc-sections -o "$native_tmp/ff-capture"
-    ff_captures=(melee missile single boundary continuous recovery native-life)
+    ff_captures=(melee missile single boundary continuous recovery native-life
+        restore-refused restore-no-effect restore-partial restore-receipt-lost restore-boundary)
     for capture in "${ff_captures[@]}"; do
         (cd "$native_tmp" && ./ff-capture "$capture") > "$native_tmp/$capture.hex"
         diff -u --strip-trailing-cr "dotnet/KcdMp.Client.Tests/Fixtures/FriendlyFire/$capture.hex" "$native_tmp/$capture.hex"

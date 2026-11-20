@@ -89,6 +89,7 @@ struct PvpTrace {
     uint8_t flags = 0;
     bool final = false;
     const char* result = nullptr; // static reason string
+    uint32_t restoreIncomplete = 0;
 };
 void log_pvp_trace(const PvpTrace& trace);
 

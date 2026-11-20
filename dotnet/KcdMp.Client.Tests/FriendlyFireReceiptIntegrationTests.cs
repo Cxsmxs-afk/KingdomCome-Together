@@ -354,6 +354,11 @@ public sealed class FriendlyFireReceiptIntegrationTests
     [InlineData("life", 1, 1, 2, 2)]
     [InlineData("late", 1, 1, 2, 2)]
     [InlineData("native-life", 1, 1, 2, 2)]
+    [InlineData("restore-refused", 1, 1, 2, 2)]
+    [InlineData("restore-no-effect", 1, 1, 2, 2)]
+    [InlineData("restore-partial", 1, 1, 2, 2)]
+    [InlineData("restore-receipt-lost", 1, 3, 5, 2)]
+    [InlineData("restore-boundary", 2, 6, 9, 2)]
     [InlineData("melee", 4, 15, 14, 3)]
     [InlineData("missile", 4, 15, 14, 4)]
     public async Task Native_measured_series_reaches_the_authenticated_target_once(
@@ -383,7 +388,8 @@ public sealed class FriendlyFireReceiptIntegrationTests
         await using var third = players >= 3 ? await ReplayPeer.ConnectAsync(relay.Port, "SeriesPeer3", ct) : null;
         await using var fourth = players == 4 ? await ReplayPeer.ConnectAsync(relay.Port, "SeriesPeer4", ct) : null;
         var spectators = new[] { third, fourth }.OfType<ReplayPeer>().ToArray();
-        var (source, target) = scenario == "missile" ? (guest, host) : (host, guest);
+        var (source, target) = scenario is "missile" or "restore-partial" or "restore-receipt-lost"
+            ? (guest, host) : (host, guest);
         const ushort caps = Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife | Protocol.LinkCapPresentationTime;
         foreach (var peer in new[] { host, guest }.Concat(spectators))
         {
