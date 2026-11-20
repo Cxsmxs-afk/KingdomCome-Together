@@ -353,15 +353,25 @@ public partial class GameBridge
     }
 
     /// <summary>A frame through the scheduler when it runs on this stream; false = write it the old way.</summary>
-    private bool Wo213TryQueue(Stream stream, byte[] packet, CancellationToken ct = default)
+    private bool Wo213TryQueue(Stream stream, byte[] packet, CancellationToken ct = default) =>
+        Wo213TryQueueScoped(stream, packet, ct, null);
+
+    private bool Wo213TryQueueScoped(Stream stream, byte[] packet, CancellationToken ct, RelayWriteScope? scope)
     {
         ProcessorFrameScope.ThrowIfAbandoned();
         ct.ThrowIfCancellationRequested();
         if (_w213Writer is not { } w || !ReferenceEquals(stream, _w213Stream)) return false;
         var lease = ProcessorFrameScope.Capture();
         bool Current() => !ct.IsCancellationRequested && lease?.IsAbandoned != true && lease?.Token.IsCancellationRequested != true;
-        w.Enqueue(packet, Current);   // throws when the writer died: the caller's write failed, as before
+        w.Enqueue(packet, Current, scope?.Completed, startWrite: scope is null ? null : Admit);
         return true;
+
+        ValueTask? Admit(Func<ValueTask> send)
+        {
+            if (scope!.Refusal() is not { } reason) return send();
+            scope.Rejected(reason);
+            return null;
+        }
     }
 
     private static bool ShouldTracePvpSend(byte[] frame) =>

@@ -488,56 +488,84 @@ public partial class GameBridge
         byte flags = hit.Flags;
         ulong callbackTick = (ulong)Environment.TickCount64;
         byte source = Volatile.Read(ref _myGhostId);
+        long lifecycle = Interlocked.Read(ref _p1Serial);
+        long senderLife = Interlocked.Read(ref _t3InputLifeRevision);
         string line = FormattableString.Invariant(
             $"MP-FF dir=out victim_eid=0x{victimEid:X} ghost={target?.Ghost.ToString() ?? "?"} hp={health:F2} st={stamina:F2} unarmed={((flags & PlayerHitV8.FlagUnarmed) != 0 ? 1 : 0)} missile={((flags & PlayerHitV8.FlagMissile) != 0 ? 1 : 0)} session={On(_ffSession)}");
         if (!_ffSession || target is not { } captured || _wo121Stream is not Stream s || (health <= 0 && stamina <= 0))
         {
-            _w121FfOutDropped++;
+            Interlocked.Increment(ref _w121FfOutDropped);
             Console.WriteLine(line + $" result=dropped reason={(!_ffSession ? "friendly-fire-off" : _wo121Stream is null ? "no-relay" : target is null ? "unknown-avatar" : "no-damage")}");
             return;
         }
         var (session, vid, incarnation, life, observedTick) = captured;
+        string targetKey = vid.ToString();
         if (!ReferenceEquals(session, _wo121ContactSession) || !ReferenceEquals(s, session.Relay) ||
             (_w213Caps & Protocol.LinkCapPvpLife) == 0)
         {
-            _w121FfOutDropped++;
+            Interlocked.Increment(ref _w121FfOutDropped);
             Console.WriteLine(line + " result=dropped reason=contact-capability");
             return;
         }
-        bool sourceCurrent = diagnostic
+        bool SourceCurrent() => diagnostic
             ? hit.SourceLifeProof != 0 && hit.SourceLifeProof == _combat.PvpNativeLife
             : _combat.PvpCaptureCurrent(hit);
-        if (!hit.FreshAt(callbackTick) || !sourceCurrent)
+        bool TargetCurrent() => life != 0 &&
+            _ghostEntityIds.TryGetValue(targetKey, out uint stillBound) && stillBound == victimEid &&
+            session.FindTarget(vid, victimEid) == (incarnation, life, observedTick);
+        if (!hit.FreshAt(callbackTick) || !SourceCurrent())
         {
-            _w121FfOutDropped++;
+            Interlocked.Increment(ref _w121FfOutDropped);
             Console.WriteLine(line + $" result=dropped reason=stale-native-capture measurement={hit.MeasurementId}");
             return;
         }
         if (!diagnostic && !session.TryClaimMeasurement(_combat, hit))
         {
-            _w121FfOutDropped++;
+            Interlocked.Increment(ref _w121FfOutDropped);
             Console.WriteLine(line + $" result=dropped reason=measurement-stale-or-duplicate measurement={hit.MeasurementId}");
             return;
         }
-        if (life == 0 || !_ghostEntityIds.TryGetValue(vid.ToString(), out uint stillBound) || stillBound != victimEid ||
-            session.FindTarget(vid, victimEid) != (incarnation, life, observedTick))
+        if (!TargetCurrent())
         {
-            _w121FfOutDropped++;
+            Interlocked.Increment(ref _w121FfOutDropped);
             Console.WriteLine(line + " result=dropped reason=recipient-life-unavailable-or-changed");
             return;
         }
         if (observedTick == 0 || hit.CapturedTick <= observedTick)
         {
-            _w121FfOutDropped++;
+            Interlocked.Increment(ref _w121FfOutDropped);
             Console.WriteLine(line + $" result=dropped reason=capture-before-recipient-life measurement={hit.MeasurementId} captured_tick={hit.CapturedTick} recipient_tick={observedTick}");
             return;
         }
         ulong contact = session.Next();
-        await WritePacketAsync(s, new PlayerHitV8(vid, stamina, health, flags, hit.Material)
-            .BuildUp(contact, incarnation, life), _wo121Ct);
-        _w121FfOut++;
-        Wo155NoteFfSent(vid);   // WO-155: the knockdown this hit causes on his screen is the one his figure falls for here
-        Console.WriteLine(line + $" result=sent contact_seq={contact} recipient={incarnation} recipient_life={life} source={source} measurement={hit.MeasurementId} captured_tick={hit.CapturedTick} measured_tick={hit.MeasuredTick} pipe_read_tick={hit.ReadTick} callback_tick={callbackTick} native_ms={hit.MeasuredTick - hit.CapturedTick} pipe_ms={hit.ReadTick - hit.MeasuredTick} queue_ms={callbackTick - hit.ReadTick}");
+        CancellationToken lifetime = _wo121Ct;
+        await WriteScopedPacketAsync(s, new PlayerHitV8(vid, stamina, health, flags, hit.Material)
+            .BuildUp(contact, incarnation, life), lifetime, new RelayWriteScope(Refusal, Rejected, AfterWrite));
+
+        bool SessionCurrent() => ReferenceEquals(session, _wo121ContactSession) && ReferenceEquals(s, _wo121Stream);
+        // The physical relay writer may have been held behind other frames.
+        string? Refusal()
+        {
+            if (lifetime.IsCancellationRequested || !SessionCurrent()) return "relay-retired";
+            if (!_ffSession || (_w213Caps & Protocol.LinkCapPvpLife) == 0) return "friendly-fire-disabled";
+            if (!hit.FreshAt((ulong)Environment.TickCount64) || !SourceCurrent() ||
+                lifecycle != Interlocked.Read(ref _p1Serial) || senderLife != Interlocked.Read(ref _t3InputLifeRevision))
+                return "stale-native-capture";
+            return TargetCurrent() ? null : "recipient-life-unavailable-or-changed";
+        }
+
+        void Rejected(string reason)
+        {
+            Interlocked.Increment(ref _w121FfOutDropped);
+            Console.WriteLine(line + $" stage=relay-write result=dropped reason={reason} measurement={hit.MeasurementId}");
+        }
+        void AfterWrite()
+        {
+            Interlocked.Increment(ref _w121FfOut);
+            if (SessionCurrent() && TargetCurrent())
+                Wo155NoteFfSent(vid);   // WO-155: only this victim's current figure may recognize the ensuing knockdown
+            Console.WriteLine(line + $" result=sent contact_seq={contact} recipient={incarnation} recipient_life={life} source={source} measurement={hit.MeasurementId} captured_tick={hit.CapturedTick} measured_tick={hit.MeasuredTick} pipe_read_tick={hit.ReadTick} callback_tick={callbackTick} native_ms={hit.MeasuredTick - hit.CapturedTick} pipe_ms={hit.ReadTick - hit.MeasuredTick} queue_ms={callbackTick - hit.ReadTick}");
+        }
     }
 
     // =====================================================================

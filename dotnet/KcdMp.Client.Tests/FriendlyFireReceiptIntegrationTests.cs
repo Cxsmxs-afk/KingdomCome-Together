@@ -121,6 +121,103 @@ public sealed class FriendlyFireReceiptIntegrationTests
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Contact_waiting_for_the_relay_writer_cannot_leave_under_a_retired_source_life(bool scheduled)
+    {
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var ct = stop.Token;
+        string name = "ff-source-writer-" + Guid.NewGuid().ToString("N")[..16];
+        using var server = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        await using var pipe = new CombatPipe(name);
+        Task listen = server.WaitForConnectionAsync(ct);
+        Assert.True(await pipe.EnsureConnectedAsync(ct));
+        await listen;
+
+        using var wire = new HeldPeerStream();
+        byte source = scheduled ? (byte)2 : (byte)1, victim = scheduled ? (byte)1 : (byte)2;
+        const uint entity = 222;
+        const ulong incarnation = 43, recipientLife = 9101, oldSourceLife = 501, newSourceLife = 502;
+        var bridge = BridgeOn(pipe, wire, source);
+        await NativeLifeAsync(pipe, server, oldSourceLife, ct);
+        typeof(GameBridge).GetField("_t3StatsNextMs", Instance)!.SetValue(bridge, long.MaxValue);
+        typeof(GameBridge).GetMethod("Wo121OnConnect", Instance)!.Invoke(bridge, [wire, ct]);
+        var contactSession = (GameBridge.PvpContactSession)typeof(GameBridge).GetField("_wo121ContactSession", Instance)!.GetValue(bridge)!;
+        var sentSequence = typeof(GameBridge.PvpContactSession).GetField("_sent", Instance)!;
+        var entities = (ConcurrentDictionary<string, uint>)typeof(GameBridge).GetField("_ghostEntityIds", Instance)!.GetValue(bridge)!;
+        entities[victim.ToString()] = entity;
+        var versions = (ConcurrentDictionary<byte, string>)typeof(GameBridge).GetField("_ghostReleaseVersions", Instance)!.GetValue(bridge)!;
+        var writeGate = (SemaphoreSlim)typeof(GameBridge).GetField("_tcpWriteLock", Instance)!.GetValue(bridge)!;
+        LinkWriter? writer = null;
+        if (scheduled)
+        {
+            writer = new LinkWriter(new LinkScheduler(new LinkSchedOptions { Budget = false }), new StreamLinkPath(wire));
+            typeof(GameBridge).GetField("_w213Writer", Instance)!.SetValue(bridge, writer);
+            typeof(GameBridge).GetField("_w213Stream", Instance)!.SetValue(bridge, wire);
+        }
+        var markers = Channel.CreateUnbounded<byte>();
+        pipe.OnLocalDowned = (_, reason) =>
+        {
+            Assert.True(markers.Writer.TryWrite(reason));
+            return Task.CompletedTask;
+        };
+        var reader = (Task)typeof(GameBridge).GetMethod("ReceiveLoopAsync", Instance)!.Invoke(bridge, [wire, ct])!;
+        bool lockHeld = false;
+        try
+        {
+            byte[] roster = new byte[Protocol.PvpPeerLifeLen];
+            roster[0] = victim;
+            BinaryPrimitives.WriteUInt64LittleEndian(roster.AsSpan(1), incarnation);
+            new PvpLifeState(1, recipientLife).Write(roster.AsSpan(Protocol.PvpPeerLen));
+            wire.Feed(Protocol.PvpPeerDown, roster);
+            wire.Feed(Protocol.ReleaseVersion, [victim, (byte)'b']);
+            while (versions.GetValueOrDefault(victim) != "b") await Task.Delay(1, ct);
+            long rosterReceivedBy = Environment.TickCount64;
+            while (Environment.TickCount64 <= rosterReceivedBy) await Task.Delay(1, ct);
+            if (writer is null)
+            {
+                await writeGate.WaitAsync(ct);
+                lockHeld = true;
+            }
+
+            await SendHitAndMarkerAsync(5, oldSourceLife, 1);
+            // The source passed its original checks and assigned a sequence before reaching the writer.
+            while ((long)sentSequence.GetValue(contactSession)! == 0) await Task.Delay(1, ct);
+            if (writer is not null) Assert.Equal((byte)1, await markers.Reader.ReadAsync(ct));
+            Assert.Empty(wire.UpstreamHits);
+
+            // The physical pipe reader observes the new life even when the notice callback is held.
+            await NativeLifeAsync(pipe, server, newSourceLife, ct);
+            if (writer is not null) await writer.PumpOnceAsync(ct);
+            else
+            {
+                writeGate.Release();
+                lockHeld = false;
+                Assert.Equal((byte)1, await markers.Reader.ReadAsync(ct));
+            }
+            Assert.Empty(wire.UpstreamHits);
+
+            await SendHitAndMarkerAsync(7, newSourceLife, 2);
+            Assert.Equal((byte)2, await markers.Reader.ReadAsync(ct));
+            if (writer is not null) await writer.PumpOnceAsync(ct);
+            Assert.Equal(new PlayerHitV8(victim, 10, 7, 0, 3).BuildUp(2, incarnation, recipientLife), Assert.Single(wire.UpstreamHits));
+        }
+        finally
+        {
+            if (lockHeld) writeGate.Release();
+            stop.Cancel();
+            await reader;
+        }
+
+        async Task SendHitAndMarkerAsync(float damage, ulong life, byte marker)
+        {
+            ulong tick = (ulong)Environment.TickCount64;
+            await server.WriteAsync(NativeContact(entity, 0, damage, tick, tick, life, marker), ct);
+            await server.WriteAsync(new byte[] { 0x91, 2, 0, 1, marker }, ct);
+        }
+    }
+
     [Fact]
     public async Task Contact_held_outside_reader_before_respawn_never_reaches_native_after_respawn_on_same_stream()
     {

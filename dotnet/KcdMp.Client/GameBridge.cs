@@ -8200,10 +8200,16 @@ public partial class GameBridge(ClientConfig config)
         }
     }
 
-    private async Task WritePacketAsync(Stream stream, byte[] packet, CancellationToken ct = default)
+    private sealed record RelayWriteScope(Func<string?> Refusal, Action<string> Rejected, Action Completed);
+
+    private Task WritePacketAsync(Stream stream, byte[] packet, CancellationToken ct = default) =>
+        WriteScopedPacketAsync(stream, packet, ct);
+
+    private async Task WriteScopedPacketAsync(Stream stream, byte[] packet, CancellationToken ct,
+        RelayWriteScope? scope = null)
     {
         ProcessorFrameScope.ThrowIfAbandoned();
-        if (Wo213TryQueue(stream, packet, ct)) return;   // WO-213 C: the scheduler is this link's writer (it counts what it sends)
+        if (Wo213TryQueueScoped(stream, packet, ct, scope)) return;
         using var frameLink = ProcessorFrameScope.Link(ct);
         ct = frameLink.Token;
         long t0 = Stopwatch.GetTimestamp();
@@ -8212,21 +8218,33 @@ public partial class GameBridge(ClientConfig config)
         bool pvpTiming = ShouldTracePvpSend(packet);
         byte pvpSource = pvpTiming ? _myGhostId : (byte)0;
         LinkWriteStamp? pvpStarted = null, pvpCompleted = null;
+        string? rejection = null;
         try
         {
             ProcessorFrameScope.ThrowIfAbandoned();
-            if (pvpTiming) pvpStarted = LinkWriteStamp.Capture();
-            await stream.WriteAsync(packet, ct);
-            if (pvpTiming) pvpCompleted = LinkWriteStamp.Capture();
-            if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
+            rejection = scope?.Refusal();
+            if (rejection is null)
+            {
+                if (pvpTiming) pvpStarted = LinkWriteStamp.Capture();
+                await stream.WriteAsync(packet, ct);
+                if (pvpTiming) pvpCompleted = LinkWriteStamp.Capture();
+                if (_sessionRecorder is { } recorder) RecordRelayWrite(recorder, packet);
+            }
         }
         finally
         {
             _tcpWriteLock.Release();
-            Wo213NoteOut(packet, Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds, Stopwatch.GetElapsedTime(t1).TotalMilliseconds);   // WO-213 A.1/A.2
+            if (rejection is null)
+                Wo213NoteOut(packet, Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds, Stopwatch.GetElapsedTime(t1).TotalMilliseconds);   // WO-213 A.1/A.2
             if (pvpStarted is { } stamp)
                 TracePvpWrite(stream, pvpSource, packet, stream is KcdMp.Steam.SteamConnectionStream, stamp, pvpCompleted);
         }
+        if (rejection is not null)
+        {
+            scope!.Rejected(rejection);
+            return;
+        }
+        scope?.Completed();
     }
 
     private static bool IntervalElapsed(ref long lastTimestamp, TimeSpan interval, long nowTimestamp)
