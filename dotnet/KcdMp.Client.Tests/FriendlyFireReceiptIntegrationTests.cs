@@ -63,6 +63,11 @@ public sealed class FriendlyFireReceiptIntegrationTests
             wire.Feed(Protocol.ReleaseVersion, [victim, marker]);
             while (!versions.TryGetValue(victim, out var version) || version != ((char)marker).ToString())
                 await Task.Delay(5, ct);
+            // The next contact must be strictly newer than the roster observation.
+            // Windows may still report the same boot tick after one short delay.
+            long rosterReceivedBy = Environment.TickCount64;
+            while (Environment.TickCount64 <= rosterReceivedBy)
+                await Task.Delay(1, ct);
         }
 
         ValueTask SendHitAsync(float damage, ulong id)
@@ -93,7 +98,6 @@ public sealed class FriendlyFireReceiptIntegrationTests
             await SendHitAsync(5, 1);
             Assert.Equal(formerLife, (await targetAtRead.Task.WaitAsync(ct))?.Life);
             await UpdateRosterAsync(2, currentLife, (byte)'b');
-            await Task.Delay(2, ct);
             await SendHitAsync(7, 2);
             await SendHitAsync(11, 3);
             await SendHitAsync(13, 4);
