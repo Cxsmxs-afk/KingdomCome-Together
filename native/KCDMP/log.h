@@ -211,17 +211,19 @@ class Scope {
     bool previous_ = active;
 public:
     Scope() noexcept { active = true; }
-    ~Scope() {
-        active = previous_;
-#ifdef _WIN32
-        if (!previous_) {
-            if (const auto event = wake.load(std::memory_order_acquire)) SetEvent(event);
-        }
-#endif
-    }
+    ~Scope() { active = previous_; }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 };
+
+inline void enqueue(const char* fmt, va_list args) {
+    queue.push(fmt, args);
+#ifdef _WIN32
+    // Signal at capture, so an engine call can hang after logging without
+    // hiding the last diagnostic until its enclosing scope returns.
+    if (const auto event = wake.load(std::memory_order_acquire)) SetEvent(event);
+#endif
+}
 } // namespace deferred_log
 
 inline void write_log(const deferred_log::Record* event, const char* fmt, va_list args) {
@@ -290,7 +292,7 @@ inline void write_log(const deferred_log::Record* event, const char* fmt, va_lis
 inline void logf(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    if (deferred_log::active) deferred_log::queue.push(fmt, args);
+    if (deferred_log::active) deferred_log::enqueue(fmt, args);
     else write_log(nullptr, fmt, args);
     va_end(args);
 }

@@ -86,17 +86,23 @@ int load_sequence_log_stall_tests(int* passed) {
     };
     test("host", Phase::Play, Gate::Play, 782, 0, 1, false, 0);
     test("joiner", Phase::Offer, Gate::Hold, 783, 0, 2, false, 0);
+    bool observedWake = true, checkedWake = false;
 #ifdef _WIN32
+    checkedWake = true;
     kcdmp::deferred_log::prepare();
+    const auto event = kcdmp::deferred_log::wake.load();
+    {
+        kcdmp::deferred_log::Scope diagnostic;
+        kcdmp::logf("LOAD-LOG-STALL-FIXTURE wake inside active scope");
+        observedWake = event && WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+    }
 #endif
     test("host-offer-hold", Phase::Offer, Gate::Hold, 784, kHostOfferHeld, 3, true, 1);
     test("host-offer-release", Phase::Play, Gate::Play, 784, 0, 4, false, 2);
     disconnected(91);
 
-    bool observedWake = true;
 #ifdef _WIN32
-    const auto event = kcdmp::deferred_log::wake.exchange(nullptr);
-    observedWake = event && WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+    kcdmp::deferred_log::wake.store(nullptr);
     if (event) CloseHandle(event);
 #endif
     kcdmp::deferred_log::Record record;
@@ -108,7 +114,8 @@ int load_sequence_log_stall_tests(int* passed) {
     }
     if (heldLog == 1 && releaseLog == 1 && lifecycleLog == 6 && observedWake) ++ok;
     else ++failed;
-    std::printf("LOAD-LOG-STALL retained lifecycle=%u nested_hold=%u nested_release=%u\n", lifecycleLog, heldLog, releaseLog);
+    std::printf("LOAD-LOG-STALL retained lifecycle=%u nested_hold=%u nested_release=%u wake_checked=%d wake_in_scope=%d\n",
+                lifecycleLog, heldLog, releaseLog, checkedWake, checkedWake && observedWake);
 
     kcdmp::deferred_log::Queue bounded;
     for (unsigned index = 0; index < 80; ++index)
