@@ -12124,11 +12124,6 @@ function KCD2MP_SetGhostHorse(id, name)
         pcall(function() world = System.GetEntityByName(name) end)
         if world and tostring(world.class or "") == "Horse" then
             mp_log("GHOST_HORSE swapping proxy for world horse '" .. name .. "' id=" .. id)
-            if ghost.istate.nativeMounted then
-                pcall(function() ghost.entity.human:ForceDismount() end)
-                ghost.istate.nativeMounted = false
-            end
-            KCD2MP_RemoveHorse(id)
             local wp = nil
             pcall(function() wp = ghost.entity:GetWorldPos() end)
             KCD2MP_SpawnHorse(id, wp and wp.x or 0, wp and wp.y or 0, wp and wp.z or 0,
@@ -12137,8 +12132,38 @@ function KCD2MP_SetGhostHorse(id, name)
     end
 end
 
+function KCD2MP_RideBinding(id)
+    local ghost, horse = KCD2MP.ghosts[id], KCD2MP.horseGhosts[id]
+    if not (ghost and ghost.entity and ghost.istate) then return nil end
+    local load = KCD2MP.w136.loadSequence
+    return { ghost = ghost, rider = ghost.entity, state = ghost.istate,
+             horse = horse, mount = horse and horse.entity,
+             session = load and load.session, generation = load and load.generation }
+end
+
+function KCD2MP_RideBindingCurrent(id, binding)
+    if not binding then return false end
+    local ghost, horse = KCD2MP.ghosts[id], KCD2MP.horseGhosts[id]
+    local load = KCD2MP.w136.loadSequence
+    return rawequal(ghost, binding.ghost) and rawequal(ghost.entity, binding.rider)
+        and rawequal(ghost.istate, binding.state) and rawequal(horse, binding.horse)
+        and rawequal(horse and horse.entity, binding.mount)
+        and (load and load.session) == binding.session and (load and load.generation) == binding.generation
+end
+
+function KCD2MP_ScheduleRideMount(id)
+    local binding = KCD2MP_RideBinding(id)
+    if not binding then return end
+    Script.SetTimer(400, function() KCD2MP_MountNPCOnHorse(id, binding) end)
+end
+
 function KCD2MP_SpawnHorse(id, x, y, z, rotZ)
-    if KCD2MP.horseGhosts[id] then
+    local ghost = KCD2MP.ghosts[id]
+    if KCD2MP.horseGhosts[id] or (ghost and ghost.istate and ghost.istate.dismountPending) then
+        if ghost and ghost.entity and not KCD2MP_GhostDismount(id, ghost, "horse-change") then
+            ghost.istate.rideRebind = true
+            return nil
+        end
         KCD2MP_RemoveHorse(id)
     end
 
@@ -12206,9 +12231,7 @@ function KCD2MP_SpawnHorse(id, x, y, z, rotZ)
             mp_log("HorseAdopt OK id=" .. id .. " world horse '" .. wantName .. "'")
             -- WO-151 Phase 2: the avatar's ride is the horse's one driver from here on
             if KCD2MP_W151AvatarTakesHorse then pcall(KCD2MP_W151AvatarTakesHorse, wantName) end
-            Script.SetTimer(400, function()
-                KCD2MP_MountNPCOnHorse(id)
-            end)
+            KCD2MP_ScheduleRideMount(id)
             return world
         end
         mp_log("HorseAdopt: '" .. tostring(wantName) .. "' not loaded here; falling back to proxy id=" .. id)
@@ -12244,28 +12267,29 @@ function KCD2MP_SpawnHorse(id, x, y, z, rotZ)
 
     mp_log("HorseSpawn OK id=" .. id .. " entityId=" .. tostring(horse.id))
 
-    Script.SetTimer(400, function()
-        KCD2MP_MountNPCOnHorse(id)
-    end)
+    KCD2MP_ScheduleRideMount(id)
 
     return horse
 end
 
-function KCD2MP_MountNPCOnHorse(id)
-    local ghost     = KCD2MP.ghosts[id]
-    local horseData = KCD2MP.horseGhosts[id]
-    if not ghost or not ghost.entity or not horseData or not horseData.entity then
-        mp_log("MountNPCOnHorse: missing entity id=" .. id)
+function KCD2MP_MountNPCOnHorse(id, binding)
+    binding = binding or KCD2MP_RideBinding(id)
+    if not KCD2MP_RideBindingCurrent(id, binding) or not binding.mount then
+        mp_log("WO160-MOUNT refused id=" .. tostring(id) .. " reason=stale-or-missing-binding")
         return
     end
 
-    local horse = horseData.entity
-    local human = ghost.entity.human
+    local ghost, st, horseData = binding.ghost, binding.state, binding.horse
+    local load = KCD2MP.w136.loadSequence
+    if not st.isRiding or st.dismountPending or KCD2MP_RideBindingCurrent(id, st.mountReadback)
+        or (load and load.enabled and (load.phase ~= 5 or load.flags ~= 0)) then return end
+    local function again() KCD2MP_MountNPCOnHorse(id, binding) end
+    local horse = binding.mount
+    local human = binding.rider.human
     mp_log(string.format("MountNPCOnHorse id=%s hasHuman=%s", id, tostring(human ~= nil)))
 
     if not human then
-        local captId = id
-        Script.SetTimer(1000, function() KCD2MP_MountNPCOnHorse(captId) end)
+        Script.SetTimer(1000, again)
         return
     end
 
@@ -12274,9 +12298,8 @@ function KCD2MP_MountNPCOnHorse(id)
     -- 20:23:54) died exactly at fresh-spawn + 400 ms ForceMount. Defer.
     local age = os.clock() - (ghost.istate and ghost.istate.spawnedAtClock or 0)
     if ghost.istate and ghost.istate.spawnedAtClock and age < 3.0 then
-        local captId = id
         mp_log(string.format("MountNPCOnHorse: ghost %s is %.1fs old -- deferring mount (crash guard)", id, age))
-        Script.SetTimer(1500, function() KCD2MP_MountNPCOnHorse(captId) end)
+        Script.SetTimer(1500, again)
         return
     end
 
@@ -12303,35 +12326,30 @@ function KCD2MP_MountNPCOnHorse(id)
         end
     end)
     if far then
-        local captId = id
         if not ghost.w157MountFarTold then
             ghost.w157MountFarTold = true
             mp_log(string.format("WO157-MOUNT id=%s the figure is %.0f m away -- no ForceMount that far (the field's host froze on one); tried again when it is near", tostring(id), far))
         end
-        Script.SetTimer(3000, function()
-            local g3 = KCD2MP.ghosts[captId]
-            if g3 and g3.istate and g3.istate.isRiding and KCD2MP.horseGhosts[captId] then KCD2MP_MountNPCOnHorse(captId) end
-        end)
+        Script.SetTimer(3000, again)
         return
     end
     ghost.w157MountFarTold = nil
 
     -- WO-160 5: the mount gate -- the horse is polled for readiness (0.25 s, up to 5 s) before the ForceMount the engine would roll back
-    local gateId = id
-    if KCD2MP_W160MountGate and not KCD2MP_W160MountGate(id, ghost, horse, function() KCD2MP_MountNPCOnHorse(gateId) end) then return end
+    if KCD2MP_W160MountGate and not KCD2MP_W160MountGate(id, ghost, horse, again) then return end
     local ghostName = "kcd2mp_" .. tostring(id)
     if KCD2MP_NpcNativeLeaseBusy(ghostName) then
-        local st = ghost.istate
-        if not st or st.nativeMountWait then return end
-        st.nativeMountWait = true
+        if st.nativeMountWait and KCD2MP_RideBindingCurrent(id, st.nativeMountWait) then return end
+        st.nativeMountWait = binding
         KCD2MP_GhostNativeSync(id, ghost, false)
         KCD2MP_NpcNativeAfterRelease(ghostName, function()
-            if KCD2MP.ghosts[id] == ghost and st.isRiding then return true end
+            if st.nativeMountWait ~= binding then return false end
+            if KCD2MP_RideBindingCurrent(id, binding) and st.isRiding and not st.dismountPending then return true end
             st.nativeMountWait = nil
             return false
         end, function()
             st.nativeMountWait = nil
-            KCD2MP_MountNPCOnHorse(id)
+            again()
         end)
         return
     end
@@ -12340,38 +12358,41 @@ function KCD2MP_MountNPCOnHorse(id)
     if not ok1 then return end
 
     -- Verify mount after short delay; if confirmed, try to suppress scheduler errors
-    local captId = id
+    st.mountReadback = binding
     Script.SetTimer(300, function()
-        local g2 = KCD2MP.ghosts[captId]
-        if not g2 then return end
-        local mounted = false
-        pcall(function() mounted = g2.entity.human and g2.entity.human:IsMounted() end)
-        mp_log("IsMounted=" .. tostring(mounted) .. " id=" .. captId)
-        if not mounted then return end
+        if st.mountReadback ~= binding then return end
+        st.mountReadback = nil
+        if not KCD2MP_RideBindingCurrent(id, binding) then
+            mp_log("WO160-MOUNT refused id=" .. tostring(id) .. " reason=stale-readback")
+            return
+        end
+        local mounted = KCD2MP_GhostIsMounted(ghost)
+        mp_log("IsMounted=" .. tostring(mounted) .. " id=" .. id)
         -- 0.28.3 peer test: the peer can dismount inside this 300 ms window.
         -- Riding STOP has already run (and found nothing to dismount): take
         -- the avatar off now instead of latching it as mounted.
-        if not g2.istate.isRiding then
-            mp_log("MP-DISMOUNT id=" .. captId .. " the mount landed after Riding STOP -- dismounting now")
-            KCD2MP_GhostDismount(captId, g2, "mount-after-stop")
+        if not st.isRiding then
+            if mounted then mp_log("MP-DISMOUNT id=" .. id .. " the mount landed after Riding STOP -- dismounting now") end
+            if KCD2MP_GhostDismount(id, ghost, "mount-after-stop") then KCD2MP_RemoveHorse(id) end
             return
         end
+        if mounted ~= true or st.dismountPending then return end
 
-        g2.istate.nativeMounted = true
-        mp_log("NATIVE MOUNT SUCCESS id=" .. captId)
-        if KCD2MP_W154RideNative then pcall(KCD2MP_W154RideNative, captId, true) end   -- WO-154 5: the horse on the DLL's writer
+        st.nativeMounted = true
+        mp_log("NATIVE MOUNT SUCCESS id=" .. id)
+        if KCD2MP_W154RideNative then pcall(KCD2MP_W154RideNative, id, true) end   -- WO-154 5: the horse on the DLL's writer
 
         -- === OPTION C: suppress "No valid scheduler behavior while occupying stance" ===
         -- Try 1: send OnHorseMounted signal so scheduler updates its state
-        local s1 = pcall(function() AI.Signal(SIGNALFILTER_SENDER, 1, "OnHorseMounted", g2.entity.id) end)
+        local s1 = pcall(function() AI.Signal(SIGNALFILTER_SENDER, 1, "OnHorseMounted", binding.rider.id) end)
         -- Try 2: disable AI entirely so scheduler stops fighting the mount
-        local s2 = pcall(function() g2.entity:EnableAI(false) end)
+        local s2 = pcall(function() binding.rider:EnableAI(false) end)
         -- Try 3: AI.AutoDisable keeps AI alive but prevents auto-sleep cycles
-        local s3 = pcall(function() AI.AutoDisable(g2.entity.id, 0) end)
+        local s3 = pcall(function() AI.AutoDisable(binding.rider.id, 0) end)
         -- Try 4: generic OnMount signal
-        local s4 = pcall(function() AI.Signal(0, 1, "OnMount", g2.entity.id) end)
+        local s4 = pcall(function() AI.Signal(0, 1, "OnMount", binding.rider.id) end)
         mp_log(string.format("OptionC signals id=%s s1=%s s2=%s s3=%s s4=%s",
-            captId, tostring(s1), tostring(s2), tostring(s3), tostring(s4)))
+            id, tostring(s1), tostring(s2), tostring(s3), tostring(s4)))
     end)
 end
 
@@ -12380,23 +12401,25 @@ function KCD2MP_GhostIsMounted(ghost)
     local e = ghost and ghost.entity
     if not (e and e.human and e.human.IsMounted) then return nil end
     local ok, m = pcall(function() return e.human:IsMounted() end)
-    if not ok then return nil end
-    return m == true
+    if ok and type(m) == "boolean" then return m end
+    return nil
 end
 
--- Take the avatar off its horse and read it back. A body that still reads
--- mounted is left `dismountPending`: the interp tick retries every 0.5 s (up
+-- Take the avatar off its horse and read it back. Until a confirmed detach,
+-- leave `dismountPending`: the interp tick retries every 0.5 s (up
 -- to 10 tries) and the native writer is not given the body meanwhile.
 --   MP-DISMOUNT id=<id> why=<..> flag=<latched> live=<before> force=ok|err|none after=<..>
 function KCD2MP_GhostDismount(id, ghost, why)
     local st = ghost and ghost.istate
     if not st then return false end
+    local binding = st.dismountBinding or KCD2MP_RideBinding(id)
+    if not KCD2MP_RideBindingCurrent(id, binding) or not rawequal(ghost, binding.ghost) then return false end
     if KCD2MP_W154RideNative then pcall(KCD2MP_W154RideNative, id, false) end   -- WO-154 5: the writer lets the horse go first
     local live = KCD2MP_GhostIsMounted(ghost)
     local flag = st.nativeMounted == true
-    if (flag or live == true) and KCD2MP_NpcNativeLeaseBusy("kcd2mp_" .. tostring(id)) then
+    if (flag or live ~= false) and KCD2MP_NpcNativeLeaseBusy("kcd2mp_" .. tostring(id)) then
         KCD2MP_GhostNativeSync(id, ghost, false)
-        st.dismountPending, st.dismountAt = true, os.clock()
+        st.dismountPending, st.dismountAt, st.dismountBinding = true, os.clock(), binding
         return false
     end
     local force = "none"
@@ -12407,15 +12430,17 @@ function KCD2MP_GhostDismount(id, ghost, why)
     elseif flag or live ~= false then
         force = "unavailable"
     end
-    st.nativeMounted = false
     local after = KCD2MP_GhostIsMounted(ghost)
     local wasPending = st.dismountPending == true
-    st.dismountPending = (after == true) or nil
-    if st.dismountPending then
+    local detached = after == false and not KCD2MP_RideBindingCurrent(id, st.mountReadback)
+    if not detached then
+        st.dismountPending, st.dismountBinding = true, binding
         st.dismountTries = (st.dismountTries or 0) + 1
         st.dismountAt = os.clock()
         st.dismountSince = st.dismountSince or os.clock()
     else
+        st.nativeMounted = false
+        st.dismountPending, st.dismountBinding, st.dismountGaveUp = nil, nil, nil
         if wasPending then
             mp_log(string.format("MP-DISMOUNT id=%s off the horse (read back) %.1f s after the stop, %d tries -- the native writer may have it now",
                 tostring(id), os.clock() - (st.dismountSince or os.clock()), (st.dismountTries or 0) + 1))
@@ -12426,22 +12451,32 @@ function KCD2MP_GhostDismount(id, ghost, why)
         mp_log(string.format("MP-DISMOUNT id=%s why=%s flag=%s live=%s force=%s after=%s",
             tostring(id), tostring(why), tostring(flag), tostring(live), force, tostring(after)))
     end
-    return after ~= true
+    return detached
 end
 
 -- From the interp tick: a dismount that did not take is tried again.
 function KCD2MP_GhostDismountRetry(id, ghost)
     local st = ghost and ghost.istate
-    if not (st and st.dismountPending) or st.isRiding then return end
+    if not (st and st.dismountPending) then return end
     if (os.clock() - (st.dismountAt or 0)) < 0.5 then return end
+    if not KCD2MP_RideBindingCurrent(id, st.dismountBinding) then
+        mp_log("MP-DISMOUNT id=" .. tostring(id) .. " reason=stale-binding")
+        st.dismountPending, st.dismountBinding, st.rideRebind = nil, nil, nil
+        st.nativeMounted, st.dismountTries, st.dismountSince, st.dismountGaveUp = nil, nil, nil, nil
+        return
+    end
     if (st.dismountTries or 0) >= 10 then
         if not st.dismountGaveUp then
             st.dismountGaveUp = true
-            mp_log("MP-DISMOUNT id=" .. tostring(id) .. " still mounted after 10 tries -- the native writer stays off this avatar")
+            mp_log("MP-DISMOUNT id=" .. tostring(id) .. " detach still unconfirmed after 10 tries -- the native writer stays off this avatar")
         end
         return
     end
-    KCD2MP_GhostDismount(id, ghost, "retry")
+    if not KCD2MP_GhostDismount(id, ghost, "retry") then return end
+    KCD2MP_RemoveHorse(id)
+    local rebind = st.rideRebind
+    st.rideRebind = nil
+    if rebind and st.isRiding then KCD2MP_SpawnHorse(id, st.tx or 0, st.ty or 0, st.tz or 0, st.tr or 0) end
 end
 
 function KCD2MP_RemoveHorse(id)
@@ -12701,8 +12736,8 @@ function KCD2MP_UpdateGhost(id, x, y, z, rotZ, isRiding, bPace, bDir, bStance, b
         -- 0.28.3 peer test: the avatar stayed on the horse. The latched flag
         -- can miss a mount that landed late; ask the body, dismount BEFORE the
         -- horse is released, and read it back (KCD2MP_GhostDismount).
-        KCD2MP_GhostDismount(id, ghost, "riding-stop")
-        KCD2MP_RemoveHorse(id)
+        istate.rideRebind = nil
+        if KCD2MP_GhostDismount(id, ghost, "riding-stop") then KCD2MP_RemoveHorse(id) end
         istate.animTag = "idle"  -- force animation reset
     end
 
@@ -14421,7 +14456,7 @@ function KCD2MP_InterpTick(arg, gen)
                 local wp = nil
                 pcall(function() wp = ghost.entity:GetWorldPos(SCRATCH.INTERPTICK_WP_SCRATCH) end)
                 if wp then x, y, sz = wp.x, wp.y, wp.z end
-            elseif oneShot then
+            elseif oneShot or istate.dismountPending then
                 -- no position/angle writes; the one-shot owns the body
             elseif istate.nativeOwned or KCD2MP_NpcNativeLeaseBusy("kcd2mp_" .. tostring(id)) then
                 -- WO-118 Phase 2b: KCDMP.dll writes this ghost every frame at its frame hook
@@ -14455,7 +14490,7 @@ function KCD2MP_InterpTick(arg, gen)
                 local rendSpeed = math.sqrt(movedDx*movedDx + movedDy*movedDy) / dt
                 istate.smoothedSpeed = lerpVal(istate.smoothedSpeed or 0, rendSpeed, 1 - 0.6 ^ steps)
 
-                if frozen then
+                if frozen or istate.dismountPending then
                     -- WO-34 issue D: no animation on a corpse. Driving walk/run
                     -- onto a dead actor is what made the reported body look
                     -- like it was walking around rather than lying where it
@@ -27219,8 +27254,8 @@ function KCD2MP_W172RideCheck(now)
                 r.tries = r.tries + 1
                 W.stats.dismounts = W.stats.dismounts + 1
                 mp_log(string.format("WO172-RIDE dismount id=%s try=%d -- the partner is off the horse but the figure still rides here", tostring(id), r.tries))
-                pcall(KCD2MP_GhostDismount, id, ghost, "w172-check")
-                pcall(KCD2MP_RemoveHorse, id)
+                local ok, detached = pcall(KCD2MP_GhostDismount, id, ghost, "w172-check")
+                if ok and detached then pcall(KCD2MP_RemoveHorse, id) end
             end
         end
     end
