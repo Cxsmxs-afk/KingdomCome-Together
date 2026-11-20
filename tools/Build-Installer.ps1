@@ -290,6 +290,7 @@ if (-not $SkipPublish) {
     # relay.log never land in the folder the installer is about to embed),
     # completes one Handshake + Ping/Pong round trip through the published
     # protocol assembly on both sides, and fails the build otherwise.
+    & (Join-Path $PSScriptRoot "Test-PayloadHandReply.ps1") -Payload $payload
     & (Join-Path $PSScriptRoot "Test-PayloadSmoke.ps1") -Payload $payload
     if ($LASTEXITCODE -ne 0) { throw "payload smoke FAILED -- the published agent and relay did not complete a round trip. Not shipping." }
 }

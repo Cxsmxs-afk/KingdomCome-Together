@@ -16,3 +16,12 @@ target_sources(KCDMP_NativeTests PRIVATE h6_combat_action_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE npc_death_release_tests.cpp)
 target_sources(KCDMP_NativeTests PRIVATE rp_timeline_outcome_integration.cpp)
 target_compile_definitions(KCDMP_NativeTests PRIVATE KCDMP_P4_TEST KCDMP_P5_TEST KCDMP_P6_TEST KCDMP_P6_CAPTURE_TEST)
+
+# The pipe smoke drives the real DLL's frame hook through a minimal importer.
+# These modules remain in the test build directory.
+add_library(KCDMP_EdgeFramework SHARED edge_payload_frame.cpp)
+target_compile_definitions(KCDMP_EdgeFramework PRIVATE KCDMP_EDGE_FRAME_PROVIDER)
+set_target_properties(KCDMP_EdgeFramework PROPERTIES OUTPUT_NAME Framework)
+add_library(KCDMP_EdgeGame SHARED edge_payload_frame.cpp)
+target_link_libraries(KCDMP_EdgeGame PRIVATE KCDMP_EdgeFramework)
+set_target_properties(KCDMP_EdgeGame PROPERTIES OUTPUT_NAME WHGame)
