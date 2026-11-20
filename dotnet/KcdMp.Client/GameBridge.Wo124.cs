@@ -431,6 +431,7 @@ public partial class GameBridge
 
     private void Wo124OnMainMenuShown()
     {
+        if (Volatile.Read(ref _pinnedHomeLoad) is not null) return;
         if (_where != GameWhere.Menu) Console.WriteLine("MP-JOIN joiner: the main menu is up");
         _where = GameWhere.Menu;
         LoadSequenceOnMenu();
@@ -516,6 +517,7 @@ public partial class GameBridge
         // own load landed last -- the agent believed the joiner was in the host's world.
         if (_leaveInProgress)
         {
+            if (Volatile.Read(ref _pinnedHomeLoad) is not null) return;
             // WO-207 C.4: a leave the link cut short may have loaded while the agent was reconnecting (its "Gameplay started" never seen);
             // the mod's last-loaded save says whether it is in
             if (!(_w207LinkRejoin && await Wo207LeaveLandedAsync()))
@@ -1400,6 +1402,7 @@ public partial class GameBridge
     /// </summary>
     private Task LeaveSharedWorldAsync(string why, string message) => LeaveSharedWorldCoreAsync(why, message, null);
     private CancellationToken _joinEngineLifetime;
+    private JoinEngineReceipt? _pinnedHomeLoad;
 
     private async Task LeaveSharedWorldCoreAsync(string why, string message, JoinerJoin? expected)
     {
@@ -1426,7 +1429,7 @@ public partial class GameBridge
         // WO-125 Phase 2: the target is recomputed now -- the newest own save whose playthrough is not the
         // host's (a hand-placed copy of the host's world is never "own"). None: the way back to the menu.
         var (src, ownWhy) = selectedHome is not null && homeFingerprint is not null
-            ? await Wo125CapturedHomeAsync(selectedHome, homeFingerprint)
+            ? await Wo125ListedHomeAsync(selectedHome)
             : await Wo125NewestOwnLoadableAsync();
         // WO-211 A.2.3: a leave after a dropped link goes home with the drop moment's Henry -- the paired final snapshot spliced into this
         // player's own newest save (his own quest items kept, the host world's left there), placed where he stood
@@ -1449,14 +1452,27 @@ public partial class GameBridge
         bool relayClosed = (expected is not null && why == "relay-lost") ||
             (!_wo122Connected && (hostAbsent || why == "relay-lost"));
         using var returnLife = expected is not null || relayClosed ? CancellationTokenSource.CreateLinkedTokenSource(_joinEngineLifetime) : null;
+        var returnToken = returnLife?.Token ?? default;
         if (src is null)
         {
             await Task.Delay(4000);
-            if (!await Wo125ExitToMenuAsync(why, returnLife?.Token ?? default, relayClosed)) { _leaveInProgress = false; SetJoinUi("left", message + " Quit the game to get back to the main menu.", HostAuthorityFailure.JoinReason(why)); }
+            await Wo124ReturnToMenuAsync(why, message, returnToken, relayClosed);
             return;
         }
         if (!await Wo177WaitQuietAsync("leave")) { _leaveInProgress = false; SetJoinUi("left", full + " " + Wo177Rules.GaveUpText); return; }   // WO-177 A5
         await Task.Delay(4000);
+        if (selectedHome is not null && homeFingerprint is not null)
+        {
+            if (_transport is LogTailGameTransport engine && ResolveSavesDirForJoin() is string savesRoot &&
+                await Task.Run(() => HomeSaveReadLease.TryAcquire(savesRoot, src, homeFingerprint)) is { } fileLease)
+                await Wo124LoadPinnedHomeAsync(src, savesRoot, engine, fileLease, returnToken);
+            else
+            {
+                Console.WriteLine("MP-H21-HOME result=menu reason=unverified-file-or-engine");
+                await Wo124ReturnToMenuAsync("private-save-changed", message, returnToken, relayClosed);
+            }
+            return;
+        }
         using var homeReceipt = relayClosed && _transport is LogTailGameTransport tail
             ? new JoinEngineReceipt(tail, _combat, src.FullPath, Path.GetDirectoryName(Path.GetDirectoryName(src.FullPath))!)
             : null;
@@ -1486,6 +1502,61 @@ public partial class GameBridge
                 if (loaded) Wo124OnGameplayStartedCore(confirmedByGameQuery: true);
                 else Wo124OnLoadFailedToMenu();
             }
+        }
+    }
+
+    private async Task Wo124ReturnToMenuAsync(string why, string message, CancellationToken ct, bool relayClosed)
+    {
+        if (await Wo125ExitToMenuAsync(why, ct, relayClosed)) return;
+        _leaveInProgress = false;
+        SetJoinUi("left", message + " Quit the game to get back to the main menu.", HostAuthorityFailure.JoinReason(why));
+    }
+
+    private async Task Wo124LoadPinnedHomeAsync(HenrySource save, string root, LogTailGameTransport engine,
+        HomeSaveReadLease fileLease, CancellationToken ct)
+    {
+        JoinEngineReceipt? receipt = null;
+        bool? loaded = null;
+        try
+        {
+            bool sent = false;
+            try
+            {
+                sent = await P5LoadGameCoreAsync(save.Playline, save.Base, "leave-command", () =>
+                {
+                    receipt = new JoinEngineReceipt(engine, _combat, save.FullPath, root);
+                    Volatile.Write(ref _pinnedHomeLoad, receipt);
+                    return true;
+                }, ct);
+            }
+            catch (Exception ex) when (ex is IOException or OperationCanceledException or HttpRequestException)
+            {
+                Console.WriteLine($"MP-H21-HOME transport={ex.GetType().Name} admitted={receipt is not null}");
+            }
+            if (receipt is null)
+            {
+                _leaveInProgress = false;
+                SetJoinUi("failed", _p5LoadRefusal.Length > 0 ? _p5LoadRefusal : "The load safety gate could not be confirmed.");
+                return;
+            }
+            Console.WriteLine($"MP-H21-HOME result=held handoff={sent}");
+            loaded = await WaitForJoinReceiptAsync(receipt.Terminal.Task, "MP-H21-HOME result=held reason=waiting-for-exact-engine-read");
+        }
+        catch (OperationCanceledException) when (receipt?.Terminal.Task.IsCanceled == true || _joinEngineLifetime.IsCancellationRequested)
+        {
+            _leaveInProgress = false;
+        }
+        finally
+        {
+            receipt?.Dispose();
+            fileLease.Dispose();
+            Volatile.Write(ref _pinnedHomeLoad, null);
+        }
+        if (loaded is bool completed)
+        {
+            Console.WriteLine($"MP-H21-HOME result=confirmed loaded={completed}");
+            if (completed) Wo124OnGameplayStartedCore(confirmedByGameQuery: true);
+            else Wo124OnLoadFailedToMenu();
         }
     }
 

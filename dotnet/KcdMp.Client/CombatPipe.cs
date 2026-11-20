@@ -1416,6 +1416,12 @@ public sealed partial class CombatPipe : IAsyncDisposable
         return (x.Payload[1] != 0, x.Payload[2] != 0, x.Payload[3] != 0);
     }
 
+    internal async Task<byte?> H21RequestSnapshotAsync(Guid attempt, CancellationToken ct)
+    {
+        var r = await Wo163Async(Protocol.H21OpSnapshot, attempt.ToByteArray(), ct);
+        return r is { Ok: true, Payload.Length: 1 } x ? x.Payload[0] : null;
+    }
+
     /// <summary>WO-184 op 35: the engine's own cancel of a pending save. Result 1 cancelled, 0 nothing pending, 2 not armed, 3 fault, 4 still pending; null = no answer.</summary>
     public async Task<(byte Result, bool Before, bool After)?> Wo184SaveCancelAsync(string why, CancellationToken ct = default)
     {

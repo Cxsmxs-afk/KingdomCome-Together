@@ -321,6 +321,7 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
         case kcdmp::wo178::kOpTrace:
         case kcdmp::wo178::kOpSaveState:    // WO-184: the engine's own save state
         case kcdmp::wo178::kOpSaveCancel:   // WO-184: the engine's own cancel of a pending save
+        case kcdmp::wo178::kOpScopedSnapshot:
             return kcdmp::wo178::handle(body[0], body, len, out, cap, outLen);
         case kcdmp::wo179::kOpStatus:   // WO-179: the scene watch
         case kcdmp::wo179::kOpConfig:

@@ -390,6 +390,8 @@ public sealed class LogTailGameTransport : IGameTransport
 
     internal readonly record struct EngineSaveTerminal(string Path, long Incarnation, bool Loaded);
     internal event Action<EngineSaveTerminal>? EngineSaveFinished;
+    internal readonly record struct EngineSaveWrite(string Path, long Incarnation);
+    internal event Action<EngineSaveWrite>? EngineSaveWritten;
     private long _engineLogIncarnation = 1;
     private string? _engineAcceptedSave, _engineReadSave;
     private bool _engineSaveAmbiguous;
@@ -900,6 +902,22 @@ public sealed class LogTailGameTransport : IGameTransport
             {
                 try { Wo144Line.Invoke(line.ToString()); }
                 catch (Exception ex) { Console.WriteLine($"[wo144] engine-line handler threw: {ex.Message}"); }
+            }
+        }
+
+        if (EngineSaveWritten is { } written)
+        {
+            const string prefix = "SaveGame: '";
+            var saveLine = line.StartsWith("[SAVE GAME] ", StringComparison.Ordinal) ? line[12..] : line;
+            if (saveLine.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                var pathAndResult = saveLine[prefix.Length..];
+                int end = pathAndResult.IndexOf('\'');
+                if (end > 0 && pathAndResult[(end + 1)..].StartsWith(" done.", StringComparison.Ordinal))
+                {
+                    try { written.Invoke(new(QuotedEngineSave(pathAndResult)!, EngineLogIncarnation)); }
+                    catch (Exception ex) { Console.WriteLine($"[save] write receipt handler threw: {ex.GetType().Name}"); }
+                }
             }
         }
 

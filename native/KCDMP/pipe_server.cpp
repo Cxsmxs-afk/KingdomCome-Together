@@ -648,7 +648,8 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
             return op == wo163::kOpReplay || op == wo163::kOpSkirmishPair ||
                    op == wo173::kOpRealHit || op == wo197::kOpPair || op == wo197::kOpSyncGuard ||
                    op == wo197::kOpEnsureGuard || op == wo187::kOpOpponent || op == wo187::kOpGuardHold ||
-                   op == wo200::kOpReplay || op == wo216::kOpRouteIn ? LoadAccess::Live : LoadAccess::Control;
+                   op == wo200::kOpReplay || op == wo216::kOpRouteIn ||
+                   op == wo178::kOpScopedSnapshot ? LoadAccess::Live : LoadAccess::Control;
         default:
             return LoadAccess::Read;
     }
