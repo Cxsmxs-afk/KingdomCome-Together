@@ -22,6 +22,18 @@ public class Wo151Tests
         Assert.Equal(ok, Wo151Rules.IsWireName(name));
     }
 
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("faults=0 sites=0 off=0 fault_switchoff=on main_cost=off proc_off=0 markers=on", null)]
+    [InlineData("faults=0 sites=0 off=0 fault_switchoff=on main_cost=off proc_off=31 markers=on", "co-op crime isolation, engine combat replay, engine melee hit handling, synced hit reactions, host NPC hostility")]
+    [InlineData("faults=17 sites=3 off=2 fault_switchoff=on main_cost=off", "2 native engine operations")]
+    [InlineData("faults=5 sites=1 off=1 proc_off=18 markers=on", "engine combat replay, host NPC hostility, 1 native engine operation")]
+    public void Native_fault_status_names_process_guards_and_old_dll_fault_totals(string? status, string? disabled)
+    {
+        Assert.Equal(disabled is null ? null : $"Disabled for this game run after an engine error: {disabled}.",
+            Wo151Rules.NativeFaultNotice(status));
+    }
+
     [Fact]
     public void A_name_over_64_characters_is_refused()
     {

@@ -13,6 +13,9 @@
 #include "script_context.h"
 #include "weather.h"
 #include "wo138.h"
+#include "wo165.h"
+#include "wo173.h"
+#include "wo178.h"
 
 #include <atomic>
 #include <cmath>
@@ -83,12 +86,23 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
         }
         case kOpStatus: {
             const fault::Totals t = fault::totals();
-            char mk[160] = "";
+            char mk[256] = "";
             actions::marker_status(mk, sizeof mk);   // WO-164 C1: the agent toasts "Map markers are off this session" from this
-            const int n = std::snprintf(reinterpret_cast<char*>(out), cap,
-                "faults=%u sites=%u off=%u fault_switchoff=%s main_cost=%s %s", t.faults, t.sites, t.off,
-                fault::switch_off() ? "on" : "off", main_thread::cost_meter() ? "on" : "off", mk);
-            *outLen = (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
+            // Process guards stay off across pipe and multiplayer session changes.
+            // Keep their field and the fault totals in the fixed-size reply when
+            // the trailing map marker counters do not fit.
+            const unsigned disabled = (sctx::isolation_enabled() ? 0u : 1u) | (wo165::off() ? 2u : 0u) |
+                                      (wo173::fault_status() << 2) | (wo178::host_answer_faulted() ? 16u : 0u);
+            auto* text = reinterpret_cast<char*>(out);
+            const int n = std::snprintf(text, cap, "faults=%u sites=%u off=%u fault_switchoff=%s main_cost=%s proc_off=%u",
+                t.faults, t.sites, t.off, fault::switch_off() ? "on" : "off", main_thread::cost_meter() ? "on" : "off", disabled);
+            if (n <= 0 || static_cast<size_t>(n) >= cap) return kRBadRequest;
+            const size_t left = cap - static_cast<size_t>(n);
+            const int appended = std::snprintf(text + n, left, " %s", mk);
+            if (appended >= 0 && static_cast<size_t>(appended) >= left) {
+                if (char* last = std::strrchr(text + n, ' ')) *last = '\0';
+            }
+            *outLen = std::strlen(text);
             return kROk;
         }
         case kOpTestFault: {

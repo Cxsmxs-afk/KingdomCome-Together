@@ -694,6 +694,8 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
     }
 }
 
+unsigned fault_status() { return (g_faulted.load() ? 1u : 0u) | (g_reactFaulted.load() ? 2u : 0u); }
+
 int status_text(char* out, int n) {
     return std::snprintf(out, n,
         "wo173 real_hits=%s faulted=%s react=%s(%s) threat=%s requests=%u engine=%u hit=%u blocked=%u pb=%u broken=%u react_queued=%u react_other=%u "
