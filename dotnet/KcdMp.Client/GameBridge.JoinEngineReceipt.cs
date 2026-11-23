@@ -39,11 +39,21 @@ public partial class GameBridge
 
         public bool MatchesTerminal(bool loaded) => Current && Terminal.Task.IsCompletedSuccessfully && Terminal.Task.Result == loaded;
         public bool CanRemoveFile => Terminal.Task.IsCompletedSuccessfully;
+        public bool ObservedExactRead => Matches(_tail.EngineReadSave);
+
+        public bool TryConfirmObservedPrivateRead() => Current &&
+            _tail.TryConsumeProbedEngineRead(_logIncarnation, _path, _userAlias, PathComparison) && Complete(loaded: true);
 
         private void Observe(LogTailGameTransport.EngineSaveTerminal receipt)
         {
-            if (receipt.Incarnation == _logIncarnation && Matches(receipt.Path) && Terminal.TrySetResult(receipt.Loaded))
-                Dispose();
+            if (receipt.Incarnation == _logIncarnation && Matches(receipt.Path)) Complete(receipt.Loaded);
+        }
+
+        private bool Complete(bool loaded)
+        {
+            if (!Terminal.TrySetResult(loaded)) return false;
+            Dispose();
+            return true;
         }
 
         private void EngineQuit()
@@ -74,7 +84,7 @@ public partial class GameBridge
     private bool IgnoreEngineTerminal(LogTailGameTransport engine) =>
         // The private load worker publishes only the matching terminal, after
         // giving the file back. Generic or stale gameplay cannot unpin it.
-        Volatile.Read(ref _pinnedHomeLoad) is not null ||
+        Volatile.Read(ref _privateReturnCheck) is not null || Volatile.Read(ref _pinnedHomeLoad) is not null ||
         (!OwnLoadExpected && _jj is not null && engine.DispatchingAmbiguousSaveTerminal) ||
         EngineNoticeBelongsToAnotherJoin(engine.DispatchingTerminalSave);
 }

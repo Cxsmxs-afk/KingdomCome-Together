@@ -1047,7 +1047,10 @@ public partial class GameBridge
                 sent = await P5LoadGameCoreAsync(pl, name, "exit-to-menu", () =>
                 {
                     if (_transport is LogTailGameTransport tail)
+                    {
                         exitReceipt = new JoinEngineReceipt(tail, _combat, path, saves);
+                        AttachPrivateReturn(exitReceipt, null);
+                    }
                     admitted = true;
                     return true;
                 }, ct);
@@ -1059,8 +1062,8 @@ public partial class GameBridge
             }
             if (exitReceipt is null) return sent;
 
-            bool loaded = await WaitForJoinReceiptAsync(exitReceipt.Terminal.Task,
-                "MP-HENRY waiting for the exact exit load to settle; its file stays protected");
+            bool loaded = await WaitForPrivateReturnAsync(exitReceipt);
+            DetachPrivateReturn(exitReceipt);
             if (!loaded && _leaveInProgress && OwnLoadExpected) Wo124OnLoadFailedToMenu();
             return !loaded;
         }
@@ -1076,6 +1079,7 @@ public partial class GameBridge
         }
         finally
         {
+            DetachPrivateReturn(exitReceipt);
             exitReceipt?.Dispose();
             exitLease?.Dispose();
             if (registered)

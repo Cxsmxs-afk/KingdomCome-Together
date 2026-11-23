@@ -17,7 +17,7 @@ public sealed class JoinCalendarIntegrationCollection { }
 public sealed partial class JoinCalendarIntegrationTests
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
-    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts, ChangeCharacter, LocalFresh, CompatibleRestore, PlayerJoinLoop }
+    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts, ChangeCharacter, LocalFresh, CompatibleRestore, PlayerJoinLoop, ReturnDeadlineLoop }
 
     [Theory]
     [InlineData(2)]
@@ -153,7 +153,7 @@ public sealed partial class JoinCalendarIntegrationTests
         string? chosen = newerStart is null ? null : await FreshChoiceWithNewerUnavailableCheckpointAsync(fixture, newerStart);
         var homeHashes = newerStart is null ? null : Directory.EnumerateFiles(fixture.GuestSaves, "*.whs", SearchOption.AllDirectories)
             .ToDictionary(path => path, path => SHA256.HashData(File.ReadAllBytes(path)));
-        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(probe == JoinProbe.PlayerJoinLoop ? 90 : boundary is null ? 25 : 40));
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(probe is JoinProbe.PlayerJoinLoop or JoinProbe.ReturnDeadlineLoop ? 90 : boundary is null ? 25 : 40));
         var ct = stop.Token;
         await using var relay = await ReplayRelay.StartAsync(ct);
         await using var hostPeer = await ReplayPeer.ConnectAsync(relay.Port, hostName, ct);
@@ -226,9 +226,9 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.False(Property<bool>(guest, "WorldSyncReady"));
             Assert.Equal(WorldLoadPhase.Menu, Get<WorldLoadSequence>(guest, "_worldLoad").Current.Phase);
 
-            if (probe == JoinProbe.PlayerJoinLoop)
+            if (probe is JoinProbe.PlayerJoinLoop or JoinProbe.ReturnDeadlineLoop)
             {
-                await TestPlayerJoinLoopAsync(fixture, host, guest, hostLink, guestLink, guestGame, ct);
+                await TestPlayerJoinLoopAsync(fixture, host, guest, hostLink, guestLink, guestGame, ct, probe == JoinProbe.ReturnDeadlineLoop);
                 return;
             }
             if (probe == JoinProbe.RepeatAborts)

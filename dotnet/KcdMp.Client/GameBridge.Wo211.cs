@@ -66,6 +66,11 @@ public partial class GameBridge
                 return;
             case "w211_leave":
                 Interlocked.Increment(ref _w211LeaveAsked);
+                if (Volatile.Read(ref _privateReturnCheck) is { RetryOffered: true } pendingReturn)
+                {
+                    _ = CheckPrivateReturnAsync(pendingReturn, playerRequested: true);
+                    return;
+                }
                 if ((!_joinedWorld && !_returningFromSharedWorld) || _isDamageAuthority)
                 {
                     Console.WriteLine("WO211-LINK leave refused reason=no-shared-world");

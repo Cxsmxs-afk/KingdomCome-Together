@@ -392,6 +392,7 @@ public sealed class LogTailGameTransport : IGameTransport
     internal event Action<EngineSaveTerminal>? EngineSaveFinished;
     internal readonly record struct EngineSaveWrite(string Path, long Incarnation);
     internal event Action<EngineSaveWrite>? EngineSaveWritten;
+    private readonly object _engineSaveGate = new();
     private long _engineLogIncarnation = 1;
     private string? _engineAcceptedSave, _engineReadSave;
     private bool _engineSaveAmbiguous;
@@ -859,10 +860,12 @@ public sealed class LogTailGameTransport : IGameTransport
         if ((LoadStarted is not null || EngineSaveFinished is not null) && line.StartsWith(readSave, StringComparison.Ordinal))
         {
             var path = QuotedEngineSave(line[readSave.Length..]);
-            if (ConflictingEngineSave(_engineReadSave, path) || ConflictingEngineSave(_engineAcceptedSave, path))
-                _engineSaveAmbiguous = true;
-            _engineReadSave = path;
-            _engineAcceptedSave = _engineReadSave;
+            lock (_engineSaveGate)
+            {
+                if (ConflictingEngineSave(_engineReadSave, path) || ConflictingEngineSave(_engineAcceptedSave, path))
+                    _engineSaveAmbiguous = true;
+                _engineReadSave = _engineAcceptedSave = path;
+            }
             try { LoadStarted?.Invoke(); }
             catch (Exception ex) { Console.WriteLine($"[join] load-started handler threw: {ex.Message}"); }
         }
@@ -871,13 +874,16 @@ public sealed class LogTailGameTransport : IGameTransport
         if ((SaveLoadAccepted is not null || EngineSaveFinished is not null) && line.StartsWith(acceptSave, StringComparison.Ordinal))
         {
             var accepted = QuotedEngineSave(line[acceptSave.Length..]);
-            if (ConflictingEngineSave(_engineReadSave, accepted) || ConflictingEngineSave(_engineAcceptedSave, accepted))
-                _engineSaveAmbiguous = true;
-            _engineAcceptedSave = accepted;
-            if (_engineAcceptedSave is { } path)
+            lock (_engineSaveGate)
             {
-                int pl = path.LastIndexOf("/playline", StringComparison.Ordinal);
-                try { SaveLoadAccepted?.Invoke(pl >= 0 ? path[(pl + 1)..] : path); }
+                if (ConflictingEngineSave(_engineReadSave, accepted) || ConflictingEngineSave(_engineAcceptedSave, accepted))
+                    _engineSaveAmbiguous = true;
+                _engineAcceptedSave = accepted;
+            }
+            if (accepted is not null)
+            {
+                int pl = accepted.LastIndexOf("/playline", StringComparison.Ordinal);
+                try { SaveLoadAccepted?.Invoke(pl >= 0 ? accepted[(pl + 1)..] : accepted); }
                 catch (Exception ex) { Console.WriteLine($"[join] save-load handler threw: {ex.Message}"); }
             }
         }
@@ -989,21 +995,44 @@ public sealed class LogTailGameTransport : IGameTransport
 
     private void NewEngineLogIncarnation()
     {
-        _engineAcceptedSave = _engineReadSave = null;
-        _engineSaveAmbiguous = false;
-        Interlocked.Increment(ref _engineLogIncarnation);
+        lock (_engineSaveGate)
+        {
+            _engineAcceptedSave = _engineReadSave = null;
+            _engineSaveAmbiguous = false;
+            Interlocked.Increment(ref _engineLogIncarnation);
+        }
+    }
+
+    // A live game query can settle this exact read even if the terminal
+    // log line was lost. Consume it so it cannot mark the next read ambiguous.
+    internal bool TryConsumeProbedEngineRead(long incarnation, string path, string? alias, StringComparison comparison)
+    {
+        lock (_engineSaveGate)
+        {
+            if (incarnation != EngineLogIncarnation || _engineSaveAmbiguous || _engineReadSave is null ||
+                (!string.Equals(_engineReadSave, path, comparison) && !string.Equals(_engineReadSave, alias, comparison)))
+                return false;
+            _engineAcceptedSave = _engineReadSave = null;
+            return true;
+        }
     }
 
     private void ReportEngineSaveTerminal(bool loaded, Action? observed)
     {
-        string? path = _engineSaveAmbiguous ? null : loaded ? _engineReadSave : _engineReadSave ?? _engineAcceptedSave;
-        _engineAcceptedSave = _engineReadSave = null;
-        DispatchingTerminalSave = path;
-        DispatchingAmbiguousSaveTerminal = _engineSaveAmbiguous;
-        _engineSaveAmbiguous = false;
+        string? path;
+        long incarnation;
+        lock (_engineSaveGate)
+        {
+            incarnation = EngineLogIncarnation;
+            path = _engineSaveAmbiguous ? null : loaded ? _engineReadSave : _engineReadSave ?? _engineAcceptedSave;
+            _engineAcceptedSave = _engineReadSave = null;
+            DispatchingTerminalSave = path;
+            DispatchingAmbiguousSaveTerminal = _engineSaveAmbiguous;
+            _engineSaveAmbiguous = false;
+        }
         try
         {
-            if (path is not null) EngineSaveFinished?.Invoke(new(path, EngineLogIncarnation, loaded));
+            if (path is not null) EngineSaveFinished?.Invoke(new(path, incarnation, loaded));
             observed?.Invoke();
         }
         catch (Exception ex) { Console.WriteLine($"[join] engine save terminal handler threw: {ex.GetType().Name}"); }

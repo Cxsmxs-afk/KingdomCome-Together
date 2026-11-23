@@ -34,7 +34,8 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private int _saveIndex;
     private string _where = "menu";
     private string? _lastLoaded;
-    private int _joinLoadsIssued, _joinFilesRead, _ownLoadsIssued;
+    private int _joinLoadsIssued, _joinFilesRead, _ownLoadsIssued, _whereQueries;
+    public int WhereQueries => Volatile.Read(ref _whereQueries);
 
     public JoinCalendarTestEngine(string logPath, string saves, Func<int, byte[]>? hostSave, Action gameplayStarted)
     {
@@ -76,6 +77,19 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public void CompleteOwnLoad()
     {
         lock (_logGate) ReadLoadedFile(_pendingOwnReads.Dequeue(), joined: false);
+    }
+
+    public void ReadOwnSaveWithoutTerminal()
+    {
+        lock (_logGate)
+        {
+            string path = _pendingOwnReads.Dequeue();
+            Assert.NotEmpty(File.ReadAllBytes(path));
+            Feed($"[CryAction] LoadGame: '{path}'");
+            _lastLoaded = Path.GetFileNameWithoutExtension(path);
+            _where = "world";
+            _gameplayStarted();
+        }
     }
 
     public void CompleteExitLoad(string path)
@@ -216,6 +230,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
                 return;
             }
 
+            if (query == "KCD2MP_W154Where") Interlocked.Increment(ref _whereQueries);
             string reply = query switch
             {
                 "KCD2MP_Wo125LastLoaded" => "last=" + _lastLoaded,

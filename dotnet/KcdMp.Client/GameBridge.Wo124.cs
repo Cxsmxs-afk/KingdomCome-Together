@@ -443,7 +443,7 @@ public partial class GameBridge
 
     private void Wo124OnMainMenuShown()
     {
-        if (Volatile.Read(ref _pinnedHomeLoad) is not null) return;
+        if (Volatile.Read(ref _privateReturnCheck) is not null || Volatile.Read(ref _pinnedHomeLoad) is not null) return;
         if (_where != GameWhere.Menu) Console.WriteLine("MP-JOIN joiner: the main menu is up");
         _where = GameWhere.Menu;
         LoadSequenceOnMenu();
@@ -519,6 +519,12 @@ public partial class GameBridge
 
     private async Task Wo124JoinerTickAsync()
     {
+        if (Volatile.Read(ref _privateReturnCheck) is { } pendingReturn)
+        {
+            if (DateTime.UtcNow - _leaveSinceUtc >= ReturnCheckDelay)
+                await CheckPrivateReturnAsync(pendingReturn);
+            return;
+        }
         if (_w207LinkRejoin) Wo207LinkRejoinTrace();   // WO-207 C.4: which gate holds a link-cut rejoin (every 20 s)
         if (!_hostModeKnown || !_hostSharedWorld) return;
         if (_jj is not null || _joinRx is not null || _joinOutId != 0 || _gameQuitting) return;
@@ -1492,10 +1498,27 @@ public partial class GameBridge
             }
             return;
         }
-        using var homeReceipt = relayClosed && _transport is LogTailGameTransport tail
-            ? new JoinEngineReceipt(tail, _combat, src.FullPath, Path.GetDirectoryName(Path.GetDirectoryName(src.FullPath))!)
-            : null;
-        if (!await P5LoadGameAsync(src.Playline, src.Base, "leave-command", returnLife?.Token ?? default))
+        JoinEngineReceipt? homeReceipt = null;
+        bool sent = false;
+        try
+        {
+            if (_transport is LogTailGameTransport tail)
+            {
+                var root = Path.GetDirectoryName(Path.GetDirectoryName(src.FullPath))!;
+                sent = await P5LoadGameCoreAsync(src.Playline, src.Base, "leave-command", () =>
+                {
+                    homeReceipt = new JoinEngineReceipt(tail, _combat, src.FullPath, root);
+                    AttachPrivateReturn(homeReceipt, src.Base);
+                    return true;
+                }, returnToken);
+            }
+            else sent = await P5LoadGameAsync(src.Playline, src.Base, "leave-command", returnToken);
+        }
+        catch (Exception ex) when (homeReceipt is not null && ex is IOException or OperationCanceledException or HttpRequestException)
+        {
+            Console.WriteLine($"MP-H21-HOME transport={ex.GetType().Name} admitted=on");
+        }
+        if (!sent && homeReceipt is null)
         {
             _leaveInProgress = false;
             SetJoinUi("failed", _p5LoadRefusal.Length > 0 ? _p5LoadRefusal : "The load safety gate could not be confirmed.");
@@ -1508,13 +1531,17 @@ public partial class GameBridge
             bool loaded;
             try
             {
-                loaded = await WaitForJoinReceiptAsync(homeReceipt.Terminal.Task,
-                    "MP-JOIN joiner: waiting for the private load to settle after the relay closed");
+                loaded = await WaitForPrivateReturnAsync(homeReceipt);
             }
             catch (OperationCanceledException) when (homeReceipt.Terminal.Task.IsCanceled)
             {
                 _leaveInProgress = false;
                 return;
+            }
+            finally
+            {
+                DetachPrivateReturn(homeReceipt);
+                homeReceipt.Dispose();
             }
             if (_leaveInProgress && OwnLoadExpected)
             {
@@ -1546,6 +1573,7 @@ public partial class GameBridge
                 {
                     receipt = new JoinEngineReceipt(engine, _combat, save.FullPath, root);
                     Volatile.Write(ref _pinnedHomeLoad, receipt);
+                    AttachPrivateReturn(receipt, save.Base);
                     return true;
                 }, ct);
             }
@@ -1560,7 +1588,7 @@ public partial class GameBridge
                 return;
             }
             Console.WriteLine($"MP-H21-HOME result=held handoff={sent}");
-            loaded = await WaitForJoinReceiptAsync(receipt.Terminal.Task, "MP-H21-HOME result=held reason=waiting-for-exact-engine-read");
+            loaded = await WaitForPrivateReturnAsync(receipt);
         }
         catch (OperationCanceledException) when (receipt?.Terminal.Task.IsCanceled == true || _joinEngineLifetime.IsCancellationRequested)
         {
@@ -1571,6 +1599,7 @@ public partial class GameBridge
             receipt?.Dispose();
             fileLease.Dispose();
             Volatile.Write(ref _pinnedHomeLoad, null);
+            DetachPrivateReturn(receipt);
         }
         if (loaded is bool completed)
         {
@@ -1652,7 +1681,13 @@ public partial class GameBridge
         lock (_joinGate)
         {
             returning = _returningFromSharedWorld;
-            if (returning) ResetJoinSessionState("private-return", suppressAutomatic: true);
+            if (returning)
+            {
+                ResetJoinSessionState("private-return", suppressAutomatic: true);
+                ClearJoinCharacterRequest();
+                ClearJoinCalendarBootstrap();
+                _leaveInProgress = false;
+            }
             _returningFromSharedWorld = false;
         }
         var absent = Interlocked.Exchange(ref _absentHostRun, null);

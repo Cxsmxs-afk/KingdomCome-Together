@@ -150,6 +150,7 @@ public partial class GameBridge
 
     private string JoinMenuPhase()
     {
+        if (Volatile.Read(ref _privateReturnCheck) is { RetryOffered: true }) return "return-needed";
         if (HostAbsentPause || LinkHeld) return "paused";
         if (_leaveInProgress || _jj is { Phase: "loading" or "post-load" or "orphaned" }) return "loading";
         if (_jj is not null || _joinOutId != 0 || Volatile.Read(ref _joinPreparation) is not null) return "waiting";
