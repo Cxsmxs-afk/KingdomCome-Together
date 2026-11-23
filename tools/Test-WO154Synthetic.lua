@@ -690,6 +690,15 @@ do
     if KCD2MP_W154MenuReturnRetry then KCD2MP_W154MenuReturnRetry(true) end
     check("F3: an unconfirmed return stays visible after relay teardown", M.connectionText():find("Return unconfirmed", 1, true) ~= nil)
     check("F3: Leave on a local retry posts exactly one action", choose("leave_world") and #evts("w211_leave", mark) == 2)
+    local getCVar = System.GetCVar
+    local fullSave = "%USER%/saves/playline2/autosave028.whs"
+    System.GetCVar = function(key)
+        if key == "wh_sys_LastLoadedSave" then return fullSave end
+        return getCVar(key)
+    end
+    check("F3: the private reply retains its exact playline and extension", KCD2MP_Wo125LastLoaded("rf3", true) == fullSave)
+    check("F3: a regular join still reads just its unique save basename", KCD2MP_Wo125LastLoaded("f3") == "autosave028")
+    System.GetCVar = getCVar
     if KCD2MP_W154MenuReturnRetry then KCD2MP_W154MenuReturnRetry(false) end
     choose("leave_world")
     check("F3: the completed return retires the local Leave retry", #evts("w211_leave", mark) == 2)
