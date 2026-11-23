@@ -48,7 +48,8 @@ public class RelayFrameCancellationTests
 
     private static (LinkWriter Writer, Action<byte[], CancellationToken> Queue) ClientWriter(Path path)
     {
-        var writer = new LinkWriter(new LinkScheduler(new LinkSchedOptions { Budget = false }), path);
+        // This fixture tests frame cancellation independently of the scheduler's state age limit.
+        var writer = new LinkWriter(new LinkScheduler(new LinkSchedOptions { Budget = false, AgeLimitMs = 0 }), path);
         var bridge = new GameBridge(new ClientConfig());
         var stream = new MemoryStream();
         const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Instance;
@@ -65,26 +66,42 @@ public class RelayFrameCancellationTests
         var (writer, queue) = ClientWriter(path);
         queue(Event(1), default);
         Task pump = writer.PumpOnceAsync(CancellationToken.None);
-        await path.Started.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        var watchdog = TimeSpan.FromSeconds(3);
+        var clock = new ManualFrameTime();
+        var queued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var result = await ProcessorFrameScope.RunAsync(async _ =>
+        try
         {
-            queue(Event(2), default);
-            queue(Npc("abandoned_npc"), default);
-            await releaseHandler.Task;
-        }, 50);
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-        releaseHandler.SetResult();
-        queue(Event(3), default);
-        queue(Npc("valid_npc"), default);
-        path.Release.SetResult();
-        await pump.WaitAsync(TimeSpan.FromSeconds(3));
-        byte[][] sent = path.Sent.ToArray();
-        Assert.Equal(new byte[] { 1, 3 }, sent.Where(f => f[0] == Protocol.StoryBeatUp).Select(f => f[^1]));
-        Assert.DoesNotContain(sent, f => Encoding.UTF8.GetString(f).Contains("abandoned_npc"));
-        Assert.Contains(sent, f => Encoding.UTF8.GetString(f).Contains("valid_npc"));
-        Assert.Equal(2, writer.Scheduler.CancelledDropped);
-        Assert.Null(writer.Failed);
+            await path.Started.Task.WaitAsync(watchdog);
+            var frame = ProcessorFrameScope.RunAsync(async _ =>
+            {
+                queue(Event(2), default);
+                queue(Npc("abandoned_npc"), default);
+                queued.SetResult();
+                await releaseHandler.Task;
+            }, 50, CancellationToken.None, clock);
+            await queued.Task.WaitAsync(watchdog);
+            clock.Expire();
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(watchdog)).Status);
+            releaseHandler.SetResult();
+            queue(Event(3), default);
+            queue(Npc("valid_npc"), default);
+            path.Release.SetResult();
+            await pump.WaitAsync(watchdog);
+            byte[][] sent = path.Sent.ToArray();
+            Assert.Equal(new byte[] { 1, 3 }, sent.Where(f => f[0] == Protocol.StoryBeatUp).Select(f => f[^1]));
+            Assert.DoesNotContain(sent, f => Encoding.UTF8.GetString(f).Contains("abandoned_npc"));
+            Assert.Contains(sent, f => Encoding.UTF8.GetString(f).Contains("valid_npc"));
+            Assert.Equal(2, writer.Scheduler.CancelledDropped);
+            Assert.Equal(0, writer.Scheduler.StaleDropped);
+            Assert.Null(writer.Failed);
+        }
+        finally
+        {
+            clock.Expire();
+            releaseHandler.TrySetResult();
+            path.Release.TrySetResult();
+        }
     }
 
     [Fact]
