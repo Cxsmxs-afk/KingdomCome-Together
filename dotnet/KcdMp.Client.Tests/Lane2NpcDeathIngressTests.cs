@@ -44,6 +44,7 @@ public sealed class Lane2NpcDeathIngressTests
 
         await fixture.Ingress(route).WaitAsync(fixture.Token);
         await fixture.Ingress(route == "guid" ? "fatal" : "guid").WaitAsync(fixture.Token);
+        if (expectedEid != 0) await fixture.CompleteFallCheckAsync(3);
         await fixture.AssertNoWriteAsync();
     }
 
@@ -134,6 +135,7 @@ public sealed class Lane2NpcDeathIngressTests
             Assert.Equal(1L, fixture.Releases);
         }
         await fixture.Ingress(route == "guid" ? "fatal" : "guid");
+        if (expectedEid != 0) await fixture.CompleteFallCheckAsync((byte)(seq + 1));
         await fixture.AssertNoWriteAsync();
     }
 
@@ -160,6 +162,7 @@ public sealed class Lane2NpcDeathIngressTests
         Assert.True(fixture.Dead);
         Assert.Equal(1L, fixture.Releases);
         await fixture.Ingress("fatal").WaitAsync(fixture.Token);
+        await fixture.CompleteFallCheckAsync(4);
         await fixture.AssertNoWriteAsync();
     }
 
@@ -433,6 +436,22 @@ public sealed class Lane2NpcDeathIngressTests
 
         public ValueTask ReplyAsync(byte seq, byte reason) =>
             _wire.WriteAsync(new byte[] { 0x81, 3, 0, reason == 0 ? (byte)1 : (byte)0, seq, reason }, Token);
+
+        public async Task CompleteFallCheckAsync(byte seq)
+        {
+            // A confirmed death schedules a read-only check for the same body.
+            // Consume exactly that frame before requiring the pipe to stay idle.
+            var check = await ReadRequestAsync();
+            Assert.Equal(0x2B, check.Op);
+            Assert.Equal(29, check.Body.Length);
+            Assert.Equal(Protocol.Wo195OpCheck, check.Body[0]);
+            Assert.Equal(Eid, BinaryPrimitives.ReadUInt32LittleEndian(check.Body.AsSpan(1, 4)));
+            Assert.Equal(_soul, new Guid(check.Body.AsSpan(5, 16)));
+            Assert.Equal(_generation, BinaryPrimitives.ReadUInt64LittleEndian(check.Body.AsSpan(21, 8)));
+            await _wire.WriteAsync(new byte[] { 0xAC, 8, 0, 1, seq, Protocol.Wo195OpCheck, 0, 1, 0, 0, 0 }, Token);
+            FieldInfo fallDown = Field("_w195FallDown");
+            while ((long)fallDown.GetValue(_bridge)! == 0) await Task.Delay(10, Token);
+        }
 
         public async Task WaitForDeadAsync()
         {
