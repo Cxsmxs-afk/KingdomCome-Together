@@ -26,6 +26,39 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
     [InlineData(2)]
     [InlineData(3)]
     [InlineData(4)]
+    public async Task An_announced_host_owns_the_seat_before_the_first_run_when_guests_claim(int players)
+    {
+        await WaitNoClientsAsync();
+        var guests = new Peer[players - 1];
+        await using var group = new PeerGroup(guests);
+        for (int i = 0; i < guests.Length; i++) guests[i] = await _relay.ConnectAsync($"guest-{i}");
+        await using var host = await _relay.ConnectAsync("the-host");
+        await host.SendRawAsync(Claim());
+        await host.SendRawAsync(JoinStatusCodec.Build(guests[0].Id, 0, Protocol.JoinStateSession,
+            Protocol.JoinReasonId("shared-world"), 0));
+        Assert.Equal(host.Id, (await guests[0].ReadUntilAsync(Protocol.JoinStatusDown, Wait))[0]);
+
+        await host.DisposeAsync();
+        foreach (var guest in guests)
+        {
+            Assert.Equal(host.Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+            await guest.SendRawAsync(Claim());
+            await BarrierAsync(guest);
+        }
+        Assert.Null(Clients.AbsentHost);
+        Console.WriteLine($"F1 players={players} authority-after-guest-claim={Clients.DamageAuthority?.Name ?? "none"}");
+        Assert.Null(Clients.DamageAuthority);
+        Assert.False(Clients.HasHostConnected());
+
+        await using var returning = await _relay.ConnectAsync("the-host");
+        await ConfirmWorldAsync(returning, guests[0]);
+        Assert.Equal(returning.Id, Clients.DamageAuthority?.Id);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
     public async Task Lowest_id_guest_can_leave_before_the_first_run_without_blocking_the_host(int players)
     {
         await WaitNoClientsAsync();

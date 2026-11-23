@@ -247,6 +247,7 @@ public partial class GameBridge
     /// <summary>JoinStatus state "session" from the host (WO-125: the joinId slot carries the world's seed, arg its flags).</summary>
     private void Wo124OnSessionMode(byte src, byte reason, uint joinId = 0, ushort arg = 0)
     {
+        Wo127NoteHostMode(src);
         bool on = Protocol.JoinReasonName(reason) == "shared-world";
         bool changed = !_hostModeKnown || _hostSharedWorld != on || _hostModeFrom != src;
         _hostSharedWorld = on;

@@ -1891,7 +1891,7 @@ public partial class GameBridge(ClientConfig config)
         _sendNpcState = (npc, x, y, z, rot, hp, flags) => SendNpcStateAsync(stream, npc, x, y, z, rot, hp, flags, cts.Token);
         _sendNpcDrag = (npc, x, y, z, rot, hp, flags) => SendNpcStateAsync(stream, npc, x, y, z, rot, hp, flags, cts.Token, asClaim: true);
         _resyncStream = stream;   // WO-102 Phase 6
-        _w144ConnectedUtc = DateTime.UtcNow;   // WO-144 5: a non-hosting agent's claim waits for the host's word
+        Wo127BeginRelayLink();   // WO-144 5: a non-hosting agent's claim waits for the host's word
         _sendNpcDeath = async npc =>
         {
             long life = Interlocked.Read(ref _npcDeathLife);

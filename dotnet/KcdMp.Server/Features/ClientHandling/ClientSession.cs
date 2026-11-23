@@ -1214,7 +1214,7 @@ public partial class ClientSession
                 // receiver sees exactly what it saw before WO-127.
                 bool claims = (flags & Protocol.PositionFlagHostClaim) != 0;
                 flags = (byte)(flags & ~Protocol.PositionFlagHostClaim);
-                if (claims && _clientHandler.HostAbsent && !_clientHandler.IsReturningHost(this))
+                if (claims && !_clientHandler.AllowsHostClaim(this))
                     claims = false;
                 if (claims != ClaimsHost)
                 {

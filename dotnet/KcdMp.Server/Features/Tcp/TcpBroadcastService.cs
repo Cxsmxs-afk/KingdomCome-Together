@@ -370,6 +370,9 @@ public class TcpBroadcastService
             why = dest is null && _clientHandler.HostAbsent ? "host-absent" : "no-target";
             return null;
         }
+        if (downType == Protocol.JoinStatusDown && body.Length == Protocol.JoinHeaderLen + 4 &&
+            body[Protocol.JoinHeaderLen] == Protocol.JoinStateSession && !_clientHandler.ObserveHostMode(source))
+        { why = "not-the-host"; return null; }
         if (announcedWorld != 0)
         {
             if (!_clientHandler.ObserveHostAnnouncement(source, announcedWorld, announcedRun))

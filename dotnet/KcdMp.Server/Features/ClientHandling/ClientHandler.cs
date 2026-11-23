@@ -222,6 +222,7 @@ public class ClientHandler
 			if (remaining == 0)
 			{
 				_absentHost = null;
+				_departedAnnouncedHost = null;
 				_hostClaimRequired = false;
 			}
 		}
@@ -232,6 +233,11 @@ public class ClientHandler
 	{
 		bool confirmed = ReferenceEquals(_sessionHost, client);
 		_sessionHost = null;
+		if (ReferenceEquals(_announcedHost, client))
+		{
+			_announcedHost = null;
+			_departedAnnouncedHost = new(client.IdentityKey, client.Name!);
+		}
 		_hostClaimRequired = true;
 		if (!confirmed || remaining == 0 || client.AnnouncedWorldEpoch == 0 || client.AnnouncedRunId == Guid.Empty ||
 			!HasPlayerIdentity(client.IdentityKey))
@@ -301,6 +307,13 @@ public class ClientHandler
 	public HostLease? AbsentHost => _absentHost;
 	private volatile HostLease? _absentHost;
 	private ClientSession? _sessionHost;
+	private ClientSession? _announcedHost;
+	private sealed record AnnouncedHostIdentity(string Key, string Name)
+	{
+		public bool Matches(ClientSession client) => HasPlayerIdentity(Key) && Key == client.IdentityKey &&
+			string.Equals(Name, client.Name, StringComparison.Ordinal);
+	}
+	private volatile AnnouncedHostIdentity? _departedAnnouncedHost;
 	private bool _hostClaimRequired;
 
 	internal (ClientSession? Host, ulong Epoch) PresentationAnchor()
@@ -344,6 +357,23 @@ public class ClientHandler
 		client.IsReady && _absentHost is { } left && string.Equals(left.IdentityKey, client.IdentityKey, StringComparison.Ordinal)
 		&& string.Equals(left.Name, client.Name, StringComparison.Ordinal);
 
+	internal bool AllowsHostClaim(ClientSession client)
+	{
+		if (_absentHost is not null) return IsReturningHost(client);
+		return _departedAnnouncedHost is not { } departed || departed.Matches(client);
+	}
+
+	internal bool ObserveHostMode(ClientSession client)
+	{
+		lock (_lock)
+		{
+			if (!ReferenceEquals(PickAuthority(out _), client)) return false;
+			_announcedHost = client;
+			_departedAnnouncedHost = null;
+			return true;
+		}
+	}
+
 	public bool ObserveHostAnnouncement(ClientSession client, uint world, Guid run)
 	{
 		lock (_lock)
@@ -380,6 +410,14 @@ public class ClientHandler
 	{
 		if (_absentHost is not null) { reason = "host-absent"; return null; }
 		if (_sessionHost is not null) { reason = "session-host"; return _sessionHost; }
+		if (_announcedHost is not null) { reason = "announced-host"; return _announcedHost; }
+		if (_departedAnnouncedHost is { } departed)
+		{
+			reason = "awaiting-announced-host";
+			foreach (var c in _readyClients)
+				if (c.IsReady && c.ClaimsHost && departed.Matches(c)) { reason = "returning-announced-host"; return c; }
+			return null;
+		}
 		var claimants = new List<ClientSession>();
 		foreach (var c in _clients)
 			if (c.IsReady && c.ClaimsHost) claimants.Add(c);
@@ -407,7 +445,8 @@ public class ClientHandler
 	public bool HasHostConnected()
 	{
 		lock (_lock)
-			return _absentHost is null && (_sessionHost is not null ||
+			return _departedAnnouncedHost is not null ? PickAuthority(out _) is not null :
+				_absentHost is null && (_sessionHost is not null || _announcedHost is not null ||
 				_clients.Any(c => c.IsReady && (c.ClaimsHost || !_hostClaimRequired && c.IsLoopback)));
 	}
 
