@@ -189,9 +189,7 @@ public sealed class Lane2NpcDeathIngressTests
     [InlineData(null)]
     public async Task Deadline_sends_one_pre_apply_abort_and_no_replacement(byte? abortReceipt)
     {
-        // This probe waits through both production budgets. Keep room for
-        // Named Pipe startup and timer scheduling on a busy test runner.
-        await using var fixture = await Fixture.OpenAsync(TimeSpan.FromSeconds(10));
+        await using var fixture = await Fixture.OpenAsync();
         Task ingress = fixture.Ingress("fatal");
         var first = await fixture.ReadRequestAsync();
         fixture.AssertBound(first, Eid);
@@ -271,7 +269,9 @@ public sealed class Lane2NpcDeathIngressTests
 
     private sealed class Fixture : IAsyncDisposable
     {
-        private readonly CancellationTokenSource _deadline;
+        private static readonly TimeSpan PipeQuietWindow = TimeSpan.FromMilliseconds(150);
+        // The watchdog covers startup and both production polling budgets on a busy runner.
+        private readonly CancellationTokenSource _deadline = new(TimeSpan.FromSeconds(15));
         private readonly NamedPipeServerStream _wire;
         private readonly CombatPipe _pipe;
         private readonly GameBridge _bridge = new(new ClientConfig());
@@ -280,9 +280,8 @@ public sealed class Lane2NpcDeathIngressTests
         private readonly Guid _soul = Guid.NewGuid();
         private ulong _generation;
 
-        private Fixture(TimeSpan deadline)
+        private Fixture()
         {
-            _deadline = new(deadline);
             string name = "lane2-npc-death-" + Guid.NewGuid().ToString("N");
             _wire = new(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
             _pipe = new(name);
@@ -290,9 +289,9 @@ public sealed class Lane2NpcDeathIngressTests
 
         public CancellationToken Token => _deadline.Token;
 
-        public static async Task<Fixture> OpenAsync(TimeSpan? deadline = null)
+        public static async Task<Fixture> OpenAsync()
         {
-            var f = new Fixture(deadline ?? TimeSpan.FromSeconds(4));
+            var f = new Fixture();
             Task connecting = f._wire.WaitForConnectionAsync(f.Token);
             Assert.True(await f._pipe.EnsureConnectedAsync(f.Token));
             await connecting;
@@ -453,11 +452,14 @@ public sealed class Lane2NpcDeathIngressTests
 
         public async Task AssertNoWriteAsync()
         {
-            using var wait = CancellationTokenSource.CreateLinkedTokenSource(Token);
-            wait.CancelAfter(150);
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
-                await _wire.ReadExactlyAsync(new byte[1], wait.Token));
-            Assert.False(Token.IsCancellationRequested);
+            using var quiet = new CancellationTokenSource();
+            using var read = CancellationTokenSource.CreateLinkedTokenSource(Token, quiet.Token);
+            Task pending = _wire.ReadExactlyAsync(new byte[1], read.Token).AsTask();
+            quiet.CancelAfter(PipeQuietWindow);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+            if (Token.IsCancellationRequested)
+                throw new TimeoutException("NPC death fixture deadline elapsed during the pipe idle check.");
+            Assert.True(quiet.IsCancellationRequested, "The pipe read must remain idle for the full observation window.");
         }
 
         public async ValueTask DisposeAsync()
