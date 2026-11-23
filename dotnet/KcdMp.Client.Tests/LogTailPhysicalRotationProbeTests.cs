@@ -1,10 +1,12 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 using System.Collections.Concurrent;
 using System.Net;
+using System.Text;
 using Xunit.Abstractions;
 
 namespace KcdMp.Client.Tests;
 
+[Collection("Join calendar integration")]
 public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
 {
     [Theory]
@@ -17,13 +19,28 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
         var folder = Directory.CreateTempSubdirectory("kct-log-tail-");
         try
         {
-            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             using var releaseRead = new ManualResetEventSlim();
+            bool changed = transition != "append";
             string path = Path.Combine(folder.FullName, "kcd.log");
             string old = path + ".old";
             const string historical = "Log Started at 2026-11-20  00:10:00\n[ CryAction ] historical marker\n" +
                 "[CryAction] LoadGame: 'playline1/historical-save'\nGameplay started\nCSystem::Quit invoked\n";
             File.WriteAllText(path, historical + new string(' ', 4096) + "\n");
+            // The ordinary case models the game's same open log writer. Rotation
+            // cases replace or truncate the path and therefore open each write anew.
+            using var writer = changed ? null : new FileStream(path, FileMode.Append, FileAccess.Write,
+                FileShare.ReadWrite | FileShare.Delete);
+            void Append(string text)
+            {
+                if (writer is null) File.AppendAllText(path, text);
+                else
+                {
+                    writer.Write(Encoding.UTF8.GetBytes(text));
+                    writer.Flush();
+                }
+            }
+
             await using var tail = new LogTailGameTransport(new HttpGameTransport("http://localhost", handler: new EmitterReply()), path);
             var firstRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var scanned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -35,7 +52,7 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
             tail.LoadStarted += () =>
             {
                 reads.Enqueue(tail.EngineReadSave);
-                if (firstRead.TrySetResult()) releaseRead.Wait(deadline.Token);
+                if (firstRead.TrySetResult() && changed) releaseRead.Wait(deadline.Token);
             };
             tail.SaveLoadAccepted += accepts.Enqueue;
             tail.EngineSaveFinished += receipts.Enqueue;
@@ -48,8 +65,18 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
             const string retired = "Loading saved game 'playline1/retired-save'\n" +
                 "[CryAction] LoadGame: 'playline1/retired-save'\nPlayVideoOnly 'main_menu.bk2'\n" +
                 "CSystem::Quit invoked\nLog Started at 2026-11-20  01:20:00\nGameplay started\n";
-            File.AppendAllText(path, "[CryAction] LoadGame: 'playline1/old-save'\n" + (bufferedTerminal ? retired : ""));
-            await firstRead.Task.WaitAsync(deadline.Token);
+            async Task WaitForLineAsync(Task line, string stage)
+            {
+                try { await line.WaitAsync(deadline.Token); }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+                {
+                    Assert.Fail($"{transition}: timed out at {stage}, incarnation={tail.EngineLogIncarnation}, " +
+                        $"reads={string.Join(',', reads)}, receipts={string.Join(',', receipts.Select(receipt => receipt.Path))}");
+                }
+            }
+
+            Append("[CryAction] LoadGame: 'playline1/old-save'\n" + (bufferedTerminal ? retired : ""));
+            await WaitForLineAsync(firstRead.Task, "first LoadGame");
             long oldIncarnation = tail.EngineLogIncarnation;
             try
             {
@@ -63,7 +90,6 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
             }
             finally { releaseRead.Set(); }
 
-            bool changed = transition != "append";
             if (changed)
             {
                 using var reopenDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(1));
@@ -79,8 +105,8 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
             }
             string newRead = changed ? "Log Started at 2026-11-20  02:20:00\nLoading saved game 'playline1/new-save'\n" +
                 "[CryAction] LoadGame: 'playline1/new-save'\n" : "";
-            File.AppendAllText(path, newRead + "Gameplay started\n[KCD2-MP] MOD INIT\n");
-            await scanned.Task.WaitAsync(deadline.Token);
+            Append(newRead + "Gameplay started\n[KCD2-MP] MOD INIT\n");
+            await WaitForLineAsync(scanned.Task, "Gameplay and MOD INIT");
             output.WriteLine($"transition={transition} buffered_terminal={bufferedTerminal} old_incarnation={oldIncarnation} current_incarnation={tail.EngineLogIncarnation} receipts={string.Join(',', receipts.Select(r => r.Path))} quits={quits} menus={menus} reads={string.Join(',', reads)} accepts={string.Join(',', accepts)}");
             var receipt = Assert.Single(receipts);
             Assert.Equal(changed ? "playline1/new-save" : "playline1/old-save", receipt.Path);
