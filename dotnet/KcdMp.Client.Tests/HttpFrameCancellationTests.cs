@@ -93,22 +93,40 @@ public class HttpFrameCancellationTests
     {
         var game = new Game((_, _) => Task.CompletedTask);
         await using var transport = Transport(game);
+        var queued = Signal();
         var release = Signal();
         var done = Signal();
-        var result = await ProcessorFrameScope.RunAsync(async _ =>
+        var clock = new ManualFrameTime();
+        var frame = ProcessorFrameScope.RunAsync(async _ =>
         {
-            try { await transport.ExecuteAsync(Toast("abandoned")); await release.Task; }
+            try
+            {
+                await transport.ExecuteAsync(Toast("abandoned"));
+                queued.SetResult();
+                await release.Task;
+            }
             finally { done.SetResult(); }
-        }, 50);
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-        release.SetResult();
-        await done.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        await transport.ExecuteAsync(Toast("next-frame"));
-        await transport.FlushAsync();
-        string call = Assert.Single(game.Calls);
-        Assert.DoesNotContain("abandoned", call);
-        Assert.Contains("next-frame", call);
-        Assert.Equal(1, transport.AbandonedStatements);
+        }, 50, CancellationToken.None, clock);
+        try
+        {
+            await queued.Task.WaitAsync(FrameTestWatchdog);
+            Assert.Equal(1, transport.Queued);
+            clock.Expire();
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(FrameTestWatchdog)).Status);
+            release.SetResult();
+            await done.Task.WaitAsync(FrameTestWatchdog);
+            await transport.ExecuteAsync(Toast("next-frame"));
+            await transport.FlushAsync();
+            string call = Assert.Single(game.Calls);
+            Assert.DoesNotContain("abandoned", call);
+            Assert.Contains("next-frame", call);
+            Assert.Equal(1, transport.AbandonedStatements);
+        }
+        finally
+        {
+            clock.Expire();
+            release.TrySetResult();
+        }
     }
 
     [Fact]
