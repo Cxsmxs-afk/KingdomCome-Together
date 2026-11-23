@@ -169,12 +169,14 @@ public class Wo203W164FitTests
         Assert.Equal("unknown-15", Protocol.ConvKindName(15));
         Assert.Equal((byte)13, Protocol.ConvTimer);
         string[] w203 = { "defence-swing", "defence-outcome", "guard-state", "engage-early", "npc-worn", "npc-pose", "join-progress", "focus-edge", "travel-route",
-            "digest-checkpoint", "epoch", "figure-hand", "tp-snapshot-request", "tp-snapshot-response", "join-calendar-receipt" };
+            "digest-checkpoint", "epoch", "figure-hand", "tp-snapshot-request", "tp-snapshot-response", "join-calendar-receipt",
+            "host-restarted", "host-restart-ticket", "host-restart-proof" };
         for (int i = 0; i < w203.Length; i++) Assert.Equal(w203[i], Protocol.W203KindName((byte)(i + 1)));
         Assert.Equal((byte)13, Protocol.W203TpSnapshotRequest);
         Assert.Equal((byte)14, Protocol.W203TpSnapshotResponse);
         Assert.Equal((byte)15, Protocol.W203JoinCalendarReceipt);
-        Assert.Equal("unknown-16", Protocol.W203KindName(16));
+        Assert.Equal(((byte)16, (byte)17, (byte)18), (Protocol.W203HostRestarted, Protocol.W203HostRestartTicket, Protocol.W203HostRestartProof));
+        Assert.Equal("unknown-19", Protocol.W203KindName(19));
         Assert.Equal(10, Protocol.Version);   // no bump: new types on the join channel
     }
 }
