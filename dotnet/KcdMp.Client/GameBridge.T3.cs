@@ -13,6 +13,7 @@ namespace KcdMp.Client;
 public partial class GameBridge
 {
     private int _t3ProcFrameTimeoutMs = 2000;
+    internal TimeProvider T3FrameTime { get; init; } = TimeProvider.System;
     private readonly ConcurrentDictionary<string, long> _t3Counters = new(StringComparer.Ordinal);
     private long _t3StatsNextMs;
     private int _t3SideDrainBusy, _t3StatsBusy;

@@ -4970,7 +4970,7 @@ public partial class GameBridge(ClientConfig config)
                     if (!LoadSequenceFrameCurrent(frame)) continue;
                     using var loadLife = LoadSequenceLink(frame, ct);
                     var result = await ProcessorFrameScope.RunAsync(token => ProcessFrameCoreAsync(frame, token, accounting),
-                        Volatile.Read(ref _t3ProcFrameTimeoutMs), loadLife?.Token ?? ct);
+                        Volatile.Read(ref _t3ProcFrameTimeoutMs), loadLife?.Token ?? ct, T3FrameTime);
                     T3FrameResult(frame.Type, result);
                     if (result.Status == ProcessorFrameScope.Outcome.SessionCancelled && ct.IsCancellationRequested) return;
                 }

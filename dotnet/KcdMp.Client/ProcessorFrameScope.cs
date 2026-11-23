@@ -1,8 +1,6 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
-using System.Diagnostics;
-
 namespace KcdMp.Client;
 
 /// <summary>A frame may give up without leaving its continuations authorized to write later.
@@ -78,7 +76,8 @@ public static class ProcessorFrameScope
         ArgumentNullException.ThrowIfNull(handler);
         if (timeoutMs < 1) throw new ArgumentOutOfRangeException(nameof(timeoutMs));
         var lease = new Lease(parent);
-        long start = Stopwatch.GetTimestamp();
+        long start = timeProvider.GetTimestamp();
+        long Elapsed() => (long)timeProvider.GetElapsedTime(start).TotalMilliseconds;
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(parent);
         Task work = Task.Run(async () =>
         {
@@ -97,7 +96,7 @@ public static class ProcessorFrameScope
             // Observe and clean up a late completion without ever awaiting it on this lane.
             _ = work.ContinueWith(t => { _ = t.Exception; lease.Release(); }, CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            return new(parent.IsCancellationRequested ? Outcome.SessionCancelled : Outcome.TimedOut, Elapsed(start));
+            return new(parent.IsCancellationRequested ? Outcome.SessionCancelled : Outcome.TimedOut, Elapsed());
         }
         deadline.Cancel();
         try
@@ -105,20 +104,19 @@ public static class ProcessorFrameScope
             await work;
             parent.ThrowIfCancellationRequested();
             lease.Complete();
-            return new(Outcome.Completed, Elapsed(start));
+            return new(Outcome.Completed, Elapsed());
         }
         catch (OperationCanceledException ex) when (parent.IsCancellationRequested)
         {
             lease.Abandon();
-            return new(Outcome.SessionCancelled, Elapsed(start), ex);
+            return new(Outcome.SessionCancelled, Elapsed(), ex);
         }
         catch (Exception ex)
         {
             // HttpClient.Timeout also throws OCE. It is a frame failure, not a session cancellation.
             lease.Abandon();
-            return new(Outcome.Faulted, Elapsed(start), ex);
+            return new(Outcome.Faulted, Elapsed(), ex);
         }
         finally { lease.Release(); }
     }
-    private static long Elapsed(long start) => (Stopwatch.GetTimestamp() - start) * 1000 / Stopwatch.Frequency;
 }

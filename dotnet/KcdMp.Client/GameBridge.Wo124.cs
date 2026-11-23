@@ -479,6 +479,7 @@ public partial class GameBridge
         if (!confirmedByGameQuery && _transport is LogTailGameTransport engine && IgnoreEngineTerminal(engine)) return;
         if (!confirmedByGameQuery && !OwnLoadExpected && _jj is { EngineReceipt: { } receipt } &&
             !receipt.MatchesTerminal(loaded: true)) return;
+        Wo136ArmLegacySettle();
         _where = GameWhere.World;
         var startedLoad = _worldLoad.Current;
         bool ownLoad = LoadSequenceEnabled ? startedLoad.OwnIntent == WorldLoadOwnIntent.ExpectedPrivate : _ownLoadExpected;

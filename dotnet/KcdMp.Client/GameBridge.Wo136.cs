@@ -135,14 +135,23 @@ public partial class GameBridge
     /// <summary>"Loading saved game" / "[CryAction] LoadGame": the mod's hold, best effort (the join's own load call already set it).</summary>
     private void Wo136OnLoadSeen(string what)
     {
+        if (!LoadSequenceEnabled)
+        {
+            // A Lua location sample can say "world" before the engine's Gameplay receipt.
+            _w136SettleUntilUtc = DateTime.MaxValue;
+            _w136LuaReleased = false;
+        }
         P1OnLoadSeen(what);
         if (!LoadSequenceEnabled) T3SideChannelsInvalidate("load-" + what);
         _ = Wo134InvalidateLedgerAsync("load-" + what);
         Wo147ForgetGuardsOnLoad(what);   // WO-147: a load re-creates the copies -- their guards are gone with the old ones
         if (LoadSequenceEnabled) { _npcLua.Clear(); return; }
-        _w136SettleUntilUtc = DateTime.MinValue;
-        _w136LuaReleased = false;
         _ = ExecLuaAsync($"if KCD2MP_W136Hold then KCD2MP_W136Hold(true, 240, \"agent-{what}\") end");
+    }
+
+    private void Wo136ArmLegacySettle()
+    {
+        if (!LoadSequenceEnabled) _w136SettleUntilUtc = DateTime.UtcNow + W136Settle;
     }
 
     /// <summary>"Gameplay started": the settle starts; the hold ends W136Settle later.</summary>
@@ -150,7 +159,6 @@ public partial class GameBridge
     {
         P1OnGameplayStarted();
         if (LoadSequenceEnabled) return;
-        _w136SettleUntilUtc = DateTime.UtcNow + W136Settle;
         _w136LuaReleased = false;
         Console.WriteLine(FormattableString.Invariant($"MP-W136 Gameplay started: NPCs wait {W136Settle.TotalSeconds:F0} s more (settle), then the held frames are replayed"));
         _ = Task.Run(async () =>
