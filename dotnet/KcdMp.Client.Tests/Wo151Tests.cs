@@ -30,7 +30,7 @@ public class Wo151Tests
     [InlineData("faults=5 sites=1 off=1 proc_off=18 markers=on", "engine combat replay, host NPC hostility, 1 native engine operation")]
     public void Native_fault_status_names_process_guards_and_old_dll_fault_totals(string? status, string? disabled)
     {
-        Assert.Equal(disabled is null ? null : $"Disabled for this game run after an engine error: {disabled}.",
+        Assert.Equal(disabled is null ? null : $"An engine error disabled {disabled} for this game run.",
             Wo151Rules.NativeFaultNotice(status));
     }
 

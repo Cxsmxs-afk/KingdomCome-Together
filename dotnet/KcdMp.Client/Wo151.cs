@@ -59,7 +59,7 @@ public static class Wo151Rules
         }
         var disabled = NativeGuardNames.Where(guard => (flags & guard.Flag) != 0).Select(guard => guard.Name).ToList();
         if (sites > 0) disabled.Add(sites == 1 ? "1 native engine operation" : $"{sites} native engine operations");
-        return disabled.Count == 0 ? null : $"Disabled for this game run after an engine error: {string.Join(", ", disabled)}.";
+        return disabled.Count == 0 ? null : $"An engine error disabled {string.Join(", ", disabled)} for this game run.";
     }
 
     public enum CatchUpVerdict { Apply, Already, AlreadyPassed, Refused }
