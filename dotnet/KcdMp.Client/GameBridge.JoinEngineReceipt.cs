@@ -83,7 +83,7 @@ public partial class GameBridge
         public long FindProbedRead() => Current
             ? _tail.FindProbedEngineRead(_logIncarnation, _initialReadSequence, _path, _userAlias, PathComparison) : 0;
 
-        public bool TryConfirmObservedPrivateRead(long sequence) => sequence > 0 && Current &&
+        public bool TryConfirmObservedPrivateRead(long sequence, string path) => sequence > 0 && Matches(path.Replace('\\', '/')) &&
             _tail.TryConsumeProbedEngineRead(_logIncarnation, sequence, _path, _userAlias, PathComparison) && TryComplete(loaded: true);
 
         public void ProtectSubmittedLoad() => Volatile.Write(ref _launcherSubmitted, true);

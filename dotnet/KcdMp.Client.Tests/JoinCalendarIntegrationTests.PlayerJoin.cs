@@ -65,8 +65,10 @@ public sealed partial class JoinCalendarIntegrationTests
             {
                 await engine.WaitForOwnLoadAsync(ct);
                 int queries = engine.WhereQueries;
-                if (cycle % 2 == 1) engine.ReadOwnSaveWithoutTerminal();
+                if (cycle != 2) engine.ReadOwnSaveWithoutTerminal();
                 else engine.Emit("wo124_where", "world"); // still the shared world, with no read of the private file
+                if (cycle == 4)
+                    engine.LastLoadedPathOverride = Path.Combine(fixture.GuestSaves, "playline2", Path.GetFileName(fixture.GuestOwnSave));
                 Set(guest, "_leaveSinceUtc", DateTime.UtcNow.AddMinutes(-6));
                 await InvokeAsync(guest, "Wo124JoinerTickAsync");
                 Console.WriteLine($"F3-RETURN cycle={cycle} checks={engine.WhereQueries - queries} locked={Call(guest, "Wo122WantLock")}");
@@ -79,7 +81,8 @@ public sealed partial class JoinCalendarIntegrationTests
                     Assert.True((bool)Call(guest, "Wo122WantLock")!);
                     Assert.NotNull(Get<object?>(guest, "_pinnedHomeLoad"));
                     await WaitAsync(() => engine.ReturnRetryVisible, "the local Leave retry to reach the menu", ct);
-                    engine.ReadOwnSaveWithoutTerminal();
+                    if (cycle == 2) engine.ReadOwnSaveWithoutTerminal();
+                    engine.LastLoadedPathOverride = null;
                     engine.Emit("w211_leave", "menu");
                     await WaitAsync(() => engine.WhereQueries == queries + 2, "one explicit return recheck", ct);
                     await WaitAsync(() => !engine.ReturnRetryVisible, "the local retry to clear", ct);

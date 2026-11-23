@@ -7,10 +7,10 @@ public partial class GameBridge
     private PrivateReturnCheck? _privateReturnCheck;
     private Task _privateReturnMenuUpdate = Task.CompletedTask;
 
-    private sealed class PrivateReturnCheck(JoinEngineReceipt receipt, string? ownSave, WorldLoadSnapshot load)
+    private sealed class PrivateReturnCheck(JoinEngineReceipt receipt, bool canConfirmPrivateWorld, WorldLoadSnapshot load)
     {
         public JoinEngineReceipt Receipt { get; } = receipt;
-        public string? OwnSave { get; } = ownSave;
+        public bool CanConfirmPrivateWorld { get; } = canConfirmPrivateWorld;
         public WorldLoadSnapshot Load { get; } = load;
         public bool DeadlineChecked;
         public bool Checking;
@@ -19,10 +19,10 @@ public partial class GameBridge
 
     // Called at the HTTP handoff while _joinGate is held. The sender continues
     // to own the physical lease until its receipt settles.
-    private void AttachPrivateReturn(JoinEngineReceipt receipt, string? ownSave)
+    private void AttachPrivateReturn(JoinEngineReceipt receipt, bool canConfirmPrivateWorld)
     {
         receipt.PublishesPrivateReturn = true;
-        Volatile.Write(ref _privateReturnCheck, new(receipt, ownSave, _worldLoad.Current));
+        Volatile.Write(ref _privateReturnCheck, new(receipt, canConfirmPrivateWorld, _worldLoad.Current));
     }
 
     private void DetachPrivateReturn(JoinEngineReceipt? receipt)
@@ -80,14 +80,14 @@ public partial class GameBridge
 
         string where = "unknown";
         string? last = null;
-        long readSequence = check.OwnSave is null ? 0 : check.Receipt.FindProbedRead();
+        long readSequence = check.CanConfirmPrivateWorld ? check.Receipt.FindProbedRead() : 0;
         try
         {
             // This round trip uses the same live place observation as W160,
             // with a token so an old unsolicited "world" cannot answer it.
             where = await Wo154WhereNowAsync(requireActiveLog: true);
             if (where == "world" && readSequence != 0)
-                last = await AskModAsync("KCD2MP_Wo125LastLoaded", 4000, null, _joinEngineLifetime, requireActiveLog: true);
+                last = await AskModAsync("KCD2MP_Wo125LastLoaded", 4000, "true", _joinEngineLifetime, requireActiveLog: true);
         }
         catch (Exception ex) when (ex is IOException or HttpRequestException or OperationCanceledException or ObjectDisposedException)
         {
@@ -101,9 +101,8 @@ public partial class GameBridge
             var load = _worldLoad.Current;
             bool sameLoad = !LoadSequenceEnabled || (load.Generation == check.Load.Generation &&
                 load.OwnIntentRevision == check.Load.OwnIntentRevision);
-            if (OwnLoadExpected && sameLoad && check.OwnSave is { } own &&
-                string.Equals(last, "last=" + own, StringComparison.OrdinalIgnoreCase) &&
-                check.Receipt.TryConfirmObservedPrivateRead(readSequence))
+            if (OwnLoadExpected && sameLoad && last is not null && last.StartsWith("path=", StringComparison.Ordinal) &&
+                check.Receipt.TryConfirmObservedPrivateRead(readSequence, last[5..]))
             {
                 Console.WriteLine("MP-H21-HOME place-check result=private-world");
                 return;

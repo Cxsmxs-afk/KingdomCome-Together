@@ -1332,7 +1332,7 @@ public partial class GameBridge
                 int sp = s.IndexOf(' ');
                 string tok = sp > 0 ? s[..sp] : s, payload = sp > 0 ? s[(sp + 1)..] : "";
                 if (_wo124Replies.TryGetValue(tok, out var t)) t.TrySetResult(payload);
-                else Console.WriteLine($"MP-ASK reply tok={tok} with no ask waiting (late) -- {payload}");
+                else if (!tok.StartsWith('r')) Console.WriteLine($"MP-ASK reply tok={tok} with no ask waiting (late) -- {payload}");
                 return;
             }
             case "wo124_where":
@@ -1516,7 +1516,7 @@ public partial class GameBridge
                     homeReceipt = PrepareLauncherProtectedReceipt(tail, src.FullPath, root);
                     if (homeReceipt is null) return false;
                     homeReceipt.ProtectSubmittedLoad();
-                    AttachPrivateReturn(homeReceipt, src.Base);
+                    AttachPrivateReturn(homeReceipt, canConfirmPrivateWorld: true);
                     return true;
                 }, returnToken);
             }
@@ -1583,7 +1583,7 @@ public partial class GameBridge
                     if (receipt is null) return false;
                     receipt.ProtectSubmittedLoad();
                     Volatile.Write(ref _pinnedHomeLoad, receipt);
-                    AttachPrivateReturn(receipt, save.Base);
+                    AttachPrivateReturn(receipt, canConfirmPrivateWorld: true);
                     return true;
                 }, ct);
             }

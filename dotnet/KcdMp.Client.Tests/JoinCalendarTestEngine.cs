@@ -33,7 +33,8 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private long _eventSequence;
     private int _saveIndex;
     private string _where = "menu";
-    private string? _lastLoaded;
+    private string? _lastLoaded, _lastLoadedPath;
+    public volatile string? LastLoadedPathOverride;
     private int _joinLoadsIssued, _joinFilesRead, _ownLoadsIssued, _whereQueries;
     public int WhereQueries => Volatile.Read(ref _whereQueries);
     public volatile bool ReturnRetryVisible;
@@ -90,6 +91,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
             Assert.NotEmpty(File.ReadAllBytes(path));
             Feed($"[CryAction] LoadGame: '{path}'");
             _lastLoaded = Path.GetFileNameWithoutExtension(path);
+            _lastLoadedPath = path;
             _where = "world";
             _gameplayStarted();
         }
@@ -160,8 +162,8 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         var retry = Regex.Match(command, @"KCD2MP_W154MenuReturnRetry\((true|false)\)");
         if (retry.Success) ReturnRetryVisible = retry.Groups[1].Value == "true";
 
-        var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry|KCD2MP_W154Where)\("(r?[0-9a-f]{8})"\)""");
-        if (query.Success) AnswerQuery(query.Groups[1].Value, query.Groups[2].Value);
+        var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry|KCD2MP_W154Where)\("(r?[0-9a-f]{8})"(, true)?\)""");
+        if (query.Success) AnswerQuery(query.Groups[1].Value, query.Groups[2].Value, query.Groups[3].Success);
         if (RequestLegacySnapshot is { } snapshot)
         {
             var request = Regex.Match(command, """KCD2MP_Wo125Snapshot\("([0-9a-f]{8})"\)""");
@@ -218,6 +220,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     {
         Assert.NotEmpty(File.ReadAllBytes(path));
         _lastLoaded = Path.GetFileNameWithoutExtension(path);
+        _lastLoadedPath = path;
         if (joined) Interlocked.Increment(ref _joinFilesRead);
         Feed($"[CryAction] LoadGame: '{path}'");
         Feed("Sending concept notification 'EntityModuleOnPostLoadGame'");
@@ -226,7 +229,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         Feed("Gameplay started");
     }
 
-    private void AnswerQuery(string query, string token)
+    private void AnswerQuery(string query, string token, bool fullPath)
     {
         lock (_logGate)
         {
@@ -240,6 +243,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
             if (query == "KCD2MP_W154Where") Interlocked.Increment(ref _whereQueries);
             string reply = query switch
             {
+                "KCD2MP_Wo125LastLoaded" when fullPath => "path=" + (LastLoadedPathOverride ?? _lastLoadedPath),
                 "KCD2MP_Wo125LastLoaded" => "last=" + _lastLoaded,
                 "KCD2MP_Wo124Lock" => "lock=held",
                 "KCD2MP_W154Where" => _where,

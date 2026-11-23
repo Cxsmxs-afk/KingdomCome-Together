@@ -1053,7 +1053,7 @@ public partial class GameBridge
                         exitReceipt = PrepareLauncherProtectedReceipt(tail, path, saves);
                         if (exitReceipt is null) return false;
                         exitReceipt.ProtectSubmittedLoad();
-                        AttachPrivateReturn(exitReceipt, null);
+                        AttachPrivateReturn(exitReceipt, canConfirmPrivateWorld: false);
                     }
                     else if (!TryProtectUnobservableEngineRead()) return false;
                     admitted = true;

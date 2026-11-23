@@ -5947,11 +5947,15 @@ function KCD2MP_Wo125PlayerIsHenry(tok)
     KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " henry=" .. ((id == "char_26_uiName") and "yes" or "no") .. " id=" .. id)
 end
 
--- The save the engine loaded last (cvar wh_sys_LastLoadedSave), base name only: the
--- agent checks that the world in memory is the file its join placed.
-function KCD2MP_Wo125LastLoaded(tok)
+-- The save the engine loaded last. Ordinary joins use the base name of their unique
+-- file. Private-return recovery needs the playline and path as well.
+function KCD2MP_Wo125LastLoaded(tok, full)
     local v = "?"
     pcall(function() v = tostring(System.GetCVar("wh_sys_LastLoadedSave")) end)
+    if full then
+        KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " path=" .. v)
+        return v
+    end
     local base = (v:match("([^/\\]+)$") or v):gsub("%.whs$", "")
     KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " last=" .. base)
     return base
