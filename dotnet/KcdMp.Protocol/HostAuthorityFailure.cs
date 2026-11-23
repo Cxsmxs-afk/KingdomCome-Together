@@ -36,7 +36,7 @@ public static class HostAuthorityFailure
         bool de = German(language);
         if (reason == NotConfirmed)
             return de
-                ? "Beitritt gestoppt: Der Multiplayer-Schutz für NPC-KI und Story wurde nicht bestätigt. Wähle im Koop-Menü erneut Beitreten. Bleibt die Meldung, prüfe die Mod-Version auf beiden PCs und sende die Protokolle über Report a bug."
+                ? "Beitritt gestoppt: Der Multiplayer-Schutz für NSC-Verhalten und Story wurde nicht bestätigt. Wähle im Koop-Menü erneut Beitreten. Bleibt die Meldung, prüfe die Mod-Version auf beiden PCs und sende die Protokolle über Report a bug."
                 : "Joining stopped: Multiplayer protection for NPC AI and story was not confirmed. Choose Join / Rejoin in the co-op menu to try again. If this persists, check the mod version on both PCs and send the logs with Report a bug.";
         string system = reason == DecisionHook ? (de ? "NPC-KI" : "NPC AI")
             : reason == StoryHook ? "Story" : (de ? "NPC-KI und Story" : "NPC AI and story");

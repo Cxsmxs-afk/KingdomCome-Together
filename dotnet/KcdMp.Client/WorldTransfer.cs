@@ -193,6 +193,7 @@ public sealed class WorldReceiver : IDisposable
         _fs?.Dispose();
         _fs = null;
         Sha256 = _sha.GetHashAndReset();
+        _sha.Dispose();
         if (Received != Offer.Size || Next != Offer.ChunkCount)
             return Fail(Protocol.JoinAbortProtocol, $"got {Received} of {Offer.Size} bytes");
         if (!Sha256.AsSpan().SequenceEqual(Offer.Sha256))
@@ -228,6 +229,7 @@ public sealed class WorldReceiver : IDisposable
             _finished = true;
             try { _fs?.Dispose(); } catch { }
             _fs = null;
+            _sha.Dispose();
             DeleteFiles();
         }
     }
