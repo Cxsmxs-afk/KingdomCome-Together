@@ -177,10 +177,13 @@ void cache_camera_anchor() {
 }
 
 bool resolve_camera_system() {
-    if (g_eng.sys) return true;
-    if (!g_eng.vftSystem || !engine::ready()) return false;
-    if (void* env = engine::genv()) g_eng.sys = field_of_type(env, 0x400, g_eng.vftSystem);
-    return g_eng.sys != nullptr;
+    // The verified gEnv slot can publish after the broader engine resolver
+    // has reported a startup failure. Check the camera's own RTTI instead.
+    struct Source {
+        void* environment() const { return engine::genv(); }
+        void* find(void* env, size_t bytes, void* const* vtable) const { return field_of_type(env, bytes, vtable); }
+    };
+    return wo203cam::resolve_camera_system(g_eng.sys, g_eng.vftSystem, Source{});
 }
 
 bool verify_camera_slot() {
@@ -970,9 +973,8 @@ bool op_poll_off_main(uint8_t, const uint8_t*, size_t, uint8_t*, size_t, size_t*
 
 void prepare_player_view() {
     // CrySystem is present before DLL initialization. Cache its image anchor
-    // here even if the engine has not published gEnv yet.
+    // here and leave the live environment and camera reads to the main thread.
     cache_camera_anchor();
-    resolve_camera_system();
 }
 
 bool refresh_player_view() {
