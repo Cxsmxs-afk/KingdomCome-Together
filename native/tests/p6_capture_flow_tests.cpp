@@ -11,6 +11,9 @@ uint64_t clockMs=1000,gen=1,life=11;
 bool playable=true,hasActor=true,hasSoul=true,changeDuringHand=false,changedBody=false;
 bool chargeReadable=false;
 float playerCharge=0;
+bool viewReadable = false, changeDuringView = false;
+unsigned viewReads = 0;
+float viewForward[3]{}, cameraPos[3]{};
 uint8_t phase=0,known=3,left=0x11,right=0;
 int actorObject=0,otherActor=0,soulObject=0,passedCount=0,failedCount=0;
 #define C6(c,label) do{if(c)++passedCount;else{++failedCount;std::printf("FAIL P6 capture %d: %s\n",__LINE__,label);}}while(false)
@@ -19,11 +22,17 @@ void* actor(uint32_t* eid){*eid=hasActor?44:0;return hasActor?(changedBody?&othe
 void* soul(){return hasSoul?&soulObject:nullptr;}
 uint8_t readPhase(void*){return phase;}
 bool readCharge(void*,float* charge,float* min,float* max){*charge=playerCharge;*min=0;*max=1;return chargeReadable;}
+bool readView(uint32_t eid, float matrix[12], float feet[3]) {
+    ++viewReads;
+    if (changeDuringView) ++life;
+    for (int row = 0; row < 3; ++row) { matrix[row * 4 + 1] = viewForward[row]; matrix[row * 4 + 3] = cameraPos[row]; feet[row] = 0; }
+    return eid == 44 && viewReadable;
+}
 uint8_t hands(uint32_t,uint8_t* l,uint8_t* r){std::memset(l,0,16);std::memset(r,0,16);l[0]=left;r[0]=right;if(changeDuringHand)++life;return known;}
 struct Reply {uint8_t code=255;size_t size=0;std::array<uint8_t,512> b{};};
 Reply poll(bool on=true,uint64_t expected=0){uint8_t b[11]={86,2,uint8_t(on?1:0)};kcdmp::p6rules::put64(b+3,expected?expected:gen);Reply r;r.code=kcdmp::wo201ranged::handle(b,sizeof b,r.b.data(),r.b.size(),&r.size);return r;}
 void step(uint8_t p,uint64_t ms=50){phase=p;clockMs+=ms;kcdmp::wo201ranged::tick();}
-void reset(){clockMs=1000;gen=1;life=11;playable=hasActor=hasSoul=true;changeDuringHand=changedBody=chargeReadable=false;playerCharge=0;phase=0;known=3;left=0x11;right=0;kcdmp::wo201ranged::set_test_backend({now,generation,epoch,gameplay,actor,soul,readPhase,hands,readCharge});kcdmp::wo201ranged::reset_for_tests();C6(poll().code==0,"current gameplay enables native v2 capture");}
+void reset(){clockMs=1000;gen=1;life=11;playable=hasActor=hasSoul=true;changeDuringHand=changedBody=chargeReadable=false;playerCharge=0;phase=0;known=3;left=0x11;right=0;viewReads=0;viewReadable=changeDuringView=false;viewForward[0]=viewForward[2]=cameraPos[0]=cameraPos[1]=0;viewForward[1]=1;cameraPos[2]=1.6f;kcdmp::wo201ranged::set_test_backend({now,generation,epoch,gameplay,actor,soul,readPhase,hands,readCharge,readView});kcdmp::wo201ranged::reset_for_tests();C6(poll().code==0,"current gameplay enables native v2 capture");}
 }
 namespace kcdmp::wo201ranged {void test_trace(const char*,...){} }
 int p6_capture_flow_tests(int* passed){
@@ -80,6 +89,36 @@ int p6_capture_flow_tests(int* passed){
     r=poll();
     C6(sampled_aim(&actorObject).observed&&!sampled_aim(&actorObject).aim&&!sampled_aim(&actorObject).charge&&
        r.b[1]==2&&r.b[18]==aim::Aiming&&r.b[66]==aim::Uncharging,"abort clears the draw and has no Fire phase");
+
+    reset(); viewReadable = true; step(aim::None);
+    C6(viewReads == 0, "camera reader stays idle outside a held phase");
+    step(aim::Charging);
+    auto view = sampled_aim(&actorObject).angles;
+    C6(viewReads == 1 && view.known() && view.yaw == 0 && view.pitch == 0,
+       "the held production sampler measures a true zero in the local first-person view");
+    viewForward[0] = -.8660254f; viewForward[1] = 0; viewForward[2] = .5f;
+    step(aim::Charging, 25);
+    C6(viewReads == 1 && sampled_aim(&actorObject).angles.yaw == 0, "aim has the same 50 ms sampling cadence");
+    step(aim::Charging, 25);
+    view = sampled_aim(&actorObject).angles;
+    C6(viewReads == 2 && view.yaw == 9000 && view.pitch == 3000 && poll().b[1] == 2,
+       "in-phase camera changes publish yaw and pitch without a new reliable phase");
+    cameraPos[0] = 2; viewForward[0] = .8660254f; step(aim::Aiming);
+    C6(sampled_aim(&actorObject).angles.yaw == 9000, "a camera away from the player cannot replace the confirmed direction");
+    changedBody = true; step(aim::Aiming);
+    C6(!sampled_aim(&otherActor).angles.known(), "a replacement actor cannot inherit the retired body's direction");
+    cameraPos[0] = 0; step(aim::Aiming);
+    C6(sampled_aim(&otherActor).angles.yaw == -9000 && sampled_aim(&otherActor).angles.pitch == 3000,
+       "the replacement can establish its own direction and height");
+    step(aim::Uncharging);
+    C6(!sampled_aim(&otherActor).angles.known() && viewReads == 5, "confirmed release drops the angle pair and does not read the camera");
+    reset(); viewReadable = changeDuringView = true; step(aim::Aiming);
+    C6(!sampled_aim(&actorObject).observed && !sampled_aim(&actorObject).angles.known(),
+       "a lifecycle change during camera read cannot admit the old view");
+    reset(); viewReadable = true; step(aim::Aiming);
+    changeDuringView = true; step(aim::Aiming);
+    C6(!sampled_aim(&actorObject).observed && !sampled_aim(&actorObject).angles.known(),
+       "the same angles still retire if camera read crosses a lifecycle boundary");
     if(passed)*passed=passedCount;
     return failedCount;
 }

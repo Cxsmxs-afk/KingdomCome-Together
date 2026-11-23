@@ -94,7 +94,8 @@ public enum BodyState2Bits : byte
     RangedChargeKnown = 0x80,
 }
 
-/// <summary>WO-121: the 12 replicated-state bytes (Position/Ghost flag 0x10).</summary>
+/// <summary>WO-121: the 12 replicated-state bytes (Position/Ghost flag 0x10).
+/// Known ranged view angles are signed centidegrees. -32768 marks an unavailable angle.</summary>
 public readonly record struct BodyState2(
     ushort SpeedCm, sbyte MoveDir, BodyState2Bits Bits, WireZone GuardZone, WireGuardStance GuardStance,
     WireZone AtkZone, byte Charge, short AimYaw, short AimPitch)

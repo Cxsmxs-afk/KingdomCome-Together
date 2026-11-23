@@ -36,5 +36,5 @@ public static class SessionHold
     public static bool LinkDead(int silentMs, int idleMs) => silentMs >= idleMs;
 
     public static string FailText(string reason) =>
-        $"Could not stay in your host's world ({(string.IsNullOrWhiteSpace(reason) ? "the link did not come back" : reason)}). Quit the game, start it again, and wait at the main menu.";
+        $"Could not stay in your host's world ({(string.IsNullOrWhiteSpace(reason) ? "the link did not come back" : reason)}). Once back in your own game, choose Join / Rejoin your host in the co-op menu.";
 }

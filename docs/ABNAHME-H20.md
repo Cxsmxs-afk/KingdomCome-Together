@@ -27,6 +27,17 @@ Ein fünfter Test lässt während der echten Kalender-Wartephase sechs weitere S
 2. Für dieselbe Join-ID müssen Host- und Gast-Logs `snapshot=sent`, `bootstrap accepted`, `receipt=accepted`, `pre-update latch armed before load`, den Latch-Readback nach dem Laden und `reason=ready` zeigen. `clock_in` ist beim Gast mindestens 1. Bei verlorener Zustellung erscheint auch `snapshot=repeated`.
 3. Für den Owner-Nachweis beide frischen Mitschnitte mit `rp_owner_n>0` und `owner_violations=0` prüfen. Das Verhalten im Spiel und die Main-Thread-Kosten werden anhand von `FRAME`, `MAIN-COST`, `MP-W207-Q` und `MP-LINK` abgenommen.
 
+### Station Rejoin-Schleife
+
+Beide PCs verwenden dieselbe Build-ID. Nach dem Rollentausch dieselben Schritte wiederholen. Für jeden Versuch Uhrzeit, Join-ID, Build-ID und Ergebnis festhalten.
+
+1. Aus dem eigenen Spiel im Koop-Menü **Join / Rejoin your host** wählen. Beim Laden **Cancel join** wählen. Nach bestätigter Rückkehr zum eigenen Spielstand erneut beitreten. Fünf Durchgänge.
+2. In der gemeinsamen Welt **Leave** wählen. Die eigene Welt muss vollständig laden und der nächste **Join / Rejoin your host** muss funktionieren. Fünf Durchgänge.
+3. Den Host im laufenden Spiel dreimal vom Relay trennen und mit demselben Weltlauf zurückkehren lassen. Der Gast bleibt pausiert, bis der Host nachweislich zurück ist. Den Sonderfall mit neu gestartetem Host separat festhalten. Er braucht einen bestätigten neuen Hostlauf und eine erneute Aktion des Gasts.
+4. Vor und nach der Schleife Threads, Handles, aktive Pipe-Verbindungen, Timer und Spielstand-Leases zählen. Temporäre `mpworld*`- und `mpexit*`-Dateien kontrollieren und den persönlichen Save per SHA-256 vergleichen. `ours_us_p95` muss auf beiden PCs unter 2.000 µs bleiben. Der Messwert darf sich um höchstens 5 % verschlechtern.
+
+Spielabnahme und Messwerte sind offen.
+
 ## Gegenproben zum Scope
 
 Auf dem lokalen Vorgänger `67cb67b` konnte ein verspätetes Paket vom bestätigten Host mit derselben Join-ID den Latch um 1.000 ms verfälschen. Der Reader prüfte die beim Lesen gelernte Welt-Epoche. Das Paket selbst enthielt nur die Join-ID. In einer separaten Probe vor dem Angebot blieb nach einem echten Relay-Disconnect die ausstehende Join-ID ungleich null. Ein nicht bestätigter Engine-Hold lieferte auf derselben Basis trotzdem ein Angebot, das der Gast erfolgreich lud. Der Progress-Test beobachtete außerdem, dass das WorldSync-Gate die Meldungen während des Host-Holds vollständig verwarf. [Kalender-Reader](../dotnet/KcdMp.Client/GameBridge.HostCalendar.cs) · [Relay-Proben](../dotnet/KcdMp.Client.Tests/JoinCalendarIntegrationTests.cs)

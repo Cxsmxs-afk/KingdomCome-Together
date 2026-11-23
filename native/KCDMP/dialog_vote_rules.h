@@ -3,6 +3,8 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 #pragma once
 
+#include "load_sequence_rules.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +14,18 @@ namespace kcdmp::dialogvote {
 constexpr uint8_t kOp = 92, kTyped = 255, kClear = 255, kRows = 8;
 constexpr size_t kTokenBytes = 32, kBytes = 7 + kTokenBytes;
 enum Result : uint8_t { Submitted = 0, ScopeChanged = 4, NotEntered = 5, Uncertain = 6 };
+
+struct SessionScope {
+    uint64_t connection = 0;
+    uint64_t load = 0;
+    bool live() const { return connection != 0; }
+    bool operator==(const SessionScope& other) const { return connection == other.connection && load == other.load; }
+};
+
+inline SessionScope observed_scope(uint64_t connection, uint64_t load) {
+    return connection && loadsequence::allowed(load, load, loadsequence::Access::Live)
+        ? SessionScope{connection, load} : SessionScope{};
+}
 
 struct Request {
     uint8_t index = kClear;

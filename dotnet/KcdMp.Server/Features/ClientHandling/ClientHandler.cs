@@ -175,21 +175,29 @@ public class ClientHandler
 	}
 
 	/// <summary>
-	/// Reserves one player slot and one wire id after a valid handshake. The
-	/// check and reserve happen under the same lock so simultaneous
-	/// handshakes cannot overbook the relay; a socket that never handshakes
-	/// consumes neither a player slot nor an id (WO-76).
+	/// Reserves a player slot and a wire id after a valid handshake. A same-player
+	/// replacement takes over the old seat but keeps a distinct id until both streams
+	/// finish. The check, reservation and retirement share one lock (WO-76, WO-144).
 	/// </summary>
-	public bool TryMarkReady(ClientSession client)
+	internal bool TryMarkReady(ClientSession client, string name, out List<ClientSession> superseded)
 	{
 		lock (_lock)
 		{
-			if (_readyClients.Count >= _maxPlayers || _freeIds.Count == 0)
+			superseded = SupersededBy(client, name);
+			int active = _readyClients.Count(c => !c.IsSuperseded);
+			if (active - superseded.Count >= _maxPlayers || _freeIds.Count == 0)
 				return false;
 
+			var authority = superseded.Count > 0 ? PickAuthority(out _) : null;
 			client.Id = _freeIds.Min;
 			_freeIds.Remove(client.Id);
-			return _readyClients.Add(client);
+			_readyClients.Add(client);
+			client.AcceptHandshake(name);
+			foreach (var old in superseded) old.MarkSuperseded();
+			if (authority is { IsSuperseded: true })
+				DepartAuthority(authority, active - superseded.Count, "superseded");
+			foreach (var old in superseded) old.AnnounceDisconnect();
+			return true;
 		}
 	}
 
@@ -205,19 +213,36 @@ public class ClientHandler
 	{
 		lock (_lock)
 		{
-			if (_absentHost is null && _readyClients.Count > 1 && _readyClients.Contains(client)
-				&& ReferenceEquals(PickAuthority(out _), client))
-			{
-				_absentHost = new HostLease(client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
-				_logger.Information("MP-HOST-ABSENT pause epoch={Epoch} run={Run} ready={Ready}",
-					client.AnnouncedWorldEpoch, client.AnnouncedRunId, _readyClients.Count - 1);
-			}
+			bool wasAuthority = _readyClients.Contains(client) && ReferenceEquals(PickAuthority(out _), client);
 			_clients.Remove(client);
-			if (ReferenceEquals(_sessionHost, client)) _sessionHost = null;
 			if (_readyClients.Remove(client))
 				_freeIds.Add(client.Id);
-			if (_readyClients.Count == 0) _absentHost = null;
+			int remaining = _readyClients.Count(c => !c.IsSuperseded);
+			if (wasAuthority) DepartAuthority(client, remaining, "disconnect");
+			if (remaining == 0)
+			{
+				_absentHost = null;
+				_hostClaimRequired = false;
+			}
 		}
+	}
+
+	// Called with _lock held, before a returning connection can acquire authority.
+	private void DepartAuthority(ClientSession client, int remaining, string reason)
+	{
+		bool confirmed = ReferenceEquals(_sessionHost, client);
+		_sessionHost = null;
+		_hostClaimRequired = true;
+		if (!confirmed || remaining == 0 || client.AnnouncedWorldEpoch == 0 || client.AnnouncedRunId == Guid.Empty ||
+			!HasPlayerIdentity(client.IdentityKey))
+			return;
+
+		_absentHost = new HostLease(client.IdentityKey, client.Name!, client.AnnouncedWorldEpoch, client.AnnouncedRunId);
+		// The guest reader retires the old host id on Disconnect. Queue it before the next
+		// host can forward its W203 proof, even if the old transport still has a pending read.
+		client.AnnounceDisconnect();
+		_logger.Information("MP-HOST-ABSENT pause epoch={Epoch} run={Run} ready={Ready} why={Reason}",
+			client.AnnouncedWorldEpoch, client.AnnouncedRunId, remaining, reason);
 	}
 
 	/// <summary>
@@ -226,20 +251,20 @@ public class ClientHandler
 	/// name) connecting again while his old connection is still here (his game
 	/// or agent restarted; a Steam connection lingers until its ~10-20 s
 	/// timeout, and for all that time the host counted a phantom partner). The
-	/// caller closes them at once; their Disconnect goes out as for any leave.
+	/// caller closes their transport after the relay has retired their authority and announced the leave.
 	/// </summary>
-	public List<ClientSession> SupersededBy(ClientSession newer)
+	private List<ClientSession> SupersededBy(ClientSession newer, string name)
 	{
 		var list = new List<ClientSession>();
 		string key = newer.IdentityKey;
-		if (string.IsNullOrEmpty(key) || key.EndsWith(':') || key.EndsWith('?') || newer.Name is null) return list;
-		lock (_lock)
-			foreach (var c in _readyClients)
-				if (!ReferenceEquals(c, newer) && c.IsReady && c.IdentityKey == key
-				    && string.Equals(c.Name, newer.Name, StringComparison.Ordinal))
-					list.Add(c);
+		if (!HasPlayerIdentity(key)) return list;
+		foreach (var c in _readyClients)
+			if (c.IsReady && c.IdentityKey == key && string.Equals(c.Name, name, StringComparison.Ordinal))
+				list.Add(c);
 		return list;
 	}
+
+	private static bool HasPlayerIdentity(string key) => !string.IsNullOrEmpty(key) && !key.EndsWith(':') && !key.EndsWith('?');
 
 	/// <summary>
 	/// Gets a copy of the client list to prevent outside manipulation.
@@ -259,9 +284,9 @@ public class ClientHandler
 	/// N peers produce N independent damage streams for one conceptual fight
 	/// and the damage multiplies by N -- see Protocol's 0x21 documentation.
 	///
-	/// While the host is connected, one declared claim wins, otherwise the single
-	/// loopback client, otherwise the lowest ready id. When that host leaves and
-	/// other players are still here, nobody replaces them: the world pauses.
+	/// Before the first authority leaves, a legacy agent can start with the sole
+	/// loopback connection or the lowest ready id. After departure, a confirmed
+	/// world requires the same host and an unstarted world requires an explicit host claim.
 	/// Derived on read from state the handler already keeps.
 	/// </summary>
 	public ClientSession? DamageAuthority
@@ -276,6 +301,7 @@ public class ClientHandler
 	public HostLease? AbsentHost => _absentHost;
 	private volatile HostLease? _absentHost;
 	private ClientSession? _sessionHost;
+	private bool _hostClaimRequired;
 
 	internal (ClientSession? Host, ulong Epoch) PresentationAnchor()
 	{
@@ -315,7 +341,7 @@ public class ClientHandler
 	public bool HostAbsent => _absentHost is not null;
 
 	public bool IsReturningHost(ClientSession client) =>
-		_absentHost is { } left && string.Equals(left.IdentityKey, client.IdentityKey, StringComparison.Ordinal)
+		client.IsReady && _absentHost is { } left && string.Equals(left.IdentityKey, client.IdentityKey, StringComparison.Ordinal)
 		&& string.Equals(left.Name, client.Name, StringComparison.Ordinal);
 
 	public bool ObserveHostAnnouncement(ClientSession client, uint world, Guid run)
@@ -324,7 +350,7 @@ public class ClientHandler
 		{
 			if (!ReferenceEquals(PickAuthority(out _), client)) return false;
 			client.NoteAnnouncement(world, run);
-			if (run != Guid.Empty) _sessionHost = client;
+			if (world != 0 && run != Guid.Empty) _sessionHost = client;
 			return true;
 		}
 	}
@@ -334,7 +360,7 @@ public class ClientHandler
 	{
 		lock (_lock)
 		{
-			if (_absentHost is not { } left || !client.ClaimsHost || !_readyClients.Contains(client)) return false;
+			if (_absentHost is not { } left || !client.IsReady || !client.ClaimsHost || !_readyClients.Contains(client)) return false;
 			if (!HostAbsentRules.SameReturn(left, client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId))
 			{
 				if (client.AnnouncedWorldEpoch != 0 || client.AnnouncedRunId != Guid.Empty)
@@ -358,6 +384,7 @@ public class ClientHandler
 		foreach (var c in _clients)
 			if (c.IsReady && c.ClaimsHost) claimants.Add(c);
 		if (claimants.Count == 1) { reason = "declared-host"; return claimants[0]; }
+		if (claimants.Count == 0 && _hostClaimRequired) { reason = "awaiting-host-claim"; return null; }
 		var pool = claimants.Count > 1 ? claimants : _clients.Where(c => c.IsReady);
 		string prefix = claimants.Count > 1 ? "declared-host+" : "";
 
@@ -374,14 +401,14 @@ public class ClientHandler
 	}
 
 	/// <summary>
-	/// WO-127: the connection test's "is the host's game here": a ready client
-	/// that claims the host, or the relay-local one (a pre-WO-127 host agent
-	/// never claims).
+	/// WO-127: reports a confirmed or claiming host to the connection test.
+	/// A relay-local legacy connection suffices at initial startup.
 	/// </summary>
 	public bool HasHostConnected()
 	{
 		lock (_lock)
-			return _absentHost is null && _clients.Any(c => c.IsReady && (c.ClaimsHost || c.IsLoopback));
+			return _absentHost is null && (_sessionHost is not null ||
+				_clients.Any(c => c.IsReady && (c.ClaimsHost || !_hostClaimRequired && c.IsLoopback)));
 	}
 
 	// WO-127: the last release a joiner was refused for, for the host's launcher
@@ -969,7 +996,7 @@ public class ClientHandler
 		get
 		{
 			lock (_lock)
-				return _readyClients.Count;
+				return _readyClients.Count(c => !c.IsSuperseded);
 		}
 	}
 }

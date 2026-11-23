@@ -137,14 +137,16 @@ public static class Wo154MenuRules
     /// cutscene) and this player down (the WO-113 guard). A Level statement in the batch queue (BatchPolicy).
     /// </summary>
     public static string SessionLua(string role, bool partner, bool? hostFastTravel, bool? hostCrimeJoint, bool? hostLeash,
-                                    string link, string version, bool gameScreen, bool downed)
+                                    string link, string version, bool gameScreen, bool downed, string? joinPhase = null)
     {
         string r = role is "host" or "joiner" ? role : "none";
         string l = link is "connected" or "connecting" or "starting" or "failed" ? link : "starting";
         string v = VersionText.IsMatch(version) ? version : "?";
         string crime = hostCrimeJoint is null ? "nil" : hostCrimeJoint.Value ? "\"joint\"" : "\"individual\"";
+        string phase = joinPhase is "ready" or "waiting" or "loading" or "connected" or "paused" or "return-needed"
+            ? $", \"{joinPhase}\"" : "";
         return string.Create(CultureInfo.InvariantCulture,
-            $"if KCD2MP_W154MenuSession then KCD2MP_W154MenuSession(\"{r}\", {LuaBool(partner)}, {LuaBool(hostFastTravel)}, {crime}, {LuaBool(hostLeash)}, \"{l}\", \"{v}\", {LuaBool(gameScreen)}, {LuaBool(downed)}) end");
+            $"if KCD2MP_W154MenuSession then KCD2MP_W154MenuSession(\"{r}\", {LuaBool(partner)}, {LuaBool(hostFastTravel)}, {crime}, {LuaBool(hostLeash)}, \"{l}\", \"{v}\", {LuaBool(gameScreen)}, {LuaBool(downed)}{phase}) end");
     }
 
     /// <summary>The menu keys for the mod: the one bound in this game run, the one stored for the next start, and the

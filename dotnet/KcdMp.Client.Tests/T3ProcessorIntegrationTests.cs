@@ -25,8 +25,8 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
     private static object? Call(GameBridge b, string method, params object?[] args) => typeof(GameBridge).GetMethod(method, Private)!.Invoke(b, args);
     private static void Where(GameBridge b, string state)
     { var f = typeof(GameBridge).GetField("_where", Private)!; f.SetValue(b, Enum.Parse(f.FieldType, state)); }
-    private static GameBridge Bridge(HttpGameTransport transport, string state)
-    { var b = new GameBridge(new ClientConfig()); Set(b, "_transport", transport); Where(b, state); return b; }
+    private static GameBridge Bridge(HttpGameTransport transport, string state, TimeProvider? frameTime = null)
+    { var b = new GameBridge(new ClientConfig()) { T3FrameTime = frameTime ?? TimeProvider.System }; Set(b, "_transport", transport); Where(b, state); return b; }
 
     private sealed class Frames
     {
@@ -97,7 +97,8 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var game = new Game(_ => release.Task); // deliberately ignores cancellation, like a genuinely stuck leaf
         await using var transport = new HttpGameTransport("http://localhost:1403", 30000, game) { BatchingEnabled = false };
-        var b = Bridge(transport, "Loading"); var frames = new Frames(b);
+        var clock = new ManualFrameTime();
+        var b = Bridge(transport, "Loading", clock); var frames = new Frames(b);
         using var session = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         Task? processor = null;
         try
@@ -106,8 +107,9 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
             frames.Send(Protocol.HorseInfoDown, [1, 0]);
             processor = frames.Run(session.Token);
             await game.Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await clock.Armed.WaitAsync(session.Token);
+            Call(b, "Wo124OnGameplayStartedCore", true);
             Call(b, "T3StartIndependentTick", frames.Writer, session.Token);
-            Where(b, "World"); Call(b, "Wo136OnGameplayStarted");
             long started = Stopwatch.GetTimestamp();
             for (int i = 0; i < 100; i++)
             {
@@ -117,17 +119,44 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
                 frames.Send(Protocol.ReleaseVersion, [2, .. Encoding.UTF8.GetBytes("next-" + i)]);
                 await Task.Delay(12, session.Token);
             }
-            while (Get<long>(b, "_w136Replayed") == 0 || Get<IDictionary>(b, "_ghostReleaseVersions")[(byte)2]?.ToString() != "next-99")
+            while (Get<long>(b, "_w136Replayed") == 0)
+                await Task.Delay(10, session.Token);
+            Assert.False(release.Task.IsCompleted);
+            Assert.Null(Get<IDictionary>(b, "_ghostReleaseVersions")[(byte)2]);
+            clock.Expire();
+            while (Get<IDictionary>(b, "_ghostReleaseVersions")[(byte)2]?.ToString() != "next-99")
                 await Task.Delay(10, session.Token);
             Assert.True(Stopwatch.GetElapsedTime(started).TotalSeconds < 5);
             Assert.Equal(1, Get<long>(b, "_w136Replayed"));
             Assert.True((long)Call(b, "Wo202QueueLagMs")! < 1000);
             var counters = Get<System.Collections.Concurrent.ConcurrentDictionary<string, long>>(b, "_t3Counters");
-            Assert.Equal(1, counters["proc_stalls"]); Assert.InRange(counters["proc_stall_max_ms"], 1, 2000);
+            Assert.Equal(1, counters["proc_stalls"]); Assert.Equal(1950, counters["proc_stall_max_ms"]);
             output.WriteLine($"T3-P0-SIM proc_stall_max_ms={counters["proc_stall_max_ms"]} catchup_ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} backlog_after_ms={Call(b, "Wo202QueueLagMs")} replayed={Get<long>(b, "_w136Replayed")}");
             frames.Complete(); await processor.WaitAsync(TimeSpan.FromSeconds(2));
         }
         finally { release.TrySetResult(); session.Cancel(); if (processor is not null) await processor; }
+    }
+
+    [Fact]
+    public async Task Legacy_world_observation_does_not_release_replay_before_the_gameplay_receipt()
+    {
+        var game = new Game(_ => Task.CompletedTask);
+        await using var transport = new HttpGameTransport("http://localhost:1403", 5000, game) { BatchingEnabled = false };
+        var b = Bridge(transport, "Loading");
+        var frames = new Frames(b);
+        Call(b, "Wo136OnLoadSeen", "fixture");
+        Assert.True((bool)Call(b, "Wo136Defer", frames.Frame(Protocol.ActionDown, []))!);
+
+        Call(b, "Wo124OnWhere", "world");
+        Call(b, "Wo136ReplayIfReleased", frames.Writer, CancellationToken.None);
+        Assert.Equal(0, Get<long>(b, "_w136Replayed"));
+
+        Call(b, "Wo124OnGameplayStartedCore", true);
+        Assert.True(Get<DateTime>(b, "_w136SettleUntilUtc") > DateTime.UtcNow);
+        Set(b, "_w136SettleUntilUtc", DateTime.UtcNow.AddTicks(-1));
+        Call(b, "Wo136ReplayIfReleased", frames.Writer, CancellationToken.None);
+        Assert.Equal(1, Get<long>(b, "_w136Replayed"));
+        frames.Complete();
     }
 
     [Fact]

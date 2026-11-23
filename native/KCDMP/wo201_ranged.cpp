@@ -11,6 +11,7 @@
 // on the partner's screen (an animation of the game's own fragments: never a shot of the figure's own -- no projectile).  WO201-RANGED.
 #include "wo201.h"
 #include "ranged_aim.h"
+#include "wo203_cam_rules.h"
 #include "p6_capture.h"
 #include "p6_rules.h"
 #include "wo163.h"
@@ -25,6 +26,7 @@
 #include "fault_guard.h"
 #include "log.h"
 #include "motion.h"
+#include "wo203.h"
 #include "rttr_abi.h"
 #include <windows.h>
 #else
@@ -177,6 +179,7 @@ rangedaim::Sample step_of(void* actor) {
     return {phase, measured};
 }
 uint8_t hand_guids(uint32_t eid,p6rules::Capture* row){return g_test.hands(eid,row->left.data(),row->right.data());}
+bool read_view(uint32_t eid, float matrix[12], float feet[3]) { return g_test.view && g_test.view(eid, matrix, feet); }
 #else
 uint64_t now_ms(){return GetTickCount64();}
 uint64_t generation(){return wo216::lifecycle_generation();}
@@ -186,7 +189,16 @@ void* local_actor(uint32_t* eid){return motion::local_actor(eid);}
 void* player_soul(){return rttr::read_player_soul();}
 rangedaim::Sample step_of(void* actor){return read_step(actor);}
 uint8_t hand_guids(uint32_t eid,p6rules::Capture* row){wo143rules::Hands h{};const uint8_t known=wo141::x::read_body_hands_strict(eid,&h);std::memcpy(row->left.data(),h.left.b,16);std::memcpy(row->right.data(),h.right.b,16);return known;}
+bool read_view(uint32_t eid, float matrix[12], float feet[3]) { return wo203::cam::read_player_view(eid, matrix, feet); }
 #endif
+
+rangedaim::Angles measured_angles(uint32_t eid) {
+    float matrix[12]{}, feet[3]{};
+    if (!read_view(eid, matrix, feet)) return {};
+    const float cameraPos[3]{matrix[3], matrix[7], matrix[11]};
+    if (!wo203cam::in_player_head(cameraPos, feet)) return {};
+    return rangedaim::camera_angles(matrix);
+}
 } // namespace
 
 #ifndef KCDMP_P6_CAPTURE_TEST
@@ -198,9 +210,10 @@ void install() {
     int found = 0;
     for (auto& s : g_steps) { s.vft = anchor::find_vftable(em, s.rtti, 0); if (s.vft) ++found; }
     if (!g_vftExp || !g_vftMain || found < 6) { g_why = "the shooting classes not found by RTTI"; return; }
+    wo203::cam::prepare_player_view();
     g_why = "resolved";
     logf("WO201-RANGED resolver: the shooting expansion, its main action and %d of %zu step classes by RTTI -- the local player's crossbow and "
-         "bow are read once a frame (no hook)", found, sizeof g_steps / sizeof g_steps[0]);
+         "bow are sampled every 50 ms (no hook)", found, sizeof g_steps / sizeof g_steps[0]);
 }
 
 #else
@@ -238,7 +251,7 @@ void tick() {
         g_lastActor = actor;
         g_lastSoul = ps;
     }
-    const auto sample = step_of(actor);
+    auto sample = step_of(actor);
     const uint8_t phase = sample.phase;
     c_reads.fetch_add(1);
     if (phase == rangedaim::Unreadable) { c_unreadable.fetch_add(1); return; }
@@ -247,10 +260,14 @@ void tick() {
         g_waitForPhaseAfterReplacement = false;
     }
 
+    const bool readingView = rangedaim::is_hold_phase(phase);
+    if (readingView) sample.angles = measured_angles(eid);
+
     auto draw = g_aim;
     const auto edge = rangedaim::apply(sample, draw);
     const bool newPhase = !g_haveLast || phase != g_last;
-    if (!newPhase && edge == rangedaim::Edge::Same) return;
+    // Camera and entity reads can cross a scope change even when their values stay the same.
+    if (!newPhase && edge == rangedaim::Edge::Same && !readingView) return;
 
     p6rules::Capture row;
     if (newPhase) {
@@ -271,10 +288,10 @@ void tick() {
     const uint8_t was=g_last;g_last=phase;g_haveLast=true;c_changes.fetch_add(1);
     if(!g_q.push(row)){stream_reset(gen,epoch,false);return;} // explicit resync; never silently drop only Fire/Leaving
     if (phase == rangedaim::Firing || phase != was)
-        logf("WO201-RANGED local %s -> %s capture=%llu source=%u known=%u epoch=%llu held=%d charge_known=%d charge=%u angles=unverified",
+        logf("WO201-RANGED local %s -> %s capture=%llu source=%u known=%u epoch=%llu held=%d charge_known=%d charge=%u aim_yaw_cd=%d aim_pitch_cd=%d",
              phase_name(was), phase_name(phase), static_cast<unsigned long long>(t), row.source, row.known,
              static_cast<unsigned long long>(epoch), draw.aim ? 1 : 0, draw.charge ? 1 : 0,
-             static_cast<unsigned>(draw.charge.value_or(0)));
+             static_cast<unsigned>(draw.charge.value_or(0)), draw.angles.yaw, draw.angles.pitch);
 }
 
 // v2 only: [op86][version2][on1][expected P1gen8] -> header18 + <=10 rows48.

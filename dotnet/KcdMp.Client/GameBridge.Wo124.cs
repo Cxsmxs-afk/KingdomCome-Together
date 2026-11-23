@@ -19,8 +19,7 @@ namespace KcdMp.Client;
 /// A joiner takes the mode from the host. Then:
 ///   * at the main menu: the agent asks for the world by itself (WO-123 does
 ///     the pause, the save and the transfer);
-///   * already in a world: nothing is asked; the player is told to come back
-///     through the main menu (KCD2 has no exit-to-menu, so: restart the game);
+///   * already in a private world: the player can ask to join from the mod menu;
 ///   * the world arrives (verified by WO-123) -> the joiner's own Henry is
 ///     spliced in (WhsSave.Splice + Check + Verify) from their newest own save
 ///     (or mp_join_henry) -> the result is placed as a transient
@@ -48,6 +47,8 @@ public partial class GameBridge
     private sealed record HostRun(uint Epoch, Guid Run);
     private HostRun? _absentHostRun, _lastHostRun;
     private int _hostAbsentRefusalLogged;
+    // Keep the save lock while the engine may still be rendering the host's world.
+    private volatile bool _returningFromSharedWorld;
     internal bool HostAbsentPause => Volatile.Read(ref _absentHostRun) is not null;
     private readonly ConcurrentDictionary<byte, bool> _modeTold = new();
     private DateTime _modeBroadcastUtc = DateTime.MinValue;
@@ -150,13 +151,24 @@ public partial class GameBridge
         _modeTold.Clear();
         _modeBroadcastUtc = DateTime.MinValue;
         _hostModeKnown = false;
-        _autoRequests = 0;
+        lock (_joinGate) ResetJoinSessionState("connect", suppressAutomatic: false);
         _autoNextUtc = DateTime.UtcNow.AddSeconds(2);
-        _needsMenuTold = false;
         _gameQuitting = false;
         _ = ExecLuaAsync("if KCD2MP_Wo124CfgEmit then KCD2MP_Wo124CfgEmit() end");
         _ = ExecLuaAsync("if KCD2MP_W171Emit then KCD2MP_W171Emit() end");   // WO-171: the marker's style / offset / flip as the mod has them
         _ = Wo124LoopAsync(ct);
+    }
+
+    // Retry policy is separate from ownership of an in-flight engine load.
+    // Called with the join gate; an explicit action opens a fresh attempt.
+    private void ResetJoinSessionState(string reason, bool suppressAutomatic)
+    {
+        _autoRequests = suppressAutomatic ? 99 : 0;
+        _autoNextUtc = DateTime.MinValue;
+        _needsMenuTold = false;
+        _rejoinPending = false;
+        Wo202RejoinReset(reason);
+        if (!suppressAutomatic) Volatile.Write(ref _blockedJoinRetry, null);
     }
 
     private async Task Wo124OnDisconnectAsync()
@@ -247,7 +259,7 @@ public partial class GameBridge
         if (!on)
         {
             _needsMenuTold = false;
-            if (_joinUiState is "waiting" or "needs-menu" or "no-save") SetJoinUi("idle", "");
+            if (_joinUiState is "waiting" or "own-world" or "no-save") SetJoinUi("idle", "");
             // This game is in the host's world and the host stopped sharing it: without
             // the lock it could now be saved into this player's own playline. Leave it.
             if (_joinedWorld) _ = LeaveSharedWorldAsync("host-separate", "Your host turned the shared world off.");
@@ -421,7 +433,7 @@ public partial class GameBridge
         _where = GameWhere.Menu;
         LoadSequenceOnMenu();
         W160WorldGone();
-        if (_leaveInProgress) CompleteHostAbsentLeave();
+        CompleteConfirmedReturn();
         _leaveInProgress = false;
         Wo206LoadSettled();   // WO-206 E: that load is over (failed); the next one bumps again
         Console.WriteLine("MP-JOIN joiner: the engine reports a failed load and is back at the MAIN MENU");
@@ -435,9 +447,9 @@ public partial class GameBridge
         if (_where != GameWhere.Menu) Console.WriteLine("MP-JOIN joiner: the main menu is up");
         _where = GameWhere.Menu;
         LoadSequenceOnMenu();
-        if (HostAbsentPause)
+        if (HostAbsentPause || _returningFromSharedWorld)
         {
-            CompleteHostAbsentLeave();
+            CompleteConfirmedReturn();
             SetJoinedWorld(false);
         }
         Wo206LoadSettled();   // WO-206 E
@@ -447,8 +459,8 @@ public partial class GameBridge
         {
             // A new game process (the last one quit): a fresh start for the automatic join.
             _gameQuitting = false;
-            _autoRequests = 0;
-            _needsMenuTold = false;
+            lock (_joinGate) ResetJoinSessionState("new-game", suppressAutomatic: false);
+            _autoNextUtc = DateTime.UtcNow.AddSeconds(3);
         }
         // WO-125: a new process's mod starts with no session mode and the agent pushes it only on a change,
         // so an agent kept across a restart left the mod refusing the joiner's lock (observed: lock=failed).
@@ -467,6 +479,7 @@ public partial class GameBridge
         if (!confirmedByGameQuery && _transport is LogTailGameTransport engine && IgnoreEngineTerminal(engine)) return;
         if (!confirmedByGameQuery && !OwnLoadExpected && _jj is { EngineReceipt: { } receipt } &&
             !receipt.MatchesTerminal(loaded: true)) return;
+        Wo136ArmLegacySettle();
         _where = GameWhere.World;
         var startedLoad = _worldLoad.Current;
         bool ownLoad = LoadSequenceEnabled ? startedLoad.OwnIntent == WorldLoadOwnIntent.ExpectedPrivate : _ownLoadExpected;
@@ -490,7 +503,7 @@ public partial class GameBridge
         }
         if (ownLoad)
         {
-            CompleteHostAbsentLeave();
+            CompleteConfirmedReturn();
             _leaveInProgress = false;
             Console.WriteLine("MP-JOIN joiner: back in this player's own world (Gameplay started)");
             Wo211AfterHomeLoad();
@@ -520,9 +533,11 @@ public partial class GameBridge
             if (Volatile.Read(ref _pinnedHomeLoad) is not null) return;
             // WO-207 C.4: a leave the link cut short may have loaded while the agent was reconnecting (its "Gameplay started" never seen);
             // the mod's last-loaded save says whether it is in
-            if (!(_w207LinkRejoin && await Wo207LeaveLandedAsync()))
+            if (_w207LinkRejoin && await Wo207LeaveLandedAsync()) CompleteConfirmedReturn();
+            else
             {
                 if ((DateTime.UtcNow - _leaveSinceUtc).TotalMinutes < 5) return;
+                if (_returningFromSharedWorld) return;
                 Console.WriteLine("MP-HENRY joiner: the leave's own load never reported in (5 min) -- the join gate opens again");
             }
             _leaveInProgress = false;
@@ -561,9 +576,9 @@ public partial class GameBridge
         if (_where == GameWhere.World && !fromWorld && !_needsMenuTold)
         {
             _needsMenuTold = true;
-            const string msg = "Your host is in a shared world. Quit, start the game again and wait at the main menu to join.";
+            const string msg = "Your host is in a shared world. Choose Join / Rejoin your host in the co-op menu.";
             Console.WriteLine("MP-JOIN joiner: the host is in a shared world but this game is already in a world -- no join asked; telling the player");
-            SetJoinUi("needs-menu", msg);
+            SetJoinUi("own-world", msg);
             await ExecLuaAsync($"if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"{EscapeLua(msg)}\") end");
             return;
         }
@@ -917,6 +932,10 @@ public partial class GameBridge
         {
             Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} failed: {ex.GetType().Name}: {ex.Message}");
             await AbortJoinerJoinAsync(j, Protocol.JoinAbortIo, "failed", "The join failed.");
+        }
+        finally
+        {
+            try { File.Delete(stagedPath); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
     }
 
@@ -1351,7 +1370,6 @@ public partial class GameBridge
         lock (_joinGate)
         {
             if (!ReferenceEquals(_jj, j)) return;
-            WorldReceiver.SweepStaging(WorldReceiver.DefaultStagingDir());
             _joinReceivedId = 0;
             _jj = null;
             if (_joinCalendarRequest?.JoinId == j.JoinId) ClearJoinCharacterRequest();
@@ -1412,8 +1430,10 @@ public partial class GameBridge
         lock (_joinGate)
         {
             if (_leaveInProgress || (expected is not null && !ReferenceEquals(_jj, expected))) return;
-            if (!_joinedWorld && _jj is null) return;
+            if (!_joinedWorld && _jj is null && !_returningFromSharedWorld) return;
+            ResetJoinSessionState("leave", suppressAutomatic: true);
             _leaveInProgress = true;  // The private load must settle before another join.
+            _returningFromSharedWorld = true;
             hostAbsent = HostAbsentPause;
             selectedHome = expected?.Character?.First?.Save ?? _joinedSource;
             homeFingerprint = expected?.Character?.First?.Fingerprint ?? _joinedSourceFingerprint;
@@ -1441,9 +1461,8 @@ public partial class GameBridge
             SetJoinedWorld(false);
             _jj = null;
             _rewinding = false;
-            _rejoinPending = false;
         }
-        if (!hostAbsent) await Wo122SetLockAsync(false, "left-shared-world");
+        if (!_lockHeld) await Wo122SetLockAsync(true, "returning-to-private-world");
         Wo144ReleaseClock("left-shared-world");   // WO-144 3.3: a clock standing with the host's never stays standing
         string full = src is null ? message : $"{message} Going back to your own game.";
         SetJoinUi("left", full, HostAuthorityFailure.JoinReason(why));
@@ -1509,7 +1528,8 @@ public partial class GameBridge
     {
         if (await Wo125ExitToMenuAsync(why, ct, relayClosed)) return;
         _leaveInProgress = false;
-        SetJoinUi("left", message + " Quit the game to get back to the main menu.", HostAuthorityFailure.JoinReason(why));
+        SetJoinUi("left", message + " The game could not return to the menu. Choose Leave in the mod menu to retry.",
+            HostAuthorityFailure.JoinReason(why));
     }
 
     private async Task Wo124LoadPinnedHomeAsync(HenrySource save, string root, LogTailGameTransport engine,
@@ -1626,12 +1646,19 @@ public partial class GameBridge
         return true;
     }
 
-    private void CompleteHostAbsentLeave()
+    private void CompleteConfirmedReturn()
     {
+        bool returning;
+        lock (_joinGate)
+        {
+            returning = _returningFromSharedWorld;
+            if (returning) ResetJoinSessionState("private-return", suppressAutomatic: true);
+            _returningFromSharedWorld = false;
+        }
         var absent = Interlocked.Exchange(ref _absentHostRun, null);
-        if (absent is null) return;
-        Console.WriteLine($"MP-HOST-ABSENT leave epoch={absent.Epoch} run={absent.Run:N} reason=private-world");
-        _ = Wo122SetLockAsync(false, "host-absent-left");
+        if (absent is not null)
+            Console.WriteLine($"MP-HOST-ABSENT leave epoch={absent.Epoch} run={absent.Run:N} reason=private-world");
+        if (returning || absent is not null) _ = Wo122SetLockAsync(false, "private-world-confirmed");
     }
 
     /// <summary>The host aborted a join this machine is running (its safety timeout, a reload, a cancel).</summary>
@@ -1734,7 +1761,7 @@ public partial class GameBridge
         LoadSequenceOnExit();
         W160WorldGone();
         _gameQuitting = true;
-        CompleteHostAbsentLeave();
+        CompleteConfirmedReturn();
         _ = Wo207OnQuitAsync();       // WO-207 C.2: the player's own background setting back before the process ends
         Wo202CrashWatch.NoteQuit();   // WO-202 I.1: the process that ends next ends on purpose
         var owedAtQuit = wasShared ? Wo184TakeOwedAtQuit() : null;   // WO-184 B4: never dropped silently

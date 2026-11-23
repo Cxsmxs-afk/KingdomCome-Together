@@ -22,16 +22,19 @@ public partial class GameBridge
         return true;
     }
 
-    private bool T3AdmitInWorldRejoin()
+    private bool T3AdmitInWorldRejoin() => T3AdmitInWorldRejoinFrom(null);
+
+    private bool T3AdmitInWorldRejoinFrom(string? trigger)
     {
+        string reason = trigger ?? _t3RejoinReason;
         if (T3HostWorldChanged)
         {
-            T3Increment("auto_rejoins_in_world");
-            Console.WriteLine($"T3-AUTO-REJOIN trigger={_t3RejoinReason} decision=request loaded_epoch={_t3JoinedHostWorld} host_epoch={_w206.World}");
+            if (trigger is null) T3Increment("auto_rejoins_in_world");
+            Console.WriteLine($"T3-AUTO-REJOIN trigger={reason} decision=request loaded_epoch={_t3JoinedHostWorld} host_epoch={_w206.World}");
             return true;
         }
-        Console.WriteLine($"T3-AUTO-REJOIN trigger={_t3RejoinReason} decision=suppress-unchanged-or-unknown loaded_epoch={_t3JoinedHostWorld} host_epoch={_w206.World}");
-        _rejoinPending = false;
+        Console.WriteLine($"T3-AUTO-REJOIN trigger={reason} decision=suppress-unchanged-or-unknown loaded_epoch={_t3JoinedHostWorld} host_epoch={_w206.World}");
+        if (trigger is null) _rejoinPending = false;
         return false;
     }
 

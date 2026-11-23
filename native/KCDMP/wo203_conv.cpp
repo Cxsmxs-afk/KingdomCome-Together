@@ -29,6 +29,7 @@
 #include "dialog_vote_rules.h"
 #include "edge_console_rules.h"
 #include "load_sequence.h"
+#include "pipe_server.h"
 #include "wo208_rules.h"
 #include "wo201.h"
 #include "motion.h"
@@ -77,6 +78,8 @@ ActiveFn g_origActive = nullptr;
 int g_setSlot = -1, g_activeSlot = -1;
 std::atomic<void*> g_activeSelf{nullptr};
 std::atomic<int32_t> g_current{-1};
+dialogvote::SessionScope g_scope;   // Main only: presentation data below belongs to this connection and load
+bool refresh_scope();
 
 struct Vote {
     bool on = false;
@@ -139,8 +142,10 @@ bool rows(void* self, char** b, size_t* n) {
 }
 
 void hk_active(void* self, int32_t index, int32_t stopper) {
-    g_activeSelf = self;
-    g_current = index;
+    if (refresh_scope()) {
+        g_activeSelf = self;
+        g_current = index;
+    }
     c_active.fetch_add(1, std::memory_order_relaxed);
     g_origActive(self, index, stopper);
 }
@@ -158,21 +163,27 @@ std::atomic<int> g_tlOn{0};
 std::atomic<float> g_tlLimit{1.0f};
 std::atomic<uint64_t> g_tlSetAt{0}, g_tlUpdAt{0};
 std::atomic<uint32_t> c_tlSets{0}, c_tlUpdates{0}, c_tlClears{0};
+void* g_tlSelf = nullptr;   // Main only
 
 void hk_set_tl(void* self) {
-    const uint64_t now = GetTickCount64();
-    g_tlLimit = 1.0f; g_tlSetAt = now; g_tlUpdAt = now; g_tlOn = 1;
-    g_tlSeq.fetch_add(1);
+    if (refresh_scope()) {
+        const uint64_t now = GetTickCount64();
+        g_tlSelf = self;
+        g_tlLimit = 1.0f; g_tlSetAt = now; g_tlUpdAt = now; g_tlOn = 1;
+        g_tlSeq.fetch_add(1);
+    }
     c_tlSets.fetch_add(1, std::memory_order_relaxed);
     g_origSetTl(self);
 }
 void hk_upd_tl(void* self, float limit) {
-    g_tlLimit = limit; g_tlUpdAt = GetTickCount64();
+    if (refresh_scope() && g_tlSelf == self) {
+        g_tlLimit = limit; g_tlUpdAt = GetTickCount64();
+    }
     c_tlUpdates.fetch_add(1, std::memory_order_relaxed);
     g_origUpdTl(self, limit);
 }
 void hk_clear_tl(void* self) {
-    if (g_tlOn.exchange(0)) g_tlSeq.fetch_add(1);
+    if (refresh_scope() && g_tlSelf == self && g_tlOn.exchange(0)) g_tlSeq.fetch_add(1);
     c_tlClears.fetch_add(1, std::memory_order_relaxed);
     g_origClearTl(self);
 }
@@ -187,9 +198,28 @@ int g_snapN = 0;
 uint32_t g_snapSeq = 0;
 uint8_t g_snapOnRight = 0;
 void* g_snapSelf = nullptr;
-uint64_t g_snapLoad = 0;
+
+// Drop the old overlay state on the main thread as soon as another hook or
+// poll observes the boundary. Keep sequence counters monotonic across reuse.
+bool refresh_scope() {
+    const auto scope = dialogvote::observed_scope(pipe::observation_connection(), loadsequence::stamp());
+    if (!(scope == g_scope)) {
+        g_scope = scope;
+        g_activeSelf = nullptr;
+        g_current = -1;
+        g_snapN = 0;
+        g_snapSelf = nullptr;
+        g_snapOnRight = 0;
+        g_vote = Vote{};
+        g_tlSelf = nullptr;
+        g_tlLimit = 1.0f; g_tlSetAt = 0; g_tlUpdAt = 0;
+        if (g_tlOn.exchange(0)) g_tlSeq.fetch_add(1);
+    }
+    return scope.live();
+}
 
 void before_flush(void* self) {
+    if (!refresh_scope()) return;
     char* b = nullptr; size_t n = 0;
     int k = 0;
     if (rows(self, &b, &n)) {
@@ -204,7 +234,6 @@ void before_flush(void* self) {
     }
     g_snapN = k;
     g_snapSelf = self;
-    g_snapLoad = loadsequence::stamp();
     g_snapOnRight = wo201vote::last_on_right() ? 1 : 0;
     ++g_snapSeq;
     if (g_vote.on) { g_vote.on = false; c_clears.fetch_add(1); }   // a new set of rows: the old vote is over
@@ -226,15 +255,18 @@ uint8_t op_poll(uint8_t, const uint8_t* body, size_t len, uint8_t* out, size_t c
         armed = wo201vote::arm_now(&why);
         if (!armed) { static bool told = false; if (!told) { told = true; logf("WO203-CONV the HUD's flush is not armed (%s) -- no vote icon on this machine", why); } }
     }
-    void* self = hud_self();
-    const int32_t cur = (g_activeSelf.load() == self) ? g_current.load() : -1;
+    const bool live = refresh_scope();
+    void* self = live ? hud_self() : nullptr;
+    const bool snapshotCurrent = self && self == g_snapSelf;
+    const int32_t cur = snapshotCurrent && g_activeSelf.load() == self ? g_current.load() : -1;
     out[0] = armed ? 1 : 0;
     out[1] = static_cast<uint8_t>(cur >= 0 && cur < 255 ? cur : 255);
-    out[2] = static_cast<uint8_t>(g_vote.on && g_vote.index >= 0 ? g_vote.index : 255);
+    out[2] = static_cast<uint8_t>(snapshotCurrent && g_vote.on && g_vote.index >= 0 ? g_vote.index : 255);
     out[3] = 0;
     size_t o = 4;
     uint8_t k = 0;
-    for (int i = 0; i < g_snapN; ++i) {
+    const int count = snapshotCurrent ? g_snapN : 0;
+    for (int i = 0; i < count; ++i) {
         const SnapRow& r = g_snap[i];
         const size_t tl = std::strlen(r.text), il = std::strlen(r.icon);
         if (o + 3 + tl + il + 9 > cap) break;
@@ -249,9 +281,12 @@ uint8_t op_poll(uint8_t, const uint8_t* body, size_t len, uint8_t* out, size_t c
     // WO-207 A.3: the decision timer as the starter's HUD shows it (after the snapshot's tail, so an older agent stops before it)
     if (o + 17 <= cap) {
         const uint64_t now = GetTickCount64();
-        const uint32_t seq = g_tlSeq.load(), sinceSet = static_cast<uint32_t>(now - g_tlSetAt.load()), sinceUpd = static_cast<uint32_t>(now - g_tlUpdAt.load());
-        const float lim = g_tlLimit.load();
-        std::memcpy(out + o, &seq, 4); out[o + 4] = static_cast<uint8_t>(g_tlOn.load() ? 1 : 0);
+        const bool timer = self && self == g_tlSelf && g_tlOn.load();
+        const uint32_t seq = g_tlSeq.load();
+        const uint32_t sinceSet = timer ? static_cast<uint32_t>(now - g_tlSetAt.load()) : 0;
+        const uint32_t sinceUpd = timer ? static_cast<uint32_t>(now - g_tlUpdAt.load()) : 0;
+        const float lim = timer ? g_tlLimit.load() : 1.0f;
+        std::memcpy(out + o, &seq, 4); out[o + 4] = timer ? 1 : 0;
         std::memcpy(out + o + 5, &lim, 4); std::memcpy(out + o + 9, &sinceSet, 4); std::memcpy(out + o + 13, &sinceUpd, 4);
         o += 17;
     }
@@ -263,10 +298,9 @@ uint8_t confirmed_mark(const uint8_t* body, size_t len, uint8_t* out, size_t* ou
     dialogvote::Request request;
     if (!dialogvote::decode(body, len, request)) return wo163::kRBadRequest;
     *outLen = 1;
-    void* self = hud_self();
+    void* self = refresh_scope() ? hud_self() : nullptr;
     if (!wo201vote::entry() || !g_origActive ||
-        !dialogvote::matches(request, g_snapSeq, g_snapN, self && self == g_snapSelf) ||
-        !loadsequence::allows(g_snapLoad, loadsequence::Access::Live)) {
+        !dialogvote::matches(request, g_snapSeq, g_snapN, self && self == g_snapSelf)) {
         out[0] = dialogvote::ScopeChanged;
         return wo163::kROk;
     }
@@ -281,7 +315,7 @@ uint8_t confirmed_mark(const uint8_t* body, size_t len, uint8_t* out, size_t* ou
 
     // An engine refresh can occur during the Lua call. Preserve the new
     // snapshot's bookkeeping and wait for the Lua half's receipt either way.
-    if (g_snapSeq == request.snapshot && g_snapSelf == self) {
+    if (refresh_scope() && g_snapSeq == request.snapshot && g_snapSelf == self) {
         g_vote = Vote{};
         if (index < 0) c_clears.fetch_add(1);
         else {
@@ -305,7 +339,9 @@ uint8_t op_mark(uint8_t, const uint8_t* body, size_t len, uint8_t* out, size_t c
     *outLen = 1;
     if (!wo201vote::entry() || !g_origActive) { out[0] = 3; return wo163::kROk; }
     if (index == 255) { g_vote.on = false; c_clears.fetch_add(1); out[0] = 0; return wo163::kROk; }
-    if (index >= g_snapN) { g_vote.on = false; out[0] = 2; return wo163::kROk; }
+    if (!refresh_scope() || hud_self() != g_snapSelf || index >= g_snapN) {
+        g_vote.on = false; out[0] = 2; return wo163::kROk;
+    }
     g_vote = Vote{};
     g_vote.on = true; g_vote.index = index;
     std::strcpy(g_vote.text, g_snap[index].text);

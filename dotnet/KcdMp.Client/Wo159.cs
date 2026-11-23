@@ -507,15 +507,15 @@ public static class Wo159
             string profile = LocalStartCheckpointStore.ProfileId(folder);
             var checkpoints = new LocalStartCheckpointStore(LocalStartCheckpointStore.DefaultRoot(), profile);
             var catalog = new HenryCharacterCatalog(HenryCharacterCatalog.DefaultRoot(), profile);
+            if (!catalog.TryListAll(out var entries)) return (styles, characters);
+            var claimedCreations = entries.Select(entry => entry.CreationId).ToHashSet();
             foreach (string style in Wo159Rules.Styles)
-                if (checkpoints.TryFind(style, null, out var start, out _) && !catalog.IsDeletedCreation(start.CreationId) &&
-                    LocalStartCheckpointStore.EngineHomeMatches(folder, start)) styles.Add(style);
-            if (catalog.TryList(out var active))
-                foreach (var entry in active)
-                    if (checkpoints.TryRead(entry.CreationId, entry.EngineBuild, out var saved, out _) &&
-                        entry.CheckpointSha256 == saved.Sha256 && entry.Style == saved.Style &&
-                        LocalStartCheckpointStore.EngineHomeMatches(folder, saved))
-                        characters.Add(new(entry.CharacterId, entry.DisplayName));
+                if (checkpoints.TryFindFresh(folder, style, null, claimedCreations, out _, out _)) styles.Add(style);
+            foreach (var entry in entries)
+                if (entry.DeletedAt is null && checkpoints.TryRead(entry.CreationId, entry.EngineBuild, out var saved, out _) &&
+                    entry.CheckpointSha256 == saved.Sha256 && entry.Style == saved.Style &&
+                    LocalStartCheckpointStore.EngineHomeMatches(folder, saved))
+                    characters.Add(new(entry.CharacterId, entry.DisplayName));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
         return (styles, characters);

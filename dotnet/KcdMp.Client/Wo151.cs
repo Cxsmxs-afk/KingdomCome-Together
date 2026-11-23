@@ -1,6 +1,7 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+using System.Globalization;
 using KcdMp.Wire;
 
 namespace KcdMp.Client;
@@ -34,6 +35,31 @@ public static class Wo151Rules
         foreach (char c in s)
             if (!(c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9' or '_')) return false;
         return true;
+    }
+
+    private static readonly (uint Flag, string Name)[] NativeGuardNames =
+    [
+        (1, "co-op crime isolation"),
+        (2, "engine combat replay"),
+        (4, "engine melee hit handling"),
+        (8, "synced hit reactions"),
+        (16, "host NPC hostility")
+    ];
+
+    internal static string? NativeFaultNotice(string? status)
+    {
+        if (string.IsNullOrEmpty(status)) return null;
+        uint flags = 0, sites = 0;
+        foreach (string field in status.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (field.StartsWith("proc_off=", StringComparison.Ordinal))
+                uint.TryParse(field.AsSpan(9), NumberStyles.None, CultureInfo.InvariantCulture, out flags);
+            else if (field.StartsWith("off=", StringComparison.Ordinal))
+                uint.TryParse(field.AsSpan(4), NumberStyles.None, CultureInfo.InvariantCulture, out sites);
+        }
+        var disabled = NativeGuardNames.Where(guard => (flags & guard.Flag) != 0).Select(guard => guard.Name).ToList();
+        if (sites > 0) disabled.Add(sites == 1 ? "1 native engine operation" : $"{sites} native engine operations");
+        return disabled.Count == 0 ? null : $"An engine error disabled {string.Join(", ", disabled)} for this game run.";
     }
 
     public enum CatchUpVerdict { Apply, Already, AlreadyPassed, Refused }

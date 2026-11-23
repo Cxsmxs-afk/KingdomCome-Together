@@ -166,6 +166,29 @@ int rp_timeline_tests(int* passed) {
         return timedGhost.push(decoded, static_cast<uint64_t>(incoming.arrivalQpc), incoming.hostAtArrivalMs) ==
                expected;
     };
+    const auto leftOfWrap = ranged_state(ranged::kHeldBit, 0, 17000, -2000);
+    const auto rightOfWrap = ranged_state(ranged::kHeldBit, 0, -17000, 4000);
+    check(enqueue(0, &leftOfWrap) && consume() && enqueue(100, &rightOfWrap) && consume(),
+          "known camera directions survive the native Ghost reader");
+    const auto halfway = timedGhost.render(local + 140);
+    check(halfway.ranged_held() && std::abs(halfway.ranged.yaw) == 18000 && halfway.ranged.pitch == 1000 &&
+          halfway.rangedStateHostMs == base,
+          "the timed receiver smooths both measured angles along the shortest yaw arc");
+    timedGhost = {};
+    const auto noView = ranged_state(ranged::kHeldBit, 0, ranged::kAngleUnavailable, ranged::kAngleUnavailable);
+    check(enqueue(0, &leftOfWrap) && consume() && enqueue(100, &noView) && consume() &&
+          timedGhost.render(local + 140).ranged.yaw == 17000 &&
+          !timedGhost.render(local + 220).ranged.angles_known(),
+          "the receiver does not invent a direction between a measured and unknown observation");
+    timedGhost = {};
+    check(enqueue(0, &leftOfWrap) && consume() && enqueue(100, &off) && consume() &&
+          timedGhost.render(local + 140).ranged.pitch == -2000 && !timedGhost.render(local + 220).ranged_held(),
+          "a scheduled Off is a discrete end and camera interpolation cannot cross it");
+    timedGhost = {};
+    check(enqueue(0, &leftOfWrap) && consume() && enqueue(250, &rightOfWrap) && consume() &&
+          timedGhost.render(local + 310).ranged.yaw == 17000,
+          "a direction is held over a long gap rather than slowly panning to a later sample");
+    timedGhost = {};
     check(enqueue(0, &active) && consume() && enqueue(1000, &turned) && consume(),
           "timed Ghost receiver reads active state and a later in-phase turn");
     const auto turn = timedGhost.render(local + 1120);

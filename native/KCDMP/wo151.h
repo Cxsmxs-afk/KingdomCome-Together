@@ -8,7 +8,8 @@
 //       mp_fault_switchoff (default on: a game-code call site that faulted 8 times this run
 //       is switched off, fault_guard.h) and mp_main_cost (default off: the per-task
 //       frame-cost meter, main_thread.cpp).
-//   2 Status    -> text: the fault totals, the switches.
+//   2 Status    -> text: fault totals and switches. proc_off bits identify process guards:
+//        1 crime isolation, 2 engine combat replay, 4 engine melee hits, 8 synced hit reactions, 16 host NPC hostility.
 //   3 TestFault [kind:1] -> [ran:1][faults:4][off:1]
 //       A deliberate fault for the live check of the guard: kind 0 reads address 0x10 at
 //       the Read site "wo151::test/read" (never switched off), kind 1 calls address 0x10

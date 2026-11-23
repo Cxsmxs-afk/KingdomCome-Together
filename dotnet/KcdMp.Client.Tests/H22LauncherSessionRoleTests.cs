@@ -222,7 +222,7 @@ public sealed class H22LauncherSessionRoleTests
     private static GateView HostGate(KcdLogFollower follower, double nowS) =>
         ConnectGateRule.ForHost(follower.State.Stage, follower.State.WorldSinceS, follower.Reading, nowS, nowS);
 
-    private sealed class MenuLua
+    internal sealed class MenuLua
     {
         private readonly Script _lua = new(CoreModules.Preset_HardSandbox | CoreModules.ErrorHandling);
 

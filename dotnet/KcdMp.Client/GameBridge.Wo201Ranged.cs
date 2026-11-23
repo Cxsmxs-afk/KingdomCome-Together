@@ -211,11 +211,8 @@ public partial class GameBridge
         catch (OperationCanceledException) { return false; }
         catch (IOException) { return false; }
     }
-    private long P6PeerAtRead(int type, byte[] p)
-    {
-        if (type != Protocol.W164Down || p.Length == 0) return 0;
-        return _p5Peers.TryGetValue(p[0], out var peer) && peer.Connected ? peer.Serial : 0;
-    }
+    private long P6PeerAtRead(byte source) =>
+        _p5Peers.TryGetValue(source, out var peer) && peer.Connected ? peer.Serial : 0;
     private bool P6PeerCurrent(byte src, long serial) => serial != 0 && _p5Peers.TryGetValue(src, out var peer) && peer.Serial == serial && peer.Connected && !peer.Token.IsCancellationRequested;
     private static bool P6Message(int type, byte[] payload, out byte source, out LootMsg message)
     {

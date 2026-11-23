@@ -38,6 +38,19 @@ int wo203_conv_tests(int* passed) {
     std::array<uint8_t, 3 + 255> longestLegacy{kOp, 3, 255};
     check(!typed(longestLegacy.data(), longestLegacy.size()), "typed marker does not consume a legal legacy name");
 
+    using kcdmp::loadsequence::advance;
+    using kcdmp::loadsequence::Gate;
+    const auto playing = advance(0, Gate::Play, true);
+    const auto menu = advance(playing, Gate::Hold);
+    const auto nextWorld = advance(menu, Gate::Play, true);
+    const auto oldSession = observed_scope(1, playing);
+    check(oldSession.live() && oldSession == observed_scope(1, playing), "same pipe and playable world retain a snapshot");
+    check(!observed_scope(0, playing).live() && !(oldSession == observed_scope(2, playing)),
+          "pipe retirement changes ownership even when the load stamp did not change");
+    check(!observed_scope(1, menu).live() && !(oldSession == observed_scope(1, nextWorld)),
+          "same-pipe menu and next world cannot retain the retired snapshot");
+    check(!(observed_scope(1, 0) == observed_scope(2, 0)), "legacy pipe reconnect is a new owner");
+
     if (passed) *passed = ok;
     return failed;
 }

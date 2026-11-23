@@ -690,7 +690,8 @@ public partial class GameBridge
 
     private async Task Wo151LoopAsync(CancellationToken ct, int sessionLife)
     {
-        long lastStatus = Environment.TickCount64;
+        long lastStatus = Environment.TickCount64 - 60_000;
+        string? lastFaultNotice = null;
         while (!ct.IsCancellationRequested)
         {
             try { await Task.Delay(1000, ct); } catch { break; }
@@ -716,7 +717,15 @@ public partial class GameBridge
                 {
                     lastStatus = now;
                     string? s = await _combat.Wo151StatusAsync(ct);
-                    if (s is not null && !s.StartsWith("faults=0 ", StringComparison.Ordinal)) Console.WriteLine($"MP-W151 dll {s}");
+                    string? notice = Wo151Rules.NativeFaultNotice(s);
+                    if (s is not null && (notice is not null || !s.StartsWith("faults=0 ", StringComparison.Ordinal)))
+                        Console.WriteLine($"MP-W151 dll {s}");
+                    if (notice is not null && notice != lastFaultNotice && _where != GameWhere.Menu &&
+                        sessionLife == Volatile.Read(ref _w151SessionLife))
+                    {
+                        await Wo151ShowFaultStatusAsync(notice);
+                        lastFaultNotice = notice;
+                    }
                     if (_w151HitRowsOut + _w151HitRowsIn + _w151CtxOnCount > 0)
                         Console.WriteLine($"MP-W151-STATS hit_rows_out={_w151HitRowsOut} hit_rows_in={_w151HitRowsIn} hit_rows_played={_w151HitRowsPlayed} copy_ctx_on={_w151CtxOnCount} copy_ctx_off={_w151CtxOffCount} fights={_w151FightStarts} health_back={_w151HealthBack} tools_cleared={_w151ToolsCleared} hands_held={_w151HandsHeld}");
                 }
@@ -767,6 +776,9 @@ public partial class GameBridge
         if (changed) Console.WriteLine($"MP-W151 dll fault_switchoff={On(r.Value.SwitchOff)} main_cost={On(r.Value.MainCost)}");
     }
 
+    private Task Wo151ShowFaultStatusAsync(string text) =>
+        ExecLuaAsync($"if KCD2MP_ShowNativeToast then KCD2MP_ShowNativeToast(\"{EscapeLua(text)}\") end");
+
     private async Task Wo151OnEventAsync(string? arg)
     {
         string a = (arg ?? "").Trim();
@@ -774,6 +786,7 @@ public partial class GameBridge
         {
             string? s = await _combat.Wo151StatusAsync();
             Console.WriteLine($"MP-W151 status {s ?? "(no answer from the DLL)"}");
+            if (Wo151Rules.NativeFaultNotice(s) is string notice) await Wo151ShowFaultStatusAsync(notice);
             _ = ExecLuaAsync($"System.LogAlways('[KCD2-MP] WO151-STATUS dll {Esc(s ?? "no answer")}')");
         }
         else if (a.StartsWith("testfault ", StringComparison.Ordinal))

@@ -195,6 +195,15 @@ public:
         if (before->ranged.hostMs <= out.appliedHostMs && before->rangedLocalMs > rangedCutoff) {
             out.ranged = before->ranged;
             out.rangedStateHostMs = out.ranged.hostMs;
+            if (out.ranged.angles_known()) {
+                // Ordinary position rows can carry the same observation many times.
+                // Push keeps the independent ranged stamps in ascending order.
+                const auto end = samples_.begin() + size_;
+                const auto newer = std::upper_bound(samples_.begin() + next, end, out.ranged.hostMs,
+                    [](uint64_t stamp, const Sample& row) { return stamp < row.ranged.hostMs; });
+                if (newer != end && newer->rangedLocalMs > rangedCutoff)
+                    rangedaim::smooth_angles(out.ranged, newer->ranged, out.targetHostMs);
+            }
         }
         if (out.source.stateHostMs > out.appliedHostMs || out.targetHostMs - out.source.stateHostMs >= kStateFreshMs)
             out.source.stateHostMs = 0;

@@ -49,10 +49,17 @@ public sealed class HenryCharacterCatalog
 
     public bool TryList(out IReadOnlyList<HenryCharacterEntry> active)
     {
-        active = [];
+        bool ok = TryListAll(out var entries);
+        active = entries.Where(IsActive).ToArray();
+        return ok;
+    }
+
+    internal bool TryListAll(out IReadOnlyList<HenryCharacterEntry> entries)
+    {
+        entries = [];
         try
         {
-            if (Read() is { } catalog) active = catalog.Characters.Where(IsActive).ToArray();
+            if (Read() is { } catalog) entries = catalog.Characters;
             return true;
         }
         catch (Exception ex) when (StorageFailure(ex)) { return false; }

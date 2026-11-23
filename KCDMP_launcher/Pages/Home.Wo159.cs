@@ -222,7 +222,8 @@ namespace KCDMP_launcher.Pages
                         hostConnectTried = true;
                         Log.Information("MP-W159 the world Start Game loaded has settled: CONNECT for the host");
                         await InvokeAsync(ConnectToGame);
-                        if (launchStage != LaunchStage.Connected) await console.LuaAsync(MenuTakeoverRule.HudLine(MenuTakeoverRule.ConnectFailedText));
+                        if (launchStage is not (LaunchStage.Connected or LaunchStage.PluginWaiting))
+                            await console.LuaAsync(MenuTakeoverRule.HudLine(MenuTakeoverRule.ConnectFailedText));
                     }
 
                     // the joiner: CONNECT as soon as the host is ready (the WO-154 gate), then the first-join answer
@@ -232,7 +233,7 @@ namespace KCDMP_launcher.Pages
                         Log.Information("MP-W159 the host is ready: CONNECT for the menu's Join ({Choice})", w159JoinChoice);
                         await InvokeAsync(ConnectToGame);
                         if (launchStage == LaunchStage.Connected) connectedAt = DateTime.UtcNow;
-                        else
+                        else if (launchStage != LaunchStage.PluginWaiting)
                         {
                             w159JoinChoice = "";
                             w159JoinState = "idle";
@@ -241,7 +242,8 @@ namespace KCDMP_launcher.Pages
                     }
                     if (!hosting && w159JoinState == "joining" && !choicePosted && launchStage == LaunchStage.Connected && w159JoinChoice.Length > 0)
                     {
-                        if (await NetService.PostJoinChoiceAsync(settings.VersionIpcPort, w159JoinChoice))
+                        if (connectedAt == default) connectedAt = DateTime.UtcNow;
+                        if (await NetService.PostJoinChoiceAsync(agentRun?.Launch.StatusPort ?? settings.VersionIpcPort, w159JoinChoice))
                         {
                             choicePosted = true;
                             Log.Information("MP-W159 first-join answer sent to the agent: {Choice}", w159JoinChoice);

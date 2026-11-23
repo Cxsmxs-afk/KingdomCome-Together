@@ -29842,7 +29842,7 @@ do
     -- ---- the agent's pushes -------------------------------------------------------------------
     -- Once a second: the role, a partner here, the host's levers as a joiner knows them (nil = not yet), the
     -- link, the version, the game's own screens, this player down (WO-113).
-    function KCD2MP_W154MenuSession(role, partner, hostFt, hostCrime, hostLeash, link, version, gameScreen, downed)
+    function KCD2MP_W154MenuSession(role, partner, hostFt, hostCrime, hostLeash, link, version, gameScreen, downed, joinPhase)
         local wasUp, wasHostFt = M.sessionUp(), M.hostFt
         role = (role == "host" or role == "joiner") and role or "none"
         local fresh = not M.fresh()
@@ -29856,6 +29856,7 @@ do
         M.hostCrime = (hostCrime == "joint" or hostCrime == "individual") and hostCrime or nil
         if hostLeash == nil then M.hostLeash = nil else M.hostLeash = hostLeash == true end
         M.link = tostring(link or "starting")
+        M.joinPhase = joinPhase
         if version ~= nil and tostring(version):match("^[%w%.%-]+$") then M.version = tostring(version) end
         M.downed = downed == true
         KCD2MP_W154MenuGameScreen(gameScreen == true, "session")
@@ -29960,7 +29961,7 @@ do
         { id = "unstuck", group = "Help", label = "I'm stuck", kind = "action", cmd = "mp_unstuck", fn = "KCD2MP_W151Unstuck",
           help = "Frees you from a stuck state: a bed, a picker that did not close, a knockdown." },
         { id = "leave_world", group = "Help", label = "Leave the host's world", kind = "action", cmd = "mp_leave", fn = "KCD2MP_W211Leave", arg = "menu",
-          help = "Only while the connection to your host is lost: leave now instead of waiting (your progress is saved first)." },
+          help = "Return to your own game. You can join your host again from there." },
         { id = "repair_combat", group = "Help", label = "Fix my weapons / stuck fight", kind = "action", cmd = "mp_repair_combat", fn = "KCD2MP_W174Repair",
           help = "Frees weapons that will not draw and a fight that never ends. Then save your game into a new slot." },
         { id = "report", group = "Help", label = "Something's wrong here", kind = "action", cmd = "mark_odd", fn = "KCD2MP_Mark", arg = "odd",
@@ -29968,6 +29969,10 @@ do
         { id = "version", group = "Help", label = "Version", kind = "info",
           get = function() return M.version or "unknown (the helper is not running)" end },
         { id = "connection", group = "Help", label = "Connection", kind = "info", get = function() return M.connectionText() end },
+        { id = "join_world", group = "Help", label = "Join / Rejoin your host", kind = "action", cmd = "mp_join_request", fn = "KCD2MP_JoinRequest",
+          help = "Ask your host for the shared world from your own game." },
+        { id = "cancel_join", group = "Help", label = "Cancel join", kind = "action", cmd = "mp_join_cancel", fn = "KCD2MP_JoinCancel",
+          help = "Stop the current join. An engine load already in progress must finish before you can join again." },
     }
 
     function M.connectionText()
@@ -29975,7 +29980,15 @@ do
         if M.link == "connected" then
             local note = KCD2MP_W157ConnNote and KCD2MP_W157ConnNote() or ""   -- WO-157 3.2: "-- the connection is struggling"
             if M.role == "host" then return (M.partner and "Hosting -- your partner is here" or "Hosting -- waiting for your partner") .. note end
-            if M.role == "joiner" then return (M.partner and "Joined your host" or "Connected -- your host is away") .. note end
+            if M.role == "joiner" then
+                if M.joinPhase == "paused" then return "Host world paused" end
+                if M.joinPhase == "loading" then return "Loading the host world..." end
+                if M.joinPhase == "waiting" then return "Waiting for the host world..." end
+                if M.joinPhase == "connected" then return "Joined your host" .. note end
+                if M.joinPhase == "return-needed" then return "Choose Leave to return to your own game" end
+                if M.joinPhase == "ready" then return "Connected -- choose Join / Rejoin your host" .. note end
+                return (M.partner and "Joined your host" or "Connected -- your host is away") .. note
+            end
             return "Connected" .. note
         end
         if M.link == "connecting" then return "Connecting..." end
@@ -36308,20 +36321,22 @@ do
         return true
     end
 
-    -- A.1: the co-op menu's "Leave the host's world" (and mp_leave): only while a hold runs -- the agent leaves the game's own way
-    -- (the final snapshot first, then this player's own save).
+    -- Use the same action during an ordinary shared-world visit and during a hold.
     function KCD2MP_W211Leave(src)
         local w = KCD2MP.w211
-        if not w.holding then
-            mp_log("WO211-LINK leave asked (" .. tostring(src) .. ") with no hold running -- nothing to do")
-            pcall(KCD2MP_ShowNativeToast, "Nothing to leave: this is for when the connection to your host is lost.")
+        local menu = KCD2MP.w154menu
+        local visiting = menu and menu.roleNow() == "joiner" and
+            (menu.joinPhase == "connected" or menu.joinPhase == "paused" or menu.joinPhase == "return-needed")
+        if not w.holding and not visiting then
+            mp_log("WO211-LINK leave refused: no shared world")
+            pcall(KCD2MP_ShowNativeToast, "You are already in your own game.")
             return false
         end
-        mp_log("WO211-LINK leave asked (" .. tostring(src) .. ") during the hold -- the agent leaves the host's world")
+        mp_log(string.format("WO211-LINK leave requested source=%s held=%s", tostring(src), tostring(w.holding == true)))
         KCD2MP_EmitEvent("w211_leave", tostring(src or "console"))
         return true
     end
-    System.AddCCommand("mp_leave", "KCD2MP_W211Leave(%line)", "WO-211 A.1: while the connection to your host is lost, leave the host's world now (your progress is saved first)")
+    System.AddCCommand("mp_leave", "KCD2MP_W211Leave(%line)", "Return from the host's world to your own game")
 
     -- P4: an old agent may deliver this after the own save loaded. Reject it:
     -- that save owns the player's safe position, with no delayed transform loop.

@@ -102,8 +102,7 @@ public sealed class ClientSessionRunner
 
 			_logger.Information("[-] {ClientName} disconnected ({Transport}). Clients: {ClientHandlerClientCount}",
 				client.Name ?? "(not ready)", client.Transport, _clientHandler.ClientCount);
-			if (client.IsReady)
-				_broadcastService.BroadcastDisconnect(client);
+			client.AnnounceDisconnect();
 
 			// Role notices follow the disconnect and reflect the same
 			// authority decision, including the pause when the host left.

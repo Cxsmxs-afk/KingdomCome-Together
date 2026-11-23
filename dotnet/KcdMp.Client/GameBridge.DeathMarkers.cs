@@ -203,7 +203,7 @@ public partial class GameBridge
         if (ack is { Safe: true } && gen == P1Lifecycle.Current.Generation && serial == Interlocked.Read(ref _p5ScopeSerial) && ReferenceEquals(stream, _wo122Stream))
         { _p5ScopeGeneration = 0; return true; }
         _p5LoadRefusal = ack is { Status: 3 }
-            ? "Laden angehalten: Kartenmarker konnten nicht sicher entfernt werden. Bitte das Spiel vollständig neu starten und danach erneut verbinden. / Loading paused: map markers could not be detached safely. Please fully restart the game, then reconnect."
+            ? "Laden angehalten: Kartenmarker konnten nicht sicher entfernt werden. Versuche die Aktion im Koop-Menü erneut. Falls die sichere Entfernung weiter fehlschlägt, starte das Spiel vollständig neu. / Loading paused: map markers could not be detached safely. Retry the action in the co-op menu. If safe removal still fails, fully restart the game."
             : "Laden angehalten: Kartenmarker konnten nicht sicher entfernt werden. Bitte erneut versuchen. / Loading paused: map markers could not be detached safely. Please try again.";
         SetJoinUi("failed", _p5LoadRefusal); Console.WriteLine($"P5-LOAD-BLOCK status={ack?.Status.ToString() ?? "unavailable"} {_p5LoadRefusal}"); return false;
     }

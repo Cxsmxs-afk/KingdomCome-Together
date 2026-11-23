@@ -372,7 +372,7 @@ public partial class GameBridge
         if (!due && !carryRanged) return null;
         if (rangedEdge)
             Console.WriteLine(FormattableString.Invariant(
-                $"MP-BOW send held={(c.RangedHeld ? 1 : 0)} charge_known={((c.Bits & BodyState2Bits.RangedChargeKnown) != 0 ? 1 : 0)} charge={c.Charge} angles={(c.RangedHeld && c.AimYaw != BodyState2.AimAngleUnavailable && c.AimPitch != BodyState2.AimAngleUnavailable ? "measured" : "unavailable")}"));
+                $"MP-BOW send held={(c.RangedHeld ? 1 : 0)} charge_known={((c.Bits & BodyState2Bits.RangedChargeKnown) != 0 ? 1 : 0)} charge={c.Charge} angles={(c.RangedHeld && c.AimYaw != BodyState2.AimAngleUnavailable && c.AimPitch != BodyState2.AimAngleUnavailable ? "measured" : "unavailable")} aim_yaw_cd={c.AimYaw} aim_pitch_cd={c.AimPitch}"));
         if (carryRanged)
         {
             _st2SawAim |= c.RangedHeld;

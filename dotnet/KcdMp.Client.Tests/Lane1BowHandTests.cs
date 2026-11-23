@@ -704,7 +704,7 @@ public sealed partial class Lane1BowHandTests
 
     private static Task ReceiveRangedBowAsync(GameBridge bridge, long capturedAt)
     {
-        var serial = (long)Call(bridge, "P6PeerAtRead", (int)Protocol.W164Down, new byte[] { Peer })!;
+        var serial = (long)Call(bridge, "P6PeerAtRead", Peer)!;
         Assert.NotEqual(0, serial);
         return (Task)Call(bridge, "Wo214OnRangedHandAsync", Peer, Bow, Call(bridge, "P6GetContext"),
             0L, serial, Call(bridge, "Wo214FigureBody", Peer), capturedAt, (Func<bool>)(() => true), CancellationToken.None, null)!;

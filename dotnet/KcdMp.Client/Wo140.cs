@@ -146,7 +146,7 @@ public static class Wo140Rules
         || type == Protocol.LootAskDown || type == Protocol.LootHostDown || type == Protocol.QuestHostDown || type == Protocol.QuestAskDown
         || type == Protocol.CrimeHostDown || type == Protocol.CrimeAskDown || type == Protocol.LeashDown || type == Protocol.LeashStateDown;
 
-    public const string SeparateText = "You loaded your own save. To play in your host's world, quit the game, start it again and wait at the main menu.";
+    public const string SeparateText = "You loaded your own save. Choose Join / Rejoin your host in the co-op menu to enter the shared world.";
     public const string SeparateLogLine = "MP-JOIN joiner: connected from its own world -- NOT joined (separate)";
 
     public static string TypeName(int type) => type switch

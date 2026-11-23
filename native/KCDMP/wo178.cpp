@@ -825,6 +825,7 @@ void install() {
 }
 
 bool host_answer_on() { return g_isHost.load() && g_hostAnswer.load() && g_armed.load() && !g_off.load(); }
+bool host_answer_faulted() { return g_off.load(); }
 
 int game_hostile(uint32_t eid) {
     auto it = g_slotOf.find(eid);

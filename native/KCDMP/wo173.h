@@ -50,5 +50,6 @@ bool lethal_offsets(uint32_t* lethal0, uint32_t* lethal1);
 
 void tick();                 // main thread, every frame: the pending blows' measures and corrections
 int status_text(char* out, int n);
+unsigned fault_status();  // bit 0: hit path, bit 1: hit reactions
 
 } // namespace kcdmp::wo173

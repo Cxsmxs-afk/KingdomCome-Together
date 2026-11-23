@@ -47,12 +47,13 @@ public class AuthorityFailureUiTests
     }
 
     [Theory]
-    [InlineData("de", "nicht bestätigt")]
-    [InlineData("en", "not confirmed")]
-    public void Missing_Dll_confirmation_does_not_invent_a_game_patch_failure(string language, string wording)
+    [InlineData("de", "nicht bestätigt", "erneut Beitreten")]
+    [InlineData("en", "not confirmed", "Choose Join / Rejoin")]
+    public void Missing_Dll_confirmation_does_not_invent_a_game_patch_failure(string language, string wording, string action)
     {
         string message = HostAuthorityFailure.Message(HostAuthorityFailure.NotConfirmed, language)!;
         Assert.Contains(wording, message);
+        Assert.Contains(action, message);
         Assert.DoesNotContain("game update", message);
         Assert.DoesNotContain("Spielupdate", message);
     }

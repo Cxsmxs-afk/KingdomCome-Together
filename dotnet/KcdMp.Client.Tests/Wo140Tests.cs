@@ -229,7 +229,7 @@ public class Wo140Tests
     [Fact]
     public void The_plain_message_and_the_support_line()
     {
-        Assert.Equal("You loaded your own save. To play in your host's world, quit the game, start it again and wait at the main menu.", Wo140Rules.SeparateText);
+        Assert.Equal("You loaded your own save. Choose Join / Rejoin your host in the co-op menu to enter the shared world.", Wo140Rules.SeparateText);
         Assert.Equal("MP-JOIN joiner: connected from its own world -- NOT joined (separate)", Wo140Rules.SeparateLogLine);
         Assert.Equal(0x0100, Protocol.LeashFlagSeparate);
         Assert.Contains("separate-world", Protocol.LeashFlagsText(Protocol.LeashFlagSeparate));

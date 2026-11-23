@@ -169,23 +169,42 @@ void* field_of_type(void* obj, size_t span, void* const* vft) {
     return nullptr;
 }
 
+bool resolve_camera_system() {
+    if (g_eng.sys) return true;
+    void* env = engine::genv();
+    HMODULE cs = GetModuleHandleA("CrySystem.dll");
+    if (!env || !cs) return false;
+    void* const* vSys = anchor::find_vftable(cs, ".?AVCSystem@@");
+    if (vSys) g_eng.sys = field_of_type(env, 0x400, vSys);
+    return g_eng.sys != nullptr;
+}
+
+bool verify_camera_slot() {
+    if (g_eng.camOff) return true;
+    void* cam = nullptr;
+    if (!vcall(g_callSite, g_eng.sys, kSysGetViewCamera, &cam) || !cam) return false;
+    const uintptr_t s = reinterpret_cast<uintptr_t>(g_eng.sys), c = reinterpret_cast<uintptr_t>(cam);
+    float m[12]{}, fov = 0;
+    if (c <= s || c - s > 0x8000 || !rd(cam, 0, &m) || !rd(cam, kCameraFov, &fov) || !std::isfinite(m[3]) || !(fov > 0.1f && fov < 3.0f))
+        return false;
+    g_eng.camOff = c - s;
+    return true;
+}
+
 bool resolve() {
     if (g_eng.ok) return true;
     if (g_eng.tried) return false;
     if (!engine::ready()) return false;   // the engine's own resolver first (gEnv); retried until it is
     g_eng.tried = true;
     auto fail = [](const char* why) { g_eng.why = why; logf("WO203B-CAM resolve FAILED -- %s; the conversation camera stays off", why); return false; };
-    HMODULE ca = GetModuleHandleA("CryAction.dll"), cs = GetModuleHandleA("CrySystem.dll");
-    if (!ca || !cs) return fail("CryAction.dll / CrySystem.dll not loaded");
-    void* const* vSys = anchor::find_vftable(cs, ".?AVCSystem@@");
+    HMODULE ca = GetModuleHandleA("CryAction.dll");
+    if (!ca || !resolve_camera_system()) return fail("CryAction.dll or the gEnv CSystem is unavailable");
     void* const* vAct = anchor::find_vftable(ca, ".?AVCCryAction@@");
     void* const* vVs = anchor::find_vftable(ca, ".?AVCViewSystem@@");
     g_eng.vftView = anchor::find_vftable(ca, ".?AVCView@@");
-    if (!vSys || !vAct || !vVs || !g_eng.vftView) return fail("RTTI CSystem / CCryAction / CViewSystem / CView vftable not unique");
+    if (!vAct || !vVs || !g_eng.vftView) return fail("RTTI CCryAction / CViewSystem / CView vftable not unique");
     void* env = engine::genv();
     if (!env) return fail("no gEnv");
-    g_eng.sys = field_of_type(env, 0x400, vSys);
-    if (!g_eng.sys) return fail("gEnv holds no CSystem");
     // the game's interface holds the framework (1.5.5: its +8, the IGameFramework the dialogue input uses); gEnv's copy, if any
     void* gi = engine::game_iface();
     void* fw = gi ? field_of_type(gi, 0x200, vAct) : nullptr;
@@ -193,18 +212,12 @@ bool resolve() {
     if (!fw) return fail("neither the game interface nor gEnv holds the CCryAction");
     g_eng.vs = field_of_type(fw, 0x2000, vVs);
     if (!g_eng.vs) return fail("CCryAction holds no CViewSystem");
-    void* cam = nullptr;
-    if (!vcall(g_callSite, g_eng.sys, kSysGetViewCamera, &cam) || !cam) return fail("ISystem::GetViewCamera call failed");
-    const uintptr_t s = reinterpret_cast<uintptr_t>(g_eng.sys), c = reinterpret_cast<uintptr_t>(cam);
-    float m[12]{}, fov = 0;
-    if (c <= s || c - s > 0x8000 || !rd(cam, 0, &m) || !rd(cam, kCameraFov, &fov) || !std::isfinite(m[3]) || !(fov > 0.1f && fov < 3.0f))
+    if (!verify_camera_slot())
         return fail("ISystem slot 0x430 is not GetViewCamera (no CCamera inside CSystem)");
-    g_eng.camOff = c - s;
-    char d1[160], d2[160];
+    char d1[160];
     anchor::describe(g_eng.vs, d1, sizeof d1);
-    anchor::describe(cam, d2, sizeof d2);
-    logf("WO203B-CAM resolved: view system %s (CCryAction field), rendered camera CSystem+0x%zx (fov %.3f), by RTTI and the "
-         "Lua bind's slot", d1, g_eng.camOff, fov);
+    logf("WO203B-CAM resolved: view system %s (CCryAction field), rendered camera CSystem+0x%zx by RTTI and the Lua bind's slot",
+         d1, g_eng.camOff);
     g_eng.ok = true;
     g_eng.why = "ok";
     return true;
@@ -212,7 +225,7 @@ bool resolve() {
 
 // The frame's rendered view: m34 + fov.
 bool read_camera(float m[12], float* fov) {
-    if (!g_eng.ok) return false;
+    if (!g_eng.camOff) return false;
     const void* cam = static_cast<const char*>(g_eng.sys) + g_eng.camOff;
     return rd(cam, 0, reinterpret_cast<float(*)[12]>(m)) && rd(cam, kCameraFov, fov) && std::isfinite(m[3]) && std::isfinite(*fov);
 }
@@ -949,6 +962,18 @@ bool op_view_off_main(uint8_t op, const uint8_t* body, size_t len, uint8_t* out,
 bool op_poll_off_main(uint8_t, const uint8_t*, size_t, uint8_t*, size_t, size_t*, uint8_t*) { return false; }
 
 } // namespace
+
+void prepare_player_view() {
+    if (engine::ready()) resolve_camera_system();
+}
+
+bool read_player_view(uint32_t eid, float matrix[12], float feet[3]) {
+    if (!eid || !g_eng.sys || g_v.st != St::Off || g_s.armed || !verify_camera_slot()) return false;
+    float entity[12]{}, fov = 0;
+    if (!read_camera(matrix, &fov) || !(fov > 0.1f && fov < 3.0f) || !entity_tm(eid, entity)) return false;
+    feet[0] = entity[3]; feet[1] = entity[7]; feet[2] = entity[11];
+    return true;
+}
 
 const bool kReg = wo203::reg_tick("cam", &tick) && wo203::reg_status("cam", &status) && wo203::reg_op(kOpView, &op_view) &&
                   wo203::reg_op(kOpPoll, &op_poll) && wo203::reg_op_off_main(kOpView, &op_view_off_main) &&

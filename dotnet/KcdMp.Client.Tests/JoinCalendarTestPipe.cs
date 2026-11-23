@@ -28,7 +28,6 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _calendar = new();
     private long? _armedWorldMs, _loadedWorldMs, _verifiedWorldMs;
-    private bool _gameplayStarted;
     private int _snapshotWhileHeld;
     private int _armRequests;
     private bool _held;
@@ -69,14 +68,13 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     {
         lock (_calendar)
         {
-            _gameplayStarted = true;
             _loadedWorldMs = _armedWorldMs;
         }
     }
 
     public void ObserveMainMenu()
     {
-        lock (_calendar) _gameplayStarted = false;
+        lock (_calendar) _loadedWorldMs = null;
     }
 
     private async Task ServeAsync(string name, CancellationToken ct)
@@ -150,9 +148,12 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
                 case 2:
                     Interlocked.Increment(ref _armRequests);
                     BeforeCalendarArm?.Invoke();
-                    if (!_failCalendarArm && !_gameplayStarted && worldMs is >= 0 and <= HostCalendar.MaxWorldMs)
+                    // The real mode 2 accepts a new latch in an already loaded world.
+                    // The old Gameplay receipt cannot verify that newly armed latch.
+                    if (!_failCalendarArm && worldMs is >= 0 and <= HostCalendar.MaxWorldMs)
                     {
                         _armedWorldMs = worldMs;
+                        _loadedWorldMs = null;
                         body[4] = 2;
                     }
                     _arm.TrySetResult();

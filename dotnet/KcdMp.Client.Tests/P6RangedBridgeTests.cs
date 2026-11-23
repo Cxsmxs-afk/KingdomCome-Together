@@ -79,6 +79,15 @@ public sealed class P6RangedBridgeTests
         public override int Read(byte[] b, int o, int n) => throw new NotSupportedException(); public override void Write(byte[] b, int o, int n) => throw new NotSupportedException();
         public override long Seek(long o, SeekOrigin s) => throw new NotSupportedException(); public override void SetLength(long n) => throw new NotSupportedException();
     }
+    private sealed class ReceiveRecording(string path, byte[] watchedFrame, Action replacePeer)
+        : FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, bufferSize: 4096, FileOptions.DeleteOnClose)
+    {
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            if (buffer.SequenceEqual(watchedFrame)) replacePeer();
+            base.Write(buffer);
+        }
+    }
     private sealed class BlockedPath(bool failSecond = false) : ILinkPath
     {
         public readonly TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously), Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -683,6 +692,68 @@ public sealed class P6RangedBridgeTests
             quiet.Cancel();
             await nativeRequest;
         }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Ranged_reader_discards_a_fire_when_the_peer_changes_before_queueing(bool receiverIsHost)
+    {
+        await using var r = await Rig.Create(receiverIsHost);
+        await r.StartTimedReceiveAsync();
+        Get<ConcurrentDictionary<string, (uint Entity, uint Birth)>>(r.Bridge, "_w214FigureBirths")[r.Peer.ToString()] =
+            (222, 0xB0B218);
+        object? bodyAtRead = Call(r.Bridge, "Wo214FigureBody", r.Peer);
+        long originalPeer = Get<long>(r.Bridge, "_p5PeerSerial");
+        byte[] fire = TimedFire(r.Peer);
+        string path = Path.Combine(Path.GetTempPath(), $"p6-reader-{Guid.NewGuid():N}.kcdrec");
+        // Relay recording runs after body capture and before the queue reads the peer in the baseline.
+        // Replace the peer through the real receipt owner while preserving the body incarnation.
+        using var capture = new ReceiveRecording(path, fire, () =>
+            Call(r.Bridge, "P5PeerAtRead", (int)Protocol.Name, new byte[] { r.Peer, 121 }));
+        using var recorder = (SessionRecorder)typeof(SessionRecorder)
+            .GetConstructor(Private, null, [typeof(FileStream)], null)!.Invoke([capture]);
+        r.Bridge.RecordSession(recorder);
+
+        using var quiet = new CancellationTokenSource();
+        byte[] header = new byte[3];
+        Task<bool> nativeRequest = ReadFrameHeaderAsync(r.Server, header, quiet.Token);
+        r.Link.Feed(fire, Down(Protocol.W164RangedStep, "after-old-peer", r.Peer));
+        Task drained = Until(() => Count(r.Bridge, "ranged_malformed") == 1);
+        try
+        {
+            if (await Task.WhenAny(nativeRequest, drained) == nativeRequest && await nativeRequest)
+            {
+                using var bodyDeadline = new CancellationTokenSource(3500);
+                byte[] request = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
+                await r.Server.ReadExactlyAsync(request, bodyDeadline.Token);
+                Assert.Equal(0x38, header[0]);
+                Assert.Equal(0x41, request[5]);
+                await ReplyHandEdge(r.Server, request);
+                ulong reboundPeer = BinaryPrimitives.ReadUInt64LittleEndian(request.AsSpan(17));
+                Assert.Fail($"Fire read under peer {originalPeer} requested a native hand change for replacement peer {reboundPeer}.");
+            }
+            await drained;
+            Assert.False(nativeRequest.IsCompleted);
+            Assert.Equal(originalPeer + 1, Get<long>(r.Bridge, "_p5PeerSerial"));
+            Assert.Equal(bodyAtRead, Call(r.Bridge, "Wo214FigureBody", r.Peer));
+            Assert.Equal(1, Count(r.Bridge, "ranged_stale"));
+            Assert.Equal(0, Count(r.Bridge, "ranged_in"));
+        }
+        finally
+        {
+            r.Bridge.RecordSession(null);
+            quiet.Cancel();
+            await nativeRequest;
+        }
+
+        byte[] fence = await r.PrimeHandAsync(Bow);
+        Assert.Equal(originalPeer + 1, BinaryPrimitives.ReadInt64LittleEndian(fence));
+        r.Link.Feed(TimedRanged(r.Peer, Step(seq: 2)));
+        var accepted = await Read(r.Server);
+        AssertRangedFire(accepted.Type, accepted.Body, RangedWeaponKind.Bow, 3, Bow, fence);
+        await ReplyEdge(r.Server, accepted.Body, EdgeOutcome.Completed, 1, 0, 0);
+        await Until(() => Get<long>(r.Bridge, "_w201RangedDispatched") == 1);
     }
 
     [Theory]

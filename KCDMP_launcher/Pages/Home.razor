@@ -29,6 +29,11 @@
         Kingdom Come: Together
     </div>
 
+    @if (AgentReconnectVisible && !showConnectedPanel)
+    {
+        <button class="btn btn-primary" disabled="@agentReconnectBusy" @onclick="ReconnectAgentAsync">@AgentReconnectLabel</button>
+    }
+
     @if (O4Requested)
     {
         <button class="btn btn-primary" disabled="@launchPreparationBusy" @onclick="StartO4LocalProfileAsync">Prepare the local prologue</button>
@@ -97,6 +102,7 @@
                         LaunchStage.WaitingForConnect => "READY TO CONNECT",
                         LaunchStage.Injecting => "INJECTING...",
                         LaunchStage.Verifying => "VERIFYING...",
+                        LaunchStage.PluginWaiting => "WAITING TO CONNECT",
                         LaunchStage.Connected => "CONNECTED",
                         LaunchStage.Failed => "CONNECT FAILED",
                         _ => ""
@@ -135,8 +141,16 @@
                             <button class="kcd-btn" disabled="@(!PendingConnectCanBeCancelled)" @onclick="CancelPendingConnect">CANCEL</button>
                         }
                     }
+                    else if (launchStage == LaunchStage.PluginWaiting)
+                    {
+                        <button class="kcd-btn primary" @onclick="RetryPluginConnectAsync">CHECK AGAIN</button>
+                    }
                     else if (launchStage == LaunchStage.Connected || launchStage == LaunchStage.Failed)
                     {
+                        @if (AgentReconnectVisible)
+                        {
+                            <button class="kcd-btn" disabled="@agentReconnectBusy" @onclick="ReconnectAgentAsync">@AgentReconnectLabel</button>
+                        }
                         <button class="kcd-btn primary" @onclick="CloseLaunchPanel">CLOSE</button>
                     }
                 </div>

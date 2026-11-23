@@ -119,6 +119,7 @@ public partial class GameBridge
         _hostJoin?.Cancel("relay-lost");
         lock (_joinGate)
         {
+            _joinPreparation = null;
             ClearJoinCharacterRequest();
             ClearJoinCalendarBootstrap();
         }
@@ -231,11 +232,10 @@ public partial class GameBridge
                 return;
             case "join_cancel":     // mp_join_cancel, on either machine
                 if (_hostJoin is { } j3) { Console.WriteLine("MP-JOIN host: mp_join_cancel"); j3.Cancel("cancel"); }
-                else if (_joinRx is not null || _joinOutId != 0 || _jj is not null || _retainedJoinWorlds.Count > 0) _ = CancelOutgoingJoinAsync("mp_join_cancel");
-                else Console.WriteLine("MP-JOIN mp_join_cancel: no join in progress");
+                else _ = CancelOutgoingJoinAsync();
                 return;
             case "join_request":    // mp_join_request on the joiner
-                _ = SendJoinRequestAsync();
+                _ = StartJoinRequestAsync(playerRequested: true);
                 return;
             case "join_ready":
                 Console.WriteLine("MP-JOIN joiner: ignored the unverified Lua Ready hint");
@@ -750,12 +750,47 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- joiner side
 
-    private async Task SendJoinRequestAsync()
+    private object? _joinPreparation;
+
+    private Task SendJoinRequestAsync() => StartJoinRequestAsync(playerRequested: false);
+
+    private async Task StartJoinRequestAsync(bool playerRequested)
     {
         if (!JoinerSharedEffective) { Console.WriteLine($"MP-JOIN mp_join_request needs a shared-world session ({(_hostModeKnown ? "the host runs separate worlds" : "mp_shared_world off here and no word from a host")})"); return; }
         if (!_wo122Connected || !_combatRoleApplied) { Console.WriteLine("MP-JOIN mp_join_request: no session"); return; }
         if (_isDamageAuthority) { Console.WriteLine("MP-JOIN mp_join_request: this machine is the host -- the joiner asks"); return; }
-        if (!Wo180SlotAvailableOrTell()) return;   // WO-180: no save slot for the host's world -- nothing is sent, the host is not paused
+        var preparing = new object();
+        lock (_joinGate)
+        {
+            if (_joinPreparation is not null || _joinRx is not null || _joinOutId != 0 || _jj is not null ||
+                _leaveInProgress || _returningFromSharedWorld)
+            {
+                Console.WriteLine("MP-JOIN request refused reason=transition-active");
+                return;
+            }
+            if (playerRequested && (_gameQuitting || _where is not (GameWhere.World or GameWhere.Menu) ||
+                OwnLoadExpected || LinkHeld || HostAbsentPause ||
+                (_joinedWorld && !T3AdmitInWorldRejoinFrom("player-request"))))
+            {
+                Console.WriteLine("MP-JOIN player request refused reason=world-not-ready");
+                return;
+            }
+            if (playerRequested) ResetJoinSessionState("player-request", suppressAutomatic: false);
+            _joinPreparation = preparing;
+        }
+        try
+        {
+            if (Wo180SlotAvailableOrTell()) await PrepareAndSendJoinAsync(preparing);
+        }
+        finally
+        {
+            lock (_joinGate)
+                if (ReferenceEquals(_joinPreparation, preparing)) _joinPreparation = null;
+        }
+    }
+
+    private async Task PrepareAndSendJoinAsync(object preparing)
+    {
         var link = _wo122Stream;
         byte host = _hostModeFrom;
         var selection = _joinedWorld ? null : CurrentCharacter();
@@ -766,22 +801,24 @@ public partial class GameBridge
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or ArgumentException)
         {
             Console.WriteLine($"MP-HENRY joiner: selected character cannot be prepared ({ex.GetType().Name})");
-            SetJoinUi("no-save", "The selected character cannot be read from this profile.", "no-henry-source");
-            return;
-        }
-        if (prepared.Character is null)
-        {
-            Console.WriteLine($"MP-HENRY joiner: request refused before transfer ({prepared.Why})");
-            SetJoinUi("no-save", prepared.Why, "no-henry-source");
+            lock (_joinGate) if (ReferenceEquals(_joinPreparation, preparing))
+                SetJoinUi("no-save", "The selected character cannot be read from this profile.", "no-henry-source");
             return;
         }
         JoinCalendarRequest request;
         lock (_joinGate)
         {
-            if (_joinRx is not null || _joinOutId != 0 || _jj is not null || _leaveInProgress)
+            if (!ReferenceEquals(_joinPreparation, preparing) || _joinRx is not null || _joinOutId != 0 ||
+                _jj is not null || _leaveInProgress || _gameQuitting)
             {
                 ReleasePendingCharacter(prepared.Character);
-                Console.WriteLine("MP-JOIN mp_join_request: a request or transfer is already running");
+                Console.WriteLine("MP-JOIN request refused reason=preparation-retired");
+                return;
+            }
+            if (prepared.Character is null)
+            {
+                Console.WriteLine($"MP-HENRY joiner: request refused before transfer ({prepared.Why})");
+                SetJoinUi("no-save", prepared.Why, "no-henry-source");
                 return;
             }
             if (!_hostModeKnown || link is null || !ReferenceEquals(_wo122Stream, link) || _hostModeFrom != host ||
@@ -796,14 +833,17 @@ public partial class GameBridge
             _joinOutId = request.JoinId;
             ClearJoinCalendarBootstrap();
             Volatile.Write(ref _joinCalendarRequest, request);
+            Wo206NoteOwnAttempt(request.JoinId);
+            SetJoinUi("requested", "Asking your host for the world...");
         }
-        Wo206NoteOwnAttempt(request.JoinId);   // WO-206 E: the host's statuses of this attempt are this joiner's
-        WorldReceiver.SweepStaging(WorldReceiver.DefaultStagingDir());
-        SetJoinUi("requested", "Asking your host for the world...");
         try
         {
-            await WritePacketAsync(request.Link, WorldReceiver.BuildRequest(request.JoinId, host: request.Host), _wo122Ct);
-            Console.WriteLine($"MP-JOIN joiner: join 0x{request.JoinId:x8} requested from the host");
+            await WriteScopedPacketAsync(request.Link, WorldReceiver.BuildRequest(request.JoinId, host: request.Host), _wo122Ct,
+                new RelayWriteScope(
+                    () => ReferenceEquals(Volatile.Read(ref _joinCalendarRequest), request) &&
+                        ReferenceEquals(_wo122Stream, request.Link) ? null : "join-request-retired",
+                    reason => Console.WriteLine($"MP-JOIN joiner: join 0x{request.JoinId:x8} request refused reason={reason}"),
+                    () => Console.WriteLine($"MP-JOIN joiner: join 0x{request.JoinId:x8} requested from the host")));
         }
         catch (Exception ex)
         {
@@ -820,26 +860,60 @@ public partial class GameBridge
         }
     }
 
-    private async Task CancelOutgoingJoinAsync(string why)
+    private async Task CancelOutgoingJoinAsync()
     {
-        uint id = _joinRx?.JoinId ?? _joinOutId;
-        JoinerJoin[] released;
+        const string message = "Join cancelled.";
+        JoinerJoin? active;
+        WorldReceiver? transfer;
+        Stream? link;
+        uint id;
+        byte host;
+        bool preparing;
         lock (_joinGate)
         {
-            var active = _jj;
-            if (active is not null) { active.Phase = "cancelled"; active.Abandoned.TrySetResult(true); _jj = null; }
+            active = _jj;
+            transfer = _joinRx;
+            var request = _joinCalendarRequest;
+            link = request?.Link ?? _wo122Stream;
+            id = active?.JoinId ?? transfer?.JoinId ?? _joinOutId;
+            host = active?.Host ?? transfer?.Host ?? request?.Host ?? Protocol.JoinTargetHost;
+            if (active is { Phase: not ("preparing" or "loading" or "post-load") } ||
+                (id == 0 && _joinPreparation is null))
+            {
+                Console.WriteLine("MP-JOIN player cancel refused reason=no-active-join");
+                return;
+            }
+            ResetJoinSessionState("player-cancel", suppressAutomatic: true);
+            preparing = active?.Phase == "preparing";
+            if (preparing) active!.Abandoned.TrySetResult(true);
+            if (active is not null && !preparing)
+            {
+                SetJoinUi("loading", "Waiting for the cancelled load to finish...");
+                StartOrphanedJoinCleanup(active, "player-cancel", message);
+            }
+            else SetJoinUi("aborted", message);
+            _joinPreparation = null;
+            _joinRx = null;
+            _joinOutId = 0;
             ClearJoinCharacterRequest();
-            released = _retainedJoinWorlds.End(joined: false, cancelled: true);
+            ClearJoinCalendarBootstrap();
             _joinReceivedId = 0;
-            _autoRequests = 99;   // a player's cancel never restarts this join automatically
         }
-        _joinRx?.Abort();
-        _joinRx = null;
-        _joinOutId = 0;
-        SetJoinUi("aborted", "Join cancelled.");
-        try { await WriteJoinAsync(WorldReceiver.BuildAbort(Protocol.JoinTargetHost, id, Protocol.JoinAbortJoinerCancel)); } catch { }
-        await CleanupRetainedJoinWorldsAsync(released, "player-cancel");
-        Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8} cancelled ({why}) -- staging deleted, the host resumes");
+        transfer?.Abort();
+        if (preparing)
+        {
+            await AbortJoinerJoinAsync(active!, Protocol.JoinAbortJoinerCancel, "player-cancel", message);
+            return;
+        }
+        if (id != 0 && link is not null && ReferenceEquals(link, _wo122Stream))
+        {
+            try { await WritePacketAsync(link, WorldReceiver.BuildAbort(host, id, Protocol.JoinAbortJoinerCancel), _wo122Ct); }
+            catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
+            {
+                Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8} player cancel not sent ({ex.GetType().Name})");
+            }
+        }
+        Console.WriteLine($"MP-JOIN joiner: join 0x{id:x8} player-cancel engine_pending={On(active is not null)}");
     }
 
     private bool JoinReadyCurrent(JoinerJoin join, JoinCalendarRequest request) =>
@@ -961,22 +1035,28 @@ public partial class GameBridge
             DropJoinCalendar(host, joinId, "offer-run-world-not-current");
             return;
         }
-        _joinRx?.Abort();
         string dir = WorldReceiver.DefaultStagingDir();
-        int swept = WorldReceiver.SweepStaging(dir);
-        try { _joinRx = new WorldReceiver(dir, joinId, host, offer.Value) { HostWorldEpoch = receiveWorld }; }
+        try
+        {
+            lock (_joinGate)
+            {
+                if (!ReferenceEquals(request, _joinCalendarRequest) || _joinOutId != joinId ||
+                    !ReferenceEquals(request.Link, _wo122Stream) || _joinRx is not null) return;
+                _joinRx = new WorldReceiver(dir, joinId, host, offer.Value) { HostWorldEpoch = receiveWorld };
+                _joinRxLastDecile = -1;
+                Interlocked.Exchange(ref _joinUiTotal, offer.Value.Size);
+                Interlocked.Exchange(ref _joinUiBytes, 0);
+                SetJoinUi("receiving", "Receiving the world... 0%");
+            }
+        }
         catch (Exception ex)
         {
             Console.WriteLine($"MP-JOIN joiner: cannot stage the world: {ex.Message}");
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortIo)); } catch { }
             return;
         }
-        _joinRxLastDecile = -1;
-        Interlocked.Exchange(ref _joinUiTotal, offer.Value.Size);
-        Interlocked.Exchange(ref _joinUiBytes, 0);
-        SetJoinUi("receiving", "Receiving the world... 0%");
         Console.WriteLine(FormattableString.Invariant(
-            $"MP-JOIN joiner: offer 0x{joinId:x8} bytes={offer.Value.Size} chunks={offer.Value.ChunkCount} sha256={Convert.ToHexString(offer.Value.Sha256)[..16].ToLowerInvariant()} worldsaved_seq={offer.Value.WorldSavedSeq} md5={Convert.ToHexString(offer.Value.Md5)[..8].ToLowerInvariant()} -> <data>/join-staging (swept {swept})"));
+            $"MP-JOIN joiner: offer 0x{joinId:x8} bytes={offer.Value.Size} chunks={offer.Value.ChunkCount} sha256={Convert.ToHexString(offer.Value.Sha256)[..16].ToLowerInvariant()} worldsaved_seq={offer.Value.WorldSavedSeq} md5={Convert.ToHexString(offer.Value.Md5)[..8].ToLowerInvariant()} -> <data>/join-staging"));
     }
 
     private async Task OnWorldChunkInAsync(byte host, uint joinId, byte[] body, CancellationToken ct)
@@ -986,23 +1066,26 @@ public partial class GameBridge
         var res = rx.Accept(index, body.AsSpan(4), out string why);
         if (res == WorldReceiver.ChunkResult.Error)
         {
+            if (!FailWorldTransfer(rx, "The world transfer failed.")) return;
             rx.Abort();
-            _joinRx = null;
-            SetJoinUi("failed", "The world transfer failed.");
             Console.WriteLine($"MP-JOIN joiner: join 0x{joinId:x8} chunk rejected ({why}) -- staging deleted, aborting");
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortProtocol)); } catch { }
             return;
         }
         double secs = (DateTime.UtcNow - rx.StartedUtc).TotalSeconds;
         double rate = rx.Received / Math.Max(secs, 1e-3);
-        Interlocked.Exchange(ref _joinUiBytes, rx.Received);
-        _joinUiEtaS = rate > 0 ? (rx.Offer.Size - rx.Received) / rate : 0;
-        _joinUiMessage = FormattableString.Invariant($"Receiving the world... {rx.Percent:F0}%");
         int decile = (int)(rx.Percent / 10);
-        if (decile != _joinRxLastDecile)
+        lock (_joinGate)
         {
-            _joinRxLastDecile = decile;
-            Console.WriteLine(FormattableString.Invariant($"MP-JOIN joiner: receiving {rx.Received}/{rx.Offer.Size} B ({rx.Percent:F0}%) eta_s={_joinUiEtaS:F1}"));
+            if (!ReferenceEquals(_joinRx, rx)) return;
+            Interlocked.Exchange(ref _joinUiBytes, rx.Received);
+            _joinUiEtaS = rate > 0 ? (rx.Offer.Size - rx.Received) / rate : 0;
+            _joinUiMessage = FormattableString.Invariant($"Receiving the world... {rx.Percent:F0}%");
+            if (decile != _joinRxLastDecile)
+            {
+                _joinRxLastDecile = decile;
+                Console.WriteLine(FormattableString.Invariant($"MP-JOIN joiner: receiving {rx.Received}/{rx.Offer.Size} B ({rx.Percent:F0}%) eta_s={_joinUiEtaS:F1}"));
+            }
         }
         if (res != WorldReceiver.ChunkResult.Complete)
         {
@@ -1031,8 +1114,7 @@ public partial class GameBridge
         }
         if (!ok)
         {
-            _joinRx = null;
-            SetJoinUi("failed", "The world arrived damaged -- the join was stopped.");
+            if (!FailWorldTransfer(rx, "The world arrived damaged -- the join was stopped.")) return;
             Console.WriteLine($"MP-JOIN joiner: join 0x{joinId:x8} REJECTED: {fwhy} -- deleted, aborting ({Protocol.JoinAbortName(reason)})");
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, reason)); } catch { }
             return;
@@ -1053,10 +1135,32 @@ public partial class GameBridge
             return;
         }
 
-        _joinRx = null;
-        if (LoadSequenceEnabled && JoinerSharedEffective) LoadSequenceBeginOffer(joinId, rx.HostWorldEpoch);
         await WriteJoinAsync(rx.BuildDone());
-        CompleteWorldTransfer(rx, secs);
+        lock (_joinGate)
+        {
+            // A player can cancel on another thread while Done is waiting for
+            // the writer. Its completed transfer no longer owns an engine load.
+            if (ReferenceEquals(_joinRx, rx) && _joinOutId == joinId)
+            {
+                _joinRx = null;
+                CompleteWorldTransfer(rx, secs);
+            }
+            else Console.WriteLine($"MP-JOIN joiner: join 0x{joinId:x8} completed transfer retired before load");
+        }
+    }
+
+    private bool FailWorldTransfer(WorldReceiver receiver, string message)
+    {
+        lock (_joinGate)
+        {
+            if (!ReferenceEquals(_joinRx, receiver)) return false;
+            _joinRx = null;
+            _joinOutId = 0;
+            ClearJoinCharacterRequest();
+            ClearJoinCalendarBootstrap();
+            SetJoinUi("failed", message);
+            return true;
+        }
     }
 
     private void CompleteWorldTransfer(WorldReceiver rx, double secs)

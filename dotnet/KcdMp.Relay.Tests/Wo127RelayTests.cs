@@ -24,7 +24,8 @@ public sealed class SteamShapedPeer : IAsyncDisposable
     private NetworkStream _s = null!;
     public byte Id { get; private set; }
 
-    public static async Task<SteamShapedPeer> ConnectAsync(IServiceProvider relay, string name)
+    public static async Task<SteamShapedPeer> ConnectAsync(IServiceProvider relay, string name,
+        string identity = "", Action? onClose = null)
     {
         var p = new SteamShapedPeer();
         var l = new TcpListener(IPAddress.Loopback, 0);
@@ -36,7 +37,7 @@ public sealed class SteamShapedPeer : IAsyncDisposable
         l.Stop();
         var far = p._far;
         // The relay end: marked non-loopback and "steam", as RelayConnection.FromSteam does.
-        var conn = new RelayConnection(far.GetStream(), "steam-peer", isLoopback: false, "steam", far.Dispose);
+        var conn = new RelayConnection(far.GetStream(), "steam-peer", isLoopback: false, "steam", onClose ?? far.Dispose, identity);
         var runner = relay.GetRequiredService<ClientSessionRunner>();
         runner.Start(runner.Create(conn));
 
