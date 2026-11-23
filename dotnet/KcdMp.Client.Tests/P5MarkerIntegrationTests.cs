@@ -123,7 +123,13 @@ public class P5MarkerIntegrationTests
         Assert.False(Get<bool>(bridge, "_ownLoadExpected")); Assert.False(Get<bool>(bridge, "_loadGraceOwn"));
         Assert.False(Get<HostAuthorityLifecycle>(bridge, "_p1Lifecycle").Current.GameplaySent); // no invented recovery edge
         Assert.Contains("Laden angehalten", Get<string>(bridge, "_joinUiMessage")); Assert.Contains("Loading paused", Get<string>(bridge, "_joinUiMessage"));
-        if (status == 3) { Assert.Contains("vollständig neu starten", Get<string>(bridge, "_joinUiMessage")); Assert.Contains("fully restart", Get<string>(bridge, "_joinUiMessage")); }
+        if (status == 3)
+        {
+            string message = Get<string>(bridge, "_joinUiMessage");
+            Assert.Contains("Versuche die Aktion im Koop-Menü erneut", message);
+            Assert.Contains("Retry the action in the co-op menu", message);
+            Assert.Contains("If safe removal still fails, fully restart", message);
+        }
     }
 
     [Fact]

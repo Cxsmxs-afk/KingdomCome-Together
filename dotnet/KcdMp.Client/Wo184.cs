@@ -384,8 +384,8 @@ public static class Wo184Rules
 
     // ---------------------------------------------------------------- the words
 
-    public const string JoinerStuckText = "Your character can't be saved right now; restart your game before the host saves again.";
-    public const string HostStuckText = "Your partner's character can't be saved right now; they should restart their game before your next save.";
+    public const string JoinerStuckText = "Your character can't be saved right now. Choose Leave in the co-op menu, then rejoin after your own game has loaded.";
+    public const string HostStuckText = "Your partner's character can't be saved right now. Wait for them to return to their own game and rejoin before your next save.";
     public const string JoinerTwoUnpairedText = "Your character wasn't saved with your host's last two saves. Use mp_save_status to see why.";
     public const string HostTwoUnpairedText = "Your partner's character wasn't saved with your last two saves.";
     public const string HostPartnerSavedText = "Partner saved.";

@@ -16,7 +16,7 @@ namespace KcdMp.Client;
 //                silently.
 //   stuck (B3)   a taken request with no file and no "ready" in 60 s is stuck: logged; the engine's own cancel (CancelPendingSaveGame, the
 //                call every load makes) clears it and a fresh snapshot is taken; the players are told when it cannot be cleared or sticks
-//                again ("restart your game").
+//                again. An ordinary return to the private save runs the engine's load-time cancel.
 //   leaving (B4) a final snapshot when the joiner leaves the host's world (the exit dialog before a quit, the mod's leave, the host gone,
 //                the relay lost; the host's reload while one is owed); mp_save_on_leave (default on) takes it at every leave. (WO-192
 //                removed the ESC menu's early snapshot: the exit dialog's own snapshot is the quit's.)
@@ -558,7 +558,7 @@ public partial class GameBridge
             _ = W164SendAsync(Protocol.JoinTargetHost, Protocol.W164SaveHealth, Wo184Rules.RecoveredWord);
         }
         else
-            Console.WriteLine($"WO184-SNAP NOT recovered: {(!_w184Recover ? "mp_save_recover is off" : c is null ? "the DLL did not answer (no engine cancel here)" : c.Value.Result == 2 ? "the engine's cancel is not armed on this build" : c.Value.Result == 4 ? "the engine still says a save is pending after its own cancel" : "the cancel faulted")} -- the pending save blocks every snapshot until this game restarts or loads");
+            Console.WriteLine($"WO184-SNAP NOT recovered: {(!_w184Recover ? "mp_save_recover is off" : c is null ? "the DLL did not answer (no engine cancel here)" : c.Value.Result == 2 ? "the engine's cancel is not armed on this build" : c.Value.Result == 4 ? "the engine still says a save is pending after its own cancel" : "the cancel faulted")} -- pending save requires engine recovery or a confirmed load");
         if ((!recovered || run >= 2) && !_w184StuckTold)
         {
             _w184StuckTold = true;
