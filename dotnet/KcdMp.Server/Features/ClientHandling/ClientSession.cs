@@ -199,7 +199,26 @@ public partial class ClientSession
     /// </summary>
     public byte Id { get; internal set; }
     public string? Name { get; private set; }
-    public bool IsReady => Name is not null;
+    private volatile bool _superseded;
+    private int _disconnectAnnounced;
+    public bool IsReady => Name is not null && !_superseded;
+    internal bool IsSuperseded => _superseded;
+    internal void MarkSuperseded() => _superseded = true;
+
+    internal void AcceptHandshake(string name)
+    {
+        // WO-110 R4: broadcasts can see this session only after the Ack has entered
+        // the FIFO. ClientHandler holds its roster lock across the reservation.
+        PvpIncarnation = (ulong)Interlocked.Increment(ref s_nextPvpIncarnation);
+        EnqueueRaw(BuildPacket(Protocol.Ack, [Id]));
+        Name = name;
+    }
+
+    internal void AnnounceDisconnect()
+    {
+        if (Name is not null && Interlocked.Exchange(ref _disconnectAnnounced, 1) == 0)
+            _broadcastService.BroadcastDisconnect(this);
+    }
 
     /// <summary>WO-110 R4: connected over a loopback address, i.e. the relay
     /// host's own agent. Read once at construction; see ClientHandler.PickAuthority.</summary>
@@ -425,7 +444,7 @@ public partial class ClientSession
                 return;
             }
 
-            if (!_clientHandler.TryMarkReady(this))
+            if (!_clientHandler.TryMarkReady(this, name, out var superseded))
             {
                 _logger.Warning("[!] Rejecting '{Name}' from {ClientRemoteEndPoint}: server is full.",
                     name, _conn.Remote);
@@ -437,29 +456,18 @@ public partial class ClientSession
                 return;
             }
 
-            // WO-110 R4: the Ack is queued BEFORE this session becomes visible
-            // as ready (Name != null). Broadcasts to "all ready clients" run on
-            // other sessions' threads; with the Ack queued after Name was set,
-            // a Ghost/Name/CombatRole packet could land in this client's queue
-            // ahead of the Ack, and the agent -- which reads exactly one reply
-            // and expects 0xFF -- dropped the connection ("Expected Ack, got
-            // packet type ..."). The write queue is FIFO, so first-queued is
-            // first-sent. Id is already assigned (TryMarkReady above).
-            PvpIncarnation = (ulong)Interlocked.Increment(ref s_nextPvpIncarnation);
-            EnqueueRaw(BuildPacket(Protocol.Ack, [Id]));
-            Name = name;
-
             _logger.Information("[+] '{Name}' connected (id={Id}, protocol v{Version}, release {Release}, loopback={Loopback}) from {ClientRemoteEndPoint}.",
                 Name, Id, clientVersion, ReleaseVersion ?? "(none)", IsLoopback ? 1 : 0, _conn.Remote);
 
             // WO-144 1.1: the same player's older connection (a restarted game or
             // agent) goes now, before anyone counts it as a second partner.
-            foreach (var old in _clientHandler.SupersededBy(this))
+            foreach (var old in superseded)
             {
                 _logger.Information("[+] '{Name}' (id={Id}) replaces its older connection id={OldId} ({Transport}): the same player connected again.",
                     Name, Id, old.Id, Transport);
                 old.Supersede(Id);
             }
+            if (IsSuperseded) return;
 
             // Broadcast this client's name to all others; send existing names to this client
             _broadcastService.BroadcastName(this);
@@ -495,6 +503,7 @@ public partial class ClientSession
                 // to ReadAsync (verified empirically this session), so the
                 // timeout is an explicit CancellationTokenSource instead.
                 await ReadExactWithIdleTimeoutAsync(header);
+                if (IsSuperseded) return;
                 int type = header[0];
                 int payloadLen = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1));
                 Meter.Count(false, KcdMp.Wire.LinkKinds.Of(type, default), payloadLen + 3);   // WO-213 A.1: what this client sent (the type's name)

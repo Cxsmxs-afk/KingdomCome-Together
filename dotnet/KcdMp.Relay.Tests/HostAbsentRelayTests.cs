@@ -2,6 +2,8 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Globalization;
+using KcdMp.Client;
 using KcdMp.Server.Features.ClientHandling;
 using KcdMp.Wire;
 using Microsoft.Extensions.DependencyInjection;
@@ -24,6 +26,32 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
     [InlineData(2)]
     [InlineData(3)]
     [InlineData(4)]
+    public async Task Lowest_id_guest_can_leave_before_the_first_run_without_blocking_the_host(int players)
+    {
+        await WaitNoClientsAsync();
+        var peers = new Peer[players];
+        await using var group = new PeerGroup(peers);
+        for (int i = 0; i < players; i++)
+            peers[i] = await _relay.ConnectAsync(i == 1 ? "the-host" : $"guest-{i}");
+        Peer guest = peers[0], host = peers[1];
+        Assert.True(guest.Id < host.Id);
+        await BarrierAsync(guest);
+        Assert.Equal(guest.Id, Clients.DamageAuthority?.Id);
+        await guest.DisposeAsync();
+        Assert.Equal(guest.Id, (await host.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+        Assert.Equal(0, (await host.ReadUntilAsync(Protocol.CombatRole, Wait))[0]);
+
+        Assert.Null(Clients.AbsentHost);
+        Assert.Null(Clients.DamageAuthority);
+        await host.SendRawAsync(Claim());
+        await BarrierAsync(host);
+        Assert.Equal(host.Id, Clients.DamageAuthority?.Id);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
     public async Task Host_leave_does_not_elect_a_joiner(int players)
     {
         await WaitNoClientsAsync();
@@ -35,11 +63,23 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
         await WaitUntilAsync(() => Clients.DamageAuthority?.Name == "the-host", "the host did not become authority");
 
         await peers[0].DisposeAsync();
-        await WaitUntilAsync(() => Clients.ReadyClientCount == players - 1, "the host's connection did not leave");
+        foreach (var guest in peers[1..])
+        {
+            Assert.Equal(peers[0].Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+            Assert.Equal(0, (await guest.ReadUntilAsync(Protocol.CombatRole, Wait))[0]);
+        }
 
+        Assert.Null(Clients.AbsentHost);
         Assert.Null(Clients.DamageAuthority);
         for (int i = 1; i < players; i++)
             Assert.False(Clients.IsDamageAuthority(Clients.GetClients().Single(c => c.Id == peers[i].Id)));
+
+        await using var back = await _relay.ConnectAsync("the-host");
+        await BarrierAsync(back);
+        Assert.Null(Clients.DamageAuthority);
+        Assert.False(Clients.HasHostConnected());
+        await ConfirmWorldAsync(back, peers[1]);
+        Assert.Equal(back.Id, Clients.DamageAuthority?.Id);
     }
 
     [Fact]
@@ -50,8 +90,7 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
         await using var a = await Peer.ConnectAsync(_relay.TcpPort, "joiner-a");
         await using var b = await Peer.ConnectAsync(_relay.TcpPort, "joiner-b");
         await using var c = await Peer.ConnectAsync(_relay.TcpPort, "joiner-c");
-        await host.SendRawAsync(Claim());
-        await WaitUntilAsync(() => Clients.DamageAuthority?.Id == host.Id, "the host did not become authority");
+        await ConfirmWorldAsync(host, a);
         long saves = Clients.DropCount($"0x{Protocol.WorldSavedUp:X2}:host-absent");
         long hits = Clients.DropCount($"0x{Protocol.PlayerHitUp:X2}:host-absent");
         long votes = Clients.DropCount($"0x{Protocol.ConvUp:X2}/k{Protocol.ConvVote}:host-absent");
@@ -89,8 +128,7 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
             peers[index] = await Peer.ConnectAsync(_relay.TcpPort, index == 0 ? "the-host" : $"joiner-{index}");
         await using var group = new PeerGroup(peers);
         Peer host = peers[0], joiner = peers[1], witness = peers[^1];
-        await host.SendRawAsync(Claim());
-        await WaitUntilAsync(() => Clients.DamageAuthority?.Id == host.Id, "the host did not acquire authority");
+        await ConfirmWorldAsync(host, joiner);
 
         byte[] request = new byte[Protocol.JoinHeaderLen + 1];
         request[0] = Protocol.JoinTargetHost;
@@ -135,6 +173,110 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
         Assert.Equal(before + 1, Clients.DropCount(drop));
         Assert.True(await witness.NoneOfAsync(downstream, TimeSpan.FromMilliseconds(100)));
         Assert.False(Clients.HasHostConnected());
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public async Task Confirmed_host_pauses_and_resumes_the_same_run_with_remaining_players(int players)
+    {
+        await WaitNoClientsAsync();
+        var peers = new Peer[players];
+        await using var group = new PeerGroup(peers);
+        for (int i = 0; i < players; i++)
+            peers[i] = await _relay.ConnectAsync(i == 0 ? "the-host" : $"guest-{i}");
+        Peer host = peers[0];
+        Guid run = await ConfirmWorldAsync(host, peers[1]);
+
+        await host.DisposeAsync();
+        foreach (var guest in peers[1..])
+            Assert.Equal(host.Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+        Assert.Null(Clients.DamageAuthority);
+        Assert.Equal(run, Clients.AbsentHost?.RunId);
+
+        await using var back = await _relay.ConnectAsync("the-host");
+        await back.SendRawAsync(Claim());
+        foreach (var guest in peers[1..])
+        {
+            await back.SendRawAsync(Epoch(142, run, 81, guest.Id));
+            byte[] accepted = await guest.ReadUntilAsync(Protocol.W203Down, Wait);
+            Assert.Equal(back.Id, accepted[0]);
+            Assert.True(HostAbsentRules.TryReadRunFromDown(accepted, out Guid resumedRun));
+            Assert.Equal(run, resumedRun);
+        }
+        Assert.Null(Clients.AbsentHost);
+        Assert.Equal(back.Id, Clients.DamageAuthority?.Id);
+    }
+
+    [Theory]
+    [InlineData(2, false)]
+    [InlineData(3, true)]
+    [InlineData(4, false)]
+    public async Task Same_run_reconnect_resumes_while_superseded_stream_is_still_physically_open(int players, bool epochFirst)
+    {
+        var relay = RelayListeners.CreateApp("--ServerInfo:MaxPlayers", players.ToString(CultureInfo.InvariantCulture));
+        int port = (await RelayListeners.StartAsync(relay)).Port;
+        await using var app = relay;
+        var clients = app.Services.GetRequiredService<ClientHandler>();
+        const string identity = "steam:test-host";
+        var requestedClose = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Model Steam's lag: the close request returns before the old session's read ends.
+        await using var old = await SteamShapedPeer.ConnectAsync(app.Services, "the-host", identity,
+            () => requestedClose.TrySetResult());
+        var guests = new Peer[players - 1];
+        await using var group = new PeerGroup(guests);
+        for (int i = 0; i < guests.Length; i++) guests[i] = await Peer.ConnectAsync(port, $"guest-{i}");
+        Peer guest = guests[0];
+        Assert.Equal(players, clients.ReadyClientCount);
+        var (extra, refusal, _) = await Peer.ConnectRawAsync(port, "different-player", ReleaseVersionInfo.Wire, Protocol.Version);
+        await using (extra) Assert.Equal(Protocol.ServerFull, refusal);
+        Guid run = Guid.NewGuid();
+        await old.SendRawAsync(Claim());
+        await old.SendRawAsync(Epoch(142, run, 81, guest.Id));
+        Assert.Equal(old.Id, (await guest.ReadUntilAsync(Protocol.W203Down, Wait))[0]);
+        var departing = clients.DamageAuthority;
+        Assert.NotNull(departing);
+
+        await using var back = await SteamShapedPeer.ConnectAsync(app.Services, "the-host", identity);
+        await requestedClose.Task.WaitAsync(Wait);
+        Assert.Contains(departing, clients.GetClients());
+        Assert.Equal(run, clients.AbsentHost?.RunId);
+        Assert.Equal(old.Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+        if (epochFirst)
+        {
+            await back.SendRawAsync(Epoch(142, run, 81, guest.Id));
+            await BarrierAsync(back.SendRawAsync, back.ReadUntilAsync);
+            Assert.Equal(run, clients.AbsentHost?.RunId);
+        }
+        await back.SendRawAsync(Claim());
+        if (epochFirst)
+        {
+            await BarrierAsync(back.SendRawAsync, back.ReadUntilAsync);
+            Assert.Equal(back.Id, clients.DamageAuthority?.Id);
+        }
+        // The returning agent sends this to every partner when its host role is applied.
+        foreach (var survivor in guests)
+        {
+            await back.SendRawAsync(Epoch(142, run, 81, survivor.Id));
+            byte[] accepted = await survivor.ReadUntilAsync(Protocol.W203Down, Wait);
+            Assert.Equal(back.Id, accepted[0]);
+            Assert.True(HostAbsentRules.TryReadRunFromDown(accepted, out Guid resumedRun));
+            Assert.Equal(run, resumedRun);
+        }
+
+        Assert.Contains(departing, clients.GetClients());
+        Assert.Equal(players, clients.ReadyClientCount);
+        Assert.Null(clients.AbsentHost);
+        Assert.Equal(back.Id, clients.DamageAuthority?.Id);
+
+        // The old physical stream's next packet neither reaches the guests nor tears down the new authority.
+        await old.SendRawAsync(Epoch(142, Guid.NewGuid(), 81, guest.Id));
+        await WaitUntilAsync(() => !clients.GetClients().Contains(departing), "the old stream did not leave");
+        Assert.Null(clients.AbsentHost);
+        Assert.Equal(back.Id, clients.DamageAuthority?.Id);
+        Assert.False(await SeesAsync(guest, Protocol.W203Down, Protocol.Disconnect));
+        await BarrierAsync(guest);
     }
 
     [Fact]
@@ -258,7 +400,7 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
         Assert.True(ready(), why);
     }
 
-    private static async Task<bool> SeesAsync(Peer peer, byte type)
+    private static async Task<bool> SeesAsync(Peer peer, params byte[] types)
     {
         var until = DateTime.UtcNow + TimeSpan.FromMilliseconds(400);
         try
@@ -266,7 +408,7 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
             while (DateTime.UtcNow < until)
             {
                 var (got, _) = await peer.ReadPacketAsync(until - DateTime.UtcNow);
-                if (got == type) return true;
+                if (types.Contains(got)) return true;
             }
         }
         catch (OperationCanceledException) { }
@@ -280,6 +422,23 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
         var body = new byte[Protocol.PositionPayloadLen];
         body[16] = Protocol.PositionFlagHostClaim;
         return Frame(Protocol.Position, body);
+    }
+
+    private static Task BarrierAsync(Peer peer) => BarrierAsync(peer.SendRawAsync, peer.ReadUntilAsync);
+
+    private static async Task BarrierAsync(Func<byte[], Task> send, Func<byte, TimeSpan, Task<byte[]>> read)
+    {
+        await send(Frame(Protocol.Ping, new byte[Protocol.PingPayloadLen]));
+        await read(Protocol.Pong, Wait);
+    }
+
+    private static async Task<Guid> ConfirmWorldAsync(Peer host, Peer witness)
+    {
+        Guid run = Guid.NewGuid();
+        await host.SendRawAsync(Claim());
+        await host.SendRawAsync(Epoch(142, run, 81, witness.Id));
+        Assert.Equal(host.Id, (await witness.ReadUntilAsync(Protocol.W203Down, Wait))[0]);
+        return run;
     }
 
     private static byte[] Hit(byte target)
@@ -316,7 +475,7 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
         public async ValueTask DisposeAsync()
         {
             foreach (var peer in _peers)
-                try { await peer.DisposeAsync(); } catch { }
+                if (peer is not null) await peer.DisposeAsync();
         }
     }
 }
