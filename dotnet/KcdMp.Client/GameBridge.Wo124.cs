@@ -900,7 +900,7 @@ public partial class GameBridge
             Task gameplay = j.GameplayStarted?.Task ?? throw new InvalidOperationException("join gameplay report was not armed");
             Task failed = j.LoadFailed?.Task ?? throw new InvalidOperationException("join load failure report was not armed");
             // WO-154 4.2: past 20 s the game is asked where it is; never given up while it is busy (mp_join_patient)
-            if (await Task.WhenAny(accepted, j.Abandoned.Task, Task.Delay(20000)) != accepted
+            if (await WaitForJoinLoadSignalAsync(20000, accepted, j.Abandoned.Task) != accepted
                 && !(_w154JoinPatient && await Wo154WaitLoadAsync(j, "accept")))
             {
                 if (Wo124JoinGone(j, "while accepting load")) return;
@@ -909,7 +909,7 @@ public partial class GameBridge
                 else await AbortJoinerJoinAsync(j, Protocol.JoinAbortLoadFailed, "load-failed", "Your host's world could not be loaded.");
                 return;
             }
-            var endT = await Task.WhenAny(gameplay, failed, j.Abandoned.Task, Task.Delay(_w154JoinPatient ? 90000 : 300000));
+            var endT = await WaitForJoinLoadSignalAsync(_w154JoinPatient ? 90000 : 300000, gameplay, failed, j.Abandoned.Task);
             if (Wo124JoinGone(j, "while loading")) return;
             if (endT != gameplay && !(endT != failed && _w154JoinPatient && await Wo154WaitLoadAsync(j, "gameplay")))
             {
@@ -1792,6 +1792,12 @@ public partial class GameBridge
             Console.WriteLine(pending);
             return await receipt.WaitAsync(_joinEngineLifetime);
         }
+    }
+
+    private static async Task<Task?> WaitForJoinLoadSignalAsync(int timeoutMs, params Task[] signals)
+    {
+        try { return await Task.WhenAny(signals).WaitAsync(TimeSpan.FromMilliseconds(timeoutMs)); }
+        catch (TimeoutException) { return null; }
     }
 
     /// <summary>The game is quitting ("CSystem::Quit invoked").</summary>
