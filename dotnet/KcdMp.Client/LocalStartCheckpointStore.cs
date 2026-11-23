@@ -241,7 +241,17 @@ public sealed class LocalStartCheckpointStore
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or JsonException) { return false; }
     }
 
-    public bool TryFind(string? style, string? expectedBuild, [NotNullWhen(true)] out LocalStartCheckpoint? checkpoint, out string reason)
+    public bool TryFind(string? style, string? expectedBuild, [NotNullWhen(true)] out LocalStartCheckpoint? checkpoint, out string reason) =>
+        TryFind(style, expectedBuild, null, out checkpoint, out reason);
+
+    /// <summary>Finds an unclaimed start with unchanged original home bytes.</summary>
+    internal bool TryFindFresh(string engineUserFolder, string? style, string? expectedBuild, IReadOnlySet<Guid> claimedCreations,
+        [NotNullWhen(true)] out LocalStartCheckpoint? checkpoint, out string reason) =>
+        TryFind(style, expectedBuild, candidate => !claimedCreations.Contains(candidate.CreationId) &&
+            EngineHomeMatches(engineUserFolder, candidate), out checkpoint, out reason);
+
+    private bool TryFind(string? style, string? expectedBuild, Predicate<LocalStartCheckpoint>? available,
+        [NotNullWhen(true)] out LocalStartCheckpoint? checkpoint, out string reason)
     {
         checkpoint = null;
         reason = "no-verified-local-start-checkpoint";
@@ -251,7 +261,8 @@ public sealed class LocalStartCheckpointStore
             foreach (string folder in Directory.EnumerateDirectories(_profileDirectory))
                 if (Guid.TryParseExact(Path.GetFileName(folder), "N", out Guid id) &&
                     TryRead(id, expectedBuild, out var candidate, out _) && (style is null || candidate.Style == style) &&
-                    (checkpoint is null || candidate.CapturedAt > checkpoint.CapturedAt)) checkpoint = candidate;
+                    (checkpoint is null || candidate.CapturedAt > checkpoint.CapturedAt) &&
+                    (available is null || available(candidate))) checkpoint = candidate;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { checkpoint = null; }
         if (checkpoint is null) return false;

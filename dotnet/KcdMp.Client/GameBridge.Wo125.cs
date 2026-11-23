@@ -687,12 +687,12 @@ public partial class GameBridge
     private static HenryChoice? Wo125LocalCheckpoint(string saves, string? style, string? build, out string why)
     {
         why = "Start fresh needs a verified local checkpoint from the normal prologue in this game profile.";
-        if (!TryCheckpointProfile(saves, out _, out string profile)) return null;
-        var store = new LocalStartCheckpointStore(LocalStartCheckpointStore.DefaultRoot(), profile);
-        if (!store.TryFind(style, build, out var checkpoint, out _)) return null;
+        if (!TryCheckpointProfile(saves, out string folder, out string profile)) return null;
         var catalog = new HenryCharacterCatalog(HenryCharacterCatalog.DefaultRoot(), profile);
-        if (!catalog.TryList(out var active) || active.Any(c => c.CreationId == checkpoint.CreationId) ||
-            catalog.IsDeletedCreation(checkpoint.CreationId)) return null;
+        if (!catalog.TryListAll(out var entries)) return null;
+        var claimedCreations = entries.Select(entry => entry.CreationId).ToHashSet();
+        var store = new LocalStartCheckpointStore(LocalStartCheckpointStore.DefaultRoot(), profile);
+        if (!store.TryFindFresh(folder, style, build, claimedCreations, out var checkpoint, out _)) return null;
         why = "";
         return Wo125CheckpointChoice(saves, checkpoint);
     }

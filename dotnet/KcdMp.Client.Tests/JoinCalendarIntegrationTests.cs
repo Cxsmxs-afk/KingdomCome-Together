@@ -5,6 +5,7 @@ using System.Text;
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Reflection;
+using System.Security.Cryptography;
 using KcdMp.Wire;
 
 namespace KcdMp.Client.Tests;
@@ -144,11 +145,14 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None,
         BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false, bool? relayEofWorldRecovery = null,
-        bool? homeProbe = null, bool failExitResponse = false)
+        bool? homeProbe = null, bool failExitResponse = false, string? newerStart = null)
     {
         using var fixture = new SaveFixture();
         string? checkpointPath = probe == JoinProbe.LocalFresh ? fixture.RecordLocalCheckpoint() : null;
         byte[]? checkpointBytes = checkpointPath is null ? null : File.ReadAllBytes(checkpointPath);
+        string? chosen = newerStart is null ? null : await FreshChoiceWithNewerUnavailableCheckpointAsync(fixture, newerStart);
+        var homeHashes = newerStart is null ? null : Directory.EnumerateFiles(fixture.GuestSaves, "*.whs", SearchOption.AllDirectories)
+            .ToDictionary(path => path, path => SHA256.HashData(File.ReadAllBytes(path)));
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(probe == JoinProbe.PlayerJoinLoop ? 90 : boundary is null ? 25 : 40));
         var ct = stop.Token;
         await using var relay = await ReplayRelay.StartAsync(ct);
@@ -212,10 +216,11 @@ public sealed partial class JoinCalendarIntegrationTests
             }
             Call(guest, "Wo125OnLauncherChoice", probe switch
             {
-                JoinProbe.LocalFresh => "fresh:soldier",
+                JoinProbe.LocalFresh => chosen ?? "fresh:soldier",
                 JoinProbe.CompatibleRestore => "restore",
                 _ => "bring"
             });
+            if (newerStart is not null) AssertFreshPreflightSelectsAnAvailableCheckpoint(guest);
             Assert.True(Property<bool>(guest, "LoadSequenceEnabled"));
             Assert.True(Property<bool>(guest, "WorldSyncEffective"));
             Assert.False(Property<bool>(guest, "WorldSyncReady"));
@@ -357,10 +362,16 @@ public sealed partial class JoinCalendarIntegrationTests
             {
                 guestGame.DeferOwnFileRead = true;
                 guestGame.FailExitResponse = failExitResponse;
-                var check = CheckPrivateReturnFileAsync(fixture.GuestOwnSave, guest, guestGame, replace, ct);
+                var check = CheckPrivateReturnFileAsync(checkpointPath ?? fixture.GuestOwnSave, guest, guestGame, replace, ct);
                 Task leave = InvokeAsync(guest, "LeaveSharedWorldAsync", "fixture", "leaving");
                 await check;
                 await leave.WaitAsync(ct);
+                if (homeHashes is not null)
+                {
+                    foreach (var (path, original) in homeHashes)
+                        Assert.Equal(original, SHA256.HashData(File.ReadAllBytes(path)));
+                    Console.WriteLine($"W6 fresh: host={hostName} joiner={guestName} newer={newerStart} own_loads={guestGame.OwnLoadsIssued} home_sha256_unchanged={homeHashes.Count}");
+                }
             }
             if (pauseAfterJoin)
             {
@@ -914,21 +925,22 @@ public sealed partial class JoinCalendarIntegrationTests
             return WhsSaveTests.File(host);
         }
 
-        public string RecordLocalCheckpoint()
+        public string RecordLocalCheckpoint(int playline = 2)
         {
             // Engine proof is controlled here. The same production checkpoint store consumes the receipt,
             // and the playable join still traverses a real TCP relay and the shipped source resolver.
-            const string build = "1.5.5-release_1_5", file = "playline2/autosave002";
+            const string build = "1.5.5-release_1_5";
+            string file = $"playline{playline}/autosave002";
             const string cutPoint = "<Roots><_Barbora><Nodes><_trosecko><Nodes>"
                 + "<_socky><Nodes><_questProgress value='Done'/></Nodes></_socky>"
                 + "<_svatba><Nodes><_questProgress value='Active'/><_objectiveVisual1><Logs><Active/></Logs></_objectiveVisual1></Nodes></_svatba>"
                 + "</Nodes></_trosecko></Nodes></_Barbora></Roots>";
             const int process = 4321;
-            var started = DateTimeOffset.UtcNow;
+            var started = DateTimeOffset.UtcNow.AddSeconds(playline);
             string profileRoot = Path.GetDirectoryName(GuestSaves)!;
             string profile = LocalStartCheckpointStore.ProfileId(profileRoot);
             var store = new LocalStartCheckpointStore(LocalStartCheckpointStore.DefaultRoot(), profile);
-            Assert.True(store.TryReserve(profileRoot, Guid.NewGuid(), process, build, 2, "join", out var reservation, out var why), why);
+            Assert.True(store.TryReserve(profileRoot, Guid.NewGuid(), process, build, playline, "join", out var reservation, out var why), why);
             using (reservation)
             {
                 Assert.True(store.TryAuthorizeNativeStart(reservation!, process, profile, build, "join", started.AddSeconds(1), out why), why);
@@ -937,7 +949,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 origin.Seed = 122;
                 origin.Skills = [(17, 1500), (23, 900), (24, 600), (19, 10)];
                 byte[] bytes = WhsSaveTests.File(origin);
-                string path = Path.Combine(GuestSaves, "playline2", "autosave002.whs");
+                string path = Path.Combine(GuestSaves, $"playline{playline}", "autosave002.whs");
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 File.WriteAllBytes(path, bytes);
                 var receipt = new LocalStartCheckpointStore.EngineSaveReceipt(reservation!.CreationId, process, profile, build, "fighter", file,
