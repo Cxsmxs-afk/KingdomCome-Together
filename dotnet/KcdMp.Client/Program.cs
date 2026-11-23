@@ -315,7 +315,13 @@ using var cts = new CancellationTokenSource();
 
 // Graceful shutdown on Ctrl+C or window close — gives finally blocks time to clean up ghosts.
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-AppDomain.CurrentDomain.ProcessExit += (_, _) => { cts.Cancel(); Thread.Sleep(500); };
+AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+{
+    if (cts.IsCancellationRequested) return;
+    try { cts.Cancel(); }
+    catch (ObjectDisposedException) { return; }
+    Thread.Sleep(500);
+};
 
 // WO-206 Part C: applied.jsonl beside the exe -- one session per file, so it starts empty (nothing else is touched)
 Wo206Applied.StartSession();
