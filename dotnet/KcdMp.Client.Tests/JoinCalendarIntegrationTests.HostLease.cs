@@ -125,6 +125,7 @@ public sealed partial class JoinCalendarIntegrationTests
                     await engine.WaitForJoinLoadAsync(ct);
                     await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && hostLink.ReadyReceived.Count == 1 &&
                         Get<object?>(host, "_hostJoin") is null, "the normal calendar, load and Ready pipeline", ct);
+                    await engine.WaitForJoinedNotificationAsync(ct);
                     Assert.Equal(generation + 1, engine.JoinLoadsIssued);
                     Assert.False(Get<bool>(guest, "_isDamageAuthority"));
                     Assert.Equal(ownSave, File.ReadAllBytes(fixture.GuestOwnSave));

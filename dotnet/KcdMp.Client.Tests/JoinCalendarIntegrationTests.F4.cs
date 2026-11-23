@@ -114,6 +114,7 @@ public sealed partial class JoinCalendarIntegrationTests
         await engine.WaitForJoinLoadAsync(ct);
         await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && Get<object?>(host, "_hostJoin") is null,
             "the next world load and Ready on the same guest reader", ct);
+        await engine.WaitForJoinedNotificationAsync(ct);
         uint ready = Assert.Single(guestLink.ReadySent);
         Assert.DoesNotContain(ready, cancelled);
         Assert.Equal(ready, Assert.Single(hostLink.ReadyReceived));
@@ -186,6 +187,7 @@ public sealed partial class JoinCalendarIntegrationTests
             await game.WaitForJoinLoadAsync(ct);
             await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && Get<object?>(host, "_hostJoin") is null,
                 "confirmed same-process rejoin after five TCP interruptions", ct);
+            await game.WaitForJoinedNotificationAsync(ct);
             uint actual = Assert.Single(link.ReadySent);
             Assert.DoesNotContain(actual, abandoned);
             Assert.Equal(actual, Assert.Single(hostLink.ReadyReceived));
@@ -261,6 +263,7 @@ public sealed partial class JoinCalendarIntegrationTests
             await engine.WaitForJoinLoadAsync(ct);
             await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && hostLink.ReadyReceived.Count == i && Get<object?>(host, "_hostJoin") is null,
                 "a confirmed join after replacing the unavailable personal save", ct);
+            await engine.WaitForJoinedNotificationAsync(ct);
             await InvokeAsync(guest, "LeaveSharedWorldAsync", "fixture", "return after checking the save");
             await WaitForAbandonedArrivalAsync(guest, engine, ct);
             Assert.Equal(i, engine.OwnLoadsIssued);
@@ -289,6 +292,7 @@ public sealed partial class JoinCalendarIntegrationTests
             string incoming = await engine.WaitForJoinLoadAsync(ct);
             await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && hostLink.ReadyReceived.Count == i + 1 && Get<object?>(host, "_hostJoin") is null,
                 "the target join to send its confirmed Ready before leaving", ct);
+            await engine.WaitForJoinedNotificationAsync(ct);
             Assert.Equal(ownBefore, SHA256.HashData(File.ReadAllBytes(ownSave)));
             File.Move(ownSave, savedOutsideProfile);
             try
@@ -370,6 +374,7 @@ public sealed partial class JoinCalendarIntegrationTests
                     await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && Get<object?>(host, "_hostJoin") is null &&
                         !File.Exists(path) && link.ReadySent.Count == cycle && hostLink.ReadyReceived.Contains(link.ReadySent.Last()),
                         "the active guest to finish its targeted join", ct);
+                    await engine.WaitForJoinedNotificationAsync(ct);
                 }
 
                 await JoinAsync(first, firstLink, firstEngine, "playline0/save001");

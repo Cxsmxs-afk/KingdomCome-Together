@@ -29,7 +29,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private readonly Channel<string> _saveLockQueries = Channel.CreateUnbounded<string>();
     private readonly TaskCompletionSource<string> _loadIssued = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<string> _resumed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource _joinedNotification = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly Channel<bool> _joinedNotifications = Channel.CreateUnbounded<bool>();
     private long _eventSequence;
     private int _saveIndex;
     private string _where = "menu";
@@ -65,9 +65,11 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public int OwnLoadsIssued => Volatile.Read(ref _ownLoadsIssued);
     public Task<string> LoadIssued => _loadIssued.Task;
     public Task<string> Resumed => _resumed.Task;
-    public Task JoinedNotification => _joinedNotification.Task;
     public Task ExitMenu => _exitMenu.Task;
     public Task<string> ExitLoad => _exitLoad.Task;
+    // The production toast is sent after the post-load owner has published the
+    // Henry snapshot and chest ledger and finished cleaning the retained join file.
+    public Task WaitForJoinedNotificationAsync(CancellationToken ct) => _joinedNotifications.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForJoinLoadAsync(CancellationToken ct = default) => _joinLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForOwnLoadAsync(CancellationToken ct = default) => _ownLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForExitLoadAsync(CancellationToken ct = default) => _exitLoads.Reader.ReadAsync(ct).AsTask();
@@ -187,7 +189,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         var resume = Regex.Match(command, """KCD2MP_JoinResume\("[0-9a-f]{8}",\s*"([^"]+)"\)""");
         if (resume.Success) _resumed.TrySetResult(resume.Groups[1].Value);
         if (command.Contains("Co-op: you are in your host's world.", StringComparison.Ordinal))
-            _joinedNotification.TrySetResult();
+            _joinedNotifications.Writer.TryWrite(true);
     }
 
     private void AcceptLoad(Match load, bool joined)

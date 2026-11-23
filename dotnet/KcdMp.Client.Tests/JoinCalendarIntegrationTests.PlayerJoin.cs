@@ -52,6 +52,7 @@ public sealed partial class JoinCalendarIntegrationTests
             await WaitAsync(() => hostLink.ReadyReceived.Count == readyBefore + 1 &&
                 Get<bool>(guest, "_joinedWorld") && Get<object?>(host, "_hostJoin") is null,
                 "explicit rejoin from the same private world", ct);
+            await engine.WaitForJoinedNotificationAsync(ct);
             Assert.Equal(0, Get<int>(guest, "_autoRequests"));
             Assert.False(Get<bool>(guest, "_needsMenuTold"));
             Assert.Equal(0, Get<int>(guest, "_w202RejoinFails"));

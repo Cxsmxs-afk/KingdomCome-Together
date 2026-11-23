@@ -355,7 +355,7 @@ public sealed partial class JoinCalendarIntegrationTests
             AssertReady(await hostLink.Ready.WaitAsync(ct), guestPeer.Id, joinId);
             await WaitAsync(() => Get<object?>(host, "_hostJoin") is null && Get<string>(guest, "_joinUiState") == "in",
                 "the host finished the join and the guest entered the world", ct);
-            await guestGame.JoinedNotification.WaitAsync(ct);
+            await guestGame.WaitForJoinedNotificationAsync(ct);
             Assert.True(Get<bool>(guest, "_joinedWorld"));
             if (original is not null)
             {
@@ -768,7 +768,7 @@ public sealed partial class JoinCalendarIntegrationTests
         Assert.NotEqual(abortedJoinId, rejoinId);
         await WaitAsync(() => hostLink.ReadyReceived.Contains(rejoinId) && Get<string>(guest, "_joinUiState") == "in" &&
             Get<object?>(host, "_hostJoin") is null, "a new request to join and the host to accept its Ready", ct);
-        await guestGame.JoinedNotification.WaitAsync(ct);
+        await guestGame.WaitForJoinedNotificationAsync(ct);
         Assert.Equal(1, guestLink.ReadySent.Count(id => id == rejoinId));
         Assert.Equal(1, hostLink.ReadyReceived.Count(id => id == rejoinId));
         Assert.Equal(2, guestGame.JoinLoadsIssued);
