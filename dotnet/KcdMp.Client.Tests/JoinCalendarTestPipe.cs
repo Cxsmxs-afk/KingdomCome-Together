@@ -35,6 +35,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private ulong _loadGeneration, _lifecycleGeneration;
 
     public CombatPipe Pipe { get; }
+    public Func<int, string, bool>? SaveListed { get; set; }
     public Action? BeforeCalendarArm { get; set; }
     public Action<string>? RequestScopedSnapshot { get; set; }
     public Task ArmObserved => _arm.Task;
@@ -111,7 +112,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         0x03 => (Pong, []),
         // Session, respawn and combat setup have no readback beyond these Result ACKs.
         0x0C or 0x0D or 0x16 or 0x18 or 0x20 or 0x2C => (Result, [1, seq, 0]),
-        0x1D when request.Length >= 3 && request.Length == 3 + request[2] => (0x8D, [1, seq, 1, 0, 0, 1, 0, request[1], request[1], 0, 0, 0]),
+        0x1D when request.Length >= 3 && request.Length == 3 + request[2] => (0x8D, SaveList(seq, request)),
         0x1E => (0x8E, [1, seq, 1, 1, 1]),
         0x26 when request is [9] => (Wo140Reply, CalendarSnapshot(seq)),
         0x26 when request is [10, ..] && request.Length == 18 => (Wo140Reply, CalendarFollow(seq, request)),
@@ -119,6 +120,12 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         0x2B when request.Length > 0 => (Wo163Reply, Wo163(seq, request)),
         _ => (Result, [0, seq, (byte)PipeReason.UnknownCommand]),
     };
+
+    private byte[] SaveList(byte seq, ReadOnlySpan<byte> request)
+    {
+        bool listed = SaveListed?.Invoke((sbyte)request[1], System.Text.Encoding.ASCII.GetString(request[3..])) ?? true;
+        return [1, seq, (byte)(listed ? 1 : 0), 0, 0, 1, 0, request[1], request[1], 0, 0, 0];
+    }
 
     private byte[] CalendarSnapshot(byte seq)
     {

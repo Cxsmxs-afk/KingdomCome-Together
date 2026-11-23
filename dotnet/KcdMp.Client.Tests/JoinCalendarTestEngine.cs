@@ -36,6 +36,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private string? _lastLoaded;
     private int _joinLoadsIssued, _joinFilesRead, _ownLoadsIssued, _whereQueries;
     public int WhereQueries => Volatile.Read(ref _whereQueries);
+    private readonly Channel<string> _exitLoads = Channel.CreateUnbounded<string>();
 
     public JoinCalendarTestEngine(string logPath, string saves, Func<int, byte[]>? hostSave, Action gameplayStarted)
     {
@@ -67,6 +68,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public Task<string> ExitLoad => _exitLoad.Task;
     public Task<string> WaitForJoinLoadAsync(CancellationToken ct = default) => _joinLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForOwnLoadAsync(CancellationToken ct = default) => _ownLoads.Reader.ReadAsync(ct).AsTask();
+    public Task<string> WaitForExitLoadAsync(CancellationToken ct = default) => _exitLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForSaveLockAsync(CancellationToken ct = default) => _saveLockQueries.Reader.ReadAsync(ct).AsTask();
 
     public void CompleteJoinLoad()
@@ -150,6 +152,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
             string path = Path.Combine(_saves, $"playline{exit.Groups[1].Value}", exit.Groups[2].Value + ".whs");
             Assert.True(File.Exists(path));
             _exitLoad.TrySetResult(path);
+            _exitLoads.Writer.TryWrite(path);
             if (!DeferExitFileRead) CompleteExitLoad(path);
         }
 
