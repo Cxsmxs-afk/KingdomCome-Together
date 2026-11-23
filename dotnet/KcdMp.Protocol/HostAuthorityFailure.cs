@@ -38,8 +38,8 @@ public static class HostAuthorityFailure
             return de
                 ? "Beitritt gestoppt: Der Multiplayer-Schutz für NSC-Verhalten und Story wurde nicht bestätigt. Wähle im Koop-Menü erneut Beitreten. Bleibt die Meldung, prüfe die Mod-Version auf beiden PCs und sende die Protokolle über Report a bug."
                 : "Joining stopped: Multiplayer protection for NPC AI and story was not confirmed. Choose Join / Rejoin in the co-op menu to try again. If this persists, check the mod version on both PCs and send the logs with Report a bug.";
-        string system = reason == DecisionHook ? (de ? "NPC-KI" : "NPC AI")
-            : reason == StoryHook ? "Story" : (de ? "NPC-KI und Story" : "NPC AI and story");
+        string system = reason == DecisionHook ? (de ? "NSC-Verhalten" : "NPC AI")
+            : reason == StoryHook ? "Story" : (de ? "NSC-Verhalten und Story" : "NPC AI and story");
         return de
             ? $"Beitritt gestoppt: Die benötigte Spielanbindung für {system} ist in dieser Spielversion nicht verfügbar. Ein Spielupdate kann die Ursache sein. Installiere die aktuelle Mod-Version auf beiden PCs. Bleibt die Meldung, sende die Protokolle über Report a bug; dann wird ein kompatibles Mod-Update benötigt."
             : $"Joining stopped: The required game integration for {system} is unavailable in this game build. A game update may be the cause. Install the current mod on both PCs. If this persists, send the logs with Report a bug; a compatible mod update is needed.";

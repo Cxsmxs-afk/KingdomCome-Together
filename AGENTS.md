@@ -8,7 +8,7 @@ That is the bar for reviews, refactors and new work. A change that keeps the cur
 
 `docs/DECISIONS-coop-design.md` records the co-op design decisions. `docs/ARCHITECTURE-shared-world.md` describes which participant owns each kind of state. `docs/DESIGN-AUDIT.md` documents measurements of the body path. Do not treat these documents as a licence to rewrite the campaign into an MMO.
 
-Decided for this fork: two players are the primary case and must feel the best; design and keep working for a small group of three or four in the same world, and test the pair first. The core, in order, is the players themselves, the NPCs, the open world, and the story and quests. Build what you see every second first; the story is still core, not a leftover. Chests and herbs stay per player: each person looks into their own. Dialogue is a majority vote. Shops and traders are secondary and only need to be as good as is reasonable. The Modding Tools build stays required for now. Native frame hooks are allowed and get fixed after game patches.
+Decided for this fork: two players are the primary case and must feel the best; design and keep working for a small group of three or four in the same world, and test the pair first. The core, in order, is the players themselves, the NPCs, the open world, and the story and quests. Build what you see every second first; the story is still core, not a leftover. Chests and herbs stay per player: each person looks into their own. The player who starts a dialogue makes the choice. Shops and traders are secondary and only need to be as good as is reasonable. The Modding Tools build stays required for now. Native frame hooks are allowed and get fixed after game patches.
 
 ## Installing
 

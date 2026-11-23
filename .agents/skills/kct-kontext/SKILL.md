@@ -13,7 +13,7 @@ Stand: H19 auf dem H20-Commit `df301015`, Version `0.65.2` (`VERSION`), Protokol
 3. Wenn du etwas änderst, das hier steht (Datei, Fluss, Falle), passt du diese Datei im selben PR an. Warum: Nur so bleibt der Kontext für das nächste Paket aktuell.
 
 ## Ziel (oberste Regel, `AGENTS.md`)
-Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op bzw. NightCoop. Zwei Spieler sind der Hauptfall, 3–4 müssen gut laufen. Truhen und Kräuter bleiben pro Spieler, Dialoge werden per Mehrheit entschieden, Friendly Fire ist an (`FriendlyFireDefault = true`, `GameBridge.Wo121.cs:42`). Am Ende gibt es **eine** Download-Datei (Drop-in-ZIP). Jede Aussage braucht Datei:Zeile, eine Logzeile oder einen CI-Lauf. Warum: Der Test vom 18.11. war in CI grün und im Spiel kaputt.
+Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op bzw. NightCoop. Zwei Spieler sind der Hauptfall, 3–4 müssen gut laufen. Truhen und Kräuter bleiben pro Spieler, Im Dialog entscheidet, wer ihn beginnt, Friendly Fire ist an (`FriendlyFireDefault = true`, `GameBridge.Wo121.cs:42`). Am Ende gibt es **eine** Download-Datei (Drop-in-ZIP). Jede Aussage braucht Datei:Zeile, eine Logzeile oder einen CI-Lauf. Warum: Der Test vom 18.11. war in CI grün und im Spiel kaputt.
 
 ## Komponenten
 | Teil | Ort | Rolle |
