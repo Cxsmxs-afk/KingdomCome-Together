@@ -285,6 +285,9 @@ public partial class GameBridge
             Task? Admit(Func<Task> send)
             {
                 if (dispatchLife.IsCancellationRequested) return null;
+                // Fence launcher restart before the durable submission mark.
+                if (!TryProtectLauncherHandoff(out var restartHandoff)) return null;
+                using var handoff = restartHandoff;
                 // Read and journal the file without holding the dispatch lock.
                 // Keep the checked handle open across the synchronous handoff.
                 using var verifiedSave = prepareDispatch?.Invoke();

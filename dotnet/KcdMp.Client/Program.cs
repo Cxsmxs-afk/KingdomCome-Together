@@ -319,17 +319,21 @@ AppDomain.CurrentDomain.ProcessExit += (_, _) => { cts.Cancel(); Thread.Sleep(50
 
 // WO-206 Part C: applied.jsonl beside the exe -- one session per file, so it starts empty (nothing else is touched)
 Wo206Applied.StartSession();
-var bridge = new GameBridge(config) { WorldRecoveryTestEnabled = testWorldRecovery };
+var launcherControl = LauncherAgentLifetime.Attach();
+if (launcherControl is not null) _ = LauncherAgentLifetime.ListenForStopAsync(cts);
+var bridge = new GameBridge(config) { WorldRecoveryTestEnabled = testWorldRecovery, LauncherRestartControl = launcherControl };
 using var recorder = recording?.Open();
 if (recording is not null && recorder is null) return 2;
 bridge.RecordSession(recorder);
 // WO-179 0.3: an agent that exits gives the joiner's host-only save lock back first (the mod's lease covers a kill)
 AppDomain.CurrentDomain.ProcessExit += (_, _) => bridge.ReleaseSaveLockOnExit("agent-exit");
-await bridge.RunAsync(cts.Token);
+try { await bridge.RunAsync(cts.Token); }
+catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
 bridge.ReleaseSaveLockOnExit("agent-stop");
 if (recorder is not null)
 {
     recorder.Dispose();
     Console.WriteLine(recorder.Failed ? "MP-T2-RECORD incomplete" : "MP-T2-RECORD complete");
 }
+launcherControl?.Remove();
 return 0;

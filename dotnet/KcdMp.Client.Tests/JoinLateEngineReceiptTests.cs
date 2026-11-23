@@ -94,11 +94,40 @@ public sealed class JoinLateEngineReceiptTests
         Assert.Equal(Fixture.SaveBytes, File.ReadAllBytes(fixture.PersonalSave));
     }
 
+    [Fact]
+    public async Task Launcher_stop_stays_fenced_after_disposal_until_the_submitted_save_reads_complete()
+    {
+        var control = LauncherAgentControl.Create();
+        const int pid = 73;
+        const long start = 1000040;
+        Assert.True(control.StampProcess(pid, start));
+        try
+        {
+            await using var fixture = new Fixture(control);
+            await fixture.ConnectNativeAsync();
+            var submitted = fixture.Submit(joinId: 1, playline: 1);
+            fixture.FinishDispatch(submitted);
+            fixture.DisposeReceipt(submitted);
+            Assert.Null(control.TryBeginStop(pid, start, out string blocked));
+            Assert.Equal("engine-read-or-control-unavailable", blocked);
+
+            fixture.Game.Feed("Gameplay started");
+            Assert.False(fixture.HasEngineTerminal(submitted));
+            Assert.Null(control.TryBeginStop(pid, start, out _));
+            fixture.ReadAndComplete(submitted.Path);
+            Assert.True(fixture.HasEngineTerminal(submitted));
+
+            using var stopped = Assert.IsType<FileStream>(control.TryBeginStop(pid, start, out _));
+            Assert.Null(control.TryProtectEngineRead());
+        }
+        finally { control.Remove(); }
+    }
+
     private sealed class Fixture : IAsyncDisposable
     {
         private readonly string _root = Directory.CreateTempSubdirectory("kcdmp-late-join-receipt-").FullName;
         private readonly string? _previousData = Environment.GetEnvironmentVariable("KCDMP_DATA_DIR");
-        private readonly GameBridge _bridge = new(new ClientConfig());
+        private readonly GameBridge _bridge;
         private readonly JoinCalendarTestPipe _pipe = new();
         private string Saves => Path.Combine(_root, "saves");
         public string OtherProfile => Path.Combine(_root, "other-profile");
@@ -108,8 +137,9 @@ public sealed class JoinLateEngineReceiptTests
         public object Place => Field(_bridge, "_where", Private).GetValue(_bridge)!;
         public static readonly byte[] SaveBytes = "synthetic verified save bytes"u8.ToArray();
 
-        public Fixture()
+        public Fixture(LauncherAgentControl? control = null)
         {
+            _bridge = new(new ClientConfig()) { LauncherRestartControl = control };
             Environment.SetEnvironmentVariable("KCDMP_DATA_DIR", _root);
             Directory.CreateDirectory(Path.GetDirectoryName(PersonalSave)!);
             File.WriteAllBytes(PersonalSave, SaveBytes);
@@ -167,6 +197,9 @@ public sealed class JoinLateEngineReceiptTests
         public Task<bool>? EngineReceiptTask((object Join, string Path) attempt) =>
             Field(attempt.Join, "EngineReceipt").GetValue(attempt.Join) is { } receipt
                 ? ((TaskCompletionSource<bool>)Field(receipt, "Terminal").GetValue(receipt)!).Task : null;
+
+        public void DisposeReceipt((object Join, string Path) attempt) =>
+            ((IDisposable)Field(attempt.Join, "EngineReceipt").GetValue(attempt.Join)!).Dispose();
 
         public Task AbortAsync((object Join, string Path) attempt) =>
             (Task)Call("AbortJoinerJoinAsync", attempt.Join, Protocol.JoinAbortLoadFailed, "fixture-abort", "Test join retired.", false)!;

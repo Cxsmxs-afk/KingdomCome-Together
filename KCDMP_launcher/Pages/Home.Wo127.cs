@@ -334,8 +334,7 @@ namespace KCDMP_launcher.Pages
 
         private void StartAgentProcess(SessionAgentLaunch launch, Process game)
         {
-            var agent = StartSessionAgent(launch.StartInfo()) ?? throw new InvalidOperationException("The session agent did not start.");
-            TrackAgent(new(game, agent, launch));
+            TrackAgent(SessionAgentRun.Start(game, launch, StartSessionAgent));
         }
 
         private Process? StartSessionAgent(ProcessStartInfo info)
@@ -357,6 +356,7 @@ namespace KCDMP_launcher.Pages
             agentRun = run;
             var launch = run.Launch;
             Log.Information("Agent started via {Via} for role {Role}", launch.Steam ? "Steam" : "address", launch.Hosting ? "host" : "join");
+            if (!run.StopControlPrepared) Log.Warning("MP-LAUNCH agent restart unavailable reason=control-file-unavailable");
             steamFallbackShown = false;
             versionPollCts?.Cancel();
             versionPollCts?.Dispose();
@@ -370,7 +370,7 @@ namespace KCDMP_launcher.Pages
             authorityFailureModalShown = false;
             agentBanner.Start(launch.Steam, agentClock.Elapsed.TotalSeconds);
             SyncAgentBanner();
-            previous?.Agent.Dispose();
+            previous?.DisposeExited();
             _ = PollAgentStatusAsync(run, agentPollCts.Token);
         }
 

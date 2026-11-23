@@ -1024,15 +1024,16 @@ public partial class GameBridge
             !join.PlacedVerified || join.PlacedPath != path) return false;
         if (_transport is LogTailGameTransport tail)
         {
-            var receipt = new JoinEngineReceipt(tail, _combat, path, savesRoot);
+            if (PrepareLauncherProtectedReceipt(tail, path, savesRoot) is not { } receipt) return false;
             if (join.Character?.Scoped is { } character && !character.RetainForEngine(join, receipt))
             {
                 receipt.Dispose();
                 return false;
             }
+            receipt.ProtectSubmittedLoad();
             join.EngineReceipt = receipt;
         }
-        else if (join.Character?.Scoped is not null) return false;
+        else if (join.Character?.Scoped is not null || !TryProtectUnobservableEngineRead()) return false;
         join.LoadDispatchInFlight = true;
         join.LoadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         join.GameplayStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1512,12 +1513,14 @@ public partial class GameBridge
                 var root = Path.GetDirectoryName(Path.GetDirectoryName(src.FullPath))!;
                 sent = await P5LoadGameCoreAsync(src.Playline, src.Base, "leave-command", () =>
                 {
-                    homeReceipt = new JoinEngineReceipt(tail, _combat, src.FullPath, root);
+                    homeReceipt = PrepareLauncherProtectedReceipt(tail, src.FullPath, root);
+                    if (homeReceipt is null) return false;
+                    homeReceipt.ProtectSubmittedLoad();
                     AttachPrivateReturn(homeReceipt, src.Base);
                     return true;
                 }, returnToken);
             }
-            else sent = await P5LoadGameAsync(src.Playline, src.Base, "leave-command", returnToken);
+            else sent = await P5LoadGameCoreAsync(src.Playline, src.Base, "leave-command", TryProtectUnobservableEngineRead, returnToken);
         }
         catch (Exception ex) when (homeReceipt is not null && ex is IOException or OperationCanceledException or HttpRequestException)
         {
@@ -1576,7 +1579,9 @@ public partial class GameBridge
             {
                 sent = await P5LoadGameCoreAsync(save.Playline, save.Base, "leave-command", () =>
                 {
-                    receipt = new JoinEngineReceipt(engine, _combat, save.FullPath, root);
+                    receipt = PrepareLauncherProtectedReceipt(engine, save.FullPath, root);
+                    if (receipt is null) return false;
+                    receipt.ProtectSubmittedLoad();
                     Volatile.Write(ref _pinnedHomeLoad, receipt);
                     AttachPrivateReturn(receipt, save.Base);
                     return true;

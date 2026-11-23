@@ -120,9 +120,12 @@ public partial class Home
     private void AgentReconnectRefused(string reason, string? message = null)
     {
         Log.Information("MP-LAUNCH agent reconnect refused reason={Reason}", reason);
-        UiService.ShowError(message ?? (reason == "agent-still-running"
-            ? "The multiplayer agent is still running. Reconnect can start a replacement after it exits."
-            : "The current game or multiplayer agent changed. Try again."));
+        UiService.ShowError(message ?? (reason switch
+        {
+            "engine-read-or-control-unavailable" => "The current save handoff or agent connection is still busy. Try again when the load finishes.",
+            "agent-identity-unconfirmed" => "The launcher could not verify the running multiplayer agent.",
+            _ => "The current game or multiplayer agent changed. Try again."
+        }));
     }
 
     private async Task ReconnectAgentAsync()
@@ -132,15 +135,16 @@ public partial class Home
         StateHasChanged();
         try
         {
-            if (prior.ReconnectBlock(game, agentRun) is { } reason)
-            {
-                AgentReconnectRefused(reason);
-                return;
-            }
             string? hostBlock = prior.Launch.Hosting ? await HostAgentStartBlockAsync(game) : null;
             if (hostBlock is not null)
             {
                 AgentReconnectRefused("host-gate", hostBlock);
+                return;
+            }
+            var stop = await prior.StopForRestartAsync(game, () => ReferenceEquals(game, pendingGameProcess) ? agentRun : null);
+            if (stop != AgentStop.AlreadyExited && prior.Launch.Hosting && await HostAgentStartBlockAsync(game) is { } afterStop)
+            {
+                AgentReconnectRefused("host-gate", afterStop);
                 return;
             }
             if (!ReferenceEquals(game, pendingGameProcess) || prior.ReconnectBlock(game, agentRun) is not null)
@@ -148,11 +152,11 @@ public partial class Home
                 AgentReconnectRefused("game-or-agent-changed");
                 return;
             }
-            int previousPid = prior.Agent.Id;
             TrackAgent(prior.Restart(game, agentRun, StartSessionAgent));
-            Log.Information("MP-LAUNCH agent reconnected gamePid={GamePid} previousAgentPid={PreviousPid} agentPid={Pid}",
-                game.Id, previousPid, agentProcess!.Id);
+            Log.Information("MP-LAUNCH agent reconnected gamePid={GamePid} previousAgentPid={PreviousPid} agentPid={Pid} stop={Stop}",
+                game.Id, prior.AgentPid, agentProcess!.Id, stop);
         }
+        catch (AgentRecoveryRefused ex) { AgentReconnectRefused(ex.Message); }
         catch (LaunchBlockedException ex) { ShowBlocked(ex.Block); }
         catch (Exception ex)
         {
