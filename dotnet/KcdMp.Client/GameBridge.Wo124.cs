@@ -97,6 +97,8 @@ public partial class GameBridge
         public DateTime LoadCmdUtc, LoadStartUtc, LoadGameUtc, GameplayUtc;
         public volatile bool LoadDispatchInFlight;
         public JoinEngineReceipt? EngineReceipt;
+        public LauncherGuestWorld? LauncherGuestScope;
+        public bool LauncherGuestScopeWasInitial;
         public int RemovalScheduled;
         public readonly TaskCompletionSource DispatchEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public ulong LoadGeneration;
@@ -1024,14 +1026,27 @@ public partial class GameBridge
             !join.PlacedVerified || join.PlacedPath != path) return false;
         if (_transport is LogTailGameTransport tail)
         {
-            if (PrepareLauncherProtectedReceipt(tail, path, savesRoot) is not { } receipt) return false;
-            if (join.Character?.Scoped is { } character && !character.RetainForEngine(join, receipt))
+            if (!TryProtectLauncherHandoff(out var guestLease)) return false;
+            try
             {
-                receipt.Dispose();
-                return false;
+                if (PrepareLauncherProtectedReceipt(tail, path, savesRoot) is not { } receipt) return false;
+                if (join.Character?.Scoped is { } character && !character.RetainForEngine(join, receipt))
+                {
+                    receipt.Dispose();
+                    return false;
+                }
+                if (guestLease is not null)
+                {
+                    var guest = join.LauncherGuestScope = new LauncherGuestWorld(this, tail, guestLease);
+                    var previousGuest = Interlocked.Exchange(ref _launcherGuestWorld, guest);
+                    join.LauncherGuestScopeWasInitial = previousGuest is null && !_joinedWorld;
+                    previousGuest?.Dispose();
+                    guestLease = null;
+                }
+                receipt.ProtectSubmittedLoad();
+                join.EngineReceipt = receipt;
             }
-            receipt.ProtectSubmittedLoad();
-            join.EngineReceipt = receipt;
+            finally { guestLease?.Dispose(); }
         }
         else if (join.Character?.Scoped is not null || !TryProtectUnobservableEngineRead()) return false;
         join.LoadDispatchInFlight = true;
@@ -1043,9 +1058,14 @@ public partial class GameBridge
         return true;
     }
 
-    private bool TryDeletePlacedJoinWorld(JoinerJoin join, string path) =>
-        JoinSaveReadEnded(join) && join.SavesRoot is { } root && join.SplicedSha is { } sha &&
-        _retainedJoinWorlds.TryDelete(path, join, full => _joinWorldJournal.TryDeleteOwned(root, full, join.JoinId, sha));
+    private bool TryDeletePlacedJoinWorld(JoinerJoin join, string path)
+    {
+        if (!JoinSaveReadEnded(join) || join.SavesRoot is not { } root || join.SplicedSha is not { } sha ||
+            !_retainedJoinWorlds.TryDelete(path, join, full => _joinWorldJournal.TryDeleteOwned(root, full, join.JoinId, sha))) return false;
+        if (join.LauncherGuestScopeWasInitial && join.LauncherGuestScope is { } guest && join.EngineReceipt is { CanRemoveFile: true } receipt &&
+            !receipt.Terminal.Task.Result) ReleaseLauncherGuestWorld(guest);
+        return true;
+    }
 
     private bool AuthorizeJoinCalendarLoad(JoinerJoin join, string savesRoot, string path)
     {
@@ -1513,7 +1533,7 @@ public partial class GameBridge
                 var root = Path.GetDirectoryName(Path.GetDirectoryName(src.FullPath))!;
                 sent = await P5LoadGameCoreAsync(src.Playline, src.Base, "leave-command", () =>
                 {
-                    homeReceipt = PrepareLauncherProtectedReceipt(tail, src.FullPath, root);
+                    homeReceipt = PrepareLauncherProtectedReceipt(tail, src.FullPath, root, LauncherPrivateReturn.OwnSave);
                     if (homeReceipt is null) return false;
                     homeReceipt.ProtectSubmittedLoad();
                     AttachPrivateReturn(homeReceipt, canConfirmPrivateWorld: true);
@@ -1579,7 +1599,7 @@ public partial class GameBridge
             {
                 sent = await P5LoadGameCoreAsync(save.Playline, save.Base, "leave-command", () =>
                 {
-                    receipt = PrepareLauncherProtectedReceipt(engine, save.FullPath, root);
+                    receipt = PrepareLauncherProtectedReceipt(engine, save.FullPath, root, LauncherPrivateReturn.OwnSave);
                     if (receipt is null) return false;
                     receipt.ProtectSubmittedLoad();
                     Volatile.Write(ref _pinnedHomeLoad, receipt);

@@ -1008,6 +1008,8 @@ public partial class GameBridge
         bool registered = false, admitted = false;
         JoinEngineReceipt? exitReceipt = null;
         HomeSaveReadLease? exitLease = null;
+        if (!TryProtectLauncherHandoff(out var restartHandoff)) return false;
+        using var handoff = restartHandoff; // covers the exact journal cleanup in finally
         try
         {
             lock (_joinGate)
@@ -1031,8 +1033,6 @@ public partial class GameBridge
             }
             // Pin the name and its parents on Windows before proving the journal's
             // identity. Keep that exact path for the engine's asynchronous read.
-            if (!TryProtectLauncherHandoff(out var restartHandoff)) return false;
-            using var handoff = restartHandoff;
             exitLease = HomeSaveReadLease.TryAcquire(saves, new(pl, name + ".whs", path, 0), Convert.ToHexString(sha));
             using (var submittedLease = exitLease is null ? null :
                 _joinWorldJournal.PrepareLoadSubmission(saves, path, exitId, sha, isExit: true))
@@ -1050,7 +1050,7 @@ public partial class GameBridge
                 {
                     if (_transport is LogTailGameTransport tail)
                     {
-                        exitReceipt = PrepareLauncherProtectedReceipt(tail, path, saves);
+                        exitReceipt = PrepareLauncherProtectedReceipt(tail, path, saves, LauncherPrivateReturn.Menu);
                         if (exitReceipt is null) return false;
                         exitReceipt.ProtectSubmittedLoad();
                         AttachPrivateReturn(exitReceipt, canConfirmPrivateWorld: false);

@@ -96,7 +96,30 @@ public partial class GameBridge
         await ExecLuaAsync($"if KCD2MP_W175Health then KCD2MP_W175Health(\"{why}\", \"repaired\", \"stuck-quest-fight:{Wo175Lua(res.What)}\", \"{newRel}\", true) end");
         await Task.Delay(2500);   // the toast is read before the loading screen
         if (!await Wo177WaitQuietAsync("w175-repaired")) return;   // WO-177 A5: never a load while a fight is running (the copy stays listed; the player loads it later)
-        if (!await P5LoadGameAsync(pl, baseName, "w175-repaired")) return;
+        await Wo175LoadRepairedCopyAsync(pl, baseName, res.NewPath!, _savesDir!);
+    }
+
+    private async Task<bool> Wo175LoadRepairedCopyAsync(int playline, string name, string path, string savesRoot)
+    {
+        if (!TryProtectLauncherHandoff(out var restartHandoff)) return false;
+        using var handoff = restartHandoff;
+        JoinEngineReceipt? receipt = null;
+        try
+        {
+            return await P5LoadGameCoreAsync(playline, name, "w175-repaired", () =>
+            {
+                if (_transport is not LogTailGameTransport tail) return TryProtectUnobservableEngineRead();
+                receipt = PrepareLauncherProtectedReceipt(tail, path, savesRoot);
+                if (receipt is null) return false;
+                receipt.ProtectSubmittedLoad();
+                return true;
+            });
+        }
+        catch (Exception ex) when (receipt is not null && ex is IOException or HttpRequestException or OperationCanceledException)
+        {
+            Console.WriteLine($"MP-W175 repaired load handoff uncertain transport={ex.GetType().Name}");
+            return false;
+        }
     }
 
     public sealed record Wo175Result(string Kind, string Why, string What, string? NewPath);

@@ -7,6 +7,39 @@ public partial class GameBridge
 {
     internal LauncherAgentControl? LauncherRestartControl { get; init; }
     private FileStream? _launcherUnobservableRead;
+    private LauncherGuestWorld? _launcherGuestWorld;
+    private enum LauncherPrivateReturn { None, OwnSave, Menu }
+
+    // The guest save lock belongs to the loaded world, not just its engine
+    // read. Keep this independent exclusion across read and relay completion.
+    private sealed class LauncherGuestWorld : IDisposable
+    {
+        private readonly GameBridge _owner;
+        private readonly LogTailGameTransport _tail;
+        private readonly FileStream _lease;
+
+        public LauncherGuestWorld(GameBridge owner, LogTailGameTransport tail, FileStream lease)
+        {
+            _owner = owner;
+            _tail = tail;
+            _lease = lease;
+            _tail.GameQuit += OnGameQuit;
+        }
+
+        private void OnGameQuit() => _owner.ReleaseLauncherGuestWorld(this);
+
+        public void Dispose()
+        {
+            _tail.GameQuit -= OnGameQuit;
+            _lease.Dispose();
+        }
+    }
+
+    private void ReleaseLauncherGuestWorld(LauncherGuestWorld scope)
+    {
+        if (ReferenceEquals(Interlocked.CompareExchange(ref _launcherGuestWorld, null, scope), scope))
+            scope.Dispose();
+    }
 
     private bool TryProtectLauncherHandoff(out FileStream? lease)
     {
@@ -16,10 +49,16 @@ public partial class GameBridge
         return false;
     }
 
-    private JoinEngineReceipt? PrepareLauncherProtectedReceipt(LogTailGameTransport tail, string path, string savesRoot)
+    private JoinEngineReceipt? PrepareLauncherProtectedReceipt(LogTailGameTransport tail, string path, string savesRoot,
+        LauncherPrivateReturn privateReturn = LauncherPrivateReturn.None)
     {
         if (!TryProtectLauncherHandoff(out var lease)) return null;
-        try { return new(tail, _combat, path, savesRoot, lease); }
+        var guest = privateReturn == LauncherPrivateReturn.None ? null : Volatile.Read(ref _launcherGuestWorld);
+        Action<bool>? onTerminal = guest is null ? null : loaded =>
+        {
+            if (privateReturn == LauncherPrivateReturn.OwnSave || !loaded) ReleaseLauncherGuestWorld(guest);
+        };
+        try { return new(tail, _combat, path, savesRoot, lease, onTerminal); }
         catch { lease?.Dispose(); throw; }
     }
 
@@ -45,6 +84,7 @@ public partial class GameBridge
         private readonly long _logIncarnation, _pipeRevision, _initialReadSequence;
         private readonly string _path;
         private readonly string? _userAlias;
+        private readonly Action<bool>? _onTerminal;
         private FileStream? _launcherReadLease;
         private bool _launcherSubmitted;
         private static StringComparison PathComparison =>
@@ -52,9 +92,10 @@ public partial class GameBridge
         public readonly TaskCompletionSource<bool> Terminal = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public JoinEngineReceipt(LogTailGameTransport tail, CombatPipe pipe, string path, string saveRoot)
-            : this(tail, pipe, path, saveRoot, null) { }
+            : this(tail, pipe, path, saveRoot, null, null) { }
 
-        public JoinEngineReceipt(LogTailGameTransport tail, CombatPipe pipe, string path, string saveRoot, FileStream? launcherReadLease)
+        public JoinEngineReceipt(LogTailGameTransport tail, CombatPipe pipe, string path, string saveRoot,
+            FileStream? launcherReadLease, Action<bool>? onTerminal)
         {
             _tail = tail;
             _pipe = pipe;
@@ -63,6 +104,7 @@ public partial class GameBridge
             _pipeRevision = pipe.EdgeConnectionRevision;
             _path = Path.GetFullPath(path).Replace('\\', '/');
             _launcherReadLease = launcherReadLease;
+            _onTerminal = onTerminal;
             // The live resolver selects the game's profile (and the named test
             // copy, where configured). An explicit join-root override is not
             // proof that the game resolves its %USER% token to that override.
@@ -93,6 +135,7 @@ public partial class GameBridge
             if (!Current) return false;
             if (Volatile.Read(ref _launcherReadLease) is not null && !Volatile.Read(ref _launcherSubmitted)) return false;
             if (!Terminal.TrySetResult(loaded)) return false;
+            _onTerminal?.Invoke(loaded);
             Dispose();
             return true;
         }

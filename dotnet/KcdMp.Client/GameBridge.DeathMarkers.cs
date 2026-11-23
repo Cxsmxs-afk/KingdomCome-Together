@@ -261,8 +261,11 @@ public partial class GameBridge
                 if (!await LoadSequenceSyncNativeAsync()) return false;
                 var current = _worldLoad.Current;
                 if (current.Generation != prepared.Generation || current.OwnIntentRevision != prepared.OwnIntentRevision) return false;
-                if (authorizeDispatch is null)
+                if (authorizeDispatch is null || reason == "w175-repaired")
+                {
                     LoadSequenceBeginLoad();
+                    dispatchScope = _worldLoad.Current;
+                }
                 else if (own)
                 {
                     if (!LoadSequenceChange(s => s.Generation == prepared.Generation && s.OwnIntentRevision == prepared.OwnIntentRevision &&

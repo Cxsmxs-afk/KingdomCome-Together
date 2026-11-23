@@ -149,6 +149,8 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         if (load.Success) AcceptLoad(load, joined: true);
         var ownLoad = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"([A-Za-z0-9_]+)","leave-command"\)""");
         if (ownLoad.Success) AcceptLoad(ownLoad, joined: false);
+        var repair = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"([A-Za-z0-9_]+)","w175-repaired"\)""");
+        if (repair.Success) AcceptLoad(repair, joined: false);
         var exit = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"(mpexit[0-9a-f]{8})","exit-to-menu"\)""");
         if (exit.Success)
         {
