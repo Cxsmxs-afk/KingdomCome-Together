@@ -39,9 +39,9 @@ namespace KCDMP_launcher.Models
     ///   (logged) -- never a dead button.</item>
     /// </list>
     /// Before WO-154 CONNECT was enabled the moment WHGame.dll loaded, with a line asking the host
-    /// to wait until the character can move. Too early, the plugin can find no ticking game and
-    /// only a game restart helps (VerifyInjectionAsync); at the main menu the host's agent connects
-    /// with no world for a joiner to receive.
+    /// to wait until the character can move. This gate still prevents a host's agent from
+    /// connecting at the main menu with no world for a joiner to receive. The launcher verifies
+    /// the native plugin after injection, independently of this gate.
     /// </summary>
     public static class ConnectGateRule
     {

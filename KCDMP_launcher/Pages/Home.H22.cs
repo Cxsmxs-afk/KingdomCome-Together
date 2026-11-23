@@ -18,7 +18,6 @@ public partial class Home
     private readonly LauncherSessionRole sessionRoles = new();
     private SessionLaunchPlan? pendingPlan;
     private MenuGameScope? roleGame;
-    private Process? agentGameProcess;
     private bool roleSwitchBusy;
     private bool launchPreparationBusy;
     private bool hidePendingPanel;
@@ -101,8 +100,8 @@ public partial class Home
     private bool RoleSessionCurrent(MenuGameScope scope) => ReferenceEquals(roleGame, scope)
         && ReferenceEquals(pendingGameProcess, scope.Game) && !scope.Game.HasExited;
 
-    private bool SessionAgentActive(MenuGameScope scope) => ReferenceEquals(agentGameProcess, scope.Game)
-        && agentProcess is { HasExited: false };
+    private bool SessionAgentActive(MenuGameScope scope) => agentRun is { Agent.HasExited: false } run
+        && ReferenceEquals(run.Game, scope.Game);
 
     private bool RoleSwitchAllowed(MenuGameScope scope, GameStage stage) => LauncherSessionRole.MenuSwitchAllowed(stage,
         launchStage == LaunchStage.WaitingForConnect && pendingDllPath is not null, RoleSessionCurrent(scope),

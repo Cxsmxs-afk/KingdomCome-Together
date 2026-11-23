@@ -307,6 +307,13 @@ namespace KCDMP_launcher.Pages
         /// <summary>Starts the agent for the selected role and transport.</summary>
         private void StartAgent(SessionLaunchPlan plan, Process game)
         {
+            StopAgentFromPreviousGame(game);
+            StartAgentProcess(DescribeAgentLaunch(plan), game);
+            pendingPlan = plan;
+        }
+
+        private SessionAgentLaunch DescribeAgentLaunch(SessionLaunchPlan plan)
+        {
             string agentPath = ResolveAgainstLauncher(settings.AgentPath);
             var server = plan.Server;
             string target = server.SteamCode is { } code
@@ -322,31 +329,49 @@ namespace KCDMP_launcher.Pages
                 " " + KeepAwakeSetting.AgentFlag(settings.KeepGameRunningInBackground) +   // WO-207 C.2
                 plan.HostClaimArgument;
 
-            var agentStartInfo = new ProcessStartInfo
-            {
-                FileName = agentPath,
-                Arguments = agentArgs,
-                UseShellExecute = false,
-                WorkingDirectory = Path.GetDirectoryName(agentPath)
-            };
+            return new(agentPath, agentArgs, plan.Hosting, server.SteamCode is not null, settings.VersionIpcPort);
+        }
 
-            StopExistingAgent();
-            agentProcess = StartChecked(agentStartInfo) ?? throw new InvalidOperationException("The session agent did not start.");
-            agentGameProcess = game;
-            Log.Information("Agent started via {Via} for role {Role}", server.SteamCode is null ? "address" : "Steam", plan.Hosting ? "host" : "join");
-            pendingPlan = plan;
+        private void StartAgentProcess(SessionAgentLaunch launch, Process game)
+        {
+            var agent = StartSessionAgent(launch.StartInfo()) ?? throw new InvalidOperationException("The session agent did not start.");
+            TrackAgent(new(game, agent, launch));
+        }
+
+        private Process? StartSessionAgent(ProcessStartInfo info)
+        {
+            // Another launcher or a manual start may own a live agent. Detect it without touching it.
+            var candidates = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(info.FileName));
+            try
+            {
+                if (candidates.Any(process => !process.HasExited))
+                    throw new InvalidOperationException("Another multiplayer agent is already running.");
+                return StartChecked(info);
+            }
+            finally { foreach (var process in candidates) process.Dispose(); }
+        }
+
+        private void TrackAgent(SessionAgentRun run)
+        {
+            var previous = agentRun;
+            agentRun = run;
+            var launch = run.Launch;
+            Log.Information("Agent started via {Via} for role {Role}", launch.Steam ? "Steam" : "address", launch.Hosting ? "host" : "join");
             steamFallbackShown = false;
             versionPollCts?.Cancel();
+            versionPollCts?.Dispose();
             versionPollCts = new CancellationTokenSource();
-            _ = PollVersionMismatchAsync(versionPollCts.Token);
+            _ = PollVersionMismatchAsync(launch.StatusPort, versionPollCts.Token);
             // WO-129: the agent's status has the agent's lifetime, not the
             // version poll's (which a closed launch panel cancels).
             agentPollCts?.Cancel();
+            agentPollCts?.Dispose();
             agentPollCts = new CancellationTokenSource();
             authorityFailureModalShown = false;
-            agentBanner.Start(server.SteamCode is not null, agentClock.Elapsed.TotalSeconds);
+            agentBanner.Start(launch.Steam, agentClock.Elapsed.TotalSeconds);
             SyncAgentBanner();
-            _ = PollAgentStatusAsync(agentProcess, agentPollCts.Token);
+            previous?.Agent.Dispose();
+            _ = PollAgentStatusAsync(run, agentPollCts.Token);
         }
 
         // WO-129: the connection line and the join banner, from the agent's two
@@ -369,18 +394,18 @@ namespace KCDMP_launcher.Pages
             joinCanFresh = agentBanner.ShowFreshJoin;   // WO-154: "Join with a new character"
         }
 
-        private async Task PollAgentStatusAsync(Process? agent, CancellationToken ct)
+        private async Task PollAgentStatusAsync(SessionAgentRun run, CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
             {
                 try { await Task.Delay(1000, ct); } catch (OperationCanceledException) { break; }
                 bool alive;
-                try { alive = agent is not null && !agent.HasExited; } catch { alive = false; }
+                try { alive = !run.Agent.HasExited; } catch { alive = false; }
                 try
                 {
-                    var cs = alive ? await NetService.GetConnectionStatusAsync(settings.VersionIpcPort) : null;
-                    var js = alive ? await NetService.GetJoinStatusAsync(settings.VersionIpcPort) : null;
-                    if (ct.IsCancellationRequested || !ReferenceEquals(agent, agentProcess)) return;
+                    var cs = alive ? await NetService.GetConnectionStatusAsync(run.Launch.StatusPort) : null;
+                    var js = alive ? await NetService.GetJoinStatusAsync(run.Launch.StatusPort) : null;
+                    if (ct.IsCancellationRequested || !ReferenceEquals(run, agentRun)) return;
                     // Steam failed: offer the address right here, in this same launch.
                     if (cs is { State: "failed", Via: "steam" } && !steamFallbackShown && cs.Kind != "Lost")
                     {
@@ -425,20 +450,39 @@ namespace KCDMP_launcher.Pages
                 ShowMessage("STEAM CONNECTION FAILED", "That address doesn't look right. Type it like 203.0.113.7:7778 or myhost.example.net:7778.", "", addressFallback: true);
                 return;
             }
-            showMessage = false;
             try
             {
                 if (launchStage == LaunchStage.Connected && pendingPlan is { Role: SessionRole.Join, Server.SteamCode: not null }
-                    && pendingGameProcess is { HasExited: false } game && ReferenceEquals(agentGameProcess, game))
+                    && pendingGameProcess is { } game && agentRun is { } current)
                 {
+                    if (agentReconnectBusy) return;
+                    if (current.ReconnectBlock(game, agentRun) is { } reason)
+                    {
+                        Log.Information("MP-LAUNCH Steam fallback refused reason={Reason}", reason);
+                        messageNext = reason == "agent-still-running"
+                            ? "You can use this address after the current multiplayer agent exits."
+                            : "The game or its multiplayer agent changed.";
+                        return;
+                    }
                     var plan = sessionRoles.Select(SessionRole.Join, server)!;
-                    StartAgent(plan, game);
+                    StartAgentProcess(DescribeAgentLaunch(plan), game);
+                    showMessage = false;
+                    pendingPlan = plan;
                     sessionRoles.RememberJoinTarget(server);
                 }
-                else if (launchStage == LaunchStage.Idle) await LaunchJoinGame(server);
+                else if (launchStage == LaunchStage.Idle)
+                {
+                    showMessage = false;
+                    await LaunchJoinGame(server);
+                }
                 else Log.Information("MP-LAUNCH Steam fallback refused reason=no-current-steam-join");
             }
             catch (LaunchBlockedException lb) { ShowBlocked(lb.Block); }   // WO-154
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "MP-LAUNCH Steam fallback agent could not start");
+                messageNext = "The multiplayer agent couldn't start. Try again.";
+            }
             StateHasChanged();
         }
     }

@@ -67,6 +67,8 @@ Ein Koop, der sich nativ anfühlt, auf dem Niveau von Elden Ring Seamless Co-op 
 
 **Snapshot / Heimkehr (H21):** `GameBridge.H21Snapshot.cs` ordnet bestätigte Quicksaves über die Engine-Meldung und die Kennung aus dem Save-Header zu. `Wo184TakeAsync` bindet Auftrag, Figur, Run, Generation und Host-Save. Die native Pipe lässt in `Exit` nur den finalen Snapshot derselben Generation zu. `HomeSaveReadLease` hält die verifizierte Datei während der Engine-Übergabe. Bei Austausch vor dem Lease bleibt die Rückkehr auf das Menü beschränkt. [Snapshot](../../../dotnet/KcdMp.Client/GameBridge.Wo184.cs) · [Heimkehr](../../../dotnet/KcdMp.Client/GameBridge.Wo124.cs)
 
+**Launcher-Wiederverbindung (W8f):** `Home.W8Reconnect.cs` wartet auf Tick und Pipe-Start der DLL mit der PID des laufenden Spiels. Nach dem Ende des genau erfassten Agenten startet „Neu verbinden“ denselben Startbefehl im selben Spielprozess. Ein laufender Agent bleibt aktiv, solange die Launcher-Schnittstelle keine sichere Übergabe belegen kann. [Launcher](../../../KCDMP_launcher/Pages/Home.W8Reconnect.cs)
+
 ## Thema → lesen (und warum)
 | Thema | Gründlich lesen | Warum |
 |---|---|---|

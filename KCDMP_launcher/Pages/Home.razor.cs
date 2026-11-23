@@ -10,7 +10,6 @@ using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using KCDMP_launcher.Components;
 using KCDMP_launcher.Components.Shared;
@@ -82,30 +81,15 @@ namespace KCDMP_launcher.Pages
         #endregion
 
         #region Launch/connect state
-        // The launcher used to inject the instant WHGame.dll became loadable,
-        // which happens well before the game finishes loading a save -- the
-        // native DLL's own liveness check then finds zero engine ticks and
-        // silently aborts (see docs/VERIFICATION-REPORT.md, "Real finding").
-        // Re-injecting the same DLL path a second time does not help: Windows
-        // does not re-run DllMain for an already-loaded module. So injection
-        // now happens exactly once, gated on the player confirming they are
-        // actually in a loaded world, and the result is verified against the
-        // DLL's own log rather than trusted from the injector's exit code.
-        private enum LaunchStage { Idle, WaitingForConnect, Injecting, Verifying, Connected, Failed }
+        private enum LaunchStage { Idle, WaitingForConnect, Injecting, Verifying, PluginWaiting, Connected, Failed }
         private LaunchStage launchStage = LaunchStage.Idle;
-        private Process? pendingGameProcess = null;
-        private string? pendingDllPath = null;
-        private string? pendingGameExe = null;   // WO-157
+        private Process? pendingGameProcess;
+        private string? pendingDllPath;
+        private string? pendingGameExe;
+        private DateTime? nativeProofSince;
         private string launchStatusMessage = "";
-        // WO-27: the agent started by ConnectToGame, tracked so a later Connect
-        // (e.g. after the game was closed and relaunched without restarting the
-        // launcher) can kill the old one first instead of leaving it running
-        // alongside a new one. Two agents both claiming the same local player
-        // identity to the relay was observed live to cause an infinite
-        // reconnect/respawn war -- ~4000 spawn cycles in ~10 minutes -- because
-        // neither side's ghost could ever be cleanly removed while the other
-        // kept reasserting it. See docs/WO-27-findings.md.
-        private Process? agentProcess = null;
+        private SessionAgentRun? agentRun;
+        private Process? agentProcess => agentRun?.Agent;
         #endregion
 
         #region Filter State
@@ -597,22 +581,7 @@ namespace KCDMP_launcher.Pages
             }
         }
 
-        /// <summary>
-        /// The second half of launching: inject and start the agent. Split out
-        /// from LaunchGame and gated on the player clicking CONNECT because the
-        /// native DLL only works once the game is actually ticking frames --
-        /// which, per docs/VERIFICATION-REPORT.md, does not happen until well
-        /// past the splash/menu screens and into a loaded save. Injecting the
-        /// moment WHGame.dll is merely loadable (the old behaviour) attaches a
-        /// DLL that immediately finds zero frames and aborts on its own
-        /// liveness check -- silently, since the injector's exit code is still
-        /// 0 (LoadLibrary succeeded; the DLL just gave up after that).
-        ///
-        /// There is no retry if this fires too early: Windows does not re-run
-        /// DllMain for a module that is already loaded at that path, so a
-        /// second injector run against the same game process is a no-op. The
-        /// only way back from a failed verification is a fresh game launch.
-        /// </summary>
+        // Inject once for this game, then wait for this DLL's own readiness evidence.
         private async Task ConnectToGame()
         {
             if (launchStage != LaunchStage.WaitingForConnect || roleSwitchBusy || roleGame?.ActionInProgress == true)
@@ -658,6 +627,7 @@ namespace KCDMP_launcher.Pages
                 // WO-157: the launcher loads the DLL itself (no KCDMP_LauncherInjector.exe for Windows to
                 // remove or refuse): the same steps and checks, failing closed with a plain message.
                 if (!ReferenceEquals(pendingGameProcess, game) || game.HasExited) return;
+                DateTime injectedAfter = DateTime.UtcNow;
                 var inject = await InjectFromLauncherAsync(game.Id, dllPath);
                 if (!ReferenceEquals(pendingGameProcess, game) || game.HasExited) return;
                 if (!inject.Ok)
@@ -667,49 +637,27 @@ namespace KCDMP_launcher.Pages
                     return;
                 }
 
-                launchStage = LaunchStage.Verifying;
-                launchStatusMessage = "Verifying the plugin actually attached...";
-                StateHasChanged();
-
-                var verdict = await VerifyInjectionAsync(dllPath, game.Id);
-                if (!ReferenceEquals(pendingGameProcess, game) || game.HasExited) return;
-                if (!verdict)
-                {
-                    UiService.ShowError(
-                        "The plugin loaded but never saw the game running -- you likely clicked Connect before " +
-                        "the save had fully loaded. It cannot retry from here: Windows will not reload an " +
-                        "already-loaded DLL into the same game process. Close the game, click Launch again, and " +
-                        "wait until you can move your character before clicking Connect.");
-                    launchStage = LaunchStage.Failed;
-                    launchStatusMessage = "Injection did not take. Restart the game to try again.";
-                    StateHasChanged();
-                    return;
-                }
-
-                StartAgent(plan, game);
-                launchStage = LaunchStage.Connected;
-                showConnectedPanel = true;
-                launchStatusMessage = "The game is ready. The line at the bottom of this window shows the connection; you can close this.";
-                StateHasChanged();
+                nativeProofSince = injectedAfter;
+                await FinishPluginConnectAsync(game, plan, dllPath, injectedAfter);
             }
             catch (LaunchBlockedException lb)
             {
-                // WO-154: Windows refused the injector or the agent. Nothing reached the game (or the
-                // plugin is in and waits), so once the player has allowed the file, CONNECT works
-                // again in this same game -- no restart needed.
+                if (!CurrentPluginConnect(game, plan)) return;
                 ShowBlocked(lb.Block);
-                launchStage = LaunchStage.WaitingForConnect;
-                launchStatusMessage = waitingText;
-                if (roleGame is { } scope && RoleSessionCurrent(scope) && ReferenceEquals(pendingPlan, plan))
+                launchStage = nativeProofSince is null ? LaunchStage.WaitingForConnect : LaunchStage.PluginWaiting;
+                launchStatusMessage = nativeProofSince is null ? waitingText : "The plugin is loaded. Check the agent file, then try again.";
+                if (launchStage == LaunchStage.WaitingForConnect && roleGame is { } scope && RoleSessionCurrent(scope) && ReferenceEquals(pendingPlan, plan))
                     StartConnectGate(plan, scope);
                 StateHasChanged();
             }
             catch (Exception ex)
             {
+                if (!CurrentPluginConnect(game, plan)) return;
                 errorMessage = ex.Message;
                 Log.Error(ex, "Connect failed");
                 UiService.ShowError("The multiplayer part couldn't be started. Try again; if it keeps failing, send the logs with Report a bug.");
-                ResetLaunchState();
+                if (nativeProofSince is null) ResetLaunchState();
+                else PluginConnectWaiting("Couldn't check or start multiplayer. Try again.");
             }
         }
 
@@ -719,7 +667,7 @@ namespace KCDMP_launcher.Pages
         /// </summary>
         private async Task SendJoinChoiceAsync(string choice)
         {
-            bool ok = await NetService.PostJoinChoiceAsync(settings.VersionIpcPort, choice);
+            bool ok = await NetService.PostJoinChoiceAsync(agentRun?.Launch.StatusPort ?? settings.VersionIpcPort, choice);
             joinStatusMessage = !ok ? "The choice did not reach the agent -- try again."
                 : choice.StartsWith("restore:", StringComparison.Ordinal) ? "Restoring the selected character..."
                 : choice == "bring" || choice.StartsWith("character:", StringComparison.Ordinal) ? "Bringing your character..."
@@ -749,7 +697,7 @@ namespace KCDMP_launcher.Pages
         /// peer (nothing to say), or after the window elapses with no peer
         /// seen at all (solo session, or the agent never got that far).
         /// </summary>
-        private async Task PollVersionMismatchAsync(CancellationToken ct)
+        private async Task PollVersionMismatchAsync(int statusPort, CancellationToken ct)
         {
             var deadline = DateTime.UtcNow.AddMinutes(5);
             while (!ct.IsCancellationRequested && DateTime.UtcNow < deadline)
@@ -757,7 +705,8 @@ namespace KCDMP_launcher.Pages
                 await Task.Delay(3000, ct).ContinueWith(_ => { });
                 if (ct.IsCancellationRequested) return;
 
-                var status = await NetService.GetVersionStatusAsync(settings.VersionIpcPort);
+                var status = await NetService.GetVersionStatusAsync(statusPort);
+                if (ct.IsCancellationRequested) return;
                 var peer = status?.Peers.FirstOrDefault();
                 if (peer is null) continue; // agent not up yet, or no peer connected yet -- keep waiting
 
@@ -778,91 +727,13 @@ namespace KCDMP_launcher.Pages
             }
         }
 
-        /// <summary>
-        /// Confirms the injection actually took by reading the DLL's own log
-        /// next to it (see native/KCDMP/log.h -- it always writes beside the
-        /// loaded module) rather than trusting the injector's exit code, which
-        /// only proves LoadLibrary succeeded, not that the plugin found a live
-        /// game to attach to.
-        ///
-        /// Looks for this run's own "pid=&lt;pid&gt;" attach line and the
-        /// liveness sample that follows it. WO-10 changed the native DLL from
-        /// a single 1s sample-and-abort to a poll (up to 5 minutes) so an
-        /// early injection retries instead of permanently failing -- see
-        /// dllmain.cpp and docs/WO-10-injection-fix.md. That changed the log
-        /// line's wording, so this regex must track it:
-        ///   success: "MAIN: N frames after ~M ms -- tick is live" (N &gt; 0)
-        ///   failure: "MAIN: tick never fired after M ms -- ..."
-        /// This 8s window is unchanged: by the time the player clicks CONNECT
-        /// here (WO-7's own gate -- they can already see and move their
-        /// character), the tick is essentially always already live, so the
-        /// native side's first 1s sample should log success well inside 8s.
-        /// The native poll's longer ceiling exists for injection paths
-        /// without that human gate (a developer running
-        /// KCDMP_LauncherInjector.exe directly, or a future automatic
-        /// injector), not for this UI flow.
-        /// </summary>
-        private static async Task<bool> VerifyInjectionAsync(string dllPath, int pid)
-        {
-            var dir = Path.GetDirectoryName(dllPath) ?? "";
-            var logPath = Path.Combine(dir, "kcdmp-native.log");
-            var deadline = DateTime.UtcNow.AddSeconds(8);
-            var attachMarker = $"pid={pid}";
-
-            while (DateTime.UtcNow < deadline)
-            {
-                try
-                {
-                    if (File.Exists(logPath))
-                    {
-                        string text;
-                        using (var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                        using (var reader = new StreamReader(stream))
-                        {
-                            text = await reader.ReadToEndAsync();
-                        }
-
-                        var attachIdx = text.LastIndexOf(attachMarker, StringComparison.Ordinal);
-                        if (attachIdx >= 0)
-                        {
-                            var tail = text[attachIdx..];
-                            var match = Regex.Match(tail, @"MAIN: (\d+) frames after ~\d+ ms -- tick is live");
-                            if (match.Success)
-                            {
-                                return int.Parse(match.Groups[1].Value) > 0;
-                            }
-                            if (tail.Contains("tick never fired"))
-                            {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                catch (IOException)
-                {
-                    // The DLL still holds a write handle at the moment we try
-                    // to open it; retry rather than treating this as failure.
-                }
-
-                await Task.Delay(300);
-            }
-
-            // Timed out without conclusive evidence either way -- treat as
-            // failure rather than optimistically starting the agent. The
-            // native side may still be polling past this point (it now has
-            // up to 5 minutes) -- that is fine: WO-7's gate means the tick
-            // should already be live by the time CONNECT is clicked, so a
-            // timeout here is a real problem (clicked too early, or the save
-            // never actually finished loading), not this fix under-waiting.
-            return false;
-        }
-
         private void ResetLaunchState()
         {
             launchStage = LaunchStage.Idle;
             pendingGameProcess = null;
             pendingPlan = null;
             pendingDllPath = null;
+            nativeProofSince = null;
             showConnectedPanel = false;
             hidePendingPanel = false;
             showJoinRole = false;
@@ -884,43 +755,15 @@ namespace KCDMP_launcher.Pages
             if (PendingConnectCanBeCancelled) ResetLaunchState();
         }
 
-        // WO-27: kill any agent this launcher already started, plus a
-        // by-name sweep for any other KcdMpClient.exe still running (e.g.
-        // orphaned by a launcher window that survived a game restart, which
-        // is what actually happened live). Only one agent should ever
-        // represent this local player to a relay at a time -- a second one
-        // fights the first over the same ghost identity forever, since
-        // neither's removal of the other's ghost can ever stick while the
-        // other keeps respawning it. Called right before starting a new
-        // agent, not on every failure path, so a Connect retry that never
-        // got as far as starting an agent does not kill an unrelated one.
-        private void StopExistingAgent()
+        private void StopAgentFromPreviousGame(Process game)
         {
-            try
-            {
-                if (agentProcess != null && !agentProcess.HasExited)
-                {
-                    agentProcess.Kill();
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "Failed to stop the tracked agent process");
-            }
-            agentProcess = null;
-
-            try
-            {
-                foreach (var proc in Process.GetProcessesByName("KcdMpClient"))
-                {
-                    try { proc.Kill(); }
-                    catch (Exception ex) { Log.Warning(ex, "Failed to stop stray KcdMpClient.exe (pid {Pid})", proc.Id); }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "Failed to enumerate KcdMpClient.exe processes");
-            }
+            if (agentRun is not { } previous || previous.Agent.HasExited) return;
+            if (ReferenceEquals(previous.Game, game) || !previous.Game.HasExited)
+                throw new InvalidOperationException("The tracked agent still has its game process.");
+            try { previous.Agent.Kill(); }
+            catch (InvalidOperationException) when (previous.Agent.HasExited) { }
+            if (!previous.Agent.WaitForExit(2000))
+                throw new InvalidOperationException("The previous game's agent did not exit.");
         }
 
         // Host flow: start a local relay, show the address a friend needs to
