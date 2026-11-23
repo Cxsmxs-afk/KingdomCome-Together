@@ -62,7 +62,7 @@ public sealed class FaultSession
 		var fs = new FaultStream(this);
 		Connection = new RelayConnection(fs, real.Remote, real.IsLoopback, real.Transport, CloseGraceful, real.IdentityKey)
 		{
-			Steam = real.Steam, Path = fs,
+			Steam = real.Steam, Path = fs, CanCarryHostRestartTicket = real.CanCarryHostRestartTicket,
 			RecoveryJoinerReady = () => _engine.OnRecoveryJoinerReady(this),
 		};
 	}

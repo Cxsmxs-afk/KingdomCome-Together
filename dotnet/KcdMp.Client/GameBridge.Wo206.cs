@@ -42,6 +42,7 @@ public partial class GameBridge
     /// epoch, every one read before keeps the old. True = consumed.</summary>
     private bool Wo206TakeAtRead(int type, byte[] payload)
     {
+        if (HostRestartTakeAtRead(type, payload)) return true;
         if (!Wo206Rules.TryReadEpochFrame(type, payload, out byte src, out uint world, out uint join, out string why)) return false;
         if (why == Wo206Rules.Ack)
         {
@@ -167,7 +168,7 @@ public partial class GameBridge
 
     private async Task Wo206AnnounceAsync(string why, byte? only = null)
     {
-        if (!W206Host && !WorldReconnectCanAnnounceReturningHost()) return;
+        if (!W206Host && !WorldReconnectCanAnnounceReturningHost()) { await HostRestartRequestAsync(); return; }
         if (W206Host)
         {
             _w206.EnsureHost();
@@ -178,6 +179,8 @@ public partial class GameBridge
         string text = WorldReconnectEpochProof(Wo206Rules.EpochText(world, _w206.Join, why), world);
         List<byte> to = only is byte o ? [o] : LivePartners();
         foreach (byte g in to) await Wo203SendSideAsync(g, Protocol.W203Epoch, text);
+        if (to.Count > 0 && W206Host && config.IsHosting && HostAbsentRules.TryReadRun(text, out _))
+            await HostRestartRequestTicketAsync();
     }
 
     /// <summary>A partner connected: it hears the epochs at once (the 10 s announcement covers the rest).</summary>
@@ -192,7 +195,7 @@ public partial class GameBridge
     private void Wo206Tick(long n)
     {
         if (n % 240 == 120 && LivePartners().Count > 0) Wo206Stats();
-        if (!W206Host && !WorldReconnectCanAnnounceReturningHost()) return;
+        if (!W206Host && !WorldReconnectCanAnnounceReturningHost() && !HostRestartCanRequest()) return;
         if (Environment.TickCount64 - Volatile.Read(ref _w206AnnouncedMs) < Wo206Rules.AnnounceEveryMs) return;
         if (LivePartners().Count == 0) { Volatile.Write(ref _w206AnnouncedMs, Environment.TickCount64); return; }
         _ = Wo206AnnounceAsync("tick");

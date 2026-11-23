@@ -263,7 +263,7 @@ public partial class GameBridge
             if (_joinUiState is "waiting" or "own-world" or "no-save") SetJoinUi("idle", "");
             // This game is in the host's world and the host stopped sharing it: without
             // the lock it could now be saved into this player's own playline. Leave it.
-            if (_joinedWorld) _ = LeaveSharedWorldAsync("host-separate", "Your host turned the shared world off.");
+            if (_joinedWorld && !HostRestartAwaitingLeave) _ = LeaveSharedWorldAsync("host-separate", "Your host turned the shared world off.");
         }
     }
 

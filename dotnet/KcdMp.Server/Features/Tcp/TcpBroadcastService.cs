@@ -322,6 +322,24 @@ public class TcpBroadcastService
         why = "";
         uint announcedWorld = 0;
         Guid announcedRun = Guid.Empty;
+        if (downType == Protocol.W203Down && body.Length > Protocol.JoinHeaderLen)
+        {
+            switch (body[Protocol.JoinHeaderLen])
+            {
+                case Protocol.W203HostRestarted:
+                    why = "relay-only";
+                    return null;
+                case Protocol.W203HostRestartTicket:
+                    if (body[0] != Protocol.JoinTargetHost || !LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var request) ||
+                        request.Text != "v1") { why = "malformed-host-restart-ticket-request"; return null; }
+                    if (_clientHandler.IssueHostRestartTicket(source) is not { } ticket)
+                    { why = "host-restart-ticket-not-issuer"; return null; }
+                    SendRestartFact(source, Protocol.JoinTargetHost, Protocol.W203HostRestartTicket, Convert.ToHexString(ticket));
+                    return source;
+                case Protocol.W203HostRestartProof:
+                    return RouteHostRestart(source, body, out why);
+            }
+        }
         if (downType == Protocol.W203Down && body.Length > Protocol.JoinHeaderLen && body[Protocol.JoinHeaderLen] == Protocol.W203Epoch)
         {
             if (!LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var epoch) ||
@@ -382,6 +400,26 @@ public class TcpBroadcastService
         }
         dest.EnqueueSenderFact(downType, source.Id, body, HostStamp(source, senderTicks));
         return dest;
+    }
+
+    private ClientSession? RouteHostRestart(ClientSession source, byte[] body, out string why)
+    {
+        if (body[0] != Protocol.JoinTargetHost || !LootMsg.TryDecode(body.AsSpan(Protocol.JoinHeaderLen), out var proof) ||
+            !HostRestartWire.TryProof(proof.Text, out var next, out var ticket))
+        { why = "malformed-host-restart"; return null; }
+        if (!_clientHandler.TryReopenHost(source, next, ticket, out var previous, out why)) return null;
+
+        // Inform all current guests before enabling the host's ordinary world announcements.
+        string notice = HostRestartWire.Notice(previous, next);
+        foreach (var guest in Others(source)) SendRestartFact(guest, source.Id, Protocol.W203HostRestarted, notice);
+        BroadcastCombatRole();
+        return source; // Relay consumed the request. The ticket never goes to another peer.
+    }
+
+    private static void SendRestartFact(ClientSession target, byte source, byte kind, string text)
+    {
+        byte[] frame = new LootMsg(kind, 0, text).BuildUp(Protocol.W203Up, target.Id);
+        target.EnqueueSenderFact(Protocol.W203Down, source, frame.AsSpan(3).ToArray());
     }
 
     private static bool TryWorldEpochDirection(string text, out Protocol.JoinFrom from, out uint announcedWorld)

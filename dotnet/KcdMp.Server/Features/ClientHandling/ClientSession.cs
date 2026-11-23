@@ -230,6 +230,7 @@ public partial class ClientSession
 
     /// <summary>WO-144: the machine on the other end (RelayConnection.IdentityKey). Never logged.</summary>
     public string IdentityKey => _conn.IdentityKey;
+    internal bool CanCarryHostRestartTicket => _conn.CanCarryHostRestartTicket;
 
     /// <summary>WO-144: a newer connection of the same player took over -- this one closes now (its Disconnect goes out as usual).</summary>
     public void Supersede(byte newerId) =>
