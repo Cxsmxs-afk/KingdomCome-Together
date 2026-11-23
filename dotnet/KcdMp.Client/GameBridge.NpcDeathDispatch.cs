@@ -31,6 +31,7 @@ public partial class GameBridge
     private static readonly TimeSpan NpcDeathPollCadence = TimeSpan.FromMilliseconds(40);
     private static readonly TimeSpan NpcDeathPollBudget = TimeSpan.FromMilliseconds(2500);
     private static readonly TimeSpan NpcDeathAbortBudget = TimeSpan.FromMilliseconds(500);
+    internal TimeProvider NpcDeathTime { private get; init; } = TimeProvider.System;
 
     private void ResetNpcDeathDispatch()
     {
@@ -174,13 +175,13 @@ public partial class GameBridge
 
     private async Task<Receipt> PollNpcDeathAsync(NpcDeathAttempt attempt, Intent intent, CancellationToken ct)
     {
-        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        budget.CancelAfter(NpcDeathPollBudget);
+        using var pollDeadline = new CancellationTokenSource(NpcDeathPollBudget, NpcDeathTime);
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct, pollDeadline.Token);
         try
         {
             while (NpcDeathAttemptCurrent(attempt))
             {
-                await Task.Delay(NpcDeathPollCadence, budget.Token);
+                await Task.Delay(NpcDeathPollCadence, NpcDeathTime, budget.Token);
                 budget.Token.ThrowIfCancellationRequested();
                 Receipt receipt = await ObserveNpcDeathAsync(attempt, budget.Token, intent);
                 if (receipt == Receipt.Pending) continue;
@@ -198,8 +199,8 @@ public partial class GameBridge
 
         // A single terminal request can reopen an unchanged living body only
         // when the DLL proves preparation and the lethal call never began.
-        using var abort = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        abort.CancelAfter(NpcDeathAbortBudget);
+        using var abortDeadline = new CancellationTokenSource(NpcDeathAbortBudget, NpcDeathTime);
+        using var abort = CancellationTokenSource.CreateLinkedTokenSource(ct, abortDeadline.Token);
         ReceiptLog(attempt, "abort-before-apply");
         Receipt result = await ObserveNpcDeathAsync(attempt, abort.Token, Intent.AbortBeforeApply);
         return EndNpcDeathAttempt(attempt, result == Receipt.Pending ? Receipt.Uncertain : result);

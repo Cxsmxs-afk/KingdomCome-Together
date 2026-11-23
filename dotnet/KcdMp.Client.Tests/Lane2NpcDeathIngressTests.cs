@@ -6,6 +6,7 @@ using System.IO.Pipes;
 using System.Net;
 using System.Reflection;
 using System.Text;
+using System.Threading.Channels;
 using KcdMp.Wire;
 
 namespace KcdMp.Client.Tests;
@@ -192,25 +193,40 @@ public sealed class Lane2NpcDeathIngressTests
     [InlineData(null)]
     public async Task Deadline_sends_one_pre_apply_abort_and_no_replacement(byte? abortReceipt)
     {
-        await using var fixture = await Fixture.OpenAsync();
+        var clock = new NpcDeathClock();
+        await using var fixture = await Fixture.OpenAsync(clock);
         Task ingress = fixture.Ingress("fatal");
         var first = await fixture.ReadRequestAsync();
         fixture.AssertBound(first, Eid);
         byte seq = 1;
         await fixture.ReplyAsync(seq++, 0x70);
 
-        while (true)
+        var pollDeadline = await clock.WaitForTimerAsync(2500, fixture.Token);
+        for (int poll = 0; poll < 2; poll++)
         {
+            var cadence = await clock.WaitForTimerAsync(40, fixture.Token);
+            cadence.Fire();
             var next = await fixture.ReadWhilePendingAsync(ingress);
             Assert.False(fixture.Dead);
-            if (next.Body.Length == 37)
-            {
-                fixture.AssertFollowup(first, next, 2);
-                if (abortReceipt is byte answer) await fixture.ReplyAsync(seq, answer);
-                break;
-            }
+            Assert.Equal(first.Op, next.Op);
             Assert.Equal(first.Body, next.Body);
             await fixture.ReplyAsync(seq++, 0x70);
+        }
+
+        // The next cadence timer proves the preceding reply was consumed and no write is in flight.
+        await clock.WaitForTimerAsync(40, fixture.Token);
+        pollDeadline.Fire();
+        var abortDeadline = await clock.WaitForTimerAsync(500, fixture.Token);
+        var abort = await fixture.ReadWhilePendingAsync(ingress);
+        Assert.False(fixture.Dead);
+        fixture.AssertFollowup(first, abort, 2);
+        if (abortReceipt is byte answer) await fixture.ReplyAsync(seq, answer);
+        else
+        {
+            // A read header and body can reach the fixture before the writer's flush finishes.
+            await fixture.Writer.WaitAsync(fixture.Token);
+            fixture.Writer.Release();
+            abortDeadline.Fire();
         }
 
         await ingress.WaitAsync(fixture.Token);
@@ -218,6 +234,7 @@ public sealed class Lane2NpcDeathIngressTests
         Assert.Equal(0L, fixture.Releases);
         await fixture.Ingress("guid").WaitAsync(fixture.Token);
         await fixture.AssertNoWriteAsync();
+        Assert.False(clock.HasScheduledTimer);
     }
 
     [Fact]
@@ -270,6 +287,38 @@ public sealed class Lane2NpcDeathIngressTests
         await ingress.WaitAsync(fixture.Token);
     }
 
+    private sealed class NpcDeathClock : TimeProvider
+    {
+        private readonly Channel<(TimeSpan Delay, Timer Timer)> _registrations = Channel.CreateUnbounded<(TimeSpan, Timer)>();
+
+        public bool HasScheduledTimer => _registrations.Reader.TryPeek(out _);
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            Assert.Equal(Timeout.InfiniteTimeSpan, period);
+            var timer = new Timer(callback, state);
+            Assert.True(_registrations.Writer.TryWrite((dueTime, timer)));
+            return timer;
+        }
+
+        public async Task<Timer> WaitForTimerAsync(int milliseconds, CancellationToken token)
+        {
+            var (delay, timer) = await _registrations.Reader.ReadAsync(token);
+            Assert.Equal(TimeSpan.FromMilliseconds(milliseconds), delay);
+            return timer;
+        }
+
+        public sealed class Timer(TimerCallback callback, object? state) : ITimer
+        {
+            private TimerCallback? _callback = callback;
+
+            public void Fire() => Interlocked.Exchange(ref _callback, null)?.Invoke(state);
+            public bool Change(TimeSpan dueTime, TimeSpan period) => throw new NotSupportedException();
+            public void Dispose() => Interlocked.Exchange(ref _callback, null);
+            public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+        }
+    }
+
     private sealed class Fixture : IAsyncDisposable
     {
         private static readonly TimeSpan PipeQuietWindow = TimeSpan.FromMilliseconds(150);
@@ -277,14 +326,15 @@ public sealed class Lane2NpcDeathIngressTests
         private readonly CancellationTokenSource _deadline = new(TimeSpan.FromSeconds(15));
         private readonly NamedPipeServerStream _wire;
         private readonly CombatPipe _pipe;
-        private readonly GameBridge _bridge = new(new ClientConfig());
+        private readonly GameBridge _bridge;
         private readonly HttpGameTransport _game = new("http://localhost:1403", 5_000, new GameDouble()) { BatchingEnabled = false };
         private readonly Stream _relay = new MemoryStream();
         private readonly Guid _soul = Guid.NewGuid();
         private ulong _generation;
 
-        private Fixture()
+        private Fixture(TimeProvider? npcDeathTime)
         {
+            _bridge = new GameBridge(new ClientConfig()) { NpcDeathTime = npcDeathTime ?? TimeProvider.System };
             string name = "lane2-npc-death-" + Guid.NewGuid().ToString("N");
             _wire = new(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
             _pipe = new(name);
@@ -292,9 +342,9 @@ public sealed class Lane2NpcDeathIngressTests
 
         public CancellationToken Token => _deadline.Token;
 
-        public static async Task<Fixture> OpenAsync()
+        public static async Task<Fixture> OpenAsync(TimeProvider? npcDeathTime = null)
         {
-            var f = new Fixture();
+            var f = new Fixture(npcDeathTime);
             Task connecting = f._wire.WaitForConnectionAsync(f.Token);
             Assert.True(await f._pipe.EnsureConnectedAsync(f.Token));
             await connecting;
