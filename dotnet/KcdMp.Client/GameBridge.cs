@@ -4787,7 +4787,9 @@ public partial class GameBridge(ClientConfig config)
                 long p6ModeSerial = type == Protocol.W164Down ? Interlocked.Read(ref _p6VisualModeSerial) : 0;
                 bool p6Ready = p6State is { Confirmed: true, GameplaySent: true } && !_p1Loading && P5LoadedWorld != 0 && !_leaveInProgress;
                 bool p6Frame = P6Message(type, payload, out byte p6Source, out var p6Message);
-                // Capture the target before the processor's wait. A respawn can replace it without changing the peer or world.
+                // Take the peer first so a replacement during body capture cannot lend its serial to the old frame.
+                long p6Peer = p6Frame ? P6PeerAtRead(p6Source) : 0;
+                // A respawn can replace the body without changing the peer or world.
                 FigureBody p6RangedBody = p6Frame && p6Message.Kind == Protocol.W164RangedStep
                     ? Wo214FigureBody(p6Source) : default;
                 long p6Deadline = p6Frame ? p6ReadTick + Protocol.MeasuredMissileApplyBudgetMs : 0;
@@ -4843,7 +4845,7 @@ public partial class GameBridge(ClientConfig config)
                     Wo207Queue(frames.Writer, inFrame with
                     {
                         P6Generation = p6State.Generation, P6Serial = p6Serial, P6Life = p6Life,
-                        P6PeerSerial = P6PeerAtRead(type, payload), P6Deadline = p6Deadline, P6RangedBody = p6RangedBody,
+                        P6PeerSerial = p6Peer, P6Deadline = p6Deadline, P6RangedBody = p6RangedBody,
                         P6VisualSerial = Interlocked.Read(ref _p6VisualSerial), P6Ready = p6Ready, P6ModeSerial = p6ModeSerial,
                         Presentation = presentation
                     }, type);
