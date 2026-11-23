@@ -176,7 +176,8 @@ public sealed partial class JoinCalendarIntegrationTests
         await using var guestPipe = new JoinCalendarTestPipe(failCalendarArm: probe == JoinProbe.RepeatAborts);
         if (f4 == F4Probe.NoOwnExit)
             guestPipe.SaveListed = (slot, name) => File.Exists(Path.Combine(fixture.GuestSaves, $"playline{slot}", name + ".whs"));
-        Func<int, byte[]> makeHostSave = f4 is F4Probe.TransferAbort or F4Probe.HostAbort ? F4LargeHostSave : fixture.MakeHostSave;
+        Func<int, byte[]> makeHostSave = f4 is F4Probe.TransferAbort or F4Probe.HostAbort or F4Probe.TransportLost
+            ? F4LargeHostSave : fixture.MakeHostSave;
         await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, makeHostSave, hostPipe.ObserveGameplayStarted);
         await using var guestGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "guest.log"), fixture.GuestSaves, null, guestPipe.ObserveGameplayStarted);
         var host = CreateBridge(hostPeer.Id, true, hostLink, hostPipe.Pipe, hostGame.Transport, fixture.HostSaves, ct);
@@ -230,9 +231,12 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.False(Property<bool>(guest, "WorldSyncReady"));
             Assert.Equal(WorldLoadPhase.Menu, Get<WorldLoadSequence>(guest, "_worldLoad").Current.Phase);
 
-            if (f4 is { } loop)
+            if (f4 is { } loop && loop != F4Probe.HostReturn)
             {
-                await TestF4LoopAsync(loop, fixture, host, guest, hostLink, guestLink, guestPipe, hostGame, guestGame, ct);
+                if (loop == F4Probe.TransportLost)
+                    await TestF4TransportLossAsync(fixture, relay.Port, guestName, host, guest, hostLink, guestPeer, guestLink, guestRead, guestGame, ct);
+                else
+                    await TestF4LoopAsync(loop, fixture, host, guest, hostLink, guestLink, guestPipe, hostGame, guestGame, ct);
                 return;
             }
 
@@ -366,6 +370,11 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.DoesNotContain(observed, packet => packet.Type is Protocol.WorldOfferDown or Protocol.WorldChunkDown or Protocol.JoinerReadyDown);
             }
             if (homeProbe.HasValue) Set(guest, "_w184SaveOnLeave", false);
+            if (f4 == F4Probe.HostReturn)
+            {
+                await TestF4HostReturnsAsync(fixture, relay.Port, hostName, host, guest, hostPeer, hostRead, guestPeer.Id, guestPipe, guestGame, ct);
+                return;
+            }
             if (relayEofWorldRecovery is bool worldRecovery)
                 await CheckClosedRelayAsync(relay, fixture.GuestOwnSave, guest, guestLink, guestGame, guestPipe, guestRead, worldRecovery, ct, homeProbe);
             else if (homeProbe is bool replace)
@@ -428,7 +437,7 @@ public sealed partial class JoinCalendarIntegrationTests
         }
         finally
         {
-            if (pauseAfterJoin || relayEofWorldRecovery is not null) Call(guest, "LoadSequenceOnExit");
+            if (pauseAfterJoin || relayEofWorldRecovery is not null || f4 == F4Probe.HostReturn) Call(guest, "LoadSequenceOnExit");
             stop.Cancel();
             await InvokeAsync(host, "Wo123OnDisconnectAsync");
             await InvokeAsync(guest, "Wo123OnDisconnectAsync");
@@ -572,7 +581,7 @@ public sealed partial class JoinCalendarIntegrationTests
     }
 
     private static async Task CheckReturningHostAsync(int port, string hostName, GameBridge host, GameBridge guest, byte guestId,
-        JoinCalendarTestPipe guestPipe, CancellationToken ct)
+        JoinCalendarTestPipe guestPipe, CancellationToken ct, Action? observeReleased = null)
     {
         Call(host, "WorldReconnectHostLost", ct);
         await using var returned = await ReplayPeer.ConnectAsync(port, hostName, ct);
@@ -594,6 +603,14 @@ public sealed partial class JoinCalendarIntegrationTests
         await guestPipe.ReleaseObserved.WaitAsync(ct);
         Assert.True(Get<bool>(guest, "_joinedWorld"));
         Assert.False(Get<bool>(guest, "_isDamageAuthority"));
+        if (observeReleased is not null)
+        {
+            // The production connect hook forgets which peers it told on the old stream.
+            Call(host, "Wo124OnSharedWorldChanged");
+            await InvokeAsync(host, "Wo124HostModeTickAsync");
+            await WaitAsync(() => Get<bool>(guest, "_hostModeKnown"), "the returning host's mode before its next departure", ct);
+            observeReleased();
+        }
         returned.FinishSending();
         await reader.WaitAsync(ct);
     }
