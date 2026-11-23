@@ -12,7 +12,8 @@ bool playable=true,hasActor=true,hasSoul=true,changeDuringHand=false,changedBody
 bool chargeReadable=false;
 float playerCharge=0;
 bool viewReadable = false, changeDuringView = false;
-unsigned viewReads = 0;
+bool viewEngineReady = true, viewResolved = true;
+unsigned viewReads = 0, viewPrepares = 0;
 float viewForward[3]{}, cameraPos[3]{};
 uint8_t phase=0,known=3,left=0x11,right=0;
 int actorObject=0,otherActor=0,soulObject=0,passedCount=0,failedCount=0;
@@ -26,13 +27,14 @@ bool readView(uint32_t eid, float matrix[12], float feet[3]) {
     ++viewReads;
     if (changeDuringView) ++life;
     for (int row = 0; row < 3; ++row) { matrix[row * 4 + 1] = viewForward[row]; matrix[row * 4 + 3] = cameraPos[row]; feet[row] = 0; }
-    return eid == 44 && viewReadable;
+    return eid == 44 && viewReadable && viewResolved;
 }
+bool prepareView() { ++viewPrepares; return viewResolved = viewEngineReady; }
 uint8_t hands(uint32_t,uint8_t* l,uint8_t* r){std::memset(l,0,16);std::memset(r,0,16);l[0]=left;r[0]=right;if(changeDuringHand)++life;return known;}
 struct Reply {uint8_t code=255;size_t size=0;std::array<uint8_t,512> b{};};
 Reply poll(bool on=true,uint64_t expected=0){uint8_t b[11]={86,2,uint8_t(on?1:0)};kcdmp::p6rules::put64(b+3,expected?expected:gen);Reply r;r.code=kcdmp::wo201ranged::handle(b,sizeof b,r.b.data(),r.b.size(),&r.size);return r;}
 void step(uint8_t p,uint64_t ms=50){phase=p;clockMs+=ms;kcdmp::wo201ranged::tick();}
-void reset(){clockMs=1000;gen=1;life=11;playable=hasActor=hasSoul=true;changeDuringHand=changedBody=chargeReadable=false;playerCharge=0;phase=0;known=3;left=0x11;right=0;viewReads=0;viewReadable=changeDuringView=false;viewForward[0]=viewForward[2]=cameraPos[0]=cameraPos[1]=0;viewForward[1]=1;cameraPos[2]=1.6f;kcdmp::wo201ranged::set_test_backend({now,generation,epoch,gameplay,actor,soul,readPhase,hands,readCharge,readView});kcdmp::wo201ranged::reset_for_tests();C6(poll().code==0,"current gameplay enables native v2 capture");}
+void reset(){clockMs=1000;gen=1;life=11;playable=hasActor=hasSoul=true;changeDuringHand=changedBody=chargeReadable=false;playerCharge=0;phase=0;known=3;left=0x11;right=0;viewReads=viewPrepares=0;viewReadable=changeDuringView=false;viewEngineReady=viewResolved=true;viewForward[0]=viewForward[2]=cameraPos[0]=cameraPos[1]=0;viewForward[1]=1;cameraPos[2]=1.6f;kcdmp::wo201ranged::set_test_backend({now,generation,epoch,gameplay,actor,soul,readPhase,hands,readCharge,readView,prepareView});kcdmp::wo201ranged::reset_for_tests();C6(poll().code==0,"current gameplay enables native v2 capture");}
 }
 namespace kcdmp::wo201ranged {void test_trace(const char*,...){} }
 int p6_capture_flow_tests(int* passed){
@@ -119,6 +121,24 @@ int p6_capture_flow_tests(int* passed){
     changeDuringView = true; step(aim::Aiming);
     C6(!sampled_aim(&actorObject).observed && !sampled_aim(&actorObject).angles.known(),
        "the same angles still retire if camera read crosses a lifecycle boundary");
+    reset(); viewReadable = true; viewEngineReady = viewResolved = false;
+    step(aim::None);
+    C6(viewPrepares == 0, "late camera resolution does no work outside a held phase");
+    step(aim::Aiming);
+    C6(viewPrepares == 1 && viewReads == 0 && !sampled_aim(&actorObject).angles.known(),
+       "a cold first held sample tries camera resolution and leaves its angles unknown");
+    viewEngineReady = true;
+    for (int i = 0; i < 9; ++i) step(aim::Aiming);
+    C6(viewPrepares == 1 && viewReads == 0 && !sampled_aim(&actorObject).angles.known(),
+       "late camera readiness retries at most once every 500 ms");
+    viewForward[0] = -.8660254f; viewForward[1] = 0; viewForward[2] = .5f;
+    step(aim::Aiming);
+    view = sampled_aim(&actorObject).angles;
+    C6(viewPrepares == 2 && viewReads == 1 && view.yaw == 9000 && view.pitch == 3000,
+       "held native sampler recovers both camera angles without starting a dialogue");
+    step(aim::Aiming); step(aim::Aiming);
+    C6(viewPrepares == 2 && viewReads == 3 && poll().b[1] == 2,
+       "successful late camera resolution stays prepared and adds no reliable shooting phase");
     if(passed)*passed=passedCount;
     return failedCount;
 }

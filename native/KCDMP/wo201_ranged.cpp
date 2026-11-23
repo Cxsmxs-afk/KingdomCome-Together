@@ -73,6 +73,10 @@ void* g_lastSoul=nullptr;void* g_lastActor=nullptr;
 rangedaim::Block g_aim{};
 bool g_waitForPhaseAfterReplacement = false;
 uint64_t g_lastEpoch=0,g_streamEpoch=0,g_lastRead=0;
+constexpr uint64_t kViewRetryMs = 500;
+uint64_t g_lastViewTry = 0;
+unsigned g_viewTries = 0;
+bool g_viewReady = false;
 std::atomic<uint32_t> c_reads{0},c_changes{0},c_unreadable{0};
 std::atomic<uint64_t> c_missingActor{0},c_unknownHand{0};
 std::atomic<bool> g_reset{false};
@@ -180,6 +184,7 @@ rangedaim::Sample step_of(void* actor) {
 }
 uint8_t hand_guids(uint32_t eid,p6rules::Capture* row){return g_test.hands(eid,row->left.data(),row->right.data());}
 bool read_view(uint32_t eid, float matrix[12], float feet[3]) { return g_test.view && g_test.view(eid, matrix, feet); }
+bool refresh_view() { return g_test.prepareView && g_test.prepareView(); }
 #else
 uint64_t now_ms(){return GetTickCount64();}
 uint64_t generation(){return wo216::lifecycle_generation();}
@@ -190,9 +195,18 @@ void* player_soul(){return rttr::read_player_soul();}
 rangedaim::Sample step_of(void* actor){return read_step(actor);}
 uint8_t hand_guids(uint32_t eid,p6rules::Capture* row){wo143rules::Hands h{};const uint8_t known=wo141::x::read_body_hands_strict(eid,&h);std::memcpy(row->left.data(),h.left.b,16);std::memcpy(row->right.data(),h.right.b,16);return known;}
 bool read_view(uint32_t eid, float matrix[12], float feet[3]) { return wo203::cam::read_player_view(eid, matrix, feet); }
+bool refresh_view() { return wo203::cam::refresh_player_view(); }
 #endif
 
-rangedaim::Angles measured_angles(uint32_t eid) {
+rangedaim::Angles measured_angles(uint32_t eid, uint64_t now) {
+    if (!g_viewReady) {
+        if (g_viewTries && now - g_lastViewTry < kViewRetryMs) return {};
+        g_lastViewTry = now;
+        ++g_viewTries;
+        if (!refresh_view()) return {};
+        g_viewReady = true;
+        logf("WO201-RANGED camera ready attempts=%u", g_viewTries);
+    }
     float matrix[12]{}, feet[3]{};
     if (!read_view(eid, matrix, feet)) return {};
     const float cameraPos[3]{matrix[3], matrix[7], matrix[11]};
@@ -219,7 +233,7 @@ void install() {
 #else
 void install(){g_why="resolved";}
 void set_test_backend(const TestBackend& b){g_test=b;}
-void reset_for_tests(){std::lock_guard<std::mutex> lk(g_lock);g_on=false;g_reset=false;g_q={};g_haveLast=false;g_last=0;g_lastSoul=g_lastActor=nullptr;g_aim={};g_waitForPhaseAfterReplacement=false;g_lastEpoch=g_streamEpoch=g_lastRead=0;g_holderOk=false;c_reads=0;c_changes=0;c_unreadable=0;c_missingActor=0;c_unknownHand=0;g_why="resolved";}
+void reset_for_tests(){std::lock_guard<std::mutex> lk(g_lock);g_on=false;g_reset=false;g_q={};g_haveLast=false;g_last=0;g_lastSoul=g_lastActor=nullptr;g_aim={};g_waitForPhaseAfterReplacement=false;g_lastEpoch=g_streamEpoch=g_lastRead=0;g_holderOk=false;c_reads=0;c_changes=0;c_unreadable=0;c_missingActor=0;c_unknownHand=0;g_lastViewTry=g_viewTries=0;g_viewReady=false;g_why="resolved";}
 #endif
 
 rangedaim::Block sampled_aim(const void* actor) {
@@ -261,7 +275,7 @@ void tick() {
     }
 
     const bool readingView = rangedaim::is_hold_phase(phase);
-    if (readingView) sample.angles = measured_angles(eid);
+    if (readingView) sample.angles = measured_angles(eid, t);
 
     auto draw = g_aim;
     const auto edge = rangedaim::apply(sample, draw);

@@ -157,6 +157,7 @@ struct Eng {
     const char* why = "not resolved";
     void* sys = nullptr;
     void* vs = nullptr;
+    void* const* vftSystem = nullptr;
     void* const* vftView = nullptr;
     size_t camOff = 0;   // the rendered CCamera inside CSystem
 } g_eng;
@@ -169,13 +170,16 @@ void* field_of_type(void* obj, size_t span, void* const* vft) {
     return nullptr;
 }
 
+void cache_camera_anchor() {
+    if (g_eng.vftSystem) return;
+    HMODULE cs = GetModuleHandleA("CrySystem.dll");
+    if (cs) g_eng.vftSystem = anchor::find_vftable(cs, ".?AVCSystem@@");
+}
+
 bool resolve_camera_system() {
     if (g_eng.sys) return true;
-    void* env = engine::genv();
-    HMODULE cs = GetModuleHandleA("CrySystem.dll");
-    if (!env || !cs) return false;
-    void* const* vSys = anchor::find_vftable(cs, ".?AVCSystem@@");
-    if (vSys) g_eng.sys = field_of_type(env, 0x400, vSys);
+    if (!g_eng.vftSystem || !engine::ready()) return false;
+    if (void* env = engine::genv()) g_eng.sys = field_of_type(env, 0x400, g_eng.vftSystem);
     return g_eng.sys != nullptr;
 }
 
@@ -198,6 +202,7 @@ bool resolve() {
     g_eng.tried = true;
     auto fail = [](const char* why) { g_eng.why = why; logf("WO203B-CAM resolve FAILED -- %s; the conversation camera stays off", why); return false; };
     HMODULE ca = GetModuleHandleA("CryAction.dll");
+    cache_camera_anchor(); // Dialogue can still initialize independently when ranged capture is disabled.
     if (!ca || !resolve_camera_system()) return fail("CryAction.dll or the gEnv CSystem is unavailable");
     void* const* vAct = anchor::find_vftable(ca, ".?AVCCryAction@@");
     void* const* vVs = anchor::find_vftable(ca, ".?AVCViewSystem@@");
@@ -964,11 +969,18 @@ bool op_poll_off_main(uint8_t, const uint8_t*, size_t, uint8_t*, size_t, size_t*
 } // namespace
 
 void prepare_player_view() {
-    if (engine::ready()) resolve_camera_system();
+    // CrySystem is present before DLL initialization. Cache its image anchor
+    // here even if the engine has not published gEnv yet.
+    cache_camera_anchor();
+    resolve_camera_system();
+}
+
+bool refresh_player_view() {
+    return g_v.st == St::Off && !g_s.armed && resolve_camera_system() && verify_camera_slot();
 }
 
 bool read_player_view(uint32_t eid, float matrix[12], float feet[3]) {
-    if (!eid || !g_eng.sys || g_v.st != St::Off || g_s.armed || !verify_camera_slot()) return false;
+    if (!eid || !g_eng.camOff || g_v.st != St::Off || g_s.armed) return false;
     float entity[12]{}, fov = 0;
     if (!read_camera(matrix, &fov) || !(fov > 0.1f && fov < 3.0f) || !entity_tm(eid, entity)) return false;
     feet[0] = entity[3]; feet[1] = entity[7]; feet[2] = entity[11];
