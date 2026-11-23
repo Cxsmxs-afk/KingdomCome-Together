@@ -158,7 +158,7 @@ public sealed class SteamRelayService : BackgroundService
 				}
 				else _logger.Information("MP-LINK steam-config left at Steam's own (the twin: steam_cfg off): {Cfg}", conn.ReadLinkConfig().Log);
 				_logger.Information("[+] a Steam peer connected (relayed={Relayed}); handshake next", (flags & 16) != 0 ? 1 : 0);
-				var client = _runner.Create(RelayConnection.FromSteam(conn.GetStream(), conn.PeerKey, conn));   // WO-144: the same player's new connection replaces his old one
+				var client = _runner.Create(RelayConnection.FromSteam(conn.GetStream(), conn.PeerKey, conn, conn.HasAuthenticatedPeer(flags)));
 				_runner.Start(client);
 				_ = WatchPeerAsync(conn);
 			}

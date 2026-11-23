@@ -18,8 +18,8 @@ public class AuthorityFailureUiTests
         Assert.Equal(reason, HostAuthorityFailure.FromStatus(status));
 
     [Theory]
-    [InlineData("de", "Beitritt gestoppt", "Spielupdate", "NPC-KI")]
-    [InlineData("de-DE", "Beitritt gestoppt", "Spielupdate", "NPC-KI")]
+    [InlineData("de", "Beitritt gestoppt", "Spielupdate", "NSC-Verhalten")]
+    [InlineData("de-DE", "Beitritt gestoppt", "Spielupdate", "NSC-Verhalten")]
     [InlineData("en", "Joining stopped", "game update", "NPC AI")]
     [InlineData("fr", "Joining stopped", "game update", "NPC AI")]
     public void Launcher_uses_failure_reason_instead_of_generic_join_failed(string language, string start, string patch, string system)
@@ -68,7 +68,7 @@ public class AuthorityFailureUiTests
             Reason = HostAuthorityFailure.JoinReason(HostAuthorityFailure.BothHooks)
         }, true, 1, "de");
         Assert.True(banner.AuthorityUnavailable);
-        Assert.Contains("NPC-KI und Story", banner.JoinMessage);
+        Assert.Contains("NSC-Verhalten und Story", banner.JoinMessage);
         Assert.DoesNotContain("clock", banner.JoinMessage);
         Assert.Equal("MOD-UPDATE ERFORDERLICH", HostAuthorityFailure.Title(banner.JoinReason, "de"));
         Assert.Equal("MULTIPLAYER NOT READY", HostAuthorityFailure.Title(HostAuthorityFailure.NotConfirmed, "en"));

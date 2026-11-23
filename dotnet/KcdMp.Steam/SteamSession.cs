@@ -406,7 +406,8 @@ public sealed class SteamSession : IDisposable
         int state = BitConverter.ToInt32(info[SteamNative.ConnInfo.State..]);
         int endReason = BitConverter.ToInt32(info[SteamNative.ConnInfo.EndReason..]);
         string endDebug = SteamLogScrub.Scrub(CString(info.Slice(SteamNative.ConnInfo.EndDebug, 128)));
-        ulong remote = BitConverter.ToUInt64(info[8..]); // identity union, when type == SteamID
+        ulong remote = BitConverter.ToInt32(info) == 16 && BitConverter.ToInt32(info[4..]) == sizeof(ulong)
+            ? BitConverter.ToUInt64(info[8..]) : 0; // SteamNetworkingIdentity's SteamID union member
 
         if (!_conns.TryGetValue(h, out var conn))
         {

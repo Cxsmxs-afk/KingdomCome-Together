@@ -17,7 +17,7 @@ public sealed class JoinCalendarIntegrationCollection { }
 public sealed partial class JoinCalendarIntegrationTests
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
-    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts, ChangeCharacter, LocalFresh, CompatibleRestore, PlayerJoinLoop }
+    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts, ChangeCharacter, LocalFresh, CompatibleRestore, PlayerJoinLoop, ReturnDeadlineLoop }
 
     [Theory]
     [InlineData(2)]
@@ -145,7 +145,7 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None,
         BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false, bool? relayEofWorldRecovery = null,
-        bool? homeProbe = null, bool failExitResponse = false, string? newerStart = null)
+        bool? homeProbe = null, bool failExitResponse = false, string? newerStart = null, F4Probe? f4 = null)
     {
         using var fixture = new SaveFixture();
         string? checkpointPath = probe == JoinProbe.LocalFresh ? fixture.RecordLocalCheckpoint() : null;
@@ -153,7 +153,8 @@ public sealed partial class JoinCalendarIntegrationTests
         string? chosen = newerStart is null ? null : await FreshChoiceWithNewerUnavailableCheckpointAsync(fixture, newerStart);
         var homeHashes = newerStart is null ? null : Directory.EnumerateFiles(fixture.GuestSaves, "*.whs", SearchOption.AllDirectories)
             .ToDictionary(path => path, path => SHA256.HashData(File.ReadAllBytes(path)));
-        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(probe == JoinProbe.PlayerJoinLoop ? 90 : boundary is null ? 25 : 40));
+        bool longProbe = f4 is not null || probe is JoinProbe.PlayerJoinLoop or JoinProbe.ReturnDeadlineLoop;
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(longProbe ? 90 : boundary is null ? 25 : 40));
         var ct = stop.Token;
         await using var relay = await ReplayRelay.StartAsync(ct);
         await using var hostPeer = await ReplayPeer.ConnectAsync(relay.Port, hostName, ct);
@@ -172,8 +173,15 @@ public sealed partial class JoinCalendarIntegrationTests
             WithholdWorldTransfer = probe == JoinProbe.HostLossBeforeOffer
         };
         await using var hostPipe = new JoinCalendarTestPipe(refuseHold: probe == JoinProbe.MissingHold);
-        await using var guestPipe = new JoinCalendarTestPipe(failCalendarArm: probe == JoinProbe.RepeatAborts);
-        await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, fixture.MakeHostSave, hostPipe.ObserveGameplayStarted);
+        await using var guestPipe = new JoinCalendarTestPipe(failCalendarArm: probe == JoinProbe.RepeatAborts)
+        {
+            CanQuickSave = f4 != F4Probe.ActiveGuest,
+        };
+        if (f4 == F4Probe.NoOwnExit)
+            guestPipe.SaveListed = (slot, name) => File.Exists(Path.Combine(fixture.GuestSaves, $"playline{slot}", name + ".whs"));
+        Func<int, byte[]> makeHostSave = f4 is F4Probe.TransferAbort or F4Probe.HostAbort or F4Probe.TransportLost
+            ? F4LargeHostSave : fixture.MakeHostSave;
+        await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, makeHostSave, hostPipe.ObserveGameplayStarted);
         await using var guestGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "guest.log"), fixture.GuestSaves, null, guestPipe.ObserveGameplayStarted);
         var host = CreateBridge(hostPeer.Id, true, hostLink, hostPipe.Pipe, hostGame.Transport, fixture.HostSaves, ct);
         var guest = CreateBridge(guestPeer.Id, false, guestLink, guestPipe.Pipe, guestGame.Transport, fixture.GuestSaves, ct, relay.Port);
@@ -226,9 +234,20 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.False(Property<bool>(guest, "WorldSyncReady"));
             Assert.Equal(WorldLoadPhase.Menu, Get<WorldLoadSequence>(guest, "_worldLoad").Current.Phase);
 
-            if (probe == JoinProbe.PlayerJoinLoop)
+            if (f4 is { } loop && loop != F4Probe.HostReturn)
             {
-                await TestPlayerJoinLoopAsync(fixture, host, guest, hostLink, guestLink, guestGame, ct);
+                if (loop == F4Probe.ActiveGuest)
+                    await TestF4ActiveGuestsAsync(fixture, relay.Port, host, guest, hostLink, guestLink, guestGame, observerC!, ct);
+                else if (loop == F4Probe.TransportLost)
+                    await TestF4TransportLossAsync(fixture, relay.Port, guestName, host, guest, hostLink, guestPeer, guestLink, guestRead, guestGame, ct);
+                else
+                    await TestF4LoopAsync(loop, fixture, host, guest, hostLink, guestLink, guestPipe, hostGame, guestGame, ct);
+                return;
+            }
+
+            if (probe is JoinProbe.PlayerJoinLoop or JoinProbe.ReturnDeadlineLoop)
+            {
+                await TestPlayerJoinLoopAsync(fixture, host, guest, hostLink, guestLink, guestGame, ct, probe == JoinProbe.ReturnDeadlineLoop);
                 return;
             }
             if (probe == JoinProbe.RepeatAborts)
@@ -336,7 +355,7 @@ public sealed partial class JoinCalendarIntegrationTests
             AssertReady(await hostLink.Ready.WaitAsync(ct), guestPeer.Id, joinId);
             await WaitAsync(() => Get<object?>(host, "_hostJoin") is null && Get<string>(guest, "_joinUiState") == "in",
                 "the host finished the join and the guest entered the world", ct);
-            await guestGame.JoinedNotification.WaitAsync(ct);
+            await guestGame.WaitForJoinedNotificationAsync(ct);
             Assert.True(Get<bool>(guest, "_joinedWorld"));
             if (original is not null)
             {
@@ -356,6 +375,11 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.DoesNotContain(observed, packet => packet.Type is Protocol.WorldOfferDown or Protocol.WorldChunkDown or Protocol.JoinerReadyDown);
             }
             if (homeProbe.HasValue) Set(guest, "_w184SaveOnLeave", false);
+            if (f4 == F4Probe.HostReturn)
+            {
+                await TestF4HostReturnsAsync(fixture, relay.Port, hostName, host, guest, hostPeer, hostRead, guestPeer.Id, guestPipe, guestGame, ct);
+                return;
+            }
             if (relayEofWorldRecovery is bool worldRecovery)
                 await CheckClosedRelayAsync(relay, fixture.GuestOwnSave, guest, guestLink, guestGame, guestPipe, guestRead, worldRecovery, ct, homeProbe);
             else if (homeProbe is bool replace)
@@ -418,7 +442,9 @@ public sealed partial class JoinCalendarIntegrationTests
         }
         finally
         {
-            if (pauseAfterJoin || relayEofWorldRecovery is not null) Call(guest, "LoadSequenceOnExit");
+            hostPipe.BeginShutdown();
+            guestPipe.BeginShutdown();
+            if (pauseAfterJoin || relayEofWorldRecovery is not null || f4 == F4Probe.HostReturn) Call(guest, "LoadSequenceOnExit");
             stop.Cancel();
             await InvokeAsync(host, "Wo123OnDisconnectAsync");
             await InvokeAsync(guest, "Wo123OnDisconnectAsync");
@@ -562,7 +588,7 @@ public sealed partial class JoinCalendarIntegrationTests
     }
 
     private static async Task CheckReturningHostAsync(int port, string hostName, GameBridge host, GameBridge guest, byte guestId,
-        JoinCalendarTestPipe guestPipe, CancellationToken ct)
+        JoinCalendarTestPipe guestPipe, CancellationToken ct, Action? observeReleased = null)
     {
         Call(host, "WorldReconnectHostLost", ct);
         await using var returned = await ReplayPeer.ConnectAsync(port, hostName, ct);
@@ -584,6 +610,14 @@ public sealed partial class JoinCalendarIntegrationTests
         await guestPipe.ReleaseObserved.WaitAsync(ct);
         Assert.True(Get<bool>(guest, "_joinedWorld"));
         Assert.False(Get<bool>(guest, "_isDamageAuthority"));
+        if (observeReleased is not null)
+        {
+            // The production connect hook forgets which peers it told on the old stream.
+            Call(host, "Wo124OnSharedWorldChanged");
+            await InvokeAsync(host, "Wo124HostModeTickAsync");
+            await WaitAsync(() => Get<bool>(guest, "_hostModeKnown"), "the returning host's mode before its next departure", ct);
+            observeReleased();
+        }
         returned.FinishSending();
         await reader.WaitAsync(ct);
     }
@@ -734,7 +768,7 @@ public sealed partial class JoinCalendarIntegrationTests
         Assert.NotEqual(abortedJoinId, rejoinId);
         await WaitAsync(() => hostLink.ReadyReceived.Contains(rejoinId) && Get<string>(guest, "_joinUiState") == "in" &&
             Get<object?>(host, "_hostJoin") is null, "a new request to join and the host to accept its Ready", ct);
-        await guestGame.JoinedNotification.WaitAsync(ct);
+        await guestGame.WaitForJoinedNotificationAsync(ct);
         Assert.Equal(1, guestLink.ReadySent.Count(id => id == rejoinId));
         Assert.Equal(1, hostLink.ReadyReceived.Count(id => id == rejoinId));
         Assert.Equal(2, guestGame.JoinLoadsIssued);
@@ -989,6 +1023,7 @@ public sealed partial class JoinCalendarIntegrationTests
         public volatile uint ProbeCalendarEpoch;
         public Task<byte[]> Ready => _ready.Task;
         public Action? BeforeFirstOffer { get; set; }
+        public Func<ReplayPacket, bool>? DropIncoming { get; set; }
         public Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask>? BeforeWrite { get; set; }
         public readonly ConcurrentQueue<uint> Aborts = new();
         public readonly ConcurrentQueue<byte> Disconnected = new();
@@ -1030,6 +1065,7 @@ public sealed partial class JoinCalendarIntegrationTests
                     BeforeFirstOffer = null;
                 }
                 if (WithholdWorldTransfer && packet.Type is Protocol.WorldOfferDown or Protocol.WorldChunkDown) continue;
+                if (DropIncoming?.Invoke(packet) == true) continue;
                 if (!replayed && packet.Type == Protocol.W164Down && FrozenClock(packet.Payload) is { } sample)
                 {
                     FrozenSnapshots.Enqueue(sample);

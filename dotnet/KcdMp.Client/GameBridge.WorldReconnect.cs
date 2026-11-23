@@ -48,6 +48,7 @@ public partial class GameBridge
     private void WorldReconnectObserveAtRead(PresentationSession session, int type, byte[] payload)
     {
         if (!ReferenceEquals(Volatile.Read(ref _presentationSession), session)) return;
+        if (type == Protocol.Disconnect && payload.Length == 1) HostRestartObserveDisconnect(payload[0]);
         if (type == Protocol.Disconnect && payload.Length == 1 && _joinedWorld && _jj is null &&
             _hostModeKnown && payload[0] == _hostModeFrom && !_leaveInProgress && !_gameQuitting)
         {
@@ -295,7 +296,8 @@ public partial class GameBridge
             if (returned) _worldReconnectHostReturn = null;
             pending = _worldReconnectHost;
         }
-        if (returned) _ = Wo206AnnounceAsync("host-return");
+        if (returned || _isDamageAuthority && Interlocked.Exchange(ref _hostRestartRequestedAt, 0) != 0)
+            _ = Wo206AnnounceAsync("host-return");
         if (pending is null || !_isDamageAuthority || !_sharedWorld || !_combatRoleApplyComplete ||
             _wo121Stream is not { } stream || !pending.Attempt.TryClaim(WorldReconnectDecision.SameWorld)) return;
         _ = WorldReconnectHostReadyAsync(pending, stream, _wo121Ct);

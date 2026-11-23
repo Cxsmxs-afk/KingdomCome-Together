@@ -261,8 +261,11 @@ public partial class GameBridge
                 if (!await LoadSequenceSyncNativeAsync()) return false;
                 var current = _worldLoad.Current;
                 if (current.Generation != prepared.Generation || current.OwnIntentRevision != prepared.OwnIntentRevision) return false;
-                if (authorizeDispatch is null)
+                if (authorizeDispatch is null || reason == "w175-repaired")
+                {
                     LoadSequenceBeginLoad();
+                    dispatchScope = _worldLoad.Current;
+                }
                 else if (own)
                 {
                     if (!LoadSequenceChange(s => s.Generation == prepared.Generation && s.OwnIntentRevision == prepared.OwnIntentRevision &&
@@ -285,6 +288,9 @@ public partial class GameBridge
             Task? Admit(Func<Task> send)
             {
                 if (dispatchLife.IsCancellationRequested) return null;
+                // Fence launcher restart before the durable submission mark.
+                if (!TryProtectLauncherHandoff(out var restartHandoff)) return null;
+                using var handoff = restartHandoff;
                 // Read and journal the file without holding the dispatch lock.
                 // Keep the checked handle open across the synchronous handoff.
                 using var verifiedSave = prepareDispatch?.Invoke();

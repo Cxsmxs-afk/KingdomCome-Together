@@ -62,6 +62,12 @@ internal sealed class TestRecordingOptions(string? path)
 
     public static bool AllowsFrame(byte type, ReadOnlySpan<byte> body)
     {
+        if (type is Protocol.W203Up or Protocol.W203Down)
+        {
+            int kindIndex = Protocol.JoinHeaderLen + (type == Protocol.W203Down ? 1 : 0);
+            if (body.Length > kindIndex && body[kindIndex] is Protocol.W203HostRestartTicket or Protocol.W203HostRestartProof)
+                return false;
+        }
         if (type == Protocol.WorldEventDown)
             return WorldSyncWire.TryReadEvent(body, out var item) && AllowsFrame(item.Type, item.Payload);
         if (type == Protocol.WorldBaselineDown)

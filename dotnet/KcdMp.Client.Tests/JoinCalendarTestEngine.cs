@@ -29,12 +29,16 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private readonly Channel<string> _saveLockQueries = Channel.CreateUnbounded<string>();
     private readonly TaskCompletionSource<string> _loadIssued = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<string> _resumed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource _joinedNotification = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly Channel<bool> _joinedNotifications = Channel.CreateUnbounded<bool>();
     private long _eventSequence;
     private int _saveIndex;
     private string _where = "menu";
-    private string? _lastLoaded;
-    private int _joinLoadsIssued, _joinFilesRead, _ownLoadsIssued;
+    private string? _lastLoaded, _lastLoadedPath;
+    public volatile string? LastLoadedPathOverride;
+    private int _joinLoadsIssued, _joinFilesRead, _ownLoadsIssued, _whereQueries;
+    public int WhereQueries => Volatile.Read(ref _whereQueries);
+    public volatile bool ReturnRetryVisible;
+    private readonly Channel<string> _exitLoads = Channel.CreateUnbounded<string>();
 
     public JoinCalendarTestEngine(string logPath, string saves, Func<int, byte[]>? hostSave, Action gameplayStarted)
     {
@@ -61,11 +65,14 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public int OwnLoadsIssued => Volatile.Read(ref _ownLoadsIssued);
     public Task<string> LoadIssued => _loadIssued.Task;
     public Task<string> Resumed => _resumed.Task;
-    public Task JoinedNotification => _joinedNotification.Task;
     public Task ExitMenu => _exitMenu.Task;
     public Task<string> ExitLoad => _exitLoad.Task;
+    // The production toast is sent after the post-load owner has published the
+    // Henry snapshot and chest ledger and finished cleaning the retained join file.
+    public Task WaitForJoinedNotificationAsync(CancellationToken ct) => _joinedNotifications.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForJoinLoadAsync(CancellationToken ct = default) => _joinLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForOwnLoadAsync(CancellationToken ct = default) => _ownLoads.Reader.ReadAsync(ct).AsTask();
+    public Task<string> WaitForExitLoadAsync(CancellationToken ct = default) => _exitLoads.Reader.ReadAsync(ct).AsTask();
     public Task<string> WaitForSaveLockAsync(CancellationToken ct = default) => _saveLockQueries.Reader.ReadAsync(ct).AsTask();
 
     public void CompleteJoinLoad()
@@ -76,6 +83,20 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public void CompleteOwnLoad()
     {
         lock (_logGate) ReadLoadedFile(_pendingOwnReads.Dequeue(), joined: false);
+    }
+
+    public void ReadOwnSaveWithoutTerminal()
+    {
+        lock (_logGate)
+        {
+            string path = _pendingOwnReads.Dequeue();
+            Assert.NotEmpty(File.ReadAllBytes(path));
+            Feed($"[CryAction] LoadGame: '{path}'");
+            _lastLoaded = Path.GetFileNameWithoutExtension(path);
+            _lastLoadedPath = path;
+            _where = "world";
+            _gameplayStarted();
+        }
     }
 
     public void CompleteExitLoad(string path)
@@ -130,17 +151,23 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         if (load.Success) AcceptLoad(load, joined: true);
         var ownLoad = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"([A-Za-z0-9_]+)","leave-command"\)""");
         if (ownLoad.Success) AcceptLoad(ownLoad, joined: false);
+        var repair = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"([A-Za-z0-9_]+)","w175-repaired"\)""");
+        if (repair.Success) AcceptLoad(repair, joined: false);
         var exit = Regex.Match(command, """KCD2MP_Wo124LoadGame\(([0-4]),"(mpexit[0-9a-f]{8})","exit-to-menu"\)""");
         if (exit.Success)
         {
             string path = Path.Combine(_saves, $"playline{exit.Groups[1].Value}", exit.Groups[2].Value + ".whs");
             Assert.True(File.Exists(path));
             _exitLoad.TrySetResult(path);
+            _exitLoads.Writer.TryWrite(path);
             if (!DeferExitFileRead) CompleteExitLoad(path);
         }
 
-        var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry|KCD2MP_W154Where)\("([0-9a-f]{8})"\)""");
-        if (query.Success) AnswerQuery(query.Groups[1].Value, query.Groups[2].Value);
+        var retry = Regex.Match(command, @"KCD2MP_W154MenuReturnRetry\((true|false)\)");
+        if (retry.Success) ReturnRetryVisible = retry.Groups[1].Value == "true";
+
+        var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry|KCD2MP_W154Where)\("(r?[0-9a-f]{8})"(, true)?\)""");
+        if (query.Success) AnswerQuery(query.Groups[1].Value, query.Groups[2].Value, query.Groups[3].Success);
         if (RequestLegacySnapshot is { } snapshot)
         {
             var request = Regex.Match(command, """KCD2MP_Wo125Snapshot\("([0-9a-f]{8})"\)""");
@@ -162,7 +189,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         var resume = Regex.Match(command, """KCD2MP_JoinResume\("[0-9a-f]{8}",\s*"([^"]+)"\)""");
         if (resume.Success) _resumed.TrySetResult(resume.Groups[1].Value);
         if (command.Contains("Co-op: you are in your host's world.", StringComparison.Ordinal))
-            _joinedNotification.TrySetResult();
+            _joinedNotifications.Writer.TryWrite(true);
     }
 
     private void AcceptLoad(Match load, bool joined)
@@ -197,6 +224,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     {
         Assert.NotEmpty(File.ReadAllBytes(path));
         _lastLoaded = Path.GetFileNameWithoutExtension(path);
+        _lastLoadedPath = path;
         if (joined) Interlocked.Increment(ref _joinFilesRead);
         Feed($"[CryAction] LoadGame: '{path}'");
         Feed("Sending concept notification 'EntityModuleOnPostLoadGame'");
@@ -205,7 +233,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         Feed("Gameplay started");
     }
 
-    private void AnswerQuery(string query, string token)
+    private void AnswerQuery(string query, string token, bool fullPath)
     {
         lock (_logGate)
         {
@@ -216,8 +244,10 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
                 return;
             }
 
+            if (query == "KCD2MP_W154Where") Interlocked.Increment(ref _whereQueries);
             string reply = query switch
             {
+                "KCD2MP_Wo125LastLoaded" when fullPath => "path=" + (LastLoadedPathOverride ?? _lastLoadedPath),
                 "KCD2MP_Wo125LastLoaded" => "last=" + _lastLoaded,
                 "KCD2MP_Wo124Lock" => "lock=held",
                 "KCD2MP_W154Where" => _where,

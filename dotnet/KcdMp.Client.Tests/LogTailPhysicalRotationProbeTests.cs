@@ -47,6 +47,7 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
             var receipts = new ConcurrentQueue<LogTailGameTransport.EngineSaveTerminal>();
             var reads = new ConcurrentQueue<string?>();
             var accepts = new ConcurrentQueue<string>();
+            var placeReplies = new ConcurrentQueue<string>();
             var quits = 0;
             var menus = 0;
             tail.LoadStarted += () =>
@@ -57,12 +58,17 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
             tail.SaveLoadAccepted += accepts.Enqueue;
             tail.EngineSaveFinished += receipts.Enqueue;
             tail.ModInitDetected += () => scanned.TrySetResult();
+            tail.GameEvent += (kind, args) =>
+            {
+                if (kind == "wo124_reply") placeReplies.Enqueue(args);
+            };
             tail.GameQuit += () => Interlocked.Increment(ref quits);
             tail.MainMenuShown += () => Interlocked.Increment(ref menus);
             long beforeAttach = tail.EngineLogIncarnation;
             await tail.StartAsync(deadline.Token);
             while (tail.EngineLogIncarnation == beforeAttach) await Task.Delay(2, deadline.Token);
-            const string retired = "Loading saved game 'playline1/retired-save'\n" +
+            const string retired = "[KCD2-MP-EVT] v1 1 wo124_reply r11111111 world\n" +
+                "Loading saved game 'playline1/retired-save'\n" +
                 "[CryAction] LoadGame: 'playline1/retired-save'\nPlayVideoOnly 'main_menu.bk2'\n" +
                 "CSystem::Quit invoked\nLog Started at 2026-11-20  01:20:00\nGameplay started\n";
             async Task WaitForLineAsync(Task line, string stage)
@@ -105,13 +111,14 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
             }
             string newRead = changed ? "Log Started at 2026-11-20  02:20:00\nLoading saved game 'playline1/new-save'\n" +
                 "[CryAction] LoadGame: 'playline1/new-save'\n" : "";
-            Append(newRead + "Gameplay started\n[KCD2-MP] MOD INIT\n");
+            Append(newRead + "Gameplay started\n[KCD2-MP-EVT] v1 2 wo124_reply r22222222 menu\n[KCD2-MP] MOD INIT\n");
             await WaitForLineAsync(scanned.Task, "Gameplay and MOD INIT");
             output.WriteLine($"transition={transition} buffered_terminal={bufferedTerminal} old_incarnation={oldIncarnation} current_incarnation={tail.EngineLogIncarnation} receipts={string.Join(',', receipts.Select(r => r.Path))} quits={quits} menus={menus} reads={string.Join(',', reads)} accepts={string.Join(',', accepts)}");
             var receipt = Assert.Single(receipts);
             Assert.Equal(changed ? "playline1/new-save" : "playline1/old-save", receipt.Path);
             Assert.Equal(changed, receipt.Incarnation > oldIncarnation);
             Assert.True(receipt.Loaded);
+            Assert.Equal(["r22222222 menu"], placeReplies.ToArray());
             Assert.Equal(0, quits);
             Assert.Equal(0, menus);
             Assert.Equal(changed ? ["playline1/old-save", "playline1/new-save"] : new[] { "playline1/old-save" }, reads.ToArray());

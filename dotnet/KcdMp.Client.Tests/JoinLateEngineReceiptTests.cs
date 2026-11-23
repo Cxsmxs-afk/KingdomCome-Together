@@ -94,22 +94,119 @@ public sealed class JoinLateEngineReceiptTests
         Assert.Equal(Fixture.SaveBytes, File.ReadAllBytes(fixture.PersonalSave));
     }
 
+    [Fact]
+    public async Task Launcher_stop_stays_fenced_through_guest_gameplay_until_game_exit()
+    {
+        var control = LauncherAgentControl.Create();
+        const int pid = 73;
+        const long start = 1000040;
+        Assert.True(control.StampProcess(pid, start));
+        try
+        {
+            await using var fixture = new Fixture(control);
+            await fixture.ConnectNativeAsync();
+            var submitted = fixture.Submit(joinId: 1, playline: 1);
+            fixture.FinishDispatch(submitted);
+            fixture.DisposeReceipt(submitted);
+            Assert.Null(control.TryBeginStop(pid, start, out string blocked));
+            Assert.Equal("engine-read-or-control-unavailable", blocked);
+
+            fixture.Game.Feed("Gameplay started");
+            Assert.False(fixture.HasEngineTerminal(submitted));
+            Assert.Null(control.TryBeginStop(pid, start, out _));
+            fixture.ReadAndComplete(submitted.Path);
+            Assert.True(fixture.HasEngineTerminal(submitted));
+            Assert.Equal("World", fixture.Place.ToString());
+            Assert.Null(control.TryBeginStop(pid, start, out _));
+
+            fixture.Game.Feed("CSystem::Quit invoked");
+
+            using var stopped = Assert.IsType<FileStream>(control.TryBeginStop(pid, start, out _));
+            Assert.Null(control.TryProtectEngineRead());
+        }
+        finally { control.Remove(); }
+    }
+
+    [Fact]
+    public async Task Launcher_stop_denies_a_failed_rejoin_until_the_exact_private_save_finishes()
+    {
+        var control = LauncherAgentControl.Create();
+        const int pid = 73;
+        const long start = 1000040;
+        Assert.True(control.StampProcess(pid, start));
+        try
+        {
+            await using var fixture = new Fixture(control);
+            await fixture.ConnectNativeAsync();
+            var original = fixture.Submit(joinId: 1, playline: 1);
+            fixture.FinishDispatch(original);
+            fixture.ReadAndComplete(original.Path);
+            Assert.True(fixture.HasEngineTerminal(original));
+
+            var rejoin = fixture.Submit(joinId: 2, playline: 2);
+            fixture.FinishDispatch(rejoin);
+            await fixture.AbortAsync(rejoin);
+            fixture.ReadSave(rejoin.Path);
+            fixture.Game.Feed("Exiting to main menu because save game loading failed");
+            Assert.True(fixture.HasEngineTerminal(rejoin));
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            while (fixture.HasReservation(rejoin)) await Task.Delay(10, deadline.Token);
+            Assert.False(File.Exists(rejoin.Path));
+            Assert.Null(control.TryBeginStop(pid, start, out _));
+
+            using var privateReceipt = fixture.ProtectPrivateReturn();
+            fixture.ReadAndComplete(Path.Combine(fixture.OtherProfile, "playline0", Path.GetFileName(fixture.PersonalSave)));
+            Assert.Null(control.TryBeginStop(pid, start, out _));
+            fixture.ReadAndComplete(fixture.PersonalSave);
+            using var stopped = Assert.IsType<FileStream>(control.TryBeginStop(pid, start, out _));
+            Assert.Null(control.TryProtectEngineRead());
+        }
+        finally { control.Remove(); }
+    }
+
+    [Fact]
+    public async Task Wo175_repaired_copy_dispatch_fences_restart_until_its_exact_engine_read()
+    {
+        var control = LauncherAgentControl.Create();
+        const int pid = 73;
+        const long start = 1000040;
+        Assert.True(control.StampProcess(pid, start));
+        try
+        {
+            await using var fixture = new Fixture(control);
+            await fixture.ConnectNativeAsync();
+            fixture.Game.DeferOwnFileRead = true;
+            using (var privateWorld = Assert.IsType<FileStream>(control.TryBeginStop(pid, start, out _)))
+                Assert.False(await fixture.LoadRepairedCopyAsync());
+
+            string repaired = fixture.CreateRepairedCopy();
+            Assert.True(await fixture.LoadRepairedCopyAsync());
+            Assert.Equal(repaired, await fixture.Game.WaitForOwnLoadAsync().WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Null(control.TryBeginStop(pid, start, out _));
+            fixture.Game.CompleteOwnLoad();
+            using var stopped = Assert.IsType<FileStream>(control.TryBeginStop(pid, start, out _));
+        }
+        finally { control.Remove(); }
+    }
+
     private sealed class Fixture : IAsyncDisposable
     {
         private readonly string _root = Directory.CreateTempSubdirectory("kcdmp-late-join-receipt-").FullName;
         private readonly string? _previousData = Environment.GetEnvironmentVariable("KCDMP_DATA_DIR");
-        private readonly GameBridge _bridge = new(new ClientConfig());
+        private readonly GameBridge _bridge;
         private readonly JoinCalendarTestPipe _pipe = new();
         private string Saves => Path.Combine(_root, "saves");
         public string OtherProfile => Path.Combine(_root, "other-profile");
         public string PersonalSave => Path.Combine(Saves, "playline0", "save001.whs");
+        private string RepairedSave => Path.Combine(Saves, "playline0", "save001_fixed.whs");
         public JoinCalendarTestEngine Game { get; }
         public object? ActiveJoin => Field(_bridge, "_jj", Private).GetValue(_bridge);
         public object Place => Field(_bridge, "_where", Private).GetValue(_bridge)!;
         public static readonly byte[] SaveBytes = "synthetic verified save bytes"u8.ToArray();
 
-        public Fixture()
+        public Fixture(LauncherAgentControl? control = null)
         {
+            _bridge = new(new ClientConfig()) { LauncherRestartControl = control };
             Environment.SetEnvironmentVariable("KCDMP_DATA_DIR", _root);
             Directory.CreateDirectory(Path.GetDirectoryName(PersonalSave)!);
             File.WriteAllBytes(PersonalSave, SaveBytes);
@@ -167,6 +264,25 @@ public sealed class JoinLateEngineReceiptTests
         public Task<bool>? EngineReceiptTask((object Join, string Path) attempt) =>
             Field(attempt.Join, "EngineReceipt").GetValue(attempt.Join) is { } receipt
                 ? ((TaskCompletionSource<bool>)Field(receipt, "Terminal").GetValue(receipt)!).Task : null;
+
+        public void DisposeReceipt((object Join, string Path) attempt) =>
+            ((IDisposable)Field(attempt.Join, "EngineReceipt").GetValue(attempt.Join)!).Dispose();
+
+        public IDisposable ProtectPrivateReturn()
+        {
+            Type kind = typeof(GameBridge).GetNestedType("LauncherPrivateReturn", BindingFlags.NonPublic)!;
+            var receipt = (IDisposable)Call("PrepareLauncherProtectedReceipt", Game.Transport, PersonalSave, Saves, Enum.Parse(kind, "OwnSave"))!;
+            receipt.GetType().GetMethod("ProtectSubmittedLoad")!.Invoke(receipt, null);
+            return receipt;
+        }
+
+        public string CreateRepairedCopy()
+        {
+            File.Copy(PersonalSave, RepairedSave);
+            return RepairedSave;
+        }
+
+        public Task<bool> LoadRepairedCopyAsync() => (Task<bool>)Call("Wo175LoadRepairedCopyAsync", 0, "save001_fixed", RepairedSave, Saves)!;
 
         public Task AbortAsync((object Join, string Path) attempt) =>
             (Task)Call("AbortJoinerJoinAsync", attempt.Join, Protocol.JoinAbortLoadFailed, "fixture-abort", "Test join retired.", false)!;

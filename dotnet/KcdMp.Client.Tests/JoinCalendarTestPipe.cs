@@ -14,6 +14,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private const byte Pong = 0x83, Result = 0x81, Wo140Reply = 0xA4, Wo151Reply = 0xAB, Wo163Reply = 0xAC;
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _serverLoop;
+    private volatile bool _shutdownStarted;
     private readonly bool _failCalendarArm;
     private readonly bool _failCalendarVerify;
     private readonly bool _refuseHold;
@@ -35,6 +36,9 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private ulong _loadGeneration, _lifecycleGeneration;
 
     public CombatPipe Pipe { get; }
+    internal Task Completion => _serverLoop;
+    public Func<int, string, bool>? SaveListed { get; set; }
+    public bool CanQuickSave { get; init; } = true;
     public Action? BeforeCalendarArm { get; set; }
     public Action<string>? RequestScopedSnapshot { get; set; }
     public Task ArmObserved => _arm.Task;
@@ -77,6 +81,9 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         lock (_calendar) _loadedWorldMs = null;
     }
 
+    // The bridge may cancel a physical write during teardown before this fixture is disposed.
+    public void BeginShutdown() => _shutdownStarted = true;
+
     private async Task ServeAsync(string name, CancellationToken ct)
     {
         try
@@ -96,8 +103,16 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
                         break;
                     var (type, body) = Reply(header[0], seq++, payload);
                     byte[] frame = [type, (byte)body.Length, (byte)(body.Length >> 8), .. body];
-                    await server.WriteAsync(frame, ct);
-                    await server.FlushAsync(ct);
+                    try
+                    {
+                        await server.WriteAsync(frame, ct);
+                        await server.FlushAsync(ct);
+                    }
+                    catch (IOException) when (_shutdownStarted && !server.IsConnected)
+                    {
+                        // A canceled bridge write can close the peer while this reply is in flight.
+                        return;
+                    }
                 }
                 server.Disconnect();
             }
@@ -111,7 +126,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         0x03 => (Pong, []),
         // Session, respawn and combat setup have no readback beyond these Result ACKs.
         0x0C or 0x0D or 0x16 or 0x18 or 0x20 or 0x2C => (Result, [1, seq, 0]),
-        0x1D when request.Length >= 3 && request.Length == 3 + request[2] => (0x8D, [1, seq, 1, 0, 0, 1, 0, request[1], request[1], 0, 0, 0]),
+        0x1D when request.Length >= 3 && request.Length == 3 + request[2] => (0x8D, SaveList(seq, request)),
         0x1E => (0x8E, [1, seq, 1, 1, 1]),
         0x26 when request is [9] => (Wo140Reply, CalendarSnapshot(seq)),
         0x26 when request is [10, ..] && request.Length == 18 => (Wo140Reply, CalendarFollow(seq, request)),
@@ -119,6 +134,12 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         0x2B when request.Length > 0 => (Wo163Reply, Wo163(seq, request)),
         _ => (Result, [0, seq, (byte)PipeReason.UnknownCommand]),
     };
+
+    private byte[] SaveList(byte seq, ReadOnlySpan<byte> request)
+    {
+        bool listed = SaveListed?.Invoke((sbyte)request[1], System.Text.Encoding.ASCII.GetString(request[3..])) ?? true;
+        return [1, seq, (byte)(listed ? 1 : 0), 0, 0, 1, 0, request[1], request[1], 0, 0, 0];
+    }
 
     private byte[] CalendarSnapshot(byte seq)
     {
@@ -210,7 +231,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         Protocol.Wo216OpConfig when request.Length == 14 => [1, seq, request[0], 0],
         Protocol.Wo216OpBrains when request.Length == 1 => [1, seq, request[0], 0, .. "decision_gate=armed story_gate=armed"u8],
         Protocol.Wo200OpConfig when request.Length == 7 => [1, seq, request[0], 0, request[1], request[2]],
-        Protocol.Wo184OpSaveState when request.Length == 1 => [1, seq, request[0], 0, 1, 0, 0, 1],
+        Protocol.Wo184OpSaveState when request.Length == 1 => [1, seq, request[0], 0, 1, 0, 0, (byte)(CanQuickSave ? 1 : 0)],
         Protocol.H21OpSnapshot when request.Length == 26 => ScopedSnapshot(seq, request[1..]),
         _ => [0, seq, request[0], (byte)PipeReason.UnknownCommand],
     };
@@ -278,6 +299,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        BeginShutdown();
         await _stop.CancelAsync();
         try
         {

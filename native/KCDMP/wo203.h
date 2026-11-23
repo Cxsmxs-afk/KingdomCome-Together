@@ -55,6 +55,7 @@ int status_text(char* out, int n);
 
 namespace cam {
 void prepare_player_view(); // read-only system/RTTI lookup at DLL initialization
+bool refresh_player_view(); // main thread, bounded lookup using the cached anchor
 bool read_player_view(uint32_t eid, float matrix[12], float feet[3]); // main thread
 }
 

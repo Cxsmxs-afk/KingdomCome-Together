@@ -92,7 +92,7 @@ public class TcpSocketService : BackgroundService
 				// only when) both halves of its switch were given; otherwise this is
 				// the same session on the same socket as ever.
 				var client = _runner.Faults is null
-					? new ClientSession(_logger, tcpListener, _broadcastService, _sessions, _clientHandler, _idleTimeout)
+					? new ClientSession(_logger, tcpListener, _broadcastService, _sessions, _clientHandler, _idleTimeout, _runner.IdleTimeProvider)
 					: _runner.Create(RelayConnection.FromTcp(tcpListener));
 				_runner.Start(client);   // WO-127: the same lifecycle for Steam sessions (SteamRelayService)
 			}

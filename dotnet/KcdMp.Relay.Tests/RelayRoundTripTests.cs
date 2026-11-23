@@ -92,13 +92,15 @@ public sealed class RelayFixture : IAsyncLifetime
 /// <summary>Keep port selection and ownership in the real TCP and HTTP listeners.</summary>
 internal static class RelayListeners
 {
-    internal static WebApplication CreateApp(params string[] options) => Program.CreateApp([
+    internal static WebApplication CreateApp(params string[] options) => CreateApp(null, options);
+
+    internal static WebApplication CreateApp(TimeProvider? idleTimeProvider, params string[] options) => Program.CreateApp([
         "--port", "0",
         "--Tcp:BindAddress", "127.0.0.1",
         "--Urls", "http://127.0.0.1:0",
         "--Serilog:WriteTo:1:Name", "Console",
         .. options
-    ]);
+    ], idleTimeProvider);
 
     internal static async Task<IPEndPoint> StartAsync(WebApplication app)
     {

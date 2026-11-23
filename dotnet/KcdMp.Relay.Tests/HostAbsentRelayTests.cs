@@ -22,6 +22,52 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
 
     public HostAbsentRelayTests(RelayFixture relay) => _relay = relay;
 
+    [Fact]
+    public async Task The_initial_explicit_host_claim_can_replace_an_unclaimed_legacy_mode_sender()
+    {
+        await WaitNoClientsAsync();
+        await using var guest = await _relay.ConnectAsync("legacy-fallback");
+        await using var host = await _relay.ConnectAsync("the-host");
+        await guest.SendRawAsync(JoinStatusCodec.Build(host.Id, 0, Protocol.JoinStateSession, Protocol.JoinReasonId("shared-world"), 0));
+        Assert.Equal(guest.Id, (await host.ReadUntilAsync(Protocol.JoinStatusDown, Wait))[0]);
+        await host.SendRawAsync(Claim());
+        await BarrierAsync(host);
+        Assert.Equal(host.Id, Clients.DamageAuthority?.Id);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public async Task An_announced_host_owns_the_seat_before_the_first_run_when_guests_claim(int players)
+    {
+        await WaitNoClientsAsync();
+        var guests = new Peer[players - 1];
+        await using var group = new PeerGroup(guests);
+        for (int i = 0; i < guests.Length; i++) guests[i] = await _relay.ConnectAsync($"guest-{i}");
+        await using var host = await _relay.ConnectAsync("the-host");
+        await host.SendRawAsync(Claim());
+        await host.SendRawAsync(JoinStatusCodec.Build(guests[0].Id, 0, Protocol.JoinStateSession,
+            Protocol.JoinReasonId("shared-world"), 0));
+        Assert.Equal(host.Id, (await guests[0].ReadUntilAsync(Protocol.JoinStatusDown, Wait))[0]);
+
+        await host.DisposeAsync();
+        foreach (var guest in guests)
+        {
+            Assert.Equal(host.Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+            await guest.SendRawAsync(Claim());
+            await BarrierAsync(guest);
+        }
+        Assert.Null(Clients.AbsentHost);
+        Console.WriteLine($"F1 players={players} authority-after-guest-claim={Clients.DamageAuthority?.Name ?? "none"}");
+        Assert.Null(Clients.DamageAuthority);
+        Assert.False(Clients.HasHostConnected());
+
+        await using var returning = await _relay.ConnectAsync("the-host");
+        await ConfirmWorldAsync(returning, guests[0]);
+        Assert.Equal(returning.Id, Clients.DamageAuthority?.Id);
+    }
+
     [Theory]
     [InlineData(2)]
     [InlineData(3)]
@@ -327,6 +373,10 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
         Assert.Equal(back.Id, accepted[0]);
         Assert.True(HostAbsentRules.TryReadRunFromDown(accepted, out Guid resumedRun));
         Assert.Equal(run, resumedRun);
+        long refused = Clients.DropCount($"0x{Protocol.W203Up:X2}/k{Protocol.W203HostRestartTicket}:host-restart-ticket-not-issuer");
+        await back.SendRawAsync(RestartTicketRequest());
+        await BarrierAsync(back);
+        Assert.Equal(refused + 1, Clients.DropCount($"0x{Protocol.W203Up:X2}/k{Protocol.W203HostRestartTicket}:host-restart-ticket-not-issuer"));
     }
 
     [Fact]
@@ -384,6 +434,169 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
         Assert.Equal(host.Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
         Assert.Null(Clients.DamageAuthority);
         Assert.Equal(run, Clients.AbsentHost?.RunId);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public async Task Same_verified_host_reopens_five_runs_and_every_guest_can_request_join(int players)
+    {
+        const uint world = 142; // A fresh process can start with the same numeric epoch as the old one.
+        await WaitNoClientsAsync();
+        var guests = new Peer[players - 1];
+        await using var group = new PeerGroup(guests);
+        var host = await _relay.ConnectAsync("the-host");
+        try
+        {
+            for (int i = 0; i < guests.Length; i++) guests[i] = await _relay.ConnectAsync($"guest-{i}");
+            Guid run = await ConfirmWorldAsync(host, guests[0]);
+            Guid firstRun = run;
+            await host.SendRawAsync(RestartTicketRequest());
+            byte[] ticket = ReadRestartTicket(await host.ReadUntilAsync(Protocol.W203Down, Wait), host.Id);
+            for (int cycle = 1; cycle <= 5; cycle++)
+            {
+                byte gone = host.Id;
+                await host.DisposeAsync();
+                foreach (Peer guest in guests)
+                {
+                    Assert.Equal(gone, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+                    await guest.SendRawAsync(Claim());
+                    await BarrierAsync(guest);
+                }
+                Assert.Null(Clients.DamageAuthority);
+                Assert.Equal(run, Clients.AbsentHost?.RunId);
+
+                if (cycle == 1)
+                {
+                    await using var sameRoute = await _relay.ConnectAsync("the-host");
+                    long denied = Clients.DropCount($"0x{Protocol.W203Up:X2}/k{Protocol.W203HostRestartProof}:host-restart-ticket");
+                    await sameRoute.SendRawAsync(Claim());
+                    await sameRoute.SendRawAsync(RestartProof(world, Guid.NewGuid(), new byte[HostRestartWire.TicketBytes]));
+                    await BarrierAsync(sameRoute);
+                    Assert.Equal(denied + 1, Clients.DropCount($"0x{Protocol.W203Up:X2}/k{Protocol.W203HostRestartProof}:host-restart-ticket"));
+                    Assert.Null(Clients.DamageAuthority);
+                    Assert.Equal(run, Clients.AbsentHost?.RunId);
+                    Console.WriteLine($"F2 players={players} same-route-name-without-ticket=refused");
+                    await sameRoute.DisposeAsync();
+                    foreach (Peer guest in guests)
+                        Assert.Equal(sameRoute.Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+                }
+                host = await _relay.ConnectAsync("the-host");
+                Guid next = Guid.NewGuid();
+                await host.SendRawAsync(Claim());
+                if (cycle == 2)
+                {
+                    await host.SendRawAsync(RestartProof(world, firstRun, ticket));
+                    await BarrierAsync(host);
+                    Assert.Null(Clients.DamageAuthority);
+                    Assert.Equal(run, Clients.AbsentHost?.RunId);
+                }
+                await host.SendRawAsync(RestartProof(world, next, ticket));
+                await BarrierAsync(host);
+                Console.WriteLine($"F2 players={players} cycle={cycle} reopened={(Clients.DamageAuthority?.Id == host.Id ? 1 : 0)}");
+                Assert.Equal(host.Id, Clients.DamageAuthority?.Id);
+                Assert.Null(Clients.AbsentHost);
+
+                foreach (Peer guest in guests)
+                {
+                    byte[] notice = await guest.ReadUntilAsync(Protocol.W203Down, Wait);
+                    AssertNotice(notice, host.Id, guest.Id, Protocol.W203HostRestarted, $"v1|{world}|{run:N}|{world}|{next:N}");
+                    uint joinId = (uint)(100 * cycle + guest.Id);
+                    await guest.SendRawAsync(WorldReceiver.BuildRequest(joinId, host: host.Id));
+                    byte[] request = await host.ReadUntilAsync(Protocol.JoinRequestDown, Wait);
+                    Assert.True(Protocol.TrySplitJoinDown(request, out byte joiner, out byte target, out uint received, out _));
+                    Assert.Equal(guest.Id, joiner);
+                    Assert.Equal(host.Id, target);
+                    Assert.Equal(joinId, received);
+                }
+                run = next;
+            }
+        }
+        finally { await host.DisposeAsync(); }
+    }
+
+    [Fact]
+    public async Task A_remote_tcp_address_and_name_cannot_reopen_a_world()
+    {
+        await WaitNoClientsAsync();
+        const string address = "tcp:192.0.2.10";
+        await using var host = await SteamShapedPeer.ConnectAsync(_relay.Services, "dedicated-host", address);
+        await using var guest = await _relay.ConnectAsync("guest");
+        Guid run = Guid.NewGuid();
+        await host.SendRawAsync(Claim());
+        await host.SendRawAsync(Epoch(142, run, 81, guest.Id));
+        Assert.Equal(host.Id, (await guest.ReadUntilAsync(Protocol.W203Down, Wait))[0]);
+        await host.DisposeAsync();
+        Assert.Equal(host.Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+
+        await using var back = await SteamShapedPeer.ConnectAsync(_relay.Services, "dedicated-host", address);
+        long denied = Clients.DropCount($"0x{Protocol.W203Up:X2}/k{Protocol.W203HostRestartProof}:host-restart-identity");
+        await back.SendRawAsync(Claim());
+        await back.SendRawAsync(RestartProof(142, Guid.NewGuid(), new byte[HostRestartWire.TicketBytes]));
+        await BarrierAsync(back.SendRawAsync, back.ReadUntilAsync);
+        Assert.Equal(denied + 1, Clients.DropCount($"0x{Protocol.W203Up:X2}/k{Protocol.W203HostRestartProof}:host-restart-identity"));
+        Assert.Null(Clients.DamageAuthority);
+        Assert.Equal(run, Clients.AbsentHost?.RunId);
+        await back.SendRawAsync(Epoch(142, run, 81, guest.Id));
+        Assert.Equal(back.Id, (await guest.ReadUntilAsync(Protocol.W203Down, Wait))[0]);
+        Assert.Equal(back.Id, Clients.DamageAuthority?.Id);
+    }
+
+    [Fact]
+    public async Task A_steam_shaped_restart_requires_the_same_verified_peer_and_the_private_ticket()
+    {
+        await WaitNoClientsAsync();
+        await using var host = await SteamShapedPeer.ConnectAsync(_relay.Services, "the-host", "steam-host", authenticated: true);
+        await using var guest = await _relay.ConnectAsync("guest");
+        Guid run = Guid.NewGuid(), next = Guid.NewGuid();
+        await host.SendRawAsync(Claim());
+        await host.SendRawAsync(Epoch(142, run, 81, guest.Id));
+        Assert.Equal(host.Id, (await guest.ReadUntilAsync(Protocol.W203Down, Wait))[0]);
+        await host.SendRawAsync(RestartTicketRequest());
+        byte[] ticket = ReadRestartTicket(await host.ReadUntilAsync(Protocol.W203Down, Wait), host.Id);
+        await host.DisposeAsync();
+        Assert.Equal(host.Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+
+        await using var other = await SteamShapedPeer.ConnectAsync(_relay.Services, "the-host", "different-steam-peer", authenticated: true);
+        await other.SendRawAsync(RestartProof(142, next, ticket));
+        await BarrierAsync(other.SendRawAsync, other.ReadUntilAsync);
+        Assert.Null(Clients.DamageAuthority);
+        Assert.Equal(run, Clients.AbsentHost?.RunId);
+
+        await using var back = await SteamShapedPeer.ConnectAsync(_relay.Services, "the-host", "steam-host", authenticated: true);
+        await back.SendRawAsync(RestartProof(142, next, ticket));
+        AssertNotice(await guest.ReadUntilAsync(Protocol.W203Down, Wait), back.Id, guest.Id, Protocol.W203HostRestarted,
+            HostRestartWire.Notice(new(142, run), new(142, next)));
+        Assert.Equal(back.Id, Clients.DamageAuthority?.Id);
+        Assert.Null(Clients.AbsentHost);
+    }
+
+    private static byte[] RestartProof(uint world, Guid run, byte[] ticket) => new LootMsg(Protocol.W203HostRestartProof, 0,
+        HostRestartWire.Proof(new(world, run), ticket)).BuildUp(Protocol.W203Up, Protocol.JoinTargetHost);
+
+    private static byte[] RestartTicketRequest() => new LootMsg(Protocol.W203HostRestartTicket, 0, "v1")
+        .BuildUp(Protocol.W203Up, Protocol.JoinTargetHost);
+
+    private static byte[] ReadRestartTicket(byte[] payload, byte target)
+    {
+        Assert.True(Protocol.TrySplitJoinDown(payload, out byte source, out byte to, out _, out var body));
+        Assert.Equal(Protocol.JoinTargetHost, source);
+        Assert.Equal(target, to);
+        Assert.True(LootMsg.TryDecode(body, out var message));
+        Assert.Equal(Protocol.W203HostRestartTicket, message.Kind);
+        Assert.True(HostRestartWire.TryTicket(message.Text, out byte[] ticket));
+        return ticket;
+    }
+
+    private static void AssertNotice(byte[] payload, byte source, byte target, byte kind, string text)
+    {
+        Assert.True(Protocol.TrySplitJoinDown(payload, out byte from, out byte to, out _, out var body));
+        Assert.Equal(source, from);
+        Assert.Equal(target, to);
+        Assert.True(LootMsg.TryDecode(body, out var restart));
+        Assert.Equal(kind, restart.Kind);
+        Assert.Equal(text, restart.Text);
     }
 
     private async Task WaitNoClientsAsync()

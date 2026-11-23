@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
+using System.Security.Cryptography;
 using ILogger = Serilog.ILogger;
 
 namespace KcdMp.Server.Features.ClientHandling;
@@ -196,7 +197,11 @@ public class ClientHandler
 			foreach (var old in superseded) old.MarkSuperseded();
 			if (authority is { IsSuperseded: true })
 				DepartAuthority(authority, active - superseded.Count, "superseded");
-			foreach (var old in superseded) old.AnnounceDisconnect();
+			foreach (var old in superseded)
+			{
+				ForgetRetiredAnnouncer(old);
+				old.AnnounceDisconnect();
+			}
 			return true;
 		}
 	}
@@ -219,9 +224,14 @@ public class ClientHandler
 				_freeIds.Add(client.Id);
 			int remaining = _readyClients.Count(c => !c.IsSuperseded);
 			if (wasAuthority) DepartAuthority(client, remaining, "disconnect");
+			ForgetRetiredAnnouncer(client);
 			if (remaining == 0)
 			{
 				_absentHost = null;
+				_departedAnnouncedHost = null;
+				_restartTicket = null;
+				_restartTicketIssuer = 0;
+				_retiredHostRuns.Clear();
 				_hostClaimRequired = false;
 			}
 		}
@@ -232,6 +242,11 @@ public class ClientHandler
 	{
 		bool confirmed = ReferenceEquals(_sessionHost, client);
 		_sessionHost = null;
+		if (ReferenceEquals(_announcedHost, client))
+		{
+			_departedAnnouncedHost = new(client.IdentityKey, client.Name!);
+			ForgetRetiredAnnouncer(client);
+		}
 		_hostClaimRequired = true;
 		if (!confirmed || remaining == 0 || client.AnnouncedWorldEpoch == 0 || client.AnnouncedRunId == Guid.Empty ||
 			!HasPlayerIdentity(client.IdentityKey))
@@ -243,6 +258,13 @@ public class ClientHandler
 		client.AnnounceDisconnect();
 		_logger.Information("MP-HOST-ABSENT pause epoch={Epoch} run={Run} ready={Ready} why={Reason}",
 			client.AnnouncedWorldEpoch, client.AnnouncedRunId, remaining, reason);
+	}
+
+	private void ForgetRetiredAnnouncer(ClientSession client)
+	{
+		if (!ReferenceEquals(_announcedHost, client)) return;
+		_announcedHost = null;
+		_announcedHostClaimed = false;
 	}
 
 	/// <summary>
@@ -301,7 +323,18 @@ public class ClientHandler
 	public HostLease? AbsentHost => _absentHost;
 	private volatile HostLease? _absentHost;
 	private ClientSession? _sessionHost;
+	private ClientSession? _announcedHost;
+	private bool _announcedHostClaimed;
+	private sealed record AnnouncedHostIdentity(string Key, string Name)
+	{
+		public bool Matches(ClientSession client) => HasPlayerIdentity(Key) && Key == client.IdentityKey &&
+			string.Equals(Name, client.Name, StringComparison.Ordinal);
+	}
+	private volatile AnnouncedHostIdentity? _departedAnnouncedHost;
 	private bool _hostClaimRequired;
+	private byte[]? _restartTicket;
+	private ulong _restartTicketIssuer;
+	private readonly HashSet<Guid> _retiredHostRuns = [];
 
 	internal (ClientSession? Host, ulong Epoch) PresentationAnchor()
 	{
@@ -344,13 +377,74 @@ public class ClientHandler
 		client.IsReady && _absentHost is { } left && string.Equals(left.IdentityKey, client.IdentityKey, StringComparison.Ordinal)
 		&& string.Equals(left.Name, client.Name, StringComparison.Ordinal);
 
+	internal bool AllowsHostClaim(ClientSession client)
+	{
+		if (_absentHost is not null) return IsReturningHost(client);
+		return _departedAnnouncedHost is not { } departed || departed.Matches(client);
+	}
+
+	internal bool ObserveHostMode(ClientSession client)
+	{
+		lock (_lock)
+		{
+			if (!ReferenceEquals(PickAuthority(out _), client)) return false;
+			_announcedHostClaimed = client.ClaimsHost || ReferenceEquals(_announcedHost, client) && _announcedHostClaimed;
+			_announcedHost = client;
+			_departedAnnouncedHost = null;
+			return true;
+		}
+	}
+
 	public bool ObserveHostAnnouncement(ClientSession client, uint world, Guid run)
 	{
 		lock (_lock)
 		{
 			if (!ReferenceEquals(PickAuthority(out _), client)) return false;
+			if (ReferenceEquals(_sessionHost, client) && client.AnnouncedRunId != Guid.Empty)
+			{
+				if (run == Guid.Empty) return true; // intermediate load announcement; keep the last confirmed run
+				if (run != client.AnnouncedRunId) return false; // changing run requires the private restart ticket
+			}
 			client.NoteAnnouncement(world, run);
-			if (world != 0 && run != Guid.Empty) _sessionHost = client;
+			if (world != 0 && run != Guid.Empty)
+			{
+				_sessionHost = client;
+				if (_restartTicketIssuer == 0) _restartTicketIssuer = client.PvpIncarnation;
+			}
+			return true;
+		}
+	}
+
+	internal byte[]? IssueHostRestartTicket(ClientSession client)
+	{
+		lock (_lock)
+		{
+			if (!client.CanCarryHostRestartTicket || !HasPlayerIdentity(client.IdentityKey) || !ReferenceEquals(_sessionHost, client) ||
+				_restartTicketIssuer != client.PvpIncarnation) return null;
+			if (_restartTicket is not null) return _restartTicket; // only this original physical stream may retry receipt
+			return _restartTicket = RandomNumberGenerator.GetBytes(HostRestartWire.TicketBytes);
+		}
+	}
+
+	internal bool TryReopenHost(ClientSession client, HostRestartWorld next, byte[] ticket, out HostRestartWorld previous, out string reason)
+	{
+		lock (_lock)
+		{
+			previous = default;
+			if (_absentHost is not { } left) { reason = "host-restart-not-paused"; return false; }
+			if (!client.CanCarryHostRestartTicket || !IsReturningHost(client) || !_readyClients.Contains(client))
+			{ reason = "host-restart-identity"; return false; }
+			if (next.Run == left.RunId || _retiredHostRuns.Contains(next.Run)) { reason = "host-restart-known-run"; return false; }
+			if (_restartTicket is null || !CryptographicOperations.FixedTimeEquals(_restartTicket, ticket))
+			{ reason = "host-restart-ticket"; return false; }
+			previous = new(left.WorldEpoch, left.RunId);
+			_retiredHostRuns.Add(left.RunId);
+			client.NoteAnnouncement(next.Epoch, next.Run);
+			_sessionHost = client;
+			_absentHost = null;
+			reason = "";
+			_logger.Information("MP-HOST-ABSENT restarted old_epoch={OldEpoch} old_run={OldRun} epoch={Epoch} run={Run}",
+				left.WorldEpoch, left.RunId, next.Epoch, next.Run);
 			return true;
 		}
 	}
@@ -360,6 +454,7 @@ public class ClientHandler
 	{
 		lock (_lock)
 		{
+			if (client.ClaimsHost && ReferenceEquals(_announcedHost, client)) _announcedHostClaimed = true;
 			if (_absentHost is not { } left || !client.IsReady || !client.ClaimsHost || !_readyClients.Contains(client)) return false;
 			if (!HostAbsentRules.SameReturn(left, client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId))
 			{
@@ -380,6 +475,16 @@ public class ClientHandler
 	{
 		if (_absentHost is not null) { reason = "host-absent"; return null; }
 		if (_sessionHost is not null) { reason = "session-host"; return _sessionHost; }
+		// Old agents can announce from the initial fallback position. They must not
+		// turn that provisional seat into ownership ahead of the first explicit claim.
+		if (_announcedHostClaimed && _announcedHost is not null) { reason = "announced-host"; return _announcedHost; }
+		if (_departedAnnouncedHost is { } departed)
+		{
+			reason = "awaiting-announced-host";
+			foreach (var c in _readyClients)
+				if (c.IsReady && c.ClaimsHost && departed.Matches(c)) { reason = "returning-announced-host"; return c; }
+			return null;
+		}
 		var claimants = new List<ClientSession>();
 		foreach (var c in _clients)
 			if (c.IsReady && c.ClaimsHost) claimants.Add(c);
@@ -407,7 +512,8 @@ public class ClientHandler
 	public bool HasHostConnected()
 	{
 		lock (_lock)
-			return _absentHost is null && (_sessionHost is not null ||
+			return _departedAnnouncedHost is not null ? PickAuthority(out _) is not null :
+				_absentHost is null && (_sessionHost is not null || _announcedHostClaimed ||
 				_clients.Any(c => c.IsReady && (c.ClaimsHost || !_hostClaimRequired && c.IsLoopback)));
 	}
 

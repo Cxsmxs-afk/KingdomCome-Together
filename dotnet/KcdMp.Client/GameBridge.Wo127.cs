@@ -16,19 +16,26 @@ namespace KcdMp.Client;
 ///     from that moment so a load (the host reloading, _where = Loading) never
 ///     drops the claim mid-session; cleared when the toggle goes off or this
 ///     machine becomes a joiner (a join running, or in the host's world).
-/// A joiner waits for the host at the MAIN MENU (WO-124), so it never claims.
+/// A guest can wait in a private world. Hearing a different host's session
+/// mode fixes that role for the life of this relay link.
 /// </summary>
 public partial class GameBridge
 {
     private bool _hostClaimLatched;
     private DateTime _w144ConnectedUtc = DateTime.MinValue;
+    private volatile bool _foreignHostHeard;
 
-    /// <summary>
-    /// WO-144 5: another agent announced itself as the host of this session (its session mode):
-    /// this machine is a joiner and never claims -- not in its own world, not between a join's end
-    /// and its joined flag (the field's claim after each join).
-    /// </summary>
-    private bool Wo144HostHeard() => _hostModeKnown && _hostModeFrom != _myGhostId;
+    private void Wo127NoteHostMode(byte source)
+    {
+        if (source != _myGhostId) _foreignHostHeard = true;
+    }
+
+    private void Wo127BeginRelayLink()
+    {
+        _foreignHostHeard = false;
+        _hostClaimLatched = false;
+        _w144ConnectedUtc = DateTime.UtcNow;
+    }
 
     private bool? _hostClaimLogged;
 
@@ -36,7 +43,7 @@ public partial class GameBridge
     {
         bool claim;
         if (config.IsHosting) claim = true;
-        else if (!_sharedWorld || _joinedWorld || _jj is not null || Wo144HostHeard()) { _hostClaimLatched = false; claim = false; }
+        else if (!_sharedWorld || _joinedWorld || _jj is not null || _foreignHostHeard) { _hostClaimLatched = false; claim = false; }
         else
         {
             bool inOwnWorld = _where == GameWhere.World || (_where == GameWhere.Unknown && !_startedAtMenu);

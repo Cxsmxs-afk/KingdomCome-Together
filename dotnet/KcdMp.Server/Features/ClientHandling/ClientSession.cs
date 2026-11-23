@@ -52,6 +52,7 @@ public partial class ClientSession
     // One timer for every header wait. A new CancellationTokenSource per packet
     // was a steady allocation on the 30-50 Hz position stream.
     private readonly CancellationTokenSource _idleRead = new();
+    private readonly ITimer? _idleReadTimer;
     private readonly byte[] _pingPayload = new byte[8];
     private int _queuedBytes;
     private long _npcCoalesced;
@@ -229,6 +230,7 @@ public partial class ClientSession
 
     /// <summary>WO-144: the machine on the other end (RelayConnection.IdentityKey). Never logged.</summary>
     public string IdentityKey => _conn.IdentityKey;
+    internal bool CanCarryHostRestartTicket => _conn.CanCarryHostRestartTicket;
 
     /// <summary>WO-144: a newer connection of the same player took over -- this one closes now (its Disconnect goes out as usual).</summary>
     public void Supersede(byte newerId) =>
@@ -270,16 +272,19 @@ public partial class ClientSession
     private readonly TimeSpan _idleTimeout;
 
     public ClientSession(ILogger logger, TcpClient tcp, TcpBroadcastService broadcastService,
-        SessionManager sessions, ClientHandler clientHandler, TimeSpan idleTimeout)
-        : this(logger, RelayConnection.FromTcp(tcp), broadcastService, sessions, clientHandler, idleTimeout) { }
+        SessionManager sessions, ClientHandler clientHandler, TimeSpan idleTimeout, TimeProvider? idleTimeProvider = null)
+        : this(logger, RelayConnection.FromTcp(tcp), broadcastService, sessions, clientHandler, idleTimeout, idleTimeProvider) { }
 
     public ClientSession(ILogger logger, RelayConnection conn, TcpBroadcastService broadcastService,
-        SessionManager sessions, ClientHandler clientHandler, TimeSpan idleTimeout)
+        SessionManager sessions, ClientHandler clientHandler, TimeSpan idleTimeout, TimeProvider? idleTimeProvider = null)
     {
         _logger = logger;
         _conn = conn;
         _stream = conn.Stream;
         _idleTimeout = idleTimeout;
+        // Keep the reusable CTS: .NET 8 TryReset only supports its built-in timer.
+        _idleReadTimer = idleTimeProvider?.CreateTimer(static state => ((CancellationTokenSource)state!).Cancel(),
+            _idleRead, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         _broadcastService = broadcastService;
         _sessions = sessions;
         _clientHandler = clientHandler;
@@ -1210,7 +1215,7 @@ public partial class ClientSession
                 // receiver sees exactly what it saw before WO-127.
                 bool claims = (flags & Protocol.PositionFlagHostClaim) != 0;
                 flags = (byte)(flags & ~Protocol.PositionFlagHostClaim);
-                if (claims && _clientHandler.HostAbsent && !_clientHandler.IsReturningHost(this))
+                if (claims && !_clientHandler.AllowsHostClaim(this))
                     claims = false;
                 if (claims != ClaimsHost)
                 {
@@ -1247,6 +1252,7 @@ public partial class ClientSession
             _worldSyncStop.Dispose();
             StopWriteQueue();
             await writeTask;
+            if (_idleReadTimer is not null) await _idleReadTimer.DisposeAsync();
             _idleRead.Dispose();
             _conn.Dispose();
         }
@@ -2051,7 +2057,8 @@ public partial class ClientSession
     {
         if (!_idleRead.TryReset())
             throw new IOException("the idle timer could not be armed again");
-        _idleRead.CancelAfter(_idleTimeout);
+        if (_idleReadTimer is null) _idleRead.CancelAfter(_idleTimeout);
+        else _idleReadTimer.Change(_idleTimeout, Timeout.InfiniteTimeSpan);
         try
         {
             int offset = 0;

@@ -37,6 +37,42 @@ void m34(const Pose& p, float m[12]) {
 } // namespace
 
 int wo203_cam_tests(int* passed) {
+    // The service resolver can reject an unpublished gEnv during bootstrap,
+    // while its already lifted slot publishes a valid environment later.
+    {
+        struct Source {
+            void* env = nullptr;
+            void* candidate = nullptr;
+            void* const* candidateVtable = nullptr;
+            mutable int searches = 0;
+            mutable size_t bytes = 0;
+            bool ready() const { return false; }
+            void* environment() const { return env; }
+            void* find(void* actualEnv, size_t limit, void* const* vtable) const {
+                ++searches;
+                bytes = limit;
+                return actualEnv == env && vtable == candidateVtable ? candidate : nullptr;
+            }
+        } source;
+        int env = 0, cameraSystem = 0;
+        void* matching[1] = {}, *foreign[1] = {};
+        void* cached = nullptr;
+        WCHECK(!resolve_camera_system(cached, matching, source) && source.searches == 0,
+               "an unpublished environment does not trigger a camera scan");
+        source.env = &env;
+        source.candidate = &cameraSystem;
+        source.candidateVtable = foreign;
+        WCHECK(!resolve_camera_system(cached, nullptr, source) && source.searches == 0,
+               "a missing CSystem anchor does not trigger a camera scan");
+        WCHECK(!resolve_camera_system(cached, matching, source) && source.searches == 1 && source.bytes == 0x400,
+               "late environment rejects a different CSystem type with a bounded lookup");
+        source.candidateVtable = matching;
+        WCHECK(!source.ready() && resolve_camera_system(cached, matching, source) && cached == &cameraSystem,
+               "late published gEnv resolves the camera even after global engine readiness failed");
+        source.env = nullptr;
+        WCHECK(resolve_camera_system(cached, matching, source) && source.searches == 2,
+               "resolving again reuses the verified system without another scan");
+    }
     // the matrix round trip: the engine's camera matrix -> the pose it holds
     {
         Pose p = pose(10, 20, 30, 37);

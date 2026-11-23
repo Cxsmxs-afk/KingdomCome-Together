@@ -5947,11 +5947,15 @@ function KCD2MP_Wo125PlayerIsHenry(tok)
     KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " henry=" .. ((id == "char_26_uiName") and "yes" or "no") .. " id=" .. id)
 end
 
--- The save the engine loaded last (cvar wh_sys_LastLoadedSave), base name only: the
--- agent checks that the world in memory is the file its join placed.
-function KCD2MP_Wo125LastLoaded(tok)
+-- The save the engine loaded last. Ordinary joins use the base name of their unique
+-- file. Private-return recovery needs the playline and path as well.
+function KCD2MP_Wo125LastLoaded(tok, full)
     local v = "?"
     pcall(function() v = tostring(System.GetCVar("wh_sys_LastLoadedSave")) end)
+    if full then
+        KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " path=" .. v)
+        return v
+    end
     local base = (v:match("([^/\\]+)$") or v):gsub("%.whs$", "")
     KCD2MP_EmitEvent("wo124_reply", tostring(tok) .. " last=" .. base)
     return base
@@ -29869,6 +29873,11 @@ do
         if fresh then KCD2MP_EmitEvent("w154_menu_cfg", "fast_travel=" .. onoff(M.fastTravel)) end   -- a (re)started agent learns ours
     end
 
+    -- A private return can still need a player action after the relay is gone.
+    function KCD2MP_W154MenuReturnRetry(pending)
+        M.returnRetry = pending == true
+    end
+
     -- The game's own screen (its menu, inventory, map, skip-time, a cutscene) came up: the mod menu closes.
     function KCD2MP_W154MenuGameScreen(on, src)
         local was = M.gameScreen == true
@@ -29976,6 +29985,7 @@ do
     }
 
     function M.connectionText()
+        if M.returnRetry then return "Return unconfirmed. Choose Leave to check it again." end
         if not M.fresh() then return "Not connected" end
         if M.link == "connected" then
             local note = KCD2MP_W157ConnNote and KCD2MP_W157ConnNote() or ""   -- WO-157 3.2: "-- the connection is struggling"
@@ -36325,8 +36335,8 @@ do
     function KCD2MP_W211Leave(src)
         local w = KCD2MP.w211
         local menu = KCD2MP.w154menu
-        local visiting = menu and menu.roleNow() == "joiner" and
-            (menu.joinPhase == "connected" or menu.joinPhase == "paused" or menu.joinPhase == "return-needed")
+        local visiting = menu and (menu.returnRetry or menu.roleNow() == "joiner" and
+            (menu.joinPhase == "connected" or menu.joinPhase == "paused" or menu.joinPhase == "return-needed"))
         if not w.holding and not visiting then
             mp_log("WO211-LINK leave refused: no shared world")
             pcall(KCD2MP_ShowNativeToast, "You are already in your own game.")

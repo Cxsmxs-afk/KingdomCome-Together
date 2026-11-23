@@ -15,9 +15,20 @@
 //     holds the last pose (never drifts).
 #pragma once
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace kcdmp::wo203cam {
+
+constexpr std::size_t kCameraSystemSearchBytes = 0x400;
+
+template <class Source>
+bool resolve_camera_system(void*& system, void* const* vtable, const Source& source) {
+    if (system) return true;
+    if (!vtable) return false;
+    if (void* env = source.environment()) system = source.find(env, kCameraSystemSearchBytes, vtable);
+    return system != nullptr;
+}
 
 constexpr float kCutMetres = 0.6f;
 constexpr float kCutDegrees = 25.0f;

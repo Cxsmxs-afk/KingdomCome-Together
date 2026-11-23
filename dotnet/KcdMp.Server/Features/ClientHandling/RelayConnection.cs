@@ -37,6 +37,7 @@ public sealed class RelayConnection : IDisposable
     /// a hash of the Steam peer (SteamP2PConnection.PeerKey). Never logged.
     /// </summary>
     public string IdentityKey { get; }
+    internal bool CanCarryHostRestartTicket { get; init; }
 
     /// <summary>WO-213 A.3/B: the Steam connection under a Steam stream (its status, its config, its lanes); null on TCP.</summary>
     public KcdMp.Steam.SteamP2PConnection? Steam { get; init; }
@@ -61,12 +62,14 @@ public sealed class RelayConnection : IDisposable
         var ep = tcp.Client.RemoteEndPoint;
         bool loop = ep is IPEndPoint ip && IPAddress.IsLoopback(ip.Address);
         string key = ep is IPEndPoint ip2 ? "tcp:" + (ip2.Address.IsIPv4MappedToIPv6 ? ip2.Address.MapToIPv4() : ip2.Address) : "tcp:?";
-        return new RelayConnection(tcp.GetStream(), ep?.ToString() ?? "(unknown)", loop, "tcp", tcp.Dispose, key);
+        return new RelayConnection(tcp.GetStream(), ep?.ToString() ?? "(unknown)", loop, "tcp", tcp.Dispose, key)
+            { CanCarryHostRestartTicket = loop };
     }
 
     /// <summary>A Steam P2P stream: never loopback, logged without an id.</summary>
-    public static RelayConnection FromSteam(Stream steamStream, string peerKey = "", KcdMp.Steam.SteamP2PConnection? steam = null) =>
-        new(steamStream, "steam-peer", isLoopback: false, "steam", steamStream.Dispose, "steam:" + peerKey) { Steam = steam };
+    public static RelayConnection FromSteam(Stream steamStream, string peerKey = "", KcdMp.Steam.SteamP2PConnection? steam = null,
+        bool authenticated = false) => new(steamStream, "steam-peer", isLoopback: false, "steam", steamStream.Dispose, "steam:" + peerKey)
+        { Steam = steam, CanCarryHostRestartTicket = authenticated };
 
     public void Dispose()
     {

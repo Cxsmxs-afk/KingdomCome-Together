@@ -102,10 +102,14 @@ public sealed class SteamP2PConnection : IDisposable
     {
         get
         {
+            if (RemoteSteamId == 0) return "";
             var h = System.Security.Cryptography.SHA256.HashData(BitConverter.GetBytes(RemoteSteamId ^ 0x6B63746F67657468UL));
             return Convert.ToHexString(h, 0, 8);
         }
     }
+
+    public bool HasAuthenticatedPeer(int infoFlags) => IsConnected && RemoteSteamId != 0 && infoFlags >= 0 &&
+        (infoFlags & (SteamNative.InfoFlagUnauthenticated | SteamNative.InfoFlagUnencrypted)) == 0;
 
     /// <summary>ESteamNetworkingConnectionState as last reported.</summary>
     public int State => _state;

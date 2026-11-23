@@ -23,9 +23,10 @@ public sealed class ClientSessionRunner
 
 	/// <summary>
 	/// WO-102.5 Phase 4: configurable so the relay round-trip tests can use a
-	/// short timeout instead of ClientSession's 30 s field default.
+	/// short timeout instead of the 90 s default.
 	/// </summary>
 	public TimeSpan IdleTimeout { get; }
+	internal TimeProvider? IdleTimeProvider { get; }
 
 	/// <summary>
 	/// WO-206 B: the test-only fault layer, or null -- always null unless BOTH
@@ -34,7 +35,7 @@ public sealed class ClientSessionRunner
 	public RelayFaults? Faults { get; }
 
 	public ClientSessionRunner(ILogger logger, IConfiguration configuration, ClientHandler clientHandler,
-		TcpBroadcastService broadcastService, SessionManager sessions, RelayFaults? faults = null)
+		TcpBroadcastService broadcastService, SessionManager sessions, RelayFaults? faults = null, TimeProvider? idleTimeProvider = null)
 	{
 		Faults = faults;
 		_logger = logger;
@@ -45,17 +46,18 @@ public sealed class ClientSessionRunner
 		// loop is separate from the console, so this only fires when nothing
 		// at all arrives. SessionHold.IdleTimeoutMs is the same number.
 		IdleTimeout = TimeSpan.FromMilliseconds(int.Parse(configuration.GetSection("Tcp")["IdleTimeoutMs"] ?? "90000"));
+		IdleTimeProvider = idleTimeProvider;
 	}
 
 	public ClientSession Create(RelayConnection conn)
 	{
 		if (Faults is null)
-			return new(_logger, conn, _broadcastService, _sessions, _clientHandler, IdleTimeout);
+			return new(_logger, conn, _broadcastService, _sessions, _clientHandler, IdleTimeout, IdleTimeProvider);
 
 		// WO-206 B: the session runs on the fault layer's stream; the layer needs
 		// the session back for the client's role and name.
 		var faulted = Faults.Attach(conn);
-		var client = new ClientSession(_logger, faulted.Connection, _broadcastService, _sessions, _clientHandler, IdleTimeout);
+		var client = new ClientSession(_logger, faulted.Connection, _broadcastService, _sessions, _clientHandler, IdleTimeout, IdleTimeProvider);
 		faulted.Bind(client);
 		return client;
 	}

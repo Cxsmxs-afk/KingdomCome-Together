@@ -46,7 +46,9 @@ public class Program
 	/// TcpBroadcastService code path over a real socket, not a copy of it.
 	/// With port zero, TcpSocketService reports the actual OS-assigned endpoint.
 	/// </summary>
-	public static WebApplication CreateApp(string[] args)
+	public static WebApplication CreateApp(string[] args) => CreateApp(args, null);
+
+	public static WebApplication CreateApp(string[] args, TimeProvider? idleTimeProvider)
 	{
 		// WO-206 B: the test bench's fault mode (Features/Faults/RelayFaultPlan.cs).
 		// Both the environment variable and the option, or nothing. The option
@@ -101,6 +103,7 @@ public class Program
 		builder.Services.AddSingleton<TcpBroadcastService>();
 		builder.Services.AddSingleton<SessionManager>();
 		builder.Services.AddSingleton<ClientSessionRunner>();   // WO-127: one session lifecycle for TCP and Steam
+		if (idleTimeProvider is not null) builder.Services.AddSingleton(idleTimeProvider);
 
 		// WO-127: Steam P2P beside the TCP listener. Does nothing unless Steam:Enabled.
 		builder.Services.AddSingleton<SteamRelayStatus>();
