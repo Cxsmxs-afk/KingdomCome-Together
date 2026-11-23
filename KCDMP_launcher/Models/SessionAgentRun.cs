@@ -100,7 +100,8 @@ public sealed class SessionAgentRun(Process game, Process agent, SessionAgentLau
         // PID, and a process tree would include children the launcher doesn't own.
         try { Agent.Kill(entireProcessTree: false); }
         catch (InvalidOperationException) when (Agent.HasExited) { return AgentStop.Graceful; }
-        await Agent.WaitForExitAsync().WaitAsync(StopTimeout);
+        using var forcedDeadline = new CancellationTokenSource(StopTimeout);
+        await Agent.WaitForExitAsync(forcedDeadline.Token);
         return AgentStop.Forced;
 
         void CheckScope()
