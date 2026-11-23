@@ -368,8 +368,8 @@ public sealed partial class JoinCalendarIntegrationTests
                 await leave.WaitAsync(ct);
                 if (homeHashes is not null)
                 {
-                    foreach (var (path, original) in homeHashes)
-                        Assert.Equal(original, SHA256.HashData(File.ReadAllBytes(path)));
+                    foreach (var (path, expectedHash) in homeHashes)
+                        Assert.Equal(expectedHash, SHA256.HashData(File.ReadAllBytes(path)));
                     Console.WriteLine($"W6 fresh: host={hostName} joiner={guestName} newer={newerStart} own_loads={guestGame.OwnLoadsIssued} home_sha256_unchanged={homeHashes.Count}");
                 }
             }
