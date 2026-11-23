@@ -173,7 +173,10 @@ public sealed partial class JoinCalendarIntegrationTests
             WithholdWorldTransfer = probe == JoinProbe.HostLossBeforeOffer
         };
         await using var hostPipe = new JoinCalendarTestPipe(refuseHold: probe == JoinProbe.MissingHold);
-        await using var guestPipe = new JoinCalendarTestPipe(failCalendarArm: probe == JoinProbe.RepeatAborts);
+        await using var guestPipe = new JoinCalendarTestPipe(failCalendarArm: probe == JoinProbe.RepeatAborts)
+        {
+            CanQuickSave = f4 != F4Probe.ActiveGuest,
+        };
         if (f4 == F4Probe.NoOwnExit)
             guestPipe.SaveListed = (slot, name) => File.Exists(Path.Combine(fixture.GuestSaves, $"playline{slot}", name + ".whs"));
         Func<int, byte[]> makeHostSave = f4 is F4Probe.TransferAbort or F4Probe.HostAbort or F4Probe.TransportLost
@@ -233,7 +236,9 @@ public sealed partial class JoinCalendarIntegrationTests
 
             if (f4 is { } loop && loop != F4Probe.HostReturn)
             {
-                if (loop == F4Probe.TransportLost)
+                if (loop == F4Probe.ActiveGuest)
+                    await TestF4ActiveGuestsAsync(fixture, relay.Port, host, guest, hostLink, guestLink, guestGame, observerC!, ct);
+                else if (loop == F4Probe.TransportLost)
                     await TestF4TransportLossAsync(fixture, relay.Port, guestName, host, guest, hostLink, guestPeer, guestLink, guestRead, guestGame, ct);
                 else
                     await TestF4LoopAsync(loop, fixture, host, guest, hostLink, guestLink, guestPipe, hostGame, guestGame, ct);

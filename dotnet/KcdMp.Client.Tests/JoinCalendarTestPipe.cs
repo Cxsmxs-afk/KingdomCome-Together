@@ -36,6 +36,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
 
     public CombatPipe Pipe { get; }
     public Func<int, string, bool>? SaveListed { get; set; }
+    public bool CanQuickSave { get; init; } = true;
     public Action? BeforeCalendarArm { get; set; }
     public Action<string>? RequestScopedSnapshot { get; set; }
     public Task ArmObserved => _arm.Task;
@@ -217,7 +218,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         Protocol.Wo216OpConfig when request.Length == 14 => [1, seq, request[0], 0],
         Protocol.Wo216OpBrains when request.Length == 1 => [1, seq, request[0], 0, .. "decision_gate=armed story_gate=armed"u8],
         Protocol.Wo200OpConfig when request.Length == 7 => [1, seq, request[0], 0, request[1], request[2]],
-        Protocol.Wo184OpSaveState when request.Length == 1 => [1, seq, request[0], 0, 1, 0, 0, 1],
+        Protocol.Wo184OpSaveState when request.Length == 1 => [1, seq, request[0], 0, 1, 0, 0, (byte)(CanQuickSave ? 1 : 0)],
         Protocol.H21OpSnapshot when request.Length == 26 => ScopedSnapshot(seq, request[1..]),
         _ => [0, seq, request[0], (byte)PipeReason.UnknownCommand],
     };

@@ -8,7 +8,7 @@ namespace KcdMp.Client.Tests;
 
 public sealed partial class JoinCalendarIntegrationTests
 {
-    private enum F4Probe { TransferAbort, NoOwnExit, HostAbort, MissingOwnSave, TransportLost, HostReturn }
+    private enum F4Probe { TransferAbort, NoOwnExit, HostAbort, MissingOwnSave, ActiveGuest, TransportLost, HostReturn }
 
     [Theory]
     [InlineData("A", "B")]
@@ -27,6 +27,13 @@ public sealed partial class JoinCalendarIntegrationTests
     [Fact]
     public Task Five_missing_own_saves_refuse_a_join_then_accept_the_next_attempt_after_restoring_the_save() =>
         RunAsync("A", "B", dropFirstSnapshot: false, f4: F4Probe.MissingOwnSave);
+
+    [Theory]
+    [InlineData(3)]
+    [InlineData(4)]
+    public Task Two_active_guests_repeat_join_and_private_return_with_overlapping_departures(int players) =>
+        RunAsync(players == 3 ? "A" : "B", players == 3 ? "B" : "A", dropFirstSnapshot: false,
+            extraPeers: players - 2, f4: F4Probe.ActiveGuest);
 
     [Fact]
     public Task Five_tcp_failures_during_transfer_can_retry_on_the_same_agent_and_engine() =>
@@ -317,6 +324,84 @@ public sealed partial class JoinCalendarIntegrationTests
         Assert.Equal(6, exits.Count);
         Assert.Equal(ownBefore, SHA256.HashData(File.ReadAllBytes(ownSave)));
         AssertF4Resources("mpexit", before, guest, guestPipe);
+    }
+
+    private static async Task TestF4ActiveGuestsAsync(SaveFixture fixture, int port, GameBridge host, GameBridge first,
+        JoinWire hostLink, JoinWire firstLink, JoinCalendarTestEngine firstEngine, ReplayPeer secondPeer, CancellationToken ct)
+    {
+        string secondSave = Path.Combine(fixture.GuestSaves, "playline1", "save002.whs");
+        var (_, source) = WhsSaveTests.Pair();
+        source.Seed += 7;
+        source.Strength += 10;
+        Directory.CreateDirectory(Path.GetDirectoryName(secondSave)!);
+        File.WriteAllBytes(secondSave, WhsSaveTests.File(source));
+        byte[] firstHash = SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave));
+        byte[] secondHash = SHA256.HashData(File.ReadAllBytes(secondSave));
+        using var secondStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        await secondPeer.SendAsync(Protocol.BuildLinkHelloUp(Protocol.LinkCapWorldSync), ct);
+        var secondLink = new JoinWire(secondPeer.Wire, await secondPeer.DrainAsync(ct), dropFirstSnapshot: false);
+        // Both guests can load their own saves while the engine refuses QuickSave.
+        await using var secondPipe = new JoinCalendarTestPipe() { CanQuickSave = false };
+        await using var secondEngine = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "guest-c.log"), fixture.GuestSaves,
+            null, secondPipe.ObserveGameplayStarted);
+        var second = CreateBridge(secondPeer.Id, false, secondLink, secondPipe.Pipe, secondEngine.Transport, fixture.GuestSaves, secondStop.Token, port);
+        secondEngine.Transport.MainMenuShown += secondPipe.ObserveMainMenu;
+        secondEngine.Emit("wo124_where", "menu");
+        Task secondRead = InvokeAsync(second, "ReceiveLoopAsync", secondLink, secondStop.Token);
+        try
+        {
+            await WaitAsync(() => Get<bool>(second, "_combatRoleApplyComplete"), "the second guest's authenticated role", ct);
+            Assert.False(Get<bool>(second, "_isDamageAuthority"));
+            await InvokeAsync(host, "Wo206AnnounceAsync", "fixture-second-active", (byte?)secondPeer.Id);
+            await WaitAsync(() => Get<bool>(second, "_hostModeKnown") && Get<Wo206Epochs>(second, "_w206").World != 0,
+                "the second guest to learn the same authenticated world", ct);
+            Assert.Equal(Get<Wo206Epochs>(first, "_w206").World, Get<Wo206Epochs>(second, "_w206").World);
+            Set(first, "_w184SaveOnLeave", false);
+            Set(second, "_w184SaveOnLeave", false);
+            firstEngine.DeferOwnFileRead = true;
+            secondEngine.DeferOwnFileRead = true;
+            for (int cycle = 1; cycle <= 5; cycle++)
+            {
+                async Task JoinAsync(GameBridge guest, JoinWire link, JoinCalendarTestEngine engine, string selected)
+                {
+                    Call(guest, "Wo125OnConsoleChoice", selected);
+                    engine.Emit("join_request", "");
+                    string path = await engine.WaitForJoinLoadAsync(ct);
+                    await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && Get<object?>(host, "_hostJoin") is null &&
+                        !File.Exists(path) && link.ReadySent.Count == cycle && hostLink.ReadyReceived.Contains(link.ReadySent.Last()),
+                        "the active guest to finish its targeted join", ct);
+                }
+
+                await JoinAsync(first, firstLink, firstEngine, "playline0/save001");
+                // The host serializes its save/transfer, but both guests stay live.
+                await JoinAsync(second, secondLink, secondEngine, "playline1/save002");
+                Assert.True(Get<bool>(first, "_joinedWorld"));
+                Task firstLeaving = InvokeAsync(first, "LeaveSharedWorldAsync", "fixture", "return first guest");
+                Task secondLeaving = InvokeAsync(second, "LeaveSharedWorldAsync", "fixture", "return second guest");
+                Assert.Equal(fixture.GuestOwnSave, await firstEngine.WaitForOwnLoadAsync(ct));
+                Assert.Equal(secondSave, await secondEngine.WaitForOwnLoadAsync(ct));
+                Assert.True(Get<bool>(first, "_leaveInProgress"));
+                Assert.True(Get<bool>(second, "_leaveInProgress"));
+                firstEngine.CompleteOwnLoad();
+                secondEngine.CompleteOwnLoad();
+                await Task.WhenAll(firstLeaving, secondLeaving);
+                await WaitAsync(() => !Get<bool>(first, "_leaveInProgress") && !Get<bool>(second, "_leaveInProgress") &&
+                    !Get<bool>(first, "_joinedWorld") && !Get<bool>(second, "_joinedWorld"),
+                    "both of the already observed private loads to confirm", ct);
+                Assert.Equal(firstHash, SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave)));
+                Assert.Equal(secondHash, SHA256.HashData(File.ReadAllBytes(secondSave)));
+                Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
+                Assert.Equal(2 * cycle, hostLink.ReadyReceived.Distinct().Count());
+                Console.WriteLine($"F4-ACTIVE-GUESTS cycle={cycle} targeted_ready={hostLink.ReadyReceived.Count} overlapping_returns=2 own_sha256_equal=2");
+            }
+        }
+        finally
+        {
+            secondStop.Cancel();
+            await InvokeAsync(second, "Wo123OnDisconnectAsync");
+            try { await secondRead.WaitAsync(TimeSpan.FromSeconds(5)); }
+            finally { Get<FileSystemWatcher?>(second, "_savesWatcher")?.Dispose(); }
+        }
     }
 
     private readonly record struct F4Owned(int PipeConnections, long PipeRevision, int Reservations, int Timers);
