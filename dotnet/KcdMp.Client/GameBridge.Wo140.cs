@@ -729,7 +729,7 @@ public partial class GameBridge
             {
                 Console.WriteLine(Wo140Rules.SeparateLogLine + " -- nothing of the host's world is applied here (no NPC stream, puppets, copy guard, stand-ins, leash, loot, quests or crime); the ghosts still show each other");
                 _w140SeparateLogMs = now;
-                SetJoinUi("own-world", SessionHold.FailText("this game is in a world that is not your host's, and reconnecting did not put it back"));
+                SetJoinUi("own-world", Wo140Rules.SeparateText);
                 await Wo140SendLeashStateSoonAsync();
             }
             else

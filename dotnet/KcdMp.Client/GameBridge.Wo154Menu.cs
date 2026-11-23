@@ -122,7 +122,8 @@ public partial class GameBridge
                     joiner && _w154mHostFtKnown ? _w154mHostFt : null,
                     joiner && _w154mHostCrimeKnown ? _w154mHostCrimeJoint : null,
                     joiner && _leashHostCfgUtc != DateTime.MinValue ? _leashHostOn : null,
-                    Wo154MenuRules.LinkWord(AgentConnectionStatus.State), ReleaseVersionInfo.Current, Wo154MenuGameScreenNow(), _localDowned));
+                    Wo154MenuRules.LinkWord(AgentConnectionStatus.State), ReleaseVersionInfo.Current,
+                    Wo154MenuGameScreenNow(), _localDowned, joiner ? JoinMenuPhase() : null));
 
                 // The saved choices: once per epoch (a session start, a world load), after the world settled; the
                 // host's levers again whenever this player becomes the host within an epoch.
@@ -147,7 +148,16 @@ public partial class GameBridge
         }
     }
 
-    /// <summary>The saved choices into the mod (each through the console command's own setter, in the mod).</summary>
+    private string JoinMenuPhase()
+    {
+        if (HostAbsentPause || LinkHeld) return "paused";
+        if (_leaveInProgress || _jj is { Phase: "loading" or "post-load" or "orphaned" }) return "loading";
+        if (_jj is not null || _joinOutId != 0 || Volatile.Read(ref _joinPreparation) is not null) return "waiting";
+        if (_returningFromSharedWorld) return "return-needed";
+        return _joinedWorld ? "connected" : "ready";
+    }
+
+    /// <summary>Send the saved choices to the mod through their regular setters.</summary>
     private async Task Wo154MenuRestoreAsync(bool hosting, bool own, string why)
     {
         JsonObject? file = SettingsJson.Read(W154mModSettings);

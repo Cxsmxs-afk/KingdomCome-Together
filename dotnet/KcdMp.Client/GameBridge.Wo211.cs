@@ -64,14 +64,16 @@ public partial class GameBridge
                 Console.WriteLine($"MP-W211 cfg {cfg}={(on ? "on" : "off")}");
                 _ = Wo211PushConfigAsync();
                 return;
-            case "w211_leave":       // A.1: the player chose "Leave the host's world" in the co-op menu during a link hold
+            case "w211_leave":
                 Interlocked.Increment(ref _w211LeaveAsked);
-                Console.WriteLine($"WO211-LINK the player asked to leave{(LinkHeld ? " during the hold" : " (no hold runs: nothing to do)")}");
-                if (LinkHeld || HostAbsentPause) _w211LeaveNow = true;
-                if (HostAbsentPause && !LinkHeld)
+                if ((!_joinedWorld && !_returningFromSharedWorld) || _isDamageAuthority)
                 {
-                    _ = LeaveSharedWorldAsync("host-left", "You left your partner's world.");
+                    Console.WriteLine("WO211-LINK leave refused reason=no-shared-world");
+                    return;
                 }
+                Console.WriteLine($"WO211-LINK leave requested held={On(LinkHeld)}");
+                if (LinkHeld) _w211LeaveNow = true;
+                else _ = LeaveSharedWorldAsync(HostAbsentPause ? "host-left" : "player-leave", "You left your host's world.");
                 return;
             case "w211_fly":         // E: the mod refused the debug flight (or a tester's mp_allow_fly let it)
                 if (arg?.StartsWith("refused", StringComparison.Ordinal) == true) Interlocked.Increment(ref _w211FlyRefused);

@@ -94,6 +94,7 @@ public sealed class WorldReceiver : IDisposable
     public const string FilePrefix = "world-";
 
     private FileStream? _fs;
+    private readonly object _fileGate = new();
     private readonly IncrementalHash _sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
     private bool _finished;
 
@@ -154,6 +155,11 @@ public sealed class WorldReceiver : IDisposable
     /// </summary>
     public ChunkResult Accept(uint index, ReadOnlySpan<byte> data, out string why)
     {
+        lock (_fileGate) return AcceptCore(index, data, out why);
+    }
+
+    private ChunkResult AcceptCore(uint index, ReadOnlySpan<byte> data, out string why)
+    {
         why = "";
         if (_finished || _fs is null) { why = "the transfer is over"; return ChunkResult.Error; }
         if (index != (uint)Next) { why = $"chunk {index} out of order (expected {Next})"; return ChunkResult.Error; }
@@ -175,6 +181,11 @@ public sealed class WorldReceiver : IDisposable
     /// kept (the next WO places it). Anything else: deleted, with the abort reason.
     /// </summary>
     public (bool Ok, byte Reason, string Why) Finish()
+    {
+        lock (_fileGate) return FinishCore();
+    }
+
+    private (bool Ok, byte Reason, string Why) FinishCore()
     {
         if (_finished) return (false, Protocol.JoinAbortProtocol, "already finished");
         _finished = true;
@@ -212,10 +223,13 @@ public sealed class WorldReceiver : IDisposable
     /// <summary>Stops and deletes whatever was staged (an abort, a disconnect, a timeout).</summary>
     public void Abort()
     {
-        _finished = true;
-        try { _fs?.Dispose(); } catch { }
-        _fs = null;
-        DeleteFiles();
+        lock (_fileGate)
+        {
+            _finished = true;
+            try { _fs?.Dispose(); } catch { }
+            _fs = null;
+            DeleteFiles();
+        }
     }
 
     private void DeleteFiles()
