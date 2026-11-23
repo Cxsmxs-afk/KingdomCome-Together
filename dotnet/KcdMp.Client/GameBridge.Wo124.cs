@@ -251,9 +251,9 @@ public partial class GameBridge
         bool on = Protocol.JoinReasonName(reason) == "shared-world";
         bool changed = !_hostModeKnown || _hostSharedWorld != on || _hostModeFrom != src;
         _hostSharedWorld = on;
-        _hostModeKnown = true;
         _hostModeFrom = src;
         if (on) Wo125OnSessionIdentity(joinId, arg);
+        _hostModeKnown = true;
         if (!changed) return;
         Console.WriteLine($"MP-JOIN joiner: the host (ghost {src}) runs {(on ? "a SHARED WORLD" : "separate worlds")} -- this machine follows (local mp_shared_world={On(_sharedWorld)} ignored while connected)");
         _ = ExecLuaAsync($"if KCD2MP_Wo124SessionMode then KCD2MP_Wo124SessionMode({(on ? "true" : "false")}) end");
