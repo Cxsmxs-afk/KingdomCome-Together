@@ -1063,8 +1063,7 @@ public partial class GameBridge
             if (exitReceipt is null) return sent;
 
             bool loaded = await WaitForPrivateReturnAsync(exitReceipt);
-            DetachPrivateReturn(exitReceipt);
-            if (!loaded && _leaveInProgress && OwnLoadExpected) Wo124OnLoadFailedToMenu();
+            if (!loaded && _leaveInProgress && OwnLoadExpected) Wo124OnLoadFailedToMenuCore(confirmedByPrivateReceipt: true);
             return !loaded;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or HttpRequestException)

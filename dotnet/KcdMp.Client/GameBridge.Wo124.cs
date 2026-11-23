@@ -427,9 +427,11 @@ public partial class GameBridge
     }
 
     /// <summary>"Exiting to main menu because save game loading failed." -- the engine went back to the menu.</summary>
-    private void Wo124OnLoadFailedToMenu()
+    private void Wo124OnLoadFailedToMenu() => Wo124OnLoadFailedToMenuCore(confirmedByPrivateReceipt: false);
+
+    private void Wo124OnLoadFailedToMenuCore(bool confirmedByPrivateReceipt)
     {
-        if (_transport is LogTailGameTransport engine && IgnoreEngineTerminal(engine)) return;
+        if (!confirmedByPrivateReceipt && _transport is LogTailGameTransport engine && IgnoreEngineTerminal(engine)) return;
         if (!OwnLoadExpected && _jj is { EngineReceipt: { } receipt } && !receipt.MatchesTerminal(loaded: false)) return;
         _where = GameWhere.Menu;
         LoadSequenceOnMenu();
@@ -1295,9 +1297,11 @@ public partial class GameBridge
     private Task<string> AskModAsync(string fn, int timeoutMs) => AskModAsync(fn, timeoutMs, null);
 
     /// <summary>WO-183: with one more argument after the token, already a Lua literal ("..." for a string, a number).</summary>
-    private async Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg, CancellationToken ct = default)
+    private async Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg, CancellationToken ct = default,
+        bool requireActiveLog = false)
     {
         string tok = Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
+        if (requireActiveLog) tok = "r" + tok;
         var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         _wo124Replies[tok] = tcs;
         try
@@ -1547,7 +1551,7 @@ public partial class GameBridge
             if (_leaveInProgress && OwnLoadExpected)
             {
                 if (loaded) Wo124OnGameplayStartedCore(confirmedByGameQuery: true);
-                else Wo124OnLoadFailedToMenu();
+                else Wo124OnLoadFailedToMenuCore(confirmedByPrivateReceipt: true);
             }
         }
     }
@@ -1606,7 +1610,7 @@ public partial class GameBridge
         {
             Console.WriteLine($"MP-H21-HOME result=confirmed loaded={completed}");
             if (completed) Wo124OnGameplayStartedCore(confirmedByGameQuery: true);
-            else Wo124OnLoadFailedToMenu();
+            else Wo124OnLoadFailedToMenuCore(confirmedByPrivateReceipt: true);
         }
     }
 

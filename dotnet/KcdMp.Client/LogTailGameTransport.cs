@@ -396,6 +396,10 @@ public sealed class LogTailGameTransport : IGameTransport
     private long _engineLogIncarnation = 1;
     private string? _engineAcceptedSave, _engineReadSave;
     private bool _engineSaveAmbiguous;
+    private long _engineReadSequence;
+    internal long EngineReadSequence => Interlocked.Read(ref _engineReadSequence);
+    internal bool DispatchingOwnedSaveTerminal { get; private set; }
+    internal void MarkSaveTerminalOwned() => DispatchingOwnedSaveTerminal = true;
     internal long EngineLogIncarnation => Interlocked.Read(ref _engineLogIncarnation);
     internal string? EngineAcceptedSave => _engineAcceptedSave;
     internal string? EngineReadSave => _engineReadSave;
@@ -865,6 +869,7 @@ public sealed class LogTailGameTransport : IGameTransport
                 if (ConflictingEngineSave(_engineReadSave, path) || ConflictingEngineSave(_engineAcceptedSave, path))
                     _engineSaveAmbiguous = true;
                 _engineReadSave = _engineAcceptedSave = path;
+                Interlocked.Increment(ref _engineReadSequence);
             }
             try { LoadStarted?.Invoke(); }
             catch (Exception ex) { Console.WriteLine($"[join] load-started handler threw: {ex.Message}"); }
@@ -1005,17 +1010,27 @@ public sealed class LogTailGameTransport : IGameTransport
 
     // A live game query can settle this exact read even if the terminal
     // log line was lost. Consume it so it cannot mark the next read ambiguous.
-    internal bool TryConsumeProbedEngineRead(long incarnation, string path, string? alias, StringComparison comparison)
+    internal long FindProbedEngineRead(long incarnation, long after, string path, string? alias, StringComparison comparison)
+    {
+        lock (_engineSaveGate)
+            return _engineReadSequence > after && ProbedEngineReadMatches(incarnation, path, alias, comparison)
+                ? _engineReadSequence : 0;
+    }
+
+    internal bool TryConsumeProbedEngineRead(long incarnation, long sequence, string path, string? alias, StringComparison comparison)
     {
         lock (_engineSaveGate)
         {
-            if (incarnation != EngineLogIncarnation || _engineSaveAmbiguous || _engineReadSave is null ||
-                (!string.Equals(_engineReadSave, path, comparison) && !string.Equals(_engineReadSave, alias, comparison)))
+            if (_engineReadSequence != sequence || !ProbedEngineReadMatches(incarnation, path, alias, comparison))
                 return false;
             _engineAcceptedSave = _engineReadSave = null;
             return true;
         }
     }
+
+    private bool ProbedEngineReadMatches(long incarnation, string path, string? alias, StringComparison comparison) =>
+        incarnation == EngineLogIncarnation && !_engineSaveAmbiguous && _engineReadSave is not null &&
+        (string.Equals(_engineReadSave, path, comparison) || string.Equals(_engineReadSave, alias, comparison));
 
     private void ReportEngineSaveTerminal(bool loaded, Action? observed)
     {
@@ -1036,7 +1051,12 @@ public sealed class LogTailGameTransport : IGameTransport
             observed?.Invoke();
         }
         catch (Exception ex) { Console.WriteLine($"[join] engine save terminal handler threw: {ex.GetType().Name}"); }
-        finally { DispatchingTerminalSave = null; DispatchingAmbiguousSaveTerminal = false; }
+        finally
+        {
+            DispatchingTerminalSave = null;
+            DispatchingAmbiguousSaveTerminal = false;
+            DispatchingOwnedSaveTerminal = false;
+        }
     }
 
     private string? _lastStoryMarker;
@@ -1063,7 +1083,17 @@ public sealed class LogTailGameTransport : IGameTransport
     private static bool IsEarlyDelivered(string text, int start, int len, string? early) =>
         early is not null && text.AsSpan(start, len).TrimEnd('\r').SequenceEqual(early.AsSpan());
 
+    private static bool IsPrivateReturnReply(ReadOnlySpan<char> line)
+    {
+        const string prefix = EventTag + " v1 ";
+        if (!line.StartsWith(prefix, StringComparison.Ordinal)) return false;
+        var eventFields = line[prefix.Length..];
+        int sequenceEnd = eventFields.IndexOf(' ');
+        return sequenceEnd >= 0 && eventFields[(sequenceEnd + 1)..].StartsWith("wo124_reply r", StringComparison.Ordinal);
+    }
+
     private static bool RequiresActiveLog(ReadOnlySpan<char> line) =>
+        IsPrivateReturnReply(line) ||
         line.StartsWith("Log Started at ", StringComparison.Ordinal) ||
         line.StartsWith("CSystem::Quit invoked", StringComparison.Ordinal) ||
         line.StartsWith("[CryAction] LoadGame: '", StringComparison.Ordinal) ||
@@ -1202,7 +1232,8 @@ public sealed class LogTailGameTransport : IGameTransport
                     if (partial.Length > 0 && earlyDone is null && (DateTime.UtcNow - partialSince).TotalMilliseconds >= 300)
                     {
                         string pending = partial.ToString();
-                        if (pending.StartsWith(EventTag, StringComparison.Ordinal))
+                        if (pending.StartsWith(EventTag, StringComparison.Ordinal) &&
+                            (!IsPrivateReturnReply(pending) || PathStillNamesCurrentLog()))
                         {
                             earlyDone = pending;
                             ProcessLine(pending.AsSpan());

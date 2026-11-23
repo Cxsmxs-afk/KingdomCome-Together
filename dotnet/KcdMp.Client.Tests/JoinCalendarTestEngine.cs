@@ -36,6 +36,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private string? _lastLoaded;
     private int _joinLoadsIssued, _joinFilesRead, _ownLoadsIssued, _whereQueries;
     public int WhereQueries => Volatile.Read(ref _whereQueries);
+    public volatile bool ReturnRetryVisible;
     private readonly Channel<string> _exitLoads = Channel.CreateUnbounded<string>();
 
     public JoinCalendarTestEngine(string logPath, string saves, Func<int, byte[]>? hostSave, Action gameplayStarted)
@@ -156,7 +157,10 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
             if (!DeferExitFileRead) CompleteExitLoad(path);
         }
 
-        var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry|KCD2MP_W154Where)\("([0-9a-f]{8})"\)""");
+        var retry = Regex.Match(command, @"KCD2MP_W154MenuReturnRetry\((true|false)\)");
+        if (retry.Success) ReturnRetryVisible = retry.Groups[1].Value == "true";
+
+        var query = Regex.Match(command, """(KCD2MP_Wo125LastLoaded|KCD2MP_Wo124Lock|KCD2MP_Wo124Henry|KCD2MP_W154Where)\("(r?[0-9a-f]{8})"\)""");
         if (query.Success) AnswerQuery(query.Groups[1].Value, query.Groups[2].Value);
         if (RequestLegacySnapshot is { } snapshot)
         {

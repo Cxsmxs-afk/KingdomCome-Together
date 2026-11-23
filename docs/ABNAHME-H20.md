@@ -6,7 +6,7 @@ Der Host sendet den eingefrorenen Kalender vor dem Weltangebot. Der bisherige Re
 
 Die eingefrorene Uhr läuft als Join-Nachricht vor dem Gameplay-Gate. Der Empfänger bindet sie an den Relay-Absender, die Verbindung, Welt-Epoche und Join-ID. Nach Annahme quittiert er diese Kombination. Bis zur Quittung wiederholt der Host denselben eingefrorenen Wert. Die Quittung beendet die Wiederholung. Der Ende-zu-Ende-Join behält den separaten Ready-Schritt, der die Weltpause freigibt. Der Joiner kann vor dem Laden auf die Uhr warten, solange der Host den Versuch offen hält. [Kalender-Reader](../dotnet/KcdMp.Client/GameBridge.HostCalendar.cs) · [Wiederholung](../dotnet/KcdMp.Client/GameBridge.JoinCalendarHost.cs)
 
-NightCoop unterscheidet zwischen einem laufenden Spiel und der geladenen Host-Welt. H20 verwendet dieselbe Trennung für den Start des Beitritts. Der Bootstrap ist im Menü verfügbar. Die laufende Welt-Uhr bleibt an die Ladephase gebunden. [NightCoop SDK](https://nightcoop.net/sdk/docs/concepts.md)
+NightCoop unterscheidet zwischen einem laufenden Spiel und der geladenen Host-Welt. H20 verwendet dieselbe Trennung für den Start des Beitritts. Der Bootstrap ist im Menü verfügbar. Die laufende Welt-Uhr bleibt an die Ladephase gebunden. [NightCoop SDK](https://nightcoop.net/sdk-concepts.html)
 
 ## Nachweis
 

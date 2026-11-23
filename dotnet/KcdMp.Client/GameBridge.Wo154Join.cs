@@ -20,9 +20,10 @@ public partial class GameBridge
     private long _w154JoinWaits, _w154JoinWaitAborts, _w154JoinWaitWorlds, _w154JoinDeferredRemovals;
 
     /// <summary>Where the game is now: menu | world | loading, "busy" when the console did not answer in time.</summary>
-    private async Task<string> Wo154WhereNowAsync(int timeoutMs = 4000)
+    private async Task<string> Wo154WhereNowAsync(int timeoutMs = 4000, bool requireActiveLog = false)
     {
-        string r = await AskModAsync("KCD2MP_W154Where", timeoutMs);
+        string r = await AskModAsync("KCD2MP_W154Where", timeoutMs, null,
+            requireActiveLog ? _joinEngineLifetime : default, requireActiveLog);
         return r is "menu" or "world" or "loading" ? r : r == "timeout" ? "busy" : "unknown";
     }
 

@@ -78,9 +78,11 @@ public sealed partial class JoinCalendarIntegrationTests
                     Assert.Equal("return-needed", Call(guest, "JoinMenuPhase"));
                     Assert.True((bool)Call(guest, "Wo122WantLock")!);
                     Assert.NotNull(Get<object?>(guest, "_pinnedHomeLoad"));
+                    await WaitAsync(() => engine.ReturnRetryVisible, "the local Leave retry to reach the menu", ct);
                     engine.ReadOwnSaveWithoutTerminal();
                     engine.Emit("w211_leave", "menu");
                     await WaitAsync(() => engine.WhereQueries == queries + 2, "one explicit return recheck", ct);
+                    await WaitAsync(() => !engine.ReturnRetryVisible, "the local retry to clear", ct);
                 }
                 await WaitAsync(() => !Get<bool>(guest, "_leaveInProgress"), "the proved private world to release the return lock", ct);
                 engine.DeferOwnFileRead = false;

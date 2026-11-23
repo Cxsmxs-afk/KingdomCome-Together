@@ -5,6 +5,7 @@ public partial class GameBridge
 {
     private static readonly TimeSpan ReturnCheckDelay = TimeSpan.FromMinutes(5);
     private PrivateReturnCheck? _privateReturnCheck;
+    private Task _privateReturnMenuUpdate = Task.CompletedTask;
 
     private sealed class PrivateReturnCheck(JoinEngineReceipt receipt, string? ownSave, WorldLoadSnapshot load)
     {
@@ -18,14 +19,40 @@ public partial class GameBridge
 
     // Called at the HTTP handoff while _joinGate is held. The sender continues
     // to own the physical lease until its receipt settles.
-    private void AttachPrivateReturn(JoinEngineReceipt receipt, string? ownSave) =>
+    private void AttachPrivateReturn(JoinEngineReceipt receipt, string? ownSave)
+    {
+        receipt.PublishesPrivateReturn = true;
         Volatile.Write(ref _privateReturnCheck, new(receipt, ownSave, _worldLoad.Current));
+    }
 
     private void DetachPrivateReturn(JoinEngineReceipt? receipt)
     {
         lock (_joinGate)
             if (_privateReturnCheck is { } check && ReferenceEquals(check.Receipt, receipt))
+            {
                 Volatile.Write(ref _privateReturnCheck, null);
+                if (check.RetryOffered) QueuePrivateReturnMenu(pending: false);
+            }
+    }
+
+    // The local retry flag is independent of the relay menu state. Keep
+    // the offer and its clear in command order if the engine answers late.
+    private void QueuePrivateReturnMenu(bool pending) =>
+        _privateReturnMenuUpdate = PublishPrivateReturnMenuAsync(_privateReturnMenuUpdate, pending);
+
+    private async Task PublishPrivateReturnMenuAsync(Task prior, bool pending)
+    {
+        await prior;
+        try
+        {
+            string value = pending ? "true" : "false";
+            await GameCalls.ExecuteNowAsync($"if KCD2MP_W154MenuReturnRetry then KCD2MP_W154MenuReturnRetry({value}) end",
+                _joinEngineLifetime);
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException or OperationCanceledException or ObjectDisposedException)
+        {
+            Console.WriteLine($"MP-H21-HOME retry-menu unavailable transport={ex.GetType().Name}");
+        }
     }
 
     // This also runs after relay teardown. The relay tick can trigger the same
@@ -53,13 +80,14 @@ public partial class GameBridge
 
         string where = "unknown";
         string? last = null;
+        long readSequence = check.OwnSave is null ? 0 : check.Receipt.FindProbedRead();
         try
         {
             // This round trip uses the same live place observation as W160,
             // with a token so an old unsolicited "world" cannot answer it.
-            where = await Wo154WhereNowAsync();
-            if (where == "world" && check.OwnSave is not null && check.Receipt.ObservedExactRead)
-                last = await AskModAsync("KCD2MP_Wo125LastLoaded", 4000);
+            where = await Wo154WhereNowAsync(requireActiveLog: true);
+            if (where == "world" && readSequence != 0)
+                last = await AskModAsync("KCD2MP_Wo125LastLoaded", 4000, null, _joinEngineLifetime, requireActiveLog: true);
         }
         catch (Exception ex) when (ex is IOException or HttpRequestException or OperationCanceledException or ObjectDisposedException)
         {
@@ -75,12 +103,16 @@ public partial class GameBridge
                 load.OwnIntentRevision == check.Load.OwnIntentRevision);
             if (OwnLoadExpected && sameLoad && check.OwnSave is { } own &&
                 string.Equals(last, "last=" + own, StringComparison.OrdinalIgnoreCase) &&
-                check.Receipt.TryConfirmObservedPrivateRead())
+                check.Receipt.TryConfirmObservedPrivateRead(readSequence))
             {
                 Console.WriteLine("MP-H21-HOME place-check result=private-world");
                 return;
             }
-            check.RetryOffered = true;
+            if (!check.RetryOffered)
+            {
+                check.RetryOffered = true;
+                QueuePrivateReturnMenu(pending: true);
+            }
             SetJoinUi("return-needed", "Your return is still unconfirmed. Choose Leave in the co-op menu to check it again.");
             Console.WriteLine($"MP-H21-HOME place-check result=pending where={where} player_retry={On(playerRequested)}");
         }

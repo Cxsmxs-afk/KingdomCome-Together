@@ -686,6 +686,13 @@ do
     check("W8: the menu cancels only once", choose("cancel_join") and #evts("join_cancel", mark) == 1)
     KCD2MP_W154MenuSession("joiner", true, nil, nil, nil, "connected", "0.65.2", false, false, "connected")
     check("W8: the menu leaves a connected host world", choose("leave_world") and #evts("w211_leave", mark) == 1)
+    session("none", false)
+    if KCD2MP_W154MenuReturnRetry then KCD2MP_W154MenuReturnRetry(true) end
+    check("F3: an unconfirmed return stays visible after relay teardown", M.connectionText():find("Return unconfirmed", 1, true) ~= nil)
+    check("F3: Leave on a local retry posts exactly one action", choose("leave_world") and #evts("w211_leave", mark) == 2)
+    if KCD2MP_W154MenuReturnRetry then KCD2MP_W154MenuReturnRetry(false) end
+    choose("leave_world")
+    check("F3: the completed return retires the local Leave retry", #evts("w211_leave", mark) == 2)
     KCD2MP_W154Menu("close")
     KCD2MP.w124.sessionShared = false
 end

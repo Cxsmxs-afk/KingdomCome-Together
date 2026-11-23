@@ -10,7 +10,7 @@ public partial class GameBridge
     {
         private readonly LogTailGameTransport _tail;
         private readonly CombatPipe _pipe;
-        private readonly long _logIncarnation, _pipeRevision;
+        private readonly long _logIncarnation, _pipeRevision, _initialReadSequence;
         private readonly string _path;
         private readonly string? _userAlias;
         private static StringComparison PathComparison =>
@@ -22,6 +22,7 @@ public partial class GameBridge
             _tail = tail;
             _pipe = pipe;
             _logIncarnation = tail.EngineLogIncarnation;
+            _initialReadSequence = tail.EngineReadSequence;
             _pipeRevision = pipe.EdgeConnectionRevision;
             _path = Path.GetFullPath(path).Replace('\\', '/');
             // The live resolver selects the game's profile (and the named test
@@ -39,14 +40,19 @@ public partial class GameBridge
 
         public bool MatchesTerminal(bool loaded) => Current && Terminal.Task.IsCompletedSuccessfully && Terminal.Task.Result == loaded;
         public bool CanRemoveFile => Terminal.Task.IsCompletedSuccessfully;
-        public bool ObservedExactRead => Matches(_tail.EngineReadSave);
+        public bool PublishesPrivateReturn { get; set; }
 
-        public bool TryConfirmObservedPrivateRead() => Current &&
-            _tail.TryConsumeProbedEngineRead(_logIncarnation, _path, _userAlias, PathComparison) && Complete(loaded: true);
+        public long FindProbedRead() => Current
+            ? _tail.FindProbedEngineRead(_logIncarnation, _initialReadSequence, _path, _userAlias, PathComparison) : 0;
+
+        public bool TryConfirmObservedPrivateRead(long sequence) => sequence > 0 && Current &&
+            _tail.TryConsumeProbedEngineRead(_logIncarnation, sequence, _path, _userAlias, PathComparison) && Complete(loaded: true);
 
         private void Observe(LogTailGameTransport.EngineSaveTerminal receipt)
         {
-            if (receipt.Incarnation == _logIncarnation && Matches(receipt.Path)) Complete(receipt.Loaded);
+            if (receipt.Incarnation != _logIncarnation || !Matches(receipt.Path)) return;
+            if (PublishesPrivateReturn) _tail.MarkSaveTerminalOwned();
+            Complete(receipt.Loaded);
         }
 
         private bool Complete(bool loaded)
@@ -84,7 +90,7 @@ public partial class GameBridge
     private bool IgnoreEngineTerminal(LogTailGameTransport engine) =>
         // The private load worker publishes only the matching terminal, after
         // giving the file back. Generic or stale gameplay cannot unpin it.
-        Volatile.Read(ref _privateReturnCheck) is not null || Volatile.Read(ref _pinnedHomeLoad) is not null ||
+        engine.DispatchingOwnedSaveTerminal || Volatile.Read(ref _privateReturnCheck) is not null || Volatile.Read(ref _pinnedHomeLoad) is not null ||
         (!OwnLoadExpected && _jj is not null && engine.DispatchingAmbiguousSaveTerminal) ||
         EngineNoticeBelongsToAnotherJoin(engine.DispatchingTerminalSave);
 }

@@ -29869,6 +29869,11 @@ do
         if fresh then KCD2MP_EmitEvent("w154_menu_cfg", "fast_travel=" .. onoff(M.fastTravel)) end   -- a (re)started agent learns ours
     end
 
+    -- A private return can still need a player action after the relay is gone.
+    function KCD2MP_W154MenuReturnRetry(pending)
+        M.returnRetry = pending == true
+    end
+
     -- The game's own screen (its menu, inventory, map, skip-time, a cutscene) came up: the mod menu closes.
     function KCD2MP_W154MenuGameScreen(on, src)
         local was = M.gameScreen == true
@@ -29976,6 +29981,7 @@ do
     }
 
     function M.connectionText()
+        if M.returnRetry then return "Return unconfirmed. Choose Leave to check it again." end
         if not M.fresh() then return "Not connected" end
         if M.link == "connected" then
             local note = KCD2MP_W157ConnNote and KCD2MP_W157ConnNote() or ""   -- WO-157 3.2: "-- the connection is struggling"
@@ -36325,8 +36331,8 @@ do
     function KCD2MP_W211Leave(src)
         local w = KCD2MP.w211
         local menu = KCD2MP.w154menu
-        local visiting = menu and menu.roleNow() == "joiner" and
-            (menu.joinPhase == "connected" or menu.joinPhase == "paused" or menu.joinPhase == "return-needed")
+        local visiting = menu and (menu.returnRetry or menu.roleNow() == "joiner" and
+            (menu.joinPhase == "connected" or menu.joinPhase == "paused" or menu.joinPhase == "return-needed"))
         if not w.holding and not visiting then
             mp_log("WO211-LINK leave refused: no shared world")
             pcall(KCD2MP_ShowNativeToast, "You are already in your own game.")
