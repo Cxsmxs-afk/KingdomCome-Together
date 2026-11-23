@@ -25,5 +25,14 @@ int ranged_aim_tests(int* passed) {
     check(!quantize_charge(-.1f, 0, 1) && !quantize_charge(.5f, .5f, .5f) &&
           !quantize_charge(std::numeric_limits<float>::quiet_NaN(), 0, 1),
           "invalid measurement never becomes zero");
+    float camera[12]{};
+    camera[1] = .6123724f; camera[5] = .6123724f; camera[9] = -.5f;
+    const auto downRight = camera_angles(camera);
+    check(downRight.known() && downRight.yaw == -4500 && downRight.pitch == -3000,
+          "the camera forward column gives known signs on both axes");
+    camera[1] = camera[5] = 0; camera[9] = 1;
+    check(!camera_angles(camera).known(), "vertical view has no measurable yaw and does not fabricate a pair");
+    camera[1] = std::numeric_limits<float>::quiet_NaN();
+    check(!camera_angles(camera).known(), "a malformed camera does not become a zero angle");
     return failures;
 }

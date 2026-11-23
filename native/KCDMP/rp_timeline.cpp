@@ -16,6 +16,7 @@ struct Body {
     uint64_t rangedHostMs = 0;
     uint32_t buffer = 0, extrap = 0;
     uint8_t rangedBits = 0, rangedCharge = 0;
+    rangedaim::Angles rangedAngles{};
 };
 
 bool g_enabled = true;
@@ -45,13 +46,14 @@ Body& body_for(uint32_t eid, uint8_t peer) {
 void report(const Body& row, uint8_t peer) {
     logf("MP-RP-TIMELINE figure=kcd2mp_%u eid=0x%X scope=%llu connection=%llu buffer_ms=%u extrap_ms_max=%u "
          "late_samples=%llu pose_n=%llu applied_host_ms=%llu target_host_ms=%llu "
-         "ranged_held=%u ranged_state_ms=%llu ranged_charge_known=%u ranged_charge=%u",
+         "ranged_held=%u ranged_state_ms=%llu ranged_charge_known=%u ranged_charge=%u aim_yaw_cd=%d aim_pitch_cd=%d",
          static_cast<unsigned>(peer), row.eid, static_cast<unsigned long long>(row.display.lifecycle),
          static_cast<unsigned long long>(row.display.connection), row.buffer, row.extrap,
          static_cast<unsigned long long>(row.late), static_cast<unsigned long long>(row.poseCount),
          static_cast<unsigned long long>(row.display.appliedHostMs), static_cast<unsigned long long>(row.display.targetHostMs),
          (row.rangedBits & rangedaim::kHeldBit) ? 1u : 0u, static_cast<unsigned long long>(row.rangedHostMs),
-         (row.rangedBits & rangedaim::kChargeKnownBit) ? 1u : 0u, static_cast<unsigned>(row.rangedCharge));
+         (row.rangedBits & rangedaim::kChargeKnownBit) ? 1u : 0u, static_cast<unsigned>(row.rangedCharge),
+         row.rangedAngles.yaw, row.rangedAngles.pitch);
 }
 
 bool same_receiver() {
@@ -102,6 +104,7 @@ void note_pose(uint32_t eid, uint8_t peer, const Output& sample) {
         row.rangedBits = sample.ranged.bits;
         row.rangedCharge = sample.ranged.charge;
     }
+    row.rangedAngles = sample.ranged.angles_known() ? rangedaim::Angles{sample.ranged.yaw, sample.ranged.pitch} : rangedaim::Angles{};
     const uint64_t now = GetTickCount64();
     if (row.lastReport == 0 || now - row.lastReport >= 4000) {
         row.lastReport = now;

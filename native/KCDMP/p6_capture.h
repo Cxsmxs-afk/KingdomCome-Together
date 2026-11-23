@@ -7,6 +7,7 @@ struct TestBackend {
     uint64_t(*now)();uint64_t(*generation)();uint64_t(*epoch)();bool(*gameplay)();
     void*(*actor)(uint32_t*);void*(*soul)();uint8_t(*phase)(void*);uint8_t(*hands)(uint32_t,uint8_t*,uint8_t*);
     bool(*charge)(void*,float*,float*,float*)=nullptr;
+    bool(*view)(uint32_t, float*, float*) = nullptr;
 };
 void set_test_backend(const TestBackend&);
 void reset_for_tests();

@@ -53,4 +53,9 @@ void install();   // dllmain: every registered install, once
 void tick();      // main thread, every frame: every registered tick
 int status_text(char* out, int n);
 
+namespace cam {
+void prepare_player_view(); // read-only system/RTTI lookup at DLL initialization
+bool read_player_view(uint32_t eid, float matrix[12], float feet[3]); // main thread
+}
+
 } // namespace kcdmp::wo203
