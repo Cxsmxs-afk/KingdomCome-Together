@@ -14,6 +14,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private const byte Pong = 0x83, Result = 0x81, Wo140Reply = 0xA4, Wo151Reply = 0xAB, Wo163Reply = 0xAC;
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _serverLoop;
+    private volatile bool _shutdownStarted;
     private readonly bool _failCalendarArm;
     private readonly bool _failCalendarVerify;
     private readonly bool _refuseHold;
@@ -35,6 +36,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private ulong _loadGeneration, _lifecycleGeneration;
 
     public CombatPipe Pipe { get; }
+    internal Task Completion => _serverLoop;
     public Func<int, string, bool>? SaveListed { get; set; }
     public bool CanQuickSave { get; init; } = true;
     public Action? BeforeCalendarArm { get; set; }
@@ -79,6 +81,9 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         lock (_calendar) _loadedWorldMs = null;
     }
 
+    // The bridge may cancel a physical write during teardown before this fixture is disposed.
+    public void BeginShutdown() => _shutdownStarted = true;
+
     private async Task ServeAsync(string name, CancellationToken ct)
     {
         try
@@ -98,8 +103,16 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
                         break;
                     var (type, body) = Reply(header[0], seq++, payload);
                     byte[] frame = [type, (byte)body.Length, (byte)(body.Length >> 8), .. body];
-                    await server.WriteAsync(frame, ct);
-                    await server.FlushAsync(ct);
+                    try
+                    {
+                        await server.WriteAsync(frame, ct);
+                        await server.FlushAsync(ct);
+                    }
+                    catch (IOException) when (_shutdownStarted && !server.IsConnected)
+                    {
+                        // A canceled bridge write can close the peer while this reply is in flight.
+                        return;
+                    }
                 }
                 server.Disconnect();
             }
@@ -286,6 +299,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        BeginShutdown();
         await _stop.CancelAsync();
         try
         {

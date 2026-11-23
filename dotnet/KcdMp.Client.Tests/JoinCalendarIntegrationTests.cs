@@ -442,6 +442,8 @@ public sealed partial class JoinCalendarIntegrationTests
         }
         finally
         {
+            hostPipe.BeginShutdown();
+            guestPipe.BeginShutdown();
             if (pauseAfterJoin || relayEofWorldRecovery is not null || f4 == F4Probe.HostReturn) Call(guest, "LoadSequenceOnExit");
             stop.Cancel();
             await InvokeAsync(host, "Wo123OnDisconnectAsync");

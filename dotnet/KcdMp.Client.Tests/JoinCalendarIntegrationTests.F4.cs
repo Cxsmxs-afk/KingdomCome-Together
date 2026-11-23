@@ -397,6 +397,7 @@ public sealed partial class JoinCalendarIntegrationTests
         }
         finally
         {
+            secondPipe.BeginShutdown();
             secondStop.Cancel();
             await InvokeAsync(second, "Wo123OnDisconnectAsync");
             try { await secondRead.WaitAsync(TimeSpan.FromSeconds(5)); }
