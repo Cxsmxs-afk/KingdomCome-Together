@@ -247,7 +247,7 @@ public sealed partial class JoinCalendarIntegrationTests
         hostPeer.FinishSending();
         await hostRead.WaitAsync(ct);
         using var resources = await F4ResourceCheck.WarmAsync($"host-return-{players}", guest, output, ct);
-        for (int i = 0; i <= 5; i++)
+        for (int i = 0; i <= 6; i++)
         {
             await WaitAsync(() => guest.HostAbsentPause && Property<bool>(guest, "LinkHeld") && !Get<bool>(guest, "_hostModeKnown"),
                 "the real host socket loss to pause the same guest world", ct);
@@ -263,9 +263,11 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Equal(original, SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave)));
                 Console.WriteLine($"F4-HOST-RETURN cycle={i} world={world} guest_join_loads=1 guest_own_loads=0 own_sha256_equal=1");
             });
-            await WaitAsync(() => guest.HostAbsentPause && Property<bool>(guest, "LinkHeld") && !Get<bool>(guest, "_hostModeKnown"),
-                "the returning connection to finish closing before sampling", ct);
-            await resources.CycleAsync(i, ct);
+            await WaitAsync(() => guest.HostAbsentPause && Property<bool>(guest, "LinkHeld") &&
+                !Get<bool>(guest, "_hostModeKnown") && pipe.NativePauseEffective,
+                "the returning connection to close and the next native hold to be active before sampling", ct);
+            // The first complete return also starts the recurring hold and reader work.
+            if (i > 0) await resources.CycleAsync(i - 1, ct);
         }
         resources.AssertBudget();
     }
@@ -278,7 +280,7 @@ public sealed partial class JoinCalendarIntegrationTests
         byte[] hash = SHA256.HashData(File.ReadAllBytes(own));
         Set(guest, "_w184SaveOnLeave", false);
         using var resources = await F4ResourceCheck.WarmAsync("missing-personal-save", guest, output, ct);
-        for (int i = 1; i <= 6; i++)
+        for (int i = 1; i <= 7; i++)
         {
             File.Move(own, removed);
             try
@@ -307,7 +309,8 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.Equal(hash, SHA256.HashData(File.ReadAllBytes(own)));
             Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
             Console.WriteLine($"F4-MISSING-SAVE cycle={i} no_load_on_failure=1 rejoin_loads={engine.JoinLoadsIssued} ready={guestLink.ReadySent.Count} own_sha256_equal=1");
-            await resources.CycleAsync(i - 1, ct);
+            // The first private return establishes the receiver's recurring work.
+            if (i > 1) await resources.CycleAsync(i - 2, ct);
         }
         resources.AssertBudget();
     }
@@ -323,7 +326,8 @@ public sealed partial class JoinCalendarIntegrationTests
         var exits = new HashSet<string>();
         bool supersedeLoad = probe == F4Probe.SupersededMenuProbe;
         using var resources = supersedeLoad ? null : await F4ResourceCheck.WarmAsync(probe == F4Probe.NoOwnExit ? "mpexit-receipt" : "mpexit", guest, output, ct);
-        int lastCycle = supersedeLoad ? 0 : 5;
+        int initialReceiptCycle = probe == F4Probe.NoOwnExit ? 1 : 0;
+        int lastCycle = supersedeLoad ? 0 : 5 + initialReceiptCycle;
         // Load and return once before measuring so the initial runtime and
         // fixture setup is outside the five comparable cycles.
         for (int i = 0; i <= lastCycle; i++)
@@ -372,10 +376,10 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
                 Assert.Empty(Directory.EnumerateFiles(WorldReceiver.DefaultStagingDir(), "world-*"));
                 Assert.Equal(ownBefore, SHA256.HashData(File.ReadAllBytes(savedOutsideProfile)));
-                Console.WriteLine($"F4-MPEXIT cycle={i} warmup={(i == 0 ? 1 : 0)} join_loads={engine.JoinLoadsIssued} own_loads=0 terminal=menu files=0 own_sha256_equal=1");
+                Console.WriteLine($"F4-MPEXIT cycle={i} warmup={(i <= initialReceiptCycle ? 1 : 0)} join_loads={engine.JoinLoadsIssued} own_loads=0 terminal=menu files=0 own_sha256_equal=1");
             }
             finally { File.Move(savedOutsideProfile, ownSave); }
-            if (resources is not null) await resources.CycleAsync(i, ct);
+            if (resources is not null && i >= initialReceiptCycle) await resources.CycleAsync(i - initialReceiptCycle, ct);
         }
         Assert.Equal(lastCycle + 1, engine.JoinLoadsIssued);
         Assert.Equal(lastCycle + 1, exits.Count);
@@ -646,10 +650,10 @@ public sealed partial class JoinCalendarIntegrationTests
         public async Task CycleAsync(int cycle, CancellationToken ct, GameBridge? secondGuest = null)
         {
             Assert.Equal(_nextCycle++, cycle);
-            // Gameplay or menu can be confirmed before its native publication
-            // returns. Drain that operation before comparing idle resources.
-            await WaitForNativePublicationAsync(_guest, ct);
-            if (secondGuest is not null) await WaitForNativePublicationAsync(secondGuest, ct);
+            // Gameplay or menu can be confirmed while its load, calendar,
+            // and authority updates still have active pipe reply deadlines.
+            await WaitForNativeTransitionAsync(_guest, ct);
+            if (secondGuest is not null) await WaitForNativeTransitionAsync(secondGuest, ct);
             var request = new TaskCompletionSource<F4ResourceSample>(TaskCreationOptions.RunContinuationsAsynchronously);
             _requests.Add(request, ct);
             var sample = await request.Task.WaitAsync(ct);
@@ -663,11 +667,16 @@ public sealed partial class JoinCalendarIntegrationTests
                 _output.WriteLine($"F4-HANDLE-TYPES scenario={_scenario} cycle={cycle} {types}");
         }
 
-        private static async Task WaitForNativePublicationAsync(GameBridge guest, CancellationToken ct)
+        private static async Task WaitForNativeTransitionAsync(GameBridge guest, CancellationToken ct)
         {
-            var published = Get<SemaphoreSlim>(guest, "_loadSequencePublish");
-            await published.WaitAsync(ct);
-            published.Release();
+            foreach (string name in new[] { "_loadSequencePublish", "_hostCalendarGate" })
+            {
+                var gate = Get<SemaphoreSlim>(guest, name);
+                await gate.WaitAsync(ct);
+                gate.Release();
+            }
+            if (Get<Task<bool>?>(guest, "_p1Pending") is { } authority)
+                await authority.WaitAsync(ct);
         }
 
         public void AssertBudget()

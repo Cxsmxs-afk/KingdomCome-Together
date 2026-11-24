@@ -4,6 +4,7 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using KcdMp.Server.Features.ClientHandling;
 using KcdMp.Wire;
 using Microsoft.AspNetCore.Builder;
@@ -18,19 +19,22 @@ internal sealed class ReplayRelay : IAsyncDisposable
     private readonly TcpListener _listener;
     private readonly CancellationTokenSource _stop = new();
     private readonly List<TcpClient> _clients = [];
+    private readonly bool _keepRecordedStates;
     private readonly Task _accept;
 
-    private ReplayRelay(WebApplication app, TcpListener listener, ClientSessionRunner runner)
+    private ReplayRelay(WebApplication app, TcpListener listener, ClientSessionRunner runner, bool keepRecordedStates)
     {
         _app = app;
         _listener = listener;
+        _keepRecordedStates = keepRecordedStates;
         Port = ((IPEndPoint)listener.LocalEndpoint).Port;
         _accept = AcceptAsync(runner);
     }
 
     public int Port { get; }
 
-    public static async Task<ReplayRelay> StartAsync(CancellationToken ct = default, string logLevel = "Fatal")
+    public static async Task<ReplayRelay> StartAsync(CancellationToken ct = default, string logLevel = "Fatal",
+        bool keepRecordedStates = false)
     {
         ct.ThrowIfCancellationRequested();
         // Reuse the shipped relay's services. The test owns its TCP listener so
@@ -40,7 +44,7 @@ internal sealed class ReplayRelay : IAsyncDisposable
         try
         {
             listener.Start();
-            return new ReplayRelay(app, listener, app.Services.GetRequiredService<ClientSessionRunner>());
+            return new ReplayRelay(app, listener, app.Services.GetRequiredService<ClientSessionRunner>(), keepRecordedStates);
         }
         catch
         {
@@ -59,11 +63,18 @@ internal sealed class ReplayRelay : IAsyncDisposable
                 var client = await _listener.AcceptTcpClientAsync(_stop.Token);
                 _clients.Add(client);
                 client.NoDelay = true;
-                runner.Start(runner.Create(RelayConnection.FromTcp(client)));
+                var session = runner.Create(RelayConnection.FromTcp(client));
+                // A recorder's single-frame route check advances on receipt.
+                // Keep its sample available while the test host is descheduled.
+                if (_keepRecordedStates && StateScheduler(session) is { } scheduler) scheduler.Options.AgeLimitMs = 0;
+                runner.Start(session);
             }
         }
         catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
     }
+
+    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_sched")]
+    private static extern ref LinkScheduler? StateScheduler(ClientSession session);
 
     public async Task StopAsync(bool gracefulEof = false)
     {
