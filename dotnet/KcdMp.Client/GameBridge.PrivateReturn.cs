@@ -79,7 +79,7 @@ public partial class GameBridge
 
         string where = "unknown";
         string? last = null;
-        bool ownSave = check.Receipt.Destination == PrivateReturnDestination.OwnSave;
+        bool ownSave = check.Receipt.Destination == LauncherPrivateReturn.OwnSave;
         long readSequence = ownSave ? check.Receipt.FindProbedRead() : 0;
         try
         {
@@ -98,7 +98,7 @@ public partial class GameBridge
         {
             check.Checking = false;
             if (!ReferenceEquals(_privateReturnCheck, check) || check.Receipt.Terminal.Task.IsCompleted) return;
-            if (OwnLoadExpected && where == "menu" && check.Receipt.Destination == PrivateReturnDestination.Menu &&
+            if (OwnLoadExpected && where == "menu" && check.Receipt.Destination == LauncherPrivateReturn.Menu &&
                 _worldLoad.TryConfirmPrivateReturn(check.Load, check.Receipt.TryConfirmMenuReturn))
             {
                 Console.WriteLine("MP-H21-HOME place-check result=menu-exit");

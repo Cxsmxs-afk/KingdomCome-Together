@@ -1540,7 +1540,7 @@ public partial class GameBridge
                 var root = Path.GetDirectoryName(Path.GetDirectoryName(src.FullPath))!;
                 sent = await P5LoadGameCoreAsync(src.Playline, src.Base, "leave-command", () =>
                 {
-                    homeReceipt = PrepareLauncherProtectedReceipt(tail, src.FullPath, root, PrivateReturnDestination.OwnSave);
+                    homeReceipt = PrepareLauncherProtectedReceipt(tail, src.FullPath, root, LauncherPrivateReturn.OwnSave);
                     if (homeReceipt is null) return false;
                     homeReceipt.ProtectSubmittedLoad();
                     AttachPrivateReturn(homeReceipt);
@@ -1606,7 +1606,7 @@ public partial class GameBridge
             {
                 sent = await P5LoadGameCoreAsync(save.Playline, save.Base, "leave-command", () =>
                 {
-                    receipt = PrepareLauncherProtectedReceipt(engine, save.FullPath, root, PrivateReturnDestination.OwnSave);
+                    receipt = PrepareLauncherProtectedReceipt(engine, save.FullPath, root, LauncherPrivateReturn.OwnSave);
                     if (receipt is null) return false;
                     receipt.ProtectSubmittedLoad();
                     Volatile.Write(ref _pinnedHomeLoad, receipt);

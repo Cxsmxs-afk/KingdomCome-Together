@@ -8,7 +8,7 @@ public partial class GameBridge
     internal LauncherAgentControl? LauncherRestartControl { get; init; }
     private FileStream? _launcherUnobservableRead;
     private LauncherGuestWorld? _launcherGuestWorld;
-    private enum PrivateReturnDestination { None, OwnSave, Menu }
+    private enum LauncherPrivateReturn { None, OwnSave, Menu }
 
     // The guest save lock belongs to the loaded world, not just its engine
     // read. Keep this independent exclusion across read and relay completion.
@@ -50,13 +50,13 @@ public partial class GameBridge
     }
 
     private JoinEngineReceipt? PrepareLauncherProtectedReceipt(LogTailGameTransport tail, string path, string savesRoot,
-        PrivateReturnDestination destination = PrivateReturnDestination.None)
+        LauncherPrivateReturn destination = LauncherPrivateReturn.None)
     {
         if (!TryProtectLauncherHandoff(out var lease)) return null;
-        var guest = destination == PrivateReturnDestination.None ? null : Volatile.Read(ref _launcherGuestWorld);
+        var guest = destination == LauncherPrivateReturn.None ? null : Volatile.Read(ref _launcherGuestWorld);
         Action<bool>? onTerminal = guest is null ? null : loaded =>
         {
-            if (destination == PrivateReturnDestination.OwnSave || !loaded) ReleaseLauncherGuestWorld(guest);
+            if (destination == LauncherPrivateReturn.OwnSave || !loaded) ReleaseLauncherGuestWorld(guest);
         };
         try { return new(tail, _combat, path, savesRoot, lease, onTerminal, destination); }
         catch { lease?.Dispose(); throw; }
@@ -95,7 +95,7 @@ public partial class GameBridge
             : this(tail, pipe, path, saveRoot, null, null) { }
 
         public JoinEngineReceipt(LogTailGameTransport tail, CombatPipe pipe, string path, string saveRoot,
-            FileStream? launcherReadLease, Action<bool>? onTerminal, PrivateReturnDestination destination = PrivateReturnDestination.None)
+            FileStream? launcherReadLease, Action<bool>? onTerminal, LauncherPrivateReturn destination = LauncherPrivateReturn.None)
         {
             _tail = tail;
             _pipe = pipe;
@@ -122,7 +122,7 @@ public partial class GameBridge
         public bool MatchesTerminal(bool loaded) => Current && Terminal.Task.IsCompletedSuccessfully && Terminal.Task.Result == loaded;
         public bool CanRemoveFile => Terminal.Task.IsCompletedSuccessfully;
         public bool PublishesPrivateReturn { get; set; }
-        public PrivateReturnDestination Destination { get; }
+        public LauncherPrivateReturn Destination { get; }
 
         public long FindProbedRead() => Current
             ? _tail.FindProbedEngineRead(_logIncarnation, _initialReadSequence, _path, _userAlias, PathComparison) : 0;
@@ -130,7 +130,7 @@ public partial class GameBridge
         public bool TryConfirmObservedPrivateRead(long sequence, string path) => sequence > 0 && Matches(path.Replace('\\', '/')) &&
             _tail.TryConsumeProbedEngineRead(_logIncarnation, sequence, _path, _userAlias, PathComparison) && TryComplete(loaded: true);
 
-        public bool TryConfirmMenuReturn() => Destination == PrivateReturnDestination.Menu && Current &&
+        public bool TryConfirmMenuReturn() => Destination == LauncherPrivateReturn.Menu && Current &&
             _tail.TryConsumeProbedMenuReturn(_logIncarnation, _initialReadSequence, _path, _userAlias, PathComparison) &&
             TryComplete(loaded: false);
 

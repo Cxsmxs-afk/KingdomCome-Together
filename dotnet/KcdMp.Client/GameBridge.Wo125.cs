@@ -1050,7 +1050,7 @@ public partial class GameBridge
                 {
                     if (_transport is LogTailGameTransport tail)
                     {
-                        exitReceipt = PrepareLauncherProtectedReceipt(tail, path, saves, PrivateReturnDestination.Menu);
+                        exitReceipt = PrepareLauncherProtectedReceipt(tail, path, saves, LauncherPrivateReturn.Menu);
                         if (exitReceipt is null) return false;
                         exitReceipt.ProtectSubmittedLoad();
                         AttachPrivateReturn(exitReceipt);
