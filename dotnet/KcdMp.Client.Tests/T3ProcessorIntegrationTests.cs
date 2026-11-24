@@ -62,16 +62,31 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
         var b = Bridge(transport, "World");
         var gate = Get<SemaphoreSlim>(b, "_hostAuthorityGate");
         await gate.WaitAsync();
-        Task? first = null;
+        using var testStop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var clock = new ManualFrameTime();
+        var started = new TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
-            var result = await ProcessorFrameScope.RunAsync(token => first = (Task)Call(b, "ApplyCombatRoleAsync", false, token)!, 100);
+            var applying = ProcessorFrameScope.RunAsync(token =>
+            {
+                var firstAttempt = (Task)Call(b, "ApplyCombatRoleAsync", false, token)!;
+                started.SetResult(firstAttempt);
+                return firstAttempt;
+            }, 100, testStop.Token, clock);
+            Task first = await started.Task.WaitAsync(testStop.Token);
+            await clock.Armed.WaitAsync(testStop.Token);
+            Assert.False(first.IsCompleted);
+            Assert.Equal(0, game.Calls);
+            clock.Expire();
+            var result = await applying.WaitAsync(testStop.Token);
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first!.WaitAsync(TimeSpan.FromSeconds(2)));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first.WaitAsync(testStop.Token));
+            Assert.True(first.IsCanceled);
             Assert.False(Get<bool>(b, "_combatRoleApplyComplete"));
         }
         finally { gate.Release(); }
-        var retry = await ProcessorFrameScope.RunAsync(token => (Task)Call(b, "ApplyCombatRoleAsync", false, token)!, 5000);
+        var retry = await ProcessorFrameScope.RunAsync(token => (Task)Call(b, "ApplyCombatRoleAsync", false, token)!,
+            5000, testStop.Token, new ManualFrameTime()).WaitAsync(testStop.Token);
         Assert.Equal(ProcessorFrameScope.Outcome.Completed, retry.Status);
         Assert.True(Get<bool>(b, "_combatRoleApplyComplete"));
         Assert.True(game.Calls > 0);
