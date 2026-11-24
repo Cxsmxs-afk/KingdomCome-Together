@@ -1,6 +1,7 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Microsoft.Diagnostics.Runtime;
 
 namespace KcdMp.Client.Tests;
 
@@ -26,12 +27,28 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         (long Start, int ModuleMemorySize, string ModuleName)[] modules;
         try { modules = self.Modules.Cast<ProcessModule>().Select(m => (Start: m.BaseAddress.ToInt64(), m.ModuleMemorySize, m.ModuleName)).ToArray(); }
         catch (System.ComponentModel.Win32Exception) { return "enabled=1 modules_unavailable=1"; }
+        // This runs after an over-budget sample. Read our own JIT metadata without suspending the test host.
+        using var diagnostics = TryAttach();
+        using var runtime = TryReadRuntime(diagnostics);
         var histories = end.Where(kv => !start.TryGetValue(kv.Key, out var kind) || kv.Value != kind)
-            .Select(kv => $"{kv.Value}:{ReadOpenOrigin(kv.Key, modules)}");
-        return $"enabled=1 clr={Environment.Version} {string.Join(',', histories.GroupBy(x => x).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key}={g.Count()}"))}";
+            .Select(kv => $"{kv.Value}:{ReadOpenOrigin(kv.Key, modules, runtime)}");
+        return $"enabled=1 clr={Environment.Version} managed={(runtime is null ? 0 : 1)} " +
+            string.Join(',', histories.GroupBy(x => x).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key}={g.Count()}"));
     }
 
-    private string ReadOpenOrigin(IntPtr handle, (long Start, int ModuleMemorySize, string ModuleName)[] modules)
+    private static DataTarget? TryAttach()
+    {
+        try { return DataTarget.AttachToProcess(Environment.ProcessId, suspend: false); }
+        catch (Exception) { return null; } // keep the native trace if live DAC is unavailable
+    }
+
+    private static ClrRuntime? TryReadRuntime(DataTarget? diagnostics)
+    {
+        try { return diagnostics?.ClrVersions.FirstOrDefault()?.CreateRuntime(); }
+        catch (Exception) { return null; }
+    }
+
+    private string ReadOpenOrigin(IntPtr handle, (long Start, int ModuleMemorySize, string ModuleName)[] modules, ClrRuntime? runtime)
     {
         int header = 2 * IntPtr.Size;
         int frameStart = (3 * IntPtr.Size + sizeof(int) + IntPtr.Size - 1) & ~(IntPtr.Size - 1);
@@ -57,7 +74,7 @@ internal sealed class F4WindowsHandleTrace : IDisposable
                     long pc = Marshal.ReadIntPtr(trace, frameStart + frame * IntPtr.Size).ToInt64();
                     if (pc == 0) break;
                     var module = modules.FirstOrDefault(m => pc >= m.Start && pc < m.Start + m.ModuleMemorySize);
-                    string name = module.ModuleName ?? "unresolved";
+                    string name = module.ModuleName ?? ReadManagedMethod(runtime, pc);
                     if (name.Equals("coreclr.dll", StringComparison.OrdinalIgnoreCase)) name += $"+{pc - module.Start:x}";
                     if (names.Count == 0 || names[^1] != name) names.Add(name);
                 }
@@ -66,6 +83,17 @@ internal sealed class F4WindowsHandleTrace : IDisposable
             return "untraced";
         }
         finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static string ReadManagedMethod(ClrRuntime? runtime, long pc)
+    {
+        try
+        {
+            var method = runtime?.GetMethodByInstructionPointer(unchecked((ulong)pc));
+            if (method is not null) return $"{method.Type?.Name}.{method.Name}";
+        }
+        catch (Exception) { } // the allocation frame can belong to code that has already unloaded
+        return "unresolved";
     }
 
     public void Dispose()

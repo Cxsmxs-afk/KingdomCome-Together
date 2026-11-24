@@ -598,7 +598,6 @@ public sealed partial class JoinCalendarIntegrationTests
         GC.WaitForPendingFinalizers();
         GC.Collect();
         GC.WaitForPendingFinalizers();
-        process.Refresh();
         var retained = Get<object>(guest, "_retainedJoinWorlds");
         int leases = (int)retained.GetType().GetProperty("Count")!.GetValue(retained)!;
         leases += Get<object?>(guest, "_joinRx") is null ? 0 : 1;
@@ -606,14 +605,16 @@ public sealed partial class JoinCalendarIntegrationTests
         leases += Get<object?>(guest, "_wo125ActiveExitPath") is null ? 0 : 1;
         int timers = Get<bool>(guest, "_rejoinPending") ? 1 : 0;
         var pipe = Get<CombatPipe>(guest, "_combat");
-        int threads = process.Threads.Count;
-        int handles = process.HandleCount;
         long runtimeTimers = Timer.ActiveCount;
         Task[] frameDeadlines = deadlineTrace.Pending();
         Dictionary<IntPtr, string>? objects = traceWindowsHandles ? new() : null;
+        string? types = OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture(objects) : null;
+        // Count after the inventory calls, so handles they initialise are present in the same observation.
+        process.Refresh();
+        int threads = process.Threads.Count;
+        int handles = process.HandleCount;
         return new(threads, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, runtimeTimers,
-            new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers),
-            OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture(objects) : null, objects, frameDeadlines);
+            new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers), types, objects, frameDeadlines);
     }
 
     private sealed class F4ResourceCheck : IDisposable
