@@ -62,7 +62,7 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
         var b = Bridge(transport, "World");
         var gate = Get<SemaphoreSlim>(b, "_hostAuthorityGate");
         await gate.WaitAsync();
-        using var testStop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var testStop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         var clock = new ManualFrameTime();
         var started = new TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously);
         try
@@ -80,7 +80,7 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
             clock.Expire();
             var result = await applying.WaitAsync(testStop.Token);
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first.WaitAsync(testStop.Token));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first.WaitAsync(TimeSpan.FromSeconds(2), testStop.Token));
             Assert.True(first.IsCanceled);
             Assert.False(Get<bool>(b, "_combatRoleApplyComplete"));
         }
