@@ -90,7 +90,7 @@ public class ProcessorPipeTests
     {
         await using var pipe = new CombatPipe("kcdmp-p0-" + Guid.NewGuid().ToString("N"));
         using var caller = new CancellationTokenSource();
-        var gate = Gate(pipe, "_gate"); await gate.WaitAsync();
+        var gate = Gate(pipe, "_connectLock"); await gate.WaitAsync();
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         Task<bool>? request = null;
         try
@@ -103,6 +103,7 @@ public class ProcessorPipeTests
                 return request;
             }, 2000, CancellationToken.None, clock);
             await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.False(request!.IsCompleted);
             caller.Cancel();
             var outcome = await frame.WaitAsync(TimeSpan.FromSeconds(2));
             Assert.Equal(ProcessorFrameScope.Outcome.Faulted, outcome.Status);
