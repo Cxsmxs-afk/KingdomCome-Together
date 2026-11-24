@@ -623,10 +623,12 @@ public sealed partial class JoinCalendarIntegrationTests
         private readonly string _scenario;
         private readonly GameBridge _guest;
         private readonly ITestOutputHelper _output;
-        private readonly BlockingCollection<TaskCompletionSource<F4ResourceSample>> _requests = new(1);
+        private readonly AutoResetEvent _requestReady = new(false);
         private readonly F4ProcessorDeadlines _deadlineTrace = new();
         private readonly Thread _sampler;
         private readonly F4WindowsHandleTrace? _handleTrace;
+        private TaskCompletionSource<F4ResourceSample>? _request;
+        private bool _stopSampler;
         private int _nextCycle;
         private F4ResourceSample _before, _after;
 
@@ -683,7 +685,7 @@ public sealed partial class JoinCalendarIntegrationTests
                     int thread = Environment.CurrentManagedThreadId;
                     if (!warmed.ContainsKey(thread))
                     {
-                        if (useWinsock) WarmWinsockThread();
+                        if (useWinsock) WarmWinsockThread(ct);
                         warmed.TryAdd(thread, 0);
                     }
                     if (warmed.Count >= workers) round.Set();
@@ -695,28 +697,38 @@ public sealed partial class JoinCalendarIntegrationTests
             return warmed.Count;
         }
 
-        private static void WarmWinsockThread()
+        private static void WarmWinsockThread(CancellationToken ct)
         {
-            // Winsock lazily opens Event and Thread handles on calling
-            // workers. Exercise a real TCP exchange on each such worker
-            // before sampling, and close every socket before the first cycle.
+            // The production NetworkStream uses overlapped WSARecv and WSASend.
+            // Issue both on this worker before waiting for either completion.
             using var listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Start(1);
             var endpoint = (IPEndPoint)listener.LocalEndpoint;
-            using var peer = new TcpClient { SendTimeout = 1000 };
+            using var peer = new TcpClient();
             peer.Connect(endpoint.Address, endpoint.Port);
             using var accepted = listener.AcceptTcpClient();
-            accepted.ReceiveTimeout = 1000;
-            peer.GetStream().WriteByte(0x2a);
-            Assert.Equal(0x2a, accepted.GetStream().ReadByte());
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(1000);
+            var received = new byte[1];
+            var read = accepted.GetStream().ReadAsync(received, deadline.Token);
+            var write = peer.GetStream().WriteAsync(new byte[] { 0x2a }, deadline.Token);
+            write.AsTask().GetAwaiter().GetResult();
+            Assert.Equal(1, read.AsTask().GetAwaiter().GetResult());
+            Assert.Equal(0x2a, received[0]);
         }
 
         private void Sample()
         {
             // The GC/finalizer and Windows handle queries use one OS thread
             // for baseline and observations, even when the join resumes on different workers.
-            foreach (var request in _requests.GetConsumingEnumerable())
+            // The event is owned for the whole fixture, including baseline. It
+            // avoids measuring a lazy SemaphoreSlim monitor created by the sampler.
+            while (true)
             {
+                _requestReady.WaitOne();
+                if (Volatile.Read(ref _stopSampler)) return;
+                var request = Interlocked.Exchange(ref _request, null);
+                if (request is null) continue;
                 try { request.SetResult(F4Resources(_guest, _handleTrace is not null, _deadlineTrace)); }
                 catch (Exception ex) { request.SetException(ex); }
             }
@@ -732,12 +744,12 @@ public sealed partial class JoinCalendarIntegrationTests
                 LogTimers("baseline", _before);
                 LogTimers("observed", sample);
                 Task[] observed = sample.FrameDeadlines;
-                int baseline = _before.FrameDeadlines.Length;
-                if (observed.Length > baseline &&
-                    sample.RuntimeTimers - observed.Length <= _before.RuntimeTimers - baseline + TimerAllowance)
+                if (observed.Length > _before.FrameDeadlines.Length)
                 {
                     // These exact delays belong to in-flight ProcessorFrameScope calls. Their owner
                     // cancels the delay on completion. Natural expiry is a failed frame, not a drain.
+                    // A completed scope can also release its native operation deadlines. The next
+                    // sample still compares the full process count, including any unowned timer.
                     try { await Task.WhenAll(observed).WaitAsync(ct); }
                     catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
                     Assert.All(observed, deadline => Assert.True(deadline.IsCanceled,
@@ -764,7 +776,9 @@ public sealed partial class JoinCalendarIntegrationTests
                 await WaitForNativeTransitionAsync(_guest, ct);
                 foreach (var player in others) await WaitForNativeTransitionAsync(player, ct);
                 var request = new TaskCompletionSource<F4ResourceSample>(TaskCreationOptions.RunContinuationsAsynchronously);
-                _requests.Add(request, ct);
+                ct.ThrowIfCancellationRequested();
+                Assert.Null(Interlocked.CompareExchange(ref _request, request, null));
+                _requestReady.Set();
                 return await request.Task.WaitAsync(ct);
             }
         }
@@ -812,11 +826,12 @@ public sealed partial class JoinCalendarIntegrationTests
 
         public void Dispose()
         {
-            _requests.CompleteAdding();
+            Volatile.Write(ref _stopSampler, true);
+            _requestReady.Set();
             try
             {
                 Assert.True(_sampler.Join(TimeSpan.FromSeconds(10)), "The F4 resource sampler did not stop");
-                _requests.Dispose();
+                _requestReady.Dispose();
             }
             finally
             {
