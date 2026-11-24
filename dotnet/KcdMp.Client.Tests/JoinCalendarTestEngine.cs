@@ -40,12 +40,13 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public volatile bool ReturnRetryVisible;
     private readonly Channel<string> _exitLoads = Channel.CreateUnbounded<string>();
 
-    public JoinCalendarTestEngine(string logPath, string saves, Func<int, byte[]>? hostSave, Action gameplayStarted)
+    public JoinCalendarTestEngine(string logPath, string saves, Func<int, byte[]>? hostSave, Action gameplayStarted,
+        int httpTimeoutMs = 2000)
     {
         _saves = saves;
         _hostSave = hostSave;
         _gameplayStarted = gameplayStarted;
-        var http = new HttpGameTransport("http://localhost:1403", 2000, new ConsoleHandler(this)) { BatchingEnabled = false };
+        var http = new HttpGameTransport("http://localhost:1403", httpTimeoutMs, new ConsoleHandler(this)) { BatchingEnabled = false };
         Transport = new LogTailGameTransport(http, logPath);
         var process = typeof(LogTailGameTransport).GetMethod("ProcessLine", BindingFlags.NonPublic | BindingFlags.Instance)!;
         _feed = (EngineLine)process.CreateDelegate(typeof(EngineLine), Transport);

@@ -5,6 +5,7 @@ using System.Reflection;
 
 namespace KcdMp.Client.Tests;
 
+[Collection("Join calendar resources")]
 public sealed class JoinCalendarTestEngineTests
 {
     [Fact]
@@ -13,7 +14,10 @@ public sealed class JoinCalendarTestEngineTests
         var root = Directory.CreateTempSubdirectory("kct-join-console-boundary-");
         try
         {
-            await using var engine = new JoinCalendarTestEngine(Path.Combine(root.FullName, "game.log"), root.FullName, null, () => { });
+            // The deadlock watchdog owns this test's deadline. The HTTP timeout
+            // would otherwise expire during the intentional hold.
+            await using var engine = new JoinCalendarTestEngine(Path.Combine(root.FullName, "game.log"), root.FullName,
+                null, () => { }, httpTimeoutMs: 15_000);
             var logGate = typeof(JoinCalendarTestEngine).GetField("_logGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(engine)!;
             var logLocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var deadline = TimeSpan.FromSeconds(5);
