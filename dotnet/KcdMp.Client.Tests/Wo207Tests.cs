@@ -514,10 +514,12 @@ public class Wo207PipeTests(ITestOutputHelper output)
 
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_priorityWaiting")]
     private static extern ref int PriorityWaiters(CombatPipe pipe);
+    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_framesWaiting")]
+    private static extern ref int FrameWaiters(CombatPipe pipe);
 
-    // The fake holds the in-flight reply while calls enter the real gate. The poll's context
-    // lets the fake place the next priority call after the poll has queued itself again.
-    private static async Task<int> PriorityRepliesBeforePollAsync(int yields)
+    // The fake holds the in-flight reply while calls enter the real gate or line.
+    // The poll's context lets it queue the next contender behind the poll again.
+    private static async Task<int> RepliesBeforePollAsync(int yields, int opportunities, bool frames)
     {
         const byte pollOp = 55;
         string name = BenchInstance.PipeNameFor("t213s" + Guid.NewGuid().ToString("N")[..8]);
@@ -525,16 +527,21 @@ public class Wo207PipeTests(ITestOutputHelper output)
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         var ct = stop.Token;
         var accept = server.WaitForConnectionAsync(ct);
-        await using var pipe = new CombatPipe(name) { FramesFirst = true, PriorityYields = yields };
+        await using var pipe = new CombatPipe(name) { FramesFirst = true };
+        if (frames) pipe.FrameYields = yields;
+        else pipe.PriorityYields = yields;
         Assert.True(await pipe.EnsureConnectedAsync(ct));
         await accept;
         var pollContext = new PollContext();
         byte sequence = 0;
-        int priorityReplies = 0, beforePoll = -1;
+        int replies = 0, beforePoll = -1;
 
-        async Task CallAsync(byte op, bool priority)
+        int Waiting() => frames ? Volatile.Read(ref FrameWaiters(pipe)) : Volatile.Read(ref PriorityWaiters(pipe));
+
+        async Task CallAsync(byte op, bool foreground)
         {
-            CombatPipe.Priority.Value = priority;
+            CombatPipe.Priority.Value = foreground && !frames;
+            Wo207Trace.Kind.Value = foreground && frames ? Wo207Trace.ConvKind : 0;
             Assert.True((await pipe.Wo138Async(op, [], ct))?.Ok == true, $"No reply for op {op}.");
         }
 
@@ -548,8 +555,8 @@ public class Wo207PipeTests(ITestOutputHelper output)
 
         async Task ReplyAsync(byte op)
         {
-            if (op == pollOp) beforePoll = priorityReplies;
-            else priorityReplies++;
+            if (op == pollOp) beforePoll = replies;
+            else replies++;
             await server.WriteAsync(new byte[] { 0x9F, 4, 0, 1, sequence++, op, 0 }, ct);
         }
 
@@ -559,30 +566,37 @@ public class Wo207PipeTests(ITestOutputHelper output)
             await ReplyAsync(await ReadRequestAsync());
         }
 
-        Task leader = CallAsync(7, priority: true);
+        var callers = new List<Task> { CallAsync(7, foreground: true) };
         Assert.Equal(7, await ReadRequestAsync());
-        Task first = CallAsync(8, priority: true);
-        Task second = CallAsync(9, priority: true);
-        Assert.Equal(2, Volatile.Read(ref PriorityWaiters(pipe)));
-        Task poll = pollContext.Run(() => CallAsync(pollOp, priority: false));
+        callers.Add(CallAsync(8, foreground: true));
+        callers.Add(CallAsync(9, foreground: true));
+        Assert.Equal(2, Waiting());
+        Task poll = pollContext.Run(() => CallAsync(pollOp, foreground: false));
 
         await ReplyAsync(7);
         Assert.Equal(8, await ReadRequestAsync());
         await ReplyAsync(8);
         Assert.Equal(9, await ReadRequestAsync());
-        Task third = CallAsync(10, priority: true);
-        Assert.Equal(1, Volatile.Read(ref PriorityWaiters(pipe)));
-        await ReplyAsync(9);
-        await pollContext.StepAsync(ct); // the poll's first turn, with op 10 waiting
-        Assert.Equal(10, await ReadRequestAsync());
-        await pollContext.StepAsync(ct); // requeue the poll before op 11 is allowed to enter
-        Task fourth = CallAsync(11, priority: true);
-        Assert.Equal(1, Volatile.Read(ref PriorityWaiters(pipe)));
-        await ReplyAsync(10);
+        byte current = 9;
+        for (int turn = 1; turn < opportunities; turn++)
+        {
+            byte next = (byte)(current + 1);
+            callers.Add(CallAsync(next, foreground: true));
+            Assert.Equal(1, Waiting());
+            await ReplyAsync(current);
+            await pollContext.StepAsync(ct); // the poll sees the waiting contender
+            Assert.Equal(next, await ReadRequestAsync());
+            await pollContext.StepAsync(ct); // requeue the poll before admitting another call
+            current = next;
+        }
+        callers.Add(CallAsync((byte)(current + 1), foreground: true));
+        Assert.Equal(1, Waiting());
+        await ReplyAsync(current);
 
         Task dll = FinishRepliesAsync();
         await pollContext.RunUntilAsync(poll, ct);
-        await Task.WhenAll(leader, first, second, third, fourth, dll);
+        callers.Add(dll);
+        await Task.WhenAll(callers);
         return beforePoll;
     }
 
@@ -621,76 +635,26 @@ public class Wo207PipeTests(ITestOutputHelper output)
         }
     }
 
-    // WO-213: frames' calls back to back (a joined talk's camera stream on the listener) never starve a poll either -- it gives way to
-    // them FrameYields times, then keeps its place; the twin (WO-207's rule, no bound) waited as long as the frames kept coming
-    private static async Task<double> PollWaitUnderFrameLoad(int frameYields)
-    {
-        string name = BenchInstance.PipeNameFor("t213f" + Guid.NewGuid().ToString("N")[..8]);
-        var server = new System.IO.Pipes.NamedPipeServerStream(name, System.IO.Pipes.PipeDirection.InOut, 1, System.IO.Pipes.PipeTransmissionMode.Byte, System.IO.Pipes.PipeOptions.Asynchronous);
-        using var stop = new CancellationTokenSource();
-        try
-        {
-            var accept = server.WaitForConnectionAsync();
-            await using var pipe = new CombatPipe(name) { FramesFirst = true, FrameYields = frameYields };
-            Assert.True(await pipe.EnsureConnectedAsync());
-            await accept;
-            var dll = Task.Run(async () =>
-            {
-                byte seq = 0;
-                var head = new byte[3];
-                try
-                {
-                    while (!stop.IsCancellationRequested)
-                    {
-                        int got = 0;
-                        while (got < 3) got += await server.ReadAsync(head.AsMemory(got), stop.Token);
-                        var body = new byte[head[1] | (head[2] << 8)];
-                        got = 0;
-                        while (got < body.Length) got += await server.ReadAsync(body.AsMemory(got), stop.Token);
-                        await Task.Delay(2);
-                        await server.WriteAsync(new byte[] { 0x9F, 4, 0, 1, seq++, body[0], 0 }, stop.Token);
-                    }
-                }
-                catch (OperationCanceledException) { }
-                catch (IOException) { }
-            });
-            // three frame handlers back to back for 1.5 s
-            var frames = Enumerable.Range(0, 3).Select(_ => Task.Run(async () =>
-            {
-                Wo207Trace.Kind.Value = Wo207Trace.ConvKind;
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                while (sw.ElapsedMilliseconds < 1500) await pipe.Wo138Async(9, []);
-            })).ToList();
-            await Task.Delay(100);
-            var w = System.Diagnostics.Stopwatch.StartNew();
-            await pipe.Wo138Async(56, []);   // a background poll
-            double waited = w.Elapsed.TotalMilliseconds;
-            await Task.WhenAll(frames);
-            stop.Cancel();
-            try { await dll; } catch { }
-            return waited;
-        }
-        finally { server.Dispose(); }
-    }
-
     [Fact]
     public async Task A_poll_gives_way_to_frames_calls_a_bounded_number_of_times()
     {
-        double waited = await PollWaitUnderFrameLoad(4);
-        Assert.True(waited < 600, $"waited {waited:F0} ms");
+        int replies = await RepliesBeforePollAsync(4, opportunities: 5, frames: true);
+        output.WriteLine($"H2-WO207 yields=4 frame_replies_before_poll={replies}");
+        Assert.Equal(7, replies);
     }
 
     [Fact]
     public async Task Twin_without_the_frame_bound_a_poll_waits_while_frames_keep_coming()
     {
-        double waited = await PollWaitUnderFrameLoad(int.MaxValue);
-        Assert.True(waited >= 1000, $"waited {waited:F0} ms");
+        int replies = await RepliesBeforePollAsync(int.MaxValue, opportunities: 5, frames: true);
+        output.WriteLine($"H2-WO207 yields=unbounded frame_replies_before_poll={replies}");
+        Assert.Equal(8, replies);
     }
 
     [Fact]
     public async Task A_poll_gives_way_to_priority_calls_for_a_bounded_time_only()
     {
-        int replies = await PriorityRepliesBeforePollAsync(1);
+        int replies = await RepliesBeforePollAsync(1, opportunities: 2, frames: false);
         output.WriteLine($"G1-WO207 yields=1 priority_replies_before_poll={replies}");
         Assert.Equal(4, replies);
     }
@@ -698,7 +662,7 @@ public class Wo207PipeTests(ITestOutputHelper output)
     [Fact]
     public async Task Twin_without_the_bound_a_poll_waits_while_priority_calls_keep_coming()
     {
-        int replies = await PriorityRepliesBeforePollAsync(int.MaxValue);
+        int replies = await RepliesBeforePollAsync(int.MaxValue, opportunities: 2, frames: false);
         output.WriteLine($"G1-WO207 yields=unbounded priority_replies_before_poll={replies}");
         Assert.Equal(5, replies);
     }
