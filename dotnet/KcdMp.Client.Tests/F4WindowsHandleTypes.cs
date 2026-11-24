@@ -24,7 +24,7 @@ internal static class F4WindowsHandleTypes
         public readonly IntPtr Text;
     }
 
-    public static string Capture()
+    public static string Capture(Dictionary<IntPtr, string>? handlesByType = null)
     {
         IntPtr process = GetCurrentProcess();
         int capacity = 64 * 1024;
@@ -61,6 +61,8 @@ internal static class F4WindowsHandleTypes
                 string name = ReadName(process, group, typeBuffer);
                 types.Add($"{name}={group.Value.Count}");
                 if (name == "Thread") threads = ThreadCounts(process, group.Value);
+                if (handlesByType is not null && (name is "Event" or "Thread"))
+                    foreach (var handle in group.Value) handlesByType.Add(handle, name);
             }
             return $"count={count} types={string.Join(',', types.Order(StringComparer.Ordinal))}{threads}";
         }

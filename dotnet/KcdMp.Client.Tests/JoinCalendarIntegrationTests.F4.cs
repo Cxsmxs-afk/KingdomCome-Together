@@ -517,9 +517,10 @@ public sealed partial class JoinCalendarIntegrationTests
     private readonly record struct F4Owned(int PipeConnections, long PipeRevision, int Reservations, int Timers);
 
     private readonly record struct F4ResourceSample(int Threads, int Handles, int RawThreads, int RawHandles,
-        int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, string? WindowsHandleTypes);
+        int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, string? WindowsHandleTypes,
+        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects);
 
-    private static F4ResourceSample F4Resources(GameBridge guest)
+    private static F4ResourceSample F4Resources(GameBridge guest, bool traceWindowsHandles)
     {
         using var process = Process.GetCurrentProcess();
         int rawThreads = process.Threads.Count;
@@ -538,9 +539,10 @@ public sealed partial class JoinCalendarIntegrationTests
         var pipe = Get<CombatPipe>(guest, "_combat");
         int threads = process.Threads.Count;
         int handles = process.HandleCount;
+        Dictionary<IntPtr, string>? objects = traceWindowsHandles ? new() : null;
         return new(threads, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, Timer.ActiveCount,
             new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers),
-            OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture() : null);
+            OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture(objects) : null, objects);
     }
 
     private sealed class F4ResourceCheck : IDisposable
@@ -551,6 +553,7 @@ public sealed partial class JoinCalendarIntegrationTests
         private readonly int _workerMin, _ioMin, _warmWorkers;
         private readonly BlockingCollection<TaskCompletionSource<F4ResourceSample>> _requests = new(1);
         private readonly Thread _sampler;
+        private readonly F4WindowsHandleTrace? _handleTrace;
         private int _nextCycle;
         private F4ResourceSample _before, _after;
 
@@ -562,6 +565,7 @@ public sealed partial class JoinCalendarIntegrationTests
             ThreadPool.GetMinThreads(out _workerMin, out _ioMin);
             _warmWorkers = Math.Max(_workerMin, 16);
             Assert.True(ThreadPool.SetMinThreads(_warmWorkers, _ioMin));
+            if (OperatingSystem.IsWindows()) _handleTrace = new();
             _sampler = new Thread(Sample) { IsBackground = true, Name = "F4 resource sampler" };
             _sampler.Start();
         }
@@ -598,7 +602,7 @@ public sealed partial class JoinCalendarIntegrationTests
             // for baseline and observations, even when the join resumes on different workers.
             foreach (var request in _requests.GetConsumingEnumerable())
             {
-                try { request.SetResult(F4Resources(_guest)); }
+                try { request.SetResult(F4Resources(_guest, _handleTrace is not null)); }
                 catch (Exception ex) { request.SetException(ex); }
             }
         }
@@ -640,6 +644,9 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"thread_pool_workers={before.ThreadPoolWorkers}->{after.ThreadPoolWorkers} runtime_timers={before.RuntimeTimers}->{after.RuntimeTimers} " +
                 $"guest_pipe={before.Owned.PipeConnections}->{after.Owned.PipeConnections} tracked_leases={before.Owned.Reservations}->{after.Owned.Reservations} " +
                 $"pipe_revision={before.Owned.PipeRevision}->{after.Owned.PipeRevision} rejoin_timer={before.Owned.Timers}->{after.Owned.Timers}");
+            if (_handleTrace is not null && after.Handles > before.Handles + 4 &&
+                before.WindowsHandleObjects is { } start && after.WindowsHandleObjects is { } end)
+                _output.WriteLine($"F4-HANDLE-ORIGINS scenario={_scenario} {_handleTrace.DescribeNewHandles(start, end)}");
             Assert.InRange(after.Threads, 0, before.Threads + 4);
             Assert.InRange(after.Handles, 0, before.Handles + 4);
             Assert.InRange(after.RuntimeTimers, 0, before.RuntimeTimers + 1);
@@ -654,7 +661,11 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.True(_sampler.Join(TimeSpan.FromSeconds(10)), "The F4 resource sampler did not stop");
                 _requests.Dispose();
             }
-            finally { Assert.True(ThreadPool.SetMinThreads(_workerMin, _ioMin)); }
+            finally
+            {
+                _handleTrace?.Dispose();
+                Assert.True(ThreadPool.SetMinThreads(_workerMin, _ioMin));
+            }
         }
     }
 }
