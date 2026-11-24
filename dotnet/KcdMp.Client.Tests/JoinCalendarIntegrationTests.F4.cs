@@ -348,7 +348,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 Console.WriteLine($"F4-MPEXIT cycle={i} warmup={(i == 0 ? 1 : 0)} join_loads={engine.JoinLoadsIssued} own_loads=0 terminal=menu files=0 own_sha256_equal=1");
             }
             finally { File.Move(savedOutsideProfile, ownSave); }
-            if (i == 0) before = F4Resources(guest, guestPipe);
+            if (i == 0 && !supersedeLoad) before = F4Resources(guest, guestPipe, drainFinalizers: output is not null);
         }
         Assert.Equal(lastCycle + 1, engine.JoinLoadsIssued);
         Assert.Equal(lastCycle + 1, exits.Count);
@@ -487,26 +487,39 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private readonly record struct F4Owned(int PipeConnections, long PipeRevision, int Reservations, int Timers);
 
-    private readonly record struct F4ResourceSample(int Threads, int Handles, int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned);
+    private readonly record struct F4ResourceSample(int Threads, int Handles, int RawThreads, int RawHandles,
+        int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned);
 
-    private static F4ResourceSample F4Resources(GameBridge guest, JoinCalendarTestPipe pipe)
+    private static F4ResourceSample F4Resources(GameBridge guest, JoinCalendarTestPipe pipe, bool drainFinalizers = false)
     {
         using var process = Process.GetCurrentProcess();
+        int rawThreads = process.Threads.Count;
+        int rawHandles = process.HandleCount;
+        if (drainFinalizers)
+        {
+            // Match both sampling boundaries in the isolated testhost. The
+            // before/after counters still include live and retained handles.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            process.Refresh();
+        }
         var retained = Get<object>(guest, "_retainedJoinWorlds");
         int leases = (int)retained.GetType().GetProperty("Count")!.GetValue(retained)!;
         leases += Get<object?>(guest, "_joinRx") is null ? 0 : 1;
         leases += Get<object?>(guest, "_pinnedHomeLoad") is null ? 0 : 1;
         leases += Get<object?>(guest, "_wo125ActiveExitPath") is null ? 0 : 1;
         int timers = Get<bool>(guest, "_rejoinPending") ? 1 : 0;
-        return new(process.Threads.Count, process.HandleCount, ThreadPool.ThreadCount, Timer.ActiveCount,
+        return new(process.Threads.Count, process.HandleCount, rawThreads, rawHandles, ThreadPool.ThreadCount, Timer.ActiveCount,
             new(pipe.Pipe.IsConnected ? 1 : 0, pipe.Pipe.EdgeConnectionRevision, leases, timers));
     }
 
     private static void AssertF4Resources(string scenario, F4ResourceSample before,
         GameBridge guest, JoinCalendarTestPipe pipe, ITestOutputHelper? output = null)
     {
-        var after = F4Resources(guest, pipe);
+        var after = F4Resources(guest, pipe, drainFinalizers: output is not null);
         string summary = $"F4-RESOURCES scenario={scenario} threads={before.Threads}->{after.Threads} handles={before.Handles}->{after.Handles} " +
+            $"raw_threads={before.RawThreads}->{after.RawThreads} raw_handles={before.RawHandles}->{after.RawHandles} " +
             $"thread_pool_workers={before.ThreadPoolWorkers}->{after.ThreadPoolWorkers} runtime_timers={before.RuntimeTimers}->{after.RuntimeTimers} " +
             $"guest_pipe={before.Owned.PipeConnections}->{after.Owned.PipeConnections} tracked_leases={before.Owned.Reservations}->{after.Owned.Reservations} " +
             $"pipe_revision={before.Owned.PipeRevision}->{after.Owned.PipeRevision} rejoin_timer={before.Owned.Timers}->{after.Owned.Timers}";
