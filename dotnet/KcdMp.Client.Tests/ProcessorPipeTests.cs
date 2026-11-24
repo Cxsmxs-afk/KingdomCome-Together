@@ -32,6 +32,19 @@ public class ProcessorPipeTests
     private static NamedPipeServerStream Server(string name) =>
         new(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
 
+    private static Task<ProcessorFrameScope.Result> AbandonStartedAsync(Func<Task> start)
+    {
+        var clock = new ManualFrameTime();
+        return ProcessorFrameScope.RunAsync(async _ =>
+        {
+            await clock.Armed;
+            var request = start();
+            Assert.False(request.IsCompleted);
+            clock.Expire();
+            await request;
+        }, 150, CancellationToken.None, clock).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
     [Fact]
     public async Task Ambient_abandon_cancels_connection_gate_wait_even_with_a_distinct_caller_token()
     {
@@ -42,7 +55,7 @@ public class ProcessorPipeTests
         Task<bool>? request = null;
         try
         {
-            var outcome = await ProcessorFrameScope.RunAsync(_ => request = pipe.Wo151WeatherGateAsync("foggy_storm", caller.Token), 150);
+            var outcome = await AbandonStartedAsync(() => request = pipe.Wo151WeatherGateAsync("foggy_storm", caller.Token));
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, outcome.Status);
             Assert.NotNull(request);
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request!.WaitAsync(TimeSpan.FromSeconds(2)));
@@ -63,12 +76,13 @@ public class ProcessorPipeTests
         Task<bool>? request = null;
         try
         {
+            var clock = new ManualFrameTime();
             var frame = ProcessorFrameScope.RunAsync(_ =>
             {
                 request = pipe.EnsureConnectedAsync(caller.Token);
                 started.SetResult();
                 return request;
-            }, 2000);
+            }, 2000, CancellationToken.None, clock);
             await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
             caller.Cancel();
             var outcome = await frame.WaitAsync(TimeSpan.FromSeconds(2));
@@ -90,7 +104,7 @@ public class ProcessorPipeTests
         Task<bool>? abandoned = null;
         try
         {
-            var outcome = await ProcessorFrameScope.RunAsync(_ => abandoned = pipe.Wo151WeatherGateAsync("foggy_storm"), 150);
+            var outcome = await AbandonStartedAsync(() => abandoned = pipe.Wo151WeatherGateAsync("foggy_storm"));
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, outcome.Status);
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned!.WaitAsync(TimeSpan.FromSeconds(2)));
             Assert.True(pipe.IsConnected); // queued cancellation does not reset another operation's connection
@@ -140,7 +154,7 @@ public class ProcessorPipeTests
         Task<(bool Ok, byte Reason, byte[] Payload)?> live;
         try
         {
-            var outcome = await ProcessorFrameScope.RunAsync(_ => abandoned = pipe.Wo151Async(7, []), 150);
+            var outcome = await AbandonStartedAsync(() => abandoned = pipe.Wo151Async(7, []));
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, outcome.Status);
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned!.WaitAsync(TimeSpan.FromSeconds(2)));
             live = pipe.Wo151Async(2, []);
@@ -165,9 +179,10 @@ public class ProcessorPipeTests
         var never = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
-            var dead = await ProcessorFrameScope.RunAsync(_ => { Assert.True(pipe.PostLatest(0x2B, [17, 0], "dead")); return never.Task; }, 150);
+            var dead = await AbandonStartedAsync(() => { Assert.True(pipe.PostLatest(0x2B, [17, 0], "dead")); return never.Task; });
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, dead.Status);
-            var live = await ProcessorFrameScope.RunAsync(_ => { Assert.True(pipe.PostLatest(0x2B, [17, 1], "live")); return Task.CompletedTask; }, 2000);
+            var live = await ProcessorFrameScope.RunAsync(_ => { Assert.True(pipe.PostLatest(0x2B, [17, 1], "live")); return Task.CompletedTask; },
+                2000, CancellationToken.None, new ManualFrameTime()).WaitAsync(TimeSpan.FromSeconds(2));
             Assert.Equal(ProcessorFrameScope.Outcome.Completed, live.Status);
         }
         finally { writer.Release(); never.SetResult(); }
