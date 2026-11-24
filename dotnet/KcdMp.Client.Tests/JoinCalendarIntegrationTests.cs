@@ -179,7 +179,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
         {
             CanQuickSave = f4 != F4Probe.ActiveGuest,
         };
-        if (f4 is F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe)
+        if (f4 is F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe or F4Probe.RetainedTimer)
             guestPipe.SaveListed = (slot, name) => File.Exists(Path.Combine(fixture.GuestSaves, $"playline{slot}", name + ".whs"));
         Func<int, byte[]> makeHostSave = f4 is F4Probe.TransferAbort or F4Probe.HostAbort or F4Probe.TransportLost
             ? F4LargeHostSave : fixture.MakeHostSave;
@@ -1052,7 +1052,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
     }
 
     /// <summary>Observes actual relay frames and can remove one frozen clock before the guest agent reads it.</summary>
-    private sealed class JoinWire(Stream wire, IReadOnlyList<ReplayPacket> initial, bool dropFirstSnapshot) : Stream
+    internal sealed class JoinWire(Stream wire, IReadOnlyList<ReplayPacket> initial, bool dropFirstSnapshot) : Stream
     {
         private readonly Queue<ReplayPacket> _initial = new(initial);
         private readonly Queue<ReplayPacket> _injected = new();

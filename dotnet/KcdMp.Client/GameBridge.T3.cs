@@ -99,6 +99,7 @@ public partial class GameBridge
         {
             try
             {
+                using var cadence = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
                 _ = T3ReportConfigAsync(ct); // configuration I/O can never hold the replay clock
                 while (!ct.IsCancellationRequested && ReferenceEquals(_frameWriter, writer))
                 {
@@ -122,7 +123,7 @@ public partial class GameBridge
                         T3Increment("proc_tick_faults");
                         Console.WriteLine($"MP-T3-TICK iteration failed error={ex.GetType().Name}; clock continues");
                     }
-                    await Task.Delay(100, ct);
+                    if (!await cadence.WaitForNextTickAsync(ct)) break;
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { }

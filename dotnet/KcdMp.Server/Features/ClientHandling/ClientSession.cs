@@ -200,18 +200,21 @@ public partial class ClientSession
     /// </summary>
     public byte Id { get; internal set; }
     public string? Name { get; private set; }
+    internal Guid RosterMember { get; private set; }
     private volatile bool _superseded;
     private int _disconnectAnnounced;
     public bool IsReady => Name is not null && !_superseded;
     internal bool IsSuperseded => _superseded;
     internal void MarkSuperseded() => _superseded = true;
 
-    internal void AcceptHandshake(string name)
+    internal void AcceptHandshake(string name, Guid rosterMember)
     {
         // WO-110 R4: broadcasts can see this session only after the Ack has entered
         // the FIFO. ClientHandler holds its roster lock across the reservation.
         PvpIncarnation = (ulong)Interlocked.Increment(ref s_nextPvpIncarnation);
+        RosterMember = rosterMember;
         EnqueueRaw(BuildPacket(Protocol.Ack, [Id]));
+        EnqueueRosterPeer(this);
         Name = name;
     }
 
@@ -338,9 +341,16 @@ public partial class ClientSession
     {
         long pruneAt = Environment.TickCount64 + 30_000;
         Action<byte[], bool> observe = (frame, _) => ObserveOutgoingFrame(frame);
+        // One clock for this writer's retry, repeat and prune work. Enqueued packets
+        // still wake it immediately. A blocked writer needs only one cadence wake.
+        await using var cadence = new Timer(static state =>
+        {
+            var signal = (SemaphoreSlim)state!;
+            if (signal.CurrentCount == 0) signal.Release();
+        }, _writeSignal, 10, 10);
         while (true)
         {
-            await _writeSignal.WaitAsync(10);
+            await _writeSignal.WaitAsync();
             try
             {
                 await _writer!.PumpOnceAsync(CancellationToken.None, observe);
@@ -1791,12 +1801,22 @@ public partial class ClientSession
         return body[3..(3 + configLen)];
     }
 
-    /// <summary>Thread-safe: enqueue a Name packet (0x03) to be sent to this client.</summary>
-    public void EnqueueName(byte ghostId, string name)
+    private void EnqueueRosterPeer(ClientSession peer)
     {
-        var nameBytes = Encoding.UTF8.GetBytes(name);
+        var payload = new byte[Protocol.RosterPeerLen];
+        payload[0] = peer.Id;
+        _clientHandler.RosterInstance.TryWriteBytes(payload.AsSpan(1, 16));
+        peer.RosterMember.TryWriteBytes(payload.AsSpan(17));
+        EnqueueRaw(BuildPacket(Protocol.RosterPeerDown, payload));
+    }
+
+    /// <summary>Queue the relay's member key before introducing the player's display name.</summary>
+    public void EnqueueName(ClientSession peer)
+    {
+        EnqueueRosterPeer(peer);
+        var nameBytes = Encoding.UTF8.GetBytes(peer.Name!);
         var payload = new byte[1 + nameBytes.Length];
-        payload[0] = ghostId;
+        payload[0] = peer.Id;
         nameBytes.CopyTo(payload, 1);
         EnqueueRaw(BuildPacket(Protocol.Name, payload));
     }

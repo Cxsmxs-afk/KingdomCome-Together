@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
 using System.Security.Cryptography;
+using System.Text;
 using ILogger = Serilog.ILogger;
 
 namespace KcdMp.Server.Features.ClientHandling;
@@ -21,6 +22,8 @@ public class ClientHandler
 	private readonly HashSet<ClientSession> _readyClients = [];
 	private readonly object _lock = new();
 	private readonly int _maxPlayers;
+	private readonly byte[] _rosterSalt = RandomNumberGenerator.GetBytes(32);
+	internal Guid RosterInstance { get; } = Guid.NewGuid();
 
 	// WO-76 (docs/WO-75-audit-findings.md s1): a free-list pool of the wire's
 	// byte-wide session ids. ClientSession.Id stays a byte until PR #3 widens
@@ -193,7 +196,7 @@ public class ClientHandler
 			client.Id = _freeIds.Min;
 			_freeIds.Remove(client.Id);
 			_readyClients.Add(client);
-			client.AcceptHandshake(name);
+			client.AcceptHandshake(name, RosterMember(client.IdentityKey, name));
 			foreach (var old in superseded) old.MarkSuperseded();
 			if (authority is { IsSuperseded: true })
 				DepartAuthority(authority, active - superseded.Count, "superseded");
@@ -242,13 +245,11 @@ public class ClientHandler
 	{
 		bool confirmed = ReferenceEquals(_sessionHost, client);
 		_sessionHost = null;
-		// The selected authority already made an explicit claim on this
-		// connection. A dedicated relay may lose it before receiving mode.
-		if (ReferenceEquals(_earlyHost, client) || client.ClaimsHost && HasPlayerIdentity(client.IdentityKey))
-		{
-			_departedEarlyHost = new(client.IdentityKey, client.Name!);
-			ForgetRetiredEarlyHost(client);
-		}
+		// A reserved seat belongs to the selected host until that player returns
+		// or the roster becomes empty. Later departures cannot replace it.
+		if ((ReferenceEquals(_earlyHost, client) || client.ClaimsHost) && HasPlayerIdentity(client.IdentityKey))
+			_departedEarlyHost ??= new(client.IdentityKey, client.Name!);
+		ForgetRetiredEarlyHost(client);
 		_hostClaimRequired = true;
 		if (!confirmed || remaining == 0 || client.AnnouncedWorldEpoch == 0 || client.AnnouncedRunId == Guid.Empty ||
 			!HasPlayerIdentity(client.IdentityKey))
@@ -290,6 +291,11 @@ public class ClientHandler
 	}
 
 	private static bool HasPlayerIdentity(string key) => !string.IsNullOrEmpty(key) && !key.EndsWith(':') && !key.EndsWith('?');
+
+	// A stable label for this relay process, with no raw address or Steam identifier on the wire.
+	private Guid RosterMember(string identity, string name) => HasPlayerIdentity(identity)
+		? new Guid(HMACSHA256.HashData(_rosterSalt, Encoding.UTF8.GetBytes($"{identity}\0{name}")).AsSpan(0, 16))
+		: Guid.NewGuid();
 
 	/// <summary>
 	/// Gets a copy of the client list to prevent outside manipulation.
@@ -388,7 +394,7 @@ public class ClientHandler
 	}
 
 	// A role change shares the roster lock with departure and mode registration.
-	// The launcher's loopback claim can arrive before Wo124 sends the mode.
+	// The first selected explicit claim reserves the seat on either transport.
 	internal bool UpdateHostClaim(ClientSession client, bool claims)
 	{
 		lock (_lock)
@@ -398,7 +404,7 @@ public class ClientHandler
 			client.ClaimsHost = claims;
 			if (claims)
 			{
-				if (ReferenceEquals(_earlyHost, client) || client.IsLoopback && _sessionHost is null &&
+				if (_sessionHost is null &&
 					ReferenceEquals(PickAuthority(out _), client)) RememberEarlyHost(client, modeObserved: false);
 				TryResumeHostCore(client);
 			}
@@ -511,9 +517,6 @@ public class ClientHandler
 	{
 		if (_absentHost is not null) { reason = "host-absent"; return null; }
 		if (_sessionHost is not null) { reason = "session-host"; return _sessionHost; }
-		// Old agents can announce from the initial fallback position. They must not
-		// turn that provisional seat into ownership ahead of the first explicit claim.
-		if (_earlyHostClaimed && _earlyHost is not null) { reason = "early-host"; return _earlyHost; }
 		if (_departedEarlyHost is { } departed)
 		{
 			reason = "awaiting-early-host";
@@ -521,6 +524,9 @@ public class ClientHandler
 				if (c.IsReady && c.ClaimsHost && departed.Matches(c)) { reason = "returning-early-host"; return c; }
 			return null;
 		}
+		// Old agents can announce from the initial fallback position. They must not
+		// turn that provisional seat into ownership ahead of the first explicit claim.
+		if (_earlyHostClaimed && _earlyHost is not null) { reason = "early-host"; return _earlyHost; }
 		var claimants = new List<ClientSession>();
 		foreach (var c in _clients)
 			if (c.IsReady && c.ClaimsHost) claimants.Add(c);

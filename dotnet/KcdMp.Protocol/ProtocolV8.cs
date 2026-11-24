@@ -358,6 +358,19 @@ public static partial class Protocol
     public const byte PlayerHitV8Down = 0x45;
     public const byte PvpPeerDown = 0x94; // negotiated relay roster entry [ghost:1][incarnation:8]
     public const byte PvpLifeUp = 0x95; // negotiated owner change [revision:8][proof:8]
+    public const byte RosterPeerDown = 0x96; // relay introduction [ghost:1][relay instance:16][opaque member:16]
+    public const int RosterPeerLen = 1 + 16 + 16;
+
+    public static bool TryReadRosterPeer(ReadOnlySpan<byte> body, out byte ghost, out Guid relay, out Guid member)
+    {
+        ghost = 0;
+        relay = member = Guid.Empty;
+        if (body.Length != RosterPeerLen) return false;
+        ghost = body[0];
+        relay = new Guid(body.Slice(1, 16));
+        member = new Guid(body[17..]);
+        return relay != Guid.Empty && member != Guid.Empty;
+    }
     public const int PvpPeerLen = 1 + sizeof(ulong);
     public const int PvpPeerLifeLen = PvpPeerLen + PvpLifeState.Length;
 

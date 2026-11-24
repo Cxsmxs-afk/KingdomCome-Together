@@ -20,7 +20,8 @@ public partial class GameBridge
 {
     private readonly PeerSet _peers = new();
     private readonly ConcurrentDictionary<byte, bool> _w144DropTold = new();
-    private readonly ConcurrentDictionary<string, (JoinerCrimeRecord Rec, DateTime At)> _w144ParkedCrime = new();
+    private readonly ConcurrentDictionary<Guid, (JoinerCrimeRecord Rec, DateTime At)> _w144ParkedCrime = new();
+    private Guid _w144CrimeRoster;
     private long _w144Dropped;
 
     private bool IsLivePeer(byte id) => _peers.IsLive(id);
@@ -54,16 +55,28 @@ public partial class GameBridge
             ? ((DateTime.UtcNow - s.AtUtc).TotalSeconds < LeashFreshS, s.S.Flags)
             : (false, (ushort)0);
 
+    private void Wo144OnRosterPeer(byte id, Guid relayInstance, Guid member)
+    {
+        if (!_peers.AnnounceRosterPeer(id, relayInstance, member))
+        {
+            Wo171RefuseSlots("roster-instance-changed");
+            return;
+        }
+        if (_w144CrimeRoster == relayInstance) return;
+        _w144ParkedCrime.Clear();
+        _w144CrimeRoster = relayInstance;
+    }
+
     /// <summary>The relay named a client (Name packet): a partner now.</summary>
     private void Wo144OnPeerConnected(byte id, string name)
     {
         bool fresh = _peers.Connected(id, name);
         Wo191ForgetSender(id, fresh ? "connected" : "named-again");   // WO-191 1a: a (re)launched agent starts a fresh order
         _w144DropTold.TryRemove(id, out _);
-        var twins = _peers.SameName(id, name);
         if (fresh)
-            Console.WriteLine($"MP-PEERS ghost {id} connected ({LivePartners().Count} partner(s) now){(twins.Count > 0 ? $" -- the same player as ghost {string.Join(",", twins)}: the relay replaces the old connection" : "")}");
-        if (_w144ParkedCrime.TryRemove(name, out var parked) && (DateTime.UtcNow - parked.At).TotalHours < 2)
+            Console.WriteLine($"MP-PEERS ghost {id} connected ({LivePartners().Count} partner(s) now)");
+        Guid member = _peers.RosterMemberOf(id);
+        if (member != Guid.Empty && _w144ParkedCrime.TryRemove(member, out var parked) && (DateTime.UtcNow - parked.At).TotalHours < 2)
         {
             int dropped = parked.Rec.DropReportedTrespasses();   // WO-157 1.2: his own machine's trespass reports are not trusted
             _w139Records[id] = parked.Rec;
@@ -74,11 +87,11 @@ public partial class GameBridge
     /// <summary>The relay's Disconnect, first thing: every loop stops counting it at once.</summary>
     private void Wo144OnPeerDisconnected(byte id)
     {
-        string? name = _peers.Disconnected(id);
+        string? name = _peers.Disconnected(id, out Guid member);
         Wo191ForgetSender(id, "disconnected");   // WO-191 1a
         Wo203CamOnPeerGone(id);                  // WO-203B: his conversation's view ends here; he no longer listens to ours
-        if (name is not null && _w139Records.TryRemove(id, out var rec) && rec.Count > 0)
-            _w144ParkedCrime[name] = (rec, DateTime.UtcNow);
+        if (name is not null && _w139Records.TryRemove(id, out var rec) && member != Guid.Empty && rec.Count > 0)
+            _w144ParkedCrime[member] = (rec, DateTime.UtcNow);
         Console.WriteLine($"MP-PEERS ghost {id} disconnected ({LivePartners().Count} partner(s) now) -- it stays removed until the relay names that id again");
         // WO-151 3.6: a partner who left holds nothing here any more (his talks and stops ended with him)
         _ = ExecLuaAsync($"if KCD2MP_W151ReleasePeerHolds then KCD2MP_W151ReleasePeerHolds({id}) end");

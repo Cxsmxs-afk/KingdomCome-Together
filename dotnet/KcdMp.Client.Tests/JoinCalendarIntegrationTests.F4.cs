@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using KcdMp.Wire;
 using Xunit.Abstractions;
+using Xunit.Sdk;
 
 namespace KcdMp.Client.Tests;
 
@@ -23,14 +24,51 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
     [Fact]
     public Task An_answer_from_the_live_menu_cannot_confirm_a_superseded_exit_load() =>
         JoinCalendarIntegrationTests.RunF4MenuProbeAsync(output, supersedeLoad: true);
+
+    [Fact]
+    public async Task Five_leaves_with_one_retained_timer_each_fail_the_same_process_timer_budget()
+    {
+        var failure = await Assert.ThrowsAsync<TrueException>(() =>
+            JoinCalendarIntegrationTests.RunF4MenuProbeAsync(output, retainTimers: true));
+        Assert.Contains("F4 runtime timer budget", failure.Message);
+        output.WriteLine("F4-TIMER-TWIN scenario=mpexit-retained-timer retained=5 result=budget-rejected");
+    }
+
+    [Fact]
+    public async Task Processor_deadlines_are_attributed_and_cancelled_while_an_unowned_short_timer_remains()
+    {
+        using var stop = new CancellationTokenSource();
+        using var trace = new F4DelayTrace();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var unowned = Task.Delay(1950, stop.Token);
+        Task<ProcessorFrameScope.Result>[] frames =
+        [
+            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token),
+            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token)
+        ];
+        try
+        {
+            var sample = Assert.IsType<F4RuntimeTimers.Inventory>(F4RuntimeTimers.Capture(trace, out long active));
+            Assert.Equal(active, sample.Count);
+            Assert.Equal(frames.Length, sample.FrameDeadlines.Length);
+            Assert.DoesNotContain(unowned, sample.FrameDeadlines);
+            release.SetResult();
+            var finished = await Task.WhenAll(frames);
+            Assert.All(finished, result => Assert.Equal(ProcessorFrameScope.Outcome.Completed, result.Status));
+            Assert.All(sample.FrameDeadlines, deadline => Assert.True(deadline.IsCanceled));
+            output.WriteLine($"F4-TIMER-ORIGIN cancelled={sample.FrameDeadlines.Length} types={sample.Types}");
+        }
+        finally { await stop.CancelAsync(); release.TrySetResult(); }
+    }
 }
 
 public sealed partial class JoinCalendarIntegrationTests
 {
-    private enum F4Probe { TransferAbort, NoOwnExit, NoOwnExitWithMenuProbe, SupersededMenuProbe, HostAbort, MissingOwnSave, ActiveGuest, TransportLost, HostReturn }
+    private enum F4Probe { TransferAbort, NoOwnExit, NoOwnExitWithMenuProbe, SupersededMenuProbe, HostAbort, MissingOwnSave, ActiveGuest, TransportLost, HostReturn, RetainedTimer }
 
-    internal static Task RunF4MenuProbeAsync(ITestOutputHelper output, bool supersedeLoad = false) =>
-        RunAsync("A", "B", dropFirstSnapshot: false, f4: supersedeLoad ? F4Probe.SupersededMenuProbe : F4Probe.NoOwnExitWithMenuProbe,
+    internal static Task RunF4MenuProbeAsync(ITestOutputHelper output, bool supersedeLoad = false, bool retainTimers = false) =>
+        RunAsync("A", "B", dropFirstSnapshot: false, f4: supersedeLoad ? F4Probe.SupersededMenuProbe
+            : retainTimers ? F4Probe.RetainedTimer : F4Probe.NoOwnExitWithMenuProbe,
             f4Output: output);
 
     [Theory]
@@ -87,7 +125,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"transfer-player-{hostLabel.ToLowerInvariant()}", ct, output),
             F4Probe.HostAbort => TestF4TransfersAsync(fixture, host, guest, hostLink, guestLink, guestPipe, hostEngine, engine,
                 "transfer-host", ct, output),
-            F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe =>
+            F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe or F4Probe.RetainedTimer =>
                 TestF4MenuExitAsync(fixture, host, guest, hostLink, engine, ct, output, probe),
             F4Probe.MissingOwnSave => TestF4MissingOwnSaveAsync(fixture, host, guest, hostLink, guestLink, engine, ct, output),
             _ => throw new ArgumentOutOfRangeException(nameof(probe))
@@ -325,9 +363,17 @@ public sealed partial class JoinCalendarIntegrationTests
         engine.DeferExitFileRead = true;
         var exits = new HashSet<string>();
         bool supersedeLoad = probe == F4Probe.SupersededMenuProbe;
-        using var resources = supersedeLoad ? null : await F4ResourceCheck.WarmAsync(probe == F4Probe.NoOwnExit ? "mpexit-receipt" : "mpexit", guest, output, ct);
+        bool retainTimers = probe == F4Probe.RetainedTimer;
+        string scenario = probe switch
+        {
+            F4Probe.NoOwnExit => "mpexit-receipt",
+            F4Probe.RetainedTimer => "mpexit-retained-timer",
+            _ => "mpexit"
+        };
+        using var resources = supersedeLoad ? null : await F4ResourceCheck.WarmAsync(scenario, guest, output, ct);
         int initialReceiptCycle = probe == F4Probe.NoOwnExit ? 1 : 0;
         int lastCycle = supersedeLoad ? 0 : 5 + initialReceiptCycle;
+        using var outstanding = retainTimers ? new RetainedLeaveTimers() : null;
         // Load and return once before measuring so the initial runtime and
         // fixture setup is outside the five comparable cycles.
         for (int i = 0; i <= lastCycle; i++)
@@ -379,12 +425,29 @@ public sealed partial class JoinCalendarIntegrationTests
                 Console.WriteLine($"F4-MPEXIT cycle={i} warmup={(i <= initialReceiptCycle ? 1 : 0)} join_loads={engine.JoinLoadsIssued} own_loads=0 terminal=menu files=0 own_sha256_equal=1");
             }
             finally { File.Move(savedOutsideProfile, ownSave); }
-            if (resources is not null && i >= initialReceiptCycle) await resources.CycleAsync(i - initialReceiptCycle, ct, host);
+            if (resources is not null && i >= initialReceiptCycle)
+            {
+                if (i > initialReceiptCycle) outstanding?.Retain();
+                await resources.CycleAsync(i - initialReceiptCycle, ct, host);
+            }
         }
         Assert.Equal(lastCycle + 1, engine.JoinLoadsIssued);
         Assert.Equal(lastCycle + 1, exits.Count);
         Assert.Equal(ownBefore, SHA256.HashData(File.ReadAllBytes(ownSave)));
         resources?.AssertBudget();
+    }
+
+    private sealed class RetainedLeaveTimers : IDisposable
+    {
+        private readonly List<CancellationTokenSource> _retained = [];
+
+        // Retain a real one-shot timer past every sample. It is released only after the test's assertion.
+        public void Retain() => _retained.Add(new CancellationTokenSource(TimeSpan.FromMinutes(2)));
+
+        public void Dispose()
+        {
+            foreach (var timer in _retained) timer.Dispose();
+        }
     }
 
     private static async Task CheckF4SupersededMenuAsync(GameBridge guest, JoinCalendarTestEngine engine, string exit, ITestOutputHelper output)
@@ -526,7 +589,7 @@ public sealed partial class JoinCalendarIntegrationTests
         int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, string? WindowsHandleTypes,
         IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, F4RuntimeTimers.Inventory? Timers);
 
-    private static F4ResourceSample F4Resources(GameBridge guest, bool traceWindowsHandles)
+    private static F4ResourceSample F4Resources(GameBridge guest, bool traceWindowsHandles, F4DelayTrace delayTrace)
     {
         using var process = Process.GetCurrentProcess();
         int rawThreads = process.Threads.Count;
@@ -545,8 +608,7 @@ public sealed partial class JoinCalendarIntegrationTests
         var pipe = Get<CombatPipe>(guest, "_combat");
         int threads = process.Threads.Count;
         int handles = process.HandleCount;
-        long runtimeTimers = Timer.ActiveCount;
-        var timerInventory = F4RuntimeTimers.Capture();
+        var timerInventory = F4RuntimeTimers.Capture(delayTrace, out long runtimeTimers);
         Dictionary<IntPtr, string>? objects = traceWindowsHandles ? new() : null;
         return new(threads, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, runtimeTimers,
             new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers),
@@ -555,13 +617,12 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private sealed class F4ResourceCheck : IDisposable
     {
+        private const int TimerAllowance = 1;
         private readonly string _scenario;
         private readonly GameBridge _guest;
         private readonly ITestOutputHelper _output;
-        private readonly int _workerMin, _ioMin, _warmWorkers;
-        private readonly int _workerMax, _ioMax;
-        private bool _workerCapSet;
         private readonly BlockingCollection<TaskCompletionSource<F4ResourceSample>> _requests = new(1);
+        private readonly F4DelayTrace _delayTrace = new();
         private readonly Thread _sampler;
         private readonly F4WindowsHandleTrace? _handleTrace;
         private int _nextCycle;
@@ -572,10 +633,6 @@ public sealed partial class JoinCalendarIntegrationTests
             _scenario = scenario;
             _guest = guest;
             _output = output;
-            ThreadPool.GetMinThreads(out _workerMin, out _ioMin);
-            ThreadPool.GetMaxThreads(out _workerMax, out _ioMax);
-            _warmWorkers = Math.Max(_workerMin, Math.Min(_workerMax,
-                OperatingSystem.IsWindows() ? Math.Max(16, ThreadPool.ThreadCount + 2) : 16));
             if (OperatingSystem.IsWindows()) _handleTrace = new();
             _sampler = new Thread(Sample) { IsBackground = true, Name = "F4 resource sampler" };
             _sampler.Start();
@@ -585,22 +642,21 @@ public sealed partial class JoinCalendarIntegrationTests
             ITestOutputHelper output, CancellationToken ct)
         {
             var check = new F4ResourceCheck(scenario, guest, output);
+            ThreadPool.GetMinThreads(out int workerMin, out int ioMin);
+            ThreadPool.GetMaxThreads(out int workerMax, out _);
+            bool useWinsock = OperatingSystem.IsWindows();
+            int warmWorkers = Math.Clamp(useWinsock ? Math.Max(16, ThreadPool.ThreadCount + 2) : 16, workerMin, workerMax);
             try
             {
-                bool useWinsock = OperatingSystem.IsWindows();
-                if (useWinsock)
+                Assert.True(ThreadPool.SetMinThreads(warmWorkers, ioMin));
+                try
                 {
-                    // Cap before queuing the warmup. Otherwise the pool can
-                    // inject workers that never run one of the parked exchanges.
-                    Assert.True(ThreadPool.SetMaxThreads(check._warmWorkers, check._ioMax));
-                    check._workerCapSet = true;
+                    int warmed = await WarmWorkersAsync(warmWorkers, useWinsock, ct);
+                    output.WriteLine($"F4-POOL-WARMUP scenario={scenario} primed={warmed} worker_min={workerMin} worker_max={workerMax}");
                 }
-                Assert.True(ThreadPool.SetMinThreads(check._warmWorkers, check._ioMin));
-                int warmed = await WarmWorkersAsync(check._warmWorkers, useWinsock, ct);
-                if (useWinsock)
+                finally
                 {
-                    Assert.InRange(ThreadPool.ThreadCount, 0, check._warmWorkers);
-                    output.WriteLine($"F4-WINSOCK-WARMUP scenario={scenario} primed={warmed} worker_cap={check._warmWorkers}");
+                    Assert.True(ThreadPool.SetMinThreads(workerMin, ioMin));
                 }
                 return check;
             }
@@ -657,7 +713,7 @@ public sealed partial class JoinCalendarIntegrationTests
             // for baseline and observations, even when the join resumes on different workers.
             foreach (var request in _requests.GetConsumingEnumerable())
             {
-                try { request.SetResult(F4Resources(_guest, _handleTrace is not null)); }
+                try { request.SetResult(F4Resources(_guest, _handleTrace is not null, _delayTrace)); }
                 catch (Exception ex) { request.SetException(ex); }
             }
         }
@@ -666,21 +722,24 @@ public sealed partial class JoinCalendarIntegrationTests
         {
             Assert.Equal(_nextCycle++, cycle);
             var sample = await SampleAfterNativeAsync();
-            if (cycle == 5 && sample.RuntimeTimers > _before.RuntimeTimers + 1)
+            if (cycle == 5 && sample.RuntimeTimers > _before.RuntimeTimers + TimerAllowance)
             {
                 LogTimers("baseline", _before);
                 LogTimers("observed", sample);
                 if (_before.Timers is { } baseline && sample.Timers is { } observed &&
-                    observed.ShortDeadlines > baseline.ShortDeadlines &&
-                    observed.Count - observed.ShortDeadlines <= baseline.Count - baseline.ShortDeadlines + 1 &&
-                    observed.WaitMs > 0)
+                    observed.FrameDeadlines.Length > baseline.FrameDeadlines.Length &&
+                    sample.RuntimeTimers - observed.FrameDeadlines.Length <=
+                        _before.RuntimeTimers - baseline.FrameDeadlines.Length + TimerAllowance)
                 {
-                    // Age only the documented one-shot request deadlines
-                    // once. A timer still open at the settled sample counts.
-                    await Task.Delay(TimeSpan.FromMilliseconds(observed.WaitMs + 20), ct);
+                    // These exact delays belong to in-flight ProcessorFrameScope calls. Their owner
+                    // cancels the delay on completion. Natural expiry is a failed frame, not a drain.
+                    try { await Task.WhenAll(observed.FrameDeadlines).WaitAsync(ct); }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+                    Assert.All(observed.FrameDeadlines, deadline => Assert.True(deadline.IsCanceled,
+                        "A processor frame deadline expired before its owner cancelled it."));
                     long early = sample.RuntimeTimers;
                     sample = await SampleAfterNativeAsync();
-                    _output.WriteLine($"F4-TIMER-DRAIN scenario={_scenario} runtime_timers={_before.RuntimeTimers}->{early}->{sample.RuntimeTimers} wait_ms={observed.WaitMs + 20}");
+                    _output.WriteLine($"F4-TIMER-DRAIN scenario={_scenario} owner=ProcessorFrameScope cancelled={observed.FrameDeadlines.Length} runtime_timers={_before.RuntimeTimers}->{early}->{sample.RuntimeTimers}");
                     LogTimers("settled", sample);
                 }
             }
@@ -708,7 +767,7 @@ public sealed partial class JoinCalendarIntegrationTests
         private void LogTimers(string phase, F4ResourceSample sample)
         {
             if (sample.Timers is { } timers)
-                _output.WriteLine($"F4-TIMER-INVENTORY scenario={_scenario} phase={phase} count={timers.Count} short={timers.ShortDeadlines} types={timers.Types}");
+                _output.WriteLine($"F4-TIMER-INVENTORY scenario={_scenario} phase={phase} count={timers.Count} frame_deadlines={timers.FrameDeadlines.Length} types={timers.Types}");
         }
 
         private static async Task WaitForNativeTransitionAsync(GameBridge player, CancellationToken ct)
@@ -742,9 +801,10 @@ public sealed partial class JoinCalendarIntegrationTests
             if (_handleTrace is not null && after.Handles > before.Handles + 4 &&
                 before.WindowsHandleObjects is { } start && after.WindowsHandleObjects is { } end)
                 _output.WriteLine($"F4-HANDLE-ORIGINS scenario={_scenario} {_handleTrace.DescribeNewHandles(start, end)}");
+            Assert.True(after.RuntimeTimers <= before.RuntimeTimers + TimerAllowance,
+                $"F4 runtime timer budget: scenario={_scenario} {before.RuntimeTimers}->{after.RuntimeTimers}, allowance={TimerAllowance}");
             Assert.InRange(after.Threads, 0, before.Threads + 4);
             Assert.InRange(after.Handles, 0, before.Handles + 4);
-            Assert.InRange(after.RuntimeTimers, 0, before.RuntimeTimers + 1);
             Assert.Equal(before.Owned, after.Owned);
         }
 
@@ -759,8 +819,7 @@ public sealed partial class JoinCalendarIntegrationTests
             finally
             {
                 _handleTrace?.Dispose();
-                if (_workerCapSet) Assert.True(ThreadPool.SetMaxThreads(_workerMax, _ioMax));
-                Assert.True(ThreadPool.SetMinThreads(_workerMin, _ioMin));
+                _delayTrace.Dispose();
             }
         }
     }

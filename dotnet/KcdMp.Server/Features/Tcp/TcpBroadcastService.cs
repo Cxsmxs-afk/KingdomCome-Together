@@ -67,10 +67,10 @@ public class TcpBroadcastService
     /// </summary>
     public void BroadcastName(ClientSession source)
     {
-        if (source.Name is null) return;
+        if (!source.IsReady) return;
 
         foreach (var target in Others(source))
-            target.EnqueueName(source.Id, source.Name);
+            target.EnqueueName(source);
     }
 
     /// <summary>
@@ -530,7 +530,7 @@ public class TcpBroadcastService
     public void SendAllNamesTo(ClientSession newClient)
     {
         foreach (var c in Others(newClient))
-            newClient.EnqueueName(c.Id, c.Name!);
+            newClient.EnqueueName(c);
     }
 
     /// <summary>

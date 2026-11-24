@@ -139,17 +139,15 @@ public static class Wo171Rules
     // ------------------------------------------------------------------ the slots
 
     /// <summary>
-    /// The host's ordered reservations for slots 2–4. Slot 1 belongs to the session host. Names are the relay's identities so a
-    /// crash-rejoin can use a different ghost id. Receivers replace their snapshot whole and only look up slots.
+    /// The host's ordered reservations for slots 2–4. Slot 1 belongs to the session host.
+    /// Relay member keys survive a new connection and a new ghost ID within the same relay process.
     /// </summary>
     public sealed record SlotTable
     {
-        public const string WirePrefix = "marker-slots-v1|";
-        private const int RelayNameMax = 32;
-        private static readonly Encoding WireName = new UTF8Encoding(false, true);
-        private string? Purple { get; init; }
-        private string? Blue { get; init; }
-        private string? Green { get; init; }
+        public const string WirePrefix = "marker-slots-v2|";
+        private Guid? Purple { get; init; }
+        private Guid? Blue { get; init; }
+        private Guid? Green { get; init; }
 
         public int GuestCount => Green is not null ? 3 : Blue is not null ? 2 : Purple is not null ? 1 : 0;
 
@@ -158,48 +156,43 @@ public static class Wo171Rules
             (previous.Blue is null || previous.Blue == Blue) &&
             (previous.Green is null || previous.Green == Green);
 
-        public SlotTable AssignGuest(string identity)
+        public SlotTable AssignGuest(Guid member)
         {
-            if (identity.Length is 0 or > RelayNameMax || FindSlot(identity, isHost: false).HasValue) return this;
-            if (Purple is null) return this with { Purple = identity };
-            if (Blue is null) return this with { Blue = identity };
-            return this with { Green = identity };
+            if (member == Guid.Empty || FindSlot(member, isHost: false).HasValue) return this;
+            if (Purple is null) return this with { Purple = member };
+            if (Blue is null) return this with { Blue = member };
+            return this with { Green = member };
         }
 
         /// <summary>Null while the host's assignment is unknown. Slot 0 is a confirmed companion when all colours are reserved.</summary>
-        public int? FindSlot(string? identity, bool isHost)
+        public int? FindSlot(Guid member, bool isHost)
         {
             if (isHost) return 1;
-            if (string.IsNullOrEmpty(identity)) return null;
-            if (identity == Purple) return 2;
-            if (identity == Blue) return 3;
-            if (identity == Green) return 4;
+            if (member == Guid.Empty) return null;
+            if (member == Purple) return 2;
+            if (member == Blue) return 3;
+            if (member == Green) return 4;
             return Green is not null ? 0 : null;
         }
 
         public string ToWire() => $"{WirePrefix}{Encode(Purple)}|{Encode(Blue)}|{Encode(Green)}";
 
-        private static string Encode(string? name) => name is null ? "" : Convert.ToBase64String(WireName.GetBytes(name));
+        private static string Encode(Guid? member) => member?.ToString("N") ?? "";
 
         public static bool TryRead(string text, out SlotTable slots)
         {
             slots = new();
             if (!text.StartsWith(WirePrefix, StringComparison.Ordinal)) return false;
-            string[] names = text[WirePrefix.Length..].Split('|');
-            if (names.Length != Colours - 1) return false;
+            string[] members = text[WirePrefix.Length..].Split('|');
+            if (members.Length != Colours - 1) return false;
 
             var parsed = slots;
             bool vacant = false;
-            foreach (string encoded in names)
+            foreach (string encoded in members)
             {
                 if (encoded.Length == 0) { vacant = true; continue; }
-                if (vacant || encoded.Length > RelayNameMax * 4) return false;
-                string name;
-                try { name = WireName.GetString(Convert.FromBase64String(encoded)); }
-                catch (FormatException) { return false; }
-                catch (DecoderFallbackException) { return false; }
-                if (Encode(name) != encoded || parsed.FindSlot(name, isHost: false).HasValue) return false;
-                var next = parsed.AssignGuest(name);
+                if (vacant || !Guid.TryParseExact(encoded, "N", out Guid member) || Encode(member) != encoded) return false;
+                var next = parsed.AssignGuest(member);
                 if (ReferenceEquals(next, parsed)) return false;
                 parsed = next;
             }

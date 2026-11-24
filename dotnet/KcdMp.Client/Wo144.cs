@@ -25,6 +25,23 @@ public sealed class PeerSet
     private readonly object _lock = new();
     private readonly Dictionary<byte, string> _live = new();
     private readonly HashSet<byte> _removed = new();
+    private readonly Dictionary<byte, Guid> _roster = new();
+    private Guid _relayInstance;
+
+    internal Guid RelayInstance { get { lock (_lock) return _relayInstance; } }
+
+    internal bool AnnounceRosterPeer(byte id, Guid relayInstance, Guid member)
+    {
+        lock (_lock)
+        {
+            if (_relayInstance != Guid.Empty && _relayInstance != relayInstance) return false;
+            _relayInstance = relayInstance;
+            _roster[id] = member;
+            return true;
+        }
+    }
+
+    internal Guid RosterMemberOf(byte id) { lock (_lock) return _roster.GetValueOrDefault(id); }
 
     /// <summary>The relay named this id: a connected partner (again, if the id was reused).</summary>
     public bool Connected(byte id, string name)
@@ -39,16 +56,28 @@ public sealed class PeerSet
     }
 
     /// <summary>The relay's Disconnect: gone, and stays gone. Returns the name it had (null if it was never named).</summary>
-    public string? Disconnected(byte id)
+    public string? Disconnected(byte id) => Disconnected(id, out _);
+
+    internal string? Disconnected(byte id, out Guid member)
     {
         lock (_lock)
         {
             _removed.Add(id);
+            _roster.Remove(id, out member);
             return _live.Remove(id, out var n) ? n : null;
         }
     }
 
-    public void Clear() { lock (_lock) { _live.Clear(); _removed.Clear(); } }
+    public void Clear()
+    {
+        lock (_lock)
+        {
+            _live.Clear();
+            _removed.Clear();
+            _roster.Clear();
+            _relayInstance = Guid.Empty;
+        }
+    }
 
     public bool IsLive(byte id) { lock (_lock) return _live.ContainsKey(id); }
 
@@ -63,11 +92,6 @@ public sealed class PeerSet
         lock (_lock) return _live.Keys.Where(k => k != self).OrderBy(k => k).ToList();
     }
 
-    /// <summary>Other live ids that carry the same player name (the relay replaces them; this is the agent's view).</summary>
-    public List<byte> SameName(byte id, string name)
-    {
-        lock (_lock) return _live.Where(kv => kv.Key != id && string.Equals(kv.Value, name, StringComparison.Ordinal)).Select(kv => kv.Key).ToList();
-    }
 }
 
 public static class Wo144Rules

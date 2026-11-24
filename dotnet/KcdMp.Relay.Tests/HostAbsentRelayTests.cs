@@ -87,12 +87,7 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
     [InlineData(4)]
     public async Task A_non_loopback_host_claim_reserves_the_seat_even_before_the_mode_packet(int players)
     {
-        var address = NetworkInterface.GetAllNetworkInterfaces().Where(nic => nic.OperationalStatus == OperationalStatus.Up)
-            .SelectMany(nic => nic.GetIPProperties().UnicastAddresses)
-            .Select(entry => entry.Address)
-            .FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ip));
-        Assert.NotNull(address);
-        var relay = new RelayFixture(address);
+        var relay = new RelayFixture(NonLoopbackAddress());
         try
         {
             await relay.InitializeAsync();
@@ -130,6 +125,76 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
         await using var returning = await relay.ConnectAsync("the-host");
         await ConfirmWorldAsync(returning, guests[0]);
         Assert.Equal(returning.Id, clients.DamageAuthority?.Id);
+    }
+
+    [Theory]
+    [InlineData(2, true)]
+    [InlineData(3, true)]
+    [InlineData(4, true)]
+    [InlineData(2, false)]
+    [InlineData(3, false)]
+    [InlineData(4, false)]
+    public async Task A_competing_claim_and_departure_do_not_reassign_the_early_host_seat(int players, bool loopback)
+    {
+        var relay = new RelayFixture(loopback ? IPAddress.Loopback : NonLoopbackAddress());
+        try
+        {
+            await relay.InitializeAsync();
+            var clients = relay.Services.GetRequiredService<ClientHandler>();
+            var guests = new Peer[players - 1];
+            await using var group = new PeerGroup(guests);
+            for (int i = 0; i < guests.Length; i++) guests[i] = await relay.ConnectAsync($"guest-{i}");
+            Peer rival = guests[0];
+            await using var host = await relay.ConnectAsync("the-host");
+            Assert.True(rival.Id < host.Id);
+            Assert.All(clients.GetClients().Where(peer => peer.IsReady), peer => Assert.Equal(loopback, peer.IsLoopback));
+
+            await host.SendRawAsync(Claim());
+            await BarrierAsync(host);
+            Assert.Equal(host.Id, clients.DamageAuthority?.Id);
+            await rival.SendRawAsync(Claim());
+            await BarrierAsync(rival);
+            var withRival = clients.DamageAuthority?.Name;
+
+            await host.DisposeAsync();
+            Assert.Equal(host.Id, (await rival.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+            var whileAbsent = clients.DamageAuthority?.Name;
+            await rival.SendRawAsync(Claim());
+            await BarrierAsync(rival);
+            var afterReclaim = clients.DamageAuthority?.Name;
+            Console.WriteLine($"K2-HOST-SEAT players={players} loopback={loopback} before={withRival ?? "none"} absent={whileAbsent ?? "none"} reclaim={afterReclaim ?? "none"}");
+            Assert.Equal("the-host", withRival);
+            Assert.Null(whileAbsent);
+            Assert.Null(afterReclaim);
+            Assert.False(clients.HasHostConnected());
+
+            // Replacing the sole guest keeps one ready peer when there are two players.
+            await using var replacement = players == 2 ? await relay.ConnectAsync("guest-0") : null;
+            Peer witness = replacement ?? guests[1];
+            await rival.DisposeAsync();
+            byte expectedDisconnect = players == 2 ? rival.Id : host.Id;
+            Assert.Equal(expectedDisconnect, (await witness.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+            if (players != 2)
+                Assert.Equal(rival.Id, (await witness.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+            await BarrierAsync(witness);
+            Assert.Null(clients.DamageAuthority);
+            Assert.False(clients.HasHostConnected());
+
+            await using var returning = await relay.ConnectAsync("the-host");
+            await ConfirmWorldAsync(returning, witness);
+            Assert.Equal(returning.Id, clients.DamageAuthority?.Id);
+        }
+        finally { await relay.DisposeAsync(); }
+    }
+
+    private static IPAddress NonLoopbackAddress()
+    {
+        var address = NetworkInterface.GetAllNetworkInterfaces().Where(nic => nic.OperationalStatus == OperationalStatus.Up)
+            .SelectMany(nic => nic.GetIPProperties().UnicastAddresses)
+            .Select(entry => entry.Address)
+            .FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ip));
+        Assert.NotNull(address);
+        return address;
     }
 
     [Theory]

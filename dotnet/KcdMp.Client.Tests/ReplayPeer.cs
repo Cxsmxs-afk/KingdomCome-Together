@@ -133,12 +133,13 @@ internal sealed class ReplayPeer : IAsyncDisposable
     // Let the relay announce a real departure while the reader drains its stream.
     public void FinishSending() => _client.Client.Shutdown(SocketShutdown.Send);
 
-    public static async Task<ReplayPeer> ConnectAsync(int port, string name, CancellationToken ct = default)
+    public static async Task<ReplayPeer> ConnectAsync(int port, string name, CancellationToken ct = default, IPAddress? localAddress = null)
     {
         using var deadline = Deadline(ct);
         var tcp = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
         try
         {
+            if (localAddress is not null) tcp.Client.Bind(new IPEndPoint(localAddress, 0));
             await tcp.ConnectAsync(IPAddress.Loopback, port, deadline.Token);
             var peer = new ReplayPeer(tcp);
             await peer.SendAsync(RelayConnector.BuildHandshake(name, ReleaseVersionInfo.Wire), deadline.Token);

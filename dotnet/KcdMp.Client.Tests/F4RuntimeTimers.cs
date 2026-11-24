@@ -6,7 +6,7 @@ namespace KcdMp.Client.Tests;
 /// <summary>Testhost diagnostics for the .NET 8 timers behind Timer.ActiveCount.</summary>
 internal static class F4RuntimeTimers
 {
-    private const uint MaxOperationDeadlineMs = 5000;
+    private const uint FrameDeadlineMaxMs = 1950; // the default 2000 ms processor budget reserves 50 ms
     private const BindingFlags Fields = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
     private static readonly Type? QueueType = typeof(Timer).Assembly.GetType("System.Threading.TimerQueue");
     private static readonly Type? EntryType = typeof(Timer).Assembly.GetType("System.Threading.TimerQueueTimer");
@@ -15,33 +15,45 @@ internal static class F4RuntimeTimers
     private static readonly FieldInfo? Long = QueueType?.GetField("_longTimers", Fields);
     private static readonly FieldInfo? Next = EntryType?.GetField("_next", Fields);
     private static readonly FieldInfo? State = EntryType?.GetField("_state", Fields);
-    private static readonly FieldInfo? Start = EntryType?.GetField("_startTicks", Fields);
     private static readonly FieldInfo? Due = EntryType?.GetField("_dueTime", Fields);
     private static readonly FieldInfo? Period = EntryType?.GetField("_period", Fields);
 
-    internal sealed record Inventory(int Count, int ShortDeadlines, long WaitMs, string Types);
+    internal sealed record Inventory(int Count, string Types, Task[] FrameDeadlines);
 
-    public static Inventory? Capture()
+    public static Inventory? Capture(F4DelayTrace trace, out long activeCount)
     {
         if (Queues?.GetValue(null) is not Array queues || Short is null || Long is null ||
-            Next is not { } next || State is not { } state || Start is not { } start ||
-            Due is not { } dueTime || Period is not { } period) return null;
+            Next is not { } next || State is not { } state ||
+            Due is not { } dueTime || Period is not { } period)
+        {
+            activeCount = Timer.ActiveCount;
+            return null;
+        }
 
         var counts = new Dictionary<(string Owner, uint Due, bool Repeating), int>();
-        int total = 0, deadlines = 0;
-        long wait = 0;
-        foreach (var queue in queues)
+        var deadlines = new List<Task>();
+        int total = 0;
+        // Use the same instant for the framework counter and the attribution.
+        // TimerQueue operations in .NET 8 use one queue lock at a time.
+        var timerQueues = queues.OfType<object>().ToArray();
+        int locked = 0;
+        try
         {
-            if (queue is null) continue;
-            lock (queue)
+            for (; locked < timerQueues.Length; locked++) Monitor.Enter(timerQueues[locked]);
+            activeCount = Timer.ActiveCount;
+            foreach (var queue in timerQueues)
             {
                 Observe(Short.GetValue(queue));
                 Observe(Long.GetValue(queue));
             }
         }
+        finally
+        {
+            while (locked > 0) Monitor.Exit(timerQueues[--locked]);
+        }
         var types = counts.OrderBy(row => row.Key.Owner).ThenBy(row => row.Key.Due)
             .Select(row => $"{row.Key.Owner}:{row.Key.Due}:{(row.Key.Repeating ? "repeat" : "once")}={row.Value}");
-        return new(total, deadlines, wait, string.Join(',', types));
+        return new(total, string.Join(',', types), deadlines.ToArray());
 
         void Observe(object? entry)
         {
@@ -50,15 +62,15 @@ internal static class F4RuntimeTimers
                 uint due = (uint)dueTime.GetValue(entry)!;
                 if (due == uint.MaxValue) continue;
                 bool repeating = (uint)period.GetValue(entry)! != uint.MaxValue;
-                string owner = state.GetValue(entry)?.GetType().Name.Split('`')[0] ?? "state-none";
-                var key = (owner, due, repeating);
+                object? timerState = state.GetValue(entry);
+                string owner = timerState?.GetType().Name.Split('`')[0] ?? "state-none";
+                var task = timerState as Task;
+                var site = task is not null ? trace.Site(task) : null;
+                var key = (site is null ? owner : $"{owner}@{site.Method}", due, repeating);
                 counts[key] = counts.GetValueOrDefault(key) + 1;
                 total++;
-                if (repeating || due > MaxOperationDeadlineMs ||
-                    owner is not ("CancellationTokenSource" or "DelayPromise" or "DelayPromiseWithCancellation" or "CancellationPromise")) continue;
-                deadlines++;
-                long age = Environment.TickCount64 - (long)start.GetValue(entry)!;
-                wait = Math.Max(wait, Math.Clamp(due - age, 0, MaxOperationDeadlineMs));
+                if (!repeating && due <= FrameDeadlineMaxMs && site is { IsFrameDeadline: true })
+                    deadlines.Add(task!);
             }
         }
     }

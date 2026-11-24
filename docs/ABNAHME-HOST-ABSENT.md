@@ -14,6 +14,8 @@ pwsh -NoProfile -File tools/Test-JoinReadiness.ps1 -Check EndToEnd
 
 Die Relay-Matrix öffnet zwei, drei und vier echte TCP-Verbindungen. Sie beginnt einen Join, einen Kampftreffer oder einen Dialogvorgang, schließt dann die Host-Verbindung und belegt über echte Relay-Reads die unterdrückte Folgeaktion. Zusätzlich prüft sie einen zurückkehrenden Host mit falscher Epoche, falscher Run-ID und fehlendem Run-Beleg. Die Client-Tests verwenden produktive Agentenpfade und kontrollierte Spiel- und DLL-Grenzen.
 
+Vor der ersten Modusmeldung sendet ein früher verbundener Gast einen zweiten Host-Claim. Die Matrix prüft am lokalen und am dedizierten Relay, dass der ausgewählte Host seinen Sitz behält, die Autorität nach seinem Abgang frei bleibt und der spätere Abgang des Anspruchstellers den Sitz nicht verändert. Der zurückgekehrte Host übernimmt nach seinem gültigen Claim wieder seinen Sitz. [TCP-Nachweis](../dotnet/KcdMp.Relay.Tests/HostAbsentRelayTests.cs)
+
 ## Abnahme im Spiel
 
 Auf gleicher Build-ID einer laufenden Runde beitreten, die Host-Verbindung während eines echten Dialogs und Kampfs einzeln trennen und kurz darauf wiederherstellen. Auf beiden Gästen `MP-HOST-ABSENT pause`, sichtbaren Hinweis und native Hold-Bestätigung prüfen. Die gemeinsamen Welt- oder Schadensschreiber bleiben unbesetzt. Nach der Rückkehr muss `MP-HOST-ABSENT resume` dieselbe Welt-Epoche und Run-ID zeigen. In einem zweiten Durchlauf über den Menüeintrag heimkehren. Dateiliste und SHA-256 der eigenen Saves vor und nach Pause und Heimkehr vergleichen. Den Rollenwechsel wiederholen. `dmg_double=0`, `rp_owner_n>0`, `owner_violations=0` und `ours_us_p95 < 2000` anhand der Spielprotokolle bewerten.
