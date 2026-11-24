@@ -273,15 +273,18 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
 
     private sealed class ConsoleHandler(JoinCalendarTestEngine engine) : HttpMessageHandler
     {
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested();
             string command = Uri.UnescapeDataString(request.RequestUri?.Query ?? "");
+            // Production submits the HTTP request under the join gate. The
+            // game and log callbacks run independently of that handoff.
+            await Task.Yield();
             engine.ConsoleCommand(command);
             bool failed = engine.FailExitResponse && command.Contains(",\"exit-to-menu\")", StringComparison.Ordinal);
             if (failed) Console.WriteLine("H21-HOME exit audit: HTTP 503 after delivering the engine command");
-            return Task.FromResult(new HttpResponseMessage(failed ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK)
-                { Content = new StringContent(failed ? "unavailable" : "ok") });
+            return new HttpResponseMessage(failed ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK)
+                { Content = new StringContent(failed ? "unavailable" : "ok") };
         }
     }
 }
