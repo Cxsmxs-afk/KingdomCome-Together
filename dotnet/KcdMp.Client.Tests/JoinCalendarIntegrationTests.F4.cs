@@ -38,7 +38,7 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
     public async Task Processor_deadlines_are_attributed_and_cancelled_while_an_unowned_short_timer_remains()
     {
         using var stop = new CancellationTokenSource();
-        using var trace = new F4DelayTrace();
+        using var trace = new F4ProcessorDeadlines();
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var unowned = Task.Delay(1950, stop.Token);
         Task<ProcessorFrameScope.Result>[] frames =
@@ -48,15 +48,15 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
         ];
         try
         {
-            var sample = Assert.IsType<F4RuntimeTimers.Inventory>(F4RuntimeTimers.Capture(trace, out long active));
-            Assert.Equal(active, sample.Count);
-            Assert.Equal(frames.Length, sample.FrameDeadlines.Length);
-            Assert.DoesNotContain(unowned, sample.FrameDeadlines);
+            Task[] deadlines = trace.Pending();
+            Assert.Equal(frames.Length, deadlines.Length);
+            Assert.DoesNotContain(unowned, deadlines);
             release.SetResult();
             var finished = await Task.WhenAll(frames);
             Assert.All(finished, result => Assert.Equal(ProcessorFrameScope.Outcome.Completed, result.Status));
-            Assert.All(sample.FrameDeadlines, deadline => Assert.True(deadline.IsCanceled));
-            output.WriteLine($"F4-TIMER-ORIGIN cancelled={sample.FrameDeadlines.Length} types={sample.Types}");
+            Assert.All(deadlines, deadline => Assert.True(deadline.IsCanceled));
+            Assert.False(unowned.IsCompleted);
+            output.WriteLine($"F4-TIMER-ORIGIN cancelled={deadlines.Length} unowned_active=1 owner=ProcessorFrameScope");
         }
         finally { await stop.CancelAsync(); release.TrySetResult(); }
     }
@@ -587,9 +587,9 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private readonly record struct F4ResourceSample(int Threads, int Handles, int RawThreads, int RawHandles,
         int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, string? WindowsHandleTypes,
-        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, F4RuntimeTimers.Inventory? Timers);
+        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, Task[] FrameDeadlines);
 
-    private static F4ResourceSample F4Resources(GameBridge guest, bool traceWindowsHandles, F4DelayTrace delayTrace)
+    private static F4ResourceSample F4Resources(GameBridge guest, bool traceWindowsHandles, F4ProcessorDeadlines deadlineTrace)
     {
         using var process = Process.GetCurrentProcess();
         int rawThreads = process.Threads.Count;
@@ -608,11 +608,12 @@ public sealed partial class JoinCalendarIntegrationTests
         var pipe = Get<CombatPipe>(guest, "_combat");
         int threads = process.Threads.Count;
         int handles = process.HandleCount;
-        var timerInventory = F4RuntimeTimers.Capture(delayTrace, out long runtimeTimers);
+        long runtimeTimers = Timer.ActiveCount;
+        Task[] frameDeadlines = deadlineTrace.Pending();
         Dictionary<IntPtr, string>? objects = traceWindowsHandles ? new() : null;
         return new(threads, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, runtimeTimers,
             new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers),
-            OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture(objects) : null, objects, timerInventory);
+            OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture(objects) : null, objects, frameDeadlines);
     }
 
     private sealed class F4ResourceCheck : IDisposable
@@ -622,7 +623,7 @@ public sealed partial class JoinCalendarIntegrationTests
         private readonly GameBridge _guest;
         private readonly ITestOutputHelper _output;
         private readonly BlockingCollection<TaskCompletionSource<F4ResourceSample>> _requests = new(1);
-        private readonly F4DelayTrace _delayTrace = new();
+        private readonly F4ProcessorDeadlines _deadlineTrace = new();
         private readonly Thread _sampler;
         private readonly F4WindowsHandleTrace? _handleTrace;
         private int _nextCycle;
@@ -645,7 +646,7 @@ public sealed partial class JoinCalendarIntegrationTests
             ThreadPool.GetMinThreads(out int workerMin, out int ioMin);
             ThreadPool.GetMaxThreads(out int workerMax, out _);
             bool useWinsock = OperatingSystem.IsWindows();
-            int warmWorkers = Math.Clamp(useWinsock ? Math.Max(16, ThreadPool.ThreadCount + 2) : 16, workerMin, workerMax);
+            int warmWorkers = Math.Clamp(useWinsock ? Math.Max(16, ThreadPool.ThreadCount + Environment.ProcessorCount) : 16, workerMin, workerMax);
             try
             {
                 Assert.True(ThreadPool.SetMinThreads(warmWorkers, ioMin));
@@ -713,7 +714,7 @@ public sealed partial class JoinCalendarIntegrationTests
             // for baseline and observations, even when the join resumes on different workers.
             foreach (var request in _requests.GetConsumingEnumerable())
             {
-                try { request.SetResult(F4Resources(_guest, _handleTrace is not null, _delayTrace)); }
+                try { request.SetResult(F4Resources(_guest, _handleTrace is not null, _deadlineTrace)); }
                 catch (Exception ex) { request.SetException(ex); }
             }
         }
@@ -726,20 +727,20 @@ public sealed partial class JoinCalendarIntegrationTests
             {
                 LogTimers("baseline", _before);
                 LogTimers("observed", sample);
-                if (_before.Timers is { } baseline && sample.Timers is { } observed &&
-                    observed.FrameDeadlines.Length > baseline.FrameDeadlines.Length &&
-                    sample.RuntimeTimers - observed.FrameDeadlines.Length <=
-                        _before.RuntimeTimers - baseline.FrameDeadlines.Length + TimerAllowance)
+                Task[] observed = sample.FrameDeadlines;
+                int baseline = _before.FrameDeadlines.Length;
+                if (observed.Length > baseline &&
+                    sample.RuntimeTimers - observed.Length <= _before.RuntimeTimers - baseline + TimerAllowance)
                 {
                     // These exact delays belong to in-flight ProcessorFrameScope calls. Their owner
                     // cancels the delay on completion. Natural expiry is a failed frame, not a drain.
-                    try { await Task.WhenAll(observed.FrameDeadlines).WaitAsync(ct); }
+                    try { await Task.WhenAll(observed).WaitAsync(ct); }
                     catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
-                    Assert.All(observed.FrameDeadlines, deadline => Assert.True(deadline.IsCanceled,
+                    Assert.All(observed, deadline => Assert.True(deadline.IsCanceled,
                         "A processor frame deadline expired before its owner cancelled it."));
                     long early = sample.RuntimeTimers;
                     sample = await SampleAfterNativeAsync();
-                    _output.WriteLine($"F4-TIMER-DRAIN scenario={_scenario} owner=ProcessorFrameScope cancelled={observed.FrameDeadlines.Length} runtime_timers={_before.RuntimeTimers}->{early}->{sample.RuntimeTimers}");
+                    _output.WriteLine($"F4-TIMER-DRAIN scenario={_scenario} owner=ProcessorFrameScope cancelled={observed.Length} runtime_timers={_before.RuntimeTimers}->{early}->{sample.RuntimeTimers}");
                     LogTimers("settled", sample);
                 }
             }
@@ -764,11 +765,8 @@ public sealed partial class JoinCalendarIntegrationTests
             }
         }
 
-        private void LogTimers(string phase, F4ResourceSample sample)
-        {
-            if (sample.Timers is { } timers)
-                _output.WriteLine($"F4-TIMER-INVENTORY scenario={_scenario} phase={phase} count={timers.Count} frame_deadlines={timers.FrameDeadlines.Length} types={timers.Types}");
-        }
+        private void LogTimers(string phase, F4ResourceSample sample) =>
+            _output.WriteLine($"F4-TIMER-SAMPLE scenario={_scenario} phase={phase} count={sample.RuntimeTimers} frame_deadlines={sample.FrameDeadlines.Length} owner=ProcessorFrameScope");
 
         private static async Task WaitForNativeTransitionAsync(GameBridge player, CancellationToken ct)
         {
@@ -819,7 +817,7 @@ public sealed partial class JoinCalendarIntegrationTests
             finally
             {
                 _handleTrace?.Dispose();
-                _delayTrace.Dispose();
+                _deadlineTrace.Dispose();
             }
         }
     }

@@ -119,15 +119,24 @@ public class T3SideChannelsTests
     {
         var q = new T3SideChannelQueue<string>(); var lease = q.Capture(7); q.GameplayStarted(7, 0);
         q.Put(0, "hung clock", lease); q.Put(1, "latest weather", lease);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var result = await ProcessorFrameScope.RunAsync(async _ =>
+        var clock = new ManualFrameTime();
+        var frame = ProcessorFrameScope.RunAsync(async _ =>
         {
             Assert.Equal("hung clock", Assert.Single(q.Take(7, 5000, true)).Value);
-            await release.Task; ProcessorFrameScope.ThrowIfAbandoned();
-        }, 50);
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-        Assert.Equal("latest weather", Assert.Single(q.Take(7, 5100, true)).Value);
-        release.TrySetResult();
+            entered.SetResult();
+            await release.Task;
+            ProcessorFrameScope.ThrowIfAbandoned();
+        }, 50, CancellationToken.None, clock);
+        try
+        {
+            await Task.WhenAll(entered.Task, clock.Armed).WaitAsync(TimeSpan.FromSeconds(3));
+            clock.Expire();
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame).Status);
+            Assert.Equal("latest weather", Assert.Single(q.Take(7, 5100, true)).Value);
+        }
+        finally { release.TrySetResult(); }
     }
 
     [Fact]

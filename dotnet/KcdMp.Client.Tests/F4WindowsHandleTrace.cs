@@ -28,7 +28,7 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         catch (System.ComponentModel.Win32Exception) { return "enabled=1 modules_unavailable=1"; }
         var histories = end.Where(kv => !start.TryGetValue(kv.Key, out var kind) || kv.Value != kind)
             .Select(kv => $"{kv.Value}:{ReadOpenOrigin(kv.Key, modules)}");
-        return $"enabled=1 {string.Join(',', histories.GroupBy(x => x).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key}={g.Count()}"))}";
+        return $"enabled=1 clr={Environment.Version} {string.Join(',', histories.GroupBy(x => x).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key}={g.Count()}"))}";
     }
 
     private string ReadOpenOrigin(IntPtr handle, (long Start, int ModuleMemorySize, string ModuleName)[] modules)
@@ -56,7 +56,9 @@ internal sealed class F4WindowsHandleTrace : IDisposable
                 {
                     long pc = Marshal.ReadIntPtr(trace, frameStart + frame * IntPtr.Size).ToInt64();
                     if (pc == 0) break;
-                    string name = modules.FirstOrDefault(m => pc >= m.Start && pc < m.Start + m.ModuleMemorySize).ModuleName ?? "unresolved";
+                    var module = modules.FirstOrDefault(m => pc >= m.Start && pc < m.Start + m.ModuleMemorySize);
+                    string name = module.ModuleName ?? "unresolved";
+                    if (name.Equals("coreclr.dll", StringComparison.OrdinalIgnoreCase)) name += $"+{pc - module.Start:x}";
                     if (names.Count == 0 || names[^1] != name) names.Add(name);
                 }
                 return names.Count == 0 ? "empty" : string.Join('>', names);

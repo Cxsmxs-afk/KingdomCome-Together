@@ -8,6 +8,8 @@ namespace KcdMp.Client;
 public static class ProcessorFrameScope
 {
     private static readonly AsyncLocal<Lease?> Ambient = new();
+    // The resource fixture can observe this exact deadline without walking runtime timer queues or stacks.
+    internal static event Action<Task, int>? DeadlineStarted;
     public enum Outcome { Completed, TimedOut, Faulted, SessionCancelled }
     public readonly record struct Result(Outcome Status, long ElapsedMs, Exception? Error = null);
 
@@ -89,7 +91,9 @@ public static class ProcessorFrameScope
         // Leave a small part of the configured upper budget for cancellation and
         // accounting. ElapsedMs is always the actual stopwatch value, never clamped.
         int reserveMs = Math.Min(50, Math.Max(1, timeoutMs / 20));
-        var timeout = Task.Delay(TimeSpan.FromMilliseconds(Math.Max(1, timeoutMs - reserveMs)), timeProvider, deadline.Token);
+        int deadlineMs = Math.Max(1, timeoutMs - reserveMs);
+        var timeout = Task.Delay(TimeSpan.FromMilliseconds(deadlineMs), timeProvider, deadline.Token);
+        DeadlineStarted?.Invoke(timeout, deadlineMs);
         if (await Task.WhenAny(work, timeout) != work)
         {
             lease.Abandon();

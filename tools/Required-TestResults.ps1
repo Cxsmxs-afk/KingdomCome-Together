@@ -72,12 +72,12 @@ function Assert-KcdTrxResults {
                         $scenario = $Matches.scenario
                     } elseif ($line -match '^\s*F4-TIMER-DRAIN scenario=(?<scenario>[a-z0-9-]+) owner=ProcessorFrameScope cancelled=[0-9]+ runtime_timers=[0-9]+->[0-9]+->[0-9]+\s*$') {
                         $scenario = $Matches.scenario
-                    } elseif ($line -match '^\s*F4-TIMER-INVENTORY scenario=(?<scenario>[a-z0-9-]+) phase=(?:baseline|observed|settled) count=[0-9]+ frame_deadlines=[0-9]+ types=[a-zA-Z0-9_.@+=:,<>|/-]*\s*$') {
+                    } elseif ($line -match '^\s*F4-TIMER-SAMPLE scenario=(?<scenario>[a-z0-9-]+) phase=(?:baseline|observed|settled) count=[0-9]+ frame_deadlines=[0-9]+ owner=ProcessorFrameScope\s*$') {
                         $scenario = $Matches.scenario
                     } elseif ($line -match '^\s*F4-TIMER-TWIN scenario=(?<scenario>mpexit-retained-timer) retained=5 result=budget-rejected\s*$') {
                         $scenario = $Matches.scenario
                         $timerTwin++
-                    } elseif ($line -match '^\s*F4-TIMER-ORIGIN cancelled=2 types=[a-zA-Z0-9_.@+=:,<>|/-]+\s*$') {
+                    } elseif ($line -match '^\s*F4-TIMER-ORIGIN cancelled=2 unowned_active=1 owner=ProcessorFrameScope\s*$') {
                         $timerOrigin++
                         Write-Host $line.Trim()
                         continue
