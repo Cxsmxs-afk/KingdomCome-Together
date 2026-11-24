@@ -696,20 +696,23 @@ public sealed partial class JoinCalendarIntegrationTests
             int active = ThreadPool.ThreadCount;
             int target = useWinsock ? active + Environment.ProcessorCount : 16;
             int warmWorkers = Math.Clamp(Math.Max(16, target), workerMin, workerMax);
-            Assert.True(ThreadPool.SetMinThreads(warmWorkers, ioMin));
+            var warmed = new ConcurrentDictionary<int, byte>();
+            var elapsed = Stopwatch.StartNew();
             try
             {
-                int warmed = await WarmWorkersAsync(warmWorkers, useWinsock, ct);
-                int reached = ThreadPool.ThreadCount;
-                if (useWinsock && reached > warmed)
+                int reached;
+                do
                 {
-                    // The warmup itself may activate more workers than the join did.
-                    // Sample only after those workers have had a Winsock exchange too.
-                    warmWorkers = Math.Clamp(reached, workerMin, workerMax);
                     Assert.True(ThreadPool.SetMinThreads(warmWorkers, ioMin));
-                    warmed = await WarmWorkersAsync(warmWorkers, useWinsock, ct);
+                    await WarmWorkerRoundAsync(warmWorkers, useWinsock, warmed, ct);
+                    reached = ThreadPool.ThreadCount;
+                    if (useWinsock && reached > warmWorkers)
+                        warmWorkers = Math.Clamp(reached, workerMin, workerMax);
                 }
-                _output.WriteLine($"F4-POOL-WARMUP scenario={_scenario} primed={warmed} worker_min={workerMin} worker_max={workerMax} after_join_workers={active} target={warmWorkers}");
+                while (warmed.Count < warmWorkers && elapsed.Elapsed < TimeSpan.FromSeconds(2));
+                _output.WriteLine($"F4-POOL-WARMUP scenario={_scenario} primed={warmed.Count} worker_min={workerMin} worker_max={workerMax} after_join_workers={active} reached={reached} target={warmWorkers}");
+                if (useWinsock)
+                    Assert.True(warmed.Count >= reached, "The process reached workers that did not complete a Winsock warmup.");
             }
             finally
             {
@@ -717,34 +720,27 @@ public sealed partial class JoinCalendarIntegrationTests
             }
         }
 
-        private static async Task<int> WarmWorkersAsync(int workers, bool useWinsock, CancellationToken ct)
+        private static async Task WarmWorkerRoundAsync(int workers, bool useWinsock,
+            ConcurrentDictionary<int, byte> warmed, CancellationToken ct)
         {
-            var warmed = new ConcurrentDictionary<int, byte>();
-            var elapsed = Stopwatch.StartNew();
-            do
+            using var round = new ManualResetEventSlim();
+            await Task.WhenAll(Enumerable.Range(0, workers).Select(_ => Task.Run(() =>
             {
-                using var round = new ManualResetEventSlim();
-                await Task.WhenAll(Enumerable.Range(0, workers).Select(_ => Task.Run(() =>
-                {
-                    int thread = Environment.CurrentManagedThreadId;
-                    if (!warmed.ContainsKey(thread))
-                    {
-                        if (useWinsock) WarmWinsockThread(ct);
-                        warmed.TryAdd(thread, 0);
-                    }
-                    if (warmed.Count >= workers) round.Set();
-                    // Every worker releases its own slot even if the test host
-                    // already occupies a slot or its timer cannot run yet.
-                    round.Wait(TimeSpan.FromMilliseconds(200), ct);
-                }, ct)));
-            } while (warmed.Count < workers && elapsed.Elapsed < TimeSpan.FromSeconds(2));
-            return warmed.Count;
+                Task exchange = warmed.TryAdd(Environment.CurrentManagedThreadId, 0) && useWinsock
+                    ? WarmWinsockThreadAsync(ct) : Task.CompletedTask;
+                if (warmed.Count >= workers) round.Set();
+                // Hold the worker only while the other workers issue their calls.
+                // The I/O completes asynchronously, outside the parking gate.
+                round.Wait(TimeSpan.FromMilliseconds(200), ct);
+                return exchange;
+            }, ct)));
         }
 
-        private static void WarmWinsockThread(CancellationToken ct)
+        private static async Task WarmWinsockThreadAsync(CancellationToken ct)
         {
             // The production NetworkStream uses overlapped WSARecv and WSASend.
-            // Issue both on this worker before waiting for either completion.
+            // Issue both on this worker. Blocking on either Task would ask .NET
+            // to create additional workers without these Winsock handles.
             using var listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Start(1);
             var endpoint = (IPEndPoint)listener.LocalEndpoint;
@@ -756,8 +752,8 @@ public sealed partial class JoinCalendarIntegrationTests
             var received = new byte[1];
             var read = accepted.GetStream().ReadAsync(received, deadline.Token);
             var write = peer.GetStream().WriteAsync(new byte[] { 0x2a }, deadline.Token);
-            write.AsTask().GetAwaiter().GetResult();
-            Assert.Equal(1, read.AsTask().GetAwaiter().GetResult());
+            await write;
+            Assert.Equal(1, await read);
             Assert.Equal(0x2a, received[0]);
         }
 
