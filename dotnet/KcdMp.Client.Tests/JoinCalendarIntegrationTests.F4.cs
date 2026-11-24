@@ -594,22 +594,11 @@ public sealed partial class JoinCalendarIntegrationTests
                     check._workerCapSet = true;
                 }
                 Assert.True(ThreadPool.SetMinThreads(check._warmWorkers, check._ioMin));
-                // Finish synthetic worker startup before any real cycle, so
-                // every measurement sees the same work since the last return.
-                using var release = new ManualResetEventSlim();
-                using var startup = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                startup.CancelAfter(TimeSpan.FromSeconds(10));
-                int waiting = check._warmWorkers;
-                await Task.WhenAll(Enumerable.Range(0, check._warmWorkers).Select(_ => Task.Run(() =>
-                {
-                    try { if (useWinsock) WarmWinsockThread(); }
-                    finally { if (Interlocked.Decrement(ref waiting) == 0) release.Set(); }
-                    release.Wait(startup.Token);
-                })));
+                int warmed = await WarmWorkersAsync(check._warmWorkers, useWinsock, ct);
                 if (useWinsock)
                 {
                     Assert.InRange(ThreadPool.ThreadCount, 0, check._warmWorkers);
-                    output.WriteLine($"F4-WINSOCK-WARMUP scenario={scenario} primed={check._warmWorkers} worker_cap={check._warmWorkers}");
+                    output.WriteLine($"F4-WINSOCK-WARMUP scenario={scenario} primed={warmed} worker_cap={check._warmWorkers}");
                 }
                 return check;
             }
@@ -618,6 +607,30 @@ public sealed partial class JoinCalendarIntegrationTests
                 check.Dispose();
                 throw;
             }
+        }
+
+        private static async Task<int> WarmWorkersAsync(int workers, bool useWinsock, CancellationToken ct)
+        {
+            var warmed = new ConcurrentDictionary<int, byte>();
+            var elapsed = Stopwatch.StartNew();
+            do
+            {
+                using var round = new ManualResetEventSlim();
+                await Task.WhenAll(Enumerable.Range(0, workers).Select(_ => Task.Run(() =>
+                {
+                    int thread = Environment.CurrentManagedThreadId;
+                    if (!warmed.ContainsKey(thread))
+                    {
+                        if (useWinsock) WarmWinsockThread();
+                        warmed.TryAdd(thread, 0);
+                    }
+                    if (warmed.Count >= workers) round.Set();
+                    // Every worker releases its own slot even if the test host
+                    // already occupies a slot or its timer cannot run yet.
+                    round.Wait(TimeSpan.FromMilliseconds(200), ct);
+                }, ct)));
+            } while (warmed.Count < workers && elapsed.Elapsed < TimeSpan.FromSeconds(2));
+            return warmed.Count;
         }
 
         private static void WarmWinsockThread()
