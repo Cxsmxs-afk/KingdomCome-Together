@@ -2,6 +2,8 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using KcdMp.Wire;
 using Xunit.Abstractions;
@@ -551,6 +553,8 @@ public sealed partial class JoinCalendarIntegrationTests
         private readonly GameBridge _guest;
         private readonly ITestOutputHelper _output;
         private readonly int _workerMin, _ioMin, _warmWorkers;
+        private readonly int _workerMax, _ioMax;
+        private bool _workerCapSet;
         private readonly BlockingCollection<TaskCompletionSource<F4ResourceSample>> _requests = new(1);
         private readonly Thread _sampler;
         private readonly F4WindowsHandleTrace? _handleTrace;
@@ -563,7 +567,9 @@ public sealed partial class JoinCalendarIntegrationTests
             _guest = guest;
             _output = output;
             ThreadPool.GetMinThreads(out _workerMin, out _ioMin);
-            _warmWorkers = Math.Max(_workerMin, 16);
+            ThreadPool.GetMaxThreads(out _workerMax, out _ioMax);
+            _warmWorkers = Math.Max(_workerMin, Math.Min(_workerMax,
+                OperatingSystem.IsWindows() ? Math.Max(16, ThreadPool.ThreadCount) : 16));
             Assert.True(ThreadPool.SetMinThreads(_warmWorkers, _ioMin));
             if (OperatingSystem.IsWindows()) _handleTrace = new();
             _sampler = new Thread(Sample) { IsBackground = true, Name = "F4 resource sampler" };
@@ -582,11 +588,20 @@ public sealed partial class JoinCalendarIntegrationTests
                 using var startup = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 startup.CancelAfter(TimeSpan.FromSeconds(10));
                 int waiting = check._warmWorkers;
+                bool useWinsock = OperatingSystem.IsWindows();
                 await Task.WhenAll(Enumerable.Range(0, check._warmWorkers).Select(_ => Task.Run(() =>
                 {
-                    if (Interlocked.Decrement(ref waiting) == 0) release.Set();
+                    try { if (useWinsock) WarmWinsockThread(); }
+                    finally { if (Interlocked.Decrement(ref waiting) == 0) release.Set(); }
                     release.Wait(startup.Token);
                 })));
+                if (useWinsock)
+                {
+                    int ceiling = Math.Max(check._warmWorkers, ThreadPool.ThreadCount);
+                    Assert.True(ThreadPool.SetMaxThreads(ceiling, check._ioMax));
+                    check._workerCapSet = true;
+                    output.WriteLine($"F4-WINSOCK-WARMUP scenario={scenario} primed={check._warmWorkers} worker_cap={ceiling}");
+                }
                 return check;
             }
             catch
@@ -594,6 +609,22 @@ public sealed partial class JoinCalendarIntegrationTests
                 check.Dispose();
                 throw;
             }
+        }
+
+        private static void WarmWinsockThread()
+        {
+            // Winsock lazily opens Event and Thread handles on calling
+            // workers. Exercise a real TCP exchange on each such worker
+            // before sampling, and close every socket before the first cycle.
+            using var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start(1);
+            var endpoint = (IPEndPoint)listener.LocalEndpoint;
+            using var peer = new TcpClient { SendTimeout = 1000 };
+            peer.Connect(endpoint.Address, endpoint.Port);
+            using var accepted = listener.AcceptTcpClient();
+            accepted.ReceiveTimeout = 1000;
+            peer.GetStream().WriteByte(0x2a);
+            Assert.Equal(0x2a, accepted.GetStream().ReadByte());
         }
 
         private void Sample()
@@ -664,6 +695,7 @@ public sealed partial class JoinCalendarIntegrationTests
             finally
             {
                 _handleTrace?.Dispose();
+                if (_workerCapSet) Assert.True(ThreadPool.SetMaxThreads(_workerMax, _ioMax));
                 Assert.True(ThreadPool.SetMinThreads(_workerMin, _ioMin));
             }
         }

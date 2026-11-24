@@ -65,6 +65,8 @@ function Assert-KcdTrxResults {
                         if (-not $resourceSummaries.Add($scenario)) { throw "Duplicate resource summary for $scenario" }
                     } elseif ($line -match '^\s*F4-HANDLE-TYPES scenario=(?<scenario>[a-z0-9-]+) cycle=[0-5] (?:count=[0-9]+ types=[A-Za-z0-9_=,]+(?: thread_[a-z_]+=[0-9]+)*|status=[0-9a-f]{8}|bad_count=1)\s*$') {
                         $scenario = $Matches.scenario
+                    } elseif ($line -match '^\s*F4-WINSOCK-WARMUP scenario=(?<scenario>[a-z0-9-]+) primed=[0-9]+ worker_cap=[0-9]+\s*$') {
+                        $scenario = $Matches.scenario
                     } else { continue }
                     if ($scenario -cnotin $resourceScenarios) { throw 'Unknown join resource scenario' }
                     Write-Host $line.Trim()
