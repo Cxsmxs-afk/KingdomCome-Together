@@ -151,7 +151,15 @@ public class Wo216LifecyclePipeTests
         Task<Wo216LifecycleReply?>? abandoned = null;
         try
         {
-            var result = await ProcessorFrameScope.RunAsync(_ => abandoned = pipe.Wo216LifecycleAsync(1, 44), 100);
+            var clock = new ManualFrameTime();
+            var result = await ProcessorFrameScope.RunAsync(async _ =>
+            {
+                await clock.Armed;
+                abandoned = pipe.Wo216LifecycleAsync(1, 44);
+                Assert.False(abandoned.IsCompleted);
+                clock.Expire();
+                await abandoned;
+            }, 100, CancellationToken.None, clock);
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned!.WaitAsync(TimeSpan.FromSeconds(2)));
             Assert.True(pipe.IsConnected);

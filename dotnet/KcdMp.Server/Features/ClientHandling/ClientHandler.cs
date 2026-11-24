@@ -242,7 +242,9 @@ public class ClientHandler
 	{
 		bool confirmed = ReferenceEquals(_sessionHost, client);
 		_sessionHost = null;
-		if (ReferenceEquals(_earlyHost, client))
+		// The selected authority already made an explicit claim on this
+		// connection. A dedicated relay may lose it before receiving mode.
+		if (ReferenceEquals(_earlyHost, client) || client.ClaimsHost && HasPlayerIdentity(client.IdentityKey))
 		{
 			_departedEarlyHost = new(client.IdentityKey, client.Name!);
 			ForgetRetiredEarlyHost(client);

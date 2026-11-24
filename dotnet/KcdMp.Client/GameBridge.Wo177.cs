@@ -93,8 +93,7 @@ public partial class GameBridge
         try
         {
             await ExecLuaAsync($"if KCD2MP_W177LoadQuiet then KCD2MP_W177LoadQuiet(\"{EscapeLua(why)}\") else KCD2MP_EmitEvent(\"w177_load_quiet\", \"{EscapeLua(why)} ok\") end");
-            var done = await Task.WhenAny(tcs.Task, Task.Delay(Wo177Rules.ProbeTimeoutMs));
-            return done == tcs.Task ? tcs.Task.Result : null;
+            return await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(Wo177Rules.ProbeTimeoutMs));
         }
         catch { return null; }
         finally { if (ReferenceEquals(_w177Probe, tcs)) _w177Probe = null; }

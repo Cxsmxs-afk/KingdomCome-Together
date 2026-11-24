@@ -323,15 +323,16 @@ public partial class GameBridge
         }
     }
 
-    private async Task W164SendAsync(byte target, byte kind, string text, CancellationToken ct = default)
+    private async Task W164SendAsync(byte target, byte kind, string text, CancellationToken ct = default, Stream? exactLink = null)
     {
+        if (exactLink is not null && !ReferenceEquals(_wo122Stream, exactLink)) return;
         using var frame = ProcessorFrameScope.Link(ct);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(frame.Token, _wo122Ct);
         ProcessorFrameScope.ThrowIfAbandoned();
         linked.Token.ThrowIfCancellationRequested();
         try
         {
-            if (_wo122Stream is not Stream stream) throw new IOException("no relay connection");
+            if ((exactLink ?? _wo122Stream) is not Stream stream) throw new IOException("no relay connection");
             await WritePacketAsync(stream, new LootMsg(kind, Interlocked.Increment(ref _w137Tok), text).BuildUp(Protocol.W164Up, target), linked.Token);
             ProcessorFrameScope.ThrowIfAbandoned(); linked.Token.ThrowIfCancellationRequested();
         }

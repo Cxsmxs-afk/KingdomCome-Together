@@ -101,6 +101,11 @@ public partial class GameBridge
     private int _w211HoldAttempt;
     private bool _w211EngineHeld;
     private long _w211HoldSerial;
+    private sealed record Wo211HoldClock(long Serial)
+    {
+        public PeriodicTimer Pulse { get; } = new(TimeSpan.FromSeconds(1));
+    }
+    private Wo211HoldClock? _w211HoldClock;
     private readonly SemaphoreSlim _w211HoldUi = new(1);
     private long _w211Holds, _w211ResumedInPlace, _w211ResumedRejoin, _w211HoldLeaves, _w211LeaveAsked, _w211SnapAfterDrop;
     private const int HostAbsentHoldRenewMs = 40_000, HostAbsentHoldRetryMs = 5_000;
@@ -129,6 +134,7 @@ public partial class GameBridge
         }
         else _w211Holding = true;
         long serial = Interlocked.Increment(ref _w211HoldSerial);
+        Volatile.Write(ref _joinedWorldRefresh, null);
         _w211LeaveNow = false;
         _w211HoldSinceUtc = DateTime.UtcNow;
         _w211HoldEpoch = _w206.World;
@@ -138,22 +144,32 @@ public partial class GameBridge
         Interlocked.Increment(ref _w211Holds);
         Console.WriteLine($"WO211-LINK hold: the link to the host dropped ({why}) -- this game stays in the host's world, still, for up to {window} s "
             + $"while the agent reconnects (the host's world epoch {_w211HoldEpoch}); the leave comes only after that or on the player's word");
-        bool typedPause = false;
-        if (LoadSequenceEnabled)
+        var clock = new Wo211HoldClock(serial);
+        Interlocked.Exchange(ref _w211HoldClock, clock)?.Pulse.Dispose();
+        try
         {
-            try { typedPause = await LoadSequenceSyncNativeAsync(waitForLink: true); } catch { }
+            bool typedPause = false;
+            if (LoadSequenceEnabled)
+            {
+                try { typedPause = await LoadSequenceSyncNativeAsync(waitForLink: true); } catch { }
+            }
+            else
+            {
+                try { _w211EngineHeld = await _combat.Wo151JoinHoldAsync(true, (ushort)(Wo211Rules.HoldWindowS + 20)) == true; } catch { }
+            }
+            if (hostAbsent)
+            {
+                await Wo122SetLockAsync(true, "host-absent");
+                Console.WriteLine($"MP-HOST-ABSENT hold epoch={_w211HoldEpoch} native={(typedPause || _w211EngineHeld ? "confirmed" : "unconfirmed")}");
+            }
+            await Wo211TellLinkUiAsync(serial, on: true, window, typedPause);
+            _ = Wo211HoldLoopAsync(clock, typedPause);
         }
-        else
+        catch
         {
-            try { _w211EngineHeld = await _combat.Wo151JoinHoldAsync(true, (ushort)(Wo211Rules.HoldWindowS + 20)) == true; } catch { }
+            Wo211StopHoldClock(serial);
+            throw;
         }
-        if (hostAbsent)
-        {
-            await Wo122SetLockAsync(true, "host-absent");
-            Console.WriteLine($"MP-HOST-ABSENT hold epoch={_w211HoldEpoch} native={(typedPause || _w211EngineHeld ? "confirmed" : "unconfirmed")}");
-        }
-        await Wo211TellLinkUiAsync(serial, on: true, window, typedPause);
-        _ = Wo211HoldLoopAsync(serial, typedPause);
         return true;
     }
 
@@ -174,14 +190,16 @@ public partial class GameBridge
     }
 
     /// <summary>The hold's own loop: the countdown, the player's Leave, the window's end.</summary>
-    private async Task Wo211HoldLoopAsync(long serial, bool typedPause)
+    private async Task Wo211HoldLoopAsync(Wo211HoldClock clock, bool typedPause)
     {
+        using var pulse = clock.Pulse;
+        long serial = clock.Serial;
         int lastShown = -1;
         long renewNativeAt = Environment.TickCount64 + HostAbsentHoldRenewMs;
         long renewSaveAt = Environment.TickCount64 + 8_000;
         while (serial == Interlocked.Read(ref _w211HoldSerial) && LinkHeld)
         {
-            await Task.Delay(1000);
+            if (!await pulse.WaitForNextTickAsync()) return;
             if (serial != Interlocked.Read(ref _w211HoldSerial)) return;
             if (!LinkHeld) break;
             var recovery = WorldReconnectPending(serial);
@@ -218,7 +236,15 @@ public partial class GameBridge
                 await Wo211TellLinkUiAsync(serial, on: true, left, typedPause);
             }
         }
+        Wo211StopHoldClock(serial);
         await Wo211TellLinkUiAsync(serial, on: false);
+    }
+
+    private void Wo211StopHoldClock(long serial)
+    {
+        var clock = Volatile.Read(ref _w211HoldClock);
+        if (clock?.Serial == serial && ReferenceEquals(Interlocked.CompareExchange(ref _w211HoldClock, null, clock), clock))
+            clock.Pulse.Dispose();
     }
 
     private async ValueTask<long> Wo211AdvanceHostAbsentHoldAsync(long serial, long now, long renewAt)
@@ -255,6 +281,7 @@ public partial class GameBridge
         if (LoadSequenceEnabled)
         {
             if (!LoadSequenceTryResumeLink(world, resumed, expectedGeneration, reconnectProof)) return false;
+            Wo211StopHoldClock(serial);
             if (leaving) LoadSequenceOnExit();
             if (resumed) _hostCalendarResumeEpoch = world;
             try { await LoadSequenceSyncNativeAsync(); } catch { }
@@ -262,6 +289,7 @@ public partial class GameBridge
         else
         {
             _w211Holding = false;
+            Wo211StopHoldClock(serial);
             if (resumed) _hostCalendarResumeEpoch = world;
             if (_w211EngineHeld)
             {
@@ -293,7 +321,7 @@ public partial class GameBridge
             {
                 if (!await Wo211EndHoldAsync(serial, world, resumed: true, $"the link is back and the host's world is the same (epoch {world}) -- no load, no jump")) return;
                 Interlocked.Increment(ref _w211ResumedInPlace);
-                await Wo210AfterSkipAsync("reconnect");   // every body's whole-body state afresh
+                await Wo210RefreshAfterReconnectAsync();   // every body's whole-body state afresh
             });
             return;
         }

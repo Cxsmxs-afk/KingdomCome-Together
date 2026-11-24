@@ -57,7 +57,7 @@ public partial class GameBridge
 
     private FileSystemWatcher? _savesWatcher;
     private string? _savesDir;
-    private readonly ConcurrentDictionary<string, DateTime> _saveEventAt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, long> _saveEventAt = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _saveSettling = new(StringComparer.OrdinalIgnoreCase);
     private string? _lastObservedMd5;
 
@@ -288,18 +288,19 @@ public partial class GameBridge
             for (int attempt = 1; attempt <= 12; attempt++)
             {
                 await ExecLuaAsync($"if KCD2MP_HostWorldSave then KCD2MP_HostWorldSave(\"{why}\", {attempt}) end");
-                var done = await Task.WhenAny(tcs.Task, Task.Delay(5000));
-                if (done == tcs.Task)
+                ObservedSave s;
+                try { s = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5)); }
+                catch (TimeoutException)
                 {
-                    var s = tcs.Task.Result;
-                    double ms = (s.AtUtc - t0).TotalMilliseconds;
-                    Console.WriteLine(FormattableString.Invariant(
-                        $"MP-WORLDSAVE done why={why} file={s.Display} attempts={attempt} request_to_verified_ms={ms:F0} bytes={s.Bytes} md5={Convert.ToHexString(s.Md5).ToLowerInvariant()} verify=ok"));
-                    _ = ExecLuaAsync(FormattableString.Invariant(
-                        $"if KCD2MP_WorldSaveDone then KCD2MP_WorldSaveDone(true, \"{s.Display}\", \"{why}\", {attempt}, {ms:F0}, \"ok\") end"));
-                    return s;
+                    Console.WriteLine($"MP-WORLDSAVE why={why} attempt={attempt}: no verified file 5 s after the request -- asking again (the engine may be unable to save right now)");
+                    continue;
                 }
-                Console.WriteLine($"MP-WORLDSAVE why={why} attempt={attempt}: no verified file 5 s after the request -- asking again (the engine may be unable to save right now)");
+                double ms = (s.AtUtc - t0).TotalMilliseconds;
+                Console.WriteLine(FormattableString.Invariant(
+                    $"MP-WORLDSAVE done why={why} file={s.Display} attempts={attempt} request_to_verified_ms={ms:F0} bytes={s.Bytes} md5={Convert.ToHexString(s.Md5).ToLowerInvariant()} verify=ok"));
+                _ = ExecLuaAsync(FormattableString.Invariant(
+                    $"if KCD2MP_WorldSaveDone then KCD2MP_WorldSaveDone(true, \"{s.Display}\", \"{why}\", {attempt}, {ms:F0}, \"ok\") end"));
+                return s;
             }
             Console.WriteLine($"MP-WORLDSAVE why={why} gave up after 12 requests over 60 s");
             _ = ExecLuaAsync($"if KCD2MP_WorldSaveDone then KCD2MP_WorldSaveDone(false, \"\", \"{why}\", 12, 60000, \"no file\") end");
@@ -390,7 +391,7 @@ public partial class GameBridge
     private void OnSaveFileEvent(string path)
     {
         if (WorldSaved.ParsePath(path) is null) return;   // not an engine-named save (e.g. a transient mpworld file)
-        _saveEventAt[path] = DateTime.UtcNow;
+        _saveEventAt[path] = Environment.TickCount64;
         if (_saveSettling.TryAdd(path, 0)) _ = SettleSaveAsync(path);
     }
 
@@ -401,12 +402,23 @@ public partial class GameBridge
         {
             string display = SaveDisplay(path);
             WhsSave.VerifyResult? last = null;
-            for (int i = 0; i < 40; i++)
+            const int quietMs = 600, retryMs = 500, timeoutMs = 20_000;
+            long started = Environment.TickCount64, deadline = started + timeoutMs, nextProbe = started;
+            while (true)
             {
-                await Task.Delay(500);
-                if (_saveEventAt.TryGetValue(path, out var at) && (DateTime.UtcNow - at).TotalMilliseconds < 600) continue;
+                long now = Environment.TickCount64;
+                long lastWrite = _saveEventAt.TryGetValue(path, out var at) ? at : started;
+                long due = Math.Max(nextProbe, lastWrite + quietMs);
+                if (now > deadline || due > deadline) break;
+                if (due > now)
+                {
+                    // A fresh change can move the quiet deadline. Recheck before reading the file.
+                    await Task.Delay((int)(due - now));
+                    continue;
+                }
                 last = WhsSave.VerifyFile(path);
                 if (last.Ok) break;
+                nextProbe = Environment.TickCount64 + retryMs;
             }
             if (last is null || !last.Ok)
             {

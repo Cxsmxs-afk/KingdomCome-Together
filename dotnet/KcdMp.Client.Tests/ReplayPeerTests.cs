@@ -11,7 +11,7 @@ public sealed class ReplayPeerTests
     [Fact]
     public async Task ReplayCapturesBothReplaceableSamplesAndTheReliableCommitFromTheActualSender()
     {
-        await using var relay = await ReplayRelay.StartAsync();
+        await using var relay = await ReplayRelay.StartAsync(keepRecordedStates: true);
         await using var source = await ReplayPeer.ConnectAsync(relay.Port, "replay-source");
         await using var receiver = await ReplayPeer.ConnectAsync(relay.Port, "replay-receiver");
         Assert.NotEqual(source.Id, receiver.Id);
