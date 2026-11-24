@@ -45,6 +45,25 @@ public class ProcessorPipeTests
         }, 150, CancellationToken.None, clock).WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    private static async Task<(byte Type, byte[] Payload)> ReadAndAbandonSentAsync(CombatPipe pipe, Stream server)
+    {
+        var clock = new ManualFrameTime();
+        var started = new TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var scope = ProcessorFrameScope.RunAsync(_ =>
+        {
+            var request = pipe.Wo151Async(7, []);
+            started.SetResult(request);
+            return request;
+        }, 300, CancellationToken.None, clock);
+        var frame = await ReadFrame(server);
+        // The DLL can see the bytes before the caller publishes the request task.
+        var abandoned = await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        clock.Expire();
+        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await scope.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned.WaitAsync(TimeSpan.FromSeconds(2)));
+        return frame;
+    }
+
     [Fact]
     public async Task Ambient_abandon_cancels_connection_gate_wait_even_with_a_distinct_caller_token()
     {
@@ -127,13 +146,8 @@ public class ProcessorPipeTests
         Assert.True(await pipe.EnsureConnectedAsync()); await accept;
         var warm = pipe.Wo151Async(2, []); await ReadFrame(server); await Reply(server, 0xAB, 1, 0, 2, 0);
         Assert.NotNull(await warm);
-        Task? abandoned = null;
-        var clock = new ManualFrameTime();
-        var scope = ProcessorFrameScope.RunAsync(_ => abandoned = pipe.Wo151Async(7, []), 300, CancellationToken.None, clock);
-        var old = await ReadFrame(server); Assert.Equal(7, old.Payload[0]);
-        clock.Expire();
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await scope).Status);
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned!.WaitAsync(TimeSpan.FromSeconds(2)));
+        var old = await ReadAndAbandonSentAsync(pipe, server);
+        Assert.Equal(7, old.Payload[0]);
         var live = pipe.Wo151Async(9, []);
         var next = await ReadFrame(server); Assert.Equal(9, next.Payload[0]);
         await Reply(server, 0xAB, 1, 1, 7, 0, 11); // the abandoned command's late answer
@@ -199,13 +213,7 @@ public class ProcessorPipeTests
         using var server = Server(name); var accept = server.WaitForConnectionAsync();
         await using var pipe = new CombatPipe(name);
         Assert.True(await pipe.EnsureConnectedAsync()); await accept; pipe.SetBatchSupported(true);
-        Task? abandoned = null;
-        var clock = new ManualFrameTime();
-        var scope = ProcessorFrameScope.RunAsync(_ => abandoned = pipe.Wo151Async(7, []), 300, CancellationToken.None, clock);
-        var old = await ReadFrame(server);
-        clock.Expire();
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await scope).Status);
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned!.WaitAsync(TimeSpan.FromSeconds(2)));
+        var old = await ReadAndAbandonSentAsync(pipe, server);
         var live = pipe.Wo151Async(2, []);
         var next = await ReadFrame(server); // within 3 s, never behind the old batch's 5 s deadline
         Assert.Equal(new byte[] { 0x2A, 1, 0, 2 }, next.Payload[3..]);
