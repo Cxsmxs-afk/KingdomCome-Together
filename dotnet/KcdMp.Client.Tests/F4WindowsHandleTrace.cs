@@ -27,8 +27,8 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         (long Start, int ModuleMemorySize, string ModuleName)[] modules;
         try { modules = self.Modules.Cast<ProcessModule>().Select(m => (Start: m.BaseAddress.ToInt64(), m.ModuleMemorySize, m.ModuleName)).ToArray(); }
         catch (System.ComponentModel.Win32Exception) { return "enabled=1 modules_unavailable=1"; }
-        // This runs after an over-budget sample. Read our own JIT metadata without suspending the test host.
-        using var diagnostics = TryAttach();
+        // This runs after an over-budget sample. A snapshot lets the DAC read stable JIT metadata.
+        using var diagnostics = TrySnapshot();
         using var runtime = TryReadRuntime(diagnostics);
         var histories = end.Where(kv => !start.TryGetValue(kv.Key, out var kind) || kv.Value != kind)
             .Select(kv => $"{kv.Value}:{ReadOpenOrigin(kv.Key, modules, runtime)}");
@@ -36,15 +36,19 @@ internal sealed class F4WindowsHandleTrace : IDisposable
             string.Join(',', histories.GroupBy(x => x).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key}={g.Count()}"));
     }
 
-    private static DataTarget? TryAttach()
+    private static DataTarget? TrySnapshot()
     {
-        try { return DataTarget.AttachToProcess(Environment.ProcessId, suspend: false); }
-        catch (Exception) { return null; } // keep the native trace if live DAC is unavailable
+        try { return DataTarget.CreateSnapshotAndAttach(Environment.ProcessId); }
+        catch (Exception) { return null; } // keep the native trace if a DAC snapshot is unavailable
     }
 
     private static ClrRuntime? TryReadRuntime(DataTarget? diagnostics)
     {
-        try { return diagnostics?.ClrVersions.FirstOrDefault()?.CreateRuntime(); }
+        try
+        {
+            string dacPath = Path.Combine(Path.GetDirectoryName(typeof(object).Assembly.Location)!, "mscordaccore.dll");
+            return diagnostics?.ClrVersions.FirstOrDefault()?.CreateRuntime(dacPath);
+        }
         catch (Exception) { return null; }
     }
 
