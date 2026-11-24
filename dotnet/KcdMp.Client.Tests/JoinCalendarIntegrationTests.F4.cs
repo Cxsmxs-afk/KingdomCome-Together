@@ -569,8 +569,7 @@ public sealed partial class JoinCalendarIntegrationTests
             ThreadPool.GetMinThreads(out _workerMin, out _ioMin);
             ThreadPool.GetMaxThreads(out _workerMax, out _ioMax);
             _warmWorkers = Math.Max(_workerMin, Math.Min(_workerMax,
-                OperatingSystem.IsWindows() ? Math.Max(16, ThreadPool.ThreadCount) : 16));
-            Assert.True(ThreadPool.SetMinThreads(_warmWorkers, _ioMin));
+                OperatingSystem.IsWindows() ? Math.Max(16, ThreadPool.ThreadCount + 2) : 16));
             if (OperatingSystem.IsWindows()) _handleTrace = new();
             _sampler = new Thread(Sample) { IsBackground = true, Name = "F4 resource sampler" };
             _sampler.Start();
@@ -582,13 +581,21 @@ public sealed partial class JoinCalendarIntegrationTests
             var check = new F4ResourceCheck(scenario, guest, output);
             try
             {
+                bool useWinsock = OperatingSystem.IsWindows();
+                if (useWinsock)
+                {
+                    // Cap before queuing the warmup. Otherwise the pool can
+                    // inject workers that never run one of the parked exchanges.
+                    Assert.True(ThreadPool.SetMaxThreads(check._warmWorkers, check._ioMax));
+                    check._workerCapSet = true;
+                }
+                Assert.True(ThreadPool.SetMinThreads(check._warmWorkers, check._ioMin));
                 // Finish synthetic worker startup before any real cycle, so
                 // every measurement sees the same work since the last return.
                 using var release = new ManualResetEventSlim();
                 using var startup = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 startup.CancelAfter(TimeSpan.FromSeconds(10));
                 int waiting = check._warmWorkers;
-                bool useWinsock = OperatingSystem.IsWindows();
                 await Task.WhenAll(Enumerable.Range(0, check._warmWorkers).Select(_ => Task.Run(() =>
                 {
                     try { if (useWinsock) WarmWinsockThread(); }
@@ -597,10 +604,8 @@ public sealed partial class JoinCalendarIntegrationTests
                 })));
                 if (useWinsock)
                 {
-                    int ceiling = Math.Max(check._warmWorkers, ThreadPool.ThreadCount);
-                    Assert.True(ThreadPool.SetMaxThreads(ceiling, check._ioMax));
-                    check._workerCapSet = true;
-                    output.WriteLine($"F4-WINSOCK-WARMUP scenario={scenario} primed={check._warmWorkers} worker_cap={ceiling}");
+                    Assert.InRange(ThreadPool.ThreadCount, 0, check._warmWorkers);
+                    output.WriteLine($"F4-WINSOCK-WARMUP scenario={scenario} primed={check._warmWorkers} worker_cap={check._warmWorkers}");
                 }
                 return check;
             }

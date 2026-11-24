@@ -190,6 +190,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
         guestGame.Transport.MainMenuShown += guestPipe.ObserveMainMenu;
         guestGame.DeferJoinFileRead = boundary?.Edge == "late-read";
         guestGame.DeferSaveLockReply = boundary?.Edge == "ready";
+        guestGame.DeferOwnFileRead = boundary?.Edge is "ready" or "late-read";
         hostGame.SaveWritten = path => Call(host, "OnSaveFileEvent", path);
         guestGame.Emit("wo124_where", "menu");
         hostGame.Emit("wo124_where", "world");
@@ -449,7 +450,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
         }
         finally
         {
-            if (probe is JoinProbe.PlayerJoinLoop or JoinProbe.ReturnDeadlineLoop && PrivateReturnPending(guest))
+            if (PrivateReturnPending(guest))
             {
                 // On a failed test, close the double as the real engine would
                 // quit. Otherwise a held Windows lease can hide the test error.
@@ -699,7 +700,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
                 finally { release.TrySetResult(); }
                 // Retirement of the Ready send and retirement of the loaded file are
                 // independent. The real return begins only after the journal cleanup.
-                await WaitForAbandonedArrivalAsync(guest, guestGame, ct);
+                await WaitForAbandonedArrivalAsync(guest, guestGame, ct, fixture.GuestOwnSave);
             }
             else
             {
@@ -725,7 +726,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
                 Assert.Empty(guestLink.ReadySent);
                 guestGame.CompleteJoinLoad();
                 Assert.Equal(1, guestGame.JoinFilesRead);
-                await WaitForAbandonedArrivalAsync(guest, guestGame, ct);
+                await WaitForAbandonedArrivalAsync(guest, guestGame, ct, fixture.GuestOwnSave);
                 if (!probe.HostLoss && !probe.GuestLoss)
                     await RejoinAfterAbortAsync(fixture, host, guest, guestPeer.Id, joinId, hostGame, guestGame, hostLink,
                         guestLink, ct);
@@ -743,9 +744,15 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
     }
 
     private static async Task WaitForAbandonedArrivalAsync(GameBridge guest, JoinCalendarTestEngine guestGame,
-        CancellationToken ct)
+        CancellationToken ct, string? controlledSave = null)
     {
-        await guestGame.WaitForOwnLoadAsync(ct);
+        string dispatchedSave = await guestGame.WaitForOwnLoadAsync(ct);
+        if (controlledSave is not null)
+        {
+            Assert.Equal(controlledSave, dispatchedSave);
+            Assert.True(PrivateReturnPending(guest));
+            guestGame.CompleteOwnLoad();
+        }
         await WaitForPrivateReturnAsync(guest, ct);
     }
 

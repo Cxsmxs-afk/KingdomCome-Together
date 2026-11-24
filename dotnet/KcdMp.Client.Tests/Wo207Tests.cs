@@ -402,54 +402,61 @@ public class Wo207PipeTests(ITestOutputHelper output)
     private static async Task<int> PriorityPosition(bool priority)
     {
         string name = BenchInstance.PipeNameFor("t213" + Guid.NewGuid().ToString("N")[..8]);
-        var server = new System.IO.Pipes.NamedPipeServerStream(name, System.IO.Pipes.PipeDirection.InOut, 1, System.IO.Pipes.PipeTransmissionMode.Byte, System.IO.Pipes.PipeOptions.Asynchronous);
-        var served = new List<byte>();
-        try
+        using var server = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var ct = stop.Token;
+        var accept = server.WaitForConnectionAsync(ct);
+        await using var pipe = new CombatPipe(name) { FramesFirst = true };
+        Assert.True(await pipe.EnsureConnectedAsync(ct));
+        await accept;
+
+        async Task CallAsync(byte op, int kind = 0, bool position = false)
         {
-            var accept = server.WaitForConnectionAsync();
-            await using var pipe = new CombatPipe(name) { FramesFirst = true };
-            Assert.True(await pipe.EnsureConnectedAsync());
-            await accept;
-            var dll = Task.Run(async () =>
-            {
-                byte seq = 0;
-                var head = new byte[3];
-                for (int k = 0; k < 16; k++)
-                {
-                    int got = 0;
-                    while (got < 3) got += await server.ReadAsync(head.AsMemory(got));
-                    var body = new byte[head[1] | (head[2] << 8)];
-                    got = 0;
-                    while (got < body.Length) got += await server.ReadAsync(body.AsMemory(got));
-                    lock (served) served.Add(body[0]);
-                    await Task.Delay(15);   // one answer a frame
-                    await server.WriteAsync(new byte[] { 0x9F, 4, 0, 1, seq++, body[0], 0 });
-                }
-            });
-            var calls = Enumerable.Range(1, 12).Select(i => pipe.Wo138Async((byte)i, [])).ToList();   // the background polls
-            calls.AddRange(Enumerable.Range(20, 3).Select(i => Task.Run(async () => { Wo207Trace.Kind.Value = 0x27; return await pipe.Wo138Async((byte)i, []); })));   // frames' calls
-            await Task.Delay(40);
-            await Task.Run(async () => { CombatPipe.Priority.Value = priority; await pipe.Wo138Async(99, []); });   // the position read
-            await Task.WhenAll(calls);
-            await dll;
-            lock (served) return served.IndexOf(99);
+            CombatPipe.Priority.Value = position;
+            Wo207Trace.Kind.Value = kind;
+            Assert.True((await pipe.Wo138Async(op, [], ct))?.Ok == true, $"No reply for op {op}.");
         }
-        finally { server.Dispose(); }
+
+        async Task<byte> ReadAsync()
+        {
+            var request = new byte[4];
+            await server.ReadExactlyAsync(request, ct);
+            Assert.Equal(new byte[] { 0x24, 1, 0 }, request[..3]);
+            return request[3];
+        }
+
+        var calls = new List<Task> { CallAsync(1) };
+        byte inFlight = await ReadAsync();
+        Assert.Equal(1, inFlight);
+        // Queue three known frames before the remaining polls. They keep
+        // their positions instead of causing arbitrary timed poll requeues.
+        for (byte op = 20; op < 23; op++) calls.Add(CallAsync(op, Wo207Trace.ConvKind));
+        Assert.Equal(3, Volatile.Read(ref FrameWaiters(pipe)));
+        for (byte op = 2; op <= 12; op++) calls.Add(CallAsync(op));
+        calls.Add(CallAsync(99, position: priority));
+        Assert.Equal(priority ? 1 : 0, Volatile.Read(ref PriorityWaiters(pipe)));
+
+        var served = new List<byte>();
+        for (byte seq = 0; seq < calls.Count; seq++)
+        {
+            byte op = seq == 0 ? inFlight : await ReadAsync();
+            served.Add(op);
+            await server.WriteAsync(new byte[] { 0x9F, 4, 0, 1, seq, op, 0 }, ct);
+        }
+        await Task.WhenAll(calls);
+        return served.IndexOf(99);
     }
 
     [Fact]
     public async Task The_position_read_goes_before_the_frames_calls_and_the_polls()
     {
-        // one give-way each (PriorityYields): ahead of the twelve polls; at worst behind the three frame calls that were already waiting
-        int at = await PriorityPosition(true);
-        Assert.InRange(at, 0, 5);
+        Assert.Equal(1, await PriorityPosition(true));
     }
 
     [Fact]
     public async Task Twin_D4_off_the_position_read_waits_behind_them()
     {
-        int at = await PriorityPosition(false);
-        Assert.True(at >= 12, $"served at {at}");
+        Assert.Equal(15, await PriorityPosition(false));
     }
 
     // WO-213 D.4, the busy host: the polls waiting at the pipe have each given way to an earlier read already. On one first-come line
