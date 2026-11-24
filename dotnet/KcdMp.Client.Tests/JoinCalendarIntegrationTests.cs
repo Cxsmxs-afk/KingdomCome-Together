@@ -7,6 +7,7 @@ using System.IO.Compression;
 using System.Reflection;
 using System.Security.Cryptography;
 using KcdMp.Wire;
+using Xunit.Abstractions;
 
 namespace KcdMp.Client.Tests;
 
@@ -145,7 +146,8 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None,
         BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false, bool? relayEofWorldRecovery = null,
-        bool? homeProbe = null, bool failExitResponse = false, string? newerStart = null, F4Probe? f4 = null)
+        bool? homeProbe = null, bool failExitResponse = false, string? newerStart = null, F4Probe? f4 = null,
+        ITestOutputHelper? f4Output = null)
     {
         using var fixture = new SaveFixture();
         string? checkpointPath = probe == JoinProbe.LocalFresh ? fixture.RecordLocalCheckpoint() : null;
@@ -177,7 +179,7 @@ public sealed partial class JoinCalendarIntegrationTests
         {
             CanQuickSave = f4 != F4Probe.ActiveGuest,
         };
-        if (f4 == F4Probe.NoOwnExit)
+        if (f4 is F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe)
             guestPipe.SaveListed = (slot, name) => File.Exists(Path.Combine(fixture.GuestSaves, $"playline{slot}", name + ".whs"));
         Func<int, byte[]> makeHostSave = f4 is F4Probe.TransferAbort or F4Probe.HostAbort or F4Probe.TransportLost
             ? F4LargeHostSave : fixture.MakeHostSave;
@@ -241,7 +243,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 else if (loop == F4Probe.TransportLost)
                     await TestF4TransportLossAsync(fixture, relay.Port, guestName, host, guest, hostLink, guestPeer, guestLink, guestRead, guestGame, ct);
                 else
-                    await TestF4LoopAsync(loop, fixture, host, guest, hostLink, guestLink, guestPipe, hostGame, guestGame, ct);
+                    await TestF4LoopAsync(loop, fixture, host, guest, hostLink, guestLink, guestPipe, hostGame, guestGame, ct, f4Output);
                 return;
             }
 
@@ -731,10 +733,13 @@ public sealed partial class JoinCalendarIntegrationTests
         CancellationToken ct)
     {
         await guestGame.WaitForOwnLoadAsync(ct);
-        await WaitAsync(() => Get<object?>(guest, "_jj") is null && !Get<bool>(guest, "_joinedWorld") &&
-            !Get<bool>(guest, "_leaveInProgress"),
-            "the abandoned arrival to return to the guest's own world", ct);
+        await WaitForPrivateReturnAsync(guest, ct);
     }
+
+    private static Task WaitForPrivateReturnAsync(GameBridge guest, CancellationToken ct) =>
+        WaitAsync(() => Get<object?>(guest, "_jj") is null && !Get<bool>(guest, "_joinedWorld") &&
+            !Get<bool>(guest, "_leaveInProgress"),
+            "the private return to finish", ct);
 
     private static async Task AbortThroughRelayAsync(BoundaryProbe probe, GameBridge guest, ReplayPeer hostPeer,
         ReplayPeer guestPeer, JoinWire guestLink, uint joinId, CancellationToken ct, bool waitForDuplicate = true)
@@ -864,7 +869,10 @@ public sealed partial class JoinCalendarIntegrationTests
     private static GameBridge CreateBridge(byte id, bool hosting, Stream relay, CombatPipe pipe,
         LogTailGameTransport game, string saves, CancellationToken ct, int relayPort = 7778)
     {
-        var bridge = new GameBridge(new ClientConfig { IsHosting = hosting, ServerHost = "127.0.0.1", ServerPort = relayPort });
+        var bridge = new GameBridge(new ClientConfig { IsHosting = hosting, ServerHost = "127.0.0.1", ServerPort = relayPort })
+        {
+            PrivateReturnNoticeTime = JoinReturnNoticeTime.Instance,
+        };
         Set(bridge, "_myGhostId", id);
         Set(bridge, "_combat", pipe);
         Set(bridge, "_transport", game);
@@ -884,6 +892,20 @@ public sealed partial class JoinCalendarIntegrationTests
         game.MainMenuShown += Handler<Action>(bridge, "Wo124OnMainMenuShown");
         game.LoadFailedToMenu += Handler<Action>(bridge, "Wo124OnLoadFailedToMenu");
         return bridge;
+    }
+
+    // The tests observe dispatches and their receipts. Expire the player-facing
+    // notice as soon as it is armed, keeping the requested duration under test.
+    private sealed class JoinReturnNoticeTime : TimeProvider
+    {
+        public static readonly JoinReturnNoticeTime Instance = new();
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            Assert.Equal(TimeSpan.FromSeconds(4), dueTime);
+            Assert.Equal(Timeout.InfiniteTimeSpan, period);
+            return TimeProvider.System.CreateTimer(callback, state, TimeSpan.Zero, period);
+        }
     }
 
     private static void DetachEngineLoadEvents(GameBridge guest, LogTailGameTransport engine)

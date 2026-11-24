@@ -199,7 +199,7 @@ public class ClientHandler
 				DepartAuthority(authority, active - superseded.Count, "superseded");
 			foreach (var old in superseded)
 			{
-				ForgetRetiredAnnouncer(old);
+				ForgetRetiredEarlyHost(old);
 				old.AnnounceDisconnect();
 			}
 			return true;
@@ -224,11 +224,11 @@ public class ClientHandler
 				_freeIds.Add(client.Id);
 			int remaining = _readyClients.Count(c => !c.IsSuperseded);
 			if (wasAuthority) DepartAuthority(client, remaining, "disconnect");
-			ForgetRetiredAnnouncer(client);
+			ForgetRetiredEarlyHost(client);
 			if (remaining == 0)
 			{
 				_absentHost = null;
-				_departedAnnouncedHost = null;
+				_departedEarlyHost = null;
 				_restartTicket = null;
 				_restartTicketIssuer = 0;
 				_retiredHostRuns.Clear();
@@ -242,10 +242,10 @@ public class ClientHandler
 	{
 		bool confirmed = ReferenceEquals(_sessionHost, client);
 		_sessionHost = null;
-		if (ReferenceEquals(_announcedHost, client))
+		if (ReferenceEquals(_earlyHost, client))
 		{
-			_departedAnnouncedHost = new(client.IdentityKey, client.Name!);
-			ForgetRetiredAnnouncer(client);
+			_departedEarlyHost = new(client.IdentityKey, client.Name!);
+			ForgetRetiredEarlyHost(client);
 		}
 		_hostClaimRequired = true;
 		if (!confirmed || remaining == 0 || client.AnnouncedWorldEpoch == 0 || client.AnnouncedRunId == Guid.Empty ||
@@ -260,11 +260,12 @@ public class ClientHandler
 			client.AnnouncedWorldEpoch, client.AnnouncedRunId, remaining, reason);
 	}
 
-	private void ForgetRetiredAnnouncer(ClientSession client)
+	private void ForgetRetiredEarlyHost(ClientSession client)
 	{
-		if (!ReferenceEquals(_announcedHost, client)) return;
-		_announcedHost = null;
-		_announcedHostClaimed = false;
+		if (!ReferenceEquals(_earlyHost, client)) return;
+		_earlyHost = null;
+		_earlyHostClaimed = false;
+		_earlyHostModeObserved = false;
 	}
 
 	/// <summary>
@@ -323,14 +324,15 @@ public class ClientHandler
 	public HostLease? AbsentHost => _absentHost;
 	private volatile HostLease? _absentHost;
 	private ClientSession? _sessionHost;
-	private ClientSession? _announcedHost;
-	private bool _announcedHostClaimed;
-	private sealed record AnnouncedHostIdentity(string Key, string Name)
+	private ClientSession? _earlyHost;
+	private bool _earlyHostClaimed;
+	private bool _earlyHostModeObserved;
+	private sealed record EarlyHostIdentity(string Key, string Name)
 	{
 		public bool Matches(ClientSession client) => HasPlayerIdentity(Key) && Key == client.IdentityKey &&
 			string.Equals(Name, client.Name, StringComparison.Ordinal);
 	}
-	private volatile AnnouncedHostIdentity? _departedAnnouncedHost;
+	private volatile EarlyHostIdentity? _departedEarlyHost;
 	private bool _hostClaimRequired;
 	private byte[]? _restartTicket;
 	private ulong _restartTicketIssuer;
@@ -380,7 +382,31 @@ public class ClientHandler
 	internal bool AllowsHostClaim(ClientSession client)
 	{
 		if (_absentHost is not null) return IsReturningHost(client);
-		return _departedAnnouncedHost is not { } departed || departed.Matches(client);
+		return _departedEarlyHost is not { } departed || departed.Matches(client);
+	}
+
+	// A role change shares the roster lock with departure and mode registration.
+	// The launcher's loopback claim can arrive before Wo124 sends the mode.
+	internal bool UpdateHostClaim(ClientSession client, bool claims)
+	{
+		lock (_lock)
+		{
+			if (!client.IsReady || !_readyClients.Contains(client) || claims == client.ClaimsHost ||
+				claims && !AllowsHostClaim(client)) return false;
+			client.ClaimsHost = claims;
+			if (claims)
+			{
+				if (ReferenceEquals(_earlyHost, client) || client.IsLoopback && _sessionHost is null &&
+					ReferenceEquals(PickAuthority(out _), client)) RememberEarlyHost(client, modeObserved: false);
+				TryResumeHostCore(client);
+			}
+			else if (!_earlyHostModeObserved)
+			{
+				// An explicit withdrawal before any mode can release a provisional seat.
+				ForgetRetiredEarlyHost(client);
+			}
+			return true;
+		}
 	}
 
 	internal bool ObserveHostMode(ClientSession client)
@@ -388,11 +414,18 @@ public class ClientHandler
 		lock (_lock)
 		{
 			if (!ReferenceEquals(PickAuthority(out _), client)) return false;
-			_announcedHostClaimed = client.ClaimsHost || ReferenceEquals(_announcedHost, client) && _announcedHostClaimed;
-			_announcedHost = client;
-			_departedAnnouncedHost = null;
+			RememberEarlyHost(client, modeObserved: true);
 			return true;
 		}
+	}
+
+	private void RememberEarlyHost(ClientSession client, bool modeObserved)
+	{
+		bool sameHost = ReferenceEquals(_earlyHost, client);
+		_earlyHostClaimed = client.ClaimsHost || sameHost && _earlyHostClaimed;
+		_earlyHostModeObserved = modeObserved || sameHost && _earlyHostModeObserved;
+		_earlyHost = client;
+		_departedEarlyHost = null;
 	}
 
 	public bool ObserveHostAnnouncement(ClientSession client, uint world, Guid run)
@@ -452,23 +485,24 @@ public class ClientHandler
 	/// <summary>Clears the pause only when this connected client is the same player and brings the same world epoch and run.</summary>
 	public bool TryResumeHost(ClientSession client)
 	{
-		lock (_lock)
+		lock (_lock) return TryResumeHostCore(client);
+	}
+
+	private bool TryResumeHostCore(ClientSession client)
+	{
+		if (_absentHost is not { } left || !client.IsReady || !client.ClaimsHost || !_readyClients.Contains(client)) return false;
+		if (!HostAbsentRules.SameReturn(left, client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId))
 		{
-			if (client.ClaimsHost && ReferenceEquals(_announcedHost, client)) _announcedHostClaimed = true;
-			if (_absentHost is not { } left || !client.IsReady || !client.ClaimsHost || !_readyClients.Contains(client)) return false;
-			if (!HostAbsentRules.SameReturn(left, client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId))
-			{
-				if (client.AnnouncedWorldEpoch != 0 || client.AnnouncedRunId != Guid.Empty)
-					_logger.Information("MP-HOST-ABSENT resume=refused name={Name} epoch={Epoch} run={Run}",
-						client.Name ?? "-", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
-				return false;
-			}
-			_sessionHost = client;
-			_absentHost = null;
-			_logger.Information("MP-HOST-ABSENT resume epoch={Epoch} run={Run}",
-				client.AnnouncedWorldEpoch, client.AnnouncedRunId);
-			return true;
+			if (client.AnnouncedWorldEpoch != 0 || client.AnnouncedRunId != Guid.Empty)
+				_logger.Information("MP-HOST-ABSENT resume=refused name={Name} epoch={Epoch} run={Run}",
+					client.Name ?? "-", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
+			return false;
 		}
+		_sessionHost = client;
+		_absentHost = null;
+		_logger.Information("MP-HOST-ABSENT resume epoch={Epoch} run={Run}",
+			client.AnnouncedWorldEpoch, client.AnnouncedRunId);
+		return true;
 	}
 
 	private ClientSession? PickAuthority(out string reason)
@@ -477,12 +511,12 @@ public class ClientHandler
 		if (_sessionHost is not null) { reason = "session-host"; return _sessionHost; }
 		// Old agents can announce from the initial fallback position. They must not
 		// turn that provisional seat into ownership ahead of the first explicit claim.
-		if (_announcedHostClaimed && _announcedHost is not null) { reason = "announced-host"; return _announcedHost; }
-		if (_departedAnnouncedHost is { } departed)
+		if (_earlyHostClaimed && _earlyHost is not null) { reason = "early-host"; return _earlyHost; }
+		if (_departedEarlyHost is { } departed)
 		{
-			reason = "awaiting-announced-host";
+			reason = "awaiting-early-host";
 			foreach (var c in _readyClients)
-				if (c.IsReady && c.ClaimsHost && departed.Matches(c)) { reason = "returning-announced-host"; return c; }
+				if (c.IsReady && c.ClaimsHost && departed.Matches(c)) { reason = "returning-early-host"; return c; }
 			return null;
 		}
 		var claimants = new List<ClientSession>();
@@ -512,8 +546,8 @@ public class ClientHandler
 	public bool HasHostConnected()
 	{
 		lock (_lock)
-			return _departedAnnouncedHost is not null ? PickAuthority(out _) is not null :
-				_absentHost is null && (_sessionHost is not null || _announcedHostClaimed ||
+			return _departedEarlyHost is not null ? PickAuthority(out _) is not null :
+				_absentHost is null && (_sessionHost is not null || _earlyHostClaimed ||
 				_clients.Any(c => c.IsReady && (c.ClaimsHost || !_hostClaimRequired && c.IsLoopback)));
 	}
 

@@ -60,6 +60,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public bool DeferExitFileRead { get; set; }
     public bool FailExitResponse { get; set; }
     public bool DeferSaveLockReply { get; set; }
+    public Action? BeforeNextWhereReply { get; set; }
     public int JoinLoadsIssued => Volatile.Read(ref _joinLoadsIssued);
     public int JoinFilesRead => Volatile.Read(ref _joinFilesRead);
     public int OwnLoadsIssued => Volatile.Read(ref _ownLoadsIssued);
@@ -99,16 +100,19 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         }
     }
 
-    public void CompleteExitLoad(string path)
+    public void CompleteExitLoad(string path, bool reportFailure = true, bool reportRead = true)
     {
         lock (_logGate)
         {
-            Assert.True(File.Exists(path));
-            Feed($"Loading saved game '{path}'");
-            Feed($"[CryAction] LoadGame: '{path}'");
-            Feed("Exiting to main menu because save game loading failed");
-            Feed("PlayVideoOnly 'main_menu'");
+            Assert.NotEmpty(File.ReadAllBytes(path));
+            if (reportRead)
+            {
+                Feed($"Loading saved game '{path}'");
+                Feed($"[CryAction] LoadGame: '{path}'");
+            }
             _where = "menu";
+            if (reportFailure) Feed("Exiting to main menu because save game loading failed");
+            Feed("PlayVideoOnly 'main_menu'");
             _exitMenu.TrySetResult();
         }
     }
@@ -158,6 +162,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         {
             string path = Path.Combine(_saves, $"playline{exit.Groups[1].Value}", exit.Groups[2].Value + ".whs");
             Assert.True(File.Exists(path));
+            lock (_logGate) _where = "loading";
             _exitLoad.TrySetResult(path);
             _exitLoads.Writer.TryWrite(path);
             if (!DeferExitFileRead) CompleteExitLoad(path);
@@ -244,7 +249,13 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
                 return;
             }
 
-            if (query == "KCD2MP_W154Where") Interlocked.Increment(ref _whereQueries);
+            if (query == "KCD2MP_W154Where")
+            {
+                Interlocked.Increment(ref _whereQueries);
+                var beforeReply = BeforeNextWhereReply;
+                BeforeNextWhereReply = null;
+                beforeReply?.Invoke();
+            }
             string reply = query switch
             {
                 "KCD2MP_Wo125LastLoaded" when fullPath => "path=" + (LastLoadedPathOverride ?? _lastLoadedPath),

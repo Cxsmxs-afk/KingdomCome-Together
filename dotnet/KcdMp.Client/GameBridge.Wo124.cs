@@ -1333,11 +1333,15 @@ public partial class GameBridge
             if (ct.CanBeCanceled) await GameCalls.ExecuteNowAsync(lua, ct);
             else await ExecLuaAsync(lua);
             long sent = Environment.TickCount64 - t0;
-            var done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs, ct));
+            string answer;
+            try { answer = await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(timeoutMs), ct); }
+            catch (TimeoutException)
+            {
+                Console.WriteLine($"MP-ASK timeout fn={fn} tok={tok} send_ms={sent} waited_ms={Environment.TickCount64 - t0}");
+                return "timeout";
+            }
             ct.ThrowIfCancellationRequested();
-            if (done == tcs.Task) return tcs.Task.Result;
-            Console.WriteLine($"MP-ASK timeout fn={fn} tok={tok} send_ms={sent} waited_ms={Environment.TickCount64 - t0}");
-            return "timeout";
+            return answer;
         }
         finally { _wo124Replies.TryRemove(tok, out _); }
     }
@@ -1369,6 +1373,9 @@ public partial class GameBridge
     }
 
     // ---------------------------------------------------------------- failures and leaving
+
+    private static readonly TimeSpan PrivateReturnNoticeDuration = TimeSpan.FromSeconds(4);
+    internal TimeProvider PrivateReturnNoticeTime { private get; init; } = TimeProvider.System;
 
     /// <summary>Before the load: abort to the host (it resumes), clean up, stay at the menu.</summary>
     private async Task AbortJoinerJoinAsync(JoinerJoin j, byte reason, string why, string message, bool sendAbort = true)
@@ -1506,12 +1513,12 @@ public partial class GameBridge
         var returnToken = returnLife?.Token ?? default;
         if (src is null)
         {
-            await Task.Delay(4000);
+            await Task.Delay(PrivateReturnNoticeDuration, PrivateReturnNoticeTime);
             await Wo124ReturnToMenuAsync(why, message, returnToken, relayClosed);
             return;
         }
         if (!await Wo177WaitQuietAsync("leave")) { _leaveInProgress = false; SetJoinUi("left", full + " " + Wo177Rules.GaveUpText); return; }   // WO-177 A5
-        await Task.Delay(4000);
+        await Task.Delay(PrivateReturnNoticeDuration, PrivateReturnNoticeTime);
         if (selectedHome is not null && homeFingerprint is not null)
         {
             if (_transport is LogTailGameTransport engine && ResolveSavesDirForJoin() is string savesRoot &&
@@ -1533,10 +1540,10 @@ public partial class GameBridge
                 var root = Path.GetDirectoryName(Path.GetDirectoryName(src.FullPath))!;
                 sent = await P5LoadGameCoreAsync(src.Playline, src.Base, "leave-command", () =>
                 {
-                    homeReceipt = PrepareLauncherProtectedReceipt(tail, src.FullPath, root, LauncherPrivateReturn.OwnSave);
+                    homeReceipt = PrepareLauncherProtectedReceipt(tail, src.FullPath, root, PrivateReturnDestination.OwnSave);
                     if (homeReceipt is null) return false;
                     homeReceipt.ProtectSubmittedLoad();
-                    AttachPrivateReturn(homeReceipt, canConfirmPrivateWorld: true);
+                    AttachPrivateReturn(homeReceipt);
                     return true;
                 }, returnToken);
             }
@@ -1599,11 +1606,11 @@ public partial class GameBridge
             {
                 sent = await P5LoadGameCoreAsync(save.Playline, save.Base, "leave-command", () =>
                 {
-                    receipt = PrepareLauncherProtectedReceipt(engine, save.FullPath, root, LauncherPrivateReturn.OwnSave);
+                    receipt = PrepareLauncherProtectedReceipt(engine, save.FullPath, root, PrivateReturnDestination.OwnSave);
                     if (receipt is null) return false;
                     receipt.ProtectSubmittedLoad();
                     Volatile.Write(ref _pinnedHomeLoad, receipt);
-                    AttachPrivateReturn(receipt, canConfirmPrivateWorld: true);
+                    AttachPrivateReturn(receipt);
                     return true;
                 }, ct);
             }

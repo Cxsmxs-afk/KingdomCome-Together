@@ -433,6 +433,12 @@ do
     mark = #LOG
     KCD2MP_W154Where("ef56")
     check("C2: a player -> world", countEvt("wo124_reply", "ef56 world", mark) == 1)
+    local whereAdapter = KCD2MP_Wo124Where
+    KCD2MP_Wo124Where = nil
+    mark = #LOG
+    KCD2MP_W154Where("r12345678")
+    check("C2: a failed observation cannot confirm a private menu return", countEvt("wo124_reply", "r12345678 unknown", mark) == 1)
+    KCD2MP_Wo124Where = whereAdapter
     local m2 = #LOG
     KCD2MP_W154SetJoinPatient("off")
     check("C2: mp_join_patient tells the agent", countEvt("w154_cfg", "join_patient=off", m2) == 1)

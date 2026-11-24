@@ -1028,9 +1028,27 @@ public sealed class LogTailGameTransport : IGameTransport
         }
     }
 
+    // A fresh, responsive menu settles an exit even if only part of the load
+    // reached the log. Never retire another save's outstanding read.
+    internal bool TryConsumeProbedMenuReturn(long incarnation, long after, string path, string? alias, StringComparison comparison)
+    {
+        lock (_engineSaveGate)
+        {
+            if (incarnation != EngineLogIncarnation || _engineSaveAmbiguous ||
+                _engineReadSave is not null && (_engineReadSequence <= after || !EngineSaveMatches(_engineReadSave, path, alias, comparison)) ||
+                _engineAcceptedSave is not null && !EngineSaveMatches(_engineAcceptedSave, path, alias, comparison))
+                return false;
+            _engineAcceptedSave = _engineReadSave = null;
+            return true;
+        }
+    }
+
     private bool ProbedEngineReadMatches(long incarnation, string path, string? alias, StringComparison comparison) =>
         incarnation == EngineLogIncarnation && !_engineSaveAmbiguous && _engineReadSave is not null &&
-        (string.Equals(_engineReadSave, path, comparison) || string.Equals(_engineReadSave, alias, comparison));
+        EngineSaveMatches(_engineReadSave, path, alias, comparison);
+
+    private static bool EngineSaveMatches(string observed, string path, string? alias, StringComparison comparison) =>
+        string.Equals(observed, path, comparison) || string.Equals(observed, alias, comparison);
 
     private void ReportEngineSaveTerminal(bool loaded, Action? observed)
     {

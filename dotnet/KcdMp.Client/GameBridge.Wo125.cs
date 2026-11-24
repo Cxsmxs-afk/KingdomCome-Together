@@ -1050,10 +1050,10 @@ public partial class GameBridge
                 {
                     if (_transport is LogTailGameTransport tail)
                     {
-                        exitReceipt = PrepareLauncherProtectedReceipt(tail, path, saves, LauncherPrivateReturn.Menu);
+                        exitReceipt = PrepareLauncherProtectedReceipt(tail, path, saves, PrivateReturnDestination.Menu);
                         if (exitReceipt is null) return false;
                         exitReceipt.ProtectSubmittedLoad();
-                        AttachPrivateReturn(exitReceipt, canConfirmPrivateWorld: false);
+                        AttachPrivateReturn(exitReceipt);
                     }
                     else if (!TryProtectUnobservableEngineRead()) return false;
                     admitted = true;

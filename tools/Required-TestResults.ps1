@@ -45,6 +45,15 @@ function Assert-KcdTrxResults {
         if ($result.GetAttribute('outcome') -ne 'Passed') {
             throw "$Suite did not pass $($result.GetAttribute('testName')) ($($result.GetAttribute('outcome')))"
         }
+        if ($Suite -eq 'Client' -and $result.GetAttribute('testName') -eq
+            'KcdMp.Client.Tests.JoinCalendarResourceTests.Five_leaves_without_an_own_save_recover_a_missing_terminal_from_the_live_menu') {
+            $stdout = $result.SelectSingleNode('t:Output/t:StdOut', $names)
+            $samples = @($stdout.InnerText -split '\r?\n' | Where-Object {
+                $_ -match '^\s*F4-RESOURCES scenario=mpexit(?: [a-z_]+=[0-9]+->[0-9]+)+\s*$'
+            })
+            if ($samples.Count -ne 1) { throw 'The join resource test did not report one before/after sample' }
+            Write-Host $samples[0].Trim()
+        }
     }
     Write-Host "Required suite $Suite PASS: $summary (minimum $MinimumCount)"
 }

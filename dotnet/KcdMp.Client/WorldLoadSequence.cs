@@ -244,6 +244,13 @@ public sealed class WorldLoadSequence
         }
     }
 
+    // A live place reply settles only the load and intent that requested it.
+    // The caller supplies the synchronous, independently scoped engine receipt.
+    internal bool TryConfirmPrivateReturn(WorldLoadSnapshot expected, Func<bool> confirm)
+    {
+        lock (_gate) return expected.Generation == _generation && expected.OwnIntentRevision == _ownRevision && confirm();
+    }
+
     public bool IsCurrent(ulong generation) { lock (_gate) return IsActive(generation); }
     public bool CanApply(ulong generation) { lock (_gate) return IsPlaying(generation) && !_linkHeld && !PrivateIntent; }
 

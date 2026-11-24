@@ -57,14 +57,14 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.False(Get<bool>(guest, "_needsMenuTold"));
             Assert.Equal(0, Get<int>(guest, "_w202RejoinFails"));
             Assert.False(Get<bool>(guest, "_rejoinPending"));
-            if (returnDeadline) engine.DeferOwnFileRead = true;
+            engine.DeferOwnFileRead = true;
             engine.Emit("w211_leave", "menu");
-            await WaitAsync(() => !Get<bool>(guest, "_joinedWorld") && Get<bool>(guest, "_leaveInProgress"),
-                "departure before the private load", ct);
+            Assert.Equal(fixture.GuestOwnSave, await engine.WaitForOwnLoadAsync(ct));
+            Assert.False(Get<bool>(guest, "_joinedWorld"));
+            Assert.True(Get<bool>(guest, "_leaveInProgress"));
             Assert.True((bool)Call(guest, "Wo122WantLock")!);
             if (returnDeadline)
             {
-                await engine.WaitForOwnLoadAsync(ct);
                 int queries = engine.WhereQueries;
                 if (cycle != 2) engine.ReadOwnSaveWithoutTerminal();
                 else engine.Emit("wo124_where", "world"); // still the shared world, with no read of the private file
@@ -88,10 +88,10 @@ public sealed partial class JoinCalendarIntegrationTests
                     await WaitAsync(() => engine.WhereQueries == queries + 2, "one explicit return recheck", ct);
                     await WaitAsync(() => !engine.ReturnRetryVisible, "the local retry to clear", ct);
                 }
-                await WaitAsync(() => !Get<bool>(guest, "_leaveInProgress"), "the proved private world to release the return lock", ct);
-                engine.DeferOwnFileRead = false;
             }
-            else await WaitForAbandonedArrivalAsync(guest, engine, ct);
+            else engine.CompleteOwnLoad();
+            await WaitForPrivateReturnAsync(guest, ct);
+            engine.DeferOwnFileRead = false;
             Assert.False((bool)Call(guest, "Wo122WantLock")!);
             Assert.Equal(returnDeadline ? cycle : cycle * 2, engine.OwnLoadsIssued);
             Assert.False(Get<bool>(guest, "_isDamageAuthority"));

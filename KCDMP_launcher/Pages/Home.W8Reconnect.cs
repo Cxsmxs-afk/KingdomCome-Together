@@ -122,7 +122,7 @@ public partial class Home
         Log.Information("MP-LAUNCH agent reconnect refused reason={Reason}", reason);
         UiService.ShowError(message ?? (reason switch
         {
-            "engine-read-or-control-unavailable" => "The current save handoff or agent connection is still busy. Try again when the load finishes.",
+            "engine-read-or-control-unavailable" => "Wait for any load to finish. If you are still in the host’s world, choose Leave in the co-op menu. Reconnect once you are back in your own game or at the main menu.",
             "agent-identity-unconfirmed" => "The launcher could not verify the running multiplayer agent.",
             _ => "The current game or multiplayer agent changed. Try again."
         }));

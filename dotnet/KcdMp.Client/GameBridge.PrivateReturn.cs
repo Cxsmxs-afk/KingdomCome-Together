@@ -7,10 +7,9 @@ public partial class GameBridge
     private PrivateReturnCheck? _privateReturnCheck;
     private Task _privateReturnMenuUpdate = Task.CompletedTask;
 
-    private sealed class PrivateReturnCheck(JoinEngineReceipt receipt, bool canConfirmPrivateWorld, WorldLoadSnapshot load)
+    private sealed class PrivateReturnCheck(JoinEngineReceipt receipt, WorldLoadSnapshot load)
     {
         public JoinEngineReceipt Receipt { get; } = receipt;
-        public bool CanConfirmPrivateWorld { get; } = canConfirmPrivateWorld;
         public WorldLoadSnapshot Load { get; } = load;
         public bool DeadlineChecked;
         public bool Checking;
@@ -19,10 +18,10 @@ public partial class GameBridge
 
     // Called at the HTTP handoff while _joinGate is held. The sender continues
     // to own the physical lease until its receipt settles.
-    private void AttachPrivateReturn(JoinEngineReceipt receipt, bool canConfirmPrivateWorld)
+    private void AttachPrivateReturn(JoinEngineReceipt receipt)
     {
         receipt.PublishesPrivateReturn = true;
-        Volatile.Write(ref _privateReturnCheck, new(receipt, canConfirmPrivateWorld, _worldLoad.Current));
+        Volatile.Write(ref _privateReturnCheck, new(receipt, _worldLoad.Current));
     }
 
     private void DetachPrivateReturn(JoinEngineReceipt? receipt)
@@ -80,7 +79,8 @@ public partial class GameBridge
 
         string where = "unknown";
         string? last = null;
-        long readSequence = check.CanConfirmPrivateWorld ? check.Receipt.FindProbedRead() : 0;
+        bool ownSave = check.Receipt.Destination == PrivateReturnDestination.OwnSave;
+        long readSequence = ownSave ? check.Receipt.FindProbedRead() : 0;
         try
         {
             // This round trip uses the same live place observation as W160,
@@ -98,11 +98,14 @@ public partial class GameBridge
         {
             check.Checking = false;
             if (!ReferenceEquals(_privateReturnCheck, check) || check.Receipt.Terminal.Task.IsCompleted) return;
-            var load = _worldLoad.Current;
-            bool sameLoad = !LoadSequenceEnabled || (load.Generation == check.Load.Generation &&
-                load.OwnIntentRevision == check.Load.OwnIntentRevision);
-            if (OwnLoadExpected && sameLoad && last is not null && last.StartsWith("path=", StringComparison.Ordinal) &&
-                check.Receipt.TryConfirmObservedPrivateRead(readSequence, last[5..]))
+            if (OwnLoadExpected && where == "menu" && check.Receipt.Destination == PrivateReturnDestination.Menu &&
+                _worldLoad.TryConfirmPrivateReturn(check.Load, check.Receipt.TryConfirmMenuReturn))
+            {
+                Console.WriteLine("MP-H21-HOME place-check result=menu-exit");
+                return;
+            }
+            if (ownSave && OwnLoadExpected && last is not null && last.StartsWith("path=", StringComparison.Ordinal) &&
+                ConfirmPrivateRead(last[5..]))
             {
                 Console.WriteLine("MP-H21-HOME place-check result=private-world");
                 return;
@@ -115,5 +118,9 @@ public partial class GameBridge
             SetJoinUi("return-needed", "Your return is still unconfirmed. Choose Leave in the co-op menu to check it again.");
             Console.WriteLine($"MP-H21-HOME place-check result=pending where={where} player_retry={On(playerRequested)}");
         }
+
+        bool ConfirmPrivateRead(string path) => LoadSequenceEnabled
+            ? _worldLoad.TryConfirmPrivateReturn(check.Load, () => check.Receipt.TryConfirmObservedPrivateRead(readSequence, path))
+            : check.Receipt.TryConfirmObservedPrivateRead(readSequence, path);
     }
 }
