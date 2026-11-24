@@ -54,14 +54,45 @@ internal static class F4WindowsHandleTypes
                 handles.Add(entry.Handle);
             }
 
-            var types = groups.Select(group => $"{ReadName(process, group, typeBuffer)}={group.Value.Count}");
-            return $"count={count} types={string.Join(',', types.Order(StringComparer.Ordinal))}";
+            var types = new List<string>();
+            string threads = "";
+            foreach (var group in groups)
+            {
+                string name = ReadName(process, group, typeBuffer);
+                types.Add($"{name}={group.Value.Count}");
+                if (name == "Thread") threads = ThreadCounts(process, group.Value);
+            }
+            return $"count={count} types={string.Join(',', types.Order(StringComparer.Ordinal))}{threads}";
         }
         finally
         {
             Marshal.FreeHGlobal(typeBuffer);
             Marshal.FreeHGlobal(entries);
         }
+    }
+
+    private static string ThreadCounts(IntPtr process, IEnumerable<IntPtr> handles)
+    {
+        var targets = new HashSet<uint>();
+        int live = 0, dead = 0, foreign = 0, unknown = 0;
+        foreach (var value in handles)
+        {
+            if (!DuplicateHandle(process, value, process, out var duplicate, 0, false, DuplicateSameAccess))
+            {
+                unknown++;
+                continue;
+            }
+            using (duplicate)
+            {
+                uint owner = GetProcessIdOfThread(duplicate);
+                uint id = GetThreadId(duplicate);
+                if (owner == 0 || id == 0 || !GetExitCodeThread(duplicate, out uint exitCode)) unknown++;
+                else if (owner != Environment.ProcessId) foreign++;
+                else if (exitCode != 259) dead++; // STILL_ACTIVE
+                else { live++; targets.Add(id); }
+            }
+        }
+        return $" thread_live={live} thread_live_distinct={targets.Count} thread_dead={dead} thread_foreign={foreign} thread_unknown={unknown}";
     }
 
     private static string ReadName(IntPtr process, KeyValuePair<uint, List<IntPtr>> group, IntPtr buffer)
@@ -88,6 +119,16 @@ internal static class F4WindowsHandleTypes
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr source, IntPtr targetProcess,
         out SafeFileHandle target, uint access, [MarshalAs(UnmanagedType.Bool)] bool inherit, uint options);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetProcessIdOfThread(SafeFileHandle thread);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetThreadId(SafeFileHandle thread);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetExitCodeThread(SafeFileHandle thread, out uint exitCode);
 
     [DllImport("ntdll.dll")]
     private static extern int NtQueryInformationProcess(IntPtr process, int kind, IntPtr buffer, int length, out int needed);

@@ -1,5 +1,6 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using KcdMp.Wire;
@@ -516,7 +517,7 @@ public sealed partial class JoinCalendarIntegrationTests
     private readonly record struct F4Owned(int PipeConnections, long PipeRevision, int Reservations, int Timers);
 
     private readonly record struct F4ResourceSample(int Threads, int Handles, int RawThreads, int RawHandles,
-        int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned);
+        int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, string? WindowsHandleTypes);
 
     private static F4ResourceSample F4Resources(GameBridge guest)
     {
@@ -526,6 +527,7 @@ public sealed partial class JoinCalendarIntegrationTests
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
+        GC.WaitForPendingFinalizers();
         process.Refresh();
         var retained = Get<object>(guest, "_retainedJoinWorlds");
         int leases = (int)retained.GetType().GetProperty("Count")!.GetValue(retained)!;
@@ -534,8 +536,11 @@ public sealed partial class JoinCalendarIntegrationTests
         leases += Get<object?>(guest, "_wo125ActiveExitPath") is null ? 0 : 1;
         int timers = Get<bool>(guest, "_rejoinPending") ? 1 : 0;
         var pipe = Get<CombatPipe>(guest, "_combat");
-        return new(process.Threads.Count, process.HandleCount, rawThreads, rawHandles, ThreadPool.ThreadCount, Timer.ActiveCount,
-            new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers));
+        int threads = process.Threads.Count;
+        int handles = process.HandleCount;
+        return new(threads, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, Timer.ActiveCount,
+            new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers),
+            OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture() : null);
     }
 
     private sealed class F4ResourceCheck : IDisposable
@@ -544,6 +549,8 @@ public sealed partial class JoinCalendarIntegrationTests
         private readonly GameBridge _guest;
         private readonly ITestOutputHelper _output;
         private readonly int _workerMin, _ioMin, _warmWorkers;
+        private readonly BlockingCollection<TaskCompletionSource<F4ResourceSample>> _requests = new(1);
+        private readonly Thread _sampler;
         private int _nextCycle;
         private F4ResourceSample _before, _after;
 
@@ -555,7 +562,19 @@ public sealed partial class JoinCalendarIntegrationTests
             ThreadPool.GetMinThreads(out _workerMin, out _ioMin);
             _warmWorkers = Math.Max(_workerMin, 16);
             Assert.True(ThreadPool.SetMinThreads(_warmWorkers, _ioMin));
-            if (OperatingSystem.IsWindows()) _ = F4WindowsHandleTypes.Capture();
+            _sampler = new Thread(Sample) { IsBackground = true, Name = "F4 resource sampler" };
+            _sampler.Start();
+        }
+
+        private void Sample()
+        {
+            // The GC/finalizer and Windows handle queries use one OS thread
+            // for baseline and observations, even when the join resumes on different workers.
+            foreach (var request in _requests.GetConsumingEnumerable())
+            {
+                try { request.SetResult(F4Resources(_guest)); }
+                catch (Exception ex) { request.SetException(ex); }
+            }
         }
 
         public async Task CycleAsync(int cycle, CancellationToken ct)
@@ -574,15 +593,17 @@ public sealed partial class JoinCalendarIntegrationTests
                     release.Wait(startup.Token);
                 })));
             }
-            var sample = F4Resources(_guest);
+            var request = new TaskCompletionSource<F4ResourceSample>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _requests.Add(request, ct);
+            var sample = await request.Task.WaitAsync(ct);
             if (cycle == 0) _before = sample;
             _after = sample;
             _output.WriteLine($"F4-RESOURCES scenario={_scenario} cycle={cycle} threads={sample.Threads} handles={sample.Handles} " +
                 $"raw_threads={sample.RawThreads} raw_handles={sample.RawHandles} thread_pool_workers={sample.ThreadPoolWorkers} " +
                 $"runtime_timers={sample.RuntimeTimers} guest_pipe={sample.Owned.PipeConnections} tracked_leases={sample.Owned.Reservations} " +
                 $"pipe_revision={sample.Owned.PipeRevision} rejoin_timer={sample.Owned.Timers}");
-            if (OperatingSystem.IsWindows())
-                _output.WriteLine($"F4-HANDLE-TYPES scenario={_scenario} cycle={cycle} {F4WindowsHandleTypes.Capture()}");
+            if (sample.WindowsHandleTypes is string types)
+                _output.WriteLine($"F4-HANDLE-TYPES scenario={_scenario} cycle={cycle} {types}");
         }
 
         public void AssertBudget()
@@ -601,6 +622,15 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.Equal(before.Owned, after.Owned);
         }
 
-        public void Dispose() => Assert.True(ThreadPool.SetMinThreads(_workerMin, _ioMin));
+        public void Dispose()
+        {
+            _requests.CompleteAdding();
+            try
+            {
+                Assert.True(_sampler.Join(TimeSpan.FromSeconds(10)), "The F4 resource sampler did not stop");
+                _requests.Dispose();
+            }
+            finally { Assert.True(ThreadPool.SetMinThreads(_workerMin, _ioMin)); }
+        }
     }
 }

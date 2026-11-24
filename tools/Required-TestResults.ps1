@@ -63,7 +63,7 @@ function Assert-KcdTrxResults {
                     } elseif ($line -match '^\s*F4-RESOURCES scenario=(?<scenario>[a-z0-9-]+)(?: [a-z_]+=[0-9]+->[0-9]+)+\s*$') {
                         $scenario = $Matches.scenario
                         if (-not $resourceSummaries.Add($scenario)) { throw "Duplicate resource summary for $scenario" }
-                    } elseif ($line -match '^\s*F4-HANDLE-TYPES scenario=(?<scenario>[a-z0-9-]+) cycle=[0-5] (?:count=[0-9]+ types=[A-Za-z0-9_=,]+|status=[0-9a-f]{8}|bad_count=1)\s*$') {
+                    } elseif ($line -match '^\s*F4-HANDLE-TYPES scenario=(?<scenario>[a-z0-9-]+) cycle=[0-5] (?:count=[0-9]+ types=[A-Za-z0-9_=,]+(?: thread_[a-z_]+=[0-9]+)*|status=[0-9a-f]{8}|bad_count=1)\s*$') {
                         $scenario = $Matches.scenario
                     } else { continue }
                     if ($scenario -cnotin $resourceScenarios) { throw 'Unknown join resource scenario' }
