@@ -444,6 +444,14 @@ public sealed partial class JoinCalendarIntegrationTests
         }
         finally
         {
+            if (probe is JoinProbe.PlayerJoinLoop or JoinProbe.ReturnDeadlineLoop && PrivateReturnPending(guest))
+            {
+                // On a failed test, close the double as the real engine would
+                // quit. Otherwise a held Windows lease can hide the test error.
+                guestGame.Feed("CSystem::Quit invoked");
+                using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await WaitAsync(() => !PrivateReturnPending(guest), "the simulated engine exit to release the private save", cleanup.Token);
+            }
             hostPipe.BeginShutdown();
             guestPipe.BeginShutdown();
             if (pauseAfterJoin || relayEofWorldRecovery is not null || f4 == F4Probe.HostReturn) Call(guest, "LoadSequenceOnExit");
@@ -738,8 +746,11 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private static Task WaitForPrivateReturnAsync(GameBridge guest, CancellationToken ct) =>
         WaitAsync(() => Get<object?>(guest, "_jj") is null && !Get<bool>(guest, "_joinedWorld") &&
-            !Get<bool>(guest, "_leaveInProgress"),
+            !Get<bool>(guest, "_leaveInProgress") && !PrivateReturnPending(guest),
             "the private return to finish", ct);
+
+    private static bool PrivateReturnPending(GameBridge guest) =>
+        Get<object?>(guest, "_pinnedHomeLoad") is not null || Get<object?>(guest, "_privateReturnCheck") is not null;
 
     private static async Task AbortThroughRelayAsync(BoundaryProbe probe, GameBridge guest, ReplayPeer hostPeer,
         ReplayPeer guestPeer, JoinWire guestLink, uint joinId, CancellationToken ct, bool waitForDuplicate = true)
