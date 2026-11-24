@@ -555,6 +555,7 @@ public sealed partial class JoinCalendarIntegrationTests
             ThreadPool.GetMinThreads(out _workerMin, out _ioMin);
             _warmWorkers = Math.Max(_workerMin, 16);
             Assert.True(ThreadPool.SetMinThreads(_warmWorkers, _ioMin));
+            if (OperatingSystem.IsWindows()) _ = F4WindowsHandleTypes.Capture();
         }
 
         public async Task CycleAsync(int cycle, CancellationToken ct)
@@ -580,6 +581,8 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"raw_threads={sample.RawThreads} raw_handles={sample.RawHandles} thread_pool_workers={sample.ThreadPoolWorkers} " +
                 $"runtime_timers={sample.RuntimeTimers} guest_pipe={sample.Owned.PipeConnections} tracked_leases={sample.Owned.Reservations} " +
                 $"pipe_revision={sample.Owned.PipeRevision} rejoin_timer={sample.Owned.Timers}");
+            if (OperatingSystem.IsWindows())
+                _output.WriteLine($"F4-HANDLE-TYPES scenario={_scenario} cycle={cycle} {F4WindowsHandleTypes.Capture()}");
         }
 
         public void AssertBudget()
