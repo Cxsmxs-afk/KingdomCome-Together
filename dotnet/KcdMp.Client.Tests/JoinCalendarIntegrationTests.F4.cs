@@ -136,7 +136,7 @@ public sealed partial class JoinCalendarIntegrationTests
         JoinCalendarTestEngine engine, string scenario, CancellationToken ct, ITestOutputHelper output)
     {
         byte[] ownBefore = SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave));
-        using var resources = await F4ResourceCheck.WarmAsync(scenario, guest, output, ct);
+        using var resources = new F4ResourceCheck(scenario, guest, output);
         var cancelled = new HashSet<uint>();
         bool hostCancels = !ReferenceEquals(canceller, engine);
         var incomingAbort = hostCancels ? guestLink.Aborts : hostLink.Aborts;
@@ -201,7 +201,7 @@ public sealed partial class JoinCalendarIntegrationTests
         JoinWire link = firstLink;
         Task read = firstRead;
         var abandoned = new HashSet<uint>();
-        using var resources = await F4ResourceCheck.WarmAsync("transfer-eof", guest, output, ct);
+        using var resources = new F4ResourceCheck("transfer-eof", guest, output);
         try
         {
             for (int i = 0; i <= 5; i++)
@@ -284,7 +284,7 @@ public sealed partial class JoinCalendarIntegrationTests
         }, "the already joined world to settle", ct);
         hostPeer.FinishSending();
         await hostRead.WaitAsync(ct);
-        using var resources = await F4ResourceCheck.WarmAsync($"host-return-{players}", guest, output, ct);
+        using var resources = new F4ResourceCheck($"host-return-{players}", guest, output);
         for (int i = 0; i <= 6; i++)
         {
             await WaitAsync(() => guest.HostAbsentPause && Property<bool>(guest, "LinkHeld") && !Get<bool>(guest, "_hostModeKnown"),
@@ -317,7 +317,7 @@ public sealed partial class JoinCalendarIntegrationTests
         string removed = Path.Combine(fixture.Root, "fixture-offline-save");
         byte[] hash = SHA256.HashData(File.ReadAllBytes(own));
         Set(guest, "_w184SaveOnLeave", false);
-        using var resources = await F4ResourceCheck.WarmAsync("missing-personal-save", guest, output, ct);
+        using var resources = new F4ResourceCheck("missing-personal-save", guest, output);
         for (int i = 1; i <= 7; i++)
         {
             File.Move(own, removed);
@@ -370,7 +370,7 @@ public sealed partial class JoinCalendarIntegrationTests
             F4Probe.RetainedTimer => "mpexit-retained-timer",
             _ => "mpexit"
         };
-        using var resources = supersedeLoad ? null : await F4ResourceCheck.WarmAsync(scenario, guest, output, ct);
+        using var resources = supersedeLoad ? null : new F4ResourceCheck(scenario, guest, output);
         int initialReceiptCycle = probe == F4Probe.NoOwnExit ? 1 : 0;
         int lastCycle = supersedeLoad ? 0 : 5 + initialReceiptCycle;
         using var outstanding = retainTimers ? new RetainedLeaveTimers() : null;
@@ -534,7 +534,7 @@ public sealed partial class JoinCalendarIntegrationTests
             Set(second, "_w184SaveOnLeave", false);
             firstEngine.DeferOwnFileRead = true;
             secondEngine.DeferOwnFileRead = true;
-            using var resources = await F4ResourceCheck.WarmAsync($"active-guests-{players}", first, output, ct);
+            using var resources = new F4ResourceCheck($"active-guests-{players}", first, output);
             for (int cycle = 1; cycle <= 6; cycle++)
             {
                 async Task JoinAsync(GameBridge guest, JoinWire link, JoinCalendarTestEngine engine, string selected)
@@ -629,7 +629,7 @@ public sealed partial class JoinCalendarIntegrationTests
         private int _nextCycle;
         private F4ResourceSample _before, _after;
 
-        private F4ResourceCheck(string scenario, GameBridge guest, ITestOutputHelper output)
+        public F4ResourceCheck(string scenario, GameBridge guest, ITestOutputHelper output)
         {
             _scenario = scenario;
             _guest = guest;
@@ -639,32 +639,25 @@ public sealed partial class JoinCalendarIntegrationTests
             _sampler.Start();
         }
 
-        public static async Task<F4ResourceCheck> WarmAsync(string scenario, GameBridge guest,
-            ITestOutputHelper output, CancellationToken ct)
+        private async Task PrimeWorkersAsync(CancellationToken ct)
         {
-            var check = new F4ResourceCheck(scenario, guest, output);
             ThreadPool.GetMinThreads(out int workerMin, out int ioMin);
             ThreadPool.GetMaxThreads(out int workerMax, out _);
             bool useWinsock = OperatingSystem.IsWindows();
-            int warmWorkers = Math.Clamp(useWinsock ? Math.Max(16, ThreadPool.ThreadCount + Environment.ProcessorCount) : 16, workerMin, workerMax);
+            // Prime the pool reached by the actual warmup round. A cold pool does not yet
+            // contain all the workers that the concurrent guest returns leave behind.
+            int active = ThreadPool.ThreadCount;
+            int target = useWinsock ? active + Environment.ProcessorCount : 16;
+            int warmWorkers = Math.Clamp(Math.Max(16, target), workerMin, workerMax);
+            Assert.True(ThreadPool.SetMinThreads(warmWorkers, ioMin));
             try
             {
-                Assert.True(ThreadPool.SetMinThreads(warmWorkers, ioMin));
-                try
-                {
-                    int warmed = await WarmWorkersAsync(warmWorkers, useWinsock, ct);
-                    output.WriteLine($"F4-POOL-WARMUP scenario={scenario} primed={warmed} worker_min={workerMin} worker_max={workerMax}");
-                }
-                finally
-                {
-                    Assert.True(ThreadPool.SetMinThreads(workerMin, ioMin));
-                }
-                return check;
+                int warmed = await WarmWorkersAsync(warmWorkers, useWinsock, ct);
+                _output.WriteLine($"F4-POOL-WARMUP scenario={_scenario} primed={warmed} worker_min={workerMin} worker_max={workerMax} after_join_workers={active} target={warmWorkers}");
             }
-            catch
+            finally
             {
-                check.Dispose();
-                throw;
+                Assert.True(ThreadPool.SetMinThreads(workerMin, ioMin));
             }
         }
 
@@ -722,6 +715,7 @@ public sealed partial class JoinCalendarIntegrationTests
         public async Task CycleAsync(int cycle, CancellationToken ct, params GameBridge[] others)
         {
             Assert.Equal(_nextCycle++, cycle);
+            if (cycle == 0) await PrimeWorkersAsync(ct);
             var sample = await SampleAfterNativeAsync();
             if (cycle == 5 && sample.RuntimeTimers > _before.RuntimeTimers + TimerAllowance)
             {
