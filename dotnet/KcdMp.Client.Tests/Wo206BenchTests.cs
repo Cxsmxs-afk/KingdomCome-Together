@@ -64,12 +64,11 @@ public class Wo206BenchTests
             bool bUp = await agentB.EnsureConnectedAsync();
             if (bUp && acceptB is not null) await acceptB;
 
-            // each agent sends a frame whose body names it; each server reads what reached it
-            _ = agentA.Wo138Async(4, "A"u8.ToArray());
-            if (bUp) _ = agentB.Wo138Async(4, "B"u8.ToArray());
-            string? seenA = await ReadTag(serverA);
-            string? seenB = bUp && serverB is not null ? await ReadTag(serverB) : null;
-            return (seenA, seenB);
+            // Keep both agents connected, and finish the identified round trips before closing either server.
+            var replyA = RoundTrip(serverA, agentA, (byte)'A');
+            var replyB = bUp && serverB is not null ? RoundTrip(serverB, agentB, (byte)'B') : Task.FromResult<string?>(null);
+            var replies = await Task.WhenAll(replyA, replyB);
+            return (replies[0], replies[1]);
         }
         finally
         {
@@ -78,26 +77,22 @@ public class Wo206BenchTests
         }
     }
 
-    private static async Task<string?> ReadTag(Stream s)
+    private static async Task<string?> RoundTrip(Stream server, CombatPipe agent, byte tag)
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var pending = agent.Wo138Async(4, [tag], cts.Token);
         var head = new byte[3];
-        if (!await ReadExactly(s, head, cts.Token)) return null;
+        await server.ReadExactlyAsync(head, cts.Token);
+        Assert.Equal(0x24, head[0]);
         var body = new byte[head[1] | (head[2] << 8)];
-        if (!await ReadExactly(s, body, cts.Token)) return null;
-        return body.Length > 0 && (body[^1] == (byte)'A' || body[^1] == (byte)'B') ? ((char)body[^1]).ToString() : "?";
-    }
-
-    private static async Task<bool> ReadExactly(Stream s, byte[] buf, CancellationToken ct)
-    {
-        int got = 0;
-        while (got < buf.Length)
-        {
-            int n = await s.ReadAsync(buf.AsMemory(got), ct);
-            if (n <= 0) return false;
-            got += n;
-        }
-        return true;
+        await server.ReadExactlyAsync(body, cts.Token);
+        Assert.Equal(2, body.Length);
+        Assert.Equal(4, body[0]);
+        await server.WriteAsync(new byte[] { 0x9F, 5, 0, 1, 1, 4, 0, body[1] }, cts.Token);
+        var reply = await pending;
+        Assert.True(reply is { Ok: true });
+        Assert.Equal(new byte[] { tag }, reply.Value.Payload);
+        return ((char)body[1]).ToString();
     }
 
     [Fact]

@@ -134,7 +134,8 @@ public sealed class HostAbsentPauseTests
     public async Task One_refused_native_renewal_keeps_the_same_pause_beyond_two_intervals()
     {
         long now = 0;
-        await using var native = new JoinCalendarTestPipe(nativeClock: () => Interlocked.Read(ref now), refusedRenewals: 1);
+        await using var native = new JoinCalendarTestPipe(nativeClock: () => Interlocked.Read(ref now), refusedRenewals: 1,
+            controlTime: new ManualFrameTime());
         await using var engine = new JoinCalendarTestEngine(Path.Combine(Path.GetTempPath(), $"kct-host-hold-{Guid.NewGuid():N}.log"),
             Path.GetTempPath(), null, native.ObserveGameplayStarted);
         var bridge = new GameBridge(new ClientConfig());

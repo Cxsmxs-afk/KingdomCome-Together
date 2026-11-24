@@ -14,6 +14,7 @@ public sealed partial class CombatPipe
     private int _disposed;
     private int _lifecycleNextId;
     private static readonly TimeSpan LifecycleDeadline = TimeSpan.FromSeconds(1);
+    internal TimeProvider ControlTime { get; init; } = TimeProvider.System;
 
     /// <summary>P1 control must reach the reader even while a main-thread batch is unanswered.
     /// It owns neither the normal request gate nor the batch pump; only physical frame writes are serialized.</summary>
@@ -30,8 +31,11 @@ public sealed partial class CombatPipe
         ct = scope.Token;
         ct.ThrowIfCancellationRequested();
         ProcessorFrameScope.ThrowIfAbandoned();
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(LifecycleDeadline);
+        using var clockDeadline = ControlTime == TimeProvider.System ? null : new CancellationTokenSource(LifecycleDeadline, ControlTime);
+        using var deadline = clockDeadline is null
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : CancellationTokenSource.CreateLinkedTokenSource(ct, clockDeadline.Token);
+        if (clockDeadline is null) deadline.CancelAfter(LifecycleDeadline);
         uint requestId = 0;
         LifecycleWait? waiting = null;
         try

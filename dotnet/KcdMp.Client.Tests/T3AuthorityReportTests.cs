@@ -80,7 +80,7 @@ public class T3AuthorityReportTests
         var accepted = server.WaitForConnectionAsync(stop.Token);
         await using var pipe = new CombatPipe(name) { BatchOn = false };
         Assert.True(await pipe.EnsureConnectedAsync(stop.Token)); await accepted;
-        var b = new GameBridge(new ClientConfig());
+        var b = new GameBridge(new ClientConfig()) { T3StatsTime = new ManualFrameTime() };
         await ((CombatPipe)typeof(GameBridge).GetField("_combat", Private)!.GetValue(b)!).DisposeAsync();
         Set(b, "_combat", pipe); Set(b, "_combatRoleApplied", true); Set(b, "_isDamageAuthority", host);
         Set(b, "_sharedWorld", true); Set(b, "_hostAuthority", true); Set(b, "_joinedWorld", true);

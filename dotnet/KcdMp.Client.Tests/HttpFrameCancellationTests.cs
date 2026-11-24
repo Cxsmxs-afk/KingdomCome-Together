@@ -280,9 +280,8 @@ public class HttpFrameCancellationTests
         transport.NowMs = () =>
         {
             // EnterHold sets Held before reading the clock and launching recovery.
-            if (transport.Held && holdEntered.TrySetResult() && !releaseHold.Wait(FrameTestWatchdog))
-                throw new TimeoutException("The test did not release the transport hold");
-            return Environment.TickCount64;
+            if (transport.Held && holdEntered.TrySetResult()) releaseHold.Wait();
+            return 0;
         };
         var frame = ProcessorFrameScope.RunAsync(async _ =>
         {
@@ -298,15 +297,19 @@ public class HttpFrameCancellationTests
         bool verified = false;
         try
         {
-            await holdEntered.Task.WaitAsync(FrameTestWatchdog);
+            await Task.WhenAll(holdEntered.Task, clock.Armed).WaitAsync(FrameTestWatchdog);
             Assert.True(transport.Held);
             clock.Expire();
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(FrameTestWatchdog)).Status);
             releaseHold.Set();
             release.SetResult();
             await probeEntered.Task.WaitAsync(FrameTestWatchdog);
-            using var deadline = new CancellationTokenSource(FrameTestWatchdog);
-            while (transport.Held) await Task.Delay(5, deadline.Token);
+            await frameEnded.Task.WaitAsync(FrameTestWatchdog);
+            var recovery = Assert.IsAssignableFrom<Task>(typeof(HttpGameTransport)
+                .GetField("_recovery", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(transport));
+            await recovery.WaitAsync(FrameTestWatchdog);
+            Assert.False(transport.Held);
             string[] requests = game.Calls.ToArray();
             Assert.True(requests.Length >= 3);
             Assert.Contains("local _ = 1", requests[2]);

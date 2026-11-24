@@ -32,7 +32,9 @@ public sealed class ReplayScenarioTests
         byte[][] sends = records.Where(record => record.Kind == SessionRecordKind.RelaySent).Select(record => record.Payload).ToArray();
         Assert.NotEmpty(sends);
         bool joinerSends = name is "knockdown" or "bow-shot" or "remote-walk-stairs" or "remote-fight-down-up";
-        await using var relay = await ReplayRelay.StartAsync(ct);
+        // Advance each recorded state after the production relay delivers it. Actual wall time
+        // between submitted records is test scheduling time, not part of the recording.
+        await using var relay = await ReplayRelay.StartAsync(ct, keepRecordedStates: true);
         await using var host = await ReplayPeer.ConnectAsync(relay.Port, "fixture-host", ct);
         await using var joiner = await ReplayPeer.ConnectAsync(relay.Port, "fixture-joiner", ct);
         Assert.Equal((byte)0, host.Id); Assert.Equal((byte)1, joiner.Id);

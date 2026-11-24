@@ -74,6 +74,7 @@ public sealed class QuestMutationBoundaryTests
         private readonly NamedPipeServerStream _native;
         private readonly CombatPipe _combat;
         private readonly Channel<Func<Task>> _work = Channel.CreateUnbounded<Func<Task>>();
+        private readonly TaskCompletionSource _nativeAccepted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly Task _receiver, _worker, _pipe;
         private int _vital = 1, _pulses, _replays;
 
@@ -109,10 +110,29 @@ public sealed class QuestMutationBoundaryTests
         public static async Task<Fixture> OpenAsync()
         {
             var relay = await ReplayRelay.StartAsync();
-            var host = await ReplayPeer.ConnectAsync(relay.Port, "QuestHost");
-            var guest = await ReplayPeer.ConnectAsync(relay.Port, "QuestGuest");
-            await host.DrainAsync();
-            return new Fixture(relay, host, guest);
+            ReplayPeer? host = null, guest = null;
+            Fixture? fixture = null;
+            try
+            {
+                host = await ReplayPeer.ConnectAsync(relay.Port, "QuestHost");
+                guest = await ReplayPeer.ConnectAsync(relay.Port, "QuestGuest");
+                await host.DrainAsync();
+                fixture = new Fixture(relay, host, guest);
+                Assert.True(await fixture._combat.EnsureConnectedAsync(fixture._stop.Token));
+                await fixture._nativeAccepted.Task.WaitAsync(fixture._stop.Token);
+                return fixture;
+            }
+            catch
+            {
+                if (fixture is not null) await fixture.DisposeAsync();
+                else
+                {
+                    if (guest is not null) await guest.DisposeAsync();
+                    if (host is not null) await host.DisposeAsync();
+                    await relay.DisposeAsync();
+                }
+                throw;
+            }
         }
 
         public int Vital => Volatile.Read(ref _vital);
@@ -185,6 +205,7 @@ public sealed class QuestMutationBoundaryTests
             try
             {
                 await _native.WaitForConnectionAsync(ct);
+                _nativeAccepted.SetResult();
                 byte seq = 0;
                 var header = new byte[3];
                 while (await _native.ReadAtLeastAsync(header, header.Length, false, ct) == header.Length)

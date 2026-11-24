@@ -103,8 +103,11 @@ public class NativeNpcLeaseTests
         await rig.ReadBind(true);
         await rig.Answer(0x81, 1, 254, 0);
         await rig.ReadBind(false);
+        Assert.Contains("ok\", 41)", Assert.Single(rig.Lua));
         await rig.Answer(0x81, 1, 255, 0);
         await rig.ReadBind(true);
+        Assert.Equal(2, rig.Lua.Count);
+        Assert.Contains("ok\", 41, true)", rig.Lua[1]);
         await rig.Answer(0x81, 1, 0, 0);
         await rig.Queue;
         Assert.Collection(rig.Lua,

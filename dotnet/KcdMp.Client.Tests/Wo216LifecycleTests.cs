@@ -109,7 +109,8 @@ public class Wo216LifecyclePipeTests
     public async Task Unanswered_main_thread_batch_does_not_hold_pure_control_or_steal_its_ack()
     {
         string name = Name(); using var server = Server(name); var accept = server.WaitForConnectionAsync();
-        await using var pipe = new CombatPipe(name); Assert.True(await pipe.EnsureConnectedAsync()); await accept;
+        await using var pipe = new CombatPipe(name) { ControlTime = new ManualFrameTime() };
+        Assert.True(await pipe.EnsureConnectedAsync()); await accept;
         pipe.SetBatchSupported(true);
         var ordinary = pipe.Wo151Async(2, []); var batch = await Read(server); Assert.Equal(0x2D, batch.Type);
         var control = pipe.Wo216LifecycleAsync(Protocol.Wo216LifecycleQuery, 0); var frame = await Read(server); uint id = Id(frame);
@@ -146,7 +147,9 @@ public class Wo216LifecyclePipeTests
     public async Task Cancel_before_physical_write_removes_the_request_without_reset_or_late_send()
     {
         string name = Name(); using var server = Server(name); var accept = server.WaitForConnectionAsync();
-        await using var pipe = new CombatPipe(name); Assert.True(await pipe.EnsureConnectedAsync()); await accept;
+        var controlTime = new ManualFrameTime();
+        await using var pipe = new CombatPipe(name) { ControlTime = controlTime };
+        Assert.True(await pipe.EnsureConnectedAsync()); await accept;
         var writer = Gate(pipe, "_writeLock"); await writer.WaitAsync();
         Task<Wo216LifecycleReply?>? abandoned = null;
         try
@@ -156,6 +159,7 @@ public class Wo216LifecyclePipeTests
             {
                 await clock.Armed;
                 abandoned = pipe.Wo216LifecycleAsync(1, 44);
+                await controlTime.Armed;
                 Assert.False(abandoned.IsCompleted);
                 clock.Expire();
                 await abandoned;
@@ -193,8 +197,14 @@ public class Wo216LifecyclePipeTests
     public async Task Own_timeout_keeps_the_connection_and_cannot_complete_a_retried_query_with_an_old_echo_id()
     {
         string name = Name(); using var server = Server(name); var accept = server.WaitForConnectionAsync();
-        await using var pipe = new CombatPipe(name); Assert.True(await pipe.EnsureConnectedAsync()); await accept;
+        var deadline = new ManualFrameTime();
+        await using var pipe = new CombatPipe(name) { ControlTime = deadline };
+        Assert.True(await pipe.EnsureConnectedAsync()); await accept;
         var old = pipe.Wo216LifecycleAsync(3, 0); uint oldId = Id(await Read(server));
+        var writer = Gate(pipe, "_writeLock");
+        Assert.True(await writer.WaitAsync(TimeSpan.FromSeconds(2)));
+        writer.Release();
+        deadline.Expire();
         Assert.Null(await old.WaitAsync(TimeSpan.FromSeconds(2))); Assert.True(pipe.IsConnected);
         var retry = pipe.Wo216LifecycleAsync(3, 0); uint nextId = Id(await Read(server)); Assert.NotEqual(oldId, nextId);
         await Reply(server, Wo163Reply, Wo216LifecycleCodecTests.Ack(oldId, generation: 1));
