@@ -36,6 +36,11 @@ function Assert-KcdTrxResults {
         throw "$Suite has missing or inconsistent test results ($summary, rows=$($results.Count))"
     }
     $executions = [System.Collections.Generic.HashSet[guid]]::new()
+    $resourceCycles = @{}
+    $resourceSummaries = [System.Collections.Generic.HashSet[string]]::new()
+    $resourceScenarios = @('mpexit', 'mpexit-receipt', 'transfer-player-a', 'transfer-player-b', 'transfer-host', 'transfer-eof',
+                          'missing-personal-save', 'cancel-rejoin-2', 'cancel-rejoin-3', 'cancel-rejoin-4', 'return-deadline',
+                          'active-guests-3', 'active-guests-4', 'host-return-2', 'host-return-3', 'host-return-4')
     foreach ($result in $results) {
         $id = [guid]::Empty
         if (-not [guid]::TryParse($result.GetAttribute('executionId'), [ref]$id) -or
@@ -45,14 +50,32 @@ function Assert-KcdTrxResults {
         if ($result.GetAttribute('outcome') -ne 'Passed') {
             throw "$Suite did not pass $($result.GetAttribute('testName')) ($($result.GetAttribute('outcome')))"
         }
-        if ($Suite -eq 'Client' -and $result.GetAttribute('testName') -eq
-            'KcdMp.Client.Tests.JoinCalendarResourceTests.Five_leaves_without_an_own_save_recover_a_missing_terminal_from_the_live_menu') {
+        if ($Suite -eq 'Client' -and $result.GetAttribute('testName').StartsWith('KcdMp.Client.Tests.JoinCalendar')) {
             $stdout = $result.SelectSingleNode('t:Output/t:StdOut', $names)
-            $samples = @($stdout.InnerText -split '\r?\n' | Where-Object {
-                $_ -match '^\s*F4-RESOURCES scenario=mpexit(?: [a-z_]+=[0-9]+->[0-9]+)+\s*$'
-            })
-            if ($samples.Count -ne 1) { throw 'The join resource test did not report one before/after sample' }
-            Write-Host $samples[0].Trim()
+            if ($stdout) {
+                foreach ($line in $stdout.InnerText -split '\r?\n') {
+                    if ($line -match '^\s*F4-RESOURCES scenario=(?<scenario>[a-z0-9-]+) cycle=(?<cycle>[0-5])(?: [a-z_]+=[0-9]+)+\s*$') {
+                        $scenario = $Matches.scenario
+                        if (-not $resourceCycles.ContainsKey($scenario)) {
+                            $resourceCycles[$scenario] = [System.Collections.Generic.HashSet[int]]::new()
+                        }
+                        if (-not $resourceCycles[$scenario].Add([int]$Matches.cycle)) { throw "Duplicate resource cycle for $scenario" }
+                    } elseif ($line -match '^\s*F4-RESOURCES scenario=(?<scenario>[a-z0-9-]+)(?: [a-z_]+=[0-9]+->[0-9]+)+\s*$') {
+                        $scenario = $Matches.scenario
+                        if (-not $resourceSummaries.Add($scenario)) { throw "Duplicate resource summary for $scenario" }
+                    } else { continue }
+                    if ($scenario -cnotin $resourceScenarios) { throw 'Unknown join resource scenario' }
+                    Write-Host $line.Trim()
+                }
+            }
+        }
+    }
+    if ($Suite -eq 'Client') {
+        foreach ($scenario in $resourceScenarios) {
+            if (-not $resourceSummaries.Contains($scenario) -or -not $resourceCycles.ContainsKey($scenario) -or
+                -not $resourceCycles[$scenario].SetEquals([int[]](0..5))) {
+                throw "Incomplete join resource checks for $scenario"
+            }
         }
     }
     Write-Host "Required suite $Suite PASS: $summary (minimum $MinimumCount)"

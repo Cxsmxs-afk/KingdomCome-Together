@@ -34,37 +34,37 @@ public sealed partial class JoinCalendarIntegrationTests
     [InlineData("A", "B")]
     [InlineData("B", "A")]
     public Task Player_cancel_retires_five_started_transfers_before_any_load_and_the_next_join_succeeds(string host, string guest) =>
-        RunAsync(host, guest, dropFirstSnapshot: false, f4: F4Probe.TransferAbort);
+        RunAsync(host, guest, dropFirstSnapshot: false, f4: F4Probe.TransferAbort, f4Output: testOutput);
 
     [Fact]
     public Task Five_leaves_without_an_own_save_use_the_exact_mpexit_receipt_and_release_the_file() =>
-        RunAsync("A", "B", dropFirstSnapshot: false, f4: F4Probe.NoOwnExit);
+        RunAsync("A", "B", dropFirstSnapshot: false, f4: F4Probe.NoOwnExit, f4Output: testOutput);
 
     [Fact]
     public Task Five_host_aborts_during_transfer_clear_the_attempt_and_the_guest_can_join_again() =>
-        RunAsync("A", "B", dropFirstSnapshot: false, f4: F4Probe.HostAbort);
+        RunAsync("A", "B", dropFirstSnapshot: false, f4: F4Probe.HostAbort, f4Output: testOutput);
 
     [Fact]
     public Task Five_missing_own_saves_refuse_a_join_then_accept_the_next_attempt_after_restoring_the_save() =>
-        RunAsync("A", "B", dropFirstSnapshot: false, f4: F4Probe.MissingOwnSave);
+        RunAsync("A", "B", dropFirstSnapshot: false, f4: F4Probe.MissingOwnSave, f4Output: testOutput);
 
     [Theory]
     [InlineData(3)]
     [InlineData(4)]
     public Task Two_active_guests_repeat_join_and_private_return_with_overlapping_departures(int players) =>
         RunAsync(players == 3 ? "A" : "B", players == 3 ? "B" : "A", dropFirstSnapshot: false,
-            extraPeers: players - 2, f4: F4Probe.ActiveGuest);
+            extraPeers: players - 2, f4: F4Probe.ActiveGuest, f4Output: testOutput);
 
     [Fact]
     public Task Five_tcp_failures_during_transfer_can_retry_on_the_same_agent_and_engine() =>
-        RunAsync("A", "B", dropFirstSnapshot: false, f4: F4Probe.TransportLost);
+        RunAsync("A", "B", dropFirstSnapshot: false, f4: F4Probe.TransportLost, f4Output: testOutput);
 
     [Theory]
     [InlineData(2)]
     [InlineData(3)]
     [InlineData(4)]
     public Task The_same_host_run_pauses_and_resumes_five_times_without_a_guest_load(int players) =>
-        RunAsync("A", "B", dropFirstSnapshot: false, extraPeers: players - 2, f4: F4Probe.HostReturn);
+        RunAsync("A", "B", dropFirstSnapshot: false, extraPeers: players - 2, f4: F4Probe.HostReturn, f4Output: testOutput);
 
     private static byte[] F4LargeHostSave(int sequence)
     {
@@ -78,29 +78,31 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private static Task TestF4LoopAsync(F4Probe probe, SaveFixture fixture, GameBridge host, GameBridge guest,
         JoinWire hostLink, JoinWire guestLink, JoinCalendarTestPipe guestPipe, JoinCalendarTestEngine hostEngine,
-        JoinCalendarTestEngine engine, CancellationToken ct, ITestOutputHelper? output) => probe switch
+        JoinCalendarTestEngine engine, string hostLabel, CancellationToken ct, ITestOutputHelper output) => probe switch
         {
-            F4Probe.TransferAbort => TestF4TransfersAsync(fixture, host, guest, hostLink, guestLink, guestPipe, engine, engine, ct),
-            F4Probe.HostAbort => TestF4TransfersAsync(fixture, host, guest, hostLink, guestLink, guestPipe, hostEngine, engine, ct),
+            F4Probe.TransferAbort => TestF4TransfersAsync(fixture, host, guest, hostLink, guestLink, guestPipe, engine, engine,
+                $"transfer-player-{hostLabel.ToLowerInvariant()}", ct, output),
+            F4Probe.HostAbort => TestF4TransfersAsync(fixture, host, guest, hostLink, guestLink, guestPipe, hostEngine, engine,
+                "transfer-host", ct, output),
             F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe =>
-                TestF4MenuExitAsync(fixture, host, guest, hostLink, guestPipe, engine, ct, output, probe == F4Probe.SupersededMenuProbe),
-            F4Probe.MissingOwnSave => TestF4MissingOwnSaveAsync(fixture, host, guest, hostLink, guestLink, engine, ct),
+                TestF4MenuExitAsync(fixture, host, guest, hostLink, engine, ct, output, probe),
+            F4Probe.MissingOwnSave => TestF4MissingOwnSaveAsync(fixture, host, guest, hostLink, guestLink, engine, ct, output),
             _ => throw new ArgumentOutOfRangeException(nameof(probe))
         };
 
     private static async Task TestF4TransfersAsync(SaveFixture fixture, GameBridge host, GameBridge guest,
         JoinWire hostLink, JoinWire guestLink, JoinCalendarTestPipe guestPipe, JoinCalendarTestEngine canceller,
-        JoinCalendarTestEngine engine, CancellationToken ct)
+        JoinCalendarTestEngine engine, string scenario, CancellationToken ct, ITestOutputHelper output)
     {
         byte[] ownBefore = SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave));
-        var before = F4Resources(guest, guestPipe);
+        using var resources = new F4ResourceCheck(scenario, guest, output);
         var cancelled = new HashSet<uint>();
         bool hostCancels = !ReferenceEquals(canceller, engine);
         var incomingAbort = hostCancels ? guestLink.Aborts : hostLink.Aborts;
         guestLink.DropIncoming = DropAfterFirstWorldChunk;
         try
         {
-            for (int i = 1; i <= 5; i++)
+            for (int i = 0; i <= 5; i++)
             {
                 engine.Emit("join_request", "");
                 await WaitAsync(() => Get<WorldReceiver?>(guest, "_joinRx")?.Next == 1,
@@ -126,10 +128,11 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
                 Assert.Equal(ownBefore, SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave)));
                 Console.WriteLine($"F4-TRANSFER canceller={(hostCancels ? "host" : "guest")} cycle={i} join=0x{receiving.JoinId:x8} staged={receiving.Received}/{receiving.Offer.Size} load=0 ready=0 staging_exists=0 own_sha256_equal=1");
+                await resources.CycleAsync(i, ct);
             }
         }
         finally { guestLink.DropIncoming = null; }
-        AssertF4Resources("transfer", before, guest, guestPipe);
+        resources.AssertBudget();
 
         engine.Emit("join_request", "");
         await engine.WaitForJoinLoadAsync(ct);
@@ -150,16 +153,17 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private static async Task TestF4TransportLossAsync(SaveFixture fixture, int port, string guestName,
         GameBridge host, GameBridge guest, JoinWire hostLink, ReplayPeer firstPeer, JoinWire firstLink, Task firstRead,
-        JoinCalendarTestEngine game, CancellationToken ct)
+        JoinCalendarTestEngine game, CancellationToken ct, ITestOutputHelper output)
     {
         byte[] ownHash = SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave));
         ReplayPeer peer = firstPeer;
         JoinWire link = firstLink;
         Task read = firstRead;
         var abandoned = new HashSet<uint>();
+        using var resources = new F4ResourceCheck("transfer-eof", guest, output);
         try
         {
-            for (int i = 1; i <= 5; i++)
+            for (int i = 0; i <= 5; i++)
             {
                 link.DropIncoming = DropAfterFirstWorldChunk;
                 game.Emit("join_request", "");
@@ -202,7 +206,9 @@ public sealed partial class JoinCalendarIntegrationTests
                 await WaitAsync(() => Get<bool>(guest, "_combatRoleApplyComplete") && Get<bool>(guest, "_hostModeKnown"),
                     "the new TCP connection to receive the real relay role and host mode", ct);
                 Assert.False(Get<bool>(guest, "_isDamageAuthority"));
+                await resources.CycleAsync(i, ct);
             }
+            resources.AssertBudget();
 
             game.Emit("join_request", "");
             await game.WaitForJoinLoadAsync(ct);
@@ -224,7 +230,8 @@ public sealed partial class JoinCalendarIntegrationTests
     }
 
     private static async Task TestF4HostReturnsAsync(SaveFixture fixture, int port, string hostName, GameBridge host, GameBridge guest,
-        ReplayPeer hostPeer, Task hostRead, byte guestId, JoinCalendarTestPipe pipe, JoinCalendarTestEngine game, CancellationToken ct)
+        ReplayPeer hostPeer, Task hostRead, byte guestId, JoinCalendarTestPipe pipe, JoinCalendarTestEngine game, int players,
+        CancellationToken ct, ITestOutputHelper output)
     {
         byte[] original = SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave));
         uint world = Get<Wo206Epochs>(guest, "_w206").World;
@@ -236,7 +243,8 @@ public sealed partial class JoinCalendarIntegrationTests
         }, "the already joined world to settle", ct);
         hostPeer.FinishSending();
         await hostRead.WaitAsync(ct);
-        for (int i = 1; i <= 5; i++)
+        using var resources = new F4ResourceCheck($"host-return-{players}", guest, output);
+        for (int i = 0; i <= 5; i++)
         {
             await WaitAsync(() => guest.HostAbsentPause && Property<bool>(guest, "LinkHeld") && !Get<bool>(guest, "_hostModeKnown"),
                 "the real host socket loss to pause the same guest world", ct);
@@ -252,17 +260,22 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Equal(original, SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave)));
                 Console.WriteLine($"F4-HOST-RETURN cycle={i} world={world} guest_join_loads=1 guest_own_loads=0 own_sha256_equal=1");
             });
+            await WaitAsync(() => guest.HostAbsentPause && Property<bool>(guest, "LinkHeld") && !Get<bool>(guest, "_hostModeKnown"),
+                "the returning connection to finish closing before sampling", ct);
+            await resources.CycleAsync(i, ct);
         }
+        resources.AssertBudget();
     }
 
     private static async Task TestF4MissingOwnSaveAsync(SaveFixture fixture, GameBridge host, GameBridge guest,
-        JoinWire hostLink, JoinWire guestLink, JoinCalendarTestEngine engine, CancellationToken ct)
+        JoinWire hostLink, JoinWire guestLink, JoinCalendarTestEngine engine, CancellationToken ct, ITestOutputHelper output)
     {
         string own = fixture.GuestOwnSave;
         string removed = Path.Combine(fixture.Root, "fixture-offline-save");
         byte[] hash = SHA256.HashData(File.ReadAllBytes(own));
         Set(guest, "_w184SaveOnLeave", false);
-        for (int i = 1; i <= 5; i++)
+        using var resources = new F4ResourceCheck("missing-personal-save", guest, output);
+        for (int i = 1; i <= 6; i++)
         {
             File.Move(own, removed);
             try
@@ -291,12 +304,13 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.Equal(hash, SHA256.HashData(File.ReadAllBytes(own)));
             Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
             Console.WriteLine($"F4-MISSING-SAVE cycle={i} no_load_on_failure=1 rejoin_loads={engine.JoinLoadsIssued} ready={guestLink.ReadySent.Count} own_sha256_equal=1");
+            await resources.CycleAsync(i - 1, ct);
         }
+        resources.AssertBudget();
     }
 
     private static async Task TestF4MenuExitAsync(SaveFixture fixture, GameBridge host, GameBridge guest,
-        JoinWire hostLink, JoinCalendarTestPipe guestPipe, JoinCalendarTestEngine engine, CancellationToken ct,
-        ITestOutputHelper? output, bool supersedeLoad)
+        JoinWire hostLink, JoinCalendarTestEngine engine, CancellationToken ct, ITestOutputHelper output, F4Probe probe)
     {
         string ownSave = fixture.GuestOwnSave;
         string savedOutsideProfile = Path.Combine(fixture.Root, "own-file-test-archive");
@@ -304,7 +318,8 @@ public sealed partial class JoinCalendarIntegrationTests
         Set(guest, "_w184SaveOnLeave", false);
         engine.DeferExitFileRead = true;
         var exits = new HashSet<string>();
-        F4ResourceSample before = default;
+        bool supersedeLoad = probe == F4Probe.SupersededMenuProbe;
+        using var resources = supersedeLoad ? null : new F4ResourceCheck(probe == F4Probe.NoOwnExit ? "mpexit-receipt" : "mpexit", guest, output);
         int lastCycle = supersedeLoad ? 0 : 5;
         // Load and return once before measuring so the initial runtime and
         // fixture setup is outside the five comparable cycles.
@@ -316,6 +331,14 @@ public sealed partial class JoinCalendarIntegrationTests
             await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && hostLink.ReadyReceived.Count == i + 1 && Get<object?>(host, "_hostJoin") is null,
                 "the target join to send its confirmed Ready before leaving", ct);
             await engine.WaitForJoinedNotificationAsync(ct);
+            if (i == 0)
+            {
+                Assert.Contains("\"State\":\"in\"", guest.JoinStatusJson());
+                Set(guest, "_joinUiExpiresAtMs", Environment.TickCount64 - 1);
+                Assert.Contains("\"State\":\"idle\"", guest.JoinStatusJson());
+                Assert.True(Get<bool>(guest, "_joinedWorld"));
+                Assert.NotNull(Get<object?>(guest, "_joinedWorldRefresh"));
+            }
             Assert.Equal(ownBefore, SHA256.HashData(File.ReadAllBytes(ownSave)));
             File.Move(ownSave, savedOutsideProfile);
             try
@@ -330,7 +353,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 byte[] exitHash = SHA256.HashData(File.ReadAllBytes(exit));
                 guest.Wo125Sweep("F4 unconfirmed exit");
                 Assert.Equal(exitHash, SHA256.HashData(File.ReadAllBytes(exit)));
-                if (output is null) engine.CompleteExitLoad(exit);
+                if (probe == F4Probe.NoOwnExit) engine.CompleteExitLoad(exit);
                 else if (supersedeLoad) await CheckF4SupersededMenuAsync(guest, engine, exit, output);
                 else await ConfirmF4ExitFromMenuAsync(guest, engine, exit, i, ct, output);
                 await WaitAsync(() => !Get<bool>(guest, "_leaveInProgress") && !File.Exists(exit) &&
@@ -339,6 +362,7 @@ public sealed partial class JoinCalendarIntegrationTests
                     "confirmed mpexit, file release and save unlock", ct);
                 Assert.False(Property<bool>(guest, "OwnLoadExpected"));
                 Assert.False(Get<bool>(guest, "_joinedWorld"));
+                Assert.Null(Get<object?>(guest, "_joinedWorldRefresh"));
                 Assert.False((bool)Call(guest, "Wo122WantLock")!);
                 Assert.Null(Get<object?>(guest, "_wo125ActiveExitPath"));
                 Assert.Null(Get<object?>(guest, "_pinnedHomeLoad"));
@@ -348,12 +372,12 @@ public sealed partial class JoinCalendarIntegrationTests
                 Console.WriteLine($"F4-MPEXIT cycle={i} warmup={(i == 0 ? 1 : 0)} join_loads={engine.JoinLoadsIssued} own_loads=0 terminal=menu files=0 own_sha256_equal=1");
             }
             finally { File.Move(savedOutsideProfile, ownSave); }
-            if (i == 0 && !supersedeLoad) before = F4Resources(guest, guestPipe, drainFinalizers: output is not null);
+            if (resources is not null) await resources.CycleAsync(i, ct);
         }
         Assert.Equal(lastCycle + 1, engine.JoinLoadsIssued);
         Assert.Equal(lastCycle + 1, exits.Count);
         Assert.Equal(ownBefore, SHA256.HashData(File.ReadAllBytes(ownSave)));
-        if (!supersedeLoad) AssertF4Resources("mpexit", before, guest, guestPipe, output);
+        resources?.AssertBudget();
     }
 
     private static async Task CheckF4SupersededMenuAsync(GameBridge guest, JoinCalendarTestEngine engine, string exit, ITestOutputHelper output)
@@ -406,7 +430,8 @@ public sealed partial class JoinCalendarIntegrationTests
     }
 
     private static async Task TestF4ActiveGuestsAsync(SaveFixture fixture, int port, GameBridge host, GameBridge first,
-        JoinWire hostLink, JoinWire firstLink, JoinCalendarTestEngine firstEngine, ReplayPeer secondPeer, CancellationToken ct)
+        JoinWire hostLink, JoinWire firstLink, JoinCalendarTestEngine firstEngine, ReplayPeer secondPeer, int players,
+        CancellationToken ct, ITestOutputHelper output)
     {
         string secondSave = Path.Combine(fixture.GuestSaves, "playline1", "save002.whs");
         var (_, source) = WhsSaveTests.Pair();
@@ -439,7 +464,8 @@ public sealed partial class JoinCalendarIntegrationTests
             Set(second, "_w184SaveOnLeave", false);
             firstEngine.DeferOwnFileRead = true;
             secondEngine.DeferOwnFileRead = true;
-            for (int cycle = 1; cycle <= 5; cycle++)
+            using var resources = new F4ResourceCheck($"active-guests-{players}", first, output);
+            for (int cycle = 1; cycle <= 6; cycle++)
             {
                 async Task JoinAsync(GameBridge guest, JoinWire link, JoinCalendarTestEngine engine, string selected)
                 {
@@ -473,7 +499,9 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
                 Assert.Equal(2 * cycle, hostLink.ReadyReceived.Distinct().Count());
                 Console.WriteLine($"F4-ACTIVE-GUESTS cycle={cycle} targeted_ready={hostLink.ReadyReceived.Count} overlapping_returns=2 own_sha256_equal=2");
+                await resources.CycleAsync(cycle - 1, ct);
             }
+            resources.AssertBudget();
         }
         finally
         {
@@ -490,48 +518,86 @@ public sealed partial class JoinCalendarIntegrationTests
     private readonly record struct F4ResourceSample(int Threads, int Handles, int RawThreads, int RawHandles,
         int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned);
 
-    private static F4ResourceSample F4Resources(GameBridge guest, JoinCalendarTestPipe pipe, bool drainFinalizers = false)
+    private static F4ResourceSample F4Resources(GameBridge guest)
     {
         using var process = Process.GetCurrentProcess();
         int rawThreads = process.Threads.Count;
         int rawHandles = process.HandleCount;
-        if (drainFinalizers)
-        {
-            // Match both sampling boundaries in the isolated testhost. The
-            // before/after counters still include live and retained handles.
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
-            process.Refresh();
-        }
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        process.Refresh();
         var retained = Get<object>(guest, "_retainedJoinWorlds");
         int leases = (int)retained.GetType().GetProperty("Count")!.GetValue(retained)!;
         leases += Get<object?>(guest, "_joinRx") is null ? 0 : 1;
         leases += Get<object?>(guest, "_pinnedHomeLoad") is null ? 0 : 1;
         leases += Get<object?>(guest, "_wo125ActiveExitPath") is null ? 0 : 1;
         int timers = Get<bool>(guest, "_rejoinPending") ? 1 : 0;
+        var pipe = Get<CombatPipe>(guest, "_combat");
         return new(process.Threads.Count, process.HandleCount, rawThreads, rawHandles, ThreadPool.ThreadCount, Timer.ActiveCount,
-            new(pipe.Pipe.IsConnected ? 1 : 0, pipe.Pipe.EdgeConnectionRevision, leases, timers));
+            new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers));
     }
 
-    private static void AssertF4Resources(string scenario, F4ResourceSample before,
-        GameBridge guest, JoinCalendarTestPipe pipe, ITestOutputHelper? output = null)
+    private sealed class F4ResourceCheck : IDisposable
     {
-        var after = F4Resources(guest, pipe, drainFinalizers: output is not null);
-        string summary = $"F4-RESOURCES scenario={scenario} threads={before.Threads}->{after.Threads} handles={before.Handles}->{after.Handles} " +
-            $"raw_threads={before.RawThreads}->{after.RawThreads} raw_handles={before.RawHandles}->{after.RawHandles} " +
-            $"thread_pool_workers={before.ThreadPoolWorkers}->{after.ThreadPoolWorkers} runtime_timers={before.RuntimeTimers}->{after.RuntimeTimers} " +
-            $"guest_pipe={before.Owned.PipeConnections}->{after.Owned.PipeConnections} tracked_leases={before.Owned.Reservations}->{after.Owned.Reservations} " +
-            $"pipe_revision={before.Owned.PipeRevision}->{after.Owned.PipeRevision} rejoin_timer={before.Owned.Timers}->{after.Owned.Timers}";
-        if (output is null) Console.WriteLine(summary);
-        else
+        private readonly string _scenario;
+        private readonly GameBridge _guest;
+        private readonly ITestOutputHelper _output;
+        private readonly int _workerMin, _ioMin, _warmWorkers;
+        private int _nextCycle;
+        private F4ResourceSample _before, _after;
+
+        public F4ResourceCheck(string scenario, GameBridge guest, ITestOutputHelper output)
         {
-            output.WriteLine(summary);
-            // Allow CLR worker and testhost bookkeeping to vary slightly after
-            // warmup. A resource retained in each of the five cycles exceeds the budget.
+            _scenario = scenario;
+            _guest = guest;
+            _output = output;
+            ThreadPool.GetMinThreads(out _workerMin, out _ioMin);
+            _warmWorkers = Math.Max(_workerMin, 16);
+            Assert.True(ThreadPool.SetMinThreads(_warmWorkers, _ioMin));
+        }
+
+        public async Task CycleAsync(int cycle, CancellationToken ct)
+        {
+            Assert.Equal(_nextCycle++, cycle);
+            if (cycle == 0)
+            {
+                // Start the common worker floor once, ahead of both samples.
+                using var release = new ManualResetEventSlim();
+                using var startup = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                startup.CancelAfter(TimeSpan.FromSeconds(10));
+                int waiting = _warmWorkers;
+                await Task.WhenAll(Enumerable.Range(0, _warmWorkers).Select(_ => Task.Run(() =>
+                {
+                    if (Interlocked.Decrement(ref waiting) == 0) release.Set();
+                    release.Wait(startup.Token);
+                })));
+            }
+            var sample = F4Resources(_guest);
+            if (cycle == 0) _before = sample;
+            _after = sample;
+            _output.WriteLine($"F4-RESOURCES scenario={_scenario} cycle={cycle} threads={sample.Threads} handles={sample.Handles} " +
+                $"raw_threads={sample.RawThreads} raw_handles={sample.RawHandles} thread_pool_workers={sample.ThreadPoolWorkers} " +
+                $"runtime_timers={sample.RuntimeTimers} guest_pipe={sample.Owned.PipeConnections} tracked_leases={sample.Owned.Reservations} " +
+                $"pipe_revision={sample.Owned.PipeRevision} rejoin_timer={sample.Owned.Timers}");
+        }
+
+        public void AssertBudget()
+        {
+            Assert.Equal(6, _nextCycle);
+            var before = _before;
+            var after = _after;
+            _output.WriteLine($"F4-RESOURCES scenario={_scenario} threads={before.Threads}->{after.Threads} handles={before.Handles}->{after.Handles} " +
+                $"raw_threads={before.RawThreads}->{after.RawThreads} raw_handles={before.RawHandles}->{after.RawHandles} " +
+                $"thread_pool_workers={before.ThreadPoolWorkers}->{after.ThreadPoolWorkers} runtime_timers={before.RuntimeTimers}->{after.RuntimeTimers} " +
+                $"guest_pipe={before.Owned.PipeConnections}->{after.Owned.PipeConnections} tracked_leases={before.Owned.Reservations}->{after.Owned.Reservations} " +
+                $"pipe_revision={before.Owned.PipeRevision}->{after.Owned.PipeRevision} rejoin_timer={before.Owned.Timers}->{after.Owned.Timers}");
             Assert.InRange(after.Threads, 0, before.Threads + 4);
             Assert.InRange(after.Handles, 0, before.Handles + 4);
+            Assert.InRange(after.RuntimeTimers, 0, before.RuntimeTimers + 1);
+            Assert.Equal(before.Owned, after.Owned);
         }
-        Assert.Equal(before.Owned, after.Owned);
+
+        public void Dispose() => Assert.True(ThreadPool.SetMinThreads(_workerMin, _ioMin));
     }
 }

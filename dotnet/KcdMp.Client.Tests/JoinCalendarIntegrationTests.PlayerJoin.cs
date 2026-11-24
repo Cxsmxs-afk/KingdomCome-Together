@@ -5,10 +5,11 @@ public sealed partial class JoinCalendarIntegrationTests
 {
     [Fact]
     public Task Five_missing_return_terminals_use_one_probe_and_keep_unverified_saves_locked() =>
-        RunAsync("A", "B", dropFirstSnapshot: false, JoinProbe.ReturnDeadlineLoop);
+        RunAsync("A", "B", dropFirstSnapshot: false, JoinProbe.ReturnDeadlineLoop, f4Output: testOutput);
 
     private static async Task TestPlayerJoinLoopAsync(SaveFixture fixture, GameBridge host, GameBridge guest,
-        JoinWire hostLink, JoinWire guestLink, JoinCalendarTestEngine engine, CancellationToken ct, bool returnDeadline = false)
+        JoinWire hostLink, JoinWire guestLink, JoinCalendarTestEngine engine, int players, CancellationToken ct,
+        Xunit.Abstractions.ITestOutputHelper output, bool returnDeadline)
     {
         byte[] own = System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave));
         Set(guest, "_w184SaveOnLeave", false);
@@ -19,7 +20,8 @@ public sealed partial class JoinCalendarIntegrationTests
         // the engine read. A faster notice must not merge these two edges.
         engine.DeferOwnFileRead = true;
         engine.Emit("wo124_where", "world");
-        for (int cycle = 1; cycle <= 5; cycle++)
+        using var resources = new F4ResourceCheck(returnDeadline ? "return-deadline" : $"cancel-rejoin-{players}", guest, output);
+        for (int cycle = 1; cycle <= 6; cycle++)
         {
             int readyBefore = guestLink.ReadySent.Count;
             if (!returnDeadline)
@@ -74,7 +76,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 int queries = engine.WhereQueries;
                 if (cycle != 2) engine.ReadOwnSaveWithoutTerminal();
                 else engine.Emit("wo124_where", "world"); // still the shared world, with no read of the private file
-                if (cycle == 4)
+                if (cycle is 4 or 6)
                     engine.LastLoadedPathOverride = Path.Combine(fixture.GuestSaves, "playline2", Path.GetFileName(fixture.GuestOwnSave));
                 Set(guest, "_leaveSinceUtc", DateTime.UtcNow.AddMinutes(-6));
                 await InvokeAsync(guest, "Wo124JoinerTickAsync");
@@ -108,7 +110,9 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.Empty(Directory.EnumerateFiles(WorldReceiver.DefaultStagingDir(), "world-*"));
             Assert.Equal(own, System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave)));
             Console.WriteLine($"W8-PLAYER-REJOIN cycle={cycle} join_loads={engine.JoinLoadsIssued} own_loads={engine.OwnLoadsIssued} pending=0 temporary_saves=0 own_save_unchanged=1");
+            await resources.CycleAsync(cycle - 1, ct);
         }
+        resources.AssertBudget();
     }
 
     private static async Task<Task<bool>> WaitForPlayerHomeDispatchAsync(GameBridge guest, JoinCalendarTestEngine engine,

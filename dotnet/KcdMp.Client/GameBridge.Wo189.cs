@@ -294,15 +294,12 @@ public partial class GameBridge
         Console.WriteLine($"WO189-PROFILE host '{op}{name}' on the joiner: {res}");
     }
 
-    /// <summary>B3: the join's Ready -- the host's active quest profiles asked for (a few seconds after, the world settled).</summary>
-    private void Wo189OnJoined()
+    /// <summary>B3: ask for the host's active quest profiles after the joined world has settled.</summary>
+    private async Task Wo189AskJoinedProfilesAsync(JoinedWorldRefresh refresh)
     {
         if (!W137Joiner || !_w189Mirror) return;
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(5_000);
-            if (_joinedWorld) await W164SendAsync(Protocol.JoinTargetHost, Protocol.W164Profile, "?");
-        });
+        try { await W164SendAsync(Protocol.JoinTargetHost, Protocol.W164Profile, "?", refresh.Lifetime, refresh.Link); }
+        catch (OperationCanceledException) when (refresh.Lifetime.IsCancellationRequested || !ReferenceEquals(_wo122Stream, refresh.Link)) { }
     }
 
     // ================================================================ C + D: cutscenes and scene positioning

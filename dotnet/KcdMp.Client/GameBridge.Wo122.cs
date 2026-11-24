@@ -288,18 +288,19 @@ public partial class GameBridge
             for (int attempt = 1; attempt <= 12; attempt++)
             {
                 await ExecLuaAsync($"if KCD2MP_HostWorldSave then KCD2MP_HostWorldSave(\"{why}\", {attempt}) end");
-                var done = await Task.WhenAny(tcs.Task, Task.Delay(5000));
-                if (done == tcs.Task)
+                ObservedSave s;
+                try { s = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5)); }
+                catch (TimeoutException)
                 {
-                    var s = tcs.Task.Result;
-                    double ms = (s.AtUtc - t0).TotalMilliseconds;
-                    Console.WriteLine(FormattableString.Invariant(
-                        $"MP-WORLDSAVE done why={why} file={s.Display} attempts={attempt} request_to_verified_ms={ms:F0} bytes={s.Bytes} md5={Convert.ToHexString(s.Md5).ToLowerInvariant()} verify=ok"));
-                    _ = ExecLuaAsync(FormattableString.Invariant(
-                        $"if KCD2MP_WorldSaveDone then KCD2MP_WorldSaveDone(true, \"{s.Display}\", \"{why}\", {attempt}, {ms:F0}, \"ok\") end"));
-                    return s;
+                    Console.WriteLine($"MP-WORLDSAVE why={why} attempt={attempt}: no verified file 5 s after the request -- asking again (the engine may be unable to save right now)");
+                    continue;
                 }
-                Console.WriteLine($"MP-WORLDSAVE why={why} attempt={attempt}: no verified file 5 s after the request -- asking again (the engine may be unable to save right now)");
+                double ms = (s.AtUtc - t0).TotalMilliseconds;
+                Console.WriteLine(FormattableString.Invariant(
+                    $"MP-WORLDSAVE done why={why} file={s.Display} attempts={attempt} request_to_verified_ms={ms:F0} bytes={s.Bytes} md5={Convert.ToHexString(s.Md5).ToLowerInvariant()} verify=ok"));
+                _ = ExecLuaAsync(FormattableString.Invariant(
+                    $"if KCD2MP_WorldSaveDone then KCD2MP_WorldSaveDone(true, \"{s.Display}\", \"{why}\", {attempt}, {ms:F0}, \"ok\") end"));
+                return s;
             }
             Console.WriteLine($"MP-WORLDSAVE why={why} gave up after 12 requests over 60 s");
             _ = ExecLuaAsync($"if KCD2MP_WorldSaveDone then KCD2MP_WorldSaveDone(false, \"\", \"{why}\", 12, 60000, \"no file\") end");

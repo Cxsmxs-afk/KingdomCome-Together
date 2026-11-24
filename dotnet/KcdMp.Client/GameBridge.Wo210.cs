@@ -20,6 +20,9 @@ public partial class GameBridge
     private long _w210LeaveReleases, _w210AskReleases, _w210AsksPolled, _w210AnimAsksOut, _w210AnimAsksIn, _w210AnimAskBad;
     private volatile uint _w210DllEff = uint.MaxValue;
     private long _w210OppWithRow;   // D.4: the opponents read right behind an NPC's attack row
+    private sealed record JoinedWorldRefresh(Stream Link, CancellationToken Lifetime, ulong Generation,
+        long StartedAtMs, string Reason, bool Animations, bool Profiles);
+    private JoinedWorldRefresh? _joinedWorldRefresh;
 
     /// <summary>A WO-210 switch: on unless the mod said off (a test twin's KCDMP_TEST_W210_OFF=name,name turns it off from the start).</summary>
     private bool W210(string name) =>
@@ -51,6 +54,7 @@ public partial class GameBridge
         if (n % 8 == 6) _ = Wo210PushConfigAsync();
         if (n % 120 == 9 && (W137Host || W137Joiner)) _ = Wo210NativeStatusAsync();
         if (W137Joiner && n % 4 == 1) _ = Wo210AsksTickAsync();   // 1 Hz: the joiner's pipe serves about one request a frame (the copies' samples too)
+        Wo210RefreshJoinedWorldIfDue();
     }
 
     // ---------------------------------------------------------------- A: the copy's own posture, released when its host NPC left it
@@ -125,18 +129,45 @@ public partial class GameBridge
 
     /// <summary>The joiner: ask the host for these bodies' state again (an empty list: every body), after a time skip or a load, or for a
     /// posture the stream has not confirmed.</summary>
-    private async Task Wo210AskAnimAsync(IReadOnlyList<string> names, string why)
+    private async Task Wo210AskAnimAsync(IReadOnlyList<string> names, string why, JoinedWorldRefresh? refresh = null)
     {
         if (!W137Joiner || !W210("copy_state_always")) return;
         byte[]? body = Wo210Rules.AnimAskBody(names);
         if (body is null) return;
         try
         {
-            await WriteJoinAsync(Protocol.BuildJoinUp(Protocol.NpcAnimAskUp, 0, 0, body));
+            byte[] packet = Protocol.BuildJoinUp(Protocol.NpcAnimAskUp, 0, 0, body);
+            if (refresh is null) await WriteJoinAsync(packet);
+            else await WritePacketAsync(refresh.Link, packet, refresh.Lifetime);
             long k = Interlocked.Increment(ref _w210AnimAsksOut);
             if (k <= 40 || k % 25 == 0) Console.WriteLine($"WO210-STATE ask npc-anim why={why} bodies={(names.Count == 0 ? "all" : string.Join(',', names))} [n={k}]");
         }
         catch (Exception ex) { Console.WriteLine($"MP-W210 npc-anim ask not sent: {ex.Message}"); }
+    }
+
+    private void ScheduleJoinedWorldRefresh(string reason, bool profiles = false)
+    {
+        if (_wo122Stream is Stream link)
+            Volatile.Write(ref _joinedWorldRefresh, new(link, _wo122Ct, _worldLoad.Current.Generation,
+                Environment.TickCount64, reason, Animations: true, Profiles: profiles && W137Joiner && _w189Mirror));
+    }
+
+    private Task Wo210RefreshAfterReconnectAsync()
+    {
+        ScheduleJoinedWorldRefresh("reconnect", profiles: true);
+        return Wo210AskAnimAsync([], "reconnect");
+    }
+
+    private void Wo210RefreshJoinedWorldIfDue()
+    {
+        var pending = Volatile.Read(ref _joinedWorldRefresh);
+        if (pending is null || Environment.TickCount64 - pending.StartedAtMs < (pending.Animations ? 4000 : 5000)) return;
+        bool current = W137Joiner && !LinkHeld && !_leaveInProgress && ReferenceEquals(_wo122Stream, pending.Link) &&
+            _worldLoad.Current.Generation == pending.Generation;
+        var next = current && pending.Animations && pending.Profiles ? pending with { Animations = false } : null;
+        if (!ReferenceEquals(Interlocked.CompareExchange(ref _joinedWorldRefresh, next, pending), pending) || !current) return;
+        if (pending.Animations) _ = Wo210AskAnimAsync([], pending.Reason + "+4s", pending);
+        else _ = Wo189AskJoinedProfilesAsync(pending);
     }
 
     /// <summary>A.4: after a time skip, a load or a join -- the host's whole-body states asked afresh (every body), twice: once now and once

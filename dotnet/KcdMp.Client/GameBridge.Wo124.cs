@@ -70,9 +70,14 @@ public partial class GameBridge
     {
         if (_joinedWorld == on) return;
         _joinedWorld = on;
-        if (!on) ReleaseJoinedCharacter();
-        if (!on) _ = Wo134InvalidateLedgerAsync("left-host-world");
-        if (!on) _ = ResetHostCalendarAsync("left-host-world");
+        if (!on)
+        {
+            Wo211StopHoldClock(Interlocked.Read(ref _w211HoldSerial));
+            Volatile.Write(ref _joinedWorldRefresh, null);
+            ReleaseJoinedCharacter();
+            _ = Wo134InvalidateLedgerAsync("left-host-world");
+            _ = ResetHostCalendarAsync("left-host-world");
+        }
         Wo122EnsureWatcher();
     }
 
@@ -1205,10 +1210,11 @@ public partial class GameBridge
             {
                 j.Phase = "in";
                 _joinReceivedId = 0;
-                SetJoinUi("in", "In your host's world.");
+                SetJoinUi("in", "In your host's world.", showForMs: 10_000);
                 completed = _retainedJoinWorlds.End(joined: true, cancelled: false);
                 _jj = null;
                 LoadSequenceOnJoinReady();
+                ScheduleJoinedWorldRefresh("join", profiles: true);
             }
         }
         if (completed is null)
@@ -1221,13 +1227,12 @@ public partial class GameBridge
             Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, j.WorldSavedSeq, j.HostWorldEpoch);
             if (j.Character?.Intent is { } intent) Interlocked.CompareExchange(ref _firstCharacter, null, intent);
         }
-        _ = Wo210AfterSkipAsync("join");
+        _ = Wo210AskAnimAsync([], "join");
         await CleanupRetainedJoinWorldsAsync(completed, "join=in");
         T3AfterJoinedWorldCleanup();
         if (_wo122Stream is Stream markerStream) _ = P5AnnounceMarkersAsync(markerStream, _wo122Ct);
         try { await ExecLuaAsync("if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"Co-op: you are in your host's world.\") end"); }
         catch (Exception ex) { Console.WriteLine($"MP-JOIN joiner: joined notification failed: {ex.Message}"); }
-        _ = Task.Delay(10000).ContinueWith(_ => { if (_joinUiState == "in") SetJoinUi("idle", ""); });
 
         Task FailReadyIfCurrentAsync() =>
             ReferenceEquals(_jj, j) && j.Phase == "post-load" && !j.Abandoned.Task.IsCompleted

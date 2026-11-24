@@ -7,7 +7,10 @@ public partial class GameBridge
 {
     private sealed record ReconnectHold(long Serial, WorldReconnectAttempt Attempt, PresentationSession? OldLink, bool NeedsBaseline, bool HostAbsent);
     private sealed record ReconnectReload(ReconnectHold Hold, WorldSyncScope Target);
-    private sealed record ReconnectHost(long Serial, WorldReconnectAttempt Attempt, bool NeedsBaseline);
+    private sealed record ReconnectHost(long Serial, WorldReconnectAttempt Attempt, bool NeedsBaseline)
+    {
+        public TaskCompletionSource Finished { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
     private readonly object _worldReconnectGate = new();
     private readonly Guid _worldReconnectInstance = Guid.NewGuid();
     private WorldReconnectFacts _worldReconnectFacts = new();
@@ -136,7 +139,7 @@ public partial class GameBridge
                     WorldReconnectFinish(pending, "same-world", elapsed, same: true, success: true);
                     Interlocked.Increment(ref _w211ResumedInPlace);
                     _ = ExecLuaAsync("KCD2MP_ShowNativeToast(\"Reconnected to your host.\")");
-                    await Wo210AfterSkipAsync("reconnect");
+                    await Wo210RefreshAfterReconnectAsync();
                 }
                 else if (pending.HostAbsent)
                 {
@@ -281,9 +284,9 @@ public partial class GameBridge
 
     private async Task WorldReconnectHostDeadlineAsync(ReconnectHost pending, CancellationToken lifetime)
     {
-        try { await Task.Delay(WorldReconnectAttempt.WindowMs + 1, lifetime); }
+        try { await pending.Finished.Task.WaitAsync(TimeSpan.FromMilliseconds(WorldReconnectAttempt.WindowMs + 1), lifetime); }
+        catch (TimeoutException) { WorldReconnectHostFinish(pending, success: false); }
         catch (OperationCanceledException) { return; }
-        WorldReconnectHostFinish(pending, success: false);
     }
 
     private void WorldReconnectHostRoleConfirmed()
@@ -327,6 +330,7 @@ public partial class GameBridge
         {
             if (!ReferenceEquals(_worldReconnectHost, pending)) return;
             _worldReconnectHost = null;
+            pending.Finished.TrySetResult();
         }
         if (!WorldRecoveryEnabled) return;
         var scope = pending.Attempt.Scope;

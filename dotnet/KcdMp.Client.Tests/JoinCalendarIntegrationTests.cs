@@ -15,7 +15,7 @@ namespace KcdMp.Client.Tests;
 public sealed class JoinCalendarIntegrationCollection { }
 
 [Collection("Join calendar integration")]
-public sealed partial class JoinCalendarIntegrationTests
+public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testOutput)
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
     private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts, ChangeCharacter, LocalFresh, CompatibleRestore, PlayerJoinLoop, ReturnDeadlineLoop }
@@ -26,7 +26,7 @@ public sealed partial class JoinCalendarIntegrationTests
     [InlineData(4)]
     public Task JoinCancelRejoinLoop(int players) =>
         RunAsync(players == 3 ? "B" : "A", players == 3 ? "A" : "B", dropFirstSnapshot: false,
-            JoinProbe.PlayerJoinLoop, extraPeers: players - 2);
+            JoinProbe.PlayerJoinLoop, extraPeers: players - 2, f4Output: testOutput);
 
     [Theory]
     [InlineData(false)]
@@ -239,17 +239,21 @@ public sealed partial class JoinCalendarIntegrationTests
             if (f4 is { } loop && loop != F4Probe.HostReturn)
             {
                 if (loop == F4Probe.ActiveGuest)
-                    await TestF4ActiveGuestsAsync(fixture, relay.Port, host, guest, hostLink, guestLink, guestGame, observerC!, ct);
+                    await TestF4ActiveGuestsAsync(fixture, relay.Port, host, guest, hostLink, guestLink, guestGame,
+                        observerC!, extraPeers + 2, ct, f4Output!);
                 else if (loop == F4Probe.TransportLost)
-                    await TestF4TransportLossAsync(fixture, relay.Port, guestName, host, guest, hostLink, guestPeer, guestLink, guestRead, guestGame, ct);
+                    await TestF4TransportLossAsync(fixture, relay.Port, guestName, host, guest, hostLink, guestPeer, guestLink,
+                        guestRead, guestGame, ct, f4Output!);
                 else
-                    await TestF4LoopAsync(loop, fixture, host, guest, hostLink, guestLink, guestPipe, hostGame, guestGame, ct, f4Output);
+                    await TestF4LoopAsync(loop, fixture, host, guest, hostLink, guestLink, guestPipe, hostGame, guestGame,
+                        hostName, ct, f4Output!);
                 return;
             }
 
             if (probe is JoinProbe.PlayerJoinLoop or JoinProbe.ReturnDeadlineLoop)
             {
-                await TestPlayerJoinLoopAsync(fixture, host, guest, hostLink, guestLink, guestGame, ct, probe == JoinProbe.ReturnDeadlineLoop);
+                await TestPlayerJoinLoopAsync(fixture, host, guest, hostLink, guestLink, guestGame, extraPeers + 2,
+                    ct, f4Output!, probe == JoinProbe.ReturnDeadlineLoop);
                 return;
             }
             if (probe == JoinProbe.RepeatAborts)
@@ -379,7 +383,8 @@ public sealed partial class JoinCalendarIntegrationTests
             if (homeProbe.HasValue) Set(guest, "_w184SaveOnLeave", false);
             if (f4 == F4Probe.HostReturn)
             {
-                await TestF4HostReturnsAsync(fixture, relay.Port, hostName, host, guest, hostPeer, hostRead, guestPeer.Id, guestPipe, guestGame, ct);
+                await TestF4HostReturnsAsync(fixture, relay.Port, hostName, host, guest, hostPeer, hostRead, guestPeer.Id,
+                    guestPipe, guestGame, extraPeers + 2, ct, f4Output!);
                 return;
             }
             if (relayEofWorldRecovery is bool worldRecovery)

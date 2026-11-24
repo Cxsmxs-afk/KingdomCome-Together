@@ -91,6 +91,7 @@ public partial class GameBridge
     private volatile string _joinUiMessage = "";
     private volatile string _joinUiReason = "";   // WO-154 4.4: why there is no save to bring (Wo154Rules.NoSaveReason)
     private volatile bool _joinUiCanFresh;        // WO-154 4.4: a new character can join (POST /join-choice?c=fresh)
+    private long _joinUiExpiresAtMs;
     private long _joinUiBytes, _joinUiTotal;
     private double _joinUiEtaS;
     private int _joinRxLastDecile = -1;
@@ -434,11 +435,14 @@ public partial class GameBridge
     {
         var tcs = new TaskCompletionSource<(string, string)>(TaskCreationOptions.RunContinuationsAsynchronously);
         j.LuaReply = tcs;
-        await ExecLuaAsync(FormattableString.Invariant(
-            $"if KCD2MP_JoinTry then KCD2MP_JoinTry(\"{j.JoinId:x8}\", \"{EscapeLua(j.Partner)}\", {_joinTimeoutS}) else KCD2MP_EmitEvent(\"join_try\", \"{j.JoinId:x8} busy no-mod\") end"));
-        var done = await Task.WhenAny(tcs.Task, Task.Delay(JoinLuaReplyTimeoutMs, j.Cts.Token));
-        j.LuaReply = null;
-        return done == tcs.Task ? tcs.Task.Result : null;
+        try
+        {
+            await ExecLuaAsync(FormattableString.Invariant(
+                $"if KCD2MP_JoinTry then KCD2MP_JoinTry(\"{j.JoinId:x8}\", \"{EscapeLua(j.Partner)}\", {_joinTimeoutS}) else KCD2MP_EmitEvent(\"join_try\", \"{j.JoinId:x8} busy no-mod\") end"));
+            return await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(JoinLuaReplyTimeoutMs), j.Cts.Token);
+        }
+        catch (TimeoutException) { return null; }
+        finally { j.LuaReply = null; }
     }
 
     private async Task RunHostJoinAsync(HostJoin j)
@@ -510,9 +514,8 @@ public partial class GameBridge
             // the engine is still writing must not keep the host frozen for the
             // request's own 60 s. The request runs on and clears its own busy flag.
             var saveTask = RequestWorldSaveCoreAsync("join");
-            await Task.WhenAny(saveTask, Task.Delay(Timeout.Infinite, dct));
+            var save = await saveTask.WaitAsync(dct);
             dct.ThrowIfCancellationRequested();
-            var save = await saveTask;
             if (save is null) { abortReason = Protocol.JoinAbortSaveFailed; resumeReason = "failed"; Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: no world save -- abort"); return; }
             var bytes = WhsSave.ReadShared(save.FullPath);
             var v = WhsSave.Verify(bytes);
@@ -1231,12 +1234,13 @@ public partial class GameBridge
         }
     }
 
-    private void SetJoinUi(string state, string message, string reason = "", bool canFresh = false)
+    private void SetJoinUi(string state, string message, string reason = "", bool canFresh = false, int showForMs = 0)
     {
         _joinUiReason = reason;
         _joinUiCanFresh = canFresh;
-        _joinUiState = state;
         _joinUiMessage = message;
+        Volatile.Write(ref _joinUiExpiresAtMs, showForMs == 0 ? 0 : Environment.TickCount64 + showForMs);
+        _joinUiState = state;
     }
 
     /// <summary>GET /join-status for the launcher (hand-rolled JSON, like /version-status).</summary>
@@ -1244,12 +1248,17 @@ public partial class GameBridge
     {
         long b = Interlocked.Read(ref _joinUiBytes), t = Interlocked.Read(ref _joinUiTotal);
         double pct = t > 0 ? 100.0 * b / t : 0;
+        string state = _joinUiState;
+        long expires = Volatile.Read(ref _joinUiExpiresAtMs);
+        // Polling the existing launcher status is enough to end the notice.
+        // No delayed write can clear the state of a later join.
+        bool expired = state == "in" && expires != 0 && Environment.TickCount64 >= expires;
         var sb = new StringBuilder(160);
-        sb.Append("{\"State\":\"").Append(_joinUiState).Append("\",\"Percent\":").Append(pct.ToString("F1", CultureInfo.InvariantCulture))
+        sb.Append("{\"State\":\"").Append(expired ? "idle" : state).Append("\",\"Percent\":").Append(pct.ToString("F1", CultureInfo.InvariantCulture))
           .Append(",\"Bytes\":").Append(b).Append(",\"Total\":").Append(t)
           .Append(",\"EtaS\":").Append(_joinUiEtaS.ToString("F1", CultureInfo.InvariantCulture))
-          .Append(",\"Message\":\"").Append(_joinUiMessage.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append('"')
-          .Append(",\"Reason\":\"").Append(_joinUiReason).Append("\",\"CanFresh\":").Append(_joinUiCanFresh ? "true" : "false").Append('}');
+          .Append(",\"Message\":\"").Append(expired ? "" : _joinUiMessage.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append('"')
+          .Append(",\"Reason\":\"").Append(expired ? "" : _joinUiReason).Append("\",\"CanFresh\":").Append(!expired && _joinUiCanFresh ? "true" : "false").Append('}');
         return sb.ToString();
     }
 }
