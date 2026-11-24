@@ -887,7 +887,23 @@ public class RelayTableGateTests : IClassFixture<RelayFixture>
         var weather = await ReadWorldDigestAsync(joiner, WorldBaselineSection.Weather, Wait);
 
         await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(clock)));
-        Assert.True(await joiner.NoneOfAsync(Protocol.WorldRepairDown, TimeSpan.FromMilliseconds(360)));
+        // Start the rejection window after the relay actually handled the request.
+        // Read each frame so a repair before the Pong still fails this check.
+        byte[] receiptPing = new byte[Protocol.PingPayloadLen];
+        receiptPing[0] = 0x43;
+        await joiner.SendRawAsync(Frame(Protocol.Ping, receiptPing));
+        long receiptDeadline = Environment.TickCount64 + (long)Wait.TotalMilliseconds;
+        while (true)
+        {
+            long remaining = receiptDeadline - Environment.TickCount64;
+            Assert.True(remaining > 0, "The relay did not acknowledge the clock repair request");
+            var (type, payload) = await joiner.ReadPacketAsync(TimeSpan.FromMilliseconds(remaining));
+            Assert.NotEqual(Protocol.WorldRepairDown, type);
+            if (type != Protocol.Pong) continue;
+            Assert.Equal(receiptPing, payload);
+            break;
+        }
+        Assert.True(await joiner.NoneOfAsync(Protocol.WorldRepairDown, TimeSpan.FromMilliseconds(400)));
         await host.SendRawAsync(Clock("b1 4000 15000 0 0 0"));
         var liveClock = await joiner.ReadUntilAsync(Protocol.W164Down, Wait);
         await joiner.SendRawAsync(WorldRecoveryWire.BuildRequest(new(clock)));

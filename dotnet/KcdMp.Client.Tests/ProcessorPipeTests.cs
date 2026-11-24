@@ -114,8 +114,10 @@ public class ProcessorPipeTests
         var warm = pipe.Wo151Async(2, []); await ReadFrame(server); await Reply(server, 0xAB, 1, 0, 2, 0);
         Assert.NotNull(await warm);
         Task? abandoned = null;
-        var scope = ProcessorFrameScope.RunAsync(_ => abandoned = pipe.Wo151Async(7, []), 300);
+        var clock = new ManualFrameTime();
+        var scope = ProcessorFrameScope.RunAsync(_ => abandoned = pipe.Wo151Async(7, []), 300, CancellationToken.None, clock);
         var old = await ReadFrame(server); Assert.Equal(7, old.Payload[0]);
+        clock.Expire();
         Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await scope).Status);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned!.WaitAsync(TimeSpan.FromSeconds(2)));
         var live = pipe.Wo151Async(9, []);
@@ -183,8 +185,10 @@ public class ProcessorPipeTests
         await using var pipe = new CombatPipe(name);
         Assert.True(await pipe.EnsureConnectedAsync()); await accept; pipe.SetBatchSupported(true);
         Task? abandoned = null;
-        var scope = ProcessorFrameScope.RunAsync(_ => abandoned = pipe.Wo151Async(7, []), 300);
+        var clock = new ManualFrameTime();
+        var scope = ProcessorFrameScope.RunAsync(_ => abandoned = pipe.Wo151Async(7, []), 300, CancellationToken.None, clock);
         var old = await ReadFrame(server);
+        clock.Expire();
         Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await scope).Status);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => abandoned!.WaitAsync(TimeSpan.FromSeconds(2)));
         var live = pipe.Wo151Async(2, []);
