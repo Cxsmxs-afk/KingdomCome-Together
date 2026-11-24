@@ -37,28 +37,73 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
     [Fact]
     public async Task Processor_deadlines_are_attributed_and_cancelled_while_an_unowned_short_timer_remains()
     {
-        using var stop = new CancellationTokenSource();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         using var trace = new F4ProcessorDeadlines();
+        using var clock = new HeldDeadlineDisposal(stop.Token);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var unowned = Task.Delay(1950, stop.Token);
+        var unowned = Task.Delay(TimeSpan.FromMilliseconds(1950), new ManualFrameTime(), stop.Token);
         Task<ProcessorFrameScope.Result>[] frames =
         [
-            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token),
-            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token)
+            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token, clock),
+            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token, clock)
         ];
         try
         {
-            Task[] deadlines = trace.Pending();
+            Task<bool>[] deadlines = trace.Pending();
             Assert.Equal(frames.Length, deadlines.Length);
             Assert.DoesNotContain(unowned, deadlines);
             release.SetResult();
+            await clock.Disposing.WaitAsync(stop.Token);
+            // Task.Delay reports cancellation before calling ITimer.Dispose.
+            // Both timers still belong to live scopes until disposal returns.
+            Assert.Equal(frames.Length, trace.Pending().Length);
+            clock.Release();
             var finished = await Task.WhenAll(frames);
             Assert.All(finished, result => Assert.Equal(ProcessorFrameScope.Outcome.Completed, result.Status));
-            Assert.All(deadlines, deadline => Assert.True(deadline.IsCanceled));
+            Assert.All(await Task.WhenAll(deadlines), cancelled => Assert.True(cancelled));
             Assert.False(unowned.IsCompleted);
             output.WriteLine($"F4-TIMER-ORIGIN cancelled={deadlines.Length} unowned_active=1 owner=ProcessorFrameScope");
         }
-        finally { await stop.CancelAsync(); release.TrySetResult(); }
+        finally
+        {
+            clock.Release();
+            release.TrySetResult();
+            await Task.WhenAll(frames);
+            await stop.CancelAsync();
+        }
+    }
+
+    private sealed class HeldDeadlineDisposal(CancellationToken stop) : TimeProvider, IDisposable
+    {
+        private readonly ManualResetEventSlim _release = new();
+        private readonly TaskCompletionSource _disposing = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly CancellationToken _stop = stop;
+        private int _entered;
+
+        public Task Disposing => _disposing.Task;
+        public void Release() => _release.Set();
+        public void Dispose() => _release.Dispose();
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>
+            new TestTimer(this, TimeProvider.System.CreateTimer(callback, state, dueTime, period));
+
+        private sealed class TestTimer(HeldDeadlineDisposal owner, ITimer timer) : ITimer
+        {
+            public bool Change(TimeSpan dueTime, TimeSpan period) => timer.Change(dueTime, period);
+
+            public void Dispose()
+            {
+                if (Interlocked.Increment(ref owner._entered) == 2) owner._disposing.SetResult();
+                try { owner._release.Wait(owner._stop); }
+                finally { timer.Dispose(); }
+            }
+
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
+        }
     }
 }
 
@@ -587,7 +632,7 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private readonly record struct F4ResourceSample(int Threads, int Handles, int RawThreads, int RawHandles,
         int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, string? WindowsHandleTypes,
-        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, Task[] FrameDeadlines);
+        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, Task<bool>[] FrameDeadlines);
 
     private static F4ResourceSample F4Resources(GameBridge guest, bool traceWindowsHandles, F4ProcessorDeadlines deadlineTrace)
     {
@@ -605,8 +650,7 @@ public sealed partial class JoinCalendarIntegrationTests
         leases += Get<object?>(guest, "_wo125ActiveExitPath") is null ? 0 : 1;
         int timers = Get<bool>(guest, "_rejoinPending") ? 1 : 0;
         var pipe = Get<CombatPipe>(guest, "_combat");
-        long runtimeTimers = Timer.ActiveCount;
-        Task[] frameDeadlines = deadlineTrace.Pending();
+        var (runtimeTimers, frameDeadlines) = deadlineTrace.Sample();
         Dictionary<IntPtr, string>? objects = traceWindowsHandles ? new() : null;
         string? types = OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture(objects) : null;
         // Count after the inventory calls, so handles they initialise are present in the same observation.
@@ -739,26 +783,20 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.Equal(_nextCycle++, cycle);
             if (cycle == 0) await PrimeWorkersAsync(ct);
             var sample = await SampleAfterNativeAsync();
-            if (cycle == 5 && sample.RuntimeTimers > _before.RuntimeTimers + TimerAllowance)
+            if (sample.FrameDeadlines.Length > 0 &&
+                (cycle == 0 || cycle == 5 && sample.RuntimeTimers > _before.RuntimeTimers + TimerAllowance))
             {
-                LogTimers("baseline", _before);
+                if (cycle == 5) LogTimers("baseline", _before);
                 LogTimers("observed", sample);
-                Task[] observed = sample.FrameDeadlines;
-                if (observed.Length > _before.FrameDeadlines.Length)
-                {
-                    // These exact delays belong to in-flight ProcessorFrameScope calls. Their owner
-                    // cancels the delay on completion. Natural expiry is a failed frame, not a drain.
-                    // A completed scope can also release its native operation deadlines. The next
-                    // sample still compares the full process count, including any unowned timer.
-                    try { await Task.WhenAll(observed).WaitAsync(ct); }
-                    catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
-                    Assert.All(observed, deadline => Assert.True(deadline.IsCanceled,
-                        "A processor frame deadline expired before its owner cancelled it."));
-                    long early = sample.RuntimeTimers;
-                    sample = await SampleAfterNativeAsync();
-                    _output.WriteLine($"F4-TIMER-DRAIN scenario={_scenario} owner=ProcessorFrameScope cancelled={observed.Length} runtime_timers={_before.RuntimeTimers}->{early}->{sample.RuntimeTimers}");
-                    LogTimers("settled", sample);
-                }
+                // These exact timers belong to ProcessorFrameScope. Wait for
+                // their release, then read the whole process count again.
+                bool[] released = await Task.WhenAll(sample.FrameDeadlines).WaitAsync(ct);
+                Assert.All(released, cancelled => Assert.True(cancelled,
+                    "A processor frame deadline expired before its owner cancelled it."));
+                long early = sample.RuntimeTimers;
+                sample = await SampleAfterNativeAsync();
+                _output.WriteLine($"F4-TIMER-DRAIN scenario={_scenario} cycle={cycle} owner=ProcessorFrameScope cancelled={released.Length} runtime_timers={early}->{sample.RuntimeTimers}");
+                LogTimers("settled", sample);
             }
             if (cycle == 0) _before = sample;
             _after = sample;
