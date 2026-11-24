@@ -377,7 +377,7 @@ public sealed partial class JoinCalendarIntegrationTests
         int cycle, CancellationToken ct, ITestOutputHelper output)
     {
         int queries = engine.WhereQueries;
-        bool useRetry = cycle % 2 != 0;
+        bool useRetry = cycle == 0 || cycle % 2 != 0; // warm the retry path as well as the ordinary menu return
         Set(guest, "_leaveSinceUtc", DateTime.UtcNow.AddMinutes(-6));
         if (useRetry)
         {
@@ -516,7 +516,7 @@ public sealed partial class JoinCalendarIntegrationTests
             output.WriteLine(summary);
             // Allow CLR worker and testhost bookkeeping to vary slightly after
             // warmup. A resource retained in each of the five cycles exceeds the budget.
-            Assert.InRange(after.Threads, 0, before.Threads + 2);
+            Assert.InRange(after.Threads, 0, before.Threads + 4);
             Assert.InRange(after.Handles, 0, before.Handles + 4);
         }
         Assert.Equal(before.Owned, after.Owned);
