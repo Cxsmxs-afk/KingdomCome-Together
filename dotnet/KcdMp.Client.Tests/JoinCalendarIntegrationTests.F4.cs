@@ -654,6 +654,15 @@ public sealed partial class JoinCalendarIntegrationTests
             try
             {
                 int warmed = await WarmWorkersAsync(warmWorkers, useWinsock, ct);
+                int reached = ThreadPool.ThreadCount;
+                if (useWinsock && reached > warmed)
+                {
+                    // The warmup itself may activate more workers than the join did.
+                    // Sample only after those workers have had a Winsock exchange too.
+                    warmWorkers = Math.Clamp(reached, workerMin, workerMax);
+                    Assert.True(ThreadPool.SetMinThreads(warmWorkers, ioMin));
+                    warmed = await WarmWorkersAsync(warmWorkers, useWinsock, ct);
+                }
                 _output.WriteLine($"F4-POOL-WARMUP scenario={_scenario} primed={warmed} worker_min={workerMin} worker_max={workerMax} after_join_workers={active} target={warmWorkers}");
             }
             finally
