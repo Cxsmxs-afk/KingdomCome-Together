@@ -240,7 +240,7 @@ public partial class ClientSession
     /// WO-127: the client's latest Position carried the HOST CLAIM bit (it runs
     /// the session). Read by ClientHandler.PickAuthority; see ProtocolWo127.cs.
     /// </summary>
-    public bool ClaimsHost { get; private set; }
+    public bool ClaimsHost { get; internal set; }
 
     /// <summary>The last world epoch and run this client announced. Zero and an empty guid mean "not announced".</summary>
     public uint AnnouncedWorldEpoch { get; private set; }
@@ -1217,10 +1217,8 @@ public partial class ClientSession
                 flags = (byte)(flags & ~Protocol.PositionFlagHostClaim);
                 if (claims && !_clientHandler.AllowsHostClaim(this))
                     claims = false;
-                if (claims != ClaimsHost)
+                if (claims != ClaimsHost && _clientHandler.UpdateHostClaim(this, claims))
                 {
-                    ClaimsHost = claims;
-                    if (claims) _clientHandler.TryResumeHost(this);
                     _logger.Information("MP-HOST-CLAIM '{Name}' (id={Id}, {Transport}) {What} the session host.",
                         Name, Id, Transport, claims ? "claims" : "no longer claims");
                     _broadcastService.BroadcastCombatRole();   // re-decides and logs MP-AUTHORITY-OWNER

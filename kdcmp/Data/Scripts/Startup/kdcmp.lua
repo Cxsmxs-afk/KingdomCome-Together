@@ -28340,7 +28340,7 @@ do
     -- Phase 4.2: where the game is, as the answer to the agent's token (wo124_reply <tok> menu|world|loading). A load
     -- that holds the main thread runs no console command: no answer at all is the agent's "busy".
     function KCD2MP_W154Where(tok)
-        local where = "menu"
+        local where = "unknown"
         if KCD2MP_Wo124Where then
             local ok, w = pcall(KCD2MP_Wo124Where)
             if ok and type(w) == "string" then where = w end

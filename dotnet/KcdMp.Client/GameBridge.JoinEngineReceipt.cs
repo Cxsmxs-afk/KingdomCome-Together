@@ -50,15 +50,15 @@ public partial class GameBridge
     }
 
     private JoinEngineReceipt? PrepareLauncherProtectedReceipt(LogTailGameTransport tail, string path, string savesRoot,
-        LauncherPrivateReturn privateReturn = LauncherPrivateReturn.None)
+        LauncherPrivateReturn destination = LauncherPrivateReturn.None)
     {
         if (!TryProtectLauncherHandoff(out var lease)) return null;
-        var guest = privateReturn == LauncherPrivateReturn.None ? null : Volatile.Read(ref _launcherGuestWorld);
+        var guest = destination == LauncherPrivateReturn.None ? null : Volatile.Read(ref _launcherGuestWorld);
         Action<bool>? onTerminal = guest is null ? null : loaded =>
         {
-            if (privateReturn == LauncherPrivateReturn.OwnSave || !loaded) ReleaseLauncherGuestWorld(guest);
+            if (destination == LauncherPrivateReturn.OwnSave || !loaded) ReleaseLauncherGuestWorld(guest);
         };
-        try { return new(tail, _combat, path, savesRoot, lease, onTerminal); }
+        try { return new(tail, _combat, path, savesRoot, lease, onTerminal, destination); }
         catch { lease?.Dispose(); throw; }
     }
 
@@ -95,7 +95,7 @@ public partial class GameBridge
             : this(tail, pipe, path, saveRoot, null, null) { }
 
         public JoinEngineReceipt(LogTailGameTransport tail, CombatPipe pipe, string path, string saveRoot,
-            FileStream? launcherReadLease, Action<bool>? onTerminal)
+            FileStream? launcherReadLease, Action<bool>? onTerminal, LauncherPrivateReturn destination = LauncherPrivateReturn.None)
         {
             _tail = tail;
             _pipe = pipe;
@@ -105,6 +105,7 @@ public partial class GameBridge
             _path = Path.GetFullPath(path).Replace('\\', '/');
             _launcherReadLease = launcherReadLease;
             _onTerminal = onTerminal;
+            Destination = destination;
             // The live resolver selects the game's profile (and the named test
             // copy, where configured). An explicit join-root override is not
             // proof that the game resolves its %USER% token to that override.
@@ -121,12 +122,17 @@ public partial class GameBridge
         public bool MatchesTerminal(bool loaded) => Current && Terminal.Task.IsCompletedSuccessfully && Terminal.Task.Result == loaded;
         public bool CanRemoveFile => Terminal.Task.IsCompletedSuccessfully;
         public bool PublishesPrivateReturn { get; set; }
+        public LauncherPrivateReturn Destination { get; }
 
         public long FindProbedRead() => Current
             ? _tail.FindProbedEngineRead(_logIncarnation, _initialReadSequence, _path, _userAlias, PathComparison) : 0;
 
         public bool TryConfirmObservedPrivateRead(long sequence, string path) => sequence > 0 && Matches(path.Replace('\\', '/')) &&
             _tail.TryConsumeProbedEngineRead(_logIncarnation, sequence, _path, _userAlias, PathComparison) && TryComplete(loaded: true);
+
+        public bool TryConfirmMenuReturn() => Destination == LauncherPrivateReturn.Menu && Current &&
+            _tail.TryConsumeProbedMenuReturn(_logIncarnation, _initialReadSequence, _path, _userAlias, PathComparison) &&
+            TryComplete(loaded: false);
 
         public void ProtectSubmittedLoad() => Volatile.Write(ref _launcherSubmitted, true);
 

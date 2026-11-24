@@ -72,6 +72,39 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
     [InlineData(2)]
     [InlineData(3)]
     [InlineData(4)]
+    public async Task A_loopback_host_claim_reserves_the_seat_even_before_the_mode_packet(int players)
+    {
+        await WaitNoClientsAsync();
+        await using var host = await _relay.ConnectAsync("the-host");
+        var guests = new Peer[players - 1];
+        await using var group = new PeerGroup(guests);
+        for (int i = 0; i < guests.Length; i++) guests[i] = await _relay.ConnectAsync($"guest-{i}");
+        await host.SendRawAsync(Claim());
+        await BarrierAsync(host);
+        Assert.Equal(host.Id, Clients.DamageAuthority?.Id);
+
+        // The launcher agent has sent a host Position, but no mode or run announcement.
+        await host.DisposeAsync();
+        foreach (var guest in guests)
+        {
+            Assert.Equal(host.Id, (await guest.ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+            await guest.SendRawAsync(Claim());
+            await BarrierAsync(guest);
+        }
+        Console.WriteLine($"G4-EARLY-CLAIM players={players} authority={Clients.DamageAuthority?.Name ?? "none"}");
+        Assert.Null(Clients.DamageAuthority);
+        Assert.False(Clients.HasHostConnected());
+        Assert.All(Clients.GetClients(), guest => Assert.False(guest.ClaimsHost));
+
+        await using var returning = await _relay.ConnectAsync("the-host");
+        await ConfirmWorldAsync(returning, guests[0]);
+        Assert.Equal(returning.Id, Clients.DamageAuthority?.Id);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
     public async Task Lowest_id_guest_can_leave_before_the_first_run_without_blocking_the_host(int players)
     {
         await WaitNoClientsAsync();

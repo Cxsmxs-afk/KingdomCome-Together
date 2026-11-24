@@ -552,6 +552,15 @@ public class Wo206FaultTests
         await using var relay = await FaultRelay.StartAsync(CutSecondPlan);
         Assert.False(await JoinerCutAfterTheWorldAsync(relay));   // the first world-sent: kept
         Assert.Equal(0, relay.Rule("cut2").CutCount);
+        // The peer sockets close before the relay removes them. A new legacy
+        // host can only start a fresh pair after the old roster is empty.
+        var clients = relay.App.Services.GetRequiredService<ClientHandler>();
+        long disconnected = Stopwatch.GetTimestamp();
+        while (clients.ClientCount != 0)
+        {
+            Assert.True(Stopwatch.GetElapsedTime(disconnected) < Wait, "The previous relay peers have not disconnected.");
+            await Task.Delay(10);
+        }
         Assert.True(await JoinerCutAfterTheWorldAsync(relay));    // the second: cut
         Assert.Equal(2, relay.Faults!.StepCount("world-sent"));
         Assert.Contains(relay.Faults.RecentLines(), l => l.StartsWith("RELAY-FAULT cut2 fired kind=cut") && l.Contains("at=step:world-sent#2"));
