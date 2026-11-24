@@ -67,6 +67,10 @@ function Assert-KcdTrxResults {
                         $scenario = $Matches.scenario
                     } elseif ($line -match '^\s*F4-WINSOCK-WARMUP scenario=(?<scenario>[a-z0-9-]+) primed=[0-9]+ worker_cap=[0-9]+\s*$') {
                         $scenario = $Matches.scenario
+                    } elseif ($line -match '^\s*F4-TIMER-DRAIN scenario=(?<scenario>[a-z0-9-]+) runtime_timers=[0-9]+->[0-9]+->[0-9]+ wait_ms=[0-9]+\s*$') {
+                        $scenario = $Matches.scenario
+                    } elseif ($line -match '^\s*F4-TIMER-INVENTORY scenario=(?<scenario>[a-z0-9-]+) phase=(?:baseline|observed|settled) count=[0-9]+ short=[0-9]+ types=[a-zA-Z0-9_=:,<>/-]*\s*$') {
+                        $scenario = $Matches.scenario
                     } else { continue }
                     if ($scenario -cnotin $resourceScenarios) { throw 'Unknown join resource scenario' }
                     Write-Host $line.Trim()

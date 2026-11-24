@@ -131,7 +131,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
                 Assert.Equal(ownBefore, SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave)));
                 Console.WriteLine($"F4-TRANSFER canceller={(hostCancels ? "host" : "guest")} cycle={i} join=0x{receiving.JoinId:x8} staged={receiving.Received}/{receiving.Offer.Size} load=0 ready=0 staging_exists=0 own_sha256_equal=1");
-                await resources.CycleAsync(i, ct);
+                await resources.CycleAsync(i, ct, host);
             }
         }
         finally { guestLink.DropIncoming = null; }
@@ -209,7 +209,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 await WaitAsync(() => Get<bool>(guest, "_combatRoleApplyComplete") && Get<bool>(guest, "_hostModeKnown"),
                     "the new TCP connection to receive the real relay role and host mode", ct);
                 Assert.False(Get<bool>(guest, "_isDamageAuthority"));
-                await resources.CycleAsync(i, ct);
+                await resources.CycleAsync(i, ct, host);
             }
             resources.AssertBudget();
 
@@ -267,7 +267,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 !Get<bool>(guest, "_hostModeKnown") && pipe.NativePauseEffective,
                 "the returning connection to close and the next native hold to be active before sampling", ct);
             // The first complete return also starts the recurring hold and reader work.
-            if (i > 0) await resources.CycleAsync(i - 1, ct);
+            if (i > 0) await resources.CycleAsync(i - 1, ct, host);
         }
         resources.AssertBudget();
     }
@@ -310,7 +310,7 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
             Console.WriteLine($"F4-MISSING-SAVE cycle={i} no_load_on_failure=1 rejoin_loads={engine.JoinLoadsIssued} ready={guestLink.ReadySent.Count} own_sha256_equal=1");
             // The first private return establishes the receiver's recurring work.
-            if (i > 1) await resources.CycleAsync(i - 2, ct);
+            if (i > 1) await resources.CycleAsync(i - 2, ct, host);
         }
         resources.AssertBudget();
     }
@@ -379,7 +379,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 Console.WriteLine($"F4-MPEXIT cycle={i} warmup={(i <= initialReceiptCycle ? 1 : 0)} join_loads={engine.JoinLoadsIssued} own_loads=0 terminal=menu files=0 own_sha256_equal=1");
             }
             finally { File.Move(savedOutsideProfile, ownSave); }
-            if (resources is not null && i >= initialReceiptCycle) await resources.CycleAsync(i - initialReceiptCycle, ct);
+            if (resources is not null && i >= initialReceiptCycle) await resources.CycleAsync(i - initialReceiptCycle, ct, host);
         }
         Assert.Equal(lastCycle + 1, engine.JoinLoadsIssued);
         Assert.Equal(lastCycle + 1, exits.Count);
@@ -506,7 +506,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
                 Assert.Equal(2 * cycle, hostLink.ReadyReceived.Distinct().Count());
                 Console.WriteLine($"F4-ACTIVE-GUESTS cycle={cycle} targeted_ready={hostLink.ReadyReceived.Count} overlapping_returns=2 own_sha256_equal=2");
-                await resources.CycleAsync(cycle - 1, ct, second);
+                await resources.CycleAsync(cycle - 1, ct, host, second);
             }
             resources.AssertBudget();
         }
@@ -524,7 +524,7 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private readonly record struct F4ResourceSample(int Threads, int Handles, int RawThreads, int RawHandles,
         int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, string? WindowsHandleTypes,
-        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects);
+        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, F4RuntimeTimers.Inventory? Timers);
 
     private static F4ResourceSample F4Resources(GameBridge guest, bool traceWindowsHandles)
     {
@@ -545,10 +545,12 @@ public sealed partial class JoinCalendarIntegrationTests
         var pipe = Get<CombatPipe>(guest, "_combat");
         int threads = process.Threads.Count;
         int handles = process.HandleCount;
+        long runtimeTimers = Timer.ActiveCount;
+        var timerInventory = F4RuntimeTimers.Capture();
         Dictionary<IntPtr, string>? objects = traceWindowsHandles ? new() : null;
-        return new(threads, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, Timer.ActiveCount,
+        return new(threads, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, runtimeTimers,
             new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers),
-            OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture(objects) : null, objects);
+            OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture(objects) : null, objects, timerInventory);
     }
 
     private sealed class F4ResourceCheck : IDisposable
@@ -660,16 +662,28 @@ public sealed partial class JoinCalendarIntegrationTests
             }
         }
 
-        public async Task CycleAsync(int cycle, CancellationToken ct, GameBridge? secondGuest = null)
+        public async Task CycleAsync(int cycle, CancellationToken ct, params GameBridge[] others)
         {
             Assert.Equal(_nextCycle++, cycle);
-            // Gameplay or menu can be confirmed while its load, calendar,
-            // and authority updates still have active pipe reply deadlines.
-            await WaitForNativeTransitionAsync(_guest, ct);
-            if (secondGuest is not null) await WaitForNativeTransitionAsync(secondGuest, ct);
-            var request = new TaskCompletionSource<F4ResourceSample>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _requests.Add(request, ct);
-            var sample = await request.Task.WaitAsync(ct);
+            var sample = await SampleAfterNativeAsync();
+            if (cycle == 5 && sample.RuntimeTimers > _before.RuntimeTimers + 1)
+            {
+                LogTimers("baseline", _before);
+                LogTimers("observed", sample);
+                if (_before.Timers is { } baseline && sample.Timers is { } observed &&
+                    observed.ShortDeadlines > baseline.ShortDeadlines &&
+                    observed.Count - observed.ShortDeadlines <= baseline.Count - baseline.ShortDeadlines + 1 &&
+                    observed.WaitMs > 0)
+                {
+                    // Age only the documented one-shot request deadlines
+                    // once. A timer still open at the settled sample counts.
+                    await Task.Delay(TimeSpan.FromMilliseconds(observed.WaitMs + 20), ct);
+                    long early = sample.RuntimeTimers;
+                    sample = await SampleAfterNativeAsync();
+                    _output.WriteLine($"F4-TIMER-DRAIN scenario={_scenario} runtime_timers={_before.RuntimeTimers}->{early}->{sample.RuntimeTimers} wait_ms={observed.WaitMs + 20}");
+                    LogTimers("settled", sample);
+                }
+            }
             if (cycle == 0) _before = sample;
             _after = sample;
             _output.WriteLine($"F4-RESOURCES scenario={_scenario} cycle={cycle} threads={sample.Threads} handles={sample.Handles} " +
@@ -678,18 +692,41 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"pipe_revision={sample.Owned.PipeRevision} rejoin_timer={sample.Owned.Timers}");
             if (sample.WindowsHandleTypes is string types)
                 _output.WriteLine($"F4-HANDLE-TYPES scenario={_scenario} cycle={cycle} {types}");
+
+            async Task<F4ResourceSample> SampleAfterNativeAsync()
+            {
+                // A phase can be confirmed while its native operations
+                // still hold physical write and reply deadlines.
+                await WaitForNativeTransitionAsync(_guest, ct);
+                foreach (var player in others) await WaitForNativeTransitionAsync(player, ct);
+                var request = new TaskCompletionSource<F4ResourceSample>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _requests.Add(request, ct);
+                return await request.Task.WaitAsync(ct);
+            }
         }
 
-        private static async Task WaitForNativeTransitionAsync(GameBridge guest, CancellationToken ct)
+        private void LogTimers(string phase, F4ResourceSample sample)
         {
-            foreach (string name in new[] { "_loadSequencePublish", "_hostCalendarGate" })
+            if (sample.Timers is { } timers)
+                _output.WriteLine($"F4-TIMER-INVENTORY scenario={_scenario} phase={phase} count={timers.Count} short={timers.ShortDeadlines} types={timers.Types}");
+        }
+
+        private static async Task WaitForNativeTransitionAsync(GameBridge player, CancellationToken ct)
+        {
+            foreach (string name in new[] { "_loadSequencePublish", "_hostCalendarGate", "_hostCalendarSendGate" })
             {
-                var gate = Get<SemaphoreSlim>(guest, name);
+                var gate = Get<SemaphoreSlim>(player, name);
                 await gate.WaitAsync(ct);
                 gate.Release();
             }
-            if (Get<Task<bool>?>(guest, "_p1Pending") is { } authority)
+            if (Get<Task<bool>?>(player, "_p1Pending") is { } authority)
                 await authority.WaitAsync(ct);
+            await Get<Task>(player, "_privateReturnMenuUpdate").WaitAsync(ct);
+            // The phase can be published while a queued single-frame native
+            // call still owns a bounded write or reply wait.
+            var native = Get<SemaphoreSlim>(Get<CombatPipe>(player, "_combat"), "_gate");
+            await native.WaitAsync(ct);
+            native.Release();
         }
 
         public void AssertBudget()

@@ -110,7 +110,7 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.Empty(Directory.EnumerateFiles(WorldReceiver.DefaultStagingDir(), "world-*"));
             Assert.Equal(own, System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave)));
             Console.WriteLine($"W8-PLAYER-REJOIN cycle={cycle} join_loads={engine.JoinLoadsIssued} own_loads={engine.OwnLoadsIssued} pending=0 temporary_saves=0 own_save_unchanged=1");
-            await resources.CycleAsync(cycle - 1, ct);
+            await resources.CycleAsync(cycle - 1, ct, host);
         }
         resources.AssertBudget();
     }
