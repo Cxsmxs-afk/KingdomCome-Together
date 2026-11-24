@@ -3,6 +3,9 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
 using System.Globalization;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using KcdMp.Client;
 using KcdMp.Server.Features.ClientHandling;
 using KcdMp.Wire;
@@ -75,13 +78,41 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
     public async Task A_loopback_host_claim_reserves_the_seat_even_before_the_mode_packet(int players)
     {
         await WaitNoClientsAsync();
-        await using var host = await _relay.ConnectAsync("the-host");
+        await VerifyEarlyHostSeatAsync(_relay, players, loopback: true);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public async Task A_non_loopback_host_claim_reserves_the_seat_even_before_the_mode_packet(int players)
+    {
+        var address = NetworkInterface.GetAllNetworkInterfaces().Where(nic => nic.OperationalStatus == OperationalStatus.Up)
+            .SelectMany(nic => nic.GetIPProperties().UnicastAddresses)
+            .Select(entry => entry.Address)
+            .FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ip));
+        Assert.NotNull(address);
+        var relay = new RelayFixture(address);
+        try
+        {
+            await relay.InitializeAsync();
+            await VerifyEarlyHostSeatAsync(relay, players, loopback: false);
+        }
+        finally { await relay.DisposeAsync(); }
+    }
+
+    private static async Task VerifyEarlyHostSeatAsync(RelayFixture relay, int players, bool loopback)
+    {
+        var clients = relay.Services.GetRequiredService<ClientHandler>();
+        await using var host = await relay.ConnectAsync("the-host");
         var guests = new Peer[players - 1];
         await using var group = new PeerGroup(guests);
-        for (int i = 0; i < guests.Length; i++) guests[i] = await _relay.ConnectAsync($"guest-{i}");
+        for (int i = 0; i < guests.Length; i++) guests[i] = await relay.ConnectAsync($"guest-{i}");
         await host.SendRawAsync(Claim());
         await BarrierAsync(host);
-        Assert.Equal(host.Id, Clients.DamageAuthority?.Id);
+        Assert.Equal(host.Id, clients.DamageAuthority?.Id);
+        Assert.Equal(players, clients.ReadyClientCount);
+        Assert.All(clients.GetClients().Where(peer => peer.IsReady), peer => Assert.Equal(loopback, peer.IsLoopback));
 
         // The launcher agent has sent a host Position, but no mode or run announcement.
         await host.DisposeAsync();
@@ -91,14 +122,14 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
             await guest.SendRawAsync(Claim());
             await BarrierAsync(guest);
         }
-        Console.WriteLine($"G4-EARLY-CLAIM players={players} authority={Clients.DamageAuthority?.Name ?? "none"}");
-        Assert.Null(Clients.DamageAuthority);
-        Assert.False(Clients.HasHostConnected());
-        Assert.All(Clients.GetClients(), guest => Assert.False(guest.ClaimsHost));
+        Console.WriteLine($"G4-EARLY-CLAIM players={players} loopback={(loopback ? 1 : 0)} authority={clients.DamageAuthority?.Name ?? "none"}");
+        Assert.Null(clients.DamageAuthority);
+        Assert.False(clients.HasHostConnected());
+        Assert.All(clients.GetClients(), guest => Assert.False(guest.ClaimsHost));
 
-        await using var returning = await _relay.ConnectAsync("the-host");
+        await using var returning = await relay.ConnectAsync("the-host");
         await ConfirmWorldAsync(returning, guests[0]);
-        Assert.Equal(returning.Id, Clients.DamageAuthority?.Id);
+        Assert.Equal(returning.Id, clients.DamageAuthority?.Id);
     }
 
     [Theory]

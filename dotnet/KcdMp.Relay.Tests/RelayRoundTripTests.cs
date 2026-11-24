@@ -46,21 +46,26 @@ public sealed class RelayFixture : IAsyncLifetime
 {
     private static int _nextFixture;
     private readonly string _fixtureId = $"relay-{Interlocked.Increment(ref _nextFixture)}";
+    private readonly IPAddress _listenAddress = IPAddress.Loopback;
+    private IPEndPoint _endpoint = null!;
     public int TcpPort { get; private set; }
     private WebApplication? _app;
+
+    public RelayFixture() { }
+    internal RelayFixture(IPAddress listenAddress) => _listenAddress = listenAddress;
 
     /// <summary>WO-127: the relay's services (ClientSessionRunner, ClientHandler) for transport-level tests.</summary>
     public IServiceProvider Services => _app!.Services;
 
     public async Task InitializeAsync()
     {
-        var app = RelayListeners.CreateApp();
-        var bound = await RelayListeners.StartAsync(app);
+        var app = RelayListeners.CreateApp("--Tcp:BindAddress", _listenAddress.ToString());
+        _endpoint = await RelayListeners.StartAsync(app, _listenAddress);
         _app = app;
-        TcpPort = bound.Port;
+        TcpPort = _endpoint.Port;
         try
         {
-            var (probe, type, body) = await Peer.ConnectRawAsync(TcpPort, "fixture-probe", Protocol.ConnectionTestRelease,
+            var (probe, type, body) = await Peer.ConnectRawAsync(_endpoint, "fixture-probe", Protocol.ConnectionTestRelease,
                 Protocol.Version, _fixtureId);
             await using (probe)
             {
@@ -78,7 +83,7 @@ public sealed class RelayFixture : IAsyncLifetime
         }
     }
 
-    public Task<Peer> ConnectAsync(string name) => Peer.ConnectAsync(TcpPort, name, _fixtureId);
+    public Task<Peer> ConnectAsync(string name) => Peer.ConnectAsync(_endpoint, name, _fixtureId);
 
     public async Task DisposeAsync()
     {
@@ -102,15 +107,15 @@ internal static class RelayListeners
         .. options
     ], idleTimeProvider);
 
-    internal static async Task<IPEndPoint> StartAsync(WebApplication app)
+    internal static async Task<IPEndPoint> StartAsync(WebApplication app, IPAddress? listenAddress = null)
     {
         try
         {
             await app.StartAsync();
             var listener = app.Services.GetServices<IHostedService>().OfType<TcpSocketService>().Single();
             var endpoint = await listener.BoundEndpoint.WaitAsync(TimeSpan.FromSeconds(10));
-            if (endpoint.Port <= 0 || !IPAddress.Loopback.Equals(endpoint.Address))
-                throw new InvalidOperationException("The test relay did not bind a TCP loopback endpoint.");
+            if (endpoint.Port <= 0 || !(listenAddress ?? IPAddress.Loopback).Equals(endpoint.Address))
+                throw new InvalidOperationException("The test relay did not bind the requested TCP endpoint.");
             return endpoint;
         }
         catch
@@ -133,10 +138,10 @@ public sealed class Peer : IAsyncDisposable
     private IPEndPoint _listener;
     public byte Id { get; private set; }
 
-    private Peer(int port, string fixture)
+    private Peer(IPEndPoint endpoint, string fixture)
     {
         _fixture = fixture;
-        _listener = new IPEndPoint(IPAddress.Loopback, port);
+        _listener = endpoint;
     }
 
     /// <summary>
@@ -144,13 +149,16 @@ public sealed class Peer : IAsyncDisposable
     /// returning the relay's FIRST reply (Ack, VersionMismatch, ServerFull or
     /// ReleaseVersionMismatch) instead of asserting it is an Ack.
     /// </summary>
-    public static async Task<(Peer Peer, byte Type, byte[] Payload)> ConnectRawAsync(int port, string name, string release, byte protocol,
-        string fixture = "unassigned")
+    public static Task<(Peer Peer, byte Type, byte[] Payload)> ConnectRawAsync(int port, string name, string release, byte protocol,
+        string fixture = "unassigned") => ConnectRawAsync(new IPEndPoint(IPAddress.Loopback, port), name, release, protocol, fixture);
+
+    internal static async Task<(Peer Peer, byte Type, byte[] Payload)> ConnectRawAsync(IPEndPoint endpoint, string name,
+        string release, byte protocol, string fixture)
     {
-        var peer = new Peer(port, fixture);
+        var peer = new Peer(endpoint, fixture);
         try
         {
-            await peer._tcp.ConnectAsync(IPAddress.Loopback, port);
+            await peer._tcp.ConnectAsync(endpoint.Address, endpoint.Port);
             var remote = (IPEndPoint)peer._tcp.Client.RemoteEndPoint!;
             peer._listener = remote.Address.IsIPv4MappedToIPv6 ? new IPEndPoint(remote.Address.MapToIPv4(), remote.Port) : remote;
             peer._stream = peer._tcp.GetStream();
@@ -180,9 +188,12 @@ public sealed class Peer : IAsyncDisposable
         }
     }
 
-    public static async Task<Peer> ConnectAsync(int port, string name, string fixture = "unassigned")
+    public static Task<Peer> ConnectAsync(int port, string name, string fixture = "unassigned") =>
+        ConnectAsync(new IPEndPoint(IPAddress.Loopback, port), name, fixture);
+
+    internal static async Task<Peer> ConnectAsync(IPEndPoint endpoint, string name, string fixture)
     {
-        var (peer, type, payload) = await ConnectRawAsync(port, name, ReleaseVersionInfo.Wire, Protocol.Version, fixture);
+        var (peer, type, payload) = await ConnectRawAsync(endpoint, name, ReleaseVersionInfo.Wire, Protocol.Version, fixture);
         if (type == Protocol.Ack) return peer;
         await peer.DisposeAsync();
         throw new InvalidDataException(peer.HandshakeFrame(type, payload.Length));
