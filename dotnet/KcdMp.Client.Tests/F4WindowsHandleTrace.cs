@@ -20,7 +20,13 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         public uint Slots;
     }
 
-    private sealed record OpenStack(long[] Frames, string? Problem = null);
+    private sealed record OpenStack(long Thread, long[] Frames, string? Problem = null);
+    internal readonly record struct Allocation(string Kind, long Thread, string Stack);
+    internal readonly record struct Bookkeeping(int WinsockPairs, int RegexCacheEvents)
+    {
+        public int Total => 2 * WinsockPairs + RegexCacheEvents;
+    }
+    internal readonly record struct HandleOrigins(string Details, Bookkeeping Runtime);
 
     public F4WindowsHandleTrace()
     {
@@ -35,9 +41,9 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         }
     }
 
-    public string DescribeNewHandles(IReadOnlyDictionary<IntPtr, string> start, IReadOnlyDictionary<IntPtr, string> end)
+    public HandleOrigins DescribeNewHandles(IReadOnlyDictionary<IntPtr, string> start, IReadOnlyDictionary<IntPtr, string> end)
     {
-        if (EnableStatus < 0) return $"enabled=0 status={unchecked((uint)EnableStatus):x8}";
+        if (EnableStatus < 0) return new($"enabled=0 status={unchecked((uint)EnableStatus):x8}", default);
         // Query the original handle history before querying modules or creating a
         // process snapshot. Those diagnostics perform more handle operations.
         var captured = end.Where(kv => !start.TryGetValue(kv.Key, out var kind) || kv.Value != kind)
@@ -45,13 +51,47 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         using var self = Process.GetCurrentProcess();
         (long Start, int ModuleMemorySize, string ModuleName)[] modules;
         try { modules = self.Modules.Cast<ProcessModule>().Select(m => (Start: m.BaseAddress.ToInt64(), m.ModuleMemorySize, m.ModuleName)).ToArray(); }
-        catch (System.ComponentModel.Win32Exception) { return "enabled=1 modules_unavailable=1"; }
+        catch (System.ComponentModel.Win32Exception) { return new("enabled=1 modules_unavailable=1", default); }
+        var liveThreads = self.Threads.Cast<ProcessThread>().Select(thread => (long)thread.Id).ToHashSet();
         // This runs after an over-budget sample. A snapshot lets the DAC read stable JIT metadata.
         using var diagnostics = TrySnapshot();
         using var runtime = TryReadRuntime(diagnostics);
-        var histories = captured.Select(handle => $"{handle.Kind}:{DescribeStack(handle.Stack, modules, runtime)}");
-        return $"enabled=1 clr={Environment.Version} managed={(runtime is null ? 0 : 1)} " +
+        var allocations = captured.Select(handle => new Allocation(handle.Kind, handle.Stack.Thread,
+            DescribeStack(handle.Stack, modules, runtime))).ToArray();
+        var histories = allocations.Select(handle => $"{handle.Kind}:{handle.Stack}@thread={handle.Thread}");
+        string details = $"enabled=1 clr={Environment.Version} managed={(runtime is null ? 0 : 1)} " +
             string.Join(',', histories.GroupBy(x => x).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key}={g.Count()}"));
+        return new(details, CountBookkeeping(allocations, liveThreads));
+    }
+
+    internal static Bookkeeping CountBookkeeping(Allocation[] allocations, IReadOnlySet<long> liveThreads)
+    {
+        // A first-use socket-provider context has one event and one thread
+        // handle on the opening worker. Incomplete or repeated pairs still
+        // count against the application budget.
+        var socketHandles = allocations
+            .Where(handle => liveThreads.Contains(handle.Thread))
+            .Select(handle => (Handle: handle, Api: WinsockApi(handle)))
+            .Where(row => row.Api is not null);
+        int pairs = socketHandles.GroupBy(row => (row.Handle.Thread, row.Api)).Count(group =>
+            group.Count(row => row.Handle.Kind == "Event") == 1 &&
+            group.Count(row => row.Handle.Kind == "Thread") == 1);
+
+        // RegexCache.Add enters a single static BCL monitor. Extra events
+        // with this stack, and events from any application monitor, stay counted.
+        int regexEvents = allocations.Count(handle => handle.Kind == "Event" &&
+            handle.Stack.Contains("coreclr.dll+", StringComparison.Ordinal) &&
+            handle.Stack.Split('>').Contains("System.Text.RegularExpressions.RegexCache.Add", StringComparer.Ordinal));
+        return new(pairs, regexEvents == 1 ? 1 : 0);
+    }
+
+    private static string? WinsockApi(Allocation handle)
+    {
+        if (handle.Kind is not ("Event" or "Thread")) return null;
+        var stack = handle.Stack.Split('>');
+        if (!stack.Contains("ws2_32.dll", StringComparer.OrdinalIgnoreCase) ||
+            handle.Kind == "Event" && !stack.Contains("mswsock.dll", StringComparer.OrdinalIgnoreCase)) return null;
+        return stack.FirstOrDefault(frame => frame is "Interop+Winsock.WSARecv" or "Interop+Winsock.WSASend");
     }
 
     private static DataTarget? TrySnapshot()
@@ -83,9 +123,10 @@ internal sealed class F4WindowsHandleTrace : IDisposable
             Marshal.WriteIntPtr(buffer, handle);
             Marshal.WriteInt32(buffer, IntPtr.Size, 0);
             int status = NtQueryInformationProcess(_process, ProcessHandleTracing, buffer, bytes, out _);
-            if (status < 0) return new([], $"status_{unchecked((uint)status):x8}");
+            if (status < 0) return new(0, [], $"status_{unchecked((uint)status):x8}");
             int traces = Marshal.ReadInt32(buffer, IntPtr.Size);
-            if (traces < 0 || traces > slots) return new([], "bad_count");
+            if (traces < 0 || traces > slots) return new(0, [], "bad_count");
+            OpenStack? owner = null;
             for (int i = 0; i < traces; i++)
             {
                 IntPtr trace = buffer + header + i * traceSize;
@@ -97,9 +138,13 @@ internal sealed class F4WindowsHandleTrace : IDisposable
                     if (pc == 0) break;
                     frames.Add(pc);
                 }
-                return new([.. frames]);
+                // HANDLE, CLIENT_ID { process, thread }, operation, stack.
+                long thread = Marshal.ReadIntPtr(trace, 2 * IntPtr.Size).ToInt64();
+                if (owner is not null && (owner.Thread != thread || !frames.SequenceEqual(owner.Frames)))
+                    return new(0, [], "reused_handle");
+                owner = new(thread, [.. frames]);
             }
-            return new([], "untraced");
+            return owner ?? new(0, [], "untraced");
         }
         finally { Marshal.FreeHGlobal(buffer); }
     }

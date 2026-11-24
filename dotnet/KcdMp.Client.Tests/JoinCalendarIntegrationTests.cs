@@ -179,7 +179,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
         {
             CanQuickSave = f4 != F4Probe.ActiveGuest,
         };
-        if (f4 is F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe or F4Probe.RetainedTimer)
+        if (f4 is F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe or F4Probe.RetainedTimer or F4Probe.RetainedHandle)
             guestPipe.SaveListed = (slot, name) => File.Exists(Path.Combine(fixture.GuestSaves, $"playline{slot}", name + ".whs"));
         Func<int, byte[]> makeHostSave = f4 is F4Probe.TransferAbort or F4Probe.HostAbort or F4Probe.TransportLost
             ? F4LargeHostSave : fixture.MakeHostSave;

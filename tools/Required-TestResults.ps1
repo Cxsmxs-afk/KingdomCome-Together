@@ -38,12 +38,14 @@ function Assert-KcdTrxResults {
     $executions = [System.Collections.Generic.HashSet[guid]]::new()
     $resourceCycles = @{}
     $resourceSummaries = [System.Collections.Generic.HashSet[string]]::new()
+    $handleBudgets = [System.Collections.Generic.HashSet[string]]::new()
     $resourceScenarios = @('mpexit', 'mpexit-receipt', 'transfer-player-a', 'transfer-player-b', 'transfer-host', 'transfer-eof',
                           'missing-personal-save', 'cancel-rejoin-2', 'cancel-rejoin-3', 'cancel-rejoin-4', 'return-deadline',
                           'active-guests-3', 'active-guests-4', 'host-return-2', 'host-return-3', 'host-return-4',
-                          'mpexit-retained-timer')
+                          'mpexit-retained-timer', 'mpexit-retained-handle')
     $timerOrigin = 0
     $timerTwin = 0
+    $handleTwin = 0
     foreach ($result in $results) {
         $id = [guid]::Empty
         if (-not [guid]::TryParse($result.GetAttribute('executionId'), [ref]$id) -or
@@ -68,15 +70,26 @@ function Assert-KcdTrxResults {
                         if (-not $resourceSummaries.Add($scenario)) { throw "Duplicate resource summary for $scenario" }
                     } elseif ($line -match '^\s*F4-HANDLE-TYPES scenario=(?<scenario>[a-z0-9-]+) cycle=[0-5] (?:count=[0-9]+ types=[A-Za-z0-9_=,]+(?: thread_[a-z_]+=[0-9]+)*|status=[0-9a-f]{8}|bad_count=1)\s*$') {
                         $scenario = $Matches.scenario
-                    } elseif ($line -match '^\s*F4-POOL-WARMUP scenario=(?<scenario>[a-z0-9-]+) primed=[0-9]+ worker_min=[0-9]+ worker_max=[0-9]+ after_join_workers=[0-9]+ target=[0-9]+\s*$') {
+                    } elseif ($line -match '^\s*F4-HANDLE-BUDGET scenario=(?<scenario>[a-z0-9-]+) before=(?<before>[0-9]+) after=(?<after>[0-9]+) winsock_pairs=(?<pairs>[0-9]+) regex_cache_events=(?<regex>[01]) compared_after=(?<compared>[0-9]+)\s*$') {
                         $scenario = $Matches.scenario
-                    } elseif ($line -match '^\s*F4-TIMER-DRAIN scenario=(?<scenario>[a-z0-9-]+) owner=ProcessorFrameScope cancelled=[0-9]+ runtime_timers=[0-9]+->[0-9]+->[0-9]+\s*$') {
+                        if (-not $handleBudgets.Add($scenario) -or
+                            [int]$Matches.compared -ne ([int]$Matches.after - 2 * [int]$Matches.pairs - [int]$Matches.regex)) {
+                            throw "Invalid or duplicate handle accounting for $scenario"
+                        }
+                    } elseif ($line -match '^\s*F4-HANDLE-ORIGINS scenario=(?<scenario>[a-z0-9-]+) enabled=[01] .+\s*$') {
+                        $scenario = $Matches.scenario
+                    } elseif ($line -match '^\s*F4-POOL-WARMUP scenario=(?<scenario>[a-z0-9-]+) primed=[0-9]+ worker_min=[0-9]+ worker_max=[0-9]+ after_join_workers=[0-9]+ reached=[0-9]+ target=[0-9]+\s*$') {
+                        $scenario = $Matches.scenario
+                    } elseif ($line -match '^\s*F4-TIMER-DRAIN scenario=(?<scenario>[a-z0-9-]+) cycle=[05] owner=ProcessorFrameScope cancelled=[0-9]+ runtime_timers=[0-9]+->[0-9]+\s*$') {
                         $scenario = $Matches.scenario
                     } elseif ($line -match '^\s*F4-TIMER-SAMPLE scenario=(?<scenario>[a-z0-9-]+) phase=(?:baseline|observed|settled) count=[0-9]+ frame_deadlines=[0-9]+ owner=ProcessorFrameScope\s*$') {
                         $scenario = $Matches.scenario
                     } elseif ($line -match '^\s*F4-TIMER-TWIN scenario=(?<scenario>mpexit-retained-timer) retained=5 result=budget-rejected\s*$') {
                         $scenario = $Matches.scenario
                         $timerTwin++
+                    } elseif ($line -match '^\s*F4-HANDLE-TWIN scenario=(?<scenario>mpexit-retained-handle) retained=10 result=budget-rejected\s*$') {
+                        $scenario = $Matches.scenario
+                        $handleTwin++
                     } elseif ($line -match '^\s*F4-TIMER-ORIGIN cancelled=2 unowned_active=1 owner=ProcessorFrameScope\s*$') {
                         $timerOrigin++
                         Write-Host $line.Trim()
@@ -89,9 +102,10 @@ function Assert-KcdTrxResults {
         }
     }
     if ($Suite -eq 'Client') {
-        if ($timerOrigin -ne 1 -or $timerTwin -ne 1) { throw 'Missing or duplicate F4 timer control result' }
+        if ($timerOrigin -ne 1 -or $timerTwin -ne 1 -or $handleTwin -ne 1) { throw 'Missing or duplicate F4 control result' }
         foreach ($scenario in $resourceScenarios) {
-            if (-not $resourceSummaries.Contains($scenario) -or -not $resourceCycles.ContainsKey($scenario) -or
+            if (-not $resourceSummaries.Contains($scenario) -or -not $handleBudgets.Contains($scenario) -or
+                -not $resourceCycles.ContainsKey($scenario) -or
                 -not $resourceCycles[$scenario].SetEquals([int[]](0..5))) {
                 throw "Incomplete join resource checks for $scenario"
             }

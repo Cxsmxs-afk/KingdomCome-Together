@@ -35,6 +35,37 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task Five_leaves_with_two_retained_file_handles_each_fail_the_application_handle_budget()
+    {
+        var failure = await Assert.ThrowsAsync<TrueException>(() =>
+            JoinCalendarIntegrationTests.RunF4MenuProbeAsync(output, retainHandles: true));
+        Assert.Contains("F4 application handle budget", failure.Message);
+        output.WriteLine("F4-HANDLE-TWIN scenario=mpexit-retained-handle retained=10 result=budget-rejected");
+    }
+
+    [Fact]
+    public void Windows_handle_accounting_requires_a_complete_pair_on_one_live_thread()
+    {
+        const string socketEvent = "ntdll.dll>mswsock.dll>ws2_32.dll>Interop+Winsock.WSARecv";
+        const string socketThread = "ntdll.dll>ws2_32.dll>Interop+Winsock.WSARecv";
+        const string regexCache = "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Text.RegularExpressions.RegexCache.Add";
+        F4WindowsHandleTrace.Allocation[] allocations =
+        [
+            new("Event", 10, socketEvent), new("Thread", 10, socketThread),
+            new("Event", 11, socketEvent), new("Thread", 12, socketThread),
+            new("Event", 13, socketEvent), new("Thread", 13, socketThread),
+            new("Event", 13, socketEvent), new("Thread", 13, socketThread),
+            new("Event", 14, socketEvent), new("Thread", 14, socketThread),
+            new("File", 10, socketEvent),
+            new("Event", 10, "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Threading.SemaphoreSlim.WaitAsync"),
+            new("Event", 10, regexCache)
+        ];
+        var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations, new HashSet<long> { 10, 11, 12, 13 });
+        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1), runtime);
+        Assert.Equal(3, runtime.Total);
+    }
+
+    [Fact]
     public async Task Processor_deadlines_are_attributed_and_cancelled_while_an_unowned_short_timer_remains()
     {
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -109,11 +140,12 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
 
 public sealed partial class JoinCalendarIntegrationTests
 {
-    private enum F4Probe { TransferAbort, NoOwnExit, NoOwnExitWithMenuProbe, SupersededMenuProbe, HostAbort, MissingOwnSave, ActiveGuest, TransportLost, HostReturn, RetainedTimer }
+    private enum F4Probe { TransferAbort, NoOwnExit, NoOwnExitWithMenuProbe, SupersededMenuProbe, HostAbort, MissingOwnSave, ActiveGuest, TransportLost, HostReturn, RetainedTimer, RetainedHandle }
 
-    internal static Task RunF4MenuProbeAsync(ITestOutputHelper output, bool supersedeLoad = false, bool retainTimers = false) =>
+    internal static Task RunF4MenuProbeAsync(ITestOutputHelper output, bool supersedeLoad = false,
+        bool retainTimers = false, bool retainHandles = false) =>
         RunAsync("A", "B", dropFirstSnapshot: false, f4: supersedeLoad ? F4Probe.SupersededMenuProbe
-            : retainTimers ? F4Probe.RetainedTimer : F4Probe.NoOwnExitWithMenuProbe,
+            : retainTimers ? F4Probe.RetainedTimer : retainHandles ? F4Probe.RetainedHandle : F4Probe.NoOwnExitWithMenuProbe,
             f4Output: output);
 
     [Theory]
@@ -170,7 +202,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"transfer-player-{hostLabel.ToLowerInvariant()}", ct, output),
             F4Probe.HostAbort => TestF4TransfersAsync(fixture, host, guest, hostLink, guestLink, guestPipe, hostEngine, engine,
                 "transfer-host", ct, output),
-            F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe or F4Probe.RetainedTimer =>
+            F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe or F4Probe.RetainedTimer or F4Probe.RetainedHandle =>
                 TestF4MenuExitAsync(fixture, host, guest, hostLink, engine, ct, output, probe),
             F4Probe.MissingOwnSave => TestF4MissingOwnSaveAsync(fixture, host, guest, hostLink, guestLink, engine, ct, output),
             _ => throw new ArgumentOutOfRangeException(nameof(probe))
@@ -409,16 +441,18 @@ public sealed partial class JoinCalendarIntegrationTests
         var exits = new HashSet<string>();
         bool supersedeLoad = probe == F4Probe.SupersededMenuProbe;
         bool retainTimers = probe == F4Probe.RetainedTimer;
+        bool retainHandles = probe == F4Probe.RetainedHandle;
         string scenario = probe switch
         {
             F4Probe.NoOwnExit => "mpexit-receipt",
             F4Probe.RetainedTimer => "mpexit-retained-timer",
+            F4Probe.RetainedHandle => "mpexit-retained-handle",
             _ => "mpexit"
         };
         using var resources = supersedeLoad ? null : new F4ResourceCheck(scenario, guest, output);
         int initialReceiptCycle = probe == F4Probe.NoOwnExit ? 1 : 0;
         int lastCycle = supersedeLoad ? 0 : 5 + initialReceiptCycle;
-        using var outstanding = retainTimers ? new RetainedLeaveTimers() : null;
+        using var outstanding = retainTimers || retainHandles ? new RetainedLeaveResources() : null;
         // Load and return once before measuring so the initial runtime and
         // fixture setup is outside the five comparable cycles.
         for (int i = 0; i <= lastCycle; i++)
@@ -472,7 +506,16 @@ public sealed partial class JoinCalendarIntegrationTests
             finally { File.Move(savedOutsideProfile, ownSave); }
             if (resources is not null && i >= initialReceiptCycle)
             {
-                if (i > initialReceiptCycle) outstanding?.Retain();
+                if (i > initialReceiptCycle)
+                {
+                    if (retainTimers) outstanding!.Add(new CancellationTokenSource(TimeSpan.FromMinutes(2)));
+                    if (retainHandles)
+                    {
+                        string path = Path.Combine(fixture.Root, "retained-handle.dat");
+                        for (int handle = 0; handle < 2; handle++)
+                            outstanding!.Add(File.Open(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite));
+                    }
+                }
                 await resources.CycleAsync(i - initialReceiptCycle, ct, host);
             }
         }
@@ -482,16 +525,16 @@ public sealed partial class JoinCalendarIntegrationTests
         resources?.AssertBudget();
     }
 
-    private sealed class RetainedLeaveTimers : IDisposable
+    private sealed class RetainedLeaveResources : IDisposable
     {
-        private readonly List<CancellationTokenSource> _retained = [];
+        private readonly List<IDisposable> _retained = [];
 
-        // Retain a real one-shot timer past every sample. It is released only after the test's assertion.
-        public void Retain() => _retained.Add(new CancellationTokenSource(TimeSpan.FromMinutes(2)));
+        public void Add(IDisposable resource) => _retained.Add(resource);
 
+        // Release the deliberately retained resources only after the budget assertion.
         public void Dispose()
         {
-            foreach (var timer in _retained) timer.Dispose();
+            foreach (var resource in _retained) resource.Dispose();
         }
     }
 
@@ -694,25 +737,14 @@ public sealed partial class JoinCalendarIntegrationTests
             // Prime the pool reached by the actual warmup round. A cold pool does not yet
             // contain all the workers that the concurrent guest returns leave behind.
             int active = ThreadPool.ThreadCount;
-            int target = useWinsock ? active + Environment.ProcessorCount : 16;
+            int target = useWinsock ? active : 16;
             int warmWorkers = Math.Clamp(Math.Max(16, target), workerMin, workerMax);
             var warmed = new ConcurrentDictionary<int, byte>();
-            var elapsed = Stopwatch.StartNew();
             try
             {
-                int reached;
-                do
-                {
-                    Assert.True(ThreadPool.SetMinThreads(warmWorkers, ioMin));
-                    await WarmWorkerRoundAsync(warmWorkers, useWinsock, warmed, ct);
-                    reached = ThreadPool.ThreadCount;
-                    if (useWinsock && reached > warmWorkers)
-                        warmWorkers = Math.Clamp(reached, workerMin, workerMax);
-                }
-                while (warmed.Count < warmWorkers && elapsed.Elapsed < TimeSpan.FromSeconds(2));
-                _output.WriteLine($"F4-POOL-WARMUP scenario={_scenario} primed={warmed.Count} worker_min={workerMin} worker_max={workerMax} after_join_workers={active} reached={reached} target={warmWorkers}");
-                if (useWinsock)
-                    Assert.True(warmed.Count >= reached, "The process reached workers that did not complete a Winsock warmup.");
+                Assert.True(ThreadPool.SetMinThreads(warmWorkers, ioMin));
+                await WarmWorkerRoundAsync(warmWorkers, useWinsock, warmed, ct);
+                _output.WriteLine($"F4-POOL-WARMUP scenario={_scenario} primed={warmed.Count} worker_min={workerMin} worker_max={workerMax} after_join_workers={active} reached={ThreadPool.ThreadCount} target={warmWorkers}");
             }
             finally
             {
@@ -848,13 +880,22 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"thread_pool_workers={before.ThreadPoolWorkers}->{after.ThreadPoolWorkers} runtime_timers={before.RuntimeTimers}->{after.RuntimeTimers} " +
                 $"guest_pipe={before.Owned.PipeConnections}->{after.Owned.PipeConnections} tracked_leases={before.Owned.Reservations}->{after.Owned.Reservations} " +
                 $"pipe_revision={before.Owned.PipeRevision}->{after.Owned.PipeRevision} rejoin_timer={before.Owned.Timers}->{after.Owned.Timers}");
+            F4WindowsHandleTrace.Bookkeeping runtime = default;
             if (_handleTrace is not null && after.Handles > before.Handles + 4 &&
                 before.WindowsHandleObjects is { } start && after.WindowsHandleObjects is { } end)
-                _output.WriteLine($"F4-HANDLE-ORIGINS scenario={_scenario} {_handleTrace.DescribeNewHandles(start, end)}");
+            {
+                var origins = _handleTrace.DescribeNewHandles(start, end);
+                runtime = origins.Runtime;
+                _output.WriteLine($"F4-HANDLE-ORIGINS scenario={_scenario} {origins.Details}");
+            }
+            int comparedHandles = after.Handles - runtime.Total;
+            _output.WriteLine($"F4-HANDLE-BUDGET scenario={_scenario} before={before.Handles} after={after.Handles} " +
+                $"winsock_pairs={runtime.WinsockPairs} regex_cache_events={runtime.RegexCacheEvents} compared_after={comparedHandles}");
             Assert.True(after.RuntimeTimers <= before.RuntimeTimers + TimerAllowance,
                 $"F4 runtime timer budget: scenario={_scenario} {before.RuntimeTimers}->{after.RuntimeTimers}, allowance={TimerAllowance}");
             Assert.InRange(after.Threads, 0, before.Threads + 4);
-            Assert.InRange(after.Handles, 0, before.Handles + 4);
+            Assert.True(comparedHandles >= 0 && comparedHandles <= before.Handles + 4,
+                $"F4 application handle budget: scenario={_scenario} {before.Handles}->{comparedHandles}, raw={after.Handles}, allowance=4");
             Assert.Equal(before.Owned, after.Owned);
         }
 
