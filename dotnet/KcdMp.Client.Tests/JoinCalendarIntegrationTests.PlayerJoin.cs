@@ -20,7 +20,7 @@ public sealed partial class JoinCalendarIntegrationTests
         // the engine read. A faster notice must not merge these two edges.
         engine.DeferOwnFileRead = true;
         engine.Emit("wo124_where", "world");
-        using var resources = new F4ResourceCheck(returnDeadline ? "return-deadline" : $"cancel-rejoin-{players}", guest, output);
+        using var resources = await F4ResourceCheck.WarmAsync(returnDeadline ? "return-deadline" : $"cancel-rejoin-{players}", guest, output, ct);
         for (int cycle = 1; cycle <= 6; cycle++)
         {
             int readyBefore = guestLink.ReadySent.Count;

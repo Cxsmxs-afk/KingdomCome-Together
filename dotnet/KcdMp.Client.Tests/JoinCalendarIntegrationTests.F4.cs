@@ -96,7 +96,7 @@ public sealed partial class JoinCalendarIntegrationTests
         JoinCalendarTestEngine engine, string scenario, CancellationToken ct, ITestOutputHelper output)
     {
         byte[] ownBefore = SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave));
-        using var resources = new F4ResourceCheck(scenario, guest, output);
+        using var resources = await F4ResourceCheck.WarmAsync(scenario, guest, output, ct);
         var cancelled = new HashSet<uint>();
         bool hostCancels = !ReferenceEquals(canceller, engine);
         var incomingAbort = hostCancels ? guestLink.Aborts : hostLink.Aborts;
@@ -161,7 +161,7 @@ public sealed partial class JoinCalendarIntegrationTests
         JoinWire link = firstLink;
         Task read = firstRead;
         var abandoned = new HashSet<uint>();
-        using var resources = new F4ResourceCheck("transfer-eof", guest, output);
+        using var resources = await F4ResourceCheck.WarmAsync("transfer-eof", guest, output, ct);
         try
         {
             for (int i = 0; i <= 5; i++)
@@ -244,7 +244,7 @@ public sealed partial class JoinCalendarIntegrationTests
         }, "the already joined world to settle", ct);
         hostPeer.FinishSending();
         await hostRead.WaitAsync(ct);
-        using var resources = new F4ResourceCheck($"host-return-{players}", guest, output);
+        using var resources = await F4ResourceCheck.WarmAsync($"host-return-{players}", guest, output, ct);
         for (int i = 0; i <= 5; i++)
         {
             await WaitAsync(() => guest.HostAbsentPause && Property<bool>(guest, "LinkHeld") && !Get<bool>(guest, "_hostModeKnown"),
@@ -275,7 +275,7 @@ public sealed partial class JoinCalendarIntegrationTests
         string removed = Path.Combine(fixture.Root, "fixture-offline-save");
         byte[] hash = SHA256.HashData(File.ReadAllBytes(own));
         Set(guest, "_w184SaveOnLeave", false);
-        using var resources = new F4ResourceCheck("missing-personal-save", guest, output);
+        using var resources = await F4ResourceCheck.WarmAsync("missing-personal-save", guest, output, ct);
         for (int i = 1; i <= 6; i++)
         {
             File.Move(own, removed);
@@ -320,7 +320,7 @@ public sealed partial class JoinCalendarIntegrationTests
         engine.DeferExitFileRead = true;
         var exits = new HashSet<string>();
         bool supersedeLoad = probe == F4Probe.SupersededMenuProbe;
-        using var resources = supersedeLoad ? null : new F4ResourceCheck(probe == F4Probe.NoOwnExit ? "mpexit-receipt" : "mpexit", guest, output);
+        using var resources = supersedeLoad ? null : await F4ResourceCheck.WarmAsync(probe == F4Probe.NoOwnExit ? "mpexit-receipt" : "mpexit", guest, output, ct);
         int lastCycle = supersedeLoad ? 0 : 5;
         // Load and return once before measuring so the initial runtime and
         // fixture setup is outside the five comparable cycles.
@@ -465,7 +465,7 @@ public sealed partial class JoinCalendarIntegrationTests
             Set(second, "_w184SaveOnLeave", false);
             firstEngine.DeferOwnFileRead = true;
             secondEngine.DeferOwnFileRead = true;
-            using var resources = new F4ResourceCheck($"active-guests-{players}", first, output);
+            using var resources = await F4ResourceCheck.WarmAsync($"active-guests-{players}", first, output, ct);
             for (int cycle = 1; cycle <= 6; cycle++)
             {
                 async Task JoinAsync(GameBridge guest, JoinWire link, JoinCalendarTestEngine engine, string selected)
@@ -500,7 +500,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
                 Assert.Equal(2 * cycle, hostLink.ReadyReceived.Distinct().Count());
                 Console.WriteLine($"F4-ACTIVE-GUESTS cycle={cycle} targeted_ready={hostLink.ReadyReceived.Count} overlapping_returns=2 own_sha256_equal=2");
-                await resources.CycleAsync(cycle - 1, ct);
+                await resources.CycleAsync(cycle - 1, ct, second);
             }
             resources.AssertBudget();
         }
@@ -554,7 +554,7 @@ public sealed partial class JoinCalendarIntegrationTests
         private int _nextCycle;
         private F4ResourceSample _before, _after;
 
-        public F4ResourceCheck(string scenario, GameBridge guest, ITestOutputHelper output)
+        private F4ResourceCheck(string scenario, GameBridge guest, ITestOutputHelper output)
         {
             _scenario = scenario;
             _guest = guest;
@@ -564,6 +564,32 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.True(ThreadPool.SetMinThreads(_warmWorkers, _ioMin));
             _sampler = new Thread(Sample) { IsBackground = true, Name = "F4 resource sampler" };
             _sampler.Start();
+        }
+
+        public static async Task<F4ResourceCheck> WarmAsync(string scenario, GameBridge guest,
+            ITestOutputHelper output, CancellationToken ct)
+        {
+            var check = new F4ResourceCheck(scenario, guest, output);
+            try
+            {
+                // Finish synthetic worker startup before any real cycle, so
+                // every measurement sees the same work since the last return.
+                using var release = new ManualResetEventSlim();
+                using var startup = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                startup.CancelAfter(TimeSpan.FromSeconds(10));
+                int waiting = check._warmWorkers;
+                await Task.WhenAll(Enumerable.Range(0, check._warmWorkers).Select(_ => Task.Run(() =>
+                {
+                    if (Interlocked.Decrement(ref waiting) == 0) release.Set();
+                    release.Wait(startup.Token);
+                })));
+                return check;
+            }
+            catch
+            {
+                check.Dispose();
+                throw;
+            }
         }
 
         private void Sample()
@@ -577,22 +603,13 @@ public sealed partial class JoinCalendarIntegrationTests
             }
         }
 
-        public async Task CycleAsync(int cycle, CancellationToken ct)
+        public async Task CycleAsync(int cycle, CancellationToken ct, GameBridge? secondGuest = null)
         {
             Assert.Equal(_nextCycle++, cycle);
-            if (cycle == 0)
-            {
-                // Start the common worker floor once, ahead of both samples.
-                using var release = new ManualResetEventSlim();
-                using var startup = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                startup.CancelAfter(TimeSpan.FromSeconds(10));
-                int waiting = _warmWorkers;
-                await Task.WhenAll(Enumerable.Range(0, _warmWorkers).Select(_ => Task.Run(() =>
-                {
-                    if (Interlocked.Decrement(ref waiting) == 0) release.Set();
-                    release.Wait(startup.Token);
-                })));
-            }
+            // Gameplay or menu can be confirmed before its native publication
+            // returns. Drain that operation before comparing idle resources.
+            await WaitForNativePublicationAsync(_guest, ct);
+            if (secondGuest is not null) await WaitForNativePublicationAsync(secondGuest, ct);
             var request = new TaskCompletionSource<F4ResourceSample>(TaskCreationOptions.RunContinuationsAsynchronously);
             _requests.Add(request, ct);
             var sample = await request.Task.WaitAsync(ct);
@@ -604,6 +621,13 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"pipe_revision={sample.Owned.PipeRevision} rejoin_timer={sample.Owned.Timers}");
             if (sample.WindowsHandleTypes is string types)
                 _output.WriteLine($"F4-HANDLE-TYPES scenario={_scenario} cycle={cycle} {types}");
+        }
+
+        private static async Task WaitForNativePublicationAsync(GameBridge guest, CancellationToken ct)
+        {
+            var published = Get<SemaphoreSlim>(guest, "_loadSequencePublish");
+            await published.WaitAsync(ct);
+            published.Release();
         }
 
         public void AssertBudget()
