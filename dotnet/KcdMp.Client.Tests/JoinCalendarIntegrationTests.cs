@@ -255,7 +255,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
 
             if (probe is JoinProbe.PlayerJoinLoop or JoinProbe.ReturnDeadlineLoop)
             {
-                await TestPlayerJoinLoopAsync(fixture, host, guest, hostLink, guestLink, guestGame, extraPeers + 2,
+                await TestPlayerJoinLoopAsync(fixture, relay, host, guest, hostLink, guestLink, guestGame, extraPeers + 2,
                     ct, f4Output!, probe == JoinProbe.ReturnDeadlineLoop);
                 return;
             }

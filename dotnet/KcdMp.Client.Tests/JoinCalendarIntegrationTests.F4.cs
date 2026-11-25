@@ -51,6 +51,7 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
         const string regexCache = "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Text.RegularExpressions.RegexCache.Add";
         const string workerStart = "ntdll.dll>KERNELBASE.dll>coreclr.dll+418df>System.Threading.Thread.StartCore";
         const string workerName = "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Threading.Thread.SetThreadPoolWorkerThreadName";
+        const string gateWait = "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Threading.SemaphoreSlim.WaitAsync";
         F4WindowsHandleTrace.Allocation[] allocations =
         [
             new("Event", 10, socketEvent), new("Thread", 10, socketThread, TargetThread: 10),
@@ -62,7 +63,10 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
             new("Thread", 20, socketThread, TargetThread: 20), new("Thread", 20, socketThread, TargetThread: 20),
             new("Event", 21, socketEvent),
             new("File", 10, socketEvent),
-            new("Event", 10, "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Threading.SemaphoreSlim.WaitAsync"),
+            new("Event", 10, gateWait),
+            new("Event", 10, gateWait, PersistentMonitor: "relay-0._writeSignal"),
+            new("File", 10, gateWait, PersistentMonitor: "relay-0._writeSignal"),
+            new("Event", 10, "Some.Application.Open", PersistentMonitor: "other-gate"),
             new("Event", 10, regexCache),
             new("Event", 15, workerStart), new("Event", 15, workerStart), new("Thread", 15, workerStart, Worker: 16),
             new("Event", 17, workerStart), new("Event", 17, workerStart), new("Thread", 17, workerStart),
@@ -70,9 +74,60 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
         ];
         var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations,
             new HashSet<long> { 10, 11, 12, 13, 16, 19, 20, 21 }, out var started);
-        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1, 1, 1, 1), runtime);
-        Assert.Equal(8, runtime.Total);
+        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1, 1, 1, 1, 1), runtime);
+        Assert.Equal(9, runtime.Total);
         Assert.Equal(16, Assert.Single(started));
+    }
+
+    [Fact]
+    public async Task A_baseline_gate_has_a_concrete_runtime_monitor_owner()
+    {
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var release = new ManualResetEventSlim();
+        using var owner = new ContendedSemaphore();
+        using var trace = new F4PersistentMonitorTrace();
+        trace.Track("baseline", owner);
+        object monitor = Assert.IsType<System.Runtime.CompilerServices.StrongBox<bool>>(
+            F4PersistentMonitorTrace.GetMonitor(owner.Gate));
+        var acquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task holder = Task.Factory.StartNew(() =>
+        {
+            lock (monitor)
+            {
+                acquired.SetResult();
+                release.Wait(stop.Token);
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Task waiting = Task.CompletedTask;
+        try
+        {
+            await acquired.Task.WaitAsync(stop.Token);
+            waiting = Task.Run(async () =>
+            {
+                await owner.Gate.WaitAsync(stop.Token);
+                owner.Gate.Release();
+            });
+            await trace.FirstObserved.WaitAsync(stop.Token);
+        }
+        finally
+        {
+            release.Set();
+            await Task.WhenAll(holder, waiting);
+        }
+        if (F4PersistentMonitorTrace.Supported)
+        {
+            var (handle, name) = Assert.Single(trace.ReadHandles());
+            Assert.Equal("baseline.Gate", name);
+            Dictionary<nint, string> objects = [];
+            F4WindowsHandleTypes.Capture(objects);
+            Assert.Equal("Event", objects.GetValueOrDefault(handle));
+        }
+    }
+
+    private sealed class ContendedSemaphore : IDisposable
+    {
+        public readonly SemaphoreSlim Gate = new(1, 1);
+        public void Dispose() => Gate.Dispose();
     }
 
     [Fact]
@@ -738,9 +793,10 @@ public sealed partial class JoinCalendarIntegrationTests
 
     private readonly record struct F4ResourceSample(int Threads, int Handles, int RawThreads, int RawHandles,
         int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, F4WindowsHandleTypes.Inventory WindowsHandles,
-        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, HashSet<long>? WindowsThreadIds, Task<bool>[] FrameDeadlines);
+        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, IReadOnlyDictionary<nint, string>? PersistentMonitorHandles,
+        HashSet<long>? WindowsThreadIds, Task<bool>[] FrameDeadlines);
 
-    private static F4ResourceSample F4Resources(GameBridge guest, bool traceWindowsHandles, F4ProcessorDeadlines deadlineTrace)
+    private static F4ResourceSample F4Resources(GameBridge guest, F4WindowsHandleTrace? windowsTrace, F4ProcessorDeadlines deadlineTrace)
     {
         using var process = Process.GetCurrentProcess();
         int rawThreads = process.Threads.Count;
@@ -757,7 +813,10 @@ public sealed partial class JoinCalendarIntegrationTests
         int timers = Get<bool>(guest, "_rejoinPending") ? 1 : 0;
         var pipe = Get<CombatPipe>(guest, "_combat");
         var (runtimeTimers, frameDeadlines) = deadlineTrace.Sample();
+        bool traceWindowsHandles = windowsTrace is not null;
         Dictionary<IntPtr, string>? objects = traceWindowsHandles ? new() : null;
+        // A pinned live monitor keeps this same event through the inventory.
+        var monitors = windowsTrace?.SampleMonitorHandles();
         var inventory = traceWindowsHandles ? F4WindowsHandleTypes.Capture(objects) : default;
         // Count after the inventory calls, so handles they initialise are present in the same observation.
         process.Refresh();
@@ -765,7 +824,7 @@ public sealed partial class JoinCalendarIntegrationTests
         var threadIds = traceWindowsHandles ? processThreads.Cast<ProcessThread>().Select(thread => (long)thread.Id).ToHashSet() : null;
         int handles = process.HandleCount;
         return new(processThreads.Count, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, runtimeTimers,
-            new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers), inventory, objects, threadIds, frameDeadlines);
+            new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers), inventory, objects, monitors, threadIds, frameDeadlines);
     }
 
     private sealed class F4ResourceCheck : IDisposable
@@ -773,6 +832,7 @@ public sealed partial class JoinCalendarIntegrationTests
         private const int TimerAllowance = 1;
         private readonly string _scenario;
         private readonly GameBridge _guest;
+        private readonly ReplayRelay? _relay;
         private readonly ITestOutputHelper _output;
         private readonly AutoResetEvent _requestReady = new(false);
         private readonly F4ProcessorDeadlines _deadlineTrace = new();
@@ -783,12 +843,13 @@ public sealed partial class JoinCalendarIntegrationTests
         private int _nextCycle;
         private F4ResourceSample _before, _after;
 
-        public F4ResourceCheck(string scenario, GameBridge guest, ITestOutputHelper output)
+        public F4ResourceCheck(string scenario, GameBridge guest, ITestOutputHelper output, ReplayRelay? relay = null)
         {
             _scenario = scenario;
             _guest = guest;
             _output = output;
-            if (OperatingSystem.IsWindows()) _handleTrace = new();
+            _relay = relay;
+            if (OperatingSystem.IsWindows()) _handleTrace = new(observeMonitors: relay is not null);
             _sampler = new Thread(Sample) { IsBackground = true, Name = "F4 resource sampler" };
             _sampler.Start();
         }
@@ -865,7 +926,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 if (Volatile.Read(ref _stopSampler)) return;
                 var request = Interlocked.Exchange(ref _request, null);
                 if (request is null) continue;
-                try { request.SetResult(F4Resources(_guest, _handleTrace is not null, _deadlineTrace)); }
+                try { request.SetResult(F4Resources(_guest, _handleTrace, _deadlineTrace)); }
                 catch (Exception ex) { request.SetException(ex); }
             }
         }
@@ -873,7 +934,25 @@ public sealed partial class JoinCalendarIntegrationTests
         public async Task CycleAsync(int cycle, CancellationToken ct, params GameBridge[] others)
         {
             Assert.Equal(_nextCycle++, cycle);
-            if (cycle == 0) await PrimeWorkersAsync(ct);
+            if (cycle == 0)
+            {
+                if (_relay is not null && _handleTrace is { TracksMonitors: true } trace)
+                {
+                    foreach (var session in _relay.ReadySessions())
+                        trace.TrackGates($"relay-{session.Id}", session);
+                    TrackPlayer("guest", _guest);
+                    for (int index = 0; index < others.Length; index++)
+                        TrackPlayer($"partner-{index}", others[index]);
+
+                    void TrackPlayer(string role, GameBridge agent)
+                    {
+                        trace.TrackGates(role, agent);
+                        trace.TrackGates($"{role}.combat", Get<CombatPipe>(agent, "_combat"));
+                        trace.TrackGates($"{role}.transport", Get<IGameTransport>(agent, "_transport"));
+                    }
+                }
+                await PrimeWorkersAsync(ct);
+            }
             var sample = await SampleAfterNativeAsync();
             if (sample.FrameDeadlines.Length > 0 &&
                 (cycle == 0 || cycle == 5 && sample.RuntimeTimers > _before.RuntimeTimers + TimerAllowance))
@@ -953,7 +1032,7 @@ public sealed partial class JoinCalendarIntegrationTests
             {
                 var newThreads = new HashSet<long>(endThreads);
                 newThreads.ExceptWith(startThreads);
-                var origins = _handleTrace.DescribeNewHandles(start, end, newThreads, checkThreads);
+                var origins = _handleTrace.DescribeNewHandles(start, end, after.PersistentMonitorHandles, newThreads, checkThreads);
                 runtime = origins.Runtime;
                 idleWorkers = Math.Min(origins.IdleNewWorkers, Math.Max(0, after.ThreadPoolWorkers - before.ThreadPoolWorkers));
                 _output.WriteLine($"F4-HANDLE-ORIGINS scenario={_scenario} {origins.Details}");
@@ -963,7 +1042,7 @@ public sealed partial class JoinCalendarIntegrationTests
             _output.WriteLine($"F4-HANDLE-BUDGET scenario={_scenario} before={before.Handles} after={after.Handles} " +
                 $"winsock_pairs={runtime.WinsockPairs} regex_cache_events={runtime.RegexCacheEvents} " +
                 $"worker_starts={runtime.WorkerStarts} worker_name_events={runtime.WorkerNameEvents} " +
-                $"winsock_thread_refs={runtime.WinsockThreadReferences} compared_after={comparedHandles}");
+                $"winsock_thread_refs={runtime.WinsockThreadReferences} persistent_monitor_events={runtime.PersistentMonitorEvents} compared_after={comparedHandles}");
             _output.WriteLine($"F4-THREAD-BUDGET scenario={_scenario} before={before.Threads} after={after.Threads} " +
                 $"idle_new_workers={idleWorkers} compared_after={comparedThreads}");
             int? startFiles = before.WindowsHandles.FileHandles;

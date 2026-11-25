@@ -7,7 +7,7 @@ public sealed partial class JoinCalendarIntegrationTests
     public Task Five_missing_return_terminals_use_one_probe_and_keep_unverified_saves_locked() =>
         RunAsync("A", "B", dropFirstSnapshot: false, JoinProbe.ReturnDeadlineLoop, f4Output: testOutput);
 
-    private static async Task TestPlayerJoinLoopAsync(SaveFixture fixture, GameBridge host, GameBridge guest,
+    private static async Task TestPlayerJoinLoopAsync(SaveFixture fixture, ReplayRelay relay, GameBridge host, GameBridge guest,
         JoinWire hostLink, JoinWire guestLink, JoinCalendarTestEngine engine, int players, CancellationToken ct,
         Xunit.Abstractions.ITestOutputHelper output, bool returnDeadline)
     {
@@ -20,7 +20,7 @@ public sealed partial class JoinCalendarIntegrationTests
         // the engine read. A faster notice must not merge these two edges.
         engine.DeferOwnFileRead = true;
         engine.Emit("wo124_where", "world");
-        using var resources = new F4ResourceCheck(returnDeadline ? "return-deadline" : $"cancel-rejoin-{players}", guest, output);
+        using var resources = new F4ResourceCheck(returnDeadline ? "return-deadline" : $"cancel-rejoin-{players}", guest, output, relay);
         for (int cycle = 1; cycle <= 6; cycle++)
         {
             int readyBefore = guestLink.ReadySent.Count;

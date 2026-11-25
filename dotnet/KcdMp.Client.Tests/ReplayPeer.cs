@@ -33,6 +33,9 @@ internal sealed class ReplayRelay : IAsyncDisposable
 
     public int Port { get; }
 
+    public ClientSession[] ReadySessions() =>
+        _app.Services.GetRequiredService<ClientHandler>().GetClients().Where(session => session.IsReady).ToArray();
+
     public static async Task<ReplayRelay> StartAsync(CancellationToken ct = default, string logLevel = "Fatal",
         bool keepRecordedStates = false)
     {

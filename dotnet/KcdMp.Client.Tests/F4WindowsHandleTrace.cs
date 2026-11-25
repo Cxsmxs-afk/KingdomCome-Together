@@ -13,6 +13,7 @@ internal sealed class F4WindowsHandleTrace : IDisposable
     private const int StackFrames = 16;
     private readonly IntPtr _process = GetCurrentProcess();
     private readonly bool? _newestFirst;
+    private readonly F4PersistentMonitorTrace? _monitors;
     public int EnableStatus { get; }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -26,15 +27,17 @@ internal sealed class F4WindowsHandleTrace : IDisposable
     private sealed record HandleOperation(int Kind, long Thread, long[] Frames);
     private sealed record HandleHistory(HandleOperation[] Operations, string? Problem = null);
     private sealed record WorkerObservation(long Id, string[] Frames, bool Waiting);
-    internal readonly record struct Allocation(string Kind, long Thread, string Stack, long Worker = 0, long TargetThread = 0);
+    internal readonly record struct Allocation(string Kind, long Thread, string Stack, long Worker = 0, long TargetThread = 0,
+        string? PersistentMonitor = null);
     internal readonly record struct Bookkeeping(int WinsockPairs, int RegexCacheEvents, int WorkerStarts, int WorkerNameEvents,
-        int WinsockThreadReferences = 0)
+        int WinsockThreadReferences = 0, int PersistentMonitorEvents = 0)
     {
-        public int Total => 2 * WinsockPairs + WinsockThreadReferences + RegexCacheEvents + 3 * WorkerStarts + WorkerNameEvents;
+        public int Total => 2 * WinsockPairs + WinsockThreadReferences + RegexCacheEvents + 3 * WorkerStarts +
+            WorkerNameEvents + PersistentMonitorEvents;
     }
     internal readonly record struct HandleOrigins(string Details, Bookkeeping Runtime, int IdleNewWorkers = 0);
 
-    public F4WindowsHandleTrace()
+    public F4WindowsHandleTrace(bool observeMonitors)
     {
         // PROCESS_HANDLE_TRACING_ENABLE_EX. Retain history across the TCP and
         // handle-inventory churn without keeping every open operation in the test.
@@ -46,16 +49,22 @@ internal sealed class F4WindowsHandleTrace : IDisposable
             EnableStatus = NtSetInformationProcess(_process, ProcessHandleTracing, ref flags, sizeof(int));
         }
         if (EnableStatus >= 0) _newestFirst = DetectHistoryOrder();
+        if (_newestFirst is not null && observeMonitors && F4PersistentMonitorTrace.Supported)
+            _monitors = new F4PersistentMonitorTrace();
     }
 
+    public bool TracksMonitors => _monitors is not null;
+    public void TrackGates(string role, object owner) => _monitors?.Track(role, owner);
+    public IReadOnlyDictionary<nint, string>? SampleMonitorHandles() => _monitors?.ReadHandles();
+
     public HandleOrigins DescribeNewHandles(IReadOnlyDictionary<IntPtr, string> start, IReadOnlyDictionary<IntPtr, string> end,
-        IReadOnlySet<long> newThreads, bool checkIdleWorkers)
+        IReadOnlyDictionary<nint, string>? monitors, IReadOnlySet<long> newThreads, bool checkIdleWorkers)
     {
         if (EnableStatus < 0) return new($"enabled=0 status={unchecked((uint)EnableStatus):x8}", default);
         // Query the original handle history before querying modules or creating a
         // process snapshot. Those diagnostics perform more handle operations.
         var captured = end.Where(kv => !start.TryGetValue(kv.Key, out var kind) || kv.Value != kind)
-            .Select(kv => (Kind: kv.Value, Stack: ReadOpenStack(kv.Key),
+            .Select(kv => (Handle: kv.Key, Kind: kv.Value, Stack: ReadOpenStack(kv.Key),
                 Worker: kv.Value == "Thread" ? ThreadPoolWorkerId(kv.Key) : 0,
                 Target: kv.Value == "Thread" ? (long)GetThreadId(kv.Key) : 0)).ToArray();
         using var self = Process.GetCurrentProcess();
@@ -67,11 +76,13 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         using var diagnostics = TrySnapshot();
         using var runtime = TryReadRuntime(diagnostics);
         var allocations = captured.Select(handle => new Allocation(handle.Kind, handle.Stack.Thread,
-            DescribeStack(handle.Stack, modules, runtime), handle.Worker, handle.Target)).ToArray();
+            DescribeStack(handle.Stack, modules, runtime), handle.Worker, handle.Target,
+            handle.Kind == "Event" ? monitors?.GetValueOrDefault(handle.Handle) : null)).ToArray();
         var bookkeeping = CountBookkeeping(allocations, liveThreads, out var startedWorkers);
         var workers = checkIdleWorkers ? ObservePoolWorkers(runtime, startedWorkers, newThreads) : [];
         var histories = allocations.Select(handle =>
-            $"{handle.Kind}:{handle.Stack}@thread={handle.Thread}@worker={handle.Worker}@target={handle.TargetThread}");
+            $"{handle.Kind}:{handle.Stack}@thread={handle.Thread}@worker={handle.Worker}@target={handle.TargetThread}" +
+            (handle.PersistentMonitor is { } monitor ? $"@monitor={monitor}" : ""));
         string order = _newestFirst is true ? "newest-first" : _newestFirst is false ? "oldest-first" : "unknown";
         var workerStacks = workers.OrderBy(worker => worker.Id)
             .Select(worker => $"{worker.Id}:{(worker.Waiting ? "waiting" : "other")}:{string.Join('>', worker.Frames.Take(6))}");
@@ -83,10 +94,11 @@ internal sealed class F4WindowsHandleTrace : IDisposable
 
     internal static Bookkeeping CountBookkeeping(Allocation[] allocations, IReadOnlySet<long> liveThreads, out HashSet<long> startedWorkers)
     {
+        var ordinary = allocations.Where(handle => handle.PersistentMonitor is null).ToArray();
         // The provider holds an Event and a reference to its actual calling
         // thread. An Event alone or competing references do not identify the
         // owner. A single Thread handle can identify itself via its OS target.
-        var socketHandles = allocations
+        var socketHandles = ordinary
             .Where(handle => liveThreads.Contains(handle.Thread))
             .Select(handle => (Handle: handle, Api: WinsockApi(handle)))
             .Where(row => row.Api is not null);
@@ -102,14 +114,14 @@ internal sealed class F4WindowsHandleTrace : IDisposable
 
         // RegexCache.Add enters a single static BCL monitor. Extra events
         // with this stack, and events from any application monitor, stay counted.
-        int regexEvents = allocations.Count(handle => handle.Kind == "Event" &&
+        int regexEvents = ordinary.Count(handle => handle.Kind == "Event" &&
             handle.Stack.Contains("coreclr.dll+", StringComparison.Ordinal) &&
             handle.Stack.Split('>').Contains("System.Text.RegularExpressions.RegexCache.Add", StringComparer.Ordinal));
 
         // Attribute CLR startup only for identified, still-live pool workers.
         // An application-owned Thread.StartCore or an unmatched Event stays counted.
         var workers = new HashSet<long>();
-        var threadStarts = allocations.Where(handle => handle.Thread != 0 &&
+        var threadStarts = ordinary.Where(handle => handle.Thread != 0 &&
             handle.Stack.Contains("coreclr.dll+", StringComparison.Ordinal) &&
             handle.Stack.Split('>').Contains("System.Threading.Thread.StartCore", StringComparer.Ordinal));
         foreach (var launch in threadStarts.GroupBy(handle => handle.Thread))
@@ -122,12 +134,20 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         }
         // The CLR assigns the name under the new worker's own monitor. Its
         // single contended initialization event belongs to that same worker.
-        int nameEvents = allocations.Where(handle => handle.Kind == "Event" && workers.Contains(handle.Thread) &&
+        int nameEvents = ordinary.Where(handle => handle.Kind == "Event" && workers.Contains(handle.Thread) &&
                 handle.Stack.Contains("coreclr.dll+", StringComparison.Ordinal) &&
                 handle.Stack.Split('>').Contains("System.Threading.Thread.SetThreadPoolWorkerThreadName", StringComparer.Ordinal))
             .GroupBy(handle => handle.Thread).Count(group => group.Count() == 1);
+        // A real native handle and a named pre-existing gate must both match.
+        // Unknown or per-leave monitors are charged even with this stack.
+        int monitorEvents = allocations.Where(handle => handle.Kind == "Event" && handle.PersistentMonitor is not null)
+            .Select(handle => (handle.PersistentMonitor, Stack: handle.Stack.Split('>')))
+            .Where(handle => handle.Stack.Contains("coreclr.dll+886b", StringComparer.OrdinalIgnoreCase) &&
+                handle.Stack.Any(frame => frame is "System.Threading.SemaphoreSlim.WaitAsync" or
+                    "System.Threading.SemaphoreSlim.Wait" or "System.Threading.SemaphoreSlim.Release"))
+            .GroupBy(handle => handle.PersistentMonitor).Count(group => group.Count() == 1);
         startedWorkers = workers;
-        return new(pairs, regexEvents == 1 ? 1 : 0, workers.Count, nameEvents, threadReferences);
+        return new(pairs, regexEvents == 1 ? 1 : 0, workers.Count, nameEvents, threadReferences, monitorEvents);
     }
 
     private static WorkerObservation[] ObservePoolWorkers(ClrRuntime? runtime, IReadOnlySet<long> startedWorkers, IReadOnlySet<long> newThreads)
@@ -284,6 +304,7 @@ internal sealed class F4WindowsHandleTrace : IDisposable
 
     public void Dispose()
     {
+        _monitors?.Dispose();
         if (EnableStatus >= 0)
             _ = NtSetInformationProcess(_process, ProcessHandleTracing, IntPtr.Zero, 0);
     }
