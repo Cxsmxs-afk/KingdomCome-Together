@@ -671,7 +671,18 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
             }
             else if (writer is not null)
             {
-                await guestGame.WaitForSaveLockAsync(ct);
+                try
+                {
+                    string loaded = await guestGame.WaitForJoinLoadAsync(ct);
+                    Assert.Equal($"mpworld{joinId:x8}.whs", Path.GetFileName(loaded));
+                    await guestGame.WaitForSaveLockAsync(ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    Assert.Fail($"The join did not reach its save-lock query before Ready. " +
+                        $"phase={Call(guest, "JoinMenuPhase")} loads={guestGame.JoinLoadsIssued} " +
+                        $"engine_reads={guestGame.JoinFilesRead} clock_in={Get<long>(guest, "_w200ClockIn")}");
+                }
                 var blocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 var flushed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

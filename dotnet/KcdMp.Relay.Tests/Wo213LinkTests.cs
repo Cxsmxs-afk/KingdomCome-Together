@@ -329,6 +329,14 @@ public class Wo213MeasureTests
 /// <summary>WO-213 C/D: the scheduler (pure). Each check with its twin (the switch off).</summary>
 public class Wo213SchedulerTests
 {
+    private sealed class SchedulerClock : TimeProvider
+    {
+        private long _milliseconds;
+        public override long TimestampFrequency => 1_000;
+        public override long GetTimestamp() => _milliseconds;
+        public void Advance(int milliseconds) => _milliseconds += milliseconds;
+    }
+
     private static byte[] NpcDown(byte src, string name, float x, ushort seq = 1)
     {
         var nb = Encoding.UTF8.GetBytes(name);
@@ -381,10 +389,11 @@ public class Wo213SchedulerTests
     [Fact]
     public void Events_go_first_in_order_and_are_never_merged_or_dropped()
     {
-        var s = new LinkScheduler(new LinkSchedOptions { AgeLimitMs = 1 });
+        var clock = new SchedulerClock();
+        var s = new LinkScheduler(new LinkSchedOptions { AgeLimitMs = 1 }, clock);
         s.Enqueue(NpcDown(0, "npc_a", 1));
         for (int i = 0; i < 5; i++) s.Enqueue(Event(i));
-        Thread.Sleep(20);
+        clock.Advance(20);
         var got = Drain(s);
         Assert.Equal(5, got.Count);   // the state aged out (C.3), every event went
         for (int i = 0; i < 5; i++) Assert.Equal(i, got[i][6]);
@@ -403,10 +412,11 @@ public class Wo213SchedulerTests
     [Fact]
     public void A_multi_second_event_backlog_lets_the_newest_state_go_first()
     {
-        var s = new LinkScheduler(new LinkSchedOptions { EventSnapMs = 40 });
+        var clock = new SchedulerClock();
+        var s = new LinkScheduler(new LinkSchedOptions { EventSnapMs = 40 }, clock);
         s.Enqueue(Event(1));
         s.Enqueue(Event(2));
-        Thread.Sleep(80);
+        clock.Advance(80);
         s.Enqueue(NpcDown(0, "npc_a", 9));
         Assert.True(s.TryTake(int.MaxValue, -1, out var frame, out bool isState));
         Assert.True(isState);
@@ -414,9 +424,9 @@ public class Wo213SchedulerTests
         Assert.True(s.StateJumped >= 1);
         var rest = Drain(s);
         Assert.Equal(2, rest.Count);
-        var held = new LinkScheduler(new LinkSchedOptions { EventSnapMs = 0 });
+        var held = new LinkScheduler(new LinkSchedOptions { EventSnapMs = 0 }, clock);
         held.Enqueue(Event(1));
-        Thread.Sleep(80);
+        clock.Advance(80);
         held.Enqueue(NpcDown(0, "npc_a", 9));
         Assert.True(held.TryTake(int.MaxValue, -1, out var ev, out bool evState));
         Assert.False(evState);
@@ -426,13 +436,14 @@ public class Wo213SchedulerTests
     [Fact]
     public void Age_limit_drops_old_state_and_twin_sends_it_late()
     {
-        var s = new LinkScheduler(new LinkSchedOptions { AgeLimitMs = 30 });
+        var clock = new SchedulerClock();
+        var s = new LinkScheduler(new LinkSchedOptions { AgeLimitMs = 30 }, clock);
         s.Enqueue(NpcDown(0, "npc_a", 1));
-        Thread.Sleep(80);
+        clock.Advance(80);
         Assert.Empty(Drain(s));
-        var twin = new LinkScheduler(new LinkSchedOptions { AgeLimitMs = 0 });
+        var twin = new LinkScheduler(new LinkSchedOptions { AgeLimitMs = 0 }, clock);
         twin.Enqueue(NpcDown(0, "npc_a", 1));
-        Thread.Sleep(80);
+        clock.Advance(80);
         Assert.Single(Drain(twin));
     }
 
@@ -460,10 +471,11 @@ public class Wo213SchedulerTests
         hands[1 + Protocol.JoinHeaderLen] = Protocol.ExtraKindHands; hands[2 + Protocol.JoinHeaderLen] = 1; hands[3 + Protocol.JoinHeaderLen] = 1; hands[4 + Protocol.JoinHeaderLen] = (byte)'a';
         Assert.False(LinkStateCodec.Split(Frame(Protocol.ActivityExtraDown, hands), pieces));   // the first build: a slot, repeated every 3 s
         Assert.False(LinkState.IsStateType(Protocol.ActivityExtraDown));
-        var s = new LinkScheduler(new LinkSchedOptions { Unreliable = true, RepeatMs = 30, RepeatExtraMs = 30 });
+        var clock = new SchedulerClock();
+        var s = new LinkScheduler(new LinkSchedOptions { Unreliable = true, RepeatMs = 30, RepeatExtraMs = 30 }, clock);
         s.Enqueue(Frame(Protocol.ActivityExtraDown, hands));
         Assert.Single(Drain(s));
-        Thread.Sleep(80);
+        clock.Advance(80);
         Assert.Empty(Drain(s));   // never repeated
         Assert.Equal(1, s.EventsSent);
     }
@@ -505,31 +517,35 @@ public class Wo213SchedulerTests
     [Fact]
     public void Repeats_restate_unchanged_owner_state_only_while_unreliable()
     {
-        var s = new LinkScheduler(new LinkSchedOptions { Unreliable = true, RepeatMs = 30 });
+        var clock = new SchedulerClock();
+        var s = new LinkScheduler(new LinkSchedOptions { Unreliable = true, RepeatMs = 30 }, clock);
         s.Enqueue(NpcDown(0, "a", 1));
         s.Enqueue(Anim("a"));
         Assert.Equal(2, Drain(s).Count);
-        Thread.Sleep(60);
+        clock.Advance(29);
+        Assert.Empty(Drain(s));
+        clock.Advance(1);
         var again = Drain(s);
         Assert.Single(again);
         Assert.Equal(Protocol.NpcAnimDown, again[0][0]);
         Assert.Equal(1, s.Repeats);
-        var twin = new LinkScheduler(new LinkSchedOptions { Unreliable = false, RepeatMs = 30 });
+        var twin = new LinkScheduler(new LinkSchedOptions { Unreliable = false, RepeatMs = 30 }, clock);
         twin.Enqueue(NpcDown(0, "a", 1));
         twin.Enqueue(Anim("a"));
         Drain(twin);
-        Thread.Sleep(60);
+        clock.Advance(60);
         Assert.Empty(Drain(twin));
     }
 
     [Fact]
     public void Bands_send_the_fighter_before_the_far_body()
     {
-        var s = new LinkScheduler { BandOf = p => p.Body == "fighter" ? 0 : 3 };
+        var clock = new SchedulerClock();
+        var s = new LinkScheduler(null, clock) { BandOf = p => p.Body == "fighter" ? 0 : 3 };
         s.Enqueue(NpcDown(0, "far", 1));
         s.Enqueue(NpcDown(0, "fighter", 1));
         Drain(s);
-        Thread.Sleep(40);
+        clock.Advance(40);
         s.Enqueue(NpcDown(0, "far", 2));
         s.Enqueue(NpcDown(0, "fighter", 2));
         var got = Drain(s);

@@ -49,6 +49,7 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
         const string socketEvent = "ntdll.dll>mswsock.dll>ws2_32.dll>Interop+Winsock.WSARecv";
         const string socketThread = "ntdll.dll>ws2_32.dll>Interop+Winsock.WSARecv";
         const string regexCache = "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Text.RegularExpressions.RegexCache.Add";
+        const string workerStart = "ntdll.dll>KERNELBASE.dll>coreclr.dll+418df>System.Threading.Thread.StartCore";
         F4WindowsHandleTrace.Allocation[] allocations =
         [
             new("Event", 10, socketEvent), new("Thread", 10, socketThread),
@@ -58,11 +59,13 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
             new("Event", 14, socketEvent), new("Thread", 14, socketThread),
             new("File", 10, socketEvent),
             new("Event", 10, "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Threading.SemaphoreSlim.WaitAsync"),
-            new("Event", 10, regexCache)
+            new("Event", 10, regexCache),
+            new("Event", 15, workerStart), new("Event", 15, workerStart), new("Thread", 15, workerStart, Worker: 16),
+            new("Event", 17, workerStart), new("Event", 17, workerStart), new("Thread", 17, workerStart)
         ];
-        var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations, new HashSet<long> { 10, 11, 12, 13 });
-        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1), runtime);
-        Assert.Equal(3, runtime.Total);
+        var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations, new HashSet<long> { 10, 11, 12, 13, 16 });
+        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1, 1), runtime);
+        Assert.Equal(6, runtime.Total);
     }
 
     [Fact]
@@ -890,7 +893,8 @@ public sealed partial class JoinCalendarIntegrationTests
             }
             int comparedHandles = after.Handles - runtime.Total;
             _output.WriteLine($"F4-HANDLE-BUDGET scenario={_scenario} before={before.Handles} after={after.Handles} " +
-                $"winsock_pairs={runtime.WinsockPairs} regex_cache_events={runtime.RegexCacheEvents} compared_after={comparedHandles}");
+                $"winsock_pairs={runtime.WinsockPairs} regex_cache_events={runtime.RegexCacheEvents} " +
+                $"worker_starts={runtime.WorkerStarts} compared_after={comparedHandles}");
             Assert.True(after.RuntimeTimers <= before.RuntimeTimers + TimerAllowance,
                 $"F4 runtime timer budget: scenario={_scenario} {before.RuntimeTimers}->{after.RuntimeTimers}, allowance={TimerAllowance}");
             Assert.InRange(after.Threads, 0, before.Threads + 4);
