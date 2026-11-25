@@ -729,10 +729,13 @@ public sealed partial class JoinCalendarIntegrationTests
         secondEngine.Transport.MainMenuShown += secondPipe.ObserveMainMenu;
         secondEngine.Emit("wo124_where", "menu");
         Task secondRead = InvokeAsync(second, "ReceiveLoopAsync", secondLink, secondStop.Token);
+        int activeCycle = 0;
+        string phase = "second-peer-role";
         try
         {
             await WaitAsync(() => Get<bool>(second, "_combatRoleApplyComplete"), "the second guest's authenticated role", ct);
             Assert.False(Get<bool>(second, "_isDamageAuthority"));
+            phase = "second-peer-world";
             await InvokeAsync(host, "Wo206AnnounceAsync", "fixture-second-active", (byte?)secondPeer.Id);
             await WaitAsync(() => Get<bool>(second, "_hostModeKnown") && Get<Wo206Epochs>(second, "_w206").World != 0,
                 "the second guest to learn the same authenticated world", ct);
@@ -744,6 +747,7 @@ public sealed partial class JoinCalendarIntegrationTests
             using var resources = new F4ResourceCheck($"active-guests-{players}", first, output, null, host, second);
             for (int cycle = 1; cycle <= 6; cycle++)
             {
+                activeCycle = cycle;
                 async Task JoinAsync(GameBridge guest, JoinWire link, JoinCalendarTestEngine engine, string selected)
                 {
                     Call(guest, "Wo125OnConsoleChoice", selected);
@@ -755,10 +759,13 @@ public sealed partial class JoinCalendarIntegrationTests
                     await engine.WaitForJoinedNotificationAsync(ct);
                 }
 
+                phase = "first-guest-join";
                 await JoinAsync(first, firstLink, firstEngine, "playline0/save001");
                 // The host serializes its save/transfer, but both guests stay live.
+                phase = "second-guest-join";
                 await JoinAsync(second, secondLink, secondEngine, "playline1/save002");
                 Assert.True(Get<bool>(first, "_joinedWorld"));
+                phase = "overlapping-private-loads";
                 Task firstLeaving = InvokeAsync(first, "LeaveSharedWorldAsync", "fixture", "return first guest");
                 Task secondLeaving = InvokeAsync(second, "LeaveSharedWorldAsync", "fixture", "return second guest");
                 Assert.Equal(fixture.GuestOwnSave, await firstEngine.WaitForOwnLoadAsync(ct));
@@ -776,9 +783,16 @@ public sealed partial class JoinCalendarIntegrationTests
                 Assert.Empty(Directory.EnumerateFiles(fixture.GuestSaves, "mp*.whs", SearchOption.AllDirectories));
                 Assert.Equal(2 * cycle, hostLink.ReadyReceived.Distinct().Count());
                 Console.WriteLine($"F4-ACTIVE-GUESTS cycle={cycle} targeted_ready={hostLink.ReadyReceived.Count} overlapping_returns=2 own_sha256_equal=2");
+                phase = "resource-sample";
                 await resources.CycleAsync(cycle - 1, ct, host, second);
             }
+            phase = "resource-budget";
             resources.AssertBudget();
+        }
+        catch (Exception error)
+        {
+            output.WriteLine($"F4-ACTIVE-GUESTS failed players={players} cycle={activeCycle} phase={phase} type={error.GetType().Name}");
+            throw;
         }
         finally
         {
