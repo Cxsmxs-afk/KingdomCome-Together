@@ -18,7 +18,8 @@ public partial class GameBridge
     private readonly object _w171SlotLock = new();
     private Stream? _w171SlotStream;
     private byte _w171SlotHost = 0xFF;
-    private string? _w171SlotHostName;
+    private Guid _w171SlotHostMember;
+    private Guid _w171RosterInstance;
     private uint _w171HostWorld;
     private HostRun? _w171GuestRun;
     private Wo171Rules.SlotTable? _w171Slots;
@@ -63,6 +64,14 @@ public partial class GameBridge
         bool sameStream = ReferenceEquals(_w171SlotStream, stream);
         bool ownHost = W137Host && host == _myGhostId;
         uint world = _w206.World;
+        Guid rosterInstance = _peers.RelayInstance;
+        if (rosterInstance != Guid.Empty && rosterInstance != _w171RosterInstance)
+        {
+            _w171Slots = null;
+            _w171RosterInstance = rosterInstance;
+            _w171SlotHostMember = Guid.Empty;
+            _w171NextSlotSend = 0;
+        }
         // Host ownership comes from the relay. The same local host process can
         // keep its reservations while it reclaims its still-loaded world.
         bool keepLocal = _w171HostWorld != 0 && _w171HostWorld == world && config.IsHosting && _sharedWorld &&
@@ -75,22 +84,21 @@ public partial class GameBridge
                 : _hostModeKnown && !_hostSharedWorld && IsLivePeer(_hostModeFrom);
             if (!separate) return;
         }
-        string? hostName = host != 0xFF && host != _myGhostId ? _peers.NameOf(host) : null;
+        Guid hostMember = host != 0xFF ? _peers.RosterMemberOf(host) : Guid.Empty;
         var guestRun = ownHost || host == 0xFF ? null : Volatile.Read(ref _lastHostRun);
         if (guestRun?.Epoch != world) guestRun = null;
-        if (sameStream && _w171SlotHost == host && _w171SlotHostName == hostName)
+        if (sameStream && _w171SlotHost == host && _w171SlotHostMember == hostMember)
         {
             if (ownHost) _w171HostWorld = world;
             _w171GuestRun = guestRun;
             return;
         }
-        // A returning host can receive another relay ID. Keep the table only
-        // when the already checked run and name on this connection match.
-        bool sameReturnedHost = sameStream && hostName is not null && _w171SlotHostName == hostName &&
+        // The returning host can receive another ghost ID. Retain the table for the same member and verified run.
+        bool sameReturnedHost = sameStream && hostMember != Guid.Empty && _w171SlotHostMember == hostMember &&
             guestRun is not null && guestRun == _w171GuestRun;
         _w171SlotStream = stream;
         _w171SlotHost = host;
-        _w171SlotHostName = hostName;
+        _w171SlotHostMember = hostMember;
         _w171HostWorld = ownHost ? world : 0;
         _w171GuestRun = guestRun;
         if (!sameReturnedHost && (!ownHost || !keepLocal)) _w171Slots = null;
@@ -114,8 +122,7 @@ public partial class GameBridge
             peers = LivePartners();
             slots = _w171Slots ?? new();
             // First observation in the host's live relay roster. Relay id breaks ties within the same tick.
-            foreach (byte peer in peers)
-                if (_peers.NameOf(peer) is string name) slots = slots.AssignGuest(name);
+            foreach (byte peer in peers) slots = slots.AssignGuest(_peers.RosterMemberOf(peer));
             long now = Environment.TickCount64;
             if (peers.Count == 0 || (ReferenceEquals(_w171Slots, slots) && now < _w171NextSlotSend)) return;
             _w171Slots = slots;
@@ -148,11 +155,11 @@ public partial class GameBridge
 
     private void Wo171RefuseSlots(string why)
     {
-        long n = ++_w171SlotRefusals;
+        long n = Interlocked.Increment(ref _w171SlotRefusals);
         if (n <= 4 || n % 64 == 0) Console.WriteLine($"WO171-SLOTS refused reason={why} n={n}");
     }
 
-    private int? Wo171PinSlot(byte ghost, string? name)
+    private int? Wo171PinSlot(byte ghost)
     {
         lock (_w171SlotLock)
         {
@@ -162,9 +169,10 @@ public partial class GameBridge
             // The old one-peer marker harness bypasses the join and supplies no session-mode frame.
             if (_w171SlotHost == 0xFF)
                 return W164TestJoinerInWorld && !_isDamageAuthority && LivePartners() is [var only] && ghost == only ? 1 : null;
-            // Relay IDs can be recycled while the host is unknown. Only the same named host keeps the red pin then.
-            bool isHost = ghost == _w171SlotHost && (ghost == host || (name is not null && name == _w171SlotHostName));
-            return isHost ? 1 : _w171Slots?.FindSlot(name, isHost: false);
+            Guid member = _peers.RosterMemberOf(ghost);
+            // The old ghost ID can be recycled while the host is absent.
+            bool isHost = ghost == _w171SlotHost && (ghost == host || (member != Guid.Empty && member == _w171SlotHostMember));
+            return isHost ? 1 : _w171Slots?.FindSlot(member, isHost: false);
         }
     }
 
@@ -188,7 +196,7 @@ public partial class GameBridge
         var st = _w171Pins.GetOrAdd(g, _ => new W171Pin());
         string? who = _peers.NameOf(g);
         st.Name = Wo171Rules.SanitizeLabel(who);
-        int? hostSlot = Wo171PinSlot(g, who);
+        int? hostSlot = Wo171PinSlot(g);
         int slot = hostSlot ?? 0;
         int rev = slot is >= 1 and <= Wo171Rules.Colours ? Wo171NoteName(slot, st.Name) : 0;
         float yaw = _ghostLastYaw.TryGetValue(g, out var yv) ? yv : 0f;   // a mounted partner's stream is the horse's too (the saddle turns with it)

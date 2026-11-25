@@ -7,7 +7,7 @@ public sealed partial class JoinCalendarIntegrationTests
     public Task Five_missing_return_terminals_use_one_probe_and_keep_unverified_saves_locked() =>
         RunAsync("A", "B", dropFirstSnapshot: false, JoinProbe.ReturnDeadlineLoop, f4Output: testOutput);
 
-    private static async Task TestPlayerJoinLoopAsync(SaveFixture fixture, GameBridge host, GameBridge guest,
+    private static async Task TestPlayerJoinLoopAsync(SaveFixture fixture, ReplayRelay relay, GameBridge host, GameBridge guest,
         JoinWire hostLink, JoinWire guestLink, JoinCalendarTestEngine engine, int players, CancellationToken ct,
         Xunit.Abstractions.ITestOutputHelper output, bool returnDeadline)
     {
@@ -20,7 +20,7 @@ public sealed partial class JoinCalendarIntegrationTests
         // the engine read. A faster notice must not merge these two edges.
         engine.DeferOwnFileRead = true;
         engine.Emit("wo124_where", "world");
-        using var resources = await F4ResourceCheck.WarmAsync(returnDeadline ? "return-deadline" : $"cancel-rejoin-{players}", guest, output, ct);
+        using var resources = new F4ResourceCheck(returnDeadline ? "return-deadline" : $"cancel-rejoin-{players}", guest, output, relay);
         for (int cycle = 1; cycle <= 6; cycle++)
         {
             int readyBefore = guestLink.ReadySent.Count;
@@ -30,6 +30,12 @@ public sealed partial class JoinCalendarIntegrationTests
                 engine.Emit("join_request", "");
                 string file = await engine.WaitForJoinLoadAsync(ct);
                 object attempt = Get<object>(guest, "_jj");
+                // The load is already handed to the engine, which still has
+                // not read the file. Finish its dispatch and queued native
+                // publications before exercising cancellation at that boundary.
+                await GetVisible<TaskCompletionSource>(attempt, "DispatchEnded").Task.WaitAsync(ct);
+                await F4ResourceCheck.WaitForNativeTransitionAsync(guest, ct);
+                Assert.Equal("loading", GetVisible<string>(attempt, "Phase"));
                 uint joinId = GetVisible<uint>(attempt, "JoinId");
                 byte[] placed = File.ReadAllBytes(file);
                 engine.Emit("join_cancel", "");
@@ -65,6 +71,7 @@ public sealed partial class JoinCalendarIntegrationTests
             Assert.False(Get<bool>(guest, "_needsMenuTold"));
             Assert.Equal(0, Get<int>(guest, "_w202RejoinFails"));
             Assert.False(Get<bool>(guest, "_rejoinPending"));
+            await F4ResourceCheck.WaitForNativeTransitionAsync(guest, ct);
             engine.Emit("w211_leave", "menu");
             string departure = $"cycle {cycle} after Leave";
             var returnReceipt = await WaitForPlayerHomeDispatchAsync(guest, engine, fixture.GuestOwnSave, departure, ct);

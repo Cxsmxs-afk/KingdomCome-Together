@@ -257,14 +257,12 @@ public sealed class EdgePipeTests
             rows.Add((Guid.NewGuid(), ordinary with { Tags = ordinary.Tags.Replace("sZ1", "sZ2", StringComparison.Ordinal) }));
         var rejected = harness.DispatchBlock(ActionRowCatalog.FromRows(rows), perfectId, 12, conn.Token,
             mismatch == "npc-wire" ? "guard" : "");
-        var firstRequest = conn.Read(Request);
-        if (await Task.WhenAny(rejected, firstRequest) == firstRequest)
-        {
-            var unexpected = await firstRequest;
-            await conn.Respond(Id(unexpected), EdgeOutcome.Completed, 0x81, [0, 0, 3]);
-            Assert.Fail($"Defense mismatch {mismatch} wrote pipe operation 0x{unexpected[5]:X2}");
-        }
-        Assert.True(await rejected);
+        Assert.True(await rejected.WaitAsync(conn.Token));
+        // Fence the rejected action on the wire. Any unexpected pose would precede this Ping.
+        var ping = conn.Pipe.PingAsync(conn.Token);
+        Assert.Empty(await conn.Read(0x03));
+        await conn.Send(0x83, []);
+        Assert.True(await ping);
     }
 
     [Theory]

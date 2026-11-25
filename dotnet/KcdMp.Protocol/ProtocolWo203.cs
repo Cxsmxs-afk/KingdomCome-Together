@@ -189,7 +189,7 @@ public static partial class Protocol
         LinkHelloDown, NpcStateQDown,   // WO-213
         PresentationClockDown, PresentationPoseDown, PresentationActionDown,
         WorldBaselineDown, WorldEventDown, WorldSyncStatusDown,
-        WorldDigestDown, WorldRepairDown, PvpPeerDown,
+        WorldDigestDown, WorldRepairDown, PvpPeerDown, RosterPeerDown,
     };
 
     // One lookup per type byte, built on first use (not in a field initializer: JoinWire lives in another part of this partial

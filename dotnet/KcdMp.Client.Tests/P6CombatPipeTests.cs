@@ -85,7 +85,14 @@ public sealed class P6CombatPipeTests
     {
         await using var r = new Rig(); await r.Connect(); var writer = Gate(r.Pipe, "_writeLock"); await writer.WaitAsync(); bool current = true;
         var stale = r.Pipe.RangedOneShotAsync("kcd2mp_1", "Fire", "l_bow", () => current);
-        try { await AtWriteGate(r.Pipe); current = false; } finally { writer.Release(); }
+        try
+        {
+            // On this connected, idle pipe the request reaches the held writer synchronously.
+            Assert.Equal(0, Gate(r.Pipe, "_gate").CurrentCount);
+            Assert.False(stale.IsCompleted);
+            current = false;
+        }
+        finally { writer.Release(); }
         Assert.Null(await stale.WaitAsync(TimeSpan.FromSeconds(3)));
         var live = r.Pipe.RangedOneShotAsync("kcd2mp_1", "Fire", "l_bow", () => true); var first = await r.Read();
         Assert.Equal(0x28, first.Type); Assert.Equal(4, first.Body[0]); Assert.Equal(Wo143Codec.OneShot("kcd2mp_1", "Fire", "l_bow", 0, 0), first.Body[1..]);

@@ -10,6 +10,12 @@ using Xunit.Abstractions;
 
 namespace KcdMp.Client.Tests;
 
+// The recovery and replay fixtures deliberately hold workers. Keep other
+// integration fixtures out of those tests' worker-entry checkpoints.
+[CollectionDefinition("Processor frame integration", DisableParallelization = true)]
+public sealed class ProcessorFrameIntegrationCollection { }
+
+[Collection("Processor frame integration")]
 public class T3ProcessorIntegrationTests(ITestOutputHelper output)
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
@@ -62,16 +68,31 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
         var b = Bridge(transport, "World");
         var gate = Get<SemaphoreSlim>(b, "_hostAuthorityGate");
         await gate.WaitAsync();
-        Task? first = null;
+        using var testStop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var clock = new ManualFrameTime();
+        var started = new TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
-            var result = await ProcessorFrameScope.RunAsync(token => first = (Task)Call(b, "ApplyCombatRoleAsync", false, token)!, 100);
+            var applying = ProcessorFrameScope.RunAsync(token =>
+            {
+                var firstAttempt = (Task)Call(b, "ApplyCombatRoleAsync", false, token)!;
+                started.SetResult(firstAttempt);
+                return firstAttempt;
+            }, 100, testStop.Token, clock);
+            Task first = await started.Task.WaitAsync(testStop.Token);
+            await clock.Armed.WaitAsync(testStop.Token);
+            Assert.False(first.IsCompleted);
+            Assert.Equal(0, game.Calls);
+            clock.Expire();
+            var result = await applying.WaitAsync(testStop.Token);
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first!.WaitAsync(TimeSpan.FromSeconds(2)));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first.WaitAsync(TimeSpan.FromSeconds(2), testStop.Token));
+            Assert.True(first.IsCanceled);
             Assert.False(Get<bool>(b, "_combatRoleApplyComplete"));
         }
         finally { gate.Release(); }
-        var retry = await ProcessorFrameScope.RunAsync(token => (Task)Call(b, "ApplyCombatRoleAsync", false, token)!, 5000);
+        var retry = await ProcessorFrameScope.RunAsync(token => (Task)Call(b, "ApplyCombatRoleAsync", false, token)!,
+            5000, testStop.Token, new ManualFrameTime()).WaitAsync(testStop.Token);
         Assert.Equal(ProcessorFrameScope.Outcome.Completed, retry.Status);
         Assert.True(Get<bool>(b, "_combatRoleApplyComplete"));
         Assert.True(game.Calls > 0);
@@ -106,33 +127,40 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
             Assert.True((bool)Call(b, "Wo136Defer", frames.Frame(Protocol.ActionDown, []))!);
             frames.Send(Protocol.HorseInfoDown, [1, 0]);
             processor = frames.Run(session.Token);
-            await game.Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            // Separate worker entry from an early processor exit. This test
+            // deliberately ties up the handler while exercising another lane.
+            var first = await Task.WhenAny(game.Entered.Task, processor).WaitAsync(TimeSpan.FromSeconds(2));
+            if (first == processor) await processor;
+            Assert.Same(game.Entered.Task, first);
             await clock.Armed.WaitAsync(session.Token);
             Call(b, "Wo124OnGameplayStartedCore", true);
-            Call(b, "T3StartIndependentTick", frames.Writer, session.Token);
-            long started = Stopwatch.GetTimestamp();
+            Assert.NotEqual(DateTime.MinValue, Get<DateTime>(b, "_w136SettleUntilUtc"));
+            using var catchup = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
+            catchup.CancelAfter(TimeSpan.FromSeconds(5));
             for (int i = 0; i < 100; i++)
             {
                 long arrival = Stopwatch.GetTimestamp();
                 long ms = (long)typeof(GameBridge).GetMethod("W147StampMs", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, [arrival])!;
                 Set(b, "_w202LastReadMs", ms);
                 frames.Send(Protocol.ReleaseVersion, [2, .. Encoding.UTF8.GetBytes("next-" + i)]);
-                await Task.Delay(12, session.Token);
             }
+            // Advance the actual replay owner's settle boundary, then let
+            // its independent loop release the held frame over the live queue.
+            Set(b, "_w136SettleUntilUtc", DateTime.MinValue);
+            Call(b, "T3StartIndependentTick", frames.Writer, session.Token);
             while (Get<long>(b, "_w136Replayed") == 0)
-                await Task.Delay(10, session.Token);
+                await Task.Delay(10, catchup.Token);
             Assert.False(release.Task.IsCompleted);
             Assert.Null(Get<IDictionary>(b, "_ghostReleaseVersions")[(byte)2]);
             clock.Expire();
-            while (Get<IDictionary>(b, "_ghostReleaseVersions")[(byte)2]?.ToString() != "next-99")
-                await Task.Delay(10, session.Token);
-            Assert.True(Stopwatch.GetElapsedTime(started).TotalSeconds < 5);
+            frames.Complete();
+            await processor.WaitAsync(TimeSpan.FromSeconds(2), catchup.Token);
+            Assert.Equal("next-99", Get<IDictionary>(b, "_ghostReleaseVersions")[(byte)2]);
             Assert.Equal(1, Get<long>(b, "_w136Replayed"));
-            Assert.True((long)Call(b, "Wo202QueueLagMs")! < 1000);
+            Assert.Equal(0, (long)Call(b, "Wo202QueueLagMs")!);
             var counters = Get<System.Collections.Concurrent.ConcurrentDictionary<string, long>>(b, "_t3Counters");
             Assert.Equal(1, counters["proc_stalls"]); Assert.Equal(1950, counters["proc_stall_max_ms"]);
-            output.WriteLine($"T3-P0-SIM proc_stall_max_ms={counters["proc_stall_max_ms"]} catchup_ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} backlog_after_ms={Call(b, "Wo202QueueLagMs")} replayed={Get<long>(b, "_w136Replayed")}");
-            frames.Complete(); await processor.WaitAsync(TimeSpan.FromSeconds(2));
+            output.WriteLine($"T3-P0-SIM proc_stall_max_ms={counters["proc_stall_max_ms"]} backlog_after_ms={Call(b, "Wo202QueueLagMs")} replayed={Get<long>(b, "_w136Replayed")}");
         }
         finally { release.TrySetResult(); session.Cancel(); if (processor is not null) await processor; }
     }

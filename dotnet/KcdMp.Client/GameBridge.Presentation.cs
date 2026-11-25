@@ -97,12 +97,14 @@ public partial class GameBridge
     {
         try
         {
-            while (!ct.IsCancellationRequested)
+            using var cadence = new PeriodicTimer(TimeSpan.FromMilliseconds(PresentationClock.ProbeIntervalMs));
+            if (ct.IsCancellationRequested) return;
+            do
             {
                 if ((_w213Caps & Protocol.LinkCapPresentationTime) != 0)
                     await WritePacketAsync(session.Relay, session.Clock.Begin(PresentationClock.NowMs()), ct);
-                await Task.Delay(PresentationClock.ProbeIntervalMs, ct);
             }
+            while (await cadence.WaitForNextTickAsync(ct));
         }
         catch (Exception ex) when (ex is OperationCanceledException or IOException or SocketException) { }
     }

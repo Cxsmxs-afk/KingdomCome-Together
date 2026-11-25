@@ -5,6 +5,7 @@ using System.Text.RegularExpressions;
 
 namespace KcdMp.Client.Tests;
 
+[Collection("Processor frame integration")]
 public class HttpFrameCancellationTests
 {
     private sealed class Game(Func<HttpRequestMessage, CancellationToken, Task> send) : HttpMessageHandler
@@ -141,13 +142,20 @@ public class HttpFrameCancellationTests
             catch (OperationCanceledException) { cancelled.SetResult(); throw; }
         });
         await using var transport = Transport(game);
-        var run = ProcessorFrameScope.RunAsync(_ => transport.ExecuteNowAsync(Toast("blocked")), 100);
-        await started.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await run).Status);
-        await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        Assert.Single(game.Calls);
-        Assert.False(transport.Held);
-        Assert.Equal(0, transport.BatchesRetried);
+        var clock = new ManualFrameTime();
+        var run = ProcessorFrameScope.RunAsync(_ => transport.ExecuteNowAsync(Toast("blocked")), 100, CancellationToken.None, clock);
+        try
+        {
+            await started.Task.WaitAsync(FrameTestWatchdog);
+            await clock.Armed.WaitAsync(FrameTestWatchdog);
+            clock.Expire();
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await run.WaitAsync(FrameTestWatchdog)).Status);
+            await cancelled.Task.WaitAsync(FrameTestWatchdog);
+            Assert.Single(game.Calls);
+            Assert.False(transport.Held);
+            Assert.Equal(0, transport.BatchesRetried);
+        }
+        finally { clock.Expire(); }
     }
 
     [Fact]
@@ -280,9 +288,8 @@ public class HttpFrameCancellationTests
         transport.NowMs = () =>
         {
             // EnterHold sets Held before reading the clock and launching recovery.
-            if (transport.Held && holdEntered.TrySetResult() && !releaseHold.Wait(FrameTestWatchdog))
-                throw new TimeoutException("The test did not release the transport hold");
-            return Environment.TickCount64;
+            if (transport.Held && holdEntered.TrySetResult()) releaseHold.Wait();
+            return 0;
         };
         var frame = ProcessorFrameScope.RunAsync(async _ =>
         {
@@ -298,15 +305,24 @@ public class HttpFrameCancellationTests
         bool verified = false;
         try
         {
-            await holdEntered.Task.WaitAsync(FrameTestWatchdog);
+            try { await Task.WhenAll(holdEntered.Task, clock.Armed).WaitAsync(FrameTestWatchdog); }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException($"Recovery setup: deadline_armed={clock.Armed.IsCompleted} " +
+                    $"hold_entered={holdEntered.Task.IsCompleted} http_calls={Volatile.Read(ref calls)}", ex);
+            }
             Assert.True(transport.Held);
             clock.Expire();
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(FrameTestWatchdog)).Status);
             releaseHold.Set();
             release.SetResult();
             await probeEntered.Task.WaitAsync(FrameTestWatchdog);
-            using var deadline = new CancellationTokenSource(FrameTestWatchdog);
-            while (transport.Held) await Task.Delay(5, deadline.Token);
+            await frameEnded.Task.WaitAsync(FrameTestWatchdog);
+            var recovery = Assert.IsAssignableFrom<Task>(typeof(HttpGameTransport)
+                .GetField("_recovery", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(transport));
+            await recovery.WaitAsync(FrameTestWatchdog);
+            Assert.False(transport.Held);
             string[] requests = game.Calls.ToArray();
             Assert.True(requests.Length >= 3);
             Assert.Contains("local _ = 1", requests[2]);
@@ -351,20 +367,32 @@ public class HttpFrameCancellationTests
         });
         await using var transport = Transport(game);
         var release = Signal();
-        var result = await ProcessorFrameScope.RunAsync(async _ =>
+        var clock = new ManualFrameTime();
+        var frame = ProcessorFrameScope.RunAsync(async _ =>
         {
             await transport.ExecuteAsync(Toast("abandoned"));
             transport.RequestFlush();
             await started.Task;
             await release.Task;
-        }, 100);
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-        release.SetResult();
-        await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        await transport.ExecuteAsync(Toast("independent"));
-        transport.RequestFlush();
-        await delivered.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        Assert.Contains(game.Calls, c => c.Contains("independent"));
-        Assert.False(transport.Held);
+        }, 100, CancellationToken.None, clock);
+        try
+        {
+            await started.Task.WaitAsync(FrameTestWatchdog);
+            await clock.Armed.WaitAsync(FrameTestWatchdog);
+            clock.Expire();
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(FrameTestWatchdog)).Status);
+            release.SetResult();
+            await cancelled.Task.WaitAsync(FrameTestWatchdog);
+            await transport.ExecuteAsync(Toast("independent"));
+            transport.RequestFlush();
+            await delivered.Task.WaitAsync(FrameTestWatchdog);
+            Assert.Contains(game.Calls, c => c.Contains("independent"));
+            Assert.False(transport.Held);
+        }
+        finally
+        {
+            clock.Expire();
+            release.TrySetResult();
+        }
     }
 }

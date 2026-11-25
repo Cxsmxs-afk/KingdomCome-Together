@@ -14,6 +14,7 @@ public partial class GameBridge
 {
     private int _t3ProcFrameTimeoutMs = 2000;
     internal TimeProvider T3FrameTime { get; init; } = TimeProvider.System;
+    internal TimeProvider T3StatsTime { get; init; } = TimeProvider.System;
     private readonly ConcurrentDictionary<string, long> _t3Counters = new(StringComparer.Ordinal);
     private long _t3StatsNextMs;
     private int _t3SideDrainBusy, _t3StatsBusy;
@@ -99,6 +100,7 @@ public partial class GameBridge
         {
             try
             {
+                using var cadence = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
                 _ = T3ReportConfigAsync(ct); // configuration I/O can never hold the replay clock
                 while (!ct.IsCancellationRequested && ReferenceEquals(_frameWriter, writer))
                 {
@@ -122,7 +124,7 @@ public partial class GameBridge
                         T3Increment("proc_tick_faults");
                         Console.WriteLine($"MP-T3-TICK iteration failed error={ex.GetType().Name}; clock continues");
                     }
-                    await Task.Delay(100, ct);
+                    if (!await cadence.WaitForNextTickAsync(ct)) break;
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
@@ -187,7 +189,7 @@ public partial class GameBridge
                     if (native is { Ok: true } b && T3AuthorityCounters.TryRead(Encoding.ASCII.GetString(b.Payload), out var values))
                         foreach (var field in values) _t3Counters[field.Key] = field.Value;
                     else T3Increment("authority_stats_unreadable");
-                }, 2000, ct);
+                }, 2000, ct, T3StatsTime);
                 if (result.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
                     T3Increment("authority_stats_unreadable");
                 Dictionary<string, long>? nativeCounters = null;
@@ -207,7 +209,7 @@ public partial class GameBridge
                         if (!values.ContainsKey("ranged_native_missing_actor")) T3Increment("ranged_stats_unreadable");
                     }
                     else { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); T3Increment("ranged_stats_unreadable"); }
-                }, 2000, ct);
+                }, 2000, ct, T3StatsTime);
                 if (worldStats.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
                 { T3Increment("world_stats_unreadable"); T3Increment("corpse_stats_unreadable"); T3Increment("ranged_stats_unreadable"); }
                 if (worldStats.Status == ProcessorFrameScope.Outcome.Completed && nativeCounters?.ContainsKey("rp_e2e_n") == true)
@@ -242,7 +244,7 @@ public partial class GameBridge
             ProcessorFrameScope.ThrowIfAbandoned();
             if (reply is { Ok: true } b && read(b.Payload, out var values))
                 snapshot = values;
-        }, 2000, ct);
+        }, 2000, ct, T3StatsTime);
         return result.Status == ProcessorFrameScope.Outcome.Completed ? snapshot : null;
     }
 

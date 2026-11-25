@@ -55,7 +55,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     public long? VerifiedWorldMs { get { lock (_calendar) return _verifiedWorldMs; } }
 
     public JoinCalendarTestPipe(bool failCalendarArm = false, bool failCalendarVerify = false, bool refuseHold = false,
-        Func<long>? nativeClock = null, int refusedRenewals = 0)
+        Func<long>? nativeClock = null, int refusedRenewals = 0, TimeProvider? controlTime = null)
     {
         _failCalendarArm = failCalendarArm;
         _failCalendarVerify = failCalendarVerify;
@@ -63,7 +63,7 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         _nativeClock = nativeClock;
         _refusedRenewals = refusedRenewals;
         string name = $"h20-calendar-{Guid.NewGuid():N}";
-        Pipe = new CombatPipe(name);
+        Pipe = new CombatPipe(name) { ControlTime = controlTime ?? TimeProvider.System };
         _serverLoop = ServeAsync(name, _stop.Token);
     }
 

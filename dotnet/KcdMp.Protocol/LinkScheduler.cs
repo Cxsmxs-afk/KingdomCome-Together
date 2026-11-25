@@ -235,7 +235,8 @@ public sealed class LinkScheduler
     private readonly Dictionary<string, int> _npcBand = new(StringComparer.Ordinal);      // body name -> the band of its last NPC state
     private readonly List<StatePiece> _split = new(8);
     private long _eventBytes;
-    private static readonly double TicksPerMs = Stopwatch.Frequency / 1000.0;
+    private readonly TimeProvider _time;
+    private readonly double _ticksPerMs;
 
     public LinkSchedOptions Options { get; }
 
@@ -248,7 +249,15 @@ public sealed class LinkScheduler
     public long CancelledDropped;
     private readonly List<double> _stateAgeAtSendMs = new(512), _eventAgeAtSendMs = new(512);
 
-    public LinkScheduler(LinkSchedOptions? options = null) => Options = options ?? new LinkSchedOptions();
+    public LinkScheduler(LinkSchedOptions? options = null) : this(options, TimeProvider.System) { }
+
+    public LinkScheduler(LinkSchedOptions? options, TimeProvider timeProvider)
+    {
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        Options = options ?? new LinkSchedOptions();
+        _time = timeProvider;
+        _ticksPerMs = timeProvider.TimestampFrequency / 1000.0;
+    }
 
     public long EventBytes { get { lock (_lock) return _eventBytes; } }
     public int EventCount { get { lock (_lock) return _events.Count; } }
@@ -262,7 +271,7 @@ public sealed class LinkScheduler
         var delivery = stillValid is null && afterWrite is null && prepare is null && startWrite is null
             ? null : new Delivery(stillValid ?? (() => true), afterWrite, prepare, startWrite);
         if (!Allowed(delivery)) return; // a revoked replacement must not displace a live state
-        long now = Stopwatch.GetTimestamp();
+        long now = _time.GetTimestamp();
         lock (_lock)
         {
             if (!Allowed(delivery)) return;
@@ -277,7 +286,7 @@ public sealed class LinkScheduler
             StateIn++;
             foreach (var p in _split)
             {
-                if (!_slots.TryGetValue(p.Slot, out var s)) _slots[p.Slot] = s = new Slot { SentTs = now - (long)(10_000 * TicksPerMs) };
+                if (!_slots.TryGetValue(p.Slot, out var s)) _slots[p.Slot] = s = new Slot { SentTs = now - (long)(10_000 * _ticksPerMs) };
                 else if (s.Dirty) Coalesced++;
                 s.P = p; s.Delivery = delivery; s.UpdatedTs = now; s.Dirty = true; s.AliveTs = now;
                 if (p.Kind == "npc-state")
@@ -312,7 +321,7 @@ public sealed class LinkScheduler
         out Action? afterWrite, out Func<byte[]>? prepare, out LinkWriteAdmission? startWrite, bool eventsHeld)
     {
         stillValid = null; afterWrite = null; prepare = null; startWrite = null;
-        long now = Stopwatch.GetTimestamp();
+        long now = _time.GetTimestamp();
         frame = []; isState = false;
         lock (_lock)
         {
@@ -324,7 +333,7 @@ public sealed class LinkScheduler
             bool eventFirst = _events.Count > 0 && !eventsHeld;
             if (eventFirst && Options.EventSnapMs > 0)
             {
-                long eventAgeMs = (long)((now - _events.Peek().Ts) / TicksPerMs);
+                long eventAgeMs = (long)((now - _events.Peek().Ts) / _ticksPerMs);
                 if (eventAgeMs >= Options.EventSnapMs)
                 {
                     foreach (var s in _slots.Values)
@@ -341,7 +350,7 @@ public sealed class LinkScheduler
                 var e = _events.Dequeue();
                 _eventBytes -= e.F.Length;
                 EventsSent++;
-                if (_eventAgeAtSendMs.Count < 20_000) _eventAgeAtSendMs.Add((now - e.Ts) / TicksPerMs);
+                if (_eventAgeAtSendMs.Count < 20_000) _eventAgeAtSendMs.Add((now - e.Ts) / _ticksPerMs);
                 frame = e.F;
                 stillValid = e.Delivery is null ? null : () => Allowed(e.Delivery);
                 afterWrite = e.Delivery is null ? null : e.Delivery.Written;
@@ -352,8 +361,8 @@ public sealed class LinkScheduler
             if (_slots.Count == 0) return false;
             // C.3 then the most overdue: (time since this body's state last went) / its band's period; a change beats a repeat
             Slot? best = null; double bestU = 0;
-            long ageLimit = Options.AgeLimitMs > 0 ? (long)(Options.AgeLimitMs * TicksPerMs) : long.MaxValue;
-            long repeat = (long)(Options.RepeatMs * TicksPerMs), repeatExtra = (long)(Options.RepeatExtraMs * TicksPerMs), alive = (long)(Options.AliveMs * TicksPerMs);
+            long ageLimit = Options.AgeLimitMs > 0 ? (long)(Options.AgeLimitMs * _ticksPerMs) : long.MaxValue;
+            long repeat = (long)(Options.RepeatMs * _ticksPerMs), repeatExtra = (long)(Options.RepeatExtraMs * _ticksPerMs), alive = (long)(Options.AliveMs * _ticksPerMs);
             bool repeats = Options.Unreliable && Options.RepeatMs > 0;
             long RepeatOf(Slot s) => s.P.Type is Protocol.ActivityExtraUp or Protocol.ActivityExtraDown ? repeatExtra : repeat;
             foreach (var s in _slots.Values)
@@ -362,7 +371,7 @@ public sealed class LinkScheduler
                 if (s.Dirty && now - s.UpdatedTs > ageLimit) { s.Dirty = false; StaleDropped++; }
                 bool due = s.Dirty || repeats && s.P.Repeatable && now - s.SentTs >= RepeatOf(s) && Alive(s.P.Body, now, alive);
                 if (!due) continue;
-                double over = (now - s.SentTs) / TicksPerMs / Period(s.Band);
+                double over = (now - s.SentTs) / _ticksPerMs / Period(s.Band);
                 double u = s.Dirty ? 1.0 + over : Math.Min(0.99, over / 1000.0);   // a repeat never outranks a change
                 if (best is null || u > bestU) { best = s; bestU = u; }
             }
@@ -388,7 +397,7 @@ public sealed class LinkScheduler
             foreach (var s in take)
             {
                 if (!s.Dirty) Repeats++;
-                else if (_stateAgeAtSendMs.Count < 20_000) _stateAgeAtSendMs.Add((now - s.UpdatedTs) / TicksPerMs);
+                else if (_stateAgeAtSendMs.Count < 20_000) _stateAgeAtSendMs.Add((now - s.UpdatedTs) / _ticksPerMs);
                 s.Dirty = false; s.SentTs = now;
             }
             StateSent++; FramesBuilt++;
@@ -415,7 +424,7 @@ public sealed class LinkScheduler
     /// <summary>Forgets the slots of bodies whose state stopped long ago (a body that left the stream); call now and then.</summary>
     public void Prune(int idleMs = 60_000)
     {
-        long now = Stopwatch.GetTimestamp(), idle = (long)(idleMs * TicksPerMs);
+        long now = _time.GetTimestamp(), idle = (long)(idleMs * _ticksPerMs);
         lock (_lock)
         {
             foreach (var k in _slots.Where(kv => !kv.Value.Dirty && now - kv.Value.AliveTs > idle).Select(kv => kv.Key).ToList()) _slots.Remove(k);

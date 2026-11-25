@@ -5,6 +5,8 @@ namespace KcdMp.Client.Tests;
 
 public class ProcessorFrameScopeTests
 {
+    private static readonly TimeSpan Watchdog = TimeSpan.FromSeconds(2);
+
     [Fact]
     public async Task Http_timeout_is_a_frame_fault_and_the_following_frame_runs()
     {
@@ -20,18 +22,32 @@ public class ProcessorFrameScopeTests
     {
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        ProcessorFrameScope.Lease? captured = null;
+        var entered = new TaskCompletionSource<ProcessorFrameScope.Lease>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var clock = new ManualFrameTime();
         bool wrote = false;
-        var result = await ProcessorFrameScope.RunAsync(async _ =>
+        var frame = ProcessorFrameScope.RunAsync(async _ =>
         {
-            captured = ProcessorFrameScope.Capture();
+            entered.SetResult(ProcessorFrameScope.Capture()!);
             try { await release.Task; ProcessorFrameScope.ThrowIfAbandoned(); wrote = true; }
             finally { finished.TrySetResult(); }
-        }, 50);
-        Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, result.Status);
-        Assert.NotNull(captured); Assert.True(captured.IsAbandoned);
-        release.SetResult(); await finished.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.False(wrote);
+        }, 50, CancellationToken.None, clock);
+        try
+        {
+            var captured = await entered.Task.WaitAsync(Watchdog);
+            Assert.NotNull(captured);
+            await clock.Armed.WaitAsync(Watchdog);
+            clock.Expire();
+            Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(Watchdog)).Status);
+            Assert.True(captured.IsAbandoned);
+            release.SetResult();
+            await finished.Task.WaitAsync(Watchdog);
+            Assert.False(wrote);
+        }
+        finally
+        {
+            clock.Expire();
+            release.TrySetResult();
+        }
     }
 
     [Fact]
@@ -68,6 +84,7 @@ public class ProcessorFrameScopeTests
         var channel = Channel.CreateUnbounded<int>();
         var never = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var clock = new ManualFrameTime();
         await channel.Writer.WriteAsync(117);
         var processor = Task.Run(async () =>
         {
@@ -76,13 +93,25 @@ public class ProcessorFrameScopeTests
                 {
                     if (frame == 117) { entered.TrySetResult(); await never.Task; }
                     else processed.Add(frame);
-                }, 100);
+                }, 100, CancellationToken.None, frame == 117 ? clock : new ManualFrameTime());
         });
-        await entered.Task;
-        // This is the independent load/replay clock, not a processor frame.
-        await channel.Writer.WriteAsync(39); channel.Writer.TryComplete();
-        await processor.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.Equal(new[] { 39 }, processed);
-        never.TrySetResult();
+        try
+        {
+            await entered.Task.WaitAsync(Watchdog);
+            await clock.Armed.WaitAsync(Watchdog);
+            // The independent load/replay clock queues the frame while the processor is still blocked.
+            await channel.Writer.WriteAsync(39);
+            channel.Writer.TryComplete();
+            clock.Expire();
+            await processor.WaitAsync(Watchdog);
+            Assert.False(never.Task.IsCompleted);
+            Assert.Equal(new[] { 39 }, processed);
+        }
+        finally
+        {
+            clock.Expire();
+            channel.Writer.TryComplete();
+            never.TrySetResult();
+        }
     }
 }

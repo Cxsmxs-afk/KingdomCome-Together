@@ -4743,9 +4743,9 @@ public partial class GameBridge(ClientConfig config)
         {
             try
             {
-                while (!ct.IsCancellationRequested)
+                using var cadence = new PeriodicTimer(NativeLuaFlushTick);
+                while (await cadence.WaitForNextTickAsync(ct))
                 {
-                    await Task.Delay(NativeLuaFlushTick, ct);
                     if (!frames.Writer.TryWrite(new InFrame(FlushTickType, Array.Empty<byte>(), 0, 0))) break;
                 }
             }
@@ -5183,6 +5183,13 @@ public partial class GameBridge(ClientConfig config)
             {
                 // WO-121: friendly fire -- a partner's hit on our Henry.
                 await OnPlayerHitV8InAsync(payload, frame.PvpContact, ct);
+            }
+            else if (type == Protocol.RosterPeerDown)
+            {
+                ProcessorFrameScope.ThrowIfAbandoned();
+                if (Protocol.TryReadRosterPeer(payload, out byte peer, out Guid relayInstance, out Guid member))
+                    Wo144OnRosterPeer(peer, relayInstance, member);
+                else Wo171RefuseSlots("malformed-roster");
             }
             else if (type == Protocol.Name && payloadLen >= 2)
             {

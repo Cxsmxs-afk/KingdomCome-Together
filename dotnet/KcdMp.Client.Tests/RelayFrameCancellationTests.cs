@@ -80,7 +80,7 @@ public class RelayFrameCancellationTests
                 queued.SetResult();
                 await releaseHandler.Task;
             }, 50, CancellationToken.None, clock);
-            await queued.Task.WaitAsync(watchdog);
+            await Task.WhenAll(queued.Task, clock.Armed).WaitAsync(watchdog);
             clock.Expire();
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(watchdog)).Status);
             releaseHandler.SetResult();

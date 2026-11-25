@@ -31,7 +31,7 @@ public class Wo144PeerTests
         var s = new PeerSet();
         s.Connected(2, "joiner");   // the old connection, named when this host connected
         s.Connected(1, "joiner");   // the joiner's game restarted: a new connection
-        Assert.Equal(new byte[] { 2 }, s.SameName(1, "joiner"));
+        Assert.Equal(new byte[] { 1, 2 }, s.Partners(0));
         s.Disconnected(2);          // the old one goes
         Assert.Equal(new byte[] { 1 }, s.Partners(0));   // peers=1, not peers=2 all session
         Assert.True(s.IsRemoved(2));

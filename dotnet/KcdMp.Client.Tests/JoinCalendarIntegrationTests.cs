@@ -32,7 +32,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
     [InlineData(false)]
     [InlineData(true)]
     public Task A_hosts_and_B_joins_from_the_main_menu(bool dropFirstSnapshot) =>
-        RunAsync("A", "B", dropFirstSnapshot);
+        RunAsync("A", "B", dropFirstSnapshot, usePhysicalSaveCadence: true);
 
     [Theory]
     [InlineData(false)]
@@ -147,7 +147,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
     private static async Task RunAsync(string hostName, string guestName, bool dropFirstSnapshot, JoinProbe probe = JoinProbe.None,
         BoundaryProbe? boundary = null, int extraPeers = 0, bool pauseAfterJoin = false, bool? relayEofWorldRecovery = null,
         bool? homeProbe = null, bool failExitResponse = false, string? newerStart = null, F4Probe? f4 = null,
-        ITestOutputHelper? f4Output = null)
+        ITestOutputHelper? f4Output = null, bool usePhysicalSaveCadence = false)
     {
         using var fixture = new SaveFixture();
         string? checkpointPath = probe == JoinProbe.LocalFresh ? fixture.RecordLocalCheckpoint() : null;
@@ -179,13 +179,15 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
         {
             CanQuickSave = f4 != F4Probe.ActiveGuest,
         };
-        if (f4 is F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe)
+        if (f4 is F4Probe.NoOwnExit or F4Probe.NoOwnExitWithMenuProbe or F4Probe.SupersededMenuProbe or F4Probe.RetainedTimer or F4Probe.RetainedHandle)
             guestPipe.SaveListed = (slot, name) => File.Exists(Path.Combine(fixture.GuestSaves, $"playline{slot}", name + ".whs"));
         Func<int, byte[]> makeHostSave = f4 is F4Probe.TransferAbort or F4Probe.HostAbort or F4Probe.TransportLost
             ? F4LargeHostSave : fixture.MakeHostSave;
-        await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, makeHostSave, hostPipe.ObserveGameplayStarted);
+        await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, makeHostSave,
+            hostPipe.ObserveGameplayStarted, publishCompletedSave: !usePhysicalSaveCadence);
         await using var guestGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "guest.log"), fixture.GuestSaves, null, guestPipe.ObserveGameplayStarted);
-        var host = CreateBridge(hostPeer.Id, true, hostLink, hostPipe.Pipe, hostGame.Transport, fixture.HostSaves, ct);
+        var host = CreateBridge(hostPeer.Id, true, hostLink, hostPipe.Pipe, hostGame.Transport, fixture.HostSaves, ct,
+            worldSaveTime: usePhysicalSaveCadence ? TimeProvider.System : new CompletedSaveTime());
         var guest = CreateBridge(guestPeer.Id, false, guestLink, guestPipe.Pipe, guestGame.Transport, fixture.GuestSaves, ct, relay.Port);
         guestGame.Transport.MainMenuShown += guestPipe.ObserveMainMenu;
         guestGame.DeferJoinFileRead = boundary?.Edge == "late-read";
@@ -253,7 +255,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
 
             if (probe is JoinProbe.PlayerJoinLoop or JoinProbe.ReturnDeadlineLoop)
             {
-                await TestPlayerJoinLoopAsync(fixture, host, guest, hostLink, guestLink, guestGame, extraPeers + 2,
+                await TestPlayerJoinLoopAsync(fixture, relay, host, guest, hostLink, guestLink, guestGame, extraPeers + 2,
                     ct, f4Output!, probe == JoinProbe.ReturnDeadlineLoop);
                 return;
             }
@@ -671,7 +673,18 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
             }
             else if (writer is not null)
             {
-                await guestGame.WaitForSaveLockAsync(ct);
+                try
+                {
+                    string loaded = await guestGame.WaitForJoinLoadAsync(ct);
+                    Assert.Equal($"mpworld{joinId:x8}.whs", Path.GetFileName(loaded));
+                    await guestGame.WaitForSaveLockAsync(ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    Assert.Fail($"The join did not reach its save-lock query before Ready. " +
+                        $"phase={Call(guest, "JoinMenuPhase")} loads={guestGame.JoinLoadsIssued} " +
+                        $"engine_reads={guestGame.JoinFilesRead} clock_in={Get<long>(guest, "_w200ClockIn")}");
+                }
                 var blocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 var flushed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -890,11 +903,13 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
     }
 
     private static GameBridge CreateBridge(byte id, bool hosting, Stream relay, CombatPipe pipe,
-        LogTailGameTransport game, string saves, CancellationToken ct, int relayPort = 7778)
+        LogTailGameTransport game, string saves, CancellationToken ct, int relayPort = 7778,
+        TimeProvider? worldSaveTime = null)
     {
         var bridge = new GameBridge(new ClientConfig { IsHosting = hosting, ServerHost = "127.0.0.1", ServerPort = relayPort })
         {
             PrivateReturnNoticeTime = JoinReturnNoticeTime.Instance,
+            WorldSaveSettleTime = worldSaveTime ?? TimeProvider.System,
         };
         Set(bridge, "_myGhostId", id);
         Set(bridge, "_combat", pipe);
@@ -927,6 +942,21 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
         {
             Assert.Equal(TimeSpan.FromSeconds(4), dueTime);
             Assert.Equal(Timeout.InfiniteTimeSpan, period);
+            return TimeProvider.System.CreateTimer(callback, state, TimeSpan.Zero, period);
+        }
+    }
+
+    private sealed class CompletedSaveTime : TimeProvider
+    {
+        private long _milliseconds;
+        public override long TimestampFrequency => 1000;
+        public override long GetTimestamp() => Interlocked.Read(ref _milliseconds);
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            Assert.InRange(dueTime.TotalMilliseconds, 1, 600);
+            Assert.Equal(Timeout.InfiniteTimeSpan, period);
+            Interlocked.Add(ref _milliseconds, (long)dueTime.TotalMilliseconds);
             return TimeProvider.System.CreateTimer(callback, state, TimeSpan.Zero, period);
         }
     }
@@ -1052,7 +1082,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
     }
 
     /// <summary>Observes actual relay frames and can remove one frozen clock before the guest agent reads it.</summary>
-    private sealed class JoinWire(Stream wire, IReadOnlyList<ReplayPacket> initial, bool dropFirstSnapshot) : Stream
+    internal sealed class JoinWire(Stream wire, IReadOnlyList<ReplayPacket> initial, bool dropFirstSnapshot) : Stream
     {
         private readonly Queue<ReplayPacket> _initial = new(initial);
         private readonly Queue<ReplayPacket> _injected = new();

@@ -2,8 +2,8 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Net;
 using System.Reflection;
-using System.Text;
 using KcdMp.Wire;
 
 namespace KcdMp.Client.Tests;
@@ -12,6 +12,13 @@ public class Wo171SlotIntegrationTests
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
     private const byte Host = 7, Ann = 8, Bob = 9;
+    private static readonly Guid FixtureRelay = Wo171Tests.Member("fixture-relay");
+
+    private static void Connect(PeerSet peers, byte id, string name)
+    {
+        Assert.True(peers.AnnounceRosterPeer(id, FixtureRelay, Wo171Tests.Member(name)));
+        peers.Connected(id, name);
+    }
 
     private static void Set(GameBridge bridge, string name, object value) =>
         typeof(GameBridge).GetField(name, Private)!.SetValue(bridge, value);
@@ -23,10 +30,13 @@ public class Wo171SlotIntegrationTests
         (PeerSet)typeof(GameBridge).GetField("_peers", Private)!.GetValue(bridge)!;
 
     private static int? Slot(GameBridge bridge, byte peer) =>
-        (int?)Call(bridge, "Wo171PinSlot", peer, Peers(bridge).NameOf(peer));
+        (int?)Call(bridge, "Wo171PinSlot", peer);
 
     private static Task Receive(GameBridge bridge, byte source, byte[] body) =>
         (Task)Call(bridge, "Wo164OnFrameAsync", source, body)!;
+
+    private static async Task<Stream> ReaderStreamAsync(ReplayPeer peer, CancellationToken ct) =>
+        new JoinCalendarIntegrationTests.JoinWire(peer.Wire, await peer.DrainAsync(ct), dropFirstSnapshot: false);
 
     private static GameBridge Bridge(byte self, Stream relay, bool hosting = false)
     {
@@ -49,13 +59,13 @@ public class Wo171SlotIntegrationTests
         var host = Bridge(Host, wire, hosting: true);
         Set(host, "_w164On", false);
         byte[] ids = Enumerable.Range(8, players - 1).Select(x => (byte)x).ToArray();
-        foreach (byte id in ids.Reverse()) Peers(host).Connected(id, $"Guest{id}");
+        foreach (byte id in ids.Reverse()) Connect(Peers(host), id, $"Guest{id}");
 
         await (Task)Call(host, "Wo164TickAsync")!;
 
         Console.WriteLine($"WO171-TEST players={players} palette_bytes={wire.Length}");
         Assert.True(wire.Length > 0, "The host tick did not publish any authoritative marker table.");
-        string expected = "marker-slots-v1|" + string.Join('|', ids.Select(id => Convert.ToBase64String(Encoding.UTF8.GetBytes($"Guest{id}")))
+        string expected = "marker-slots-v2|" + string.Join('|', ids.Select(id => Wo171Tests.Member($"Guest{id}").ToString("N"))
             .Concat(Enumerable.Repeat("", 4 - players)));
         wire.Position = 0;
         byte[] header = new byte[3];
@@ -78,6 +88,49 @@ public class Wo171SlotIntegrationTests
         Set(bridge, "_hostModeKnown", true);
         Set(bridge, "_hostSharedWorld", true);
         Set(bridge, "_hostModeFrom", host);
+    }
+
+    [Fact]
+    public async Task Two_guests_with_the_same_display_name_keep_distinct_colours_across_rejoin()
+    {
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = stop.Token;
+        await using var relay = await ReplayRelay.StartAsync(ct);
+        await using var hostPeer = await ReplayPeer.ConnectAsync(relay.Port, "Host", ct);
+        await using var first = await ReplayPeer.ConnectAsync(relay.Port, "Henry", ct);
+        var otherAddress = IPAddress.Parse("127.0.0.2");
+        await using var second = await ReplayPeer.ConnectAsync(relay.Port, "Henry", ct, otherAddress);
+        var hostLink = await ReaderStreamAsync(hostPeer, ct);
+        var host = Bridge(hostPeer.Id, hostLink, hosting: true);
+        Set(host, "_wo122Ct", ct);
+        Set(host, "_w164On", false);
+        var reader = (Task)Call(host, "ReceiveLoopAsync", hostLink, ct)!;
+        try
+        {
+            await WaitForRosterAsync(first.Id, second.Id);
+            await (Task)Call(host, "Wo171SyncSlotsAsync")!;
+            Assert.Equal(2, Slot(host, first.Id));
+            Assert.Equal(3, Slot(host, second.Id));
+
+            await using var returning = await ReplayPeer.ConnectAsync(relay.Port, "Henry", ct, otherAddress);
+            Assert.NotEqual(second.Id, returning.Id);
+            await WaitForRosterAsync(first.Id, returning.Id);
+            Assert.False(Peers(host).IsLive(second.Id));
+            await (Task)Call(host, "Wo171SyncSlotsAsync")!;
+            Assert.Equal(2, Slot(host, first.Id));
+            Assert.Equal(3, Slot(host, returning.Id));
+        }
+        finally
+        {
+            stop.Cancel();
+            await reader.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        async Task WaitForRosterAsync(byte a, byte b)
+        {
+            while (Peers(host).NameOf(a) != "Henry" || Peers(host).NameOf(b) != "Henry")
+                await Task.Delay(5, ct);
+        }
     }
 
     private static byte[] SnapshotBody(Wo171Rules.SlotTable slots, byte target) =>
@@ -113,20 +166,19 @@ public class Wo171SlotIntegrationTests
         await using var cy = players >= 4 ? await ReplayPeer.ConnectAsync(relay.Port, "Cy", ct) : null;
         var peers = new[] { (Peer: ann, Name: "Ann"), (Peer: bob, Name: "Bob"), (Peer: cy, Name: "Cy") }
             .Where(x => x.Peer is not null).OrderBy(x => x.Peer!.Id).ToArray();
-        var host = Bridge(hostPeer.Id, hostPeer.Wire, hosting: true);
+        var hostLink = await ReaderStreamAsync(hostPeer, ct);
+        var host = Bridge(hostPeer.Id, hostLink, hosting: true);
         Set(host, "_wo122Ct", ct);
         Set(host, "_w164On", false);
-        var guests = peers.Select(p => Bridge(p.Peer!.Id, p.Peer.Wire)).ToArray();
-        var readers = new List<Task>();
+        var guests = new GameBridge[peers.Length];
+        var readers = new List<Task> { (Task)Call(host, "ReceiveLoopAsync", hostLink, ct)! };
         for (int i = 0; i != guests.Length; i++)
         {
-            byte self = peers[i].Peer!.Id;
-            Peers(host).Connected(self, peers[i].Name);
-            var guest = guests[i];
+            var peer = peers[i].Peer!;
+            var link = await ReaderStreamAsync(peer, ct);
+            var guest = guests[i] = Bridge(peer.Id, link);
             Set(guest, "_wo122Ct", ct);
-            Peers(guest).Connected(hostPeer.Id, "Host");
-            foreach (var p in peers.Reverse()) Peers(guest).Connected(p.Peer!.Id, p.Name);
-            readers.Add((Task)Call(guest, "ReceiveLoopAsync", peers[i].Peer!.Wire, ct)!);
+            readers.Add((Task)Call(guest, "ReceiveLoopAsync", link, ct)!);
         }
 
         try
@@ -137,6 +189,8 @@ public class Wo171SlotIntegrationTests
             foreach (var p in peers)
                 await hostPeer.SendAsync(JoinStatusCodec.Build(p.Peer!.Id, 0, Protocol.JoinStateSession,
                     Protocol.JoinReasonId("shared-world"), 0), ct);
+            while (peers.Any(p => Peers(host).NameOf(p.Peer!.Id) != p.Name) ||
+                guests.Any(guest => Slot(guest, hostPeer.Id) != 1)) await Task.Delay(5, ct);
             await (Task)Call(host, "Wo164TickAsync")!;
 
             for (int i = 0; i != guests.Length; i++)
@@ -164,27 +218,27 @@ public class Wo171SlotIntegrationTests
     {
         using var relay = new MemoryStream();
         var guest = Bridge(Ann, relay);
-        Peers(guest).Connected(Host, "Host");
-        Peers(guest).Connected(Bob, "Bob");
+        Connect(Peers(guest), Host, "Host");
+        Connect(Peers(guest), Bob, "Bob");
         ConfirmHost(guest);
         var world = (Wo206Epochs)typeof(GameBridge).GetField("_w206", Private)!.GetValue(guest)!;
         world.LearnWorld(15, 1);
         var run = Guid.NewGuid();
         guest.HostAbsentOnEpoch(15, run);
 
-        var original = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob");
+        var original = new Wo171Rules.SlotTable().AssignGuest(Wo171Tests.Member("Ann")).AssignGuest(Wo171Tests.Member("Bob"));
         await Receive(guest, Host, SnapshotBody(original, Ann));
         Assert.Equal(3, Slot(guest, Bob));
         guest.EnterHostAbsentPause("fixture");
-        var messageFromReturningHost = SnapshotBody(original.AssignGuest("Cy"), Ann);
-        Peers(guest).Connected(10, "Cy");
+        var messageFromReturningHost = SnapshotBody(original.AssignGuest(Wo171Tests.Member("Cy")), Ann);
+        Connect(Peers(guest), 10, "Cy");
         byte returningHost = Host;
         if (changedHostId)
         {
             returningHost = 17;
             Peers(guest).Disconnected(Host);
-            Peers(guest).Connected(Host, "Different player");
-            Peers(guest).Connected(returningHost, "Host");
+            Connect(Peers(guest), Host, "Different player");
+            Connect(Peers(guest), returningHost, "Host");
             ConfirmHost(guest, returningHost);
             Assert.NotEqual(1, Slot(guest, Host));
         }
@@ -214,9 +268,9 @@ public class Wo171SlotIntegrationTests
         var host = Bridge(Host, oldRelay, hosting: true);
         var world = (Wo206Epochs)typeof(GameBridge).GetField("_w206", Private)!.GetValue(host)!;
         world.EnsureHost();
-        Peers(host).Connected(Ann, "Ann");
-        if (players >= 3) Peers(host).Connected(Bob, "Bob");
-        if (players >= 4) Peers(host).Connected(10, "Cy");
+        Connect(Peers(host), Ann, "Ann");
+        if (players >= 3) Connect(Peers(host), Bob, "Bob");
+        if (players >= 4) Connect(Peers(host), 10, "Cy");
         await (Task)Call(host, "Wo171SyncSlotsAsync")!;
         Assert.Equal(2, Slot(host, Ann));
         if (players >= 3) Assert.Equal(3, Slot(host, Bob));
@@ -226,7 +280,7 @@ public class Wo171SlotIntegrationTests
         Set(host, "_isDamageAuthority", false);
         Set(host, "_wo122Stream", newRelay);
         Peers(host).Disconnected(Ann);
-        Peers(host).Connected(20, "Ann");
+        Connect(Peers(host), 20, "Ann");
         await (Task)Call(host, "Wo171SyncSlotsAsync")!;
         Assert.Equal(0, newRelay.Length);
         Assert.Null(Slot(host, 20));
@@ -241,10 +295,33 @@ public class Wo171SlotIntegrationTests
         for (byte next = 21; next <= 25; next++)
         {
             Peers(host).Disconnected((byte)(next - 1));
-            Peers(host).Connected(next, "Ann");
+            Connect(Peers(host), next, "Ann");
             await (Task)Call(host, "Wo171SyncSlotsAsync")!;
             Assert.Equal(2, Slot(host, next));
         }
+    }
+
+    [Fact]
+    public async Task A_new_relay_instance_assigns_fresh_slots_even_when_the_host_keeps_its_world()
+    {
+        using var previous = new MemoryStream();
+        using var current = new MemoryStream();
+        var host = Bridge(Host, previous, hosting: true);
+        var world = (Wo206Epochs)typeof(GameBridge).GetField("_w206", Private)!.GetValue(host)!;
+        world.EnsureHost();
+        var roster = Peers(host);
+        Connect(roster, Ann, "Ann");
+        Connect(roster, Bob, "Bob");
+        await (Task)Call(host, "Wo171SyncSlotsAsync")!;
+        Assert.Equal(3, Slot(host, Bob));
+
+        roster.Clear();
+        Set(host, "_wo122Stream", current);
+        Assert.True(roster.AnnounceRosterPeer(Bob, Wo171Tests.Member("restarted-relay"), Wo171Tests.Member("Bob-new-relay")));
+        roster.Connected(Bob, "Bob");
+        await (Task)Call(host, "Wo171SyncSlotsAsync")!;
+        Assert.Equal(2, Slot(host, Bob));
+        Assert.Equal(1, Slot(host, Host));
     }
 
     [Fact]
@@ -256,12 +333,12 @@ public class Wo171SlotIntegrationTests
         var host = Bridge(Host, hostRelay, hosting: true);
         var ann = Bridge(Ann, annRelay);
         var bob = Bridge(Bob, bobRelay);
-        Peers(host).Connected(Ann, "Ann");
-        Peers(host).Connected(Bob, "Bob");
-        Peers(ann).Connected(Bob, "Bob");
-        Peers(ann).Connected(Host, "Host");
-        Peers(bob).Connected(Host, "Host");
-        Peers(bob).Connected(Ann, "Ann");
+        Connect(Peers(host), Ann, "Ann");
+        Connect(Peers(host), Bob, "Bob");
+        Connect(Peers(ann), Bob, "Bob");
+        Connect(Peers(ann), Host, "Host");
+        Connect(Peers(bob), Host, "Host");
+        Connect(Peers(bob), Ann, "Ann");
         ConfirmHost(ann);
         ConfirmHost(bob);
 
@@ -286,9 +363,9 @@ public class Wo171SlotIntegrationTests
 
         const byte bobAfterRejoin = 20;
         Peers(host).Disconnected(Bob);
-        Peers(host).Connected(bobAfterRejoin, "Bob");
+        Connect(Peers(host), bobAfterRejoin, "Bob");
         Peers(ann).Disconnected(Bob);
-        Peers(ann).Connected(bobAfterRejoin, "Bob");
+        Connect(Peers(ann), bobAfterRejoin, "Bob");
         await (Task)Call(host, "Wo171SyncSlotsAsync")!;
         Assert.Equal(3, Slot(host, bobAfterRejoin));
         Assert.Equal(3, Slot(ann, bobAfterRejoin));
@@ -301,11 +378,11 @@ public class Wo171SlotIntegrationTests
         using var newRelay = new MemoryStream();
         var joiner = Bridge(Ann, relay);
         const byte earliestPeer = 1;
-        Peers(joiner).Connected(earliestPeer, "Cy");
-        Peers(joiner).Connected(Host, "Host");
-        Peers(joiner).Connected(Bob, "Bob");
-        var hostSlots = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob");
-        var otherSlots = new Wo171Rules.SlotTable().AssignGuest("Bob").AssignGuest("Ann");
+        Connect(Peers(joiner), earliestPeer, "Cy");
+        Connect(Peers(joiner), Host, "Host");
+        Connect(Peers(joiner), Bob, "Bob");
+        var hostSlots = new Wo171Rules.SlotTable().AssignGuest(Wo171Tests.Member("Ann")).AssignGuest(Wo171Tests.Member("Bob"));
+        var otherSlots = new Wo171Rules.SlotTable().AssignGuest(Wo171Tests.Member("Bob")).AssignGuest(Wo171Tests.Member("Ann"));
         byte[] accepted = SnapshotBody(hostSlots, Ann);
         byte[] untrusted = SnapshotBody(otherSlots, Ann);
 
@@ -334,13 +411,13 @@ public class Wo171SlotIntegrationTests
         const byte cy = 10, observer = 11;
         using var relay = new MemoryStream();
         var joiner = Bridge(observer, relay);
-        Peers(joiner).Connected(Host, "Host");
-        Peers(joiner).Connected(Ann, "Ann");
-        Peers(joiner).Connected(Bob, "Bob");
-        Peers(joiner).Connected(cy, "Cy");
+        Connect(Peers(joiner), Host, "Host");
+        Connect(Peers(joiner), Ann, "Ann");
+        Connect(Peers(joiner), Bob, "Bob");
+        Connect(Peers(joiner), cy, "Cy");
         ConfirmHost(joiner);
-        var original = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob").AssignGuest("Cy");
-        var conflicting = new Wo171Rules.SlotTable().AssignGuest("Cy").AssignGuest("Bob").AssignGuest("Ann");
+        var original = new Wo171Rules.SlotTable().AssignGuest(Wo171Tests.Member("Ann")).AssignGuest(Wo171Tests.Member("Bob")).AssignGuest(Wo171Tests.Member("Cy"));
+        var conflicting = new Wo171Rules.SlotTable().AssignGuest(Wo171Tests.Member("Cy")).AssignGuest(Wo171Tests.Member("Bob")).AssignGuest(Wo171Tests.Member("Ann"));
         await Receive(joiner, Host, SnapshotBody(original, observer));
 
         int?[] Slots() => [Slot(joiner, Host), Slot(joiner, Ann), Slot(joiner, Bob), Slot(joiner, cy)];
@@ -363,13 +440,13 @@ public class Wo171SlotIntegrationTests
         if (!hostStillLive)
         {
             Set(joiner, "_hostModeKnown", false);
-            Peers(joiner).Connected(Host, "Different player");
+            Connect(Peers(joiner), Host, "Different player");
             Assert.Equal(0, Slot(joiner, Host));
         }
         Assert.Equal(new[] { 2, 3, 4 }, Slots().Skip(1).Select(slot =>
             Wo171Rules.PictureSlot(Wo171Rules.CodeFor(Wo171Rules.Style.Rotating, slot ?? 0, 0, 0))));
 
-        Peers(joiner).Connected(Host, "Host");
+        Connect(Peers(joiner), Host, "Host");
         ConfirmHost(joiner);
         Assert.Equal(expected, Slots());
     }
@@ -379,13 +456,13 @@ public class Wo171SlotIntegrationTests
     {
         using var relay = new MemoryStream();
         var joiner = Bridge(Ann, relay);
-        Peers(joiner).Connected(Host, "Host");
-        Peers(joiner).Connected(Bob, "Bob");
+        Connect(Peers(joiner), Host, "Host");
+        Connect(Peers(joiner), Bob, "Bob");
         Set(joiner, "_joinedWorld", true);
         Set(joiner, "_hostAuthority", true);
         Set(joiner, "_sharedWorld", false);
         ConfirmHost(joiner);
-        var slots = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob");
+        var slots = new Wo171Rules.SlotTable().AssignGuest(Wo171Tests.Member("Ann")).AssignGuest(Wo171Tests.Member("Bob"));
         byte[] snapshot = SnapshotBody(slots, Ann);
         await Receive(joiner, Host, snapshot);
 
@@ -420,12 +497,12 @@ public class Wo171SlotIntegrationTests
         using var relay = new MemoryStream();
         using var replacementRelay = new MemoryStream();
         var joiner = Bridge(Ann, relay);
-        Peers(joiner).Connected(Host, "Host");
-        Peers(joiner).Connected(Bob, "Bob");
-        Peers(joiner).Connected(replacementHost, "Replacement");
+        Connect(Peers(joiner), Host, "Host");
+        Connect(Peers(joiner), Bob, "Bob");
+        Connect(Peers(joiner), replacementHost, "Replacement");
         ConfirmHost(joiner);
-        var original = new Wo171Rules.SlotTable().AssignGuest("Ann").AssignGuest("Bob");
-        var replacement = new Wo171Rules.SlotTable().AssignGuest("Bob").AssignGuest("Ann");
+        var original = new Wo171Rules.SlotTable().AssignGuest(Wo171Tests.Member("Ann")).AssignGuest(Wo171Tests.Member("Bob"));
+        var replacement = new Wo171Rules.SlotTable().AssignGuest(Wo171Tests.Member("Bob")).AssignGuest(Wo171Tests.Member("Ann"));
         byte[] originalBody = SnapshotBody(original, Ann);
         byte[] replacementBody = SnapshotBody(replacement, Ann);
         await Receive(joiner, Host, originalBody);

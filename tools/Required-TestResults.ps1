@@ -38,9 +38,17 @@ function Assert-KcdTrxResults {
     $executions = [System.Collections.Generic.HashSet[guid]]::new()
     $resourceCycles = @{}
     $resourceSummaries = [System.Collections.Generic.HashSet[string]]::new()
+    $handleBudgets = [System.Collections.Generic.HashSet[string]]::new()
+    $threadBudgets = [System.Collections.Generic.HashSet[string]]::new()
+    $fileBudgets = [System.Collections.Generic.HashSet[string]]::new()
+    $clientDurations = [System.Collections.Generic.List[object]]::new()
     $resourceScenarios = @('mpexit', 'mpexit-receipt', 'transfer-player-a', 'transfer-player-b', 'transfer-host', 'transfer-eof',
                           'missing-personal-save', 'cancel-rejoin-2', 'cancel-rejoin-3', 'cancel-rejoin-4', 'return-deadline',
-                          'active-guests-3', 'active-guests-4', 'host-return-2', 'host-return-3', 'host-return-4')
+                          'active-guests-3', 'active-guests-4', 'host-return-2', 'host-return-3', 'host-return-4',
+                          'mpexit-retained-timer', 'mpexit-retained-handle')
+    $timerOrigin = 0
+    $timerTwin = 0
+    $handleTwin = 0
     foreach ($result in $results) {
         $id = [guid]::Empty
         if (-not [guid]::TryParse($result.GetAttribute('executionId'), [ref]$id) -or
@@ -49,6 +57,14 @@ function Assert-KcdTrxResults {
         }
         if ($result.GetAttribute('outcome') -ne 'Passed') {
             throw "$Suite did not pass $($result.GetAttribute('testName')) ($($result.GetAttribute('outcome')))"
+        }
+        if ($Suite -eq 'Client') {
+            $elapsed = [TimeSpan]::Zero
+            if ([TimeSpan]::TryParse($result.GetAttribute('duration'), [Globalization.CultureInfo]::InvariantCulture, [ref]$elapsed) -and
+                $elapsed.TotalSeconds -ge 2) {
+                $method = $result.GetAttribute('testName') -replace '\(.*$', ''
+                $clientDurations.Add(@{ Method = $method; Milliseconds = [int]$elapsed.TotalMilliseconds })
+            }
         }
         if ($Suite -eq 'Client' -and $result.GetAttribute('testName').StartsWith('KcdMp.Client.Tests.JoinCalendar')) {
             $stdout = $result.SelectSingleNode('t:Output/t:StdOut', $names)
@@ -65,12 +81,44 @@ function Assert-KcdTrxResults {
                         if (-not $resourceSummaries.Add($scenario)) { throw "Duplicate resource summary for $scenario" }
                     } elseif ($line -match '^\s*F4-HANDLE-TYPES scenario=(?<scenario>[a-z0-9-]+) cycle=[0-5] (?:count=[0-9]+ types=[A-Za-z0-9_=,]+(?: thread_[a-z_]+=[0-9]+)*|status=[0-9a-f]{8}|bad_count=1)\s*$') {
                         $scenario = $Matches.scenario
-                    } elseif ($line -match '^\s*F4-WINSOCK-WARMUP scenario=(?<scenario>[a-z0-9-]+) primed=[0-9]+ worker_cap=[0-9]+\s*$') {
+                    } elseif ($line -match '^\s*F4-HANDLE-BUDGET scenario=(?<scenario>[a-z0-9-]+) before=(?<before>[0-9]+) after=(?<after>[0-9]+) winsock_pairs=(?<pairs>[0-9]+) regex_cache_events=(?<regex>[01]) worker_starts=(?<workers>[0-9]+) worker_name_events=(?<workerNames>[0-9]+) winsock_thread_refs=(?<socketThreads>[0-9]+) persistent_monitor_events=(?<persistentMonitors>[0-9]+) compared_after=(?<compared>[0-9]+)\s*$') {
                         $scenario = $Matches.scenario
-                    } elseif ($line -match '^\s*F4-TIMER-DRAIN scenario=(?<scenario>[a-z0-9-]+) runtime_timers=[0-9]+->[0-9]+->[0-9]+ wait_ms=[0-9]+\s*$') {
+                        if (-not $handleBudgets.Add($scenario) -or
+                            [int]$Matches.workerNames -gt [int]$Matches.workers -or
+                            [int]$Matches.compared -ne ([int]$Matches.after - 2 * [int]$Matches.pairs - [int]$Matches.socketThreads -
+                                [int]$Matches.regex - 3 * [int]$Matches.workers - [int]$Matches.workerNames -
+                                [int]$Matches.persistentMonitors)) {
+                            throw "Invalid or duplicate handle accounting for $scenario"
+                        }
+                    } elseif ($line -match '^\s*F4-THREAD-BUDGET scenario=(?<scenario>[a-z0-9-]+) before=(?<before>[0-9]+) after=(?<after>[0-9]+) idle_new_workers=(?<idle>[0-9]+) compared_after=(?<compared>[0-9]+)\s*$') {
                         $scenario = $Matches.scenario
-                    } elseif ($line -match '^\s*F4-TIMER-INVENTORY scenario=(?<scenario>[a-z0-9-]+) phase=(?:baseline|observed|settled) count=[0-9]+ short=[0-9]+ types=[a-zA-Z0-9_=:,<>/-]*\s*$') {
+                        if (-not $threadBudgets.Add($scenario) -or [int]$Matches.compared -ne ([int]$Matches.after - [int]$Matches.idle)) {
+                            throw "Invalid or duplicate thread accounting for $scenario"
+                        }
+                    } elseif ($line -match '^\s*F4-FILE-BUDGET scenario=(?<scenario>[a-z0-9-]+) before=(?<before>[0-9]+) after=(?<after>[0-9]+)\s*$') {
                         $scenario = $Matches.scenario
+                        $overBudget = [int]$Matches.after -gt [int]$Matches.before + 4
+                        if (-not $fileBudgets.Add($scenario) -or $overBudget -ne ($scenario -eq 'mpexit-retained-handle')) {
+                            throw "Invalid or duplicate file handle accounting for $scenario"
+                        }
+                    } elseif ($line -match '^\s*F4-HANDLE-ORIGINS scenario=(?<scenario>[a-z0-9-]+) enabled=[01] .+\s*$') {
+                        $scenario = $Matches.scenario
+                    } elseif ($line -match '^\s*F4-POOL-WARMUP scenario=(?<scenario>[a-z0-9-]+) primed=[0-9]+ worker_min=[0-9]+ worker_max=[0-9]+ after_join_workers=[0-9]+ reached=[0-9]+ target=[0-9]+\s*$') {
+                        $scenario = $Matches.scenario
+                    } elseif ($line -match '^\s*F4-TIMER-DRAIN scenario=(?<scenario>[a-z0-9-]+) cycle=[05] owner=ProcessorFrameScope cancelled=[0-9]+ runtime_timers=[0-9]+->[0-9]+\s*$') {
+                        $scenario = $Matches.scenario
+                    } elseif ($line -match '^\s*F4-TIMER-SAMPLE scenario=(?<scenario>[a-z0-9-]+) phase=(?:baseline|observed|settled) count=[0-9]+ frame_deadlines=[0-9]+ owner=ProcessorFrameScope\s*$') {
+                        $scenario = $Matches.scenario
+                    } elseif ($line -match '^\s*F4-TIMER-TWIN scenario=(?<scenario>mpexit-retained-timer) retained=5 result=budget-rejected\s*$') {
+                        $scenario = $Matches.scenario
+                        $timerTwin++
+                    } elseif ($line -match '^\s*F4-HANDLE-TWIN scenario=(?<scenario>mpexit-retained-handle) retained=10 result=budget-rejected\s*$') {
+                        $scenario = $Matches.scenario
+                        $handleTwin++
+                    } elseif ($line -match '^\s*F4-TIMER-ORIGIN cancelled=2 unowned_active=1 owner=ProcessorFrameScope\s*$') {
+                        $timerOrigin++
+                        Write-Host $line.Trim()
+                        continue
                     } else { continue }
                     if ($scenario -cnotin $resourceScenarios) { throw 'Unknown join resource scenario' }
                     Write-Host $line.Trim()
@@ -79,11 +127,17 @@ function Assert-KcdTrxResults {
         }
     }
     if ($Suite -eq 'Client') {
+        if ($timerOrigin -ne 1 -or $timerTwin -ne 1 -or $handleTwin -ne 1) { throw 'Missing or duplicate F4 control result' }
         foreach ($scenario in $resourceScenarios) {
-            if (-not $resourceSummaries.Contains($scenario) -or -not $resourceCycles.ContainsKey($scenario) -or
+            if (-not $resourceSummaries.Contains($scenario) -or -not $handleBudgets.Contains($scenario) -or -not $threadBudgets.Contains($scenario) -or
+                ($IsWindows -and -not $fileBudgets.Contains($scenario)) -or
+                -not $resourceCycles.ContainsKey($scenario) -or
                 -not $resourceCycles[$scenario].SetEquals([int[]](0..5))) {
                 throw "Incomplete join resource checks for $scenario"
             }
+        }
+        $clientDurations | Sort-Object { $_.Milliseconds } -Descending | Select-Object -First 10 | ForEach-Object {
+            Write-Host "Client case duration ms=$($_.Milliseconds) method=$($_.Method)"
         }
     }
     Write-Host "Required suite $Suite PASS: $summary (minimum $MinimumCount)"

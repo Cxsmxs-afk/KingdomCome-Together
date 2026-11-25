@@ -230,9 +230,11 @@ public class Wo153Tests
     public async Task A_healthy_game_gets_every_statement_in_order_in_one_command()
     {
         var g = new FakeGame();
-        await using var t = Transport(g);
+        // The fake supplies the answer immediately. This ordering case has no real HTTP deadline.
+        await using var t = new HttpGameTransport("http://localhost:1403", Timeout.Infinite, g) { NowMs = () => 0 };
         await t.ExecuteAsync(Ghost("0", 1)); await t.ExecuteAsync(Toast("a")); await t.ExecuteAsync(Ghost("1", 1));
         await t.FlushAsync();
+        Assert.Equal(1, g.Calls);
         var cmd = Assert.Single(g.Run);
         Assert.True(cmd.IndexOf("UpdateGhost(\"0\"") < cmd.IndexOf("ShowNativeToast(\"a\")"));
         Assert.True(cmd.IndexOf("ShowNativeToast(\"a\")") < cmd.IndexOf("UpdateGhost(\"1\""));
