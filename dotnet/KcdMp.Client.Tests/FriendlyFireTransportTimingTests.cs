@@ -24,7 +24,7 @@ public sealed class FriendlyFireTransportTimingTests(ITestOutputHelper output)
         var bridge = new GameBridge(new ClientConfig());
         var writePacket = typeof(GameBridge).GetMethod("WritePacketAsync", Instance)!;
         var start = typeof(GameBridge).GetMethod("Wo213StartWriter", Instance)!;
-        var stop = typeof(GameBridge).GetMethod("Wo213StopWriter", Instance)!;
+        var stop = typeof(GameBridge).GetMethod("Wo213StopWriterAsync", Instance)!;
         Task Send(byte[] packet) => (Task)writePacket.Invoke(bridge, [wire, packet, ct])!;
 
         var before = Console.Out;
@@ -63,8 +63,8 @@ public sealed class FriendlyFireTransportTimingTests(ITestOutputHelper output)
         finally
         {
             wire.Release.TrySetResult();
-            if (scheduled) stop.Invoke(bridge, null);
-            Console.SetOut(before);
+            try { if (scheduled) await (Task)stop.Invoke(bridge, null)!; }
+            finally { Console.SetOut(before); }
         }
 
         string[] Samples() => logs.ToString().Split('\n').Where(line => line.StartsWith("MP-LANE2-FF-TIME ", StringComparison.Ordinal)).ToArray();

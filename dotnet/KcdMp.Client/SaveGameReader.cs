@@ -65,8 +65,8 @@ public static class SaveGameReader
             return e < 0 ? string.Empty : xml[s..e];
         }
         if (xml.IndexOf("<C_SaveGameDescription", StringComparison.Ordinal) < 0) return null;
-        long.TryParse(Attr(xml, "SaveTime"), out long t);
-        int.TryParse(Attr(xml, "SaveId"), out int id);
+        long t = long.TryParse(Attr(xml, "SaveTime"), out long time) ? time : 0;
+        int id = int.TryParse(Attr(xml, "SaveId"), out int parsedId) ? parsedId : 0;
         return new Description(Attr(xml, "QuestNameOverride"), Attr(xml, "LevelName"), Attr(xml, "SaveType"), t, id);
     }
 
