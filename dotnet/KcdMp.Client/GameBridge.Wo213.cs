@@ -241,6 +241,7 @@ public partial class GameBridge
     private LinkWriter? _w213Writer;
     private Stream? _w213Stream;
     private CancellationTokenSource? _w213WriterCts;
+    private Task? _w213WriteTask;
     private volatile ushort _w213Caps;
 
     /// <summary>
@@ -264,7 +265,7 @@ public partial class GameBridge
         if (W213Switch.TwinOff("link_sched"))
         {
             Console.WriteLine("MP-LINK scheduler OFF (the twin: link_sched) -- every frame written in order as before");
-            _ = Wo213AdvertisePvpContactAsync(stream);
+            Faults.FireAndLog(Wo213AdvertisePvpContactAsync(stream), "relay-pvp-hello");
             return;
         }
         ILinkPath path = link.Steam is { } s2 ? new SteamLinkPath(s2) : new StreamLinkPath(stream);
@@ -292,8 +293,8 @@ public partial class GameBridge
             }
             catch (Exception ex) { Console.WriteLine($"MP-LINK the writer stopped: {ex.GetType().Name}: {ex.Message}"); try { link.Dispose(); } catch { } }
         }
-        if (ExecutionContext.IsFlowSuppressed()) _ = Task.Run(RunWriter);
-        else { using (ExecutionContext.SuppressFlow()) _ = Task.Run(RunWriter); }
+        if (ExecutionContext.IsFlowSuppressed()) _w213WriteTask = Task.Run(RunWriter);
+        else { using (ExecutionContext.SuppressFlow()) _w213WriteTask = Task.Run(RunWriter); }
         ushort caps = (ushort)(Protocol.LinkCapLatestWins | Protocol.LinkCapPresentationTime | Protocol.LinkCapPresentationCombat
                      | Protocol.LinkCapPvpContact | Protocol.LinkCapPvpLife
                      | (LoadSequenceEnabled && W221On("baseline_events") ? Protocol.LinkCapWorldSync : 0)
@@ -314,10 +315,20 @@ public partial class GameBridge
         }
     }
 
-    private void Wo213StopWriter()
+    private async Task Wo213StopWriterAsync()
     {
-        try { _w213WriterCts?.Cancel(); } catch { }
-        _w213Writer = null; _w213Stream = null; _w213WriterCts = null;
+        LinkWriter? writer = Interlocked.Exchange(ref _w213Writer, null);
+        var cts = _w213WriterCts;
+        var task = _w213WriteTask;
+        _w213Stream = null;
+        _w213WriterCts = null;
+        _w213WriteTask = null;
+        try { if (cts is not null) await cts.CancelAsync(); }
+        finally
+        {
+            try { if (task is not null) await task; }
+            finally { writer?.Dispose(); cts?.Dispose(); }
+        }
     }
 
     private NpcCompact.Decoder _w213Npc = new();

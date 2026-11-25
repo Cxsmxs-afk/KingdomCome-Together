@@ -3,21 +3,12 @@ using System.Collections.Immutable;
 
 namespace KcdMp.Client.Tests;
 
-internal sealed class F4ProcessorDeadlines : IDisposable
+internal sealed class F4ProcessorDeadlines
 {
-    private const int DefaultDeadlineMs = 1950; // the 2000 ms frame budget reserves 50 ms
-    private readonly Func<TimeProvider, int, TimeProvider> _instrument;
+    private static readonly TimeSpan DefaultDeadline = TimeSpan.FromMilliseconds(1950);
     private ImmutableStack<Task<bool>> _deadlines = ImmutableStack<Task<bool>>.Empty;
 
-    public F4ProcessorDeadlines()
-    {
-        _instrument = Instrument;
-        if (Interlocked.CompareExchange(ref ProcessorFrameScope.InstrumentDeadlineTime, _instrument, null) is not null)
-            throw new InvalidOperationException("A frame deadline probe is already installed.");
-    }
-
-    private TimeProvider Instrument(TimeProvider source, int deadlineMs) =>
-        deadlineMs <= DefaultDeadlineMs ? new DeadlineClock(source, this) : source;
+    public TimeProvider Wrap(TimeProvider source) => new DeadlineClock(source, this);
 
     public Task<bool>[] Pending() => Volatile.Read(ref _deadlines).Where(timer => !timer.IsCompleted).ToArray();
 
@@ -33,12 +24,16 @@ internal sealed class F4ProcessorDeadlines : IDisposable
         return (count, active.ToArray());
     }
 
-    public void Dispose() => Interlocked.CompareExchange(ref ProcessorFrameScope.InstrumentDeadlineTime, null, _instrument);
-
     private sealed class DeadlineClock(TimeProvider source, F4ProcessorDeadlines probe) : TimeProvider
     {
+        public override DateTimeOffset GetUtcNow() => source.GetUtcNow();
+        public override long TimestampFrequency => source.TimestampFrequency;
+        public override long GetTimestamp() => source.GetTimestamp();
+
         public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
         {
+            // This provider is used only by these processors, with the same budget as before.
+            if (dueTime > DefaultDeadline) return source.CreateTimer(callback, state, dueTime, period);
             var timer = new DeadlineTimer(callback, state);
             ImmutableInterlocked.Push(ref probe._deadlines, timer.Released);
             timer.Start(source, dueTime, period);

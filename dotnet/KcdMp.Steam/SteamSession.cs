@@ -351,7 +351,13 @@ public sealed class SteamSession : IDisposable
 
     private void PumpLoop()
     {
-        if (OperatingSystem.IsWindows()) timeBeginPeriod(1);
+        bool highResolution = false;
+        if (OperatingSystem.IsWindows())
+        {
+            uint result = timeBeginPeriod(1);
+            highResolution = result == 0;
+            if (!highResolution) EmitLog($"steam timer resolution request failed code={result}");
+        }
         var msgs = new IntPtr[64];
         try
         {
@@ -370,7 +376,11 @@ public sealed class SteamSession : IDisposable
         }
         finally
         {
-            if (OperatingSystem.IsWindows()) timeEndPeriod(1);
+            if (highResolution)
+            {
+                uint result = timeEndPeriod(1);
+                if (result != 0) EmitLog($"steam timer resolution release failed code={result}");
+            }
         }
     }
 

@@ -22,7 +22,7 @@ public sealed class ClientConfig
     public const string FileName = "kcdmp-client.json";
 
     /// <summary>Host or IP of the relay server.</summary>
-    public string ServerHost { get; set; } = "localhost";
+    public string ServerHost { get; set; } = "127.0.0.1";
 
     /// <summary>Relay server port.</summary>
     public int ServerPort { get; set; } = 7778;
@@ -37,7 +37,7 @@ public sealed class ClientConfig
     /// Base URL of the local game debug API. The game listens on 1403; the
     /// agent only ever talks to its own machine, so no port proxy is needed.
     /// </summary>
-    public string GameApiBase { get; set; } = "http://localhost:1403";
+    public string GameApiBase { get; set; } = "http://127.0.0.1:1403";
 
     /// <summary>
     /// WO-153 3: a Lua batch the game does not answer within the timeout (it is loading, hung or busy) is kept and sent again
@@ -311,7 +311,7 @@ public sealed class ClientConfig
     ///
     /// Both forms are accepted:
     ///   named:      --host 192.168.1.10 --port 7778 --name Henry
-    ///               --game-api http://localhost:1403 --no-voice
+    ///               --game-api http://127.0.0.1:1403 --no-voice
     ///   positional: &lt;host&gt; &lt;port&gt; &lt;name&gt; &lt;gameApiBase&gt;   (the pre-config form,
     ///               kept so existing shortcuts and the README examples still work)
     /// </summary>

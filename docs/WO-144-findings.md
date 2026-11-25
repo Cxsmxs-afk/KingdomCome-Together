@@ -25,6 +25,11 @@ sent; the camera was aimed and the player moved by console.
 
 ## The answer
 
+The host restores a parked crime record when the same opaque member reconnects
+to the same relay roster within two hours. A relay process restart creates a
+new roster and clears parked crime records. A display name cannot identify the
+old member, and this policy does not alter crime already in the game save.
+
 The first real sessions broke on four things underneath everything else, and
 all four are fixed at their root:
 

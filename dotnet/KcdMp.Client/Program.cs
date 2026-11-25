@@ -6,6 +6,8 @@ using KcdMp.Client;
 using Microsoft.Win32;
 using System.Text.RegularExpressions;
 
+GameBridge.Faults.Install();
+
 // --save-tool (WO-122 Phase 5): the ported .whs reader/verify/splicer, offline.
 // Runs before the config load and the agent.log tee so a tool run never
 // rotates or overwrites the agent's own log.
@@ -326,7 +328,8 @@ AppDomain.CurrentDomain.ProcessExit += (_, _) =>
 // WO-206 Part C: applied.jsonl beside the exe -- one session per file, so it starts empty (nothing else is touched)
 Wo206Applied.StartSession();
 var launcherControl = LauncherAgentLifetime.Attach();
-if (launcherControl is not null) _ = LauncherAgentLifetime.ListenForStopAsync(cts);
+if (launcherControl is not null)
+    GameBridge.Faults.FireAndLog(LauncherAgentLifetime.ListenForStopAsync(cts), "launcher-stop-listener");
 var bridge = new GameBridge(config) { WorldRecoveryTestEnabled = testWorldRecovery, LauncherRestartControl = launcherControl };
 using var recorder = recording?.Open();
 if (recording is not null && recorder is null) return 2;

@@ -35,6 +35,7 @@ namespace KcdMp.Client;
 /// </summary>
 public partial class GameBridge(ClientConfig config)
 {
+    internal static ProcessFaultLog Faults { get; } = new("client", message => Console.WriteLine(message));
     private const int TickMs           = 10;
     private const float PosThreshold  = 0.05f;
     private const float RotThreshold  = 0.02f;
@@ -83,8 +84,7 @@ public partial class GameBridge(ClientConfig config)
     // bind/hold/config/trace events cross here to the pipe; a 1 Hz heartbeat
     // tells Lua the native writer is alive (without it Lua writes every puppet
     // itself, as before). docs/WO-118-findings.md.
-    private NativeNpcFeed? _nativeFeedObj;
-    private NativeNpcFeed _nativeFeed => _nativeFeedObj ??= new NativeNpcFeed(_combat);
+    private NativeNpcFeed? _nativeFeed;
     private volatile bool _nativeWriteOn = true;      // mirror of mp_npc_native_write
     // WO-118 follow-up: Lua push coalescing for puppets the DLL writes. The
     // bound set holds the names the DLL acknowledged and has not dropped (bind
@@ -681,7 +681,7 @@ public partial class GameBridge(ClientConfig config)
 
     private sealed class SessionCounters
     {
-        public long Pongs, SwingsSent, SwingsRecv, SwingsQueued, SwingsFailed, SwingsNoEntity,
+        public long Pongs, SwingsSent, SwingsRecv, SwingsQueued, SwingsFailed,
                     DmgOut, DmgOutFatal, DmgIn, DmgInApplied, DmgInFailed, DmgOutDropped, DmgInRefused,
                     NpcStateOut, NpcClaimOut, NpcDragOut, StoryDivergencesPushed,
                     CutsceneLocalEdges, CutscenePeerEdges, GhostPackets, PosStaleOut, GhostStaleIn;
@@ -815,7 +815,7 @@ public partial class GameBridge(ClientConfig config)
         Console.WriteLine(FormattableString.Invariant(
             $"MP-SUMMARY section=position stale_out={s.PosStaleOut} ghost_stale_in={s.GhostStaleIn}"));
         Console.WriteLine(FormattableString.Invariant(
-            $"MP-SUMMARY section=swings sent={s.SwingsSent} recv={s.SwingsRecv} queued={s.SwingsQueued} failed={s.SwingsFailed} no_entity={s.SwingsNoEntity}"));
+            $"MP-SUMMARY section=swings sent={s.SwingsSent} recv={s.SwingsRecv} queued={s.SwingsQueued} failed={s.SwingsFailed}"));
         Console.WriteLine(FormattableString.Invariant(
             $"MP-SUMMARY section=damage out={s.DmgOut} out_fatal={s.DmgOutFatal} out_dropped={s.DmgOutDropped} in={s.DmgIn} in_applied={s.DmgInApplied} in_failed={s.DmgInFailed} in_refused={s.DmgInRefused} authority={(_isDamageAuthority ? 1 : 0)}"));
         Console.WriteLine(FormattableString.Invariant(
@@ -1235,7 +1235,9 @@ public partial class GameBridge(ClientConfig config)
         {
             Console.WriteLine("[transport] no frames yet; re-issuing the emitter start");
             tail.ResetEmitterStart();
-            try { await tail.StartAsync(ct); } catch { }
+            try { await tail.StartAsync(ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex) { Faults.ReportThrottled("emitter-restart", ex); }
             deadline = DateTime.UtcNow.AddSeconds(3);
             while (tail.FramesReceived == 0 && DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
                 await Task.Delay(50, ct);
@@ -1251,7 +1253,7 @@ public partial class GameBridge(ClientConfig config)
         {
             tail.GameEvent += OnGameEvent;
             Console.WriteLine($"[transport] {tail.Name} -- the mod is loaded (its init line is in this launch's {Path.GetFileName(tail.LogPath)}) but its emitter has not ticked yet: kept, the emitter start sent again every {EmitterRetryEveryMs / 1000} s until frames come");
-            _ = EmitterRetryAsync(tail, ct);
+            Faults.FireAndLog(EmitterRetryAsync(tail, ct), "emitter-retry");
             return tail;
         }
 
@@ -1294,7 +1296,9 @@ public partial class GameBridge(ClientConfig config)
                 await Task.Delay(EmitterRetryEveryMs, ct);
                 if (tail.FramesReceived > 0) break;
                 tail.ResetEmitterStart();
-                try { await tail.StartAsync(ct); ++sends; } catch (OperationCanceledException) { return; } catch { }
+                try { await tail.StartAsync(ct); ++sends; }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+                catch (Exception ex) { Faults.ReportThrottled("emitter-restart", ex); }
             }
             if (tail.FramesReceived > 0)
                 Console.WriteLine($"[transport] {tail.Name} -- the emitter's first frame {(Environment.TickCount64 - t0) / 1000.0:F1} s after the tail was kept ({sends} start(s) sent again)");
@@ -2285,6 +2289,10 @@ public partial class GameBridge(ClientConfig config)
                 }
                 else if (!_posNative || !state.HasValue)
                     _cadNative.Break();
+                if (_transport is LogTailGameTransport positionTail)
+                    await positionTail.UpdateNativePositionCadenceAsync(
+                        poseFromLog && (ringLive || nat.HasValue) && _where == GameWhere.World,
+                        Environment.TickCount64, cts.Token);
                 if (IntervalElapsed(ref lastCadenceReport, CadenceReportInterval, nowTimestamp))
                     ReportCadence();
                 if (IntervalElapsed(ref lastDropReport, DropReportInterval, nowTimestamp))
@@ -2409,9 +2417,13 @@ public partial class GameBridge(ClientConfig config)
         }
         finally
         {
+            if (_transport is LogTailGameTransport positionTail)
+                await TryJoinControlAsync(
+                    () => positionTail.UpdateNativePositionCadenceAsync(false, Environment.TickCount64, CancellationToken.None),
+                    "position-cadence-reset");
             try { PrintSessionSummary("disconnect"); } catch { }   // WO-98 Phase 6
             try { Wo213OnDisconnect(); } catch { }                 // WO-213 A.1: the connection's per-kind totals
-            Wo213StopWriter();                                     // WO-213 C
+            await TryJoinControlAsync(Wo213StopWriterAsync, "relay-writer-stop"); // WO-213 C
             // WO-211 A.1: a joiner in the host's world whose link dropped (not the agent stopping) holds there while it reconnects --
             // decided before the per-WO teardowns below, which read it (the save lock stays, the leave does not run, the host stays shown)
             if (!appCt.IsCancellationRequested)
@@ -4689,6 +4701,8 @@ public partial class GameBridge(ClientConfig config)
         // EOF must revoke its frame/side-channel leases before any teardown I/O.
         var receiveLife = CancellationTokenSource.CreateLinkedTokenSource(ct);
         ct = receiveLife.Token;
+        await using var nativeFeed = new NativeNpcFeed(_combat) { Enabled = _nativeWriteOn };
+        Volatile.Write(ref _nativeFeed, nativeFeed);
         P6BeginReceive(stream, ct);
         var tpConnection = T3TpBeginReceive(stream, ct);
         var presentationSession = new PresentationSession(stream, ct);
@@ -4696,7 +4710,7 @@ public partial class GameBridge(ClientConfig config)
         if (!ReferenceEquals(pvpSession?.Relay, stream)) pvpSession = null;
         Volatile.Write(ref _presentationSession, presentationSession);
         PresentationResetNative(ct);
-        _ = PresentationClockLoopAsync(presentationSession, ct);
+        Faults.FireAndLog(PresentationClockLoopAsync(presentationSession, ct), "presentation-clock");
         var frames = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
         _frameWriter = frames.Writer;   // WO-136: the load hold replays held frames through here
         T3StartIndependentTick(frames.Writer, ct);
@@ -4705,20 +4719,21 @@ public partial class GameBridge(ClientConfig config)
         // frames in the one processor (the joiner's "[ping]" read 40-63 s): countdowns came in bursts,
         // a pull's answer came after its timeout. Leash frames never wait for NPC traffic now.
         var leashLane = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
-        _ = Wo147LeashLaneAsync(leashLane.Reader, ct);
+        Faults.FireAndLog(Wo147LeashLaneAsync(leashLane.Reader, ct), "leash-reader");
         // WO-207 A.1: the conversation's own lane. On the bench the listener's camera samples waited 3-5 s behind NPC traffic and the
         // listener's DLL ended the view for silence; a line or a vote is a moment too (lines, options, votes, the camera, the end).
         var convLane = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
-        _ = Wo207ConvLaneAsync(convLane.Reader, ct);
+        Faults.FireAndLog(Wo207ConvLaneAsync(convLane.Reader, ct), "conversation-reader");
         // WO-207 B.3: the activity frames' own lane (each row a native write through the pipe; in order, never in the frame processor's way)
         var actLane = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
-        _ = Wo207ActivityLaneAsync(actLane.Reader, ct);
+        Faults.FireAndLog(Wo207ActivityLaneAsync(actLane.Reader, ct), "activity-reader");
         var lootLane = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
         var lootProcessor = T3LootLaneAsync(lootLane, ct);
         int stopped = 0;
         void StopReceive()
         {
             if (Interlocked.Exchange(ref stopped, 1) != 0) return;
+            Interlocked.CompareExchange(ref _nativeFeed, null, nativeFeed);
             RetireJoinCalendarAtRead(null, stream);
             P6EndReceive(stream, ct);
             WorldSyncStop(stream);
@@ -4739,7 +4754,7 @@ public partial class GameBridge(ClientConfig config)
         // The coalescer's clock: a pending Lua push must go out once it is due
         // even when no further frame for that NPC arrives (a puppet that just
         // stopped). Through the channel, so the push state stays single-threaded.
-        _ = Task.Run(async () =>
+        Faults.FireAndLog(Task.Run(async () =>
         {
             try
             {
@@ -4749,8 +4764,8 @@ public partial class GameBridge(ClientConfig config)
                     if (!frames.Writer.TryWrite(new InFrame(FlushTickType, Array.Empty<byte>(), 0, 0))) break;
                 }
             }
-            catch (OperationCanceledException) { }
-        });
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        }), "npc-coalescer-clock");
         var header = new byte[3];
         try
         {
@@ -4881,6 +4896,8 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private void FeedNativeAtRead(int type, byte[] payload, long arrival, bool replay = false, PresentationFrame presentation = default)
     {
+        ProcessorFrameScope.ThrowIfAbandoned();
+        var nativeFeed = Volatile.Read(ref _nativeFeed);
         // WO-136: while a world loads nothing is bound or written natively either (the replay feeds it later).
         if (!replay && Wo136HeldType(type) && Wo136Holding) return;
         if (_w140Separate && Wo140Rules.DroppedWhenSeparate(type)) return;   // WO-140: a joiner in its own world (counted by the processor)
@@ -4897,7 +4914,7 @@ public partial class GameBridge(ClientConfig config)
             int o = 2 + nameLen;
             _w164NpcPos[npcName] = (ReadFloat(payload, o), ReadFloat(payload, o + 4), Environment.TickCount64);   // WO-164 D2
             if (EdgeForwardPose(type, payload, arrival)) return;
-            _nativeFeed.Enqueue(new NativeNpcSample(payload[0], npcName,
+            nativeFeed?.Enqueue(new NativeNpcSample(payload[0], npcName,
                 ReadFloat(payload, o), ReadFloat(payload, o + 4), ReadFloat(payload, o + 8), ReadFloat(payload, o + 12),
                 // WO-121: 0x80 is the pipe's own "state block follows" bit, never a wire flag.
                 (byte)(payload[o + Protocol.NpcStateFlagsOffset] & ~NativeNpcCodec.FlagState2),
@@ -4925,7 +4942,7 @@ public partial class GameBridge(ClientConfig config)
                 timeForwarded = _combat.PostPresentationPose((byte)type, payload, arrival, presentation.SampleMs, presentation.HostAtArrivalMs, connection);
             }
             if (!timeForwarded && !EdgeForwardPose(type, payload, arrival))
-                _nativeFeed.Enqueue(new NativeNpcSample(gs.GhostId, "kcd2mp_" + gs.GhostId, gs.X, gs.Y, gs.Z, gs.RotZ,
+                nativeFeed?.Enqueue(new NativeNpcSample(gs.GhostId, "kcd2mp_" + gs.GhostId, gs.X, gs.Y, gs.Z, gs.RotZ,
                     gs.IsRiding ? (byte)0x10 : (byte)0, gSeq, gs.SenderMs, arrival, gs.State2));
             Wo154FeedRiddenHorse(gs, gSeq, arrival);   // WO-154 5: the ridden horse rides the rider's stream
             // WO-121: the newest sender stamp per peer -- the clock an event's
@@ -4969,7 +4986,7 @@ public partial class GameBridge(ClientConfig config)
                 {
                     if (!LoadSequenceFrameCurrent(frame)) continue;
                     using var loadLife = LoadSequenceLink(frame, ct);
-                    var result = await ProcessorFrameScope.RunAsync(token => ProcessFrameCoreAsync(frame, token, accounting),
+                    var result = await RunProcessorFrameAsync(token => ProcessFrameCoreAsync(frame, token, accounting),
                         Volatile.Read(ref _t3ProcFrameTimeoutMs), loadLife?.Token ?? ct, T3FrameTime);
                     T3FrameResult(frame.Type, result);
                     if (result.Status == ProcessorFrameScope.Outcome.SessionCancelled && ct.IsCancellationRequested) return;
@@ -7446,7 +7463,7 @@ public partial class GameBridge(ClientConfig config)
                 if (p.Length < 1) { Console.WriteLine($"[npcwrite] malformed npc_native_cfg '{arg}'"); return; }
                 _nativeWriteOn = p[0].Equals("on", StringComparison.OrdinalIgnoreCase);
                 if (p.Length > 1) _nativeSenderClock = p[1].Equals("on", StringComparison.OrdinalIgnoreCase);
-                _nativeFeed.Enabled = _nativeWriteOn;
+                if (Volatile.Read(ref _nativeFeed) is { } feed) feed.Enabled = _nativeWriteOn;
                 if (!_nativeWriteOn) _nativeBound.Clear();   // WO-118 follow-up: every puppet back to full-rate Lua
                 Console.WriteLine($"[npcwrite] mp_npc_native_write {(_nativeWriteOn ? "on" : "off")} senderclock={(_nativeSenderClock ? "on" : "off")} -> DLL");
                 bool on = _nativeWriteOn, sc = _nativeSenderClock;
@@ -7614,9 +7631,9 @@ public partial class GameBridge(ClientConfig config)
             _ = PresentationConfigureAsync(ct);
             await ExecLuaAsync(FormattableString.Invariant(
                 $"if KCD2MP_NpcNativeAlive then KCD2MP_NpcNativeAlive({(s.Armed ? 1 : 0)}, {(s.NativeOn ? 1 : 0)}, {s.Bound}, {s.Writing}, 1) end"));
-            if ((++_nativeHeartbeats % 10) == 0)
+            if ((++_nativeHeartbeats % 10) == 0 && Volatile.Read(ref _nativeFeed) is { } feed)
                 Console.WriteLine(FormattableString.Invariant(
-                    $"MP-NPCWRITE-STATUS armed={(s.Armed ? 1 : 0)} on={(s.NativeOn ? 1 : 0)} bound={s.Bound} writing={s.Writing} frames={s.FramesWritten} writes={s.Writes} drops={s.Drops} samples={s.Samples} feed_enqueued={Interlocked.Read(ref _nativeFeed.Enqueued)} feed_sent={Interlocked.Read(ref _nativeFeed.Sent)} feed_batches={Interlocked.Read(ref _nativeFeed.Batches)} feed_failed={Interlocked.Read(ref _nativeFeed.FailedBatches)} feed_coalesced={Interlocked.Read(ref _nativeFeed.Coalesced)} binds_ok={Interlocked.Read(ref _nativeBindsOk)} binds_refused={Interlocked.Read(ref _nativeBindsRefused)} dll_drops_seen={Interlocked.Read(ref _nativeDrops)} holds={Interlocked.Read(ref _nativeHolds)} lua_bound={_nativeBound.Count} lua_pushed={_npcLua.Pushed} lua_coalesced={_npcLua.Coalesced}"));
+                    $"MP-NPCWRITE-STATUS armed={(s.Armed ? 1 : 0)} on={(s.NativeOn ? 1 : 0)} bound={s.Bound} writing={s.Writing} frames={s.FramesWritten} writes={s.Writes} drops={s.Drops} samples={s.Samples} feed_enqueued={Interlocked.Read(ref feed.Enqueued)} feed_sent={Interlocked.Read(ref feed.Sent)} feed_batches={Interlocked.Read(ref feed.Batches)} feed_failed={Interlocked.Read(ref feed.FailedBatches)} feed_coalesced={Interlocked.Read(ref feed.Coalesced)} binds_ok={Interlocked.Read(ref _nativeBindsOk)} binds_refused={Interlocked.Read(ref _nativeBindsRefused)} dll_drops_seen={Interlocked.Read(ref _nativeDrops)} holds={Interlocked.Read(ref _nativeHolds)} lua_bound={_nativeBound.Count} lua_pushed={_npcLua.Pushed} lua_coalesced={_npcLua.Coalesced}"));
         }
         catch { }
         finally { Interlocked.Exchange(ref _nativeHeartbeatBusy, 0); }

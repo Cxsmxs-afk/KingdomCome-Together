@@ -72,7 +72,7 @@ public partial class GameBridge
     private readonly ConcurrentDictionary<int, long> _w140SepDrops = new();
     private readonly ConcurrentDictionary<byte, bool> _w140SepJoinersTold = new();
     private long _w140Asks, _w140AsksIn, _w140Yes, _w140No, _w140Timeouts, _w140Begins, _w140BeginsIn, _w140Starts, _w140StartFallbacks,
-                 _w140Stops, _w140Pulls, _w140HeldNative, _w140SepDropped, _w140SepOutDropped, _w140RestSaves;
+                 _w140Pulls, _w140HeldNative, _w140SepDropped, _w140SepOutDropped, _w140RestSaves;
 
     private const uint W140ApproveMs = 30_000;
     private const long W140AcceptWaitMs = 180_000;      // an accepter waits this long for the asker to lie down and choose
@@ -161,7 +161,7 @@ public partial class GameBridge
     }
 
     private string Wo140StatsLine() => FormattableString.Invariant(
-        $"MP-WO140-STATS vote={On(_w140On)} required={On(W140VoteRequired)} separate={On(_w140Separate)} asks_out={_w140Asks} asks_in={_w140AsksIn} yes={_w140Yes} no={_w140No} timeouts={_w140Timeouts} begins_out={_w140Begins} begins_in={_w140BeginsIn} starts={_w140Starts} start_fallbacks={_w140StartFallbacks} stops={_w140Stops} pulls={_w140Pulls} held_native={_w140HeldNative} rest_saves={_w140RestSaves} separate_dropped={_w140SepDropped} separate_out_dropped={_w140SepOutDropped} woke_kept={Interlocked.Read(ref _w157WokeKept)}");
+        $"MP-WO140-STATS vote={On(_w140On)} required={On(W140VoteRequired)} separate={On(_w140Separate)} asks_out={_w140Asks} asks_in={_w140AsksIn} yes={_w140Yes} no={_w140No} timeouts={_w140Timeouts} begins_out={_w140Begins} begins_in={_w140BeginsIn} starts={_w140Starts} start_fallbacks={_w140StartFallbacks} pulls={_w140Pulls} held_native={_w140HeldNative} rest_saves={_w140RestSaves} separate_dropped={_w140SepDropped} separate_out_dropped={_w140SepOutDropped} woke_kept={Interlocked.Read(ref _w157WokeKept)}");
 
     private async Task Wo140SendAsync(byte target, byte kind, uint tok, string text)
     {

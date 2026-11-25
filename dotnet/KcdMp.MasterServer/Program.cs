@@ -15,6 +15,8 @@ class Program
 	static async Task Main(string[] args)
 	{
 		var builder = WebApplication.CreateBuilder(args);
+		if (string.IsNullOrWhiteSpace(builder.Configuration["urls"]))
+			builder.WebHost.UseUrls("http://127.0.0.1:5100");
 
 		builder.Services.AddSerilog(options =>
 		{

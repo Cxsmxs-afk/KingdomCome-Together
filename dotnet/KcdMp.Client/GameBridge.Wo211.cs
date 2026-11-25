@@ -151,11 +151,17 @@ public partial class GameBridge
             bool typedPause = false;
             if (LoadSequenceEnabled)
             {
-                try { typedPause = await LoadSequenceSyncNativeAsync(waitForLink: true); } catch { }
+                await TryJoinControlAsync(async () =>
+                {
+                    typedPause = await LoadSequenceSyncNativeAsync(waitForLink: true);
+                }, "link-hold-native");
             }
             else
             {
-                try { _w211EngineHeld = await _combat.Wo151JoinHoldAsync(true, (ushort)(Wo211Rules.HoldWindowS + 20)) == true; } catch { }
+                await TryJoinControlAsync(async () =>
+                {
+                    _w211EngineHeld = await _combat.Wo151JoinHoldAsync(true, (ushort)(Wo211Rules.HoldWindowS + 20)) == true;
+                }, "link-hold-legacy");
             }
             if (hostAbsent)
             {
@@ -163,7 +169,7 @@ public partial class GameBridge
                 Console.WriteLine($"MP-HOST-ABSENT hold epoch={_w211HoldEpoch} native={(typedPause || _w211EngineHeld ? "confirmed" : "unconfirmed")}");
             }
             await Wo211TellLinkUiAsync(serial, on: true, window, typedPause);
-            _ = Wo211HoldLoopAsync(clock, typedPause);
+            Faults.FireAndLog(Wo211HoldLoopAsync(clock, typedPause), "link-hold-clock");
         }
         catch
         {
@@ -185,7 +191,8 @@ public partial class GameBridge
             string uiOnly = typedPause ? ", true" : "";
             await ExecLuaAsync($"if KCD2MP_W211LinkHold then KCD2MP_W211LinkHold({(on ? "true" : "false")}, {left}, \"{message}\"{uiOnly}) end");
         }
-        catch { }
+        catch (Exception ex) when (JoinControlRetired(ex)) { }
+        catch (Exception ex) { Faults.ReportThrottled("link-hold-menu", ex); }
         finally { _w211HoldUi.Release(); }
     }
 
@@ -284,7 +291,7 @@ public partial class GameBridge
             Wo211StopHoldClock(serial);
             if (leaving) LoadSequenceOnExit();
             if (resumed) _hostCalendarResumeEpoch = world;
-            try { await LoadSequenceSyncNativeAsync(); } catch { }
+            await TryJoinControlAsync(() => LoadSequenceSyncNativeAsync(), "link-release-native");
         }
         else
         {
@@ -294,7 +301,7 @@ public partial class GameBridge
             if (_w211EngineHeld)
             {
                 await _loadSequencePublish.WaitAsync();
-                try { await _combat.Wo151JoinHoldAsync(false, 0); } catch { }
+                try { await TryJoinControlAsync(() => _combat.Wo151JoinHoldAsync(false, 0), "link-release-legacy"); }
                 finally { _w211EngineHeld = false; _loadSequencePublish.Release(); }
             }
         }

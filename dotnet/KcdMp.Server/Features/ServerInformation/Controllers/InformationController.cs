@@ -38,6 +38,7 @@ public class InformationController : ControllerBase
 	public IActionResult GetInfo()
 	{
 		_serverInfo.Players = _clientHandler.ReadyClientCount;
+		_serverInfo.MaxPlayers = _clientHandler.MaxPlayers;
 
 		return Ok(_serverInfo);
 	}

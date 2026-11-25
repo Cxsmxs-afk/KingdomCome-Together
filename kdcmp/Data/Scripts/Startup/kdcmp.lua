@@ -777,8 +777,14 @@ end
 
 function KCD2MP_EmitTick()
     if not KCD2MP.emitRunning then return end
-    Script.SetTimer(KCD2MP.emitIntervalMs, KCD2MP_EmitTick)  -- reschedule FIRST: a Lua error must not kill the stream
     local nowClock = os.clock()
+    local intervalMs = KCD2MP.emitIntervalMs
+    if KCD2MP._nativePositionUntil and nowClock < KCD2MP._nativePositionUntil then
+        local readable, questWindow = true, nil
+        if KCD2MP_QuestWindow then readable, questWindow = pcall(KCD2MP_QuestWindow) end
+        if readable and not questWindow then intervalMs = math.max(intervalMs, 40) end
+    end
+    Script.SetTimer(intervalMs, KCD2MP_EmitTick)  -- a Lua error below this reschedule cannot kill the stream
     if KCD2MP_W207AwakeWatch and nowClock - (KCD2MP._w207WatchAt or 0) > 2 then KCD2MP._w207WatchAt = nowClock; pcall(KCD2MP_W207AwakeWatch) end   -- WO-207 C.2
 
     -- WO-59 Thread D: a frame-rate floor signal, so the next "FPS dropped"
@@ -799,11 +805,11 @@ function KCD2MP_EmitTick()
         if dtMs > st.max then st.max = dtMs end
         if (nowClock - st.winStart) >= 15 and st.n > 0 then
             local avg = st.sum / st.n
-            local degraded = avg > KCD2MP.emitIntervalMs * 2.0
+            local degraded = avg > intervalMs * 2.0
             if degraded or (nowClock - st.baseAt) >= 60 then
                 System.LogAlways(string.format(
                     "[KCD2-MP] tickstat avg=%.1fms max=%.1fms n=%d interval=%dms%s",
-                    avg, st.max, st.n, KCD2MP.emitIntervalMs,
+                    avg, st.max, st.n, intervalMs,
                     degraded and string.format(" DEGRADED (~%.0f fps floor)", 1000 / avg) or ""))
                 st.baseAt = nowClock
             end
@@ -848,7 +854,12 @@ end
 
 function KCD2MP_StopEmitter()
     KCD2MP.emitRunning = false
+    KCD2MP._nativePositionUntil = nil
     System.LogAlways("[KCD2-MP] State emitter stopped after " .. KCD2MP.emitSeq .. " lines")
+end
+
+function KCD2MP_NativePositionCadence(active)
+    KCD2MP._nativePositionUntil = active and (os.clock() + 1.5) or nil
 end
 
 -- Legacy name, kept because the 500 ms KCD2MP_Tick calls it. Delegates so there
@@ -1056,7 +1067,7 @@ function KCD2MP_ApplyWeather(profile, blend)
     profile = tostring(profile or "")
     if profile == "" then return end
     local b = tonumber(blend) or 30
-    local ok, err = false, nil
+    local ok, err = false
     if EnvironmentModule and EnvironmentModule.BlendTimeOfDay then
         ok, err = pcall(function()
             EnvironmentModule.BlendTimeOfDay(profile, b, true)
@@ -6574,7 +6585,7 @@ do
                 end
             end
         end
-        local now = os.clock()
+        now = os.clock()
         if now - C.reportedAt >= 60 then
             C.reportedAt = now
             local count = 0
@@ -7991,7 +8002,7 @@ function KCD2MP_W136AvatarTorch(id, on)
     local g = KCD2MP.ghosts and KCD2MP.ghosts[id]
     local e = g and g.entity
     if not (e and e.human and e.inventory) then return false end
-    local how = "?"
+    local how
     if on then
         local it = nil
         pcall(function() it = e.inventory:FindItem(w.TORCH_ITEM) end)
@@ -8631,7 +8642,7 @@ function KCD2MP_W137HostHold(on, npc, peer, why)
     if not h then return false end
     w.held[npc] = nil
     w.stats.releases = w.stats.releases + 1
-    local exec = "ok"
+    local exec
     if KCD2MP.w123 and KCD2MP.w123.paused and KCD2MP.w123.npcs[npc] then
         exec = "left-to-the-join-pause"   -- a join paused the world meanwhile: its resume wakes it
     elseif h.paused then
@@ -11238,40 +11249,37 @@ function KCD2MP_NpcPuppetTick(arg, gen)
             if KCD2MP.npcSmooth then
                 spd = mp_npc_smooth_render(p, now)
             end
-            local dx, dy = 0, 0
-            if spd ~= nil then
-                -- rendered; fall through to the write below
-            else
-            -- Legacy path (mp_npc_smooth off, or an empty ring): the
-            -- pre-WO-77 per-tick 0.5 lerp, kept verbatim for the live A/B.
-            -- Same teleport-vs-lerp shape as the ghost interp: snap on a big
-            -- gap, smooth otherwise.
-            dx, dy = (p.tx or p.cx) - p.cx, (p.ty or p.cy) - p.cy
-            if dx*dx + dy*dy > 25.0 then
-                p.cx, p.cy, p.cz, p.cr = p.tx, p.ty, p.tz, p.tr
-            else
-                p.cx = p.cx + dx * 0.5
-                p.cy = p.cy + dy * 0.5
-                p.cz = p.tz or p.cz
-                -- WO-69: yaw was a HARD SNAP (`p.cr = p.tr or p.cr`) while
-                -- position was lerped -- so a puppet's body slid smoothly
-                -- while its facing jumped 4x/sec to whatever the last packet
-                -- said. That is a jitter source entirely independent of the
-                -- position stream, and no amount of position smoothing would
-                -- have fixed it. lerpAngle is the ghost path's own
-                -- shortest-path helper (file-top local, in scope here --
-                -- unlike getFloorZ, which is declared AFTER this tick and
-                -- would bind to a nil global).
-                --
-                -- Position smoothing is deliberately NOT changed in this work
-                -- order: it is WO-70's, behind the WO-63 ordering gate
-                -- (live-verify WO-60 first). Yaw is safe to land now because
-                -- it smooths ROTATION, so it cannot mask the position
-                -- snap-between-attractors that WO-60's footage has to show.
-                if p.tr then p.cr = lerpAngle(p.cr or p.tr, p.tr, 0.5) end
-            end
-            -- Legacy speed: per-tick rendered displacement, no hysteresis.
-            spd = math.sqrt(dx*dx + dy*dy) * 0.5 / 0.050
+            if spd == nil then
+                -- Legacy path (mp_npc_smooth off, or an empty ring): the
+                -- pre-WO-77 per-tick 0.5 lerp, kept verbatim for the live A/B.
+                -- Same teleport-vs-lerp shape as the ghost interp: snap on a big
+                -- gap, smooth otherwise.
+                local dx, dy = (p.tx or p.cx) - p.cx, (p.ty or p.cy) - p.cy
+                if dx*dx + dy*dy > 25.0 then
+                    p.cx, p.cy, p.cz, p.cr = p.tx, p.ty, p.tz, p.tr
+                else
+                    p.cx = p.cx + dx * 0.5
+                    p.cy = p.cy + dy * 0.5
+                    p.cz = p.tz or p.cz
+                    -- WO-69: yaw was a HARD SNAP (`p.cr = p.tr or p.cr`) while
+                    -- position was lerped -- so a puppet's body slid smoothly
+                    -- while its facing jumped 4x/sec to whatever the last packet
+                    -- said. That is a jitter source entirely independent of the
+                    -- position stream, and no amount of position smoothing would
+                    -- have fixed it. lerpAngle is the ghost path's own
+                    -- shortest-path helper (file-top local, in scope here --
+                    -- unlike getFloorZ, which is declared AFTER this tick and
+                    -- would bind to a nil global).
+                    --
+                    -- Position smoothing is deliberately NOT changed in this work
+                    -- order: it is WO-70's, behind the WO-63 ordering gate
+                    -- (live-verify WO-60 first). Yaw is safe to land now because
+                    -- it smooths ROTATION, so it cannot mask the position
+                    -- snap-between-attractors that WO-60's footage has to show.
+                    if p.tr then p.cr = lerpAngle(p.cr or p.tr, p.tr, 0.5) end
+                end
+                -- Legacy speed: per-tick rendered displacement, no hysteresis.
+                spd = math.sqrt(dx*dx + dy*dy) * 0.5 / 0.050
             end
 
             -- WO-118: a puppet the DLL acknowledged is written by KCDMP.dll every
@@ -11850,7 +11858,7 @@ function KCD2MP_SpawnGhost(id, x, y, z, rotZ)
     local hasAi = nil
     pcall(function() hasAi = (entity.AI ~= nil) end)
     local aiFn = (AI ~= nil) and type(AI.ChangeParameter) or "no AI table"
-    local okAi, aiErr = false, nil
+    local okAi, aiErr = false
     if AIPARAM_FACTION == nil then
         aiErr = "AIPARAM_FACTION is nil -- call skipped"
     elseif aiFn ~= "function" then
@@ -13205,7 +13213,8 @@ end
 function KCD2MP_LabelTick()
     if not KCD2MP.labelRunning then return end
     Script.SetTimer(8, KCD2MP_LabelTick)
-    KCD2MP._labelAliveAt = os.clock()
+    local now = os.clock()
+    KCD2MP._labelAliveAt = now
     KCD2MP_ApplyHorseTransforms()
     -- WO-154: the name badges and the ping line are the player's to hide (mp_name_badges, mp_ping_line, mp_clean_screen)
     local mm = KCD2MP.w154menu
@@ -13218,13 +13227,12 @@ function KCD2MP_LabelTick()
                 -- The neck bone does not move enough in one frame to be worth
                 -- a GetBonePos on every one. 50 ms is about three frames at
                 -- 60 fps and the badge still sits on the body.
-                local nowL = os.clock()
-                if lbl.ent and lbl.badgeAt and (nowL - lbl.badgeAt) < 0.05 and lbl.blvl then
+                if lbl.ent and lbl.badgeAt and (now - lbl.badgeAt) < 0.05 and lbl.blvl then
                     lx, ly, lz, lvl = lbl.bx, lbl.by, lbl.bz, lbl.blvl
                     KCD2MP_PerfBump("boneReuse")
                 elseif lbl.ent then
                     lx, ly, lz, lvl = KCD2MP_W158BadgeAnchor(lbl.ent, lbl.x, lbl.y, lbl.z)
-                    lbl.badgeAt, lbl.bx, lbl.by, lbl.bz, lbl.blvl = nowL, lx, ly, lz, lvl
+                    lbl.badgeAt, lbl.bx, lbl.by, lbl.bz, lbl.blvl = now, lx, ly, lz, lvl
                     KCD2MP_PerfBump("boneRead")
                 end
                 if lbl.ent then KCD2MP_W158BadgeNote(id, lvl) end
@@ -14731,7 +14739,7 @@ function KCD2MP_InterpTick(arg, gen)
             if KCD2MP.w151 and KCD2MP.w151.rideOwner ~= false and KCD2MP_W136MountedHorse then
                 local gh = nil
                 pcall(function() gh = KCD2MP_W136MountedHorse() end)
-                if gh then riding = true; mountName = gh; KCD2MP.isRiding = true end
+                if gh then mountName = gh; KCD2MP.isRiding = true end
                 KCD2MP.w151.localMount = gh
                 if gh then KCD2MP.w151.mountingName = nil end
             end
@@ -18555,9 +18563,10 @@ function KCD2MP_W134HostTake(peer, tok, name, cls, amt, hp, screen, generation)
     -- WO-136 Phase 7: a refused take names who got it -- mine (this joiner's own
     -- earlier take), none (this body never held it), else gone (someone else: the
     -- host or another joiner). Only "gone" shows the notice on the joiner.
-    if decided then
-    elseif verdict == "ok" then W134.noteTake(tostring(name), tostring(cls), tostring(peer), amt)
-    else verdict = W134.goneWhy(tostring(name), tostring(cls), tostring(peer), have) end
+    if not decided then
+        if verdict == "ok" then W134.noteTake(tostring(name), tostring(cls), tostring(peer), amt)
+        else verdict = W134.goneWhy(tostring(name), tostring(cls), tostring(peer), have) end
+    end
     if e then W134.noteCounts(tostring(name), e) end
     w.stats.hostTakes = w.stats.hostTakes + 1
     -- WO-195B 2d: an item out of a LIVING NPC is a pickpocket: the host's own witness rule (the victim's eyes and ears included) says whether it
@@ -21149,7 +21158,7 @@ function KCD2MP_W139Stole(rec)
     local tries = 0
     local function check()
         tries = tries + 1
-        local gone = false
+        local gone
         if rec.cls and rec.had then
             local now = nil
             pcall(function() now = player.inventory:GetCountOfClass(rec.cls) end)
@@ -26971,8 +26980,8 @@ function KCD2MP_W164EscortFind()
     pcall(function() ents = System.GetEntitiesInSphere(pp, 8) end)
     local best, bestD = nil, 64
     for _, e in ipairs(ents or {}) do
-        local nm, cls = nil, nil
-        pcall(function() if e.GetName then nm = e:GetName() end; cls = e.class end)
+        local nm
+        pcall(function() if e.GetName then nm = e:GetName() end end)
         if nm and e.soul and e ~= player and not KCD2MP.npcPuppets[nm] and not string.find(nm, "^kcd2mp_") and not (mp_is_mod_entity and mp_is_mod_entity(e)) then
             local pos = nil
             pcall(function() pos = e:GetWorldPos() end)
@@ -27957,7 +27966,7 @@ do
                 local _, current = w155_body(id)
                 return W.dead[id] == death and not death.released and current == e
             end, function()
-                local ok, err = false, nil
+                local ok, err = false
                 if type(e.actor.RagDollize) == "function" then
                     ok, err = pcall(function() e.actor:RagDollize() end)
                 elseif type(e.actor.Fall) == "function" then
@@ -33363,13 +33372,13 @@ end
 -- Distance from the player to one registry beat, or nil when it cannot be
 -- known right now (entity-positioned beat whose entity is not streamed in).
 local function questBeatDist2(b, ppos)
-    local bx, by, bz = b.x, b.y, b.z
+    local bx, by = b.x, b.y
     if b.e then
         local ent = System.GetEntityByName(b.e)
         if not ent then return nil end
         local ok, ep = pcall(function() return ent:GetWorldPos() end)
         if not ok or not ep then return nil end
-        bx, by, bz = ep.x, ep.y, ep.z
+        bx, by = ep.x, ep.y
     end
     if not bx then return nil end
     local dx, dy = bx - ppos.x, by - ppos.y
@@ -39482,7 +39491,7 @@ do
         playerRef = player, loading = nil, dead = nil, menu = false, link = nil, use = nil, agentSerial = -1, agentDowned = nil, agentAuthority = nil, agentLifeRevision = 0,
         stats = { input_held_max_s = 0, input_releases = 0 }, reportedAt = os.clock() }
     KCD2MP.t3Input = I
-    local unpackValues = unpack or table.unpack
+    local unpackValues = unpack or rawget(table, "unpack")
     local function pack(...) return { n = select("#", ...), ... } end
     local heldValue = { no_input = true, noninteractive = true, player = false, movement = false, dialog = true, kcd2mp_listen = true }
     local maps = { "no_input", "noninteractive", "player", "movement" }

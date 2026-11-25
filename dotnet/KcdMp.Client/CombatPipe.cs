@@ -272,6 +272,26 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// </summary>
     public bool OwnLine { get; set; } = true;
     private readonly SemaphoreSlim _line = new(1, 1);
+    private TaskCompletionSource? _frameProgress;
+
+    private Task? PendingFrameProgress(int yieldsLeft)
+    {
+        if (yieldsLeft <= 0 || Volatile.Read(ref _framesWaiting) == 0) return null;
+        var progress = Volatile.Read(ref _frameProgress);
+        if (progress is null)
+        {
+            var next = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            progress = Interlocked.CompareExchange(ref _frameProgress, next, null) ?? next;
+        }
+        // A frame can cancel between the first count and registration.
+        return Volatile.Read(ref _framesWaiting) == 0 ? null : progress.Task;
+    }
+
+    private void FrameLeftQueue()
+    {
+        Interlocked.Decrement(ref _framesWaiting);
+        Interlocked.Exchange(ref _frameProgress, null)?.TrySetResult();
+    }
 
     private async Task<bool> EnterGateInnerAsync(CancellationToken ct)
     {
@@ -297,16 +317,17 @@ public sealed partial class CombatPipe : IAsyncDisposable
         {
             Interlocked.Increment(ref _framesWaiting);
             try { await _line.WaitAsync(ct); }
-            finally { Interlocked.Decrement(ref _framesWaiting); }
+            finally { FrameLeftQueue(); }
             return;
         }
         int frameYields = FramesFirst ? FrameYields : 0;
         while (true)
         {
             await _line.WaitAsync(ct);
-            if (Volatile.Read(ref _framesWaiting) == 0 || frameYields-- <= 0) return;
+            if (PendingFrameProgress(frameYields) is not { } progress) return;
+            --frameYields;
             _line.Release();   // a frame's handler waits: it goes first
-            await Task.Delay(1, ct);
+            await progress.WaitAsync(ct).ConfigureAwait(ConfigureAwaitOptions.ForceYielding | ConfigureAwaitOptions.ContinueOnCapturedContext);
         }
     }
 
@@ -319,16 +340,17 @@ public sealed partial class CombatPipe : IAsyncDisposable
         {
             Interlocked.Increment(ref _framesWaiting);
             try { await GateBehindPriorityAsync(ct, yields); }
-            finally { Interlocked.Decrement(ref _framesWaiting); }
+            finally { FrameLeftQueue(); }
             return;
         }
         int frameYields = FrameYields;   // WO-213: a poll's give-way to frames' calls is bounded too
         while (true)
         {
             yields = await GateBehindPriorityAsync(ct, yields);
-            if (Volatile.Read(ref _framesWaiting) == 0 || frameYields-- <= 0) return;
+            if (PendingFrameProgress(frameYields) is not { } progress) return;
+            --frameYields;
             _gate.Release();   // a frame's handler waits: it goes first
-            await Task.Delay(1, ct);
+            await progress.WaitAsync(ct).ConfigureAwait(ConfigureAwaitOptions.ForceYielding | ConfigureAwaitOptions.ContinueOnCapturedContext);
         }
     }
 

@@ -14,8 +14,9 @@ namespace KcdMp.Client;
 // (WO-139), sleep and wait (WO-140), activities (WO-141/143), the leash
 // (WO-114) -- reads LivePartners(); the sleep and wait votes read
 // VotingPartners() (connected AND in this world). A crime record the host keeps
-// for a joiner survives his reconnect: parked under his name at the
-// Disconnect, given back when that name connects again.
+// for a joiner survives reconnect to the same relay: parked under its roster
+// member ID at Disconnect, restored to that member when it connects again.
+// A new relay process issues a new roster and cannot vouch for old records.
 public partial class GameBridge
 {
     private readonly PeerSet _peers = new();
@@ -63,6 +64,8 @@ public partial class GameBridge
             return;
         }
         if (_w144CrimeRoster == relayInstance) return;
+        // Parked records belong to the issuing relay roster, even when the
+        // name or member ID in a new roster happens to match.
         _w144ParkedCrime.Clear();
         _w144CrimeRoster = relayInstance;
     }

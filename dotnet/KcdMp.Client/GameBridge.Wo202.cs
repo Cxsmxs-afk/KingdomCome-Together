@@ -10,7 +10,6 @@ public partial class GameBridge
 {
     private readonly ConcurrentDictionary<string, bool> _w202On = new(StringComparer.Ordinal);
     private bool W202(string name) => _w202On.TryGetValue(name, out bool v) ? v : Wo202Rules.DefaultOn(name);
-    private long _w202JoinEarlyReleases, _w202JoinSilenceWaits;
 
     private void Wo202OnEvent(string name, string? arg)
     {
@@ -41,7 +40,7 @@ public partial class GameBridge
     private void Wo202Status()
     {
         string sw = string.Join(" ", Wo202Rules.SwitchNames.Select(n => $"{n}={(W202(n) ? "on" : "off")}"));
-        Console.WriteLine($"MP-W202-STATS {sw} join_early_releases={_w202JoinEarlyReleases} join_silence_waits={_w202JoinSilenceWaits} quest_fails={_w202FailsLogged} " +
+        Console.WriteLine($"MP-W202-STATS {sw} quest_fails={_w202FailsLogged} " +
                           $"death_checks={_w202DeathChecks} death_falls={_w202DeathFalls} death_fall_failed={_w202DeathFallFailed} death_lying={_w202DeathLying} death_announced={_w202DeathAnnounced} death_refused={_w202DeathRefused} " + Wo202ClockStats() + " " + Wo202KeysStats());
     }
 

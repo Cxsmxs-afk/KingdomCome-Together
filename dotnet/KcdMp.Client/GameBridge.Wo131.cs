@@ -31,7 +31,7 @@ public partial class GameBridge
     private readonly ConcurrentDictionary<string, Guid> _w131FactionDone = new();
     private readonly ConcurrentDictionary<string, long> _w131FactionTriedMs = new();
     private long _w131HitsForwarded, _w131HitsDropped, _w131DeathsBlocked, _w131GuardOn, _w131GuardFail,
-                 _w131Follow, _w131FollowFail, _w131Restore, _w131RestoreFail, _w131StopFights, _w131FactionOk, _w131FactionFail;
+                 _w131Follow, _w131FollowFail, _w131Restore, _w131RestoreFail, _w131FactionOk, _w131FactionFail;
     private readonly ConcurrentDictionary<string, long> _w131DropReasons = new();
 
     private static long W131NowMs() => Environment.TickCount64;
@@ -96,7 +96,7 @@ public partial class GameBridge
                     string reasons = string.Join(",", _w131DropReasons.Select(kv => $"{kv.Key}:{kv.Value}"));
                     string? nat = await _combat.Wo131StatusAsync(ct);
                     Console.WriteLine(FormattableString.Invariant(
-                        $"MP-WO131-STATS joiner={(Wo131JoinerActive ? 1 : 0)} perceive_host={(Wo131HostPerceiveActive ? 1 : 0)} hits_fwd={_w131HitsForwarded} hits_drop={_w131HitsDropped} [{reasons}] deaths_blocked={_w131DeathsBlocked} guard_on={_w131GuardOn} guard_fail={_w131GuardFail} follow={_w131Follow} follow_fail={_w131FollowFail} restore={_w131Restore} restore_fail={_w131RestoreFail} stopfight={_w131StopFights} faction_ok={_w131FactionOk} faction_fail={_w131FactionFail} | {nat ?? "native: no answer"}"));
+                        $"MP-WO131-STATS joiner={(Wo131JoinerActive ? 1 : 0)} perceive_host={(Wo131HostPerceiveActive ? 1 : 0)} hits_fwd={_w131HitsForwarded} hits_drop={_w131HitsDropped} [{reasons}] deaths_blocked={_w131DeathsBlocked} guard_on={_w131GuardOn} guard_fail={_w131GuardFail} follow={_w131Follow} follow_fail={_w131FollowFail} restore={_w131Restore} restore_fail={_w131RestoreFail} faction_ok={_w131FactionOk} faction_fail={_w131FactionFail} | {nat ?? "native: no answer"}"));
                     Console.WriteLine(Wo136StatsLine());   // WO-136
                 }
             }

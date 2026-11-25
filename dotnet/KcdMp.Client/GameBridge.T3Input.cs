@@ -39,7 +39,7 @@ public partial class GameBridge
             bool downed; long lifeRevision;
             lock (_t3InputStateGate) { downed = _localDowned; lifeRevision = _t3InputLifeAuthority == generation ? _t3InputLifeRevision : 0; }
             string command = $"if KCD2MP_T3InputAgentState then KCD2MP_T3InputAgentState({(_w192MenuOpen ? "true" : "false")},{(downed ? "true" : "false")},{serial.ToString(CultureInfo.InvariantCulture)},\"{generation.ToString(CultureInfo.InvariantCulture)}\",{lifeRevision.ToString(CultureInfo.InvariantCulture)}) end";
-            var result = await ProcessorFrameScope.RunAsync(token => _transport.ExecuteNowAsync(command, token), 2000, ct);
+            var result = await RunProcessorFrameAsync(token => _transport.ExecuteNowAsync(command, token), 2000, ct);
             if (result.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut) T3Increment("input_owner_sync_failed");
         }
         finally { Interlocked.Exchange(ref _t3InputBusy, 0); }

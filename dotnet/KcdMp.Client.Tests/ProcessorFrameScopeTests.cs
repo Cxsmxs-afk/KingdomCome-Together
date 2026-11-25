@@ -8,6 +8,13 @@ public class ProcessorFrameScopeTests
     private static readonly TimeSpan Watchdog = TimeSpan.FromSeconds(2);
 
     [Fact]
+    public void The_client_assembly_has_no_process_wide_deadline_test_hook()
+    {
+        Assert.Null(typeof(ProcessorFrameScope).GetField("InstrumentDeadlineTime",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic));
+    }
+
+    [Fact]
     public async Task Http_timeout_is_a_frame_fault_and_the_following_frame_runs()
     {
         var first = await ProcessorFrameScope.RunAsync(_ => Task.FromException(new TaskCanceledException("HTTP timeout")), 2000);

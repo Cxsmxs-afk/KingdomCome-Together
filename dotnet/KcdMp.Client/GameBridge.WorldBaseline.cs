@@ -66,7 +66,7 @@ public partial class GameBridge
     private async Task<bool> ApplyWorldStateFrameAsync(InFrame frame, CancellationToken ct)
     {
         if (!WorldBaselineCurrent(frame, ct)) return false;
-        var result = await ProcessorFrameScope.RunAsync(token => ProcessFrameCoreAsync(frame, token, null), 1800, ct);
+        var result = await RunProcessorFrameAsync(token => ProcessFrameCoreAsync(frame, token, null), 1800, ct);
         return result.Status == ProcessorFrameScope.Outcome.Completed && WorldBaselineCurrent(frame, ct);
     }
 
@@ -74,7 +74,7 @@ public partial class GameBridge
     {
         if (CacheHostCalendar(clock.Source, clock.Text) is not { } state) return false;
         bool corrected = false;
-        var result = await ProcessorFrameScope.RunAsync(async _ =>
+        var result = await RunProcessorFrameAsync(async _ =>
         {
             corrected = await UpdateHostCalendarAsync(state.Sample, state.Generation);
         }, 1800, ct);

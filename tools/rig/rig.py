@@ -80,7 +80,7 @@ def note(event, **kv):
 
 def api_up(port):
     try:
-        with urllib.request.urlopen('http://localhost:%d/api/rpg/SoulList/SoulCount' % port, timeout=3) as r: r.read(64)
+        with urllib.request.urlopen('http://127.0.0.1:%d/api/rpg/SoulList/SoulCount' % port, timeout=3) as r: r.read(64)
         return True
     except Exception:
         return False
@@ -92,7 +92,7 @@ def console(port, c, timeout=20):
     # 503 = the game's API is busy with another request (an agent's batch): the command never ran, so it is sent again
     for attempt in range(40):
         try:
-            with urllib.request.urlopen('http://localhost:%d/api/System/Console/ExecuteString?command=%s' % (port, enc), timeout=timeout) as r:
+            with urllib.request.urlopen('http://127.0.0.1:%d/api/System/Console/ExecuteString?command=%s' % (port, enc), timeout=timeout) as r:
                 return r.read(1 << 20).decode('utf-8', 'replace')
         except urllib.error.HTTPError as e:
             if e.code != 503 or attempt == 39: raise

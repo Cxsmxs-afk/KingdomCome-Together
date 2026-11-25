@@ -79,8 +79,8 @@ public class ClientHandler
 		// WO-76 (docs/WO-75-audit-findings.md s1): 0 was accepted at face
 		// value and refused every handshake (TryMarkReady's count-vs-limit
 		// check can never pass), bricking the relay with no indication why.
-		int configuredMaxPlayers = configuration.GetValue("ServerInfo:MaxPlayers", 64);
-		_maxPlayers = Math.Max(1, configuredMaxPlayers);
+		int configuredMaxPlayers = configuration.GetValue("ServerInfo:MaxPlayers", Protocol.MaxCoopPlayers);
+		_maxPlayers = Math.Clamp(configuredMaxPlayers, 1, Protocol.MaxCoopPlayers);
 		if (_maxPlayers != configuredMaxPlayers)
 			logger.Warning("[!] ServerInfo:MaxPlayers={Configured} is invalid; clamped to {Effective}.",
 				configuredMaxPlayers, _maxPlayers);
@@ -248,7 +248,7 @@ public class ClientHandler
 		// A reserved seat belongs to the selected host until that player returns
 		// or the roster becomes empty. Later departures cannot replace it.
 		if ((ReferenceEquals(_earlyHost, client) || client.ClaimsHost) && HasPlayerIdentity(client.IdentityKey))
-			_departedEarlyHost ??= new(client.IdentityKey, client.Name!);
+			_departedEarlyHost ??= new(client.IdentityKey, client.Name!, client.IsLoopback);
 		ForgetRetiredEarlyHost(client);
 		_hostClaimRequired = true;
 		if (!confirmed || remaining == 0 || client.AnnouncedWorldEpoch == 0 || client.AnnouncedRunId == Guid.Empty ||
@@ -335,7 +335,7 @@ public class ClientHandler
 	private ClientSession? _earlyHost;
 	private bool _earlyHostClaimed;
 	private bool _earlyHostModeObserved;
-	private sealed record EarlyHostIdentity(string Key, string Name)
+	private sealed record EarlyHostIdentity(string Key, string Name, bool IsLoopback)
 	{
 		public bool Matches(ClientSession client) => HasPlayerIdentity(Key) && Key == client.IdentityKey &&
 			string.Equals(Name, client.Name, StringComparison.Ordinal);
@@ -390,11 +390,13 @@ public class ClientHandler
 	internal bool AllowsHostClaim(ClientSession client)
 	{
 		if (_absentHost is not null) return IsReturningHost(client);
-		return _departedEarlyHost is not { } departed || departed.Matches(client);
+		return _departedEarlyHost is not { } departed || departed.Matches(client) ||
+			(!departed.IsLoopback && client.IsLoopback);
 	}
 
 	// A role change shares the roster lock with departure and mode registration.
-	// The first selected explicit claim reserves the seat on either transport.
+	// An explicit claim reserves the seat. Before any confirmed world, the relay's
+	// own launcher can supersede a provisional claim from a remote connection.
 	internal bool UpdateHostClaim(ClientSession client, bool claims)
 	{
 		lock (_lock)
@@ -517,6 +519,18 @@ public class ClientHandler
 	{
 		if (_absentHost is not null) { reason = "host-absent"; return null; }
 		if (_sessionHost is not null) { reason = "session-host"; return _sessionHost; }
+		if (_departedEarlyHost is { IsLoopback: false } ||
+			(_earlyHostClaimed && _earlyHost is { IsLoopback: false }))
+		{
+			ClientSession? localClaim = null;
+			foreach (var client in _readyClients)
+			{
+				if (!client.IsReady || !client.ClaimsHost || !client.IsLoopback) continue;
+				if (localClaim is not null) { localClaim = null; break; }
+				localClaim = client;
+			}
+			if (localClaim is not null) { reason = "relay-local-claim"; return localClaim; }
+		}
 		if (_departedEarlyHost is { } departed)
 		{
 			reason = "awaiting-early-host";

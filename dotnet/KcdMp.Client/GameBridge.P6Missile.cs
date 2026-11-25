@@ -56,7 +56,7 @@ public partial class GameBridge
             while (_p6MeasuredWork.TryDequeue(out var work))
             {
                 Interlocked.Decrement(ref _p6MeasuredCount);
-                await ProcessorFrameScope.RunAsync(token => P6PublishMeasuredAsync(work, token), 2000, work.Context.Cancellation);
+                await RunProcessorFrameAsync(token => P6PublishMeasuredAsync(work, token), 2000, work.Context.Cancellation);
             }
         }
         finally

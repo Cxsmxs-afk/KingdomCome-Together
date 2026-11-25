@@ -9,6 +9,38 @@ namespace KcdMp.Client.Tests;
 [Collection("Join calendar integration")]
 public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
 {
+    [Fact]
+    public async Task Native_cadence_renews_only_on_schedule_and_restores_the_log_fallback()
+    {
+        string path = Path.GetTempFileName();
+        try
+        {
+            var game = new EmitterReply();
+            var transport = new HttpGameTransport("http://127.0.0.1:1403", handler: game);
+            await using var tail = new LogTailGameTransport(transport, path);
+            Assert.Equal(5, tail.ReadDelayMs);
+
+            await tail.UpdateNativePositionCadenceAsync(true, 100, default);
+            await transport.FlushAsync();
+            Assert.Equal(10, tail.ReadDelayMs);
+            Assert.Contains("KCD2MP_NativePositionCadence(true)", Assert.Single(game.Commands));
+
+            await tail.UpdateNativePositionCadenceAsync(true, 849, default);
+            await transport.FlushAsync();
+            Assert.Single(game.Commands);
+
+            await tail.UpdateNativePositionCadenceAsync(true, 850, default);
+            await tail.UpdateNativePositionCadenceAsync(false, 851, default);
+            await transport.FlushAsync();
+            Assert.Equal(5, tail.ReadDelayMs);
+            string fallback = game.Commands.Last();
+            Assert.Contains("KCD2MP_NativePositionCadence(false)", fallback);
+            Assert.DoesNotContain("KCD2MP_NativePositionCadence(true)", fallback);
+            Assert.Equal(2, game.Commands.Count);
+        }
+        finally { File.Delete(path); }
+    }
+
     [Theory]
     [InlineData("replace", false)]
     [InlineData("replace", true)]
@@ -129,7 +161,12 @@ public sealed class LogTailPhysicalRotationProbeTests(ITestOutputHelper output)
 
     private sealed class EmitterReply : HttpMessageHandler
     {
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
-            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+        public ConcurrentQueue<string> Commands { get; } = new();
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Commands.Enqueue(Uri.UnescapeDataString(request.RequestUri!.Query));
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+        }
     }
 }

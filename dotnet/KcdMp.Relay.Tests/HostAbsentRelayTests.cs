@@ -39,6 +39,68 @@ public sealed class HostAbsentRelayTests : IClassFixture<RelayFixture>
     }
 
     [Theory]
+    [InlineData(2, false)]
+    [InlineData(3, true)]
+    [InlineData(4, false)]
+    public async Task The_launcher_host_takes_the_seat_from_an_unconfirmed_remote_claim(int players, bool remoteLeaves)
+    {
+        await using var app = RelayListeners.CreateApp("--Tcp:BindAddress", "0.0.0.0");
+        int port = (await RelayListeners.StartAsync(app, IPAddress.Any)).Port;
+        var clients = app.Services.GetRequiredService<ClientHandler>();
+        var remoteEndpoint = new IPEndPoint(NonLoopbackAddress(), port);
+        var guests = new Peer[players - 1];
+        await using var group = new PeerGroup(guests);
+        for (int i = 0; i < guests.Length; i++)
+            guests[i] = await Peer.ConnectAsync(remoteEndpoint, $"remote-guest-{i}", "dedicated-host-seat");
+        Peer first = guests[0];
+        await first.SendRawAsync(Claim());
+        await BarrierAsync(first);
+        Assert.Equal(first.Id, clients.DamageAuthority?.Id);
+        Assert.False(clients.DamageAuthority!.IsLoopback);
+        if (remoteLeaves)
+        {
+            await first.DisposeAsync();
+            Assert.Equal(first.Id, (await guests[1].ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+            Assert.Null(clients.DamageAuthority);
+        }
+
+        await using var host = await Peer.ConnectAsync(port, "launcher-host");
+        await host.SendRawAsync(Claim());
+        await BarrierAsync(host);
+        Console.WriteLine($"A-HOST-SEAT players={players} earlier_claim_left={remoteLeaves} owner={clients.DamageAuthority?.Name ?? "none"}");
+        Assert.Equal("launcher-host", clients.DamageAuthority?.Name);
+        Assert.True(clients.DamageAuthority!.IsLoopback);
+        await ConfirmWorldAsync(host, guests[remoteLeaves ? 1 : 0]);
+        Assert.Equal(host.Id, clients.DamageAuthority?.Id);
+    }
+
+    [Fact]
+    public async Task The_fifth_player_gets_the_four_seat_limit_and_can_retry_after_a_leave()
+    {
+        await using var app = RelayListeners.CreateApp("--ServerInfo:MaxPlayers", "64");
+        int port = (await RelayListeners.StartAsync(app)).Port;
+        var clients = app.Services.GetRequiredService<ClientHandler>();
+        var players = new Peer[4];
+        await using var group = new PeerGroup(players);
+        for (int i = 0; i < players.Length; i++) players[i] = await Peer.ConnectAsync(port, $"seat-{i}");
+
+        var (extra, type, reason) = await Peer.ConnectRawAsync(port, "fifth-player", ReleaseVersionInfo.Wire, Protocol.Version);
+        await using (extra)
+        {
+            Console.WriteLine($"B3-CAPACITY first_reply=0x{type:X2} configured=64 effective={clients.MaxPlayers}");
+            Assert.Equal(Protocol.ServerFull, type);
+            Assert.Equal((byte)4, Assert.Single(reason));
+        }
+        Assert.Equal(4, clients.ReadyClientCount);
+
+        await players[0].DisposeAsync();
+        Assert.Equal(players[0].Id, (await players[1].ReadUntilAsync(Protocol.Disconnect, Wait))[0]);
+        await using var admitted = await Peer.ConnectAsync(port, "fifth-player");
+        await BarrierAsync(admitted);
+        Assert.Equal(4, clients.ReadyClientCount);
+    }
+
+    [Theory]
     [InlineData(2)]
     [InlineData(3)]
     [InlineData(4)]

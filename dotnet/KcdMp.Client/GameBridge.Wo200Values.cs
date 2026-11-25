@@ -16,7 +16,7 @@ namespace KcdMp.Client;
 //   II.7 world_clock_from_host: precise native calendar samples; the joiner's pre-update follower replaces ratio slews and poll pulls.
 public partial class GameBridge
 {
-    private long _w200HitsNotApplied, _w200VitalsOut, _w200VitalsIn, _w200StaminaSet, _w200MountOut, _w200MountIn, _w200ClockOut, _w200ClockIn, _w200Slews;
+    private long _w200HitsNotApplied, _w200VitalsOut, _w200VitalsIn, _w200StaminaSet, _w200MountOut, _w200MountIn, _w200ClockOut, _w200ClockIn;
     private readonly ConcurrentDictionary<string, (string Horse, float St, float Hp)> _w200HostVals = new(StringComparer.Ordinal);
     private double _w200Ratio = 15.0;       // the ratio this joiner last set (15 = the game's own)
     private long _w200ClockTick;
@@ -165,5 +165,5 @@ public partial class GameBridge
     }
 
     private string Wo200ValuesStats() => FormattableString.Invariant(
-        $"hits_not_applied={_w200HitsNotApplied} vitals_out={_w200VitalsOut} vitals_in={_w200VitalsIn} stamina_set={_w200StaminaSet} mount_out={_w200MountOut} mount_in={_w200MountIn} clock_out={_w200ClockOut} clock_in={_w200ClockIn} slews={_w200Slews} ratio={_w200Ratio:F2} clinch_ends={_w200ClinchEnds} noise_out={_w200NoiseOut} noise_in={_w200NoiseIn}");
+        $"hits_not_applied={_w200HitsNotApplied} vitals_out={_w200VitalsOut} vitals_in={_w200VitalsIn} stamina_set={_w200StaminaSet} mount_out={_w200MountOut} mount_in={_w200MountIn} clock_out={_w200ClockOut} clock_in={_w200ClockIn} ratio={_w200Ratio:F2} clinch_ends={_w200ClinchEnds} noise_out={_w200NoiseOut} noise_in={_w200NoiseIn}");
 }

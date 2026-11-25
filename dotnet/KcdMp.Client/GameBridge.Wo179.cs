@@ -41,7 +41,7 @@ public partial class GameBridge
     {
         public int Seq; public string Name = "", Type = ""; public char Kind;
         public long StartMs, EndMs; public float SX, SY, SZ;
-        public bool Sent, Video, SkipKey, Skip, Ended, PartnerSkipKey;
+        public bool Sent, Video, SkipKey, Ended, PartnerSkipKey;
     }
 
     private sealed class W179Remote

@@ -302,7 +302,7 @@ public sealed class MasterAnnounceService : BackgroundService
 	/// clients that finished the handshake -- a launcher checking whether the
 	/// port answers opens a connection and drops it, and that is not a player.
 	/// </summary>
-	private RelayState Snapshot() => new(_serverInfo.MapName, _clients.ReadyClientCount, _serverInfo.MaxPlayers);
+	private RelayState Snapshot() => new(_serverInfo.MapName, _clients.ReadyClientCount, _clients.MaxPlayers);
 
 	private readonly record struct RelayState(string MapName, int Players, int MaxPlayers);
 
@@ -454,7 +454,7 @@ public sealed class MasterAnnounceService : BackgroundService
 public sealed class MasterServerOptions
 {
 	/// <summary>
-	/// Where the master server is, e.g. "http://localhost:5100". Empty
+	/// Where the master server is, e.g. "http://127.0.0.1:5100". Empty
 	/// disables announcing entirely. The endpoint path is appended by the
 	/// relay; https/wss is used when the URL says so.
 	/// </summary>

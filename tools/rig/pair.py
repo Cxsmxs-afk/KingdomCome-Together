@@ -707,7 +707,7 @@ def join_from_menu(cid, p, st, key, port, *, wait_host=host_ready):
                 rig.say('copy', cid, 'first-join answer taken: %s (pinned, try %d)' % (pin, i + 1))
                 return 0
         rig.say('copy', cid, 'the agent did not take the pinned first-join answer %s' % pin); return 1
-    url = 'http://localhost:%d/join-choice?c=bring' % p['version_port']
+    url = 'http://127.0.0.1:%d/join-choice?c=bring' % p['version_port']
     t0 = time.time()
     while time.time() - t0 < 90:
         try:
@@ -729,7 +729,7 @@ def start_agent(cid, role, port, twin=False):
     st = state()
     exe = os.path.join(p['agent_dir'], 'KcdMpClient.exe')
     argv = [exe, '--host', '127.0.0.1', '--port', str(RELAY_PORT), '--no-voice'] + (['--hosting'] if role == 'host' else []) + \
-           ['--name', p['name'], '--game-api', 'http://localhost:%d' % port, '--dice-ipc-port', str(p['dice_port']),
+           ['--name', p['name'], '--game-api', 'http://127.0.0.1:%d' % port, '--dice-ipc-port', str(p['dice_port']),
             '--version-ipc-port', str(p['version_port']), '--no-discord']
     env = rig.clean_env({'KCDMP_INSTANCE': cid, 'KCD2MP_INSTALL': p['root'], 'KCDMP_DATA_DIR': p['data_dir'],
                          'KCDMP_BACKUP_DIR': p['backup_dir']})

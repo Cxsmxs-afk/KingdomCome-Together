@@ -415,7 +415,7 @@ public partial class GameBridge
                 _hostCalendarResumeEpoch = join.HostWorldEpoch;
                 join.CalendarVerified = true;
             }
-            Console.WriteLine(FormattableString.Invariant($"MP-CALENDAR join 0x{join.JoinId:x8}: new-load pre-update latch verified calendar_ms={r.Value.AfterMs} slews={_w200Slews}"));
+            Console.WriteLine(FormattableString.Invariant($"MP-CALENDAR join 0x{join.JoinId:x8}: new-load pre-update latch verified calendar_ms={r.Value.AfterMs}"));
             return true;
         }
         finally { _hostCalendarGate.Release(); }

@@ -51,6 +51,7 @@ public static class BatchPolicy
         if (fn.StartsWith("KCD2MP_W137Talk", StringComparison.Ordinal) || fn == "KCD2MP_ApplyNativeScan") return (BatchKind.Stale, null);
         // one call only: a statement that carries a second call cannot be replaced by another statement's first
         if (args.Contains("KCD2MP_", StringComparison.Ordinal)) return (BatchKind.Edge, null);
+        if (fn == "KCD2MP_NativePositionCadence") return (BatchKind.Level, fn);
         if (!LevelFns.Contains(fn)) return (BatchKind.Edge, null);
         return (BatchKind.Level, fn + "|" + FirstArg(args));
     }

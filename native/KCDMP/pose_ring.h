@@ -93,7 +93,7 @@ inline void publish(View v, uint32_t hostMs, float x, float y, float z, float ro
     std::memset(s.name, 0, kNameLen);
     if (name) {
         uint32_t n = 0;
-        while (name[n] && n < kNameLen) { s.name[n] = name[n]; ++n; }
+        while (n < kNameLen && name[n]) { s.name[n] = name[n]; ++n; }
         s.nameLen = static_cast<uint8_t>(n);
     }
     s.seq.store(odd + 1u, std::memory_order_release);

@@ -55,6 +55,7 @@ public sealed class SteamRelayStatus
 public sealed class SteamRelayService : BackgroundService
 {
 	private readonly ILogger _logger;
+	private readonly KcdMp.Wire.ProcessFaultLog _faults;
 	private readonly IConfiguration _configuration;
 	private readonly ClientSessionRunner _runner;
 	private readonly SteamRelayStatus _status;
@@ -62,6 +63,7 @@ public sealed class SteamRelayService : BackgroundService
 	public SteamRelayService(ILogger logger, IConfiguration configuration, ClientSessionRunner runner, SteamRelayStatus status)
 	{
 		_logger = logger;
+		_faults = new("server", message => logger.Error("{Fault}", message));
 		_configuration = configuration;
 		_runner = runner;
 		_status = status;
@@ -160,23 +162,25 @@ public sealed class SteamRelayService : BackgroundService
 				_logger.Information("[+] a Steam peer connected (relayed={Relayed}); handshake next", (flags & 16) != 0 ? 1 : 0);
 				var client = _runner.Create(RelayConnection.FromSteam(conn.GetStream(), conn.PeerKey, conn, conn.HasAuthenticatedPeer(flags)));
 				_runner.Start(client);
-				_ = WatchPeerAsync(conn);
+				_faults.FireAndLog(WatchPeerAsync(conn, ct), "steam-peer-watch");
 			}
 		}
 		catch (OperationCanceledException) { }
 		catch (System.Threading.Channels.ChannelClosedException) { }
 		finally
 		{
-			try { session.ClearRichPresence(); } catch { }
+			try { session.ClearRichPresence(); }
+			catch (ObjectDisposedException) { }
+			catch (Exception ex) { _faults.ReportThrottled("steam-presence-clear", ex); }
 			_status.Set("off", "Steam stopped.");
 			_logger.Information("[steam] stopped");
 		}
 	}
 
-	private async Task WatchPeerAsync(SteamP2PConnection conn)
+	private async Task WatchPeerAsync(SteamP2PConnection conn, CancellationToken ct)
 	{
-		while (conn.IsConnected) await Task.Delay(1000);
-		_status.AddPeer(-1);
+		try { while (conn.IsConnected) await Task.Delay(1000, ct); }
+		finally { _status.AddPeer(-1); }
 	}
 }
 

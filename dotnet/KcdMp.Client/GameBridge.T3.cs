@@ -13,8 +13,14 @@ namespace KcdMp.Client;
 public partial class GameBridge
 {
     private int _t3ProcFrameTimeoutMs = 2000;
-    internal TimeProvider T3FrameTime { get; init; } = TimeProvider.System;
-    internal TimeProvider T3StatsTime { get; init; } = TimeProvider.System;
+    internal TimeProvider ProcessorTime { get; set; } = TimeProvider.System;
+    internal TimeProvider? T3FrameTime { get; init; }
+    internal TimeProvider? T3StatsTime { get; init; }
+
+    private Task<ProcessorFrameScope.Result> RunProcessorFrameAsync(Func<CancellationToken, Task> handler,
+        int timeoutMs, CancellationToken ct, TimeProvider? timeProvider = null) =>
+        ProcessorFrameScope.RunAsync(handler, timeoutMs, ct, timeProvider ?? ProcessorTime);
+
     private readonly ConcurrentDictionary<string, long> _t3Counters = new(StringComparer.Ordinal);
     private long _t3StatsNextMs;
     private int _t3SideDrainBusy, _t3StatsBusy;
@@ -110,7 +116,7 @@ public partial class GameBridge
                         WorldSyncTick(ct);
                         // Native work spawned by replay inherits this receive lease;
                         // EOF revokes it before a queued late write can reach the game.
-                        await ProcessorFrameScope.RunAsync(_ =>
+                        await RunProcessorFrameAsync(_ =>
                         {
                             Wo136ReplayIfReleased(writer, ct);
                             return Task.CompletedTask;
@@ -136,7 +142,7 @@ public partial class GameBridge
 
     private async Task T3ReportConfigAsync(CancellationToken ct)
     {
-        var result = await ProcessorFrameScope.RunAsync(token => _transport.ExecuteNowAsync(
+        var result = await RunProcessorFrameAsync(token => _transport.ExecuteNowAsync(
             "if KCD2MP_T3ReportCfg then KCD2MP_T3ReportCfg() end", token), 2000, ct);
         if (result.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
             Console.WriteLine($"MP-T3-CONFIG report unavailable reason={result.Status}");
@@ -147,7 +153,7 @@ public partial class GameBridge
         if (Interlocked.CompareExchange(ref _t3SideDrainBusy, 1, 0) != 0) return;
         try
         {
-            var result = await ProcessorFrameScope.RunAsync(token => T3DrainSideChannels(token),
+            var result = await RunProcessorFrameAsync(token => T3DrainSideChannels(token),
                 Volatile.Read(ref _t3ProcFrameTimeoutMs), ct);
             T3FrameResult(Protocol.W164Down, result);
         }
@@ -182,7 +188,7 @@ public partial class GameBridge
             IReadOnlyDictionary<string, long>? loadSnapshot = null;
             if (role != 0)
             {
-                var result = await ProcessorFrameScope.RunAsync(async token =>
+                var result = await RunProcessorFrameAsync(async token =>
                 {
                     var native = await _combat.Wo163Async(Protocol.Wo216OpBrains, [], token);
                     ProcessorFrameScope.ThrowIfAbandoned();
@@ -193,7 +199,7 @@ public partial class GameBridge
                 if (result.Status is ProcessorFrameScope.Outcome.Faulted or ProcessorFrameScope.Outcome.TimedOut)
                     T3Increment("authority_stats_unreadable");
                 Dictionary<string, long>? nativeCounters = null;
-                var worldStats = await ProcessorFrameScope.RunAsync(async token =>
+                var worldStats = await RunProcessorFrameAsync(async token =>
                 {
                     var native = await _combat.Wo163Async(Protocol.T3OpStats, [], token);
                     ProcessorFrameScope.ThrowIfAbandoned();
@@ -238,7 +244,7 @@ public partial class GameBridge
     private async Task<IReadOnlyDictionary<string, long>?> T3ReadNativePageAsync(byte command, ReadT3Page read, CancellationToken ct)
     {
         Dictionary<string, long>? snapshot = null;
-        var result = await ProcessorFrameScope.RunAsync(async token =>
+        var result = await RunProcessorFrameAsync(async token =>
         {
             var reply = await _combat.Wo163Async(Protocol.T3OpStats, [command], token);
             ProcessorFrameScope.ThrowIfAbandoned();

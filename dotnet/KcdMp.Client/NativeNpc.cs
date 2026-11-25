@@ -184,12 +184,14 @@ public static class NativeNpcCodec
 /// are the agent's own QPC stamps -- the DLL reads the same clock -- so pipe
 /// queueing never shifts a sample on the sender-clock timeline.
 /// </summary>
-public sealed class NativeNpcFeed
+public sealed class NativeNpcFeed : IAsyncDisposable
 {
     private readonly CombatPipe _pipe;
+    private readonly object _lifetime = new();
     private readonly Channel<NativeNpcSample> _queue = Channel.CreateBounded<NativeNpcSample>(
         new BoundedChannelOptions(8192) { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true, SingleWriter = false });
     private Task? _loop;
+    private bool _closed;
     private readonly CancellationTokenSource _cts = new();
 
     /// <summary>Mirrors the mod's mp_npc_native_write (default on). Off: nothing is forwarded.</summary>
@@ -236,8 +238,39 @@ public sealed class NativeNpcFeed
         if (!Enabled) return;
         if (!_pipe.IsConnected) { Interlocked.Increment(ref DroppedNotConnected); return; }
         if (Encoding.UTF8.GetByteCount(s.Name) is 0 or > NativeNpcCodec.MaxNameLen) return;
-        _loop ??= Task.Run(() => LoopAsync(_cts.Token));
+        if (Volatile.Read(ref _loop) is null)
+        {
+            lock (_lifetime)
+            {
+                if (_closed) return;
+                if (_loop is null)
+                {
+                    // The feed belongs to the reader, not to the frame that
+                    // first queued a sample.
+                    if (ExecutionContext.IsFlowSuppressed()) _loop = Task.Run(() => LoopAsync(_cts.Token));
+                    else { using (ExecutionContext.SuppressFlow()) _loop = Task.Run(() => LoopAsync(_cts.Token)); }
+                }
+            }
+        }
         if (_queue.Writer.TryWrite(s)) Interlocked.Increment(ref Enqueued);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Task? loop;
+        lock (_lifetime)
+        {
+            if (_closed) return;
+            _closed = true;
+            _queue.Writer.TryComplete();
+            loop = _loop;
+        }
+        try { await _cts.CancelAsync(); }
+        finally
+        {
+            try { if (loop is not null) await loop; }
+            finally { _cts.Dispose(); }
+        }
     }
 
     private async Task LoopAsync(CancellationToken ct)

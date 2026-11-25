@@ -40,15 +40,16 @@ public sealed class PackOptions
     public int Level { get; set; } = 19;
     /// <summary>zstd window log: 26 = 64 MB, inside what every zstd reader accepts by default.</summary>
     public int WindowLog { get; set; } = 26;
-    /// <summary>Collapse runs of repeated lines in *.log files (off = pack the bytes as they are).</summary>
+    /// <summary>Collapse runs of repeated lines in *.log files. Both modes redact private data.</summary>
     public bool Collapse { get; set; } = true;
 }
 
 public sealed class FileReport
 {
     public string Entry = "";
+    internal string InputEntry { get; init; } = "";
     public long OriginalBytes, StoredBytes;
-    public string Sha256 = "";           // of the original bytes
+    public string Sha256 = "";           // of the redacted bytes before collapsing
     public string? SameAs;               // another entry with identical content: stored once, there
     public CollapseStats? Collapse;      // null when the file was not collapsed
     public int Part;                     // 1-based
@@ -86,7 +87,9 @@ public static class Packer
         opt ??= new PackOptions();
         Directory.CreateDirectory(outDir);
         // Repacking an extracted bundle regenerates the verdict from the supplied logs.
-        sources = sources.Where(s => !s.EntryName.Equals(VerdictReport.EntryName, StringComparison.OrdinalIgnoreCase)).ToList();
+        sources = sources.Where(s => !s.EntryName.Equals(VerdictReport.EntryName, StringComparison.OrdinalIgnoreCase) &&
+            !BundlePrivacy.IsPrivateFile(s.EntryName) && (s.Path is null || !BundlePrivacy.IsPrivateFile(s.Path))).ToList();
+        baseName = BundlePrivacy.Entry(baseName);
         sources = ArrangeAnim(sources);
         sources = ArrangeAnimSession(sources);
         var res = new PackResult();
@@ -103,8 +106,10 @@ public static class Packer
                     using var r = new StreamReader(new MemoryStream(b, false), Encoding.Latin1, false, 1 << 16);
                     var lines = Lines(r).ToList();
                     windows.Scan(lines);
-                    if (s.EntryName.StartsWith("agent", StringComparison.OrdinalIgnoreCase)) MarkList.Collect(s.EntryName, lines, res.Marks);
+                    if (s.EntryName.StartsWith("agent", StringComparison.OrdinalIgnoreCase))
+                        MarkList.Collect(BundlePrivacy.Entry(s.EntryName), lines, res.Marks);
                 }
+        for (int i = 0; i < res.Marks.Count; i++) res.Marks[i] = BundlePrivacy.Text(res.Marks[i]);
         res.OddMarks = windows.Count;
         // Evaluate before collapse and use the same result in both reports.
         VerdictReport? verdict = null;
@@ -119,16 +124,18 @@ public static class Packer
         {
             verdict ??= VerdictRules.Evaluate(new Briefing.Input());
             res.Briefing = "# Kingdom Come: Together -- briefing\n\n" + verdict.ToMarkdown()
-                + "The briefing could not be written: " + ex.GetType().Name + ": " + ex.Message + "\n";
+                + "The briefing could not be written: " + ex.GetType().Name + "\n";
         }
-        res.Verdict = verdict.ToText();
+        res.Briefing = BundlePrivacy.Text(res.Briefing);
+        res.Verdict = BundlePrivacy.Text(verdict.ToText());
         // WO-206 D: the animation report beside the probe's file (never fatal)
         if (res.Anim is { } an)
             try { sources = sources.Append(new SourceFile(AnimStream.ReportEntry, Bytes: Encoding.UTF8.GetBytes(AnimReport.Html(an)))).ToList(); }
-            catch (Exception ex) { Say("anim-report.html not written: " + ex.Message); }
+            catch (Exception ex) { Say("anim-report.html not written: " + ex.GetType().Name); }
 
         // pass 2: dedupe, collapse, compress one frame per entry
         var seen = new Dictionary<string, string>(StringComparer.Ordinal);   // sha256 -> first entry
+        var entries = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var frames = new List<(string Name, byte[] Frame, FileReport Rep)>();
         using var comp = new Compressor(opt.Level);
         comp.SetParameter(ZSTD_cParameter.ZSTD_c_windowLog, opt.WindowLog);
@@ -137,23 +144,28 @@ public static class Packer
         {
             byte[]? raw = Read(s);
             if (raw is null) continue;
-            var rep = new FileReport { Entry = s.EntryName, OriginalBytes = raw.Length, Sha256 = Hex(SHA256.HashData(raw)) };
+            string entry = BundlePrivacy.Entry(s.EntryName);
+            byte[]? data = BundlePrivacy.Bytes(raw);
+            if (data is null) { Say($"{entry}: omitted binary data"); continue; }
+            string safeName = entry;
+            for (int suffix = 2; !entries.Add(entry); suffix++)
+                entry = $"{Path.ChangeExtension(safeName, null)}-{suffix}{Path.GetExtension(safeName)}";
+            var rep = new FileReport { Entry = entry, InputEntry = s.EntryName, OriginalBytes = raw.Length, Sha256 = Hex(SHA256.HashData(data)) };
             res.OriginalBytes += raw.Length;
-            if (seen.TryGetValue(rep.Sha256, out var first)) { rep.SameAs = first; res.Files.Add(rep); Say($"{s.EntryName}: identical to {first}"); continue; }
-            seen[rep.Sha256] = s.EntryName;
+            if (seen.TryGetValue(rep.Sha256, out var first)) { rep.SameAs = first; res.Files.Add(rep); Say($"{entry}: identical to {first}"); continue; }
+            seen[rep.Sha256] = entry;
 
-            byte[] data = raw;
             if (opt.Collapse && IsLog(s.EntryName))
             {
-                var (d, st) = Collapser.CollapseBytes(raw, windows);
+                var (d, st) = Collapser.CollapseBytes(data, windows);
                 data = d; rep.Collapse = st; res.Totals.Add(st);
-                Say($"{s.EntryName}: {st.LinesIn} lines -> {st.LinesKept + st.Summaries} ({st.Elided} collapsed)");
+                Say($"{entry}: {st.LinesIn} lines -> {st.LinesKept + st.Summaries} ({st.Elided} collapsed)");
             }
             rep.StoredBytes = data.Length;
             res.Files.Add(rep);
             DateTime mtime = s.Path is not null && File.Exists(s.Path) ? File.GetLastWriteTimeUtc(s.Path) : DateTime.UtcNow;
 
-            AddEntry(frames, comp, opt, s.EntryName, data, mtime, rep, Say);
+            AddEntry(frames, comp, opt, entry, data, mtime, rep, Say);
         }
 
         // bins: biggest first into the first part with room; part 1 keeps room for the manifest
@@ -235,7 +247,7 @@ public static class Packer
         }
         sb.Append("Kept in full everywhere: MP-MARK, FAULT, STATS / summary lines; a collapsed run keeps its first and last line and is replaced in between by a line starting \"")
           .Append(Collapser.SummaryPrefix.Trim()).Append("\" with the count\r\n\r\n");
-        sb.Append("part | entry | original bytes | stored bytes | sha256 of the original | note\r\n");
+        sb.Append("part | entry | original bytes | stored bytes | sha256 after redaction and before collapse | note\r\n");
         foreach (var f in res.Files)
         {
             string note = f.SameAs is not null ? $"same content as {f.SameAs}"
