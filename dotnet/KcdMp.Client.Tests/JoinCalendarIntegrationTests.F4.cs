@@ -791,7 +791,8 @@ public sealed partial class JoinCalendarIntegrationTests
         }
         catch (Exception error)
         {
-            output.WriteLine($"F4-ACTIVE-GUESTS failed players={players} cycle={activeCycle} phase={phase} type={error.GetType().Name}");
+            output.WriteLine($"F4-ACTIVE-GUESTS failed players={players} cycle={activeCycle} phase={phase} type={error.GetType().Name} " +
+                $"second_pipe={secondPipe.Completion.Status} second_pipe_drop={secondPipe.Pipe.LastConnectionDropReason}");
             throw;
         }
         finally

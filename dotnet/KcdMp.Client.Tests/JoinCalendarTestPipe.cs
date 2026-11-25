@@ -40,8 +40,6 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     private ulong _loadGeneration, _lifecycleGeneration;
 
     public CombatPipe Pipe { get; }
-    internal string Name { get; }
-    internal Func<ValueTask>? BeforeReply { get; set; }
     internal Task Completion => _serverLoop;
     public Func<int, string, bool>? SaveListed { get; set; }
     public bool CanQuickSave { get; init; } = true;
@@ -68,9 +66,9 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         _refuseHold = refuseHold;
         _nativeClock = nativeClock;
         _refusedRenewals = refusedRenewals;
-        Name = $"h20-calendar-{Guid.NewGuid():N}";
-        Pipe = new CombatPipe(Name) { ControlTime = controlTime ?? TimeProvider.System };
-        _serverLoop = ServeAsync(Name, _stop.Token);
+        string name = $"h20-calendar-{Guid.NewGuid():N}";
+        Pipe = new CombatPipe(name) { ControlTime = controlTime ?? TimeProvider.System };
+        _serverLoop = ServeAsync(name, _stop.Token);
     }
 
     // Called by the load boundary before publishing the guest's physical Gameplay marker in kcd.log.
@@ -109,17 +107,22 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
                             break;
                         var (type, body) = Reply(header[0], seq++, payload);
                         byte[] frame = [type, (byte)body.Length, (byte)(body.Length >> 8), .. body];
-                        if (BeforeReply is { } before) await before();
                         await server.WriteAsync(frame, ct);
                         await server.FlushAsync(ct);
                     }
                 }
                 catch (IOException error) when (PeerDeparted(server, error))
                 {
-                    // A canceled bridge command can retire the physical peer
-                    // with a native reply outstanding. The next connection
-                    // starts its own sequence on the same listening instance.
                     if (_shutdownStarted) return;
+                    // CombatPipe explicitly drops streams when the physical
+                    // framing or the first sequence can no longer be trusted.
+                    // An unexpected live close still fails the fixture.
+                    string reason = Pipe.LastConnectionDropReason;
+                    if (reason != "sequence-unconfirmed" && !reason.StartsWith("physical-write-cancelled-", StringComparison.Ordinal))
+                    {
+                        Console.WriteLine($"[calendar-double] unexpected peer close reason={reason} hresult=0x{error.HResult:x8}");
+                        throw;
+                    }
                 }
                 server.Disconnect();
             }
