@@ -134,30 +134,33 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
             Assert.Same(game.Entered.Task, first);
             await clock.Armed.WaitAsync(session.Token);
             Call(b, "Wo124OnGameplayStartedCore", true);
-            Call(b, "T3StartIndependentTick", frames.Writer, session.Token);
-            long started = Stopwatch.GetTimestamp();
+            Assert.NotEqual(DateTime.MinValue, Get<DateTime>(b, "_w136SettleUntilUtc"));
+            using var catchup = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
+            catchup.CancelAfter(TimeSpan.FromSeconds(5));
             for (int i = 0; i < 100; i++)
             {
                 long arrival = Stopwatch.GetTimestamp();
                 long ms = (long)typeof(GameBridge).GetMethod("W147StampMs", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, [arrival])!;
                 Set(b, "_w202LastReadMs", ms);
                 frames.Send(Protocol.ReleaseVersion, [2, .. Encoding.UTF8.GetBytes("next-" + i)]);
-                await Task.Delay(12, session.Token);
             }
+            // Advance the actual replay owner's settle boundary, then let
+            // its independent loop release the held frame over the live queue.
+            Set(b, "_w136SettleUntilUtc", DateTime.MinValue);
+            Call(b, "T3StartIndependentTick", frames.Writer, session.Token);
             while (Get<long>(b, "_w136Replayed") == 0)
-                await Task.Delay(10, session.Token);
+                await Task.Delay(10, catchup.Token);
             Assert.False(release.Task.IsCompleted);
             Assert.Null(Get<IDictionary>(b, "_ghostReleaseVersions")[(byte)2]);
             clock.Expire();
-            while (Get<IDictionary>(b, "_ghostReleaseVersions")[(byte)2]?.ToString() != "next-99")
-                await Task.Delay(10, session.Token);
-            Assert.True(Stopwatch.GetElapsedTime(started).TotalSeconds < 5);
+            frames.Complete();
+            await processor.WaitAsync(TimeSpan.FromSeconds(2), catchup.Token);
+            Assert.Equal("next-99", Get<IDictionary>(b, "_ghostReleaseVersions")[(byte)2]);
             Assert.Equal(1, Get<long>(b, "_w136Replayed"));
-            Assert.True((long)Call(b, "Wo202QueueLagMs")! < 1000);
+            Assert.Equal(0, (long)Call(b, "Wo202QueueLagMs")!);
             var counters = Get<System.Collections.Concurrent.ConcurrentDictionary<string, long>>(b, "_t3Counters");
             Assert.Equal(1, counters["proc_stalls"]); Assert.Equal(1950, counters["proc_stall_max_ms"]);
-            output.WriteLine($"T3-P0-SIM proc_stall_max_ms={counters["proc_stall_max_ms"]} catchup_ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} backlog_after_ms={Call(b, "Wo202QueueLagMs")} replayed={Get<long>(b, "_w136Replayed")}");
-            frames.Complete(); await processor.WaitAsync(TimeSpan.FromSeconds(2));
+            output.WriteLine($"T3-P0-SIM proc_stall_max_ms={counters["proc_stall_max_ms"]} backlog_after_ms={Call(b, "Wo202QueueLagMs")} replayed={Get<long>(b, "_w136Replayed")}");
         }
         finally { release.TrySetResult(); session.Cancel(); if (processor is not null) await processor; }
     }
