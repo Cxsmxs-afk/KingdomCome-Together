@@ -25,12 +25,13 @@ internal sealed class F4WindowsHandleTrace : IDisposable
     private sealed record OpenStack(long Thread, long[] Frames, string? Problem = null);
     private sealed record HandleOperation(int Kind, long Thread, long[] Frames);
     private sealed record HandleHistory(HandleOperation[] Operations, string? Problem = null);
+    private sealed record WorkerObservation(long Id, string[] Frames, bool Waiting);
     internal readonly record struct Allocation(string Kind, long Thread, string Stack, long Worker = 0);
-    internal readonly record struct Bookkeeping(int WinsockPairs, int RegexCacheEvents, int WorkerStarts = 0)
+    internal readonly record struct Bookkeeping(int WinsockPairs, int RegexCacheEvents, int WorkerStarts, int WorkerNameEvents)
     {
-        public int Total => 2 * WinsockPairs + RegexCacheEvents + 3 * WorkerStarts;
+        public int Total => 2 * WinsockPairs + RegexCacheEvents + 3 * WorkerStarts + WorkerNameEvents;
     }
-    internal readonly record struct HandleOrigins(string Details, Bookkeeping Runtime);
+    internal readonly record struct HandleOrigins(string Details, Bookkeeping Runtime, int IdleNewWorkers = 0);
 
     public F4WindowsHandleTrace()
     {
@@ -46,7 +47,8 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         if (EnableStatus >= 0) _newestFirst = DetectHistoryOrder();
     }
 
-    public HandleOrigins DescribeNewHandles(IReadOnlyDictionary<IntPtr, string> start, IReadOnlyDictionary<IntPtr, string> end)
+    public HandleOrigins DescribeNewHandles(IReadOnlyDictionary<IntPtr, string> start, IReadOnlyDictionary<IntPtr, string> end,
+        IReadOnlySet<long> newThreads, bool checkIdleWorkers)
     {
         if (EnableStatus < 0) return new($"enabled=0 status={unchecked((uint)EnableStatus):x8}", default);
         // Query the original handle history before querying modules or creating a
@@ -64,14 +66,19 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         using var runtime = TryReadRuntime(diagnostics);
         var allocations = captured.Select(handle => new Allocation(handle.Kind, handle.Stack.Thread,
             DescribeStack(handle.Stack, modules, runtime), handle.Worker)).ToArray();
+        var bookkeeping = CountBookkeeping(allocations, liveThreads, out var startedWorkers);
+        var workers = checkIdleWorkers ? ObservePoolWorkers(runtime, startedWorkers, newThreads) : [];
         var histories = allocations.Select(handle => $"{handle.Kind}:{handle.Stack}@thread={handle.Thread}@worker={handle.Worker}");
         string order = _newestFirst is true ? "newest-first" : _newestFirst is false ? "oldest-first" : "unknown";
+        var workerStacks = workers.OrderBy(worker => worker.Id)
+            .Select(worker => $"{worker.Id}:{(worker.Waiting ? "waiting" : "other")}:{string.Join('>', worker.Frames.Take(6))}");
         string details = $"enabled=1 clr={Environment.Version} managed={(runtime is null ? 0 : 1)} order={order} " +
+            $"new_worker_stacks={string.Join(',', workerStacks)} " +
             string.Join(',', histories.GroupBy(x => x).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key}={g.Count()}"));
-        return new(details, CountBookkeeping(allocations, liveThreads));
+        return new(details, bookkeeping, workers.Count(worker => worker.Waiting));
     }
 
-    internal static Bookkeeping CountBookkeeping(Allocation[] allocations, IReadOnlySet<long> liveThreads)
+    internal static Bookkeeping CountBookkeeping(Allocation[] allocations, IReadOnlySet<long> liveThreads, out HashSet<long> startedWorkers)
     {
         // A first-use socket-provider context has one event and one thread
         // handle on the opening worker. Incomplete or repeated pairs still
@@ -92,7 +99,7 @@ internal sealed class F4WindowsHandleTrace : IDisposable
 
         // Attribute CLR startup only for identified, still-live pool workers.
         // An application-owned Thread.StartCore or an unmatched Event stays counted.
-        int starts = 0;
+        var workers = new HashSet<long>();
         var threadStarts = allocations.Where(handle => handle.Thread != 0 &&
             handle.Stack.Contains("coreclr.dll+", StringComparison.Ordinal) &&
             handle.Stack.Split('>').Contains("System.Threading.Thread.StartCore", StringComparer.Ordinal));
@@ -102,9 +109,45 @@ internal sealed class F4WindowsHandleTrace : IDisposable
             var targetIds = threads.Select(handle => handle.Worker).ToHashSet();
             if (threads.Length > 0 && !targetIds.Contains(0) && targetIds.Count == threads.Length && targetIds.IsSubsetOf(liveThreads) &&
                 launch.Count(handle => handle.Kind == "Event") == 2 * threads.Length)
-                starts += threads.Length;
+                workers.UnionWith(targetIds);
         }
-        return new(pairs, regexEvents == 1 ? 1 : 0, starts);
+        // The CLR assigns the name under the new worker's own monitor. Its
+        // single contended initialization event belongs to that same worker.
+        int nameEvents = allocations.Where(handle => handle.Kind == "Event" && workers.Contains(handle.Thread) &&
+                handle.Stack.Contains("coreclr.dll+", StringComparison.Ordinal) &&
+                handle.Stack.Split('>').Contains("System.Threading.Thread.SetThreadPoolWorkerThreadName", StringComparer.Ordinal))
+            .GroupBy(handle => handle.Thread).Count(group => group.Count() == 1);
+        startedWorkers = workers;
+        return new(pairs, regexEvents == 1 ? 1 : 0, workers.Count, nameEvents);
+    }
+
+    private static WorkerObservation[] ObservePoolWorkers(ClrRuntime? runtime, IReadOnlySet<long> startedWorkers, IReadOnlySet<long> newThreads)
+    {
+        if (runtime is null) return [];
+        try
+        {
+            var observations = new List<WorkerObservation>();
+            foreach (var thread in runtime.Threads)
+            {
+                if (!thread.IsAlive || !startedWorkers.Contains(thread.OSThreadId) || !newThreads.Contains(thread.OSThreadId)) continue;
+                var frames = thread.EnumerateStackTrace(includeContext: false, maxFrames: 24)
+                    .Where(frame => frame.Kind != ClrStackFrameKind.Runtime)
+                    .Select(frame => frame.Method is { Type.Name: string type } method ? $"{type}.{method.Name}" : "unresolved")
+                    .ToArray();
+                observations.Add(new(thread.OSThreadId, frames, IsPoolWaiting(frames)));
+            }
+            return [.. observations];
+        }
+        catch (Exception) { return []; } // a missing or unreadable stack stays inside the raw thread budget
+    }
+
+    internal static bool IsPoolWaiting(string[] frames)
+    {
+        int worker = Array.IndexOf(frames, "System.Threading.PortableThreadPool+WorkerThread.WorkerThreadStart");
+        return worker > 0 && frames.Take(worker).All(frame => frame is
+            "System.Threading.LowLevelLifoSemaphore.Wait" or
+            "System.Threading.LowLevelLifoSemaphore.WaitForSignal" or
+            "System.Threading.LowLevelLifoSemaphore.WaitCore");
     }
 
     private static string? WinsockApi(Allocation handle)

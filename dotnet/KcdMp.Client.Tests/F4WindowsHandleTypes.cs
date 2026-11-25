@@ -24,7 +24,9 @@ internal static class F4WindowsHandleTypes
         public readonly IntPtr Text;
     }
 
-    public static string Capture(Dictionary<IntPtr, string>? handlesByType = null)
+    internal readonly record struct Inventory(string? Details, int? FileHandles = null);
+
+    public static Inventory Capture(Dictionary<IntPtr, string>? handlesByType = null)
     {
         IntPtr process = GetCurrentProcess();
         int capacity = 64 * 1024;
@@ -39,12 +41,12 @@ internal static class F4WindowsHandleTypes
                 entries = Marshal.ReAllocHGlobal(entries, (IntPtr)capacity);
                 status = NtQueryInformationProcess(process, ProcessHandleInformation, entries, capacity, out needed);
             }
-            if (status < 0) return $"status={unchecked((uint)status):x8}";
+            if (status < 0) return new($"status={unchecked((uint)status):x8}");
 
             int size = Marshal.SizeOf<Entry>();
             int header = 2 * IntPtr.Size;
             long count = Marshal.ReadIntPtr(entries).ToInt64();
-            if (count < 0 || count > (capacity - header) / size) return "bad_count=1";
+            if (count < 0 || count > (capacity - header) / size) return new("bad_count=1");
 
             var groups = new Dictionary<uint, List<IntPtr>>();
             for (int i = 0; i < count; i++)
@@ -56,15 +58,17 @@ internal static class F4WindowsHandleTypes
 
             var types = new List<string>();
             string threads = "";
+            int? files = null;
             foreach (var group in groups)
             {
                 string name = ReadName(process, group, typeBuffer);
                 types.Add($"{name}={group.Value.Count}");
                 if (name == "Thread") threads = ThreadCounts(process, group.Value);
+                if (name == "File") files = group.Value.Count;
                 if (handlesByType is not null && (name is "Event" or "Thread"))
                     foreach (var handle in group.Value) handlesByType.Add(handle, name);
             }
-            return $"count={count} types={string.Join(',', types.Order(StringComparer.Ordinal))}{threads}";
+            return new($"count={count} types={string.Join(',', types.Order(StringComparer.Ordinal))}{threads}", files);
         }
         finally
         {

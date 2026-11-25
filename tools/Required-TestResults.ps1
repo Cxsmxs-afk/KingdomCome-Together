@@ -39,6 +39,8 @@ function Assert-KcdTrxResults {
     $resourceCycles = @{}
     $resourceSummaries = [System.Collections.Generic.HashSet[string]]::new()
     $handleBudgets = [System.Collections.Generic.HashSet[string]]::new()
+    $threadBudgets = [System.Collections.Generic.HashSet[string]]::new()
+    $fileBudgets = [System.Collections.Generic.HashSet[string]]::new()
     $resourceScenarios = @('mpexit', 'mpexit-receipt', 'transfer-player-a', 'transfer-player-b', 'transfer-host', 'transfer-eof',
                           'missing-personal-save', 'cancel-rejoin-2', 'cancel-rejoin-3', 'cancel-rejoin-4', 'return-deadline',
                           'active-guests-3', 'active-guests-4', 'host-return-2', 'host-return-3', 'host-return-4',
@@ -70,11 +72,23 @@ function Assert-KcdTrxResults {
                         if (-not $resourceSummaries.Add($scenario)) { throw "Duplicate resource summary for $scenario" }
                     } elseif ($line -match '^\s*F4-HANDLE-TYPES scenario=(?<scenario>[a-z0-9-]+) cycle=[0-5] (?:count=[0-9]+ types=[A-Za-z0-9_=,]+(?: thread_[a-z_]+=[0-9]+)*|status=[0-9a-f]{8}|bad_count=1)\s*$') {
                         $scenario = $Matches.scenario
-                    } elseif ($line -match '^\s*F4-HANDLE-BUDGET scenario=(?<scenario>[a-z0-9-]+) before=(?<before>[0-9]+) after=(?<after>[0-9]+) winsock_pairs=(?<pairs>[0-9]+) regex_cache_events=(?<regex>[01]) worker_starts=(?<workers>[0-9]+) compared_after=(?<compared>[0-9]+)\s*$') {
+                    } elseif ($line -match '^\s*F4-HANDLE-BUDGET scenario=(?<scenario>[a-z0-9-]+) before=(?<before>[0-9]+) after=(?<after>[0-9]+) winsock_pairs=(?<pairs>[0-9]+) regex_cache_events=(?<regex>[01]) worker_starts=(?<workers>[0-9]+) worker_name_events=(?<workerNames>[0-9]+) compared_after=(?<compared>[0-9]+)\s*$') {
                         $scenario = $Matches.scenario
                         if (-not $handleBudgets.Add($scenario) -or
-                            [int]$Matches.compared -ne ([int]$Matches.after - 2 * [int]$Matches.pairs - [int]$Matches.regex - 3 * [int]$Matches.workers)) {
+                            [int]$Matches.workerNames -gt [int]$Matches.workers -or
+                            [int]$Matches.compared -ne ([int]$Matches.after - 2 * [int]$Matches.pairs - [int]$Matches.regex - 3 * [int]$Matches.workers - [int]$Matches.workerNames)) {
                             throw "Invalid or duplicate handle accounting for $scenario"
+                        }
+                    } elseif ($line -match '^\s*F4-THREAD-BUDGET scenario=(?<scenario>[a-z0-9-]+) before=(?<before>[0-9]+) after=(?<after>[0-9]+) idle_new_workers=(?<idle>[0-9]+) compared_after=(?<compared>[0-9]+)\s*$') {
+                        $scenario = $Matches.scenario
+                        if (-not $threadBudgets.Add($scenario) -or [int]$Matches.compared -ne ([int]$Matches.after - [int]$Matches.idle)) {
+                            throw "Invalid or duplicate thread accounting for $scenario"
+                        }
+                    } elseif ($line -match '^\s*F4-FILE-BUDGET scenario=(?<scenario>[a-z0-9-]+) before=(?<before>[0-9]+) after=(?<after>[0-9]+)\s*$') {
+                        $scenario = $Matches.scenario
+                        $overBudget = [int]$Matches.after -gt [int]$Matches.before + 4
+                        if (-not $fileBudgets.Add($scenario) -or $overBudget -ne ($scenario -eq 'mpexit-retained-handle')) {
+                            throw "Invalid or duplicate file handle accounting for $scenario"
                         }
                     } elseif ($line -match '^\s*F4-HANDLE-ORIGINS scenario=(?<scenario>[a-z0-9-]+) enabled=[01] .+\s*$') {
                         $scenario = $Matches.scenario
@@ -104,7 +118,8 @@ function Assert-KcdTrxResults {
     if ($Suite -eq 'Client') {
         if ($timerOrigin -ne 1 -or $timerTwin -ne 1 -or $handleTwin -ne 1) { throw 'Missing or duplicate F4 control result' }
         foreach ($scenario in $resourceScenarios) {
-            if (-not $resourceSummaries.Contains($scenario) -or -not $handleBudgets.Contains($scenario) -or
+            if (-not $resourceSummaries.Contains($scenario) -or -not $handleBudgets.Contains($scenario) -or -not $threadBudgets.Contains($scenario) -or
+                ($IsWindows -and -not $fileBudgets.Contains($scenario)) -or
                 -not $resourceCycles.ContainsKey($scenario) -or
                 -not $resourceCycles[$scenario].SetEquals([int[]](0..5))) {
                 throw "Incomplete join resource checks for $scenario"

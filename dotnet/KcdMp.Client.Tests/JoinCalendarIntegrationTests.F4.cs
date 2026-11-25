@@ -50,6 +50,7 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
         const string socketThread = "ntdll.dll>ws2_32.dll>Interop+Winsock.WSARecv";
         const string regexCache = "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Text.RegularExpressions.RegexCache.Add";
         const string workerStart = "ntdll.dll>KERNELBASE.dll>coreclr.dll+418df>System.Threading.Thread.StartCore";
+        const string workerName = "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Threading.Thread.SetThreadPoolWorkerThreadName";
         F4WindowsHandleTrace.Allocation[] allocations =
         [
             new("Event", 10, socketEvent), new("Thread", 10, socketThread),
@@ -61,11 +62,25 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
             new("Event", 10, "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Threading.SemaphoreSlim.WaitAsync"),
             new("Event", 10, regexCache),
             new("Event", 15, workerStart), new("Event", 15, workerStart), new("Thread", 15, workerStart, Worker: 16),
-            new("Event", 17, workerStart), new("Event", 17, workerStart), new("Thread", 17, workerStart)
+            new("Event", 17, workerStart), new("Event", 17, workerStart), new("Thread", 17, workerStart),
+            new("Event", 16, workerName), new("Event", 10, workerName)
         ];
-        var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations, new HashSet<long> { 10, 11, 12, 13, 16 });
-        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1, 1), runtime);
-        Assert.Equal(6, runtime.Total);
+        var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations, new HashSet<long> { 10, 11, 12, 13, 16 }, out var started);
+        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1, 1, 1), runtime);
+        Assert.Equal(7, runtime.Total);
+        Assert.Equal(16, Assert.Single(started));
+    }
+
+    [Fact]
+    public void A_busy_pool_thread_or_an_application_thread_stays_in_the_thread_budget()
+    {
+        const string poolStart = "System.Threading.PortableThreadPool+WorkerThread.WorkerThreadStart";
+        const string poolWait = "System.Threading.LowLevelLifoSemaphore.WaitForSignal";
+        Assert.True(F4WindowsHandleTrace.IsPoolWaiting([poolWait, poolStart]));
+        Assert.False(F4WindowsHandleTrace.IsPoolWaiting(
+            [poolWait, "KcdMp.Client.Transport.WaitForReply", "System.Threading.ThreadPoolWorkQueue.Dispatch", poolStart]));
+        Assert.False(F4WindowsHandleTrace.IsPoolWaiting([poolWait, "KcdMp.Client.Transport.ReadLoop"]));
+        Assert.False(F4WindowsHandleTrace.IsPoolWaiting([poolStart]));
     }
 
     [Fact]
@@ -677,8 +692,8 @@ public sealed partial class JoinCalendarIntegrationTests
     private readonly record struct F4Owned(int PipeConnections, long PipeRevision, int Reservations, int Timers);
 
     private readonly record struct F4ResourceSample(int Threads, int Handles, int RawThreads, int RawHandles,
-        int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, string? WindowsHandleTypes,
-        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, Task<bool>[] FrameDeadlines);
+        int ThreadPoolWorkers, long RuntimeTimers, F4Owned Owned, F4WindowsHandleTypes.Inventory WindowsHandles,
+        IReadOnlyDictionary<IntPtr, string>? WindowsHandleObjects, HashSet<long>? WindowsThreadIds, Task<bool>[] FrameDeadlines);
 
     private static F4ResourceSample F4Resources(GameBridge guest, bool traceWindowsHandles, F4ProcessorDeadlines deadlineTrace)
     {
@@ -698,13 +713,14 @@ public sealed partial class JoinCalendarIntegrationTests
         var pipe = Get<CombatPipe>(guest, "_combat");
         var (runtimeTimers, frameDeadlines) = deadlineTrace.Sample();
         Dictionary<IntPtr, string>? objects = traceWindowsHandles ? new() : null;
-        string? types = OperatingSystem.IsWindows() ? F4WindowsHandleTypes.Capture(objects) : null;
+        var inventory = traceWindowsHandles ? F4WindowsHandleTypes.Capture(objects) : default;
         // Count after the inventory calls, so handles they initialise are present in the same observation.
         process.Refresh();
-        int threads = process.Threads.Count;
+        var processThreads = process.Threads;
+        var threadIds = traceWindowsHandles ? processThreads.Cast<ProcessThread>().Select(thread => (long)thread.Id).ToHashSet() : null;
         int handles = process.HandleCount;
-        return new(threads, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, runtimeTimers,
-            new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers), types, objects, frameDeadlines);
+        return new(processThreads.Count, handles, rawThreads, rawHandles, ThreadPool.ThreadCount, runtimeTimers,
+            new(pipe.IsConnected ? 1 : 0, pipe.EdgeConnectionRevision, leases, timers), inventory, objects, threadIds, frameDeadlines);
     }
 
     private sealed class F4ResourceCheck : IDisposable
@@ -835,7 +851,7 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"raw_threads={sample.RawThreads} raw_handles={sample.RawHandles} thread_pool_workers={sample.ThreadPoolWorkers} " +
                 $"runtime_timers={sample.RuntimeTimers} guest_pipe={sample.Owned.PipeConnections} tracked_leases={sample.Owned.Reservations} " +
                 $"pipe_revision={sample.Owned.PipeRevision} rejoin_timer={sample.Owned.Timers}");
-            if (sample.WindowsHandleTypes is string types)
+            if (sample.WindowsHandles.Details is string types)
                 _output.WriteLine($"F4-HANDLE-TYPES scenario={_scenario} cycle={cycle} {types}");
 
             async Task<F4ResourceSample> SampleAfterNativeAsync()
@@ -884,20 +900,41 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"guest_pipe={before.Owned.PipeConnections}->{after.Owned.PipeConnections} tracked_leases={before.Owned.Reservations}->{after.Owned.Reservations} " +
                 $"pipe_revision={before.Owned.PipeRevision}->{after.Owned.PipeRevision} rejoin_timer={before.Owned.Timers}->{after.Owned.Timers}");
             F4WindowsHandleTrace.Bookkeeping runtime = default;
-            if (_handleTrace is not null && after.Handles > before.Handles + 4 &&
-                before.WindowsHandleObjects is { } start && after.WindowsHandleObjects is { } end)
+            int idleWorkers = 0;
+            bool checkThreads = after.Threads > before.Threads + 4;
+            if (_handleTrace is not null && (after.Handles > before.Handles + 4 || checkThreads) &&
+                before.WindowsHandleObjects is { } start && after.WindowsHandleObjects is { } end &&
+                before.WindowsThreadIds is { } startThreads && after.WindowsThreadIds is { } endThreads)
             {
-                var origins = _handleTrace.DescribeNewHandles(start, end);
+                var newThreads = new HashSet<long>(endThreads);
+                newThreads.ExceptWith(startThreads);
+                var origins = _handleTrace.DescribeNewHandles(start, end, newThreads, checkThreads);
                 runtime = origins.Runtime;
+                idleWorkers = Math.Min(origins.IdleNewWorkers, Math.Max(0, after.ThreadPoolWorkers - before.ThreadPoolWorkers));
                 _output.WriteLine($"F4-HANDLE-ORIGINS scenario={_scenario} {origins.Details}");
             }
             int comparedHandles = after.Handles - runtime.Total;
+            int comparedThreads = after.Threads - idleWorkers;
             _output.WriteLine($"F4-HANDLE-BUDGET scenario={_scenario} before={before.Handles} after={after.Handles} " +
                 $"winsock_pairs={runtime.WinsockPairs} regex_cache_events={runtime.RegexCacheEvents} " +
-                $"worker_starts={runtime.WorkerStarts} compared_after={comparedHandles}");
+                $"worker_starts={runtime.WorkerStarts} worker_name_events={runtime.WorkerNameEvents} compared_after={comparedHandles}");
+            _output.WriteLine($"F4-THREAD-BUDGET scenario={_scenario} before={before.Threads} after={after.Threads} " +
+                $"idle_new_workers={idleWorkers} compared_after={comparedThreads}");
+            int? startFiles = before.WindowsHandles.FileHandles;
+            int? endFiles = after.WindowsHandles.FileHandles;
+            if (startFiles.HasValue && endFiles.HasValue)
+                _output.WriteLine($"F4-FILE-BUDGET scenario={_scenario} before={startFiles} after={endFiles}");
             Assert.True(after.RuntimeTimers <= before.RuntimeTimers + TimerAllowance,
                 $"F4 runtime timer budget: scenario={_scenario} {before.RuntimeTimers}->{after.RuntimeTimers}, allowance={TimerAllowance}");
-            Assert.InRange(after.Threads, 0, before.Threads + 4);
+            if (_handleTrace is not null)
+            {
+                // A terminated runtime worker must not offset a still-open file or socket.
+                Assert.True(startFiles.HasValue && endFiles.HasValue, $"Missing Windows file handle inventory for {_scenario}");
+                Assert.True(endFiles <= startFiles + 4,
+                    $"F4 application handle budget: scenario={_scenario} Windows file handles {startFiles}->{endFiles}, allowance=4");
+            }
+            Assert.True(comparedThreads >= 0 && comparedThreads <= before.Threads + 4,
+                $"F4 application thread budget: scenario={_scenario} {before.Threads}->{comparedThreads}, raw={after.Threads}, allowance=4");
             Assert.True(comparedHandles >= 0 && comparedHandles <= before.Handles + 4,
                 $"F4 application handle budget: scenario={_scenario} {before.Handles}->{comparedHandles}, raw={after.Handles}, allowance=4");
             Assert.Equal(before.Owned, after.Owned);
