@@ -117,7 +117,7 @@ public partial class ClientSession
 
     private void OnLinkHello(byte[] hello)
     {
-        Protocol.TryParseLinkHello(hello, out byte version, out ushort caps, out _, out _);
+        if (!Protocol.TryParseLinkHello(hello, out byte version, out ushort caps, out _, out _)) return;
         ushort both = (ushort)(caps & RelayLinkCaps);
         // Once enabled the link keeps its contact identity until disconnect.
         if (_linkPvpContact) both |= Protocol.LinkCapPvpContact;
