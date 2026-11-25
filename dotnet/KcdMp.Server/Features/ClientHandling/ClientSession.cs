@@ -117,7 +117,7 @@ public partial class ClientSession
 
     private void OnLinkHello(byte[] hello)
     {
-        Protocol.TryParseLinkHello(hello, out byte version, out ushort caps, out _, out _);
+        if (!Protocol.TryParseLinkHello(hello, out byte version, out ushort caps, out _, out _)) return;
         ushort both = (ushort)(caps & RelayLinkCaps);
         // Once enabled the link keeps its contact identity until disconnect.
         if (_linkPvpContact) both |= Protocol.LinkCapPvpContact;
@@ -333,8 +333,7 @@ public partial class ClientSession
         }
         try { _writer!.Enqueue(packet); }
         catch (IOException) { AbortWriteQueue(null); return false; }
-        _writeSignal.Release();
-        return true;
+        return SignalOpenWriteQueue();
     }
 
     private async Task SchedWriteLoopAsync()
@@ -1255,14 +1254,24 @@ public partial class ClientSession
         }
         finally
         {
-            _worldSyncStop.Cancel();
-            if (_worldSyncTick is not null) await _worldSyncTick;
-            _worldSyncStop.Dispose();
-            StopWriteQueue();
-            await writeTask;
-            if (_idleReadTimer is not null) await _idleReadTimer.DisposeAsync();
-            _idleRead.Dispose();
-            _conn.Dispose();
+            try
+            {
+                try { await _worldSyncStop.CancelAsync(); }
+                finally { if (_worldSyncTick is not null) await _worldSyncTick; }
+            }
+            finally
+            {
+                _worldSyncStop.Dispose();
+                StopWriteQueue();
+                try { await writeTask; }
+                finally
+                {
+                    _writer?.Dispose();
+                    _writeSignal.Dispose();
+                    try { if (_idleReadTimer is not null) await _idleReadTimer.DisposeAsync(); }
+                    finally { _idleRead.Dispose(); _conn.Dispose(); }
+                }
+            }
         }
     }
 
@@ -1848,7 +1857,7 @@ public partial class ClientSession
         }
 
         if (overflow) AbortWriteQueue($"outbound queue limit reached ({MaxQueuedBytes / 1024} KB queued; {_npcCoalesced} NPC samples were already thinned)");
-        else _writeSignal.Release();
+        else SignalOpenWriteQueue();
         return !overflow;
     }
 
@@ -1888,7 +1897,7 @@ public partial class ClientSession
         }
         if (coalesced) _clientHandler.CountDrop(Protocol.NpcStateDown, "pressure-coalesced");
         if (overflow) AbortWriteQueue($"outbound queue limit reached ({MaxQueuedBytes / 1024} KB queued; {_npcCoalesced} NPC samples were already thinned)");
-        else if (queued) _writeSignal.Release();
+        else if (queued) SignalOpenWriteQueue();
     }
 
     private void EnqueueGhostPacket(byte ghostId, byte[] packet)
@@ -1922,13 +1931,27 @@ public partial class ClientSession
         }
 
         if (overflow) AbortWriteQueue("outbound queue limit reached");
-        else if (queued) _writeSignal.Release();
+        else if (queued) SignalOpenWriteQueue();
+    }
+
+    private bool SignalOpenWriteQueue()
+    {
+        lock (_writeQueueLock)
+        {
+            if (_writeQueueStopped) return false;
+            _writeSignal.Release();
+            return true;
+        }
     }
 
     private void StopWriteQueue()
     {
-        lock (_writeQueueLock) _writeQueueStopped = true;
-        _writeSignal.Release();
+        lock (_writeQueueLock)
+        {
+            if (_writeQueueStopped) return;
+            _writeQueueStopped = true;
+            _writeSignal.Release();
+        }
     }
 
     private void AbortWriteQueue(string? reason)
@@ -1941,11 +1964,11 @@ public partial class ClientSession
             _pendingGhostPackets.Clear();
             _pendingNpcPackets.Clear();
             _queuedBytes = 0;
+            _writeSignal.Release();
         }
 
         if (reason is not null)
             _logger.Warning("[!] Disconnecting {Name}: {Reason}.", Name ?? $"id={Id}", reason);
-        _writeSignal.Release();
         _conn.Dispose();
     }
 

@@ -4,6 +4,7 @@
 using KcdMp.Server.Features.Faults;
 using KcdMp.Server.Features.Interactions;
 using KcdMp.Server.Features.Tcp;
+using KcdMp.Wire;
 using ILogger = Serilog.ILogger;
 
 namespace KcdMp.Server.Features.ClientHandling;
@@ -17,6 +18,7 @@ namespace KcdMp.Server.Features.ClientHandling;
 public sealed class ClientSessionRunner
 {
 	private readonly ILogger _logger;
+	private readonly ProcessFaultLog _faults;
 	private readonly ClientHandler _clientHandler;
 	private readonly TcpBroadcastService _broadcastService;
 	private readonly SessionManager _sessions;
@@ -39,6 +41,7 @@ public sealed class ClientSessionRunner
 	{
 		Faults = faults;
 		_logger = logger;
+		_faults = new("server", message => logger.Error("{Fault}", message));
 		_clientHandler = clientHandler;
 		_broadcastService = broadcastService;
 		_sessions = sessions;
@@ -65,25 +68,14 @@ public sealed class ClientSessionRunner
 	public void Start(ClientSession client)
 	{
 		_clientHandler.AddClient(client);
+		_faults.FireAndLog(RunSessionAsync(client), "relay-session");
+	}
 
-		// ClientHandler is thread-safe, so the disconnect bookkeeping needs no
-		// lock and no async continuation of its own.
-		_ = client.RunAsync().ContinueWith(task =>
+	private async Task RunSessionAsync(ClientSession client)
+	{
+		try { await client.RunAsync(); }
+		finally
 		{
-			// RunAsync's own catch only covers IOException/SocketException/
-			// EndOfStreamException (normal disconnects); anything else faults
-			// this Task. Discarding that fault here would make a real crash
-			// look identical to a normal disconnect in the log -- the exact
-			// "silent catch on a background task" trap HANDOFF-WO4-combat.md
-			// already warns about, just one level up (the continuation,
-			// not RunAsync's own try/catch).
-			if (task.IsFaulted)
-			{
-				_logger.Error(task.Exception?.Flatten(),
-					"[!] {ClientName}'s connection handler faulted unexpectedly",
-					client.Name ?? "(not ready)");
-			}
-
 			_clientHandler.RemoveClient(client);
 
 			// WO-38: a sleeper who disconnects mid-skip must not leave the
@@ -109,6 +101,6 @@ public sealed class ClientSessionRunner
 			// Role notices follow the disconnect and reflect the same
 			// authority decision, including the pause when the host left.
 			_broadcastService.BroadcastCombatRole();
-		}, CancellationToken.None);
+		}
 	}
 }

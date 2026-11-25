@@ -91,6 +91,35 @@ public class Wo171SlotIntegrationTests
     }
 
     [Fact]
+    public void Parked_crime_survives_a_reconnect_but_never_crosses_a_relay_restart()
+    {
+        using var relay = new MemoryStream();
+        var bridge = Bridge(Host, relay, hosting: true);
+        Guid member = Wo171Tests.Member("Henry");
+
+        ConnectMember(Ann, FixtureRelay);
+        var record = (JoinerCrimeRecord)Call(bridge, "Wo139Record", Ann)!;
+        Assert.True(record.Add(new JoinerCrimeRecord.Crime { Kind = "theft", Witnesses = 1 }));
+        Call(bridge, "Wo144OnPeerDisconnected", Ann);
+        Call(bridge, "Wo144OnRelayLost");
+        ConnectMember(Bob, FixtureRelay);
+        Assert.Same(record, Call(bridge, "Wo139Record", Bob));
+
+        Call(bridge, "Wo144OnPeerDisconnected", Bob);
+        Call(bridge, "Wo144OnRelayLost");
+        ConnectMember(Ann, Wo171Tests.Member("restarted-relay"));
+        var fresh = (JoinerCrimeRecord)Call(bridge, "Wo139Record", Ann)!;
+        Assert.NotSame(record, fresh);
+        Assert.Equal(0, fresh.Count);
+
+        void ConnectMember(byte id, Guid roster)
+        {
+            Call(bridge, "Wo144OnRosterPeer", id, roster, member);
+            Call(bridge, "Wo144OnPeerConnected", id, "Henry");
+        }
+    }
+
+    [Fact]
     public async Task Two_guests_with_the_same_display_name_keep_distinct_colours_across_rejoin()
     {
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(15));

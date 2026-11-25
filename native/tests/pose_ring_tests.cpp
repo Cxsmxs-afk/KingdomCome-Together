@@ -147,6 +147,14 @@ int pose_ring_tests(int* passed) {
     PCHECK(got == kCapacity, "a read after wrap returns one full ring, not the dropped head");
     PCHECK(all[got - 1].hostMs == 1000 + kCapacity + 10 - 1, "the newest sample survived the wrap");
 
+    char fullName[kcdmp::posering::kNameLen];
+    std::memset(fullName, 'a', sizeof(fullName));
+    cursor = v.header->writeIndex.load();
+    publish(v, 42, 0, 0, 0, 0, kPlayer, 0, fullName);
+    PCHECK(read_since(v, cursor, out, 8, &n, &next) == kOk && n == 1 &&
+           std::memcmp(out[0].name, fullName, sizeof(fullName)) == 0,
+           "a full-width name does not need a byte past the producer's field");
+
     uint32_t before = v.header->writeIndex.load();
     leave_torn(v);
     PCHECK(read_since(v, before, out, 8, &n, &next) == kOk && n == 0, "a torn slot is not returned");

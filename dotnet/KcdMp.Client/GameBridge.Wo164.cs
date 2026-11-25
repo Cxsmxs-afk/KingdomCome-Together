@@ -113,7 +113,7 @@ public partial class GameBridge
         var m = W164Running.Match(line);
         if (!m.Success) return;
         string dlg = m.Groups[1].Value.Trim();
-        int.TryParse(m.Groups[2].Value, out int id);
+        int id = int.TryParse(m.Groups[2].ValueSpan, out int parsed) ? parsed : 0;
         string ex0 = m.Groups[3].Value, ex1 = m.Groups[4].Value, soul = m.Groups[5].Value;
         if (ex0 == "Dude" && _w164Talks.TryGetValue(ex1, out var t))
         {

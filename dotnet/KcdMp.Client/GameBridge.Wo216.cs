@@ -534,6 +534,7 @@ public static class Wo216Rules
         int n = body[0], o = 1;
         if (n == 0 || n > Protocol.NpcRouteMaxBodies) return false;
         var outB = new List<byte>(1 + n * (4 + Protocol.NpcRouteRecLen)) { 0 };
+        Span<byte> e = stackalloc byte[4];
         for (int i = 0; i < n; i++)
         {
             if (o >= body.Length) return false;
@@ -544,7 +545,6 @@ public static class Wo216Rules
             if (eid == 0) unknown++;
             else
             {
-                Span<byte> e = stackalloc byte[4];
                 BinaryPrimitives.WriteUInt32LittleEndian(e, eid);
                 outB.AddRange(e.ToArray());
                 outB.AddRange(body.AsSpan(o + 1 + nl, Protocol.NpcRouteRecLen).ToArray());

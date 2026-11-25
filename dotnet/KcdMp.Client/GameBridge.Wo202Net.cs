@@ -151,7 +151,7 @@ public partial class GameBridge
         {
             var h = GetForegroundWindow();
             if (h == IntPtr.Zero) return -1;
-            GetWindowThreadProcessId(h, out uint pid);
+            if (GetWindowThreadProcessId(h, out uint pid) == 0) return -1;
             using var p = Process.GetProcessById((int)pid);
             return string.Equals(p.ProcessName, "KingdomCome", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
         }

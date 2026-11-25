@@ -268,7 +268,7 @@ namespace KCDMP_launcher.Services
         {
             try
             {
-                return await _httpClient.GetFromJsonAsync<VersionStatusData>($"http://localhost:{port}/version-status");
+                return await _httpClient.GetFromJsonAsync<VersionStatusData>($"http://127.0.0.1:{port}/version-status");
             }
             catch
             {
@@ -284,7 +284,7 @@ namespace KCDMP_launcher.Services
         {
             try
             {
-                return await _httpClient.GetFromJsonAsync<JoinStatusData>($"http://localhost:{port}/join-status");
+                return await _httpClient.GetFromJsonAsync<JoinStatusData>($"http://127.0.0.1:{port}/join-status");
             }
             catch
             {
@@ -300,7 +300,7 @@ namespace KCDMP_launcher.Services
         {
             try
             {
-                return await _httpClient.GetFromJsonAsync<ConnectionStatusData>($"http://localhost:{port}/connection-status");
+                return await _httpClient.GetFromJsonAsync<ConnectionStatusData>($"http://127.0.0.1:{port}/connection-status");
             }
             catch
             {
@@ -332,7 +332,7 @@ namespace KCDMP_launcher.Services
         {
             try
             {
-                using var r = await _httpClient.PostAsync($"http://localhost:{port}/join-choice?c={Uri.EscapeDataString(choice)}", null);
+                using var r = await _httpClient.PostAsync($"http://127.0.0.1:{port}/join-choice?c={Uri.EscapeDataString(choice)}", null);
                 return r.IsSuccessStatusCode;
             }
             catch

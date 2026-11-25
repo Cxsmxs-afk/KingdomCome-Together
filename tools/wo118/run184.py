@@ -247,13 +247,13 @@ def down():
 
 def join_status():
     try:
-        return urllib.request.urlopen('http://localhost:%d/join-status' % IPC, timeout=5).read().decode()
+        return urllib.request.urlopen('http://127.0.0.1:%d/join-status' % IPC, timeout=5).read().decode()
     except Exception as e:
         return '<%s>' % e
 
 
 def choose(c):
-    r = urllib.request.urlopen(urllib.request.Request('http://localhost:%d/join-choice?c=%s' % (IPC, urllib.parse.quote(c)), method='POST'), timeout=5)
+    r = urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:%d/join-choice?c=%s' % (IPC, urllib.parse.quote(c)), method='POST'), timeout=5)
     return r.status
 
 

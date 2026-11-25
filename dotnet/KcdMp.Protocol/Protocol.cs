@@ -797,6 +797,7 @@ public static partial class Protocol
     /// each other at Handshake.
     /// </summary>
     public const byte Version = 10;
+    public const int MaxCoopPlayers = 4;
 
     // C→S
     public const byte Handshake      = 0x00;

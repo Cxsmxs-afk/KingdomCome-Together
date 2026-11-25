@@ -43,14 +43,23 @@ public static class Wo202CrashWatch
     public static void Start(Func<string?> gameFolder, CancellationToken ct)
     {
         if (Interlocked.Exchange(ref _started, 1) == 1) return;
-        _ = Task.Run(async () =>
+        GameBridge.Faults.FireAndLog(Task.Run(async () =>
         {
-            while (!ct.IsCancellationRequested)
+            try
             {
-                try { Tick(gameFolder); } catch { }
-                try { await Task.Delay(2000, ct); } catch { return; }
+                while (!ct.IsCancellationRequested)
+                {
+                    try { Tick(gameFolder); }
+                    catch (Exception ex) { GameBridge.Faults.ReportThrottled("game-process-sample", ex); }
+                    await Task.Delay(2000, ct);
+                }
             }
-        }, CancellationToken.None);
+            finally
+            {
+                _game?.Dispose();
+                _game = null;
+            }
+        }, CancellationToken.None), "game-process-watch");
     }
 
     private static void Tick(Func<string?> gameFolder)
@@ -58,13 +67,23 @@ public static class Wo202CrashWatch
         if (_game is null)
         {
             Process? newest = null;
+            DateTime newestStart = DateTime.MinValue;
             foreach (var p in Process.GetProcessesByName("KingdomCome"))
             {
-                try { if (newest is null || p.StartTime > newest.StartTime) newest = p; } catch { }
+                try
+                {
+                    DateTime started = p.StartTime;
+                    if (started <= newestStart) continue;
+                    newest?.Dispose();
+                    newest = p;
+                    newestStart = started;
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception) { }
+                finally { if (!ReferenceEquals(newest, p)) p.Dispose(); }
             }
             if (newest is null) return;
             _game = newest; _gamePid = newest.Id; _quitSeen = false;
-            try { _gameStart = newest.StartTime; } catch { _gameStart = DateTime.Now; }
+            _gameStart = newestStart;
             return;
         }
         bool exited;

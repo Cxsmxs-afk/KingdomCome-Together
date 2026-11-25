@@ -461,11 +461,13 @@ public readonly record struct LinkWriteStamp(long Qpc, long Tick)
 /// way when the options say so. The budget (D.1) is a token bucket refilled from the path's own rate (Steam's send rate, the shaper's)
 /// minus the headroom; a path that does not report a rate (plain TCP) has none, and its own small buffer holds the writer instead.
 /// </summary>
-public sealed class LinkWriter
+public sealed class LinkWriter : IDisposable
 {
     private readonly LinkScheduler _sched;
     private readonly ILinkPath _path;
     private readonly SemaphoreSlim _signal = new(0);
+    private readonly object _signalGate = new();
+    private volatile bool _closed;
     private double _tokens;
     private long _lastRefill = Stopwatch.GetTimestamp();
     public Exception? Failed { get; private set; }
@@ -487,9 +489,22 @@ public sealed class LinkWriter
     public void Enqueue(byte[] frame, Func<bool>? stillValid = null, Action? afterWrite = null,
         Func<byte[]>? prepare = null, LinkWriteAdmission? startWrite = null)
     {
+        if (_closed) throw new IOException("the link's writer is closed");
         if (Failed is { } f) throw new IOException("the link's writer stopped: " + f.Message, f);
         _sched.Enqueue(frame, stillValid, afterWrite, prepare, startWrite);
-        if (_signal.CurrentCount == 0) _signal.Release();
+        lock (_signalGate)
+            if (!_closed && _signal.CurrentCount == 0) _signal.Release();
+    }
+
+    /// <summary>The owner stops and awaits the write loop before disposing its wake signal.</summary>
+    public void Dispose()
+    {
+        lock (_signalGate)
+        {
+            if (_closed) return;
+            _closed = true;
+            _signal.Dispose();
+        }
     }
 
     public async Task RunAsync(CancellationToken ct, Action<byte[], bool>? onFrame = null)

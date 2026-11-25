@@ -9,7 +9,7 @@
 # ?depth= serialises the whole object graph. GET /api/rpg/SoulList/SoulsByName
 # with no depth returned 658 MB. Every read here is capped and aborts the stream.
 
-$script:KcdApiBase = "http://localhost:1403"
+$script:KcdApiBase = "http://127.0.0.1:1403"
 
 function Invoke-KcdApi {
     <#

@@ -195,6 +195,50 @@ public class PackerTests
         finally { Directory.Delete(dir, true); }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void The_shared_bundle_redacts_private_values_in_payloads_paths_and_reports(bool collapse)
+    {
+        var dir = Temp();
+        try
+        {
+            string[] privateValues =
+            [
+                "192.0.2.88", "2001:db8::333", "::ffff:203.0.113.12", "::1", "fe80::4%12",
+                string.Concat("76561198", "012345678"), "[U:1:12345]", "STEAM_1:0:12345",
+                "Test Windows User", "LinuxTester", "MacTester", "inner-ticket-value", "inner-password-value"
+            ];
+            string log = "12:00:15.924 MP-MARK odd " + string.Join(" ", privateValues.Take(8)) + "\n"
+                + "C:\\Users\\Test Windows User\\game\\kcd.log /home/LinuxTester/game /Users/MacTester/Game\n"
+                + "[MP-STATS] ours_us_p95=1310\n";
+            string settings = """{"path":"C:\\Users\\Test Windows User\\game","hostRestartTicket":"inner-ticket-value","password":"inner-password-value"}""";
+            var result = Packer.Pack([
+                new("agent.log", Bytes: Encoding.UTF8.GetBytes(log)),
+                new("settings.json", Bytes: Encoding.UTF8.GetBytes(settings)),
+                new("crashes/Report.wer", Bytes: Encoding.Unicode.GetPreamble().Concat(Encoding.Unicode.GetBytes(log)).ToArray()),
+                new("crashes/game.dmp", Bytes: [0, 1, 2]),
+                new("leash/192.0.2.88-positions.csv", Bytes: Encoding.UTF8.GetBytes("x,y,z\n1,2,3\n"))
+            ], dir, "sanitized", new PackOptions { Collapse = collapse });
+            var archive = Open(Assert.Single(result.Parts));
+            foreach (var file in archive)
+            {
+                string content = file.Key.EndsWith(".wer", StringComparison.Ordinal)
+                    ? Encoding.Unicode.GetString(file.Value) : Encoding.UTF8.GetString(file.Value);
+                Assert.False(privateValues.Any(value => file.Key.Contains(value, StringComparison.Ordinal) ||
+                    content.Contains(value, StringComparison.Ordinal)), $"Private value remained in an archive entry ({Path.GetExtension(file.Key)}).");
+            }
+            Assert.DoesNotContain("crashes/game.dmp", archive.Keys);
+            string[] leaked = privateValues.Where(value => result.Manifest.Contains(value, StringComparison.Ordinal)).ToArray();
+            Assert.True(leaked.Length == 0, "A private value remained in the manifest.");
+            Assert.Contains("12:00:15.924", Encoding.UTF8.GetString(archive["agent.log"]));
+            Assert.Contains("ours_us_p95=1310", Encoding.UTF8.GetString(archive["agent.log"]));
+            using var sanitizedSettings = System.Text.Json.JsonDocument.Parse(archive["settings.json"]);
+            Assert.Equal("<redacted>", sanitizedSettings.RootElement.GetProperty("password").GetString());
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
     [Fact]
     public void T3_stats_from_both_roles_and_native_survive_actual_bundle_collapse()
     {
@@ -244,8 +288,9 @@ public class PackerTests
             var src = new List<SourceFile>();
             for (int i = 0; i < 6; i++)
             {
-                var b = new byte[400_000]; rnd.NextBytes(b);   // incompressible
-                src.Add(new($"leash/f{i}.csv", Bytes: b));
+                var b = new byte[400_000]; rnd.NextBytes(b);
+                byte[] text = Encoding.ASCII.GetBytes(Convert.ToBase64String(b, Base64FormattingOptions.InsertLineBreaks));
+                src.Add(new($"leash/f{i}.csv", Bytes: text));
             }
             var opt = new PackOptions { MaxPartBytes = 1_200_000 + 256 * 1024 + 64 * 1024, Level = 3 };
             var r = Packer.Pack(src, dir, "KCDMP-logs-test", opt);

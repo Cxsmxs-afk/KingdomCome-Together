@@ -8,8 +8,6 @@ namespace KcdMp.Client;
 public static class ProcessorFrameScope
 {
     private static readonly AsyncLocal<Lease?> Ambient = new();
-    // A test can wrap this exact timer and observe when its disposal returns.
-    internal static Func<TimeProvider, int, TimeProvider>? InstrumentDeadlineTime;
     public enum Outcome { Completed, TimedOut, Faulted, SessionCancelled }
     public readonly record struct Result(Outcome Status, long ElapsedMs, Exception? Error = null);
 
@@ -92,8 +90,7 @@ public static class ProcessorFrameScope
         // accounting. ElapsedMs is always the actual stopwatch value, never clamped.
         int reserveMs = Math.Min(50, Math.Max(1, timeoutMs / 20));
         int deadlineMs = Math.Max(1, timeoutMs - reserveMs);
-        var deadlineTime = Volatile.Read(ref InstrumentDeadlineTime)?.Invoke(timeProvider, deadlineMs) ?? timeProvider;
-        var timeout = Task.Delay(TimeSpan.FromMilliseconds(deadlineMs), deadlineTime, deadline.Token);
+        var timeout = Task.Delay(TimeSpan.FromMilliseconds(deadlineMs), timeProvider, deadline.Token);
         if (await Task.WhenAny(work, timeout) != work)
         {
             lease.Abandon();

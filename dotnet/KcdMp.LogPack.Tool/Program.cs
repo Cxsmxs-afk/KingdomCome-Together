@@ -101,7 +101,8 @@ foreach (var f in files.Where(f => f.EntryName.EndsWith(".log")))
     using (var r = new StreamReader(f.Path!, Encoding.Latin1)) wins.Scan(Lines(r));
 foreach (var rep in res.Files.Where(r => r.Collapse is not null))
 {
-    var orig = File.ReadAllText(files.First(f => f.EntryName == rep.Entry).Path!, Encoding.Latin1).Split('\n');
+    var source = File.ReadAllBytes(files.First(f => f.EntryName == rep.InputEntry).Path!);
+    var orig = Encoding.Latin1.GetString(BundlePrivacy.Bytes(source)!).Split('\n');
     if (orig.Length > 0 && orig[^1].Length == 0) orig = orig[..^1];
     var kept = new HashSet<string>(StringComparer.Ordinal);
     // the output lines in order; a subsequence check for the windowed lines
@@ -122,7 +123,7 @@ foreach (var rep in res.Files.Where(r => r.Collapse is not null))
     Console.WriteLine($"  verify {rep.Entry}: window lines {wcount:N0} missing {miss}, protected lines {protectedN:N0} missing {protectedMiss}, lines in {rep.Collapse!.LinesIn:N0} = kept {rep.Collapse.LinesKept:N0} + collapsed {rep.Collapse.Elided:N0} ({(rep.Collapse.Balanced ? "balanced" : "NOT BALANCED")}), output lines {outLines.Length:N0} = kept + summaries {rep.Collapse.LinesKept + rep.Collapse.Summaries:N0}");
     if (miss > 0 || protectedMiss > 0 || !rep.Collapse.Balanced || outLines.Length != rep.Collapse.LinesKept + rep.Collapse.Summaries) bad++;
 }
-// every non-collapsed file byte-equal
+// Every non-collapsed file is present, possibly split across parts.
 foreach (var rep in res.Files.Where(r => r.Collapse is null && r.SameAs is null && !outFiles.ContainsKey(r.Entry) && !outFiles.Keys.Any(k => k.StartsWith(r.Entry + ".piece"))))
 { Console.WriteLine("  MISSING " + rep.Entry); bad++; }
 Console.WriteLine(bad == 0 ? "VERIFY OK" : $"VERIFY FAILED ({bad})");

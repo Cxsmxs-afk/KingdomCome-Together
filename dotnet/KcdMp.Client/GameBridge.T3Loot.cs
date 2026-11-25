@@ -43,7 +43,7 @@ public partial class GameBridge
                     }
                     T3Increment("loot_fastlane_frames");
                     T3Max("loot_fastlane_max_wait_ms", Math.Max(0, (Stopwatch.GetTimestamp() - frame.Arrival) * 1000 / Stopwatch.Frequency));
-                    var result = await ProcessorFrameScope.RunAsync(async token =>
+                    var result = await RunProcessorFrameAsync(async token =>
                     {
                         var before = CurrentLoot.Value;
                         CurrentLoot.Value = new(this, frame, frame.LootGeneration);

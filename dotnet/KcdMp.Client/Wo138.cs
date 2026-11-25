@@ -164,10 +164,10 @@ public static class Wo138Codec
             groups[^1].Add(n); size += need;
         }
         var bodies = new List<byte[]>();
+        Span<byte> h = stackalloc byte[5];
         for (int i = 0; i < groups.Count; i++)
         {
             var ms = new MemoryStream();
-            Span<byte> h = stackalloc byte[5];
             BinaryPrimitives.WriteUInt16LittleEndian(h, gen);
             h[2] = (byte)i; h[3] = (byte)groups.Count; h[4] = (byte)groups[i].Count;
             ms.Write(h);

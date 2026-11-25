@@ -56,8 +56,11 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- host side
 
-    private sealed class HostJoin
+    private sealed class HostJoin : IAsyncDisposable
     {
+        private readonly object _lifetime = new();
+        private Task _cancellation = Task.CompletedTask;
+        private bool _closed;
         public uint JoinId;
         public byte Joiner;
         public string Partner = "";
@@ -75,7 +78,29 @@ public partial class GameBridge
         public long LastJoinerMsgMs = Environment.TickCount64;   // WO-204 IV.1: the joiner's last message of this join (progress, ack, ready)
         public volatile int SentPct;       // WO-154 4.1: the transfer's acknowledged share, for the hold's panel
         public TaskCompletionSource<(string Kind, string Arg)>? LuaReply;
-        public void Cancel(string reason) { CancelReason ??= reason; try { Cts.Cancel(); } catch (ObjectDisposedException) { } }
+        public void Cancel(string reason)
+        {
+            lock (_lifetime)
+            {
+                if (_closed || CancelReason is not null) return;
+                CancelReason = reason;
+                _cancellation = Cts.CancelAsync();
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            Task cancellation;
+            lock (_lifetime)
+            {
+                if (_closed) return;
+                _closed = true;
+                cancellation = _cancellation;
+            }
+            Inbox.Writer.TryComplete();
+            try { await cancellation; }
+            finally { Cts.Dispose(); }
+        }
     }
 
     private HostJoin? _hostJoin;
@@ -112,7 +137,7 @@ public partial class GameBridge
 
     private void Wo123OnConnect(Stream stream, CancellationToken ct)
     {
-        _ = ExecLuaAsync("if KCD2MP_Wo123CfgEmit then KCD2MP_Wo123CfgEmit() end");
+        Faults.FireAndLog(ExecLuaAsync("if KCD2MP_Wo123CfgEmit then KCD2MP_Wo123CfgEmit() end"), "join-config");
     }
 
     private async Task Wo123OnDisconnectAsync()
@@ -178,7 +203,7 @@ public partial class GameBridge
         {
             await Task.Delay(TimeSpan.FromSeconds(delayS));
             if (_hostJoin is not null) return;   // a new join owns the pause now
-            try { await ExecLuaAsync("if KCD2MP_JoinResumeStale then KCD2MP_JoinResumeStale(\"host-reload\") end"); } catch { }
+            await TryJoinControlAsync(() => ExecLuaAsync("if KCD2MP_JoinResumeStale then KCD2MP_JoinResumeStale(\"host-reload\") end"), "host-join-reload");
         }
     }
 
@@ -408,12 +433,12 @@ public partial class GameBridge
         if (j is null)
         {
             Console.WriteLine($"MP-JOIN host: join 0x{joinId:x8} from {who} (ghost {joiner}) refused: {refuse}");
-            try { await WriteJoinAsync(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateRefused, Protocol.JoinReasonId(refuse), 0)); } catch { }
+            await TryJoinControlAsync(() => WriteJoinAsync(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateRefused, Protocol.JoinReasonId(refuse), 0)), "join-status-reply");
             return;
         }
         Console.WriteLine($"MP-JOIN host: join 0x{joinId:x8} requested by {who} (ghost {joiner}) -- timeout {_joinTimeoutS} s once paused");
         Wo206HostJoinStarted(joinId);   // WO-206 E: a new join epoch
-        _ = RunHostJoinAsync(j);
+        Faults.FireAndLog(RunHostJoinAsync(j), "host-join");
     }
 
     /// <summary>
@@ -715,6 +740,18 @@ public partial class GameBridge
     private async Task FinishHostJoinAsync(HostJoin j, string reason, byte abortReason)
     {
         Task calendarStopped = StopHeldJoinCalendarAsync(j);
+        try { await EndHostJoinAsync(j, reason, abortReason); }
+        finally
+        {
+            lock (_joinGate) if (ReferenceEquals(_hostJoin, j)) _hostJoin = null;
+            j.DeadlineCts = null;
+            try { await calendarStopped; }
+            finally { await j.DisposeAsync(); }
+        }
+    }
+
+    private async Task EndHostJoinAsync(HostJoin j, string reason, byte abortReason)
+    {
         Wo206HostJoinEnded(j.JoinId, reason);   // WO-206 E: first of all -- an abort is a new join epoch, nothing of this attempt counts from here
         double pausedS = j.PausedUtc is { } p ? (DateTime.UtcNow - p).TotalSeconds : 0;
         // Resume first: nothing below may keep the host frozen. WO-151: the engine's own hold first of all
@@ -724,19 +761,18 @@ public partial class GameBridge
         Wo154HostJoinPanelHide($"join {reason}");   // WO-154 4.1
         if (j.PausedUtc is not null)
         {
-            try { await ExecLuaAsync($"if KCD2MP_JoinResume then KCD2MP_JoinResume(\"{j.JoinId:x8}\", \"{EscapeLua(reason)}\") end"); }
-            catch (Exception ex) { Console.WriteLine($"MP-JOIN host: resume could not reach the mod: {ex.Message} (the mod's own timer resumes)"); }
+            await TryJoinControlAsync(() => ExecLuaAsync($"if KCD2MP_JoinResume then KCD2MP_JoinResume(\"{j.JoinId:x8}\", \"{EscapeLua(reason)}\") end"), "host-join-resume");
         }
         else
         {
-            try { await ExecLuaAsync($"if KCD2MP_JoinDeferEnd then KCD2MP_JoinDeferEnd(\"{j.JoinId:x8}\", \"{EscapeLua(reason)}\") end"); } catch { }
+            await TryJoinControlAsync(() => ExecLuaAsync($"if KCD2MP_JoinDeferEnd then KCD2MP_JoinDeferEnd(\"{j.JoinId:x8}\", \"{EscapeLua(reason)}\") end"), "host-join-defer-end");
             // WO-206 B2 (a 5 s cut right after the request): the JoinTry was still waiting in the game's queue when the joiner went;
             // it ran after this end and paused the world for a join nobody resumed (195 s, the mod's own safety timer). The resume is
             // the mod's own, keyed by the join and a no-op when that join never paused -- sent after the JoinTry, it ends it.
-            try { await ExecLuaAsync($"if KCD2MP_JoinResume then KCD2MP_JoinResume(\"{j.JoinId:x8}\", \"{EscapeLua(reason)}\") end"); } catch { }
+            await TryJoinControlAsync(() => ExecLuaAsync($"if KCD2MP_JoinResume then KCD2MP_JoinResume(\"{j.JoinId:x8}\", \"{EscapeLua(reason)}\") end"), "host-join-resume-deferred");
         }
         if (abortReason != 0 && reason != "joiner-gone" && reason != "relay-lost")
-            try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Joiner, j.JoinId, abortReason)); } catch { }
+            await TryJoinControlAsync(() => WriteJoinAsync(WorldReceiver.BuildAbort(j.Joiner, j.JoinId, abortReason)), "host-join-abort");
         if (reason != "joiner-gone" && reason != "relay-lost")
             await TrySendStatusAsync(j, Protocol.JoinStateResumed, reason, (ushort)Math.Min(pausedS, ushort.MaxValue));
         // A new time basis and running rate travel together; never extrapolate the held seconds at rate 15.
@@ -746,10 +782,19 @@ public partial class GameBridge
         Console.WriteLine(FormattableString.Invariant(
             $"MP-JOIN host: resume join=0x{j.JoinId:x8} reason={reason} paused_s={pausedS:F1} phase_at_end={j.Phase}{(abortReason != 0 ? $" abort_sent={Protocol.JoinAbortName(abortReason)}" : "")}"));
         Wo202NoteEvent(FormattableString.Invariant($"the join's hold ended ({reason}, {pausedS:F0} s)"));
-        lock (_joinGate) if (ReferenceEquals(_hostJoin, j)) _hostJoin = null;
-        await calendarStopped;
-        j.Cts.Dispose();
     }
+
+    private async Task TryJoinControlAsync(Func<Task> action, string operation)
+    {
+        try { await action(); }
+        catch (Exception ex) when (JoinControlRetired(ex)) { }
+        catch (Exception ex) { Faults.ReportThrottled(operation, ex); }
+    }
+
+    private bool JoinControlRetired(Exception error) =>
+        error is OperationCanceledException &&
+            (_wo122Ct.IsCancellationRequested || ProcessorFrameScope.Capture()?.IsAbandoned == true) ||
+        (!_wo122Connected && error is (IOException or System.Net.Sockets.SocketException or ObjectDisposedException));
 
     // ---------------------------------------------------------------- joiner side
 
@@ -1011,13 +1056,13 @@ public partial class GameBridge
         if (!JoinerSharedEffective || _isDamageAuthority)
         {
             Console.WriteLine($"MP-JOIN joiner: offer 0x{joinId:x8} refused ({(!JoinerSharedEffective ? "not a shared-world session" : "this machine is the host")})");
-            try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortSharedWorldOff)); } catch { }
+            await TryJoinControlAsync(() => WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortSharedWorldOff)), "join-status-reply");
             return;
         }
         if (joinId != _joinOutId)
         {
             Console.WriteLine($"MP-JOIN joiner: offer 0x{joinId:x8} refused: this machine asked for 0x{_joinOutId:x8}");
-            try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortProtocol)); } catch { }
+            await TryJoinControlAsync(() => WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortProtocol)), "join-status-reply");
             return;
         }
         if (Volatile.Read(ref _joinCalendarRequest) is not { } request || request.JoinId != joinId ||
@@ -1030,7 +1075,7 @@ public partial class GameBridge
         if (offer is null)
         {
             Console.WriteLine($"MP-JOIN joiner: offer 0x{joinId:x8} refused: {why}");
-            try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, why.Contains("limit") ? Protocol.JoinAbortTooBig : Protocol.JoinAbortProtocol)); } catch { }
+            await TryJoinControlAsync(() => WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, why.Contains("limit") ? Protocol.JoinAbortTooBig : Protocol.JoinAbortProtocol)), "join-status-reply");
             return;
         }
         if (offer.Value.Run is { } run && !H21GuestOfferRunCurrent(host, receiveWorld, run))
@@ -1055,7 +1100,7 @@ public partial class GameBridge
         catch (Exception ex)
         {
             Console.WriteLine($"MP-JOIN joiner: cannot stage the world: {ex.Message}");
-            try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortIo)); } catch { }
+            await TryJoinControlAsync(() => WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortIo)), "join-status-reply");
             return;
         }
         Console.WriteLine(FormattableString.Invariant(
@@ -1072,7 +1117,7 @@ public partial class GameBridge
             if (!FailWorldTransfer(rx, "The world transfer failed.")) return;
             rx.Abort();
             Console.WriteLine($"MP-JOIN joiner: join 0x{joinId:x8} chunk rejected ({why}) -- staging deleted, aborting");
-            try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortProtocol)); } catch { }
+            await TryJoinControlAsync(() => WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, Protocol.JoinAbortProtocol)), "join-status-reply");
             return;
         }
         double secs = (DateTime.UtcNow - rx.StartedUtc).TotalSeconds;
@@ -1119,7 +1164,7 @@ public partial class GameBridge
         {
             if (!FailWorldTransfer(rx, "The world arrived damaged -- the join was stopped.")) return;
             Console.WriteLine($"MP-JOIN joiner: join 0x{joinId:x8} REJECTED: {fwhy} -- deleted, aborting ({Protocol.JoinAbortName(reason)})");
-            try { await WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, reason)); } catch { }
+            await TryJoinControlAsync(() => WriteJoinAsync(WorldReceiver.BuildAbort(host, joinId, reason)), "join-status-reply");
             return;
         }
         if (run is { } completed)

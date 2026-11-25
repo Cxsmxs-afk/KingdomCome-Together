@@ -75,9 +75,9 @@ namespace KCDMP_launcher.Pages
 
         // ------------------------------------------------------------ host
 
-        /// <summary>The relay's command line: the TCP port as before, plus Steam when allowed.</summary>
+        /// <summary>The session port and player limit, plus Steam when allowed.</summary>
         private string RelayArguments() =>
-            $"--port {settings.HostPort}" +
+            $"--port {settings.HostPort} --ServerInfo:MaxPlayers {Protocol.MaxCoopPlayers}" +
             (settings.HostAllowSteam ? $" --steam true --steam-app {settings.SteamAppId}{SteamGameArg}" : "");
 
         private bool HostSettingsLocked =>

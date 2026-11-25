@@ -253,10 +253,10 @@ namespace KCDMP_launcher.Components.Shared
 
         /// <summary>
         /// WO-202 I.1: not one crash of the 2026-10-20 sessions left evidence in a bundle. Collected now, each part never fatal:
-        ///   * crashes/   the DLL's reports (kcdmp-crashes\crash-*: crash.txt, crash.dmp, the agent's agent-statements.txt);
+        ///   * crashes/   the DLL's text reports and the agent's agent-statements.txt;
         ///   * game-crash/ the game's own crash reporter (BugSplat on the Modding Tools build): its %TEMP%\bugsplat_*.log lines
-        ///     (the faulting module and offset; the machine and account lines left out), its minidump while it is still there,
-        ///     and its BugSplatAttachments (small files only);
+        ///     (the faulting module and offset; the machine and account lines left out)
+        ///     and its small text attachments;
         ///   * windows/   Windows Error Reporting's reports for KingdomCome.exe and the Application event log's crash entries
         ///     (the only trace a fast-fail leaves).
         /// </summary>
@@ -268,7 +268,7 @@ namespace KCDMP_launcher.Components.Shared
                 var root = new DirectoryInfo(Path.Combine(gameDir, "kcdmp-crashes"));
                 if (root.Exists)
                     foreach (var d in root.GetDirectories("crash-*").Where(d => d.LastWriteTime >= since).OrderByDescending(d => d.LastWriteTime).Take(4))
-                        foreach (var f in d.GetFiles())
+                        foreach (var f in d.GetFiles("*.txt"))
                             add(f.FullName, $"crashes/{d.Name}/{f.Name}");
             }
             catch { }
@@ -280,8 +280,6 @@ namespace KCDMP_launcher.Components.Shared
                     var keep = File.ReadAllLines(f.FullName).Where(l => !l.Contains("Attributes:") && !l.Contains("setUser") && !l.Contains("setMail"));
                     list.Add(new KcdMp.LogPack.SourceFile($"game-crash/{f.Name}", Bytes: System.Text.Encoding.UTF8.GetBytes(string.Join("\n", keep))));
                 }
-                foreach (var f in tmp.GetFiles("Kingdom Come*.dmp").Where(f => f.LastWriteTime >= since && f.Length < 64L << 20).OrderByDescending(f => f.LastWriteTime).Take(2))
-                    add(f.FullName, $"game-crash/{f.Name.Replace(':', '_')}");
             }
             catch { }
             try

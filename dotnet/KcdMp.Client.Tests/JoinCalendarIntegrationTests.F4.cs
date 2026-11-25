@@ -146,14 +146,15 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
     public async Task Processor_deadlines_are_attributed_and_cancelled_while_an_unowned_short_timer_remains()
     {
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var trace = new F4ProcessorDeadlines();
+        var trace = new F4ProcessorDeadlines();
         using var clock = new HeldDeadlineDisposal(stop.Token);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var unowned = Task.Delay(TimeSpan.FromMilliseconds(1950), new ManualFrameTime(), stop.Token);
+        TimeProvider deadlineTime = trace.Wrap(clock);
         Task<ProcessorFrameScope.Result>[] frames =
         [
-            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token, clock),
-            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token, clock)
+            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token, deadlineTime),
+            ProcessorFrameScope.RunAsync(_ => release.Task, 2000, stop.Token, deadlineTime)
         ];
         try
         {
@@ -290,7 +291,7 @@ public sealed partial class JoinCalendarIntegrationTests
         JoinCalendarTestEngine engine, string scenario, CancellationToken ct, ITestOutputHelper output)
     {
         byte[] ownBefore = SHA256.HashData(File.ReadAllBytes(fixture.GuestOwnSave));
-        using var resources = new F4ResourceCheck(scenario, guest, output);
+        using var resources = new F4ResourceCheck(scenario, guest, output, null, host);
         var cancelled = new HashSet<uint>();
         bool hostCancels = !ReferenceEquals(canceller, engine);
         var incomingAbort = hostCancels ? guestLink.Aborts : hostLink.Aborts;
@@ -396,7 +397,7 @@ public sealed partial class JoinCalendarIntegrationTests
         JoinWire link = firstLink;
         Task read = firstRead;
         var abandoned = new HashSet<uint>();
-        using var resources = new F4ResourceCheck("transfer-eof", guest, output);
+        using var resources = new F4ResourceCheck("transfer-eof", guest, output, null, host);
         try
         {
             for (int i = 0; i <= 5; i++)
@@ -479,7 +480,7 @@ public sealed partial class JoinCalendarIntegrationTests
         }, "the already joined world to settle", ct);
         hostPeer.FinishSending();
         await hostRead.WaitAsync(ct);
-        using var resources = new F4ResourceCheck($"host-return-{players}", guest, output);
+        using var resources = new F4ResourceCheck($"host-return-{players}", guest, output, null, host);
         for (int i = 0; i <= 6; i++)
         {
             await WaitAsync(() => guest.HostAbsentPause && Property<bool>(guest, "LinkHeld") && !Get<bool>(guest, "_hostModeKnown"),
@@ -512,7 +513,7 @@ public sealed partial class JoinCalendarIntegrationTests
         string removed = Path.Combine(fixture.Root, "fixture-offline-save");
         byte[] hash = SHA256.HashData(File.ReadAllBytes(own));
         Set(guest, "_w184SaveOnLeave", false);
-        using var resources = new F4ResourceCheck("missing-personal-save", guest, output);
+        using var resources = new F4ResourceCheck("missing-personal-save", guest, output, null, host);
         for (int i = 1; i <= 7; i++)
         {
             File.Move(own, removed);
@@ -567,7 +568,7 @@ public sealed partial class JoinCalendarIntegrationTests
             F4Probe.RetainedHandle => "mpexit-retained-handle",
             _ => "mpexit"
         };
-        using var resources = supersedeLoad ? null : new F4ResourceCheck(scenario, guest, output);
+        using var resources = supersedeLoad ? null : new F4ResourceCheck(scenario, guest, output, null, host);
         int initialReceiptCycle = probe == F4Probe.NoOwnExit ? 1 : 0;
         int lastCycle = supersedeLoad ? 0 : 5 + initialReceiptCycle;
         using var outstanding = retainTimers || retainHandles ? new RetainedLeaveResources() : null;
@@ -740,7 +741,7 @@ public sealed partial class JoinCalendarIntegrationTests
             Set(second, "_w184SaveOnLeave", false);
             firstEngine.DeferOwnFileRead = true;
             secondEngine.DeferOwnFileRead = true;
-            using var resources = new F4ResourceCheck($"active-guests-{players}", first, output);
+            using var resources = new F4ResourceCheck($"active-guests-{players}", first, output, null, host, second);
             for (int cycle = 1; cycle <= 6; cycle++)
             {
                 async Task JoinAsync(GameBridge guest, JoinWire link, JoinCalendarTestEngine engine, string selected)
@@ -843,12 +844,17 @@ public sealed partial class JoinCalendarIntegrationTests
         private int _nextCycle;
         private F4ResourceSample _before, _after;
 
-        public F4ResourceCheck(string scenario, GameBridge guest, ITestOutputHelper output, ReplayRelay? relay = null)
+        private readonly (GameBridge Player, TimeProvider Previous)[] _processorClocks;
+
+        public F4ResourceCheck(string scenario, GameBridge guest, ITestOutputHelper output, ReplayRelay? relay,
+            params GameBridge[] others)
         {
             _scenario = scenario;
             _guest = guest;
             _output = output;
             _relay = relay;
+            _processorClocks = others.Prepend(guest).Select(player => (player, player.ProcessorTime)).ToArray();
+            foreach (var (player, previous) in _processorClocks) player.ProcessorTime = _deadlineTrace.Wrap(previous);
             if (OperatingSystem.IsWindows()) _handleTrace = new(observeMonitors: relay is not null);
             _sampler = new Thread(Sample) { IsBackground = true, Name = "F4 resource sampler" };
             _sampler.Start();
@@ -1077,7 +1083,7 @@ public sealed partial class JoinCalendarIntegrationTests
             finally
             {
                 _handleTrace?.Dispose();
-                _deadlineTrace.Dispose();
+                foreach (var (player, previous) in _processorClocks) player.ProcessorTime = previous;
             }
         }
     }

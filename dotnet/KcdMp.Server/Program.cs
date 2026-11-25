@@ -8,6 +8,7 @@ using KcdMp.Server.Features.Interactions;
 using KcdMp.Server.Features.ServerInformation;
 using KcdMp.Server.Features.Steam;
 using KcdMp.Server.Features.Tcp;
+using KcdMp.Wire;
 using Serilog;
 
 namespace KcdMp.Server;
@@ -34,6 +35,7 @@ public class Program
 	/// </summary>
 	static async Task Main(string[] args)
 	{
+		new ProcessFaultLog("server", message => Console.Error.WriteLine(message)).Install();
 		await using var app = CreateApp(args);
 		await app.RunAsync();
 	}

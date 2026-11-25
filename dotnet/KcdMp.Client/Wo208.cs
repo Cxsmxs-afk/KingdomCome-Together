@@ -105,6 +105,7 @@ public static class Wo208Rules
         int count = body[0], o = 1;
         var ms = new MemoryStream();
         ms.WriteByte(0);
+        Span<byte> e = stackalloc byte[4];
         for (int i = 0; i < count; i++)
         {
             if (o + 1 > body.Length) return false;
@@ -124,7 +125,6 @@ public static class Wo208Rules
             for (int k = 0; k < nsc; k++) if (body[o + k * Wire.Protocol.NpcAnimScopeLen] < 0xA0) real++;
             if (eid != 0 && known < 255)
             {
-                Span<byte> e = stackalloc byte[4];
                 System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(e, eid);
                 ms.Write(e); ms.WriteByte(cm); ms.WriteByte((byte)real);
                 for (int k = 0; k < nsc; k++)

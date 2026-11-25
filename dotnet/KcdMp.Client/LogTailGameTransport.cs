@@ -80,6 +80,10 @@ public sealed class LogTailGameTransport : IGameTransport
     private readonly string _logPath;
     private readonly int _emitIntervalMs;
     private readonly CancellationTokenSource _cts = new();
+    private volatile bool _nativePositionCadence;
+    private long _nativePositionRenewAt;
+    internal int ReadDelayMs => _nativePositionCadence
+        ? Math.Max(10, _emitIntervalMs / 4) : Math.Max(2, _emitIntervalMs / 4);
 
     private Task? _tailTask;
     private volatile bool _emitterStarted;
@@ -167,6 +171,27 @@ public sealed class LogTailGameTransport : IGameTransport
     /// missing mod without simply asking twice.
     /// </summary>
     public void ResetEmitterStart() => _emitterStarted = false;
+
+    /// <summary>Called by the position sender while its native sample is usable.</summary>
+    internal async Task UpdateNativePositionCadenceAsync(bool active, long nowMs, CancellationToken ct)
+    {
+        // The position loop does not wait on an extra HTTP round trip.
+        active &= _http.BatchingEnabled;
+        if (active == _nativePositionCadence && (!active || nowMs < _nativePositionRenewAt)) return;
+        ct.ThrowIfCancellationRequested();
+        bool changed = active != _nativePositionCadence;
+        _nativePositionCadence = active;
+        _nativePositionRenewAt = active ? nowMs + 750 : 0;
+        // Batched alongside the existing console work. The Lua lease expires if a
+        // load, the transport, or an agent exit prevents the next renewal.
+        if (!_http.BatchingEnabled) return;
+        await _http.ExecuteAsync(
+            active
+                ? "if KCD2MP_NativePositionCadence then KCD2MP_NativePositionCadence(true) end"
+                : "if KCD2MP_NativePositionCadence then KCD2MP_NativePositionCadence(false) end", ct);
+        if (changed)
+            Console.WriteLine($"MP-POS-CADENCE native={(active ? 1 : 0)} tail_wait_ms={ReadDelayMs}");
+    }
 
     /// <summary>The mod's init line (the second of its two; see <see cref="ModInitDetected"/>).</summary>
     public const string ModInitMarker = "[KCD2-MP] MOD INIT";
@@ -1259,7 +1284,7 @@ public sealed class LogTailGameTransport : IGameTransport
                     }
                     // Caught up. Poll well inside the emit interval so a fresh
                     // line is picked up promptly without spinning a core.
-                    await Task.Delay(Math.Max(2, _emitIntervalMs / 4), ct);
+                    await Task.Delay(ReadDelayMs, ct);
                     continue;
                 }
 

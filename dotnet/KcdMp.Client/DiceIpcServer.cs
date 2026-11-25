@@ -52,7 +52,7 @@ public sealed class DiceIpcServer(DiceIpcState state, int port)
     public void Start()
     {
         _cts = new CancellationTokenSource();
-        _listener.Prefixes.Add($"http://localhost:{port}/");
+        _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
         try
         {
             _listener.Start();
@@ -64,7 +64,7 @@ public sealed class DiceIpcServer(DiceIpcState state, int port)
             return;
         }
 
-        Console.WriteLine($"[dice-ipc] Listening on http://localhost:{port}/ for the launcher.");
+        Console.WriteLine($"[dice-ipc] Listening on http://127.0.0.1:{port}/ for the launcher.");
         _loop = RunAsync(_cts.Token);
     }
 

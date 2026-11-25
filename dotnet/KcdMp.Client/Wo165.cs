@@ -66,7 +66,8 @@ public static class Wo165Rules
         if (text.StartsWith("refused=", StringComparison.Ordinal)) { refused = text[8..].Split(' ')[0]; return false; }
         foreach (var kv in text.Split(' ', StringSplitOptions.RemoveEmptyEntries))
         {
-            if (kv.StartsWith("seq=", StringComparison.Ordinal)) uint.TryParse(kv[4..], out seq);
+            if (kv.StartsWith("seq=", StringComparison.Ordinal))
+                seq = uint.TryParse(kv.AsSpan(4), out uint parsed) ? parsed : 0;
             else if (kv.StartsWith("engine=", StringComparison.Ordinal)) engine = kv[7..];
         }
         if (seq == 0 || engine.Length == 0) { refused = "unreadable-answer"; return false; }

@@ -112,7 +112,7 @@ public partial class GameBridge
         if (current is not { } sample || sample.Ratio <= 0 || now - sample.ArrivedMs is < 0 or > 9000)
             return false;
         bool applied = false;
-        var result = await ProcessorFrameScope.RunAsync(async _ =>
+        var result = await RunProcessorFrameAsync(async _ =>
         {
             applied = await UpdateHostCalendarAsync(sample, generation);
         }, 1800, ct);

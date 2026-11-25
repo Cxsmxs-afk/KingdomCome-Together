@@ -124,7 +124,7 @@ def choose(c, port=int(os.environ.get('KCDMP_VERSION_IPC_PORT', '0') or 0)):
     if not port:
         # the agent's version/join-status listener: ClientConfig's default
         port = 5902
-    r = urllib.request.urlopen(urllib.request.Request('http://localhost:%d/join-choice?c=%s' % (port, c), method='POST'), timeout=5)
+    r = urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:%d/join-choice?c=%s' % (port, c), method='POST'), timeout=5)
     print(r.status, r.read().decode())
 
 

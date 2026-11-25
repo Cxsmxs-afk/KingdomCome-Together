@@ -591,7 +591,8 @@ public partial class GameBridge
                 ? await LoadSequenceHostOfferAsync(j.JoinId, on, maxS)
                 : await _combat.Wo151JoinHoldAsync(on, maxS);
         }
-        catch { }
+        catch (Exception ex) when (JoinControlRetired(ex)) { }
+        catch (Exception ex) { Faults.ReportThrottled(on ? "host-join-hold" : "host-join-release", ex); }
         if (on)
         {
             j.EngineHeld = held == true;
