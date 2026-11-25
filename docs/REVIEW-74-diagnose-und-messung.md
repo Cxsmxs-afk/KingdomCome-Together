@@ -19,7 +19,7 @@ python3 tools/sim/measure-process.py /pfad/zur/basis /tmp/kct-cpu-basis
 python3 tools/sim/measure-process.py /pfad/zum/kandidaten /tmp/kct-cpu-kandidat
 ```
 
-Die CPU-Zeit entspricht je Prozess der Summe aus User- und Systemzeit aus `/proc/<pid>/stat`, auf 60 Sekunden normiert. Die Agent-Summe enthält bei vier Spielern alle vier Prozesse. Die Zeit der Game-Doubles läuft separat. Beide Messungen ohne konkurrierenden Build wiederholen. Für den Simulator den gleichen `--timeline both`-Befehl einmal aufwärmen und danach den Median der fünf CPU-Summen berichten.
+Die CPU-Zeit entspricht je Prozess der Summe aus User- und Systemzeit aus `/proc/<pid>/stat`, auf 60 Sekunden normiert. Die Agent-Summe enthält bei vier Spielern alle vier Prozesse. Die Zeit der Game-Doubles läuft separat. `agent_position_packets_per_s` gibt je Agent die mittlere ausgehende Paketrate aus den periodischen `MP-LINK kinds`-Fenstern an. Beide Messungen ohne konkurrierenden Build wiederholen. Für den Simulator den gleichen `--timeline both`-Befehl einmal aufwärmen und danach den Median der fünf CPU-Summen berichten.
 
 ## Besitzer und Protokolle
 

@@ -105,6 +105,21 @@ def produce(logs, closed):
             closed.wait(max(0, until - time.monotonic()))
 
 
+def position_packets_per_second(log):
+    duration = 0.0
+    packets = 0.0
+    # Use periodic windows so the measurement also covers a process that exits
+    # without the connection summary. Each kind is reported as bytes/s, packets/s.
+    windows = re.findall(r"(?m)^MP-LINK kinds who=\S+ window_s=([\d.]+) [^\n]*? out=([^\n]*?) in=", log)
+    for window, outgoing in windows:
+        seconds = float(window)
+        duration += seconds
+        match = re.search(r"(?:^|,)pos:\d+/([\d.]+)(?:,|$)", outgoing)
+        if match:
+            packets += seconds * float(match[1])
+    return round(packets / duration, 2) if duration else 0.0
+
+
 def measure(players, active):
     run = out / ("four" if active else "idle")
     run.mkdir(parents=True, exist_ok=True)
@@ -182,17 +197,15 @@ def measure(players, active):
         cpu = [round((b - a) * 60 / duration / os.sysconf("SC_CLK_TCK"), 3) for a, b in zip(before, after)]
         for agent in agents:
             stop_process(agent)
-        pose_frames = []
+        position_rates = []
         for i in range(players):
             agent_log = (run / f"player-{i}" / "agent.log").read_text(errors="replace")
-            summary = re.search(r"MP-LINK kinds-total .*? out=(.*?) in=", agent_log)
-            match = re.search(r"(?:^|,)pos:(\d+)/", summary[1]) if summary else None
-            pose_frames.append(int(match[1]) if match else 0)
-        if active and any(count == 0 for count in pose_frames):
-            raise RuntimeError(f"Moving agents sent too few poses: {pose_frames}; see {run}")
+            position_rates.append(position_packets_per_second(agent_log))
+        if active and any(rate == 0 for rate in position_rates):
+            raise RuntimeError(f"Moving agents sent no position packets in sampled windows: {position_rates}; see {run}")
         return {"players": players, "moving": active, "wall_s": duration, "relay_cpu_s_per_min": cpu[0],
                 "agent_cpu_s_per_min": cpu[1:], "agent_total_cpu_s_per_min": round(sum(cpu[1:]), 3),
-                "agent_position_frames": pose_frames}
+                "agent_position_packets_per_s": position_rates}
 
 
 for args in [(1, False), (4, True)]:
