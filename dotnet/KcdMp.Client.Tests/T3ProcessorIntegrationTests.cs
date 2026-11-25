@@ -10,6 +10,12 @@ using Xunit.Abstractions;
 
 namespace KcdMp.Client.Tests;
 
+// The recovery and replay fixtures deliberately hold workers. Keep other
+// integration fixtures out of those tests' worker-entry checkpoints.
+[CollectionDefinition("Processor frame integration", DisableParallelization = true)]
+public sealed class ProcessorFrameIntegrationCollection { }
+
+[Collection("Processor frame integration")]
 public class T3ProcessorIntegrationTests(ITestOutputHelper output)
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
@@ -121,7 +127,11 @@ public class T3ProcessorIntegrationTests(ITestOutputHelper output)
             Assert.True((bool)Call(b, "Wo136Defer", frames.Frame(Protocol.ActionDown, []))!);
             frames.Send(Protocol.HorseInfoDown, [1, 0]);
             processor = frames.Run(session.Token);
-            await game.Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            // Separate worker entry from an early processor exit. This test
+            // deliberately ties up the handler while exercising another lane.
+            var first = await Task.WhenAny(game.Entered.Task, processor).WaitAsync(TimeSpan.FromSeconds(2));
+            if (first == processor) await processor;
+            Assert.Same(game.Entered.Task, first);
             await clock.Armed.WaitAsync(session.Token);
             Call(b, "Wo124OnGameplayStartedCore", true);
             Call(b, "T3StartIndependentTick", frames.Writer, session.Token);

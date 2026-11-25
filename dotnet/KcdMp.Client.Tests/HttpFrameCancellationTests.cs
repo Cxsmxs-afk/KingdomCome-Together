@@ -5,6 +5,7 @@ using System.Text.RegularExpressions;
 
 namespace KcdMp.Client.Tests;
 
+[Collection("Processor frame integration")]
 public class HttpFrameCancellationTests
 {
     private sealed class Game(Func<HttpRequestMessage, CancellationToken, Task> send) : HttpMessageHandler
@@ -304,7 +305,12 @@ public class HttpFrameCancellationTests
         bool verified = false;
         try
         {
-            await Task.WhenAll(holdEntered.Task, clock.Armed).WaitAsync(FrameTestWatchdog);
+            try { await Task.WhenAll(holdEntered.Task, clock.Armed).WaitAsync(FrameTestWatchdog); }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException($"Recovery setup: deadline_armed={clock.Armed.IsCompleted} " +
+                    $"hold_entered={holdEntered.Task.IsCompleted} http_calls={Volatile.Read(ref calls)}", ex);
+            }
             Assert.True(transport.Held);
             clock.Expire();
             Assert.Equal(ProcessorFrameScope.Outcome.TimedOut, (await frame.WaitAsync(FrameTestWatchdog)).Status);
