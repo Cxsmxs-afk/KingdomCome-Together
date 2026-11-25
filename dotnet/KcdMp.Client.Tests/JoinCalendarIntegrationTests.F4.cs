@@ -44,7 +44,7 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void Windows_handle_accounting_requires_a_complete_pair_on_one_live_thread()
+    public void Windows_handle_accounting_requires_proven_live_thread_ownership()
     {
         const string socketEvent = "ntdll.dll>mswsock.dll>ws2_32.dll>Interop+Winsock.WSARecv";
         const string socketThread = "ntdll.dll>ws2_32.dll>Interop+Winsock.WSARecv";
@@ -275,22 +275,28 @@ public sealed partial class JoinCalendarIntegrationTests
         resources.AssertBudget();
 
         var requested = new TaskCompletionSource<uint>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var offered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        int calendarsBefore = guestLink.FrozenSnapshots.Count;
+        var offered = new ConcurrentQueue<uint>();
         guestLink.BeforeWrite = (packet, _) =>
         {
             if (packet.Length >= 8 && packet.Span[0] == Protocol.JoinRequestUp)
                 requested.TrySetResult(BinaryPrimitives.ReadUInt32LittleEndian(packet.Span[4..]));
             return ValueTask.CompletedTask;
         };
-        guestLink.BeforeFirstOffer = () => offered.TrySetResult();
+        guestLink.DropIncoming = packet =>
+        {
+            if (packet.Type == Protocol.WorldOfferDown &&
+                Protocol.TrySplitJoinDown(packet.Payload, out _, out _, out uint id, out _))
+                offered.Enqueue(id);
+            return false;
+        };
         uint retryId;
         try
         {
             engine.Emit("join_request", "");
             string loadedFile = await engine.WaitForJoinLoadAsync(ct);
-            Assert.True(requested.Task.IsCompletedSuccessfully && offered.Task.IsCompletedSuccessfully);
+            Assert.True(requested.Task.IsCompletedSuccessfully);
             retryId = requested.Task.Result;
+            Assert.Contains(retryId, offered);
             Assert.Equal($"mpworld{retryId:x8}.whs", Path.GetFileName(loadedFile));
         }
         catch (OperationCanceledException ex) when (ct.IsCancellationRequested)
@@ -298,8 +304,8 @@ public sealed partial class JoinCalendarIntegrationTests
             object? hostAttempt = Get<object?>(host, "_hostJoin");
             object? guestAttempt = Get<object?>(guest, "_jj");
             uint request = requested.Task.IsCompletedSuccessfully ? requested.Task.Result : 0;
-            throw new TimeoutException($"F4 rejoin scenario={scenario} request={request:x8} offer={offered.Task.IsCompleted} " +
-                $"calendars={guestLink.FrozenSnapshots.Count - calendarsBefore} native_arms={guestPipe.ArmRequests} " +
+            throw new TimeoutException($"F4 rejoin scenario={scenario} request={request:x8} offer={offered.Contains(request)} " +
+                $"calendars={guestLink.FrozenSnapshots.Count(sample => sample.JoinId == request)} native_arms={guestPipe.ArmRequests} " +
                 $"guest_ui={Get<string>(guest, "_joinUiState")} guest_reason={Get<string>(guest, "_joinUiReason")} " +
                 $"host_phase={(hostAttempt is null ? "none" : GetVisible<string>(hostAttempt, "Phase"))} " +
                 $"guest_phase={(guestAttempt is null ? "none" : GetVisible<string>(guestAttempt, "Phase"))} " +
@@ -308,7 +314,7 @@ public sealed partial class JoinCalendarIntegrationTests
         finally
         {
             guestLink.BeforeWrite = null;
-            guestLink.BeforeFirstOffer = null;
+            guestLink.DropIncoming = null;
         }
         await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && Get<object?>(host, "_hostJoin") is null,
             "the next world load and Ready on the same guest reader", ct);
