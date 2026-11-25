@@ -201,6 +201,8 @@ public delegate ValueTask? LinkWriteAdmission(Func<ValueTask> write);
 /// </summary>
 public sealed class LinkScheduler
 {
+    private const int RetryMs = 10;
+    private const int PruneMs = 60_000;
     // Optional producer authority. Shared by all pieces of one original packet,
     // so a revoked multi-body packet is counted once, including after selection.
     private sealed class Delivery(Func<bool> valid, Action? afterWrite, Func<byte[]>? prepare, LinkWriteAdmission? startWrite)
@@ -235,6 +237,8 @@ public sealed class LinkScheduler
     private readonly Dictionary<string, int> _npcBand = new(StringComparer.Ordinal);      // body name -> the band of its last NPC state
     private readonly List<StatePiece> _split = new(8);
     private long _eventBytes;
+    private int _dirty;
+    private long _pruneAt = long.MaxValue;
     private readonly TimeProvider _time;
     private readonly double _ticksPerMs;
 
@@ -261,7 +265,7 @@ public sealed class LinkScheduler
 
     public long EventBytes { get { lock (_lock) return _eventBytes; } }
     public int EventCount { get { lock (_lock) return _events.Count; } }
-    public int DirtySlots { get { lock (_lock) return _slots.Values.Count(s => s.Dirty); } }
+    public int DirtySlots { get { lock (_lock) return _dirty; } }
 
     /// <summary>One whole frame (header included), from any thread.</summary>
     public void Enqueue(byte[] frame, Func<bool>? stillValid = null, Action? afterWrite = null,
@@ -287,8 +291,10 @@ public sealed class LinkScheduler
             foreach (var p in _split)
             {
                 if (!_slots.TryGetValue(p.Slot, out var s)) _slots[p.Slot] = s = new Slot { SentTs = now - (long)(10_000 * _ticksPerMs) };
-                else if (s.Dirty) Coalesced++;
+                if (s.Dirty) Coalesced++;
+                else _dirty++;
                 s.P = p; s.Delivery = delivery; s.UpdatedTs = now; s.Dirty = true; s.AliveTs = now;
+                _pruneAt = Math.Min(_pruneAt, now + Milliseconds(PruneMs));
                 if (p.Kind == "npc-state")
                 {
                     _npcSeenTs[p.Body] = now;
@@ -362,14 +368,13 @@ public sealed class LinkScheduler
             // C.3 then the most overdue: (time since this body's state last went) / its band's period; a change beats a repeat
             Slot? best = null; double bestU = 0;
             long ageLimit = Options.AgeLimitMs > 0 ? (long)(Options.AgeLimitMs * _ticksPerMs) : long.MaxValue;
-            long repeat = (long)(Options.RepeatMs * _ticksPerMs), repeatExtra = (long)(Options.RepeatExtraMs * _ticksPerMs), alive = (long)(Options.AliveMs * _ticksPerMs);
+            long alive = Milliseconds(Options.AliveMs);
             bool repeats = Options.Unreliable && Options.RepeatMs > 0;
-            long RepeatOf(Slot s) => s.P.Type is Protocol.ActivityExtraUp or Protocol.ActivityExtraDown ? repeatExtra : repeat;
             foreach (var s in _slots.Values)
             {
-                if (!Allowed(s.Delivery)) { s.Dirty = false; continue; }
-                if (s.Dirty && now - s.UpdatedTs > ageLimit) { s.Dirty = false; StaleDropped++; }
-                bool due = s.Dirty || repeats && s.P.Repeatable && now - s.SentTs >= RepeatOf(s) && Alive(s.P.Body, now, alive);
+                if (!Allowed(s.Delivery)) { MarkClean(s); continue; }
+                if (s.Dirty && now - s.UpdatedTs > ageLimit) { MarkClean(s); StaleDropped++; }
+                bool due = s.Dirty || repeats && s.P.Repeatable && now >= RepeatAt(s) && Alive(s.P.Body, now, alive);
                 if (!due) continue;
                 double over = (now - s.SentTs) / _ticksPerMs / Period(s.Band);
                 double u = s.Dirty ? 1.0 + over : Math.Min(0.99, over / 1000.0);   // a repeat never outranks a change
@@ -385,7 +390,7 @@ public sealed class LinkScheduler
                 int size = best.P.Prefix.Length + 1 + best.P.Item.Length;
                 foreach (var s in _slots.Values
                              .Where(s => !ReferenceEquals(s, best) && s.P.Group == best.P.Group && Allowed(s.Delivery)
-                                         && (s.Dirty || repeats && s.P.Repeatable && now - s.SentTs >= RepeatOf(s) && Alive(s.P.Body, now, alive)))
+                                         && (s.Dirty || repeats && s.P.Repeatable && now >= RepeatAt(s) && Alive(s.P.Body, now, alive)))
                              .OrderByDescending(s => (now - s.SentTs) / Period(s.Band)))
                 {
                     if (take.Count >= maxItems || size + s.P.Item.Length > maxPayload) break;
@@ -398,7 +403,8 @@ public sealed class LinkScheduler
             {
                 if (!s.Dirty) Repeats++;
                 else if (_stateAgeAtSendMs.Count < 20_000) _stateAgeAtSendMs.Add((now - s.UpdatedTs) / _ticksPerMs);
-                s.Dirty = false; s.SentTs = now;
+                MarkClean(s);
+                s.SentTs = now;
             }
             StateSent++; FramesBuilt++;
             frame = built; isState = true;
@@ -421,14 +427,61 @@ public sealed class LinkScheduler
 
     private bool Alive(string body, long now, long alive) => _npcSeenTs.TryGetValue(body, out long t) && now - t <= alive;
 
-    /// <summary>Forgets the slots of bodies whose state stopped long ago (a body that left the stream); call now and then.</summary>
-    public void Prune(int idleMs = 60_000)
+    private long Milliseconds(int milliseconds) => (long)(milliseconds * _ticksPerMs);
+    private long RepeatAt(Slot slot) => slot.SentTs + Milliseconds(
+        slot.P.Type is Protocol.ActivityExtraUp or Protocol.ActivityExtraDown ? Options.RepeatExtraMs : Options.RepeatMs);
+
+    private void MarkClean(Slot slot)
     {
-        long now = _time.GetTimestamp(), idle = (long)(idleMs * _ticksPerMs);
+        if (!slot.Dirty) return;
+        slot.Dirty = false;
+        _dirty--;
+    }
+
+    /// <summary>The writer's next scheduled wake after a pump. Enqueue wakes independently of this deadline.</summary>
+    public int NextWorkDelayMs()
+    {
+        long now = _time.GetTimestamp();
         lock (_lock)
         {
-            foreach (var k in _slots.Where(kv => !kv.Value.Dirty && now - kv.Value.AliveTs > idle).Select(kv => kv.Key).ToList()) _slots.Remove(k);
-            foreach (var k in _npcSeenTs.Where(kv => now - kv.Value > idle).Select(kv => kv.Key).ToList()) { _npcSeenTs.Remove(k); _npcBand.Remove(k); }
+            long retryAt = now + Milliseconds(RetryMs);
+            long next = Math.Min(_pruneAt, _events.Count > 0 || _dirty > 0 ? retryAt : long.MaxValue);
+            if (Options.Unreliable && Options.RepeatMs > 0)
+            {
+                long alive = Milliseconds(Options.AliveMs);
+                foreach (var slot in _slots.Values)
+                {
+                    if (slot.Dirty || !slot.P.Repeatable) continue;
+                    long repeat = RepeatAt(slot);
+                    long due = Math.Max(now, repeat);
+                    if (Alive(slot.P.Body, due, alive) && Allowed(slot.Delivery))
+                        next = Math.Min(next, repeat > now ? repeat : retryAt);
+                }
+            }
+            return next == long.MaxValue ? Timeout.Infinite :
+                (int)Math.Clamp(Math.Ceiling((next - now) / _ticksPerMs), 0, int.MaxValue);
+        }
+    }
+
+    internal void PruneDue()
+    {
+        long now = _time.GetTimestamp(), idle = Milliseconds(PruneMs);
+        lock (_lock)
+        {
+            if (now < _pruneAt) return;
+            _pruneAt = long.MaxValue;
+            foreach (var (key, slot) in _slots)
+            {
+                long expiry = slot.AliveTs + idle;
+                if (!slot.Dirty && now >= expiry) _slots.Remove(key);
+                else _pruneAt = Math.Min(_pruneAt, Math.Max(expiry, now + Milliseconds(RetryMs)));
+            }
+            foreach (var (name, seen) in _npcSeenTs)
+            {
+                if (now < seen + idle) continue;
+                _npcSeenTs.Remove(name);
+                _npcBand.Remove(name);
+            }
         }
     }
 
@@ -463,6 +516,7 @@ public readonly record struct LinkWriteStamp(long Qpc, long Tick)
 /// </summary>
 public sealed class LinkWriter : IDisposable
 {
+    private static readonly DeadlineAlarm Alarm = new();
     private readonly LinkScheduler _sched;
     private readonly ILinkPath _path;
     private readonly SemaphoreSlim _signal = new(0);
@@ -492,6 +546,12 @@ public sealed class LinkWriter : IDisposable
         if (_closed) throw new IOException("the link's writer is closed");
         if (Failed is { } f) throw new IOException("the link's writer stopped: " + f.Message, f);
         _sched.Enqueue(frame, stillValid, afterWrite, prepare, startWrite);
+        Wake();
+    }
+
+    /// <summary>Wake a waiting writer when its owner's shutdown condition changes.</summary>
+    public void Wake()
+    {
         lock (_signalGate)
             if (!_closed && _signal.CurrentCount == 0) _signal.Release();
     }
@@ -507,18 +567,22 @@ public sealed class LinkWriter : IDisposable
         }
     }
 
-    public async Task RunAsync(CancellationToken ct, Action<byte[], bool>? onFrame = null)
+    public async Task RunAsync(CancellationToken ct, Action<byte[], bool>? onFrame = null, Func<bool>? drained = null)
     {
         try
         {
-            while (!ct.IsCancellationRequested)
+            while (!ct.IsCancellationRequested && drained?.Invoke() != true)
             {
-                await _signal.WaitAsync(10, ct);
+                Alarm.Schedule(this, _sched.NextWorkDelayMs());
+                await _signal.WaitAsync(ct);
+                if (drained?.Invoke() == true) break;
                 await PumpOnceAsync(ct, onFrame);
+                _sched.PruneDue();
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex) { Failed = ex; throw; }
+        finally { Alarm.Schedule(this, Timeout.Infinite); }
     }
 
     /// <summary>Sends whatever may go now (the budget and the path's queue allow); <paramref name="onFrame"/> sees each frame first.</summary>
@@ -599,7 +663,69 @@ public sealed class LinkWriter : IDisposable
         }
     }
 
-    public void Wake() { if (_signal.CurrentCount == 0) _signal.Release(); }
+    // One process timer handles the real deadlines of all connected writers.
+    // Quiet writers with empty schedules never register a deadline.
+    private sealed class DeadlineAlarm
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<LinkWriter, long> _waiting = new();
+        private readonly Timer _timer;
+        private long _armed = long.MaxValue;
+
+        public DeadlineAlarm()
+        {
+            // The process-wide timer must not retain the first link's ambient scope.
+            if (ExecutionContext.IsFlowSuppressed()) _timer = CreateTimer();
+            else
+            {
+                using var scope = ExecutionContext.SuppressFlow();
+                _timer = CreateTimer();
+            }
+        }
+
+        private Timer CreateTimer() => new(static state => ((DeadlineAlarm)state!).WakeDue(), this,
+            Timeout.Infinite, Timeout.Infinite);
+
+        public void Schedule(LinkWriter writer, int delay)
+        {
+            lock (_gate)
+            {
+                if (delay == Timeout.Infinite)
+                {
+                    if (!_waiting.Remove(writer)) return;
+                }
+                else _waiting[writer] = Environment.TickCount64 + delay;
+                ArmNext();
+            }
+        }
+
+        private void WakeDue()
+        {
+            lock (_gate)
+            {
+                long now = Environment.TickCount64;
+                _armed = long.MaxValue;
+                foreach (var (writer, due) in _waiting)
+                {
+                    if (now < due) continue;
+                    _waiting.Remove(writer);
+                    writer.Wake();
+                }
+                ArmNext();
+            }
+        }
+
+        private void ArmNext()
+        {
+            long next = long.MaxValue;
+            foreach (long due in _waiting.Values) next = Math.Min(next, due);
+            if (next == _armed) return;
+            _armed = next;
+            int delay = next == long.MaxValue ? Timeout.Infinite :
+                (int)Math.Clamp(next - Environment.TickCount64, 0, int.MaxValue);
+            _timer.Change(delay, Timeout.Infinite);
+        }
+    }
 }
 
 /// <summary>WO-213 C: a plain stream as a link path (TCP): reliable, in order, no numbers of its own.</summary>

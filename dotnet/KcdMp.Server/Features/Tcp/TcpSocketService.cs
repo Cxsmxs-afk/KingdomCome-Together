@@ -106,7 +106,7 @@ public class TcpSocketService : BackgroundService
 		finally
 		{
 			listener.Stop();
-			try { await expiry; } catch { }
+			try { await expiry; } catch (OperationCanceledException) { } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("relay-expiry-stop", caughtFailure); }
 		}
 	}
 

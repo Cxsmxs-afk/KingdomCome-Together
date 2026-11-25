@@ -110,16 +110,16 @@ public partial class GameBridge
         Console.WriteLine(FormattableString.Invariant($"MP-LANES agent nonce={nonce} frames={frames} started={(started ? 1 : 0)}"));
     }
 
-    private Task EdgeExecLuaAsync(string lua, EdgeLane lane)
+    private Task EdgeExecLuaAsync(string lua, EdgeLane lane, CancellationToken cancellation = default)
     {
         var recording = Volatile.Read(ref _recordingTransport);
-        return recording is null ? ExecuteEdgeLuaAsync(lua, lane) :
-            recording.ObserveExecuteAsync(lua, () => ExecuteEdgeLuaAsync(lua, lane));
+        return recording is null ? ExecuteEdgeLuaAsync(lua, lane, cancellation) :
+            recording.ObserveExecuteAsync(lua, () => ExecuteEdgeLuaAsync(lua, lane, cancellation));
     }
 
-    private async Task ExecuteEdgeLuaAsync(string lua, EdgeLane lane)
+    private async Task ExecuteEdgeLuaAsync(string lua, EdgeLane lane, CancellationToken cancellation)
     {
-        using var scope = ProcessorFrameScope.Link(default);
+        using var scope = ProcessorFrameScope.Link(cancellation);
         var ct = scope.Token;
         // Position and action data have their own native ingress. Lua calls
         // retain ordered game/setup work such as spawning and policy updates.

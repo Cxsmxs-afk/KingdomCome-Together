@@ -102,14 +102,14 @@ public partial class GameBridge
             await _combat.Wo138Async(Wo138Codec.OpLevers, Wo138Codec.LeversBody(false, Wo138Codec.DefaultMask));
             await _combat.Wo138Async(Wo138Codec.OpHold, [0]);
         }
-        catch { }
+        catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("stream-observer-stop", caughtFailure); }
         try
         {
             await _transport.ExecuteNowAsync("if KCD2MP_W138NativeSend then KCD2MP_W138NativeSend(0) end; " +
                                              "if KCD2MP_W138Hold then KCD2MP_W138Hold(false, 0, true) end; " +
                                              "if KCD2MP_W138ApseRatio then KCD2MP_W138ApseRatio(false) end");
         }
-        catch { }
+        catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("stream-reconcile-close", caughtFailure); }
         _w138HoldOn = false;
         _w138LeversApplied = false;
     }
@@ -277,7 +277,7 @@ public partial class GameBridge
                 ? $"MP-WO138 HOLD on: the host's copies stay visible (host paused: {Wo138Codec.Describe(reasons)})"
                 : lost ? $"MP-WO138 HOLD off: the host's link is lost ({(now - last) / 1000.0:F1} s silent) -- the 3 s rule hides its copies"
                        : "MP-WO138 HOLD off: the host resumed -- the copies' silence clocks restart now");
-            try { await _combat.Wo138Async(Wo138Codec.OpHold, [(byte)(hold ? 1 : 0)], ct); } catch { }
+            try { await _combat.Wo138Async(Wo138Codec.OpHold, [(byte)(hold ? 1 : 0)], ct); } catch (Exception caughtFailure) { Faults.ReportThrottled("stream-runtime-hold", caughtFailure); }
         }
         if (edge || hold)
             await ExecLuaAsync($"if KCD2MP_W138Hold then KCD2MP_W138Hold({(hold ? "true" : "false")}, {reasons}, {(lost ? "false" : "true")}) end");

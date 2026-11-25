@@ -97,9 +97,9 @@ public partial class GameBridge
         _w154Coalescer.TakeReady(0, all: true);
         foreach (var (npc, h) in _w137TalkHolds.ToArray())
             if (_w137TalkHolds.TryRemove(npc, out _)) _ = ExecLuaAsync($"if KCD2MP_W137HostHold then KCD2MP_W137HostHold(false, \"{npc}\", {h.Peer}, \"disconnect\") end");
-        try { await _combat.Wo137ConfigAsync(false, 0, 0); } catch { }
+        try { await _combat.Wo137ConfigAsync(false, 0, 0); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("quest-observer-stop", caughtFailure); }
         _w137CfgKey = -1;
-        try { await ExecLuaAsync("if KCD2MP_W137Session then KCD2MP_W137Session(false, false, false) end"); } catch { }
+        try { await ExecLuaAsync("if KCD2MP_W137Session then KCD2MP_W137Session(false, false, false) end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("quest-mode-clear", caughtFailure); }
         if (dropped > 0) Console.WriteLine($"MP-W137 disconnected: {dropped} host change(s) still queued were dropped (the next join loads the host's world exactly)");
     }
 

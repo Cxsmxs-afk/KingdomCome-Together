@@ -538,6 +538,31 @@ public class Wo213SchedulerTests
     }
 
     [Fact]
+    public void Writer_deadlines_follow_retry_repeat_liveness_and_prune()
+    {
+        var clock = new SchedulerClock();
+        var scheduler = new LinkScheduler(new LinkSchedOptions { Unreliable = true, RepeatMs = 30, AliveMs = 45 }, clock);
+        Assert.Equal(Timeout.Infinite, scheduler.NextWorkDelayMs());
+        scheduler.Enqueue(Event(1));
+        Assert.Equal(10, scheduler.NextWorkDelayMs());
+        Assert.Single(Drain(scheduler));
+        Assert.Equal(Timeout.Infinite, scheduler.NextWorkDelayMs());
+
+        scheduler.Enqueue(NpcDown(0, "a", 1));
+        scheduler.Enqueue(Anim("a"));
+        Assert.Equal(2, Drain(scheduler).Count);
+        Assert.Equal(30, scheduler.NextWorkDelayMs());
+        clock.Advance(17);
+        Assert.Equal(13, scheduler.NextWorkDelayMs());
+        clock.Advance(13);
+        Assert.Single(Drain(scheduler));
+        // Its next repeat would be at 60 ms, beyond the 45 ms liveness window.
+        Assert.Equal(59_970, scheduler.NextWorkDelayMs());
+        clock.Advance(59_970);
+        Assert.Equal(0, scheduler.NextWorkDelayMs());
+    }
+
+    [Fact]
     public void Bands_send_the_fighter_before_the_far_body()
     {
         var clock = new SchedulerClock();

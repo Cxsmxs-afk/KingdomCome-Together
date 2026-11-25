@@ -64,7 +64,7 @@ public partial class GameBridge
     {
         _w141Connected = false;
         _combat.OnActivityFrame = null;
-        try { await _combat.Wo141ConfigAsync(0, false, 250); } catch { }
+        try { await _combat.Wo141ConfigAsync(0, false, 250); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("weather-observer-stop", caughtFailure); }
         _w141CfgKey = -1;
         _w141HostRows.Clear(); _w141Blocked.Clear(); _w141Talking.Clear(); _w141PeerRows.Clear();
         _w141Mine = ActivityState.None;

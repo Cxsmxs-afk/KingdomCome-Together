@@ -140,12 +140,12 @@ public sealed class DiscordPresence : IDisposable
     /// </summary>
     public static void ForgetCachedAssets(RichPresence? cached)
     {
-        try { if (cached is not null) cached.Assets = null; } catch { }
+        try { if (cached is not null) cached.Assets = null; } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("discord-presence-assets", caughtFailure); }
     }
 
     public void Dispose()
     {
         try { _client?.Dispose(); }
-        catch { /* best-effort on shutdown, matches the rest of Program.cs */ }
+        catch (ObjectDisposedException) { /* best-effort on shutdown, matches the rest of Program.cs */ } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("discord-client-close", caughtFailure); }
     }
 }

@@ -90,7 +90,7 @@ public partial class GameBridge
                 return;
             case "w178_trace":        // research: the DLL's duel trace for <secs>
                 if (!ushort.TryParse(arg, NumberStyles.Integer, CultureInfo.InvariantCulture, out ushort secs)) return;
-                _ = Task.Run(async () => { try { await _combat.Wo163Async(Protocol.Wo178OpTrace, [(byte)(secs & 0xFF), (byte)(secs >> 8)]); } catch { } });
+                _ = Task.Run(async () => { try { await _combat.Wo163Async(Protocol.Wo178OpTrace, [(byte)(secs & 0xFF), (byte)(secs >> 8)]); } catch (Exception caughtFailure) { Faults.ReportThrottled("animation-trace", caughtFailure); } });
                 Console.WriteLine($"MP-W178 duel trace {secs} s asked");
                 return;
         }
@@ -164,7 +164,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo178OpStatus, []);
             if (r is { Ok: true } x) n = Encoding.ASCII.GetString(x.Payload);
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("animation-status", caughtFailure); }
         Console.WriteLine(FormattableString.Invariant(
             $"MP-W178-STATS world_autosave={On(_w178WorldAutosave)} quicksave={On(_w178Quicksave)} joiner_lock={On(_w178JoinerLock)} host_lock_answer={On(_w178HostLockAnswer)} hold={On(_w178Hold)} engine_cap={On(_w178EngineCap)} player_recoil={On(_w178PlayerRecoil)} hit_reach={On(_w178HitReach)} clinch_guard={On(_w178ClinchGuard)} own_block={On(_w178OwnBlock)} copy_engine_state={On(_w178CopyEngineState)} pb_at_contact={On(_w178PbAtContact)} saves={Interlocked.Read(ref _w178Saves)} refused={Interlocked.Read(ref _w178SaveRefused)} no_file={Interlocked.Read(ref _w178NoFile)} asks={Interlocked.Read(ref _w178Asks)} asks_in={Interlocked.Read(ref _w178AsksIn)} answers={Interlocked.Read(ref _w178Answers)} offers={Interlocked.Read(ref _w178Offers)} withdrawn={Interlocked.Read(ref _w178Withdrawn)} held={Interlocked.Read(ref _w178Held)} held_done={Interlocked.Read(ref _w178HeldDone)} held_lost={Interlocked.Read(ref _w178HeldLost)} picks={Interlocked.Read(ref _w178Picks)} native: {n ?? "no answer"}"));
     }
@@ -291,7 +291,7 @@ public partial class GameBridge
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(a, eid);
         a[4] = why;
         a[5] = flags;
-        _ = Task.Run(async () => { try { await _combat.Wo163Async(Protocol.Wo178OpOffer, a); } catch { } });
+        _ = Task.Run(async () => { try { await _combat.Wo163Async(Protocol.Wo178OpOffer, a); } catch (Exception caughtFailure) { Faults.ReportThrottled("hand-offer", caughtFailure); } });
     }
 
     // ================================================================ C4: a held blow
@@ -310,7 +310,7 @@ public partial class GameBridge
             {
                 await Task.Delay(Wo178Rules.HeldPollMs);
                 (bool Ok, byte Reason, byte[] Payload)? r = null;
-                try { r = await _combat.Wo163Async(Protocol.Wo178OpHeldResult, a); } catch { }
+                try { r = await _combat.Wo163Async(Protocol.Wo178OpHeldResult, a); } catch (Exception caughtFailure) { Faults.ReportThrottled("hand-result", caughtFailure); }
                 if (r is not { Ok: true, Payload.Length: >= 34 } x || x.Payload[0] == 1) continue;
                 if (x.Payload[0] != 2) break;
                 var h = Wo173Hit.TryDecode(true, 0, x.Payload[1..]);
@@ -359,7 +359,7 @@ public partial class GameBridge
             if (KcdLogLocator.Find() is string log && Path.GetDirectoryName(log) is string root)
                 bound = KeybindPak.BoundQuickSaveKeyInPak(Path.Combine(root, "Mods", "kdcmp", "Data", KeybindPak.PakFileName));
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("animation-log-window", caughtFailure); }
         _w178QsStoredKey = stored;
         _w178QsActiveKey = bound is not null && Array.IndexOf(Wo178Rules.QuickSaveKeys, bound) >= 0 ? bound : stored;
         _ = ExecLuaAsync($"if KCD2MP_W178QsKeys then KCD2MP_W178QsKeys(\"{_w178QsActiveKey}\", \"{_w178QsStoredKey}\", \"\") end");

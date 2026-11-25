@@ -460,7 +460,7 @@ public partial class GameBridge
     /// <summary>Guarded copies: their local hits on this player are discarded whether or not they are engaged.</summary>
     private async Task Wo132DiscardAsync(bool on, uint eid)
     {
-        try { await _combat.Wo132DiscardAsync(on, eid); } catch { }
+        try { await _combat.Wo132DiscardAsync(on, eid); } catch (Exception caughtFailure) { Faults.ReportThrottled("npc-discard", caughtFailure); }
     }
 
     /// <summary>Live checks from the console (w132_check): "block on|off", "read me|&lt;npc&gt;".</summary>

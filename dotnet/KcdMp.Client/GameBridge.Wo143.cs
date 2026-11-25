@@ -75,7 +75,7 @@ public partial class GameBridge
     {
         _w143Connected = false;
         _combat.OnExtraFrame = null;
-        try { await _combat.Wo143ConfigAsync(0, 0); } catch { }
+        try { await _combat.Wo143ConfigAsync(0, 0); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("pose-observer-stop", caughtFailure); }
         _w143CfgKey = -1;
         await Wo143ReleaseAllTempsAsync("the session ended");
         _w143HostHands.Clear(); _w143HostGaits.Clear(); _w143LookNow.Clear(); _w143Mini.Clear();
@@ -292,7 +292,7 @@ public partial class GameBridge
     {
         int n = _w143Temps.Values.Sum(s => s.Count);
         if (n == 0) return;
-        try { await ExecLuaAsync("if KCD2MP_W143ReleaseAll then KCD2MP_W143ReleaseAll() end"); } catch { }
+        try { await ExecLuaAsync("if KCD2MP_W143ReleaseAll then KCD2MP_W143ReleaseAll() end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("pose-release", caughtFailure); }
         _w143Temps.Clear(); _w143ReleaseAt.Clear();
         Console.WriteLine($"MP-W143 {n} temporary tool(s) taken back ({why})");
     }

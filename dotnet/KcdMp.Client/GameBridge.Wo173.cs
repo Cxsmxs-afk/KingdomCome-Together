@@ -60,7 +60,7 @@ public partial class GameBridge
     private async Task Wo173StatusAsync()
     {
         string? n = null;
-        try { n = await _combat.Wo173StatusAsync(); } catch { }
+        try { n = await _combat.Wo173StatusAsync(); } catch (Exception caughtFailure) { Faults.ReportThrottled("persistent-hp-probe", caughtFailure); }
         Console.WriteLine("MP-WO173-STATS " + Wo173StatsText() + " native: " + (n ?? "?"));
     }
 

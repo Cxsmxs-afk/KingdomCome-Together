@@ -508,7 +508,7 @@ public partial class GameBridge
     {
         var q = new W200Quiet { Clock = clock, Port = port, AtMs = W200Now() };
         var g = Wo200Graph();
-        if (g is not null) { try { q.States = g.Of(clock, port).States; } catch { } }
+        if (g is not null) { try { q.States = g.Of(clock, port).States; } catch (Exception caughtFailure) { Faults.ReportThrottled("quest-clock-probe", caughtFailure); } }
         lock (_w200Lock) { _w200Quiet.Add(q); if (_w200Quiet.Count > 64) _w200Quiet.RemoveAt(0); }
     }
 
@@ -562,7 +562,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo200OpStatus, []);
             if (r is { Ok: true } x) n = Encoding.ASCII.GetString(x.Payload);
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("quest-clock-status", caughtFailure); }
         string sw = string.Join(' ', Wo200Rules.SwitchNames.Select(s => $"{s}={On(W200(s))}"));
         string refusals = string.Join(",", _w200Refusals.OrderBy(k => k.Key, StringComparer.Ordinal).Select(k => $"{k.Key.Replace(' ', ':')}={k.Value}"));
         Console.WriteLine(FormattableString.Invariant(

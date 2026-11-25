@@ -42,7 +42,7 @@ public sealed record SteamInstall(string? Root, IReadOnlyList<string> Libraries)
                 }
             }
         }
-        catch { /* unreadable vdf: the root alone */ }
+        catch (Exception caughtFailure) { /* unreadable vdf: the root alone */ SetupDiagnostics.ReportThrottled("steam-library-vdf", caughtFailure); }
         return new SteamInstall(root, libs);
     }
 
@@ -110,7 +110,7 @@ public static class GameLocator
                 dir = Path.GetDirectoryName(dir);
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("game-root-walk", caughtFailure); }
         return null;
     }
 
@@ -129,7 +129,7 @@ public static class GameLocator
                 if (IsModdingToolsBuild(exe)) return exe;
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("game-modding-tools-probe", caughtFailure); }
         return null;
     }
 

@@ -50,7 +50,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo216OpStatus, []);
             if (r is { Ok: true } rr) Console.WriteLine($"MP-W216-NATIVE {Encoding.ASCII.GetString(rr.Payload)}");
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("animation-session-probe", caughtFailure); }
     }
 
     /// <summary>The mod's own switches: told at every connect and every change.</summary>

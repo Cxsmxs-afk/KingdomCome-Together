@@ -246,7 +246,7 @@ public partial class GameBridge
         if (!W137Joiner) return;
         double now = W164Now();
         QuestValueIndex? qidx = null;
-        try { qidx = await Wo147QuestIndexAsync(); } catch { }
+        try { qidx = await Wo147QuestIndexAsync(); } catch (Exception caughtFailure) { Faults.ReportThrottled("quest-label-probe", caughtFailure); }
         foreach (var (path, m) in _w164Mism.ToArray())
         {
             if (now - m.SeenAt > 90) { _w164Mism.TryRemove(path, out _); continue; }   // no checkpoint lists it any more

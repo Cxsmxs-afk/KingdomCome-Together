@@ -59,10 +59,10 @@ public partial class GameBridge
         // is the mod's buff on the world's NPCs: take it back off.
         foreach (var (name, eid) in _w131Guarded.ToArray())
         {
-            try { await _combat.Wo131CopyGuardAsync(false, eid); } catch { }
+            try { await _combat.Wo131CopyGuardAsync(false, eid); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("copy-guard-release", caughtFailure); }
             _w131Guarded.TryRemove(name, out _);
         }
-        try { await _transport.ExecuteNowAsync("if KCD2MP_W131Tick then KCD2MP_W131Tick(false, false) end"); } catch { }
+        try { await _transport.ExecuteNowAsync("if KCD2MP_W131Tick then KCD2MP_W131Tick(false, false) end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("w131-stop", caughtFailure); }
     }
 
     private async Task Wo131LoopAsync(CancellationToken ct)
@@ -116,7 +116,7 @@ public partial class GameBridge
         if (Wo140HoldOutbound($"a hit on {npcName}")) return (false, 0, false);   // WO-140: its own world, not the host's
         if (!Wo131JoinerActive) return (true, health, died);
         Wo131HitCheck? hc = null;
-        try { hc = await _combat.Wo131HitCheckAsync(soul, npcName); } catch { }
+        try { hc = await _combat.Wo131HitCheckAsync(soul, npcName); } catch (Exception caughtFailure) { Faults.ReportThrottled("hit-check", caughtFailure); }
         var (v, h) = Wo131Rules.GateJoinerHit(hc, health);
         if (v != Wo131Rules.HitVerdict.Forward)
         {

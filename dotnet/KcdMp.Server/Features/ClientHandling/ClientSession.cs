@@ -49,6 +49,7 @@ public partial class ClientSession
     private readonly Dictionary<string, byte[]> _pendingNpcPackets = new();   // WO-110 4.4: "<src>|<name>" -> newest packet, only under pressure
     private readonly SemaphoreSlim _writeSignal = new(0);
     private bool _writeQueueStopped;
+    private bool _writeQueueAborted;
     // One timer for every header wait. A new CancellationTokenSource per packet
     // was a steady allocation on the 30-50 Hz position stream.
     private readonly CancellationTokenSource _idleRead = new();
@@ -325,43 +326,35 @@ public partial class ClientSession
     /// <summary>WO-213 C: a frame into the scheduler; the events' backlog keeps the 0.63.9 cap (past it the client is cut).</summary>
     private bool SchedEnqueue(byte[] packet)
     {
-        lock (_writeQueueLock) if (_writeQueueStopped) return false;
-        if (_sched!.EventBytes + packet.Length > MaxQueuedBytes)
+        bool overflow;
+        lock (_writeQueueLock)
         {
-            AbortWriteQueue($"outbound queue limit reached ({MaxQueuedBytes / 1024} KB of events waiting)");
-            return false;
+            if (_writeQueueStopped) return false;
+            overflow = _sched!.EventBytes + packet.Length > MaxQueuedBytes;
+            if (!overflow)
+            {
+                try { _writer!.Enqueue(packet); return true; }
+                catch (IOException) { }
+            }
         }
-        try { _writer!.Enqueue(packet); }
-        catch (IOException) { AbortWriteQueue(null); return false; }
-        return SignalOpenWriteQueue();
+        AbortWriteQueue(overflow ? $"outbound queue limit reached ({MaxQueuedBytes / 1024} KB of events waiting)" : null);
+        return false;
     }
 
     private async Task SchedWriteLoopAsync()
     {
-        long pruneAt = Environment.TickCount64 + 30_000;
-        Action<byte[], bool> observe = (frame, _) => ObserveOutgoingFrame(frame);
-        // One clock for this writer's retry, repeat and prune work. Enqueued packets
-        // still wake it immediately. A blocked writer needs only one cadence wake.
-        await using var cadence = new Timer(static state =>
+        bool Drained()
         {
-            var signal = (SemaphoreSlim)state!;
-            if (signal.CurrentCount == 0) signal.Release();
-        }, _writeSignal, 10, 10);
-        while (true)
+            lock (_writeQueueLock) return _writeQueueStopped && (_writeQueueAborted || _sched!.EventCount == 0);
+        }
+        try
         {
-            await _writeSignal.WaitAsync();
-            try
-            {
-                await _writer!.PumpOnceAsync(CancellationToken.None, observe);
-            }
-            catch (Exception ex)
-            {
-                _logger.Debug(ex, "[!] Write loop for {Name} stopped", Name ?? $"id={Id}");
-                AbortWriteQueue(null);
-                return;
-            }
-            if (Environment.TickCount64 >= pruneAt) { _sched!.Prune(); pruneAt = Environment.TickCount64 + 30_000; }
-            lock (_writeQueueLock) if (_writeQueueStopped && _sched!.EventCount == 0) return;   // what was written before the close went out
+            await _writer!.RunAsync(CancellationToken.None, (frame, _) => ObserveOutgoingFrame(frame), Drained);
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug("Scheduled write stopped ({Type})", ex.GetType().Name);
+            AbortWriteQueue(null);
         }
     }
 
@@ -1263,7 +1256,15 @@ public partial class ClientSession
             {
                 _worldSyncStop.Dispose();
                 StopWriteQueue();
-                try { await writeTask; }
+                try
+                {
+                    try { await writeTask.WaitAsync(TimeSpan.FromSeconds(2)); }
+                    catch (TimeoutException)
+                    {
+                        AbortWriteQueue("outbound drain expired");
+                        await writeTask;
+                    }
+                }
                 finally
                 {
                     _writer?.Dispose();
@@ -1950,7 +1951,7 @@ public partial class ClientSession
         {
             if (_writeQueueStopped) return;
             _writeQueueStopped = true;
-            _writeSignal.Release();
+            WakeWriteQueue();
         }
     }
 
@@ -1958,18 +1959,25 @@ public partial class ClientSession
     {
         lock (_writeQueueLock)
         {
-            if (_writeQueueStopped) return;
+            if (_writeQueueAborted) return;
             _writeQueueStopped = true;
+            _writeQueueAborted = true;
             _writeQueue.Clear();
             _pendingGhostPackets.Clear();
             _pendingNpcPackets.Clear();
             _queuedBytes = 0;
-            _writeSignal.Release();
+            WakeWriteQueue();
         }
 
         if (reason is not null)
             _logger.Warning("[!] Disconnecting {Name}: {Reason}.", Name ?? $"id={Id}", reason);
         _conn.Dispose();
+    }
+
+    private void WakeWriteQueue()
+    {
+        if (_writer is { } writer) writer.Wake();
+        else _writeSignal.Release();
     }
 
     private async Task WriteLoopAsync()

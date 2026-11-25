@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Reflection;
 using System.Security.Cryptography;
 using KcdMp.Wire;
 
@@ -65,6 +66,43 @@ public class Wo123Tests : IDisposable
     }
 
     // ---------------------------------------------------------------- the wire table
+
+    [Fact]
+    public void A_durable_flush_failure_aborts_the_transfer_and_removes_the_stage()
+    {
+        byte[] save = WhsSaveTests.File(WhsSaveTests.Pair().Host);
+        var tx = new WorldSender(save, 0xF105, 1, 1, Md5Of(save), chunkSize: 8192);
+        var offer = WorldOffer.TryDecode(Body(tx.BuildOfferPacket()), out _)!.Value;
+        using var rx = new WorldReceiver(_dir, tx.JoinId, 0, offer);
+        var file = typeof(WorldReceiver).GetField("_fs", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        ((FileStream)file.GetValue(rx)!).Dispose();
+        file.SetValue(rx, new FlushFailStream(rx.PartPath));
+        string own = Path.Combine(_dir, "personal.whs");
+        File.WriteAllBytes(own, save);
+        foreach (byte[] packet in tx.TakeSendable())
+        {
+            byte[] body = Body(packet);
+            Assert.NotEqual(WorldReceiver.ChunkResult.Error,
+                rx.Accept(BinaryPrimitives.ReadUInt32LittleEndian(body), body.AsSpan(4), out _));
+        }
+
+        var result = rx.Finish();
+        Assert.False(result.Ok);
+        Assert.Equal(Protocol.JoinAbortIo, result.Reason);
+        Assert.Contains("flush", result.Why);
+        Assert.False(File.Exists(rx.PartPath));
+        Assert.False(File.Exists(rx.FinalPath));
+        Assert.Equal(save, File.ReadAllBytes(own));
+    }
+
+    private sealed class FlushFailStream(string path) : FileStream(path, FileMode.Truncate, FileAccess.Write, FileShare.Read)
+    {
+        public override void Flush(bool flushToDisk)
+        {
+            if (flushToDisk) throw new IOException("fixture durable flush failed");
+            base.Flush(false);
+        }
+    }
 
     [Fact]
     public void Join_wire_table_is_consistent()
@@ -204,7 +242,8 @@ public class Wo123Tests : IDisposable
     [Fact]
     public void A_whole_transfer_reassembles_the_file_exactly_and_verifies()
     {
-        var save = WhsSaveTests.SyntheticSave();
+        // Exercise many ACK windows regardless of the host's DEFLATE implementation.
+        var save = WhsSaveTests.File(new WhsSaveTests.Spec { Incompressible = true });
         var tx = new WorldSender(save, 0xC0FFEE, 1, 12, Md5Of(save), chunkSize: 256, windowBytes: 1024);
         Assert.True(tx.ChunkCount > 8, $"the synthetic save is only {save.Length} bytes");
         var (ok, _, why, rx, acks, maxInFlight) = Transfer(tx);

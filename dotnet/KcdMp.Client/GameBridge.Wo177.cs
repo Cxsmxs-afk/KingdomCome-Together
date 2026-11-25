@@ -138,7 +138,7 @@ public partial class GameBridge
             {
                 Interlocked.Increment(ref _w177Gaveup);
                 Console.WriteLine($"MP-W177 load why={why} NOT issued: still {shown} after {sw.ElapsedMilliseconds / 1000} s");
-                try { await ExecLuaAsync($"if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"{EscapeLua(Wo177Rules.GaveUpText)}\") end"); } catch { }
+                try { await ExecLuaAsync($"if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"{EscapeLua(Wo177Rules.GaveUpText)}\") end"); } catch (Exception caughtFailure) { Faults.ReportThrottled("load-quiet-notice", caughtFailure); }
                 return false;
             }
             await Task.Delay(Wo177Rules.PollMs);

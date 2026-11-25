@@ -2580,7 +2580,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         }
         else if (type == WorldOut)
         {
-            if (Wo138Codec.TryParseWorld(body, out var ws)) { try { OnWorld?.Invoke(ws); } catch { } }
+            if (Wo138Codec.TryParseWorld(body, out var ws)) { try { OnWorld?.Invoke(ws); } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("world-notification", caughtFailure); } }
         }
         else if (type == MenuOut)
         {
@@ -2633,7 +2633,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             {
                 uint at = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0));
                 float st = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)), hp = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8));
-                _ = Task.Run(async () => { try { await h(at, st, hp); } catch { } });
+                _ = Task.Run(async () => { try { await h(at, st, hp); } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("discarded-hit-handler", caughtFailure); } });
             }
         }
         else if (type == NpcDropped && body.Length >= 2 && body.Length == 2 + body[1])

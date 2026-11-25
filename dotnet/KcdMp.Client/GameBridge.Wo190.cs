@@ -93,7 +93,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo190OpStatus, []);
             if (r is { Ok: true } x) n = Encoding.ASCII.GetString(x.Payload);
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("footstep-status", caughtFailure); }
         Console.WriteLine(FormattableString.Invariant(
             $"MP-W190-STATS anim_trace={On(_w190Trace)} anim_scope_log={Wo190Rules.ScopeLogName((byte)Volatile.Read(ref _w190ScopeLog))} anim_idle_watch={On(_w190IdleWatch)} anim_standin_weapon={On(_w190StandinWeapon)} copy_weapon_hold={On(_w190CopyWeaponHold)} anim_requeue_gate={On(_w190RequeueGate)} anim_gait_hold={On(_w190GaitHold)} copy_swing_takeover={On(_w190SwingTakeover)} engage_hold={On(_w190EngageHold)} hands_asked={Interlocked.Read(ref _w190HandsAsked)} hands_armed={Interlocked.Read(ref _w190HandsArmed)} hands_bare={Interlocked.Read(ref _w190HandsBare)} hands_unknown={Interlocked.Read(ref _w190HandsUnknown)} standin_filtered={Interlocked.Read(ref _w190StandinFiltered)} weapon_told={Interlocked.Read(ref _w190WeaponTold)} engage_holds={Interlocked.Read(ref _w190EngageHolds)} engage_hold_releases={Interlocked.Read(ref _w190EngageHoldReleases)} clinch_reported={Interlocked.Read(ref _w190ClinchReported)} clinch_replayed={Interlocked.Read(ref _w190ClinchReplayed)} clinch_kept={Interlocked.Read(ref _w190ClinchKept)} | native: {n ?? "no answer"}"));
     }
@@ -131,7 +131,7 @@ public partial class GameBridge
                 return (hands, tags);
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("footstep-surface", caughtFailure); }
         Interlocked.Increment(ref _w190HandsUnknown);
         return (Wo190Rules.HandsUnknown, "");
     }

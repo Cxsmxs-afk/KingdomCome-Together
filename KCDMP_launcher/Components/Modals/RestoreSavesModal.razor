@@ -195,7 +195,7 @@
     private bool GameRunning()
     {
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "KingdomCome" };
-        try { if (!string.IsNullOrWhiteSpace(GamePath)) names.Add(System.IO.Path.GetFileNameWithoutExtension(GamePath)); } catch { }
+        if (!string.IsNullOrWhiteSpace(GamePath)) names.Add(System.IO.Path.GetFileNameWithoutExtension(GamePath));
         foreach (var n in names)
         {
             var procs = Process.GetProcessesByName(n);

@@ -111,7 +111,7 @@ public static class Workspace
         var mt = new FileInfo(mtPath);
 
         bool isSymlink = false;
-        try { isSymlink = mt.LinkTarget is not null; } catch { }
+        try { isSymlink = mt.LinkTarget is not null; } catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("workspace-link-probe", caughtFailure); }
 
         if (!mt.Exists && !isSymlink)
             return new WorkspaceEntry(rel, gamePath, mtPath, gameLen, EntryState.Missing, LinkKind.None, 0);

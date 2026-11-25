@@ -101,7 +101,7 @@ namespace KCDMP_launcher.Models
             {
                 using var p = Process.GetProcessById(pid);
                 string? path = null;
-                try { path = p.MainModule?.FileName; } catch { }
+                try { path = p.MainModule?.FileName; } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("relay-process-path", caughtFailure); }
                 return (p.ProcessName, path);
             }
             catch { return (null, null); }

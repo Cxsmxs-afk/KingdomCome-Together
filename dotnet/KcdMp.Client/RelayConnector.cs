@@ -41,7 +41,7 @@ public sealed class RelayLink : IDisposable
 
     public void Dispose()
     {
-        try { _owner.Dispose(); } catch { }
+        try { _owner.Dispose(); } catch (ObjectDisposedException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("relay-link-dispose", caughtFailure); }
     }
 }
 

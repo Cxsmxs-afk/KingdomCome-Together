@@ -5606,6 +5606,10 @@ function KCD2MP_JoinTry(joinId, partner, timeoutS)
     local w = KCD2MP.w123
     joinId = tostring(joinId)
     w.tries = w.tries + 1
+    if w.closedJoins and w.closedJoins[joinId] then
+        KCD2MP_EmitEvent("join_try", joinId .. " busy retired")
+        return false
+    end
     if w.paused then
         if w.joinId == joinId then KCD2MP_EmitEvent("join_try", joinId .. " paused " .. w.npcN); return true end
         KCD2MP_EmitEvent("join_try", joinId .. " busy another-join")
@@ -5633,9 +5637,12 @@ function KCD2MP_JoinTry(joinId, partner, timeoutS)
     w.phaseAt = os.clock()   -- WO-129: each stage's own elapsed seconds on the host's bar
     -- the clock: read, freeze, read back
     w.ratioWas, w.ratioSet = nil, false
-    pcall(function() w.ratioWas = Calendar.GetWorldTimeRatio() end)
+    pcall(function() w.ratioWas = tonumber(Calendar.GetWorldTimeRatio()) end)
     local ratioNow = nil
-    pcall(function() Calendar.SetWorldTimeRatio(0); w.ratioSet = true end)
+    if w.ratioWas ~= nil then
+        w.ratioSet = true
+        pcall(function() Calendar.SetWorldTimeRatio(0) end)
+    end
     pcall(function() ratioNow = Calendar.GetWorldTimeRatio() end)
     local clock0 = nil
     pcall(function() clock0 = Calendar.GetWorldTime() end)
@@ -5684,13 +5691,17 @@ function KCD2MP_JoinResume(joinId, reason)
         mp_log(string.format("MP-JOIN resume join=%s reason=%s -- not paused for this join (already resumed)", joinId, reason))
         return false
     end
-    w.paused = false
-    w.scanGen = w.scanGen + 1
     local ratioBack, clock1 = nil, nil
     if w.ratioSet and w.ratioWas ~= nil then
         pcall(function() Calendar.SetWorldTimeRatio(w.ratioWas) end)
     end
-    pcall(function() ratioBack = Calendar.GetWorldTimeRatio() end)
+    pcall(function() ratioBack = tonumber(Calendar.GetWorldTimeRatio()) end)
+    if w.ratioSet and (type(ratioBack) ~= "number" or math.abs(ratioBack - w.ratioWas) > 0.00001) then
+        mp_log(string.format("MP-JOIN resume join=%s reason=%s clock_restore=unconfirmed", joinId, reason))
+        return false
+    end
+    w.paused = false
+    w.scanGen = w.scanGen + 1
     pcall(function() clock1 = Calendar.GetWorldTime() end)
     local resumed, left = 0, 0
     for name in pairs(w.npcs) do
@@ -5715,6 +5726,25 @@ function KCD2MP_JoinResume(joinId, reason)
     end
     KCD2MP_EmitEvent("join_resumed", joinId .. " " .. reason)
     return true
+end
+
+-- A receipt is from this attempt and follows the clock's readback. Retain
+-- recent closed joins so an old JoinTry on a switched console path cannot
+-- reacquire the pause after the agent has received that receipt.
+function KCD2MP_JoinResumeControl(joinId, reason, token, deferred)
+    local w = KCD2MP.w123
+    joinId = tostring(joinId)
+    w.closedJoins, w.closedOrder = w.closedJoins or {}, w.closedOrder or {}
+    if not w.closedJoins[joinId] then
+        w.closedJoins[joinId] = true
+        w.closedOrder[#w.closedOrder + 1] = joinId
+        if #w.closedOrder > 16 then w.closedJoins[table.remove(w.closedOrder, 1)] = nil end
+    end
+    if not w.paused or w.joinId == joinId then
+        if deferred then KCD2MP_JoinDeferEnd(joinId, reason) end
+        if w.paused then KCD2MP_JoinResume(joinId, reason) end
+    end
+    KCD2MP_EmitEvent("join_resume_check", joinId .. " " .. tostring(token) .. (w.paused and " paused" or " running"))
 end
 
 -- After a load (the agent, twice): a pause no join owns any more -- its resume

@@ -71,7 +71,7 @@ public sealed class DiceIpcServer(DiceIpcState state, int port)
     public void Stop()
     {
         _cts?.Cancel();
-        try { _listener.Stop(); } catch { }
+        try { _listener.Stop(); } catch (ObjectDisposedException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("dice-listener-close", caughtFailure); }
     }
 
     private async Task RunAsync(CancellationToken ct)
@@ -134,7 +134,7 @@ public sealed class DiceIpcServer(DiceIpcState state, int port)
         catch (Exception ex)
         {
             Console.WriteLine($"[dice-ipc] request failed: {ex.Message}");
-            try { ctx.Response.StatusCode = 500; ctx.Response.Close(); } catch { }
+            try { ctx.Response.StatusCode = 500; ctx.Response.Close(); } catch (Exception closeError) when (closeError is System.Net.HttpListenerException or ObjectDisposedException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("dice-error-response", caughtFailure); }
         }
     }
 

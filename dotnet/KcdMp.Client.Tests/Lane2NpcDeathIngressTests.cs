@@ -104,39 +104,40 @@ public sealed class Lane2NpcDeathIngressTests
     [InlineData("guid", 0U)]
     public async Task Finished_after_1200ms_confirms_one_apply_on_the_original_body(string route, uint expectedEid)
     {
-        await using var fixture = await Fixture.OpenAsync();
+        const int finishMs = 1200;
+        const int pollMs = 40;
+        var clock = new NpcDeathClock();
+        await using var fixture = await Fixture.OpenAsync(clock);
         Task ingress = fixture.Ingress(route);
         var first = await fixture.ReadRequestAsync();
         fixture.AssertBound(first, expectedEid);
         byte seq = 1;
-        long started = Stopwatch.GetTimestamp();
         await fixture.ReplyAsync(seq++, 0x70);
+        await clock.WaitForTimerAsync(2500, fixture.Token);
 
-        while (true)
+        for (int elapsed = pollMs; elapsed <= finishMs; elapsed += pollMs)
         {
+            var cadence = await clock.WaitForTimerAsync(pollMs, fixture.Token);
+            cadence.Fire();
             var next = await fixture.ReadWhilePendingAsync(ingress);
             Assert.Equal(first.Op, next.Op);
             Assert.Equal(first.Body, next.Body);
             Assert.False(fixture.Dead);
             Assert.Equal(0L, fixture.Releases);
-            if (Stopwatch.GetElapsedTime(started) >= TimeSpan.FromMilliseconds(1200))
-            {
-                // The DLL publishes its sole lethal application once Finished
-                // is visible. The same original request authorizes that apply.
-                await fixture.ReplyAsync(seq, 0);
-                break;
-            }
-            await fixture.ReplyAsync(seq++, 0x70);
+            // The original request remains the only authorization when the
+            // DLL reports Finished after 30 production poll intervals.
+            await fixture.ReplyAsync(seq++, elapsed == finishMs ? (byte)0 : (byte)0x70);
         }
 
         await ingress.WaitAsync(fixture.Token);
+        Assert.False(clock.HasScheduledTimer);
         if (expectedEid != 0)
         {
             Assert.True(fixture.Dead);
             Assert.Equal(1L, fixture.Releases);
         }
         await fixture.Ingress(route == "guid" ? "fatal" : "guid");
-        if (expectedEid != 0) await fixture.CompleteFallCheckAsync((byte)(seq + 1));
+        if (expectedEid != 0) await fixture.CompleteFallCheckAsync(seq);
         await fixture.AssertNoWriteAsync();
     }
 

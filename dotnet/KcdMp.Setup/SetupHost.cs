@@ -56,7 +56,7 @@ public sealed class RealSetupHost : ISetupHost
                 if (key?.GetValue("InstallPath") is string ip && Usable(ip, out var p)) return p;
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("steam-install-registry", caughtFailure); }
         return null;
     }
 
@@ -85,7 +85,7 @@ public sealed class RealSetupHost : ISetupHost
             using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam\ActiveProcess");
             if (key?.GetValue("ActiveUser") is int user && user != 0) return true;
         }
-        catch { }
+        catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("steam-process-registry", caughtFailure); }
         return null;
     }
 
@@ -111,7 +111,7 @@ public sealed class RealSetupHost : ISetupHost
                     Directory.EnumerateDirectories(shared, "6.*").Any())
                     return true;
             }
-            catch { }
+            catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("dotnet-runtime-probe", caughtFailure); }
         }
         return false;
     }

@@ -275,7 +275,7 @@ public partial class GameBridge
                 _w171RunStamp = Wo171Rules.RunStamp(head) ?? "unknown";
                 Directory.CreateDirectory(dir);
                 foreach (var old in Directory.GetFiles(dir, "kct_n_*.xml"))
-                    if (!Path.GetFileName(old).StartsWith($"kct_n_{_w171RunStamp}_", StringComparison.Ordinal)) { try { File.Delete(old); } catch { } }
+                    if (!Path.GetFileName(old).StartsWith($"kct_n_{_w171RunStamp}_", StringComparison.Ordinal)) { try { File.Delete(old); } catch (Exception closeError) when (closeError is FileNotFoundException or DirectoryNotFoundException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("log-prune", caughtFailure); } }
             }
             var taken = _w171Taken.GetOrAdd(slot, s => Wo171ReadTaken(dir, s));
             lock (taken)

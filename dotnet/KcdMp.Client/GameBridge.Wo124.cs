@@ -766,7 +766,11 @@ public partial class GameBridge
             j.SplicedParts = WhsSave.PartsFromStream(splicedRaw, choice.Parts.Build, WhsSave.HenryParts.OriginSnapshot);
             Console.WriteLine(FormattableString.Invariant(
                 $"MP-JOIN joiner: join 0x{j.JoinId:x8} spliced world={hostBytes.Length} B + henry={choice.Detail} ({choice.Mode}) -> {res.File.Length} B in {spliceMs:F0} ms; check PASS, verify ok; quest items stripped={rp.QuestItemsRemoved.Count}, keys host_kept={rp.KeysHostKept} joiner_added={rp.KeysJoinerAdded}"));
-            try { File.Delete(stagedPath); } catch { }
+            try { File.Delete(stagedPath); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Faults.ReportThrottled("join-staging-cleanup", ex);
+            }
             if (Wo124JoinGone(j, "before placing")) return;   // WO-206 B2: an abort while the splice ran (the relay lost mid-join)
 
             // ---- Phase 3: place, read back, rescan, listed. WO-175 S1 / WO-180 (mp_coop_playline, on by default): in the playline
@@ -1442,9 +1446,16 @@ public partial class GameBridge
     private async Task LeaveAfterFailedJoinAsync(JoinerJoin j, byte reason, string why, string message)
     {
         if (!ReferenceEquals(_jj, j)) return;
-        try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason)); } catch { }
+        bool abortSent = false;
+        try
+        {
+            await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason));
+            abortSent = true;
+        }
+        catch (Exception ex) when (JoinControlRetired(ex)) { }
+        catch (Exception ex) { Faults.ReportThrottled("join-abort-after-load", ex); }
         await ResetJoinCalendarAfterAbortAsync(j, "failed-post-load");
-        Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} ABORTED after the load ({why}) -- JoinAbort {Protocol.JoinAbortName(reason)} sent (the host resumes)");
+        Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} ABORTED after the load ({why}) -- JoinAbort {Protocol.JoinAbortName(reason)} sent={(abortSent ? 1 : 0)}");
         lock (_joinGate)
         {
             if (!ReferenceEquals(_jj, j)) return;

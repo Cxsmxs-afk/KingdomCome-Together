@@ -201,7 +201,7 @@ public partial class GameBridge
                 }
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("digest-arm", caughtFailure); }
     }
 
     private int _w206dDraining;

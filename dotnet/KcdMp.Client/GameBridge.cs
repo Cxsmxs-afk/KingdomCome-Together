@@ -1512,7 +1512,7 @@ public partial class GameBridge(ClientConfig config)
                 relayRelease, ReleaseVersionInfo.Wire);
             // Into the game too: the player sees why nothing connects (WO-211 0.2: the same version from another build says so)
             Console.WriteLine($"MP-BUILD refused by the relay: {KcdMp.Wire.BuildId.MismatchText(ReleaseVersionInfo.Wire, relayRelease)} (this build {ReleaseVersionInfo.Wire}, the relay's {relayRelease})");
-            try { await ExecLuaAsync($"if KCD2MP_ShowNativeToast then KCD2MP_ShowNativeToast(\"KCD2-MP: {EscapeLua(KcdMp.Wire.BuildId.MismatchText(ReleaseVersionInfo.Wire, relayRelease))}\") end"); await _transport.FlushAsync(appCt); } catch { }
+            try { await ExecLuaAsync($"if KCD2MP_ShowNativeToast then KCD2MP_ShowNativeToast(\"KCD2-MP: {EscapeLua(KcdMp.Wire.BuildId.MismatchText(ReleaseVersionInfo.Wire, relayRelease))}\") end"); await _transport.FlushAsync(appCt); } catch (Exception caughtFailure) { Faults.ReportThrottled("build-mismatch-toast", caughtFailure); }
             throw new ReleaseVersionMismatchException(relayRelease);
         }
 
@@ -1628,7 +1628,7 @@ public partial class GameBridge(ClientConfig config)
         // Kick off the Lua interp tick immediately so KCD2MP.isRiding gets updated
         // even before the first ghost is spawned (e.g. player already on horse at connect time).
         try { await ExecLuaAsync("if KCD2MP_StartInterp then KCD2MP_StartInterp() end"); }
-        catch { /* ignore if mod not loaded yet */ }
+        catch (Exception caughtFailure) { /* ignore if mod not loaded yet */ Faults.ReportThrottled("interpolation-start", caughtFailure); }
 
         // WO-58: clear any ghost bodies embedded in the loaded save. A save
         // made with a peer's ghost standing nearby captures that entity like
@@ -1639,7 +1639,7 @@ public partial class GameBridge(ClientConfig config)
         // old save" report looks like). Once per connection, before any
         // ghost of this session spawns.
         try { await ExecLuaAsync("if KCD2MP_SweepStrayGhosts then KCD2MP_SweepStrayGhosts() end"); }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("ghost-startup-sweep", caughtFailure); }
 
         // Start voice chat — frames captured on background thread, queued, sent in main loop.
         // Left null when disabled, which also suppresses every _voice?. call below.
@@ -2144,7 +2144,7 @@ public partial class GameBridge(ClientConfig config)
                         // flag write per ghost per 2.5 s; failures log once.
                         await ExecLuaAsync("if KCD2MP_ReassertGhostIgnorance then KCD2MP_ReassertGhostIgnorance() end");
                     }
-                    catch { }
+                    catch (Exception caughtFailure) { Faults.ReportThrottled("emitter-rearm", caughtFailure); }
                 }
 
                 // WO-48: re-broadcast my still-unclaimed drops so a peer who
@@ -2154,7 +2154,7 @@ public partial class GameBridge(ClientConfig config)
                     && !_myOpenDrops.IsEmpty)
                 {
                     foreach (var payload in _myOpenDrops.Values)
-                        try { await SendItemDropAsync(stream, payload, cts.Token); } catch { }
+                        try { await SendItemDropAsync(stream, payload, cts.Token); } catch (Exception caughtFailure) { Faults.ReportThrottled("item-drop-heartbeat", caughtFailure); }
                 }
 
                 // WO-28 Phase 0. A save load destroys every ghost entity while
@@ -2167,7 +2167,7 @@ public partial class GameBridge(ClientConfig config)
                 if (IntervalElapsed(ref lastGhostReconcile, ReconcileGhostsInterval, nowTimestamp))
                 {
                     try { await ExecLuaAsync("if KCD2MP_ReconcileGhosts then KCD2MP_ReconcileGhosts() end"); }
-                    catch { }
+                    catch (Exception caughtFailure) { Faults.ReportThrottled("ghost-reconcile", caughtFailure); }
                 }
 
                 // WO-113: keep the DLL's session flag fresh -- idempotent, and
@@ -2209,7 +2209,7 @@ public partial class GameBridge(ClientConfig config)
                     && !_localSkipActive && !_awaitSkipDoneTime)
                 {
                     try { await ExecLuaAsync("if KCD2MP_ReportWorldTime then KCD2MP_ReportWorldTime() end"); }
-                    catch { }
+                    catch (Exception caughtFailure) { Faults.ReportThrottled("world-time-report", caughtFailure); }
                 }
 
                 // WO-40 Phase 3: weather arbitration, checked every ~5 s.
@@ -2221,7 +2221,7 @@ public partial class GameBridge(ClientConfig config)
                 // WO-99 Phase 4: periodic MP-SUMMARY / MP-SUMMARY-MOD snapshot.
                 if (IntervalElapsed(ref lastSummary, SummaryHeartbeat, nowTimestamp))
                 {
-                    try { PrintSessionSummary("periodic"); } catch { }
+                    try { PrintSessionSummary("periodic"); } catch (Exception caughtFailure) { Faults.ReportThrottled("session-summary", caughtFailure); }
                 }
 
                 if (state.HasValue && _staleRun > 0)
@@ -2285,7 +2285,7 @@ public partial class GameBridge(ClientConfig config)
                 LocalState? natState2 = nat;
                 if (nat is null && _posNative && state.HasValue && _posNativeRefusedByOracle)
                 {
-                    try { natState2 = await _combat.ReadLocalStateAsync(cts.Token); } catch (OperationCanceledException) { throw; } catch { }
+                    try { natState2 = await _combat.ReadLocalStateAsync(cts.Token); } catch (OperationCanceledException) { throw; } catch (Exception caughtFailure) { Faults.ReportThrottled("native-position-menu", caughtFailure); }
                 }
                 else if (!_posNative || !state.HasValue)
                     _cadNative.Break();
@@ -2421,8 +2421,8 @@ public partial class GameBridge(ClientConfig config)
                 await TryJoinControlAsync(
                     () => positionTail.UpdateNativePositionCadenceAsync(false, Environment.TickCount64, CancellationToken.None),
                     "position-cadence-reset");
-            try { PrintSessionSummary("disconnect"); } catch { }   // WO-98 Phase 6
-            try { Wo213OnDisconnect(); } catch { }                 // WO-213 A.1: the connection's per-kind totals
+            try { PrintSessionSummary("disconnect"); } catch (Exception caughtFailure) { Faults.ReportThrottled("final-session-summary", caughtFailure); }   // WO-98 Phase 6
+            try { Wo213OnDisconnect(); } catch (Exception caughtFailure) { Faults.ReportThrottled("link-scope-stop", caughtFailure); }                 // WO-213 A.1: the connection's per-kind totals
             await TryJoinControlAsync(Wo213StopWriterAsync, "relay-writer-stop"); // WO-213 C
             // WO-211 A.1: a joiner in the host's world whose link dropped (not the agent stopping) holds there while it reconnects --
             // decided before the per-WO teardowns below, which read it (the save lock stays, the leave does not run, the host stays shown)
@@ -2435,10 +2435,10 @@ public partial class GameBridge(ClientConfig config)
             _stats = new SessionCounters();
             _peerCutscene.Clear();
             cts.Cancel();
-            try { await receiveTask;     } catch { }
-            try { await pingTask;        } catch { }
-            try { await appearanceTask;  } catch { }
-            try { await outfitWatchTask; } catch { }
+            try { await receiveTask;     } catch (OperationCanceledException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("await-reader", caughtFailure); }
+            try { await pingTask;        } catch (OperationCanceledException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("await-ping", caughtFailure); }
+            try { await appearanceTask;  } catch (OperationCanceledException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("await-appearance", caughtFailure); }
+            try { await outfitWatchTask; } catch (OperationCanceledException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("await-outfit", caughtFailure); }
             Wo154VoiceSessionEnd();   // the microphone closes (WO-154: under the switch's lock)
 
             if (_transport is LogTailGameTransport tailForPause2)
@@ -2512,8 +2512,8 @@ public partial class GameBridge(ClientConfig config)
             _combat.OnLocalGrave = null;
             _combat.OnDeathMarker = null;
             await P5ClearPeerAsync(255);
-            try { await _combat.SetSessionAsync(false); } catch { }
-            try { await _combat.MirrorGraveAsync(2, 0xFF, 0, 0, 0, 0); } catch { }
+            try { await _combat.SetSessionAsync(false); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("native-session-close", caughtFailure); }
+            try { await _combat.MirrorGraveAsync(2, 0xFF, 0, 0, 0, 0); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("native-grave-clear", caughtFailure); }
             _sessionWeatherProfile = null;
             _lastAppliedWeatherProfile = null;
             _weatherNextRepickUtc = DateTime.MinValue;
@@ -3490,7 +3490,7 @@ public partial class GameBridge(ClientConfig config)
                 "if KCD2MP_ShowInteractionMsg then KCD2MP_ShowInteractionMsg(\"Clock re-synced to the session's time\") end",
                 Protocol.TimeSkipKindUnknown, target));
         }
-        catch { /* game might have unloaded */ }
+        catch (Exception caughtFailure) { /* game might have unloaded */ Faults.ReportThrottled("reload-clock-convergence", caughtFailure); }
     }
 
     // -------------------------------------------------------------------------
@@ -3918,7 +3918,7 @@ public partial class GameBridge(ClientConfig config)
             return hit.Name;
 
         string? name = null;
-        try { name = await _transport.ReadSoulNameByGuidAsync(soul, ct); } catch { }
+        try { name = await _transport.ReadSoulNameByGuidAsync(soul, ct); } catch (Exception caughtFailure) { Faults.ReportThrottled("soul-name-query", caughtFailure); }
         if (name is not null && !NpcNamePattern.IsMatch(name)) name = null;
         _soulNameByGuid[soul] = (name, now);
         return name;
@@ -3936,7 +3936,7 @@ public partial class GameBridge(ClientConfig config)
         {
             if (_copySoulGuid.TryGetValue(npcName, out var cg) && cg.Eid == copyEid) return cg.Guid;
             Guid? byBody = null;
-            try { byBody = await _combat.Wo147SoulGuidOfEidAsync(copyEid, ct); } catch { }
+            try { byBody = await _combat.Wo147SoulGuidOfEidAsync(copyEid, ct); } catch (Exception caughtFailure) { Faults.ReportThrottled("copy-soul-query", caughtFailure); }
             if (byBody is Guid bg) { _copySoulGuid[npcName] = (copyEid, bg); return bg; }
         }
         var now = DateTime.UtcNow;
@@ -3945,7 +3945,7 @@ public partial class GameBridge(ClientConfig config)
             return hit.Guid;
 
         Guid? guid = null;
-        try { guid = await _transport.ReadGhostSoulGuidAsync(npcName, ct); } catch { }
+        try { guid = await _transport.ReadGhostSoulGuidAsync(npcName, ct); } catch (Exception caughtFailure) { Faults.ReportThrottled("ghost-soul-query", caughtFailure); }
         _soulGuidByName[npcName] = (guid, now);
         return guid;
     }
@@ -4189,11 +4189,13 @@ public partial class GameBridge(ClientConfig config)
         bool exact = !quiet && W207("skip_end_exact");
         if (exact) worldTime = Wo207Rules.SkipEndTarget(worldTime, receivedUtc ?? DateTime.UtcNow, DateTime.UtcNow, WorldTimeRatio);
         Console.WriteLine($"[timeskip] {who} -> worldTime={worldTime} kind={kind}{(quiet ? " (quiet)" : "")}{(exact && worldTime != rawEnd ? $" (the host's end {rawEnd} + the real time since)" : "")}");
+        bool submitted = false;
         try
         {
             await ExecLuaAsync(string.Format(CultureInfo.InvariantCulture,
                 "if KCD2MP_ApplyTimeSkip then KCD2MP_ApplyTimeSkip(\"{0}\",{1},{2},{3}) end",
                 EscapeLua(who), kind, worldTime, quiet || W140SharedSkip ? "true" : "false"));   // WO-140: both slept -- no "slept till" toast
+            submitted = true;
             if (exact && W140SharedSkip)   // WO-207 C.3: this game's own count ran past the host's end -- back to it now (the forward write above covers behind)
             {
                 var pulled = await _combat.Wo140PullAsync(worldTime, worldTime, ct);
@@ -4216,7 +4218,9 @@ public partial class GameBridge(ClientConfig config)
                 await RequestNpcResyncAsync(kind == Protocol.TimeSkipKindFastTravel ? NpcResyncReason.FastTravel : NpcResyncReason.Sleep, _resyncStream, ct);
             }
         }
-        catch { /* game might have unloaded */ }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        catch (Exception ex) { Faults.ReportThrottled("remote-clock-skip", ex); }
+        if (!submitted) return;
 
         // The applied advance must not read as a fresh local jump on the next
         // poll, or two clients would bounce the same skip back and forth.
@@ -4286,7 +4290,7 @@ public partial class GameBridge(ClientConfig config)
                         // OperationCanceledException too, and one stopped the field host's pump mid-menu for good.
                         catch (OperationCanceledException) when (cts.IsCancellationRequested) { break; }
                         catch (OperationCanceledException) { await Task.Delay(50); }
-                        catch { /* a dropped frame is not worth stopping the pump for */ }
+                        catch (Exception caughtFailure) { /* a dropped frame is not worth stopping the pump for */ Faults.ReportThrottled("interpolation-pump", caughtFailure); }
                         frames++;
                     }
                 }
@@ -4311,7 +4315,7 @@ public partial class GameBridge(ClientConfig config)
             _interpPumpCts = null;
         }
         if (cts is null) return;
-        try { cts.Cancel(); } catch { }
+        try { cts.Cancel(); } catch (ObjectDisposedException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("input-cancel", caughtFailure); }
         cts.Dispose();
     }
 
@@ -5039,7 +5043,7 @@ public partial class GameBridge(ClientConfig config)
                                    * 1000L / System.Diagnostics.Stopwatch.Frequency);
                     Console.WriteLine($"[ping] {ms} ms");
                     _stats.OnPong(ms);
-                    try { await ExecLuaAsync($"KCD2MP_ShowPing({ms})"); } catch { }
+                    try { await ExecLuaAsync($"KCD2MP_ShowPing({ms})"); } catch (Exception caughtFailure) { Faults.ReportThrottled("ping-hud", caughtFailure); }
                 }
             }
             else if (type == Protocol.ClockSyncDown && payloadLen == Protocol.ClockSyncDownPayloadLen)
@@ -5276,17 +5280,17 @@ public partial class GameBridge(ClientConfig config)
                 frame.PvpContact?.Session.NoteBodyDetached(ghostId);
                 BumpGhostGeneration(ghostId.ToString(), "peer disconnected");
                 if (_peerApproach.TryRemove(ghostId, out _))
-                    try { await ExecLuaAsync($"if KCD2MP_QuestPromptMoot then KCD2MP_QuestPromptMoot(\"peer left\", \"{ghostId}\") end"); } catch { }
+                    try { await ExecLuaAsync($"if KCD2MP_QuestPromptMoot then KCD2MP_QuestPromptMoot(\"peer left\", \"{ghostId}\") end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("peer-quest-prompt-clear", caughtFailure); }
                 if (_peerCatchup.TryRemove(ghostId, out _))
-                    try { await ExecLuaAsync($"if KCD2MP_QuestCatchupRemote then KCD2MP_QuestCatchupRemote(\"{ghostId}\", \"\", \"\", 0) end"); } catch { }
+                    try { await ExecLuaAsync($"if KCD2MP_QuestCatchupRemote then KCD2MP_QuestCatchupRemote(\"{ghostId}\", \"\", \"\", 0) end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("peer-quest-marker-clear", caughtFailure); }
                 // A peer who disconnects mid-pause must not leave us
                 // slowed forever with no PauseDown(exit) ever coming.
                 await ApplyPeerPauseAsync(ghostId, paused: false, ct);
                 // WO-113: a gone peer's mirror gravestones go with them;
                 // the owner re-announces on its next connect.
-                try { await P5ClearPeerAsync(ghostId, ct); await _combat.MirrorGraveAsync(2, ghostId, 0, 0, 0, 0, ct); } catch { }
+                try { await P5ClearPeerAsync(ghostId, ct); await _combat.MirrorGraveAsync(2, ghostId, 0, 0, 0, 0, ct); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("peer-life-clear", caughtFailure); }
                 // WO-211 A.1.5: a partner in this world keeps its figure, marked reconnecting, for the hold's window (Wo211HostFigureTick)
-                if (!Wo211HoldFigure(ghostId, w211InWorld)) { try { await ExecLuaAsync($"KCD2MP_RemoveGhost(\"{ghostId}\")"); } catch { } }
+                if (!Wo211HoldFigure(ghostId, w211InWorld)) { try { await ExecLuaAsync($"KCD2MP_RemoveGhost(\"{ghostId}\")"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("ghost-remove", caughtFailure); } }
                 await Wo123OnPeerGoneAsync(ghostId);   // WO-123: a joiner gone mid-join resumes the host
                 await Wo124OnPeerGoneAsync(ghostId);   // WO-124: cancel an active join or hold an already joined world
                 Wo144AfterPeerGone(ghostId);           // WO-144: its name and per-partner rows go last (the handlers above read them)
@@ -5484,7 +5488,7 @@ public partial class GameBridge(ClientConfig config)
                     await ExecLuaAsync($"KCD2MP_SetGhostDead(\"{sourceId}\", true)");
                     await ExecLuaAsync($"if KCD2MP_ShowInteractionMsg then KCD2MP_ShowInteractionMsg(\"{EscapeLua(who)} died\") end");
                 }
-                catch { }
+                catch (Exception caughtFailure) { Faults.ReportThrottled("ghost-death-mark", caughtFailure); }
             }
             else if (type == Protocol.CombatRole && payloadLen == Protocol.CombatRolePayloadLen)
             {
@@ -5494,7 +5498,7 @@ public partial class GameBridge(ClientConfig config)
                 bool amAuthority = payload[0] != 0;
                 Console.WriteLine(FormattableString.Invariant(
                     $"MP-AUTHORITY-OWNER self_id={_myGhostId} authority={(amAuthority ? "self" : "peer")} reason=relay-combatrole"));
-                try { await ExecLuaAsync(FormattableString.Invariant($"if KCD2MP_AuthorityOwnerLog then KCD2MP_AuthorityOwnerLog({_myGhostId},{(amAuthority ? "true" : "false")}) end")); } catch { }
+                try { await ExecLuaAsync(FormattableString.Invariant($"if KCD2MP_AuthorityOwnerLog then KCD2MP_AuthorityOwnerLog({_myGhostId},{(amAuthority ? "true" : "false")}) end")); } catch (Exception caughtFailure) { Faults.ReportThrottled("authority-probe", caughtFailure); }
                 await ApplyCombatRoleAsync(amAuthority, ct);
             }
             else if (type == Protocol.TimeSkipDown && payloadLen == Protocol.TimeSkipDownPayloadLen)
@@ -5964,7 +5968,7 @@ public partial class GameBridge(ClientConfig config)
             await ExecLuaAsync($@"KCD2MP_UpdateGhost(""{ghostId}"",{gx},{gy},{gz},{rot},{ride}{tail})");
             Console.WriteLine($"[ghost {ghostId}] {gx} {gy} {gz} riding={isRiding}");
         }
-        catch { /* game might have unloaded */ }
+        catch (Exception caughtFailure) { /* game might have unloaded */ Faults.ReportThrottled("ghost-lua-position", caughtFailure); }
     }
 
     /// <summary>
@@ -5995,7 +5999,7 @@ public partial class GameBridge(ClientConfig config)
             if (ReloadReconcile.VitalsClearDeathTag(health))
                 await ExecLuaAsync($"KCD2MP_SetGhostDead(\"{ghostId}\", false)");
         }
-        catch { /* game might have unloaded */ }
+        catch (Exception caughtFailure) { /* game might have unloaded */ Faults.ReportThrottled("ghost-health", caughtFailure); }
     }
 
     /// <summary>Escapes a string for embedding in a Lua double-quoted literal.</summary>
@@ -6035,7 +6039,7 @@ public partial class GameBridge(ClientConfig config)
             await ExecLuaAsync($@"KCD2MP_SetGhostName(""{ghostId}"",""{safeName}"")");
             Console.WriteLine($"[name] ghost {ghostId} = {ghostName}");
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("ghost-name", caughtFailure); }
     }
 
     /// <summary>
@@ -6337,6 +6341,7 @@ public partial class GameBridge(ClientConfig config)
                 return;
             case "join_try":         // WO-123
             case "join_resumed":
+            case "join_resume_check":
             case "join_cancel":
             case "join_request":
             case "join_ready":
@@ -7348,7 +7353,7 @@ public partial class GameBridge(ClientConfig config)
                     _ = Task.Run(async () =>
                     {
                         bool ok = false;
-                        try { ok = await _combat.SetRespawnAsync(on); } catch { }
+                        try { ok = await _combat.SetRespawnAsync(on); } catch (Exception caughtFailure) { Faults.ReportThrottled("native-respawn-toggle", caughtFailure); }
                         Console.WriteLine($"[respawn] DLL {(ok ? "took" : "did NOT take")} mp_respawn {(on ? "on" : "off")}");
                     });
                 }
@@ -7635,11 +7640,11 @@ public partial class GameBridge(ClientConfig config)
                 Console.WriteLine(FormattableString.Invariant(
                     $"MP-NPCWRITE-STATUS armed={(s.Armed ? 1 : 0)} on={(s.NativeOn ? 1 : 0)} bound={s.Bound} writing={s.Writing} frames={s.FramesWritten} writes={s.Writes} drops={s.Drops} samples={s.Samples} feed_enqueued={Interlocked.Read(ref feed.Enqueued)} feed_sent={Interlocked.Read(ref feed.Sent)} feed_batches={Interlocked.Read(ref feed.Batches)} feed_failed={Interlocked.Read(ref feed.FailedBatches)} feed_coalesced={Interlocked.Read(ref feed.Coalesced)} binds_ok={Interlocked.Read(ref _nativeBindsOk)} binds_refused={Interlocked.Read(ref _nativeBindsRefused)} dll_drops_seen={Interlocked.Read(ref _nativeDrops)} holds={Interlocked.Read(ref _nativeHolds)} lua_bound={_nativeBound.Count} lua_pushed={_npcLua.Pushed} lua_coalesced={_npcLua.Coalesced}"));
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("native-heartbeat", caughtFailure); }
         finally { Interlocked.Exchange(ref _nativeHeartbeatBusy, 0); }
     }
 
-    private Task ExecLuaAsync(string lua)
+    private Task ExecLuaAsync(string lua, CancellationToken cancellation = default)
     {
         ProcessorFrameScope.ThrowIfAbandoned();
         // WO-124: at the main menu (before any world) only the join's own calls
@@ -7650,7 +7655,7 @@ public partial class GameBridge(ClientConfig config)
                 Console.WriteLine($"MP-JOIN menu gate: holding world pushes into the mod until a world loads ({_menuHeldLua} so far)");
             return Task.CompletedTask;
         }
-        return EdgeExecLuaAsync(lua, EdgeLane.Bulk);
+        return EdgeExecLuaAsync(lua, EdgeLane.Bulk, cancellation);
     }
 
     private bool _startedAtMenu;
@@ -7854,7 +7859,7 @@ public partial class GameBridge(ClientConfig config)
         CombatPipe.Priority.Value = band;   // WO-213 D.4: first at the pipe's gate (this method's own flow only)
         try { r = await _combat.ReadLocalStateAsync(ct); }
         catch (OperationCanceledException) { throw; }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("native-position", caughtFailure); }
         finally { CombatPipe.Priority.Value = false; }
         if (r is not LocalState ls)
         {
@@ -7932,7 +7937,7 @@ public partial class GameBridge(ClientConfig config)
         NpcScanResult? r = null;
         try { r = await _combat.ScanNpcsAsync(anchors, _npcScanRadiusM, ct); }
         catch (OperationCanceledException) { throw; }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("native-npc-scan", caughtFailure); }
         sw.Stop();
 
         if (r is not NpcScanResult res)
@@ -8190,7 +8195,7 @@ public partial class GameBridge(ClientConfig config)
         LocalBodyState? b = null;
         try { b = await _combat.ReadBodyStateAsync(0, ct); }
         catch (OperationCanceledException) { throw; }
-        catch { /* the pipe reports its own faults; treat as a miss */ }
+        catch (Exception caughtFailure) { /* the pipe reports its own faults; treat as a miss */ Faults.ReportThrottled("native-body-query", caughtFailure); }
 
         if (b is not null) { _bodyStateMisses = 0; return b; }
         if (++_bodyStateMisses == BodyStateGiveUpAfter)

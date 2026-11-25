@@ -54,7 +54,7 @@ public static class SteamLibraryLocator
         foreach (var candidate in Candidates(gameExePath))
         {
             try { if (File.Exists(candidate)) return Path.GetFullPath(candidate); }
-            catch { /* unreadable path: next */ }
+            catch (Exception caughtFailure) { /* unreadable path: next */ KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("steam-sdk-candidate", caughtFailure); }
         }
         return null;
     }
@@ -104,7 +104,7 @@ public static class SteamLibraryLocator
                 using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam");
                 if (key?.GetValue("SteamPath") is string sp) roots.Add(sp.Replace('/', '\\'));
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("steam-sdk-registry", caughtFailure); }
         }
         roots.Add(@"C:\Program Files (x86)\Steam");
 

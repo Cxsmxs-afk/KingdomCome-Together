@@ -106,7 +106,7 @@ public partial class GameBridge
         }
         catch (Exception ex)
         {
-            try { voice.Dispose(); } catch { }
+            try { voice.Dispose(); } catch (ObjectDisposedException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("voice-reset-dispose", caughtFailure); }
             Console.WriteLine($"[voice] Failed to start ({why}): {ex.Message}");
             return false;
         }
@@ -117,8 +117,8 @@ public partial class GameBridge
         var voice = _voice;
         if (voice is null) return;
         _voice = null;                               // first: the loops stop using it
-        try { voice.Stop(); } catch { }
-        try { voice.Dispose(); } catch { }           // the microphone and the output device close
+        try { voice.Stop(); } catch (ObjectDisposedException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("voice-stop", caughtFailure); }
+        try { voice.Dispose(); } catch (ObjectDisposedException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("voice-dispose", caughtFailure); }           // the microphone and the output device close
         while (_voiceQueue.TryDequeue(out _)) { }    // a frame captured before the close is never sent
         Console.WriteLine($"MP-VOICE microphone closed ({why})");
     }

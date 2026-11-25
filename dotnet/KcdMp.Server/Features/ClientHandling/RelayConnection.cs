@@ -74,6 +74,6 @@ public sealed class RelayConnection : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        try { _dispose(); } catch { /* closing a dead transport */ }
+        try { _dispose(); } catch (ObjectDisposedException) { /* closing a dead transport */ } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("relay-transport-close", caughtFailure); }
     }
 }

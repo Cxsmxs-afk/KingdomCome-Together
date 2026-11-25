@@ -87,7 +87,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo195OpStatus, []);
             if (r is { Ok: true } x) n = Encoding.ASCII.GetString(x.Payload);
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("inventory-probe", caughtFailure); }
         Console.WriteLine(FormattableString.Invariant(
             $"WO195-STATS dead_release={On(_w195DeadRelease)} stealth_witness={On(_w195StealthWitness)} body_loot_host={On(_w195BodyLootHost)} releases={Interlocked.Read(ref _w195Releases)} released_engaged={Interlocked.Read(ref _w195ReleasedEngaged)} refusals={Interlocked.Read(ref _w195Refusals)} fall_down={Interlocked.Read(ref _w195FallDown)} fall_standing={Interlocked.Read(ref _w195FallStanding)} marked_dead={_w195Dead.Count} asleep_sent={Interlocked.Read(ref _w195AsleepSent)} host_asleep={_w195HostAsleep.Count(kv => kv.Value)} stealth_in={Interlocked.Read(ref _w195StealthIn)} screen_takes={Interlocked.Read(ref _w195ScreenTakes)} | native: {n ?? "no answer"}"));
     }

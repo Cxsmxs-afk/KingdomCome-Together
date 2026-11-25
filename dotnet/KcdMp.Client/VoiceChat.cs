@@ -80,8 +80,8 @@ public sealed class VoiceChat : IDisposable
     {
         if (!_running) return;
         _running = false;
-        try { _waveIn?.StopRecording(); } catch { }
-        try { _waveOut?.Stop(); }         catch { }
+        try { _waveIn?.StopRecording(); } catch (ObjectDisposedException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("voice-recorder-stop", caughtFailure); }
+        try { _waveOut?.Stop(); }         catch (ObjectDisposedException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("voice-player-stop", caughtFailure); }
     }
 
     public void Dispose()

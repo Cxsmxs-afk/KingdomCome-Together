@@ -93,7 +93,7 @@ public partial class GameBridge
     {
         _leashByJoiner.Clear();
         _leashJoinerState.Clear();
-        try { await _combat.SetPartnerAsync(false, 0, 0, 0, 0, new(TeleportSource.Respawn, Environment.TickCount64 + 2000, P1Lifecycle.Current.Generation, () => true)); } catch { }
+        try { await _combat.SetPartnerAsync(false, 0, 0, 0, 0, new(TeleportSource.Respawn, Environment.TickCount64 + 2000, P1Lifecycle.Current.Generation, () => true)); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("partner-clear", caughtFailure); }
         if (_leashFtBlocked) await Wo114SetFastTravelBlockAsync(false, "disconnect");
         _ = ExecLuaAsync("if KCD2MP_Wo114Countdown then KCD2MP_Wo114Countdown(0) end");
     }
@@ -481,7 +481,7 @@ public partial class GameBridge
         if (was != block)
             Console.WriteLine($"MP-LEASH joiner: fast travel {(block ? "ARMED off -- the engine's switch is held only while this player picks on the travel map (a quest's own travel is never refused; WO-167)" : "given back")} ({why})");
         try { await ExecLuaAsync($"if KCD2MP_Wo114FastTravelBlock then KCD2MP_Wo114FastTravelBlock({(block ? "true" : "false")}, \"{EscapeLua(why)}\") end"); }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("fast-travel-gate", caughtFailure); }
     }
 
     /// <summary>The host's Leash message.</summary>

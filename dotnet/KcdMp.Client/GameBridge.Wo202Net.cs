@@ -220,7 +220,7 @@ public partial class GameBridge
         }
         else _ownLoadExpected = false;
         Console.WriteLine($"MP-W202 rejoin: the leave's own load is in ('{got}', its Gameplay started was not seen while the link was down) -- the join gate opens (WO-207 C.4)");
-        try { await ExecLuaAsync("if KCD2MP_Wo124Where then KCD2MP_Wo124Where() end"); } catch { }   // the mod's own word on where it is
+        try { await ExecLuaAsync("if KCD2MP_Wo124Where then KCD2MP_Wo124Where() end"); } catch (Exception caughtFailure) { Faults.ReportThrottled("net-recovery-place-probe", caughtFailure); }   // the mod's own word on where it is
         return true;
     }
 

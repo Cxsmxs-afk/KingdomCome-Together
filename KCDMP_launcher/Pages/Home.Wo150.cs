@@ -326,7 +326,7 @@ namespace KCDMP_launcher.Pages
                 foreach (var line in File.ReadAllLines(status)) Log.Information("setup: elevated helper: {Line}", Redact.Text(line));
                 File.Delete(status);
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("setup-status-read", caughtFailure); }
         }
 
         /// <summary>

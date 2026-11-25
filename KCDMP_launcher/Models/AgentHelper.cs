@@ -50,7 +50,7 @@ namespace KCDMP_launcher.Models
                 }
             }
             catch (OperationCanceledException) { }
-            try { if (!p.HasExited) p.Kill(); } catch { }
+            try { if (!p.HasExited) p.Kill(); } catch (InvalidOperationException) { } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("launcher-agent-kill", caughtFailure); }
             if (found is null) return null;
             try { return JsonSerializer.Deserialize<T>(found, Json); }
             catch { return null; }

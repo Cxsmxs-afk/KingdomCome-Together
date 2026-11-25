@@ -81,7 +81,7 @@ public partial class GameBridge
                 // the temporary tools go at once (WO-143 keeps them while a row says so)
                 _ = Task.Run(async () =>
                 {
-                    try { await _combat.Wo143HandsAsync(name, [], []); Interlocked.Increment(ref _w151ToolsCleared); } catch { }
+                    try { await _combat.Wo143HandsAsync(name, [], []); Interlocked.Increment(ref _w151ToolsCleared); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("tool-clear", caughtFailure); }
                 });
             }
         }
@@ -116,7 +116,7 @@ public partial class GameBridge
         {
             if (want.TryGetValue(kv.Key, out uint e2) && e2 == kv.Value) continue;
             _w151CtxOn.TryRemove(kv.Key, out _);
-            try { await _combat.Wo151CopyFightAsync(kv.Value, false); } catch { }
+            try { await _combat.Wo151CopyFightAsync(kv.Value, false); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("copy-fight-clear", caughtFailure); }
             Interlocked.Increment(ref _w151CtxOffCount);
         }
         foreach (var kv in want)
@@ -761,7 +761,7 @@ public partial class GameBridge
         foreach (var kv in _w151CtxOn.ToArray())
         {
             _w151CtxOn.TryRemove(kv.Key, out _);
-            try { await _combat.Wo151CopyFightAsync(kv.Value, false); } catch { }
+            try { await _combat.Wo151CopyFightAsync(kv.Value, false); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("copy-fight-reap", caughtFailure); }
         }
     }
 

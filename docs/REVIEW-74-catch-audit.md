@@ -1,0 +1,215 @@
+# C#-Catch-Audit nach Draft #74
+
+Basis ist `b1c8cf2548a077e26038eacf13023c3797a2c325`.
+Roslyn findet 183 nackte leere Catches und 16 weitere Catches, die ausschließlich einen Kommentar enthalten, in `.cs`-Produktionsdateien.
+Im C#-Block eines Razor-Modals findet sich eine weitere Stelle. Tests und Build-Ausgaben sind ausgenommen.
+Die Zeilen unten beziehen sich auf die Basis. Die Vorgangskennung lässt sich im aktuellen Code oder im Log suchen.
+
+- (a) Abbruch, auslaufender Transport oder Cleanup. Erwartete Fehler sind typisiert. Unerwartete Fehler bleiben im gedrosselten Log sichtbar.
+- (b) Optionale Engine-, Status-, Umgebungs- oder Diagnosearbeit. Der vorhandene Rückfall bleibt aktiv. Die Störung erhält eine eigene gedrosselte Meldung.
+- (c) Fachlicher Fehler mit Änderung des Ergebnisses, der Zustandsfortschreibung oder der Datenfreigabe.
+
+| Datei und Zeile auf der Basis | Kategorie | Vorgang und Entscheidung |
+| --- | --- | --- |
+| `dotnet/KcdMp.Client/CombatPipe.cs:2583` | b | `world-notification` |
+| `dotnet/KcdMp.Client/CombatPipe.cs:2636` | b | `discarded-hit-handler` |
+| `dotnet/KcdMp.Client/DiceIpcServer.cs:74` | a | `dice-listener-close` |
+| `dotnet/KcdMp.Client/DiceIpcServer.cs:137` | a | `dice-error-response` |
+| `dotnet/KcdMp.Client/DiscordPresence.cs:143` | b | `discord-presence-assets` |
+| `dotnet/KcdMp.Client/DiscordPresence.cs:149` | a | `discord-client-close` |
+| `dotnet/KcdMp.Client/GameBridge.cs:1515` | b | `build-mismatch-toast` |
+| `dotnet/KcdMp.Client/GameBridge.cs:1631` | b | `interpolation-start` |
+| `dotnet/KcdMp.Client/GameBridge.cs:1642` | b | `ghost-startup-sweep` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2147` | b | `emitter-rearm` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2157` | b | `item-drop-heartbeat` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2170` | b | `ghost-reconcile` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2212` | b | `world-time-report` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2224` | b | `session-summary` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2288` | b | `native-position-menu` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2424` | b | `final-session-summary` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2425` | b | `link-scope-stop` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2438` | a | `await-reader` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2439` | a | `await-ping` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2440` | a | `await-appearance` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2441` | a | `await-outfit` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2515` | a | `native-session-close` |
+| `dotnet/KcdMp.Client/GameBridge.cs:2516` | a | `native-grave-clear` |
+| `dotnet/KcdMp.Client/GameBridge.cs:3493` | b | `reload-clock-convergence` |
+| `dotnet/KcdMp.Client/GameBridge.cs:3921` | b | `soul-name-query` |
+| `dotnet/KcdMp.Client/GameBridge.cs:3939` | b | `copy-soul-query` |
+| `dotnet/KcdMp.Client/GameBridge.cs:3948` | b | `ghost-soul-query` |
+| `dotnet/KcdMp.Client/GameBridge.cs:4219` | c | `remote-clock-skip` Fehlgeschlagenen Uhrenaufruf vor dem Vorschieben der lokalen Zeitbasis behandeln. |
+| `dotnet/KcdMp.Client/GameBridge.cs:4289` | b | `interpolation-pump` |
+| `dotnet/KcdMp.Client/GameBridge.cs:4314` | a | `input-cancel` |
+| `dotnet/KcdMp.Client/GameBridge.cs:5042` | b | `ping-hud` |
+| `dotnet/KcdMp.Client/GameBridge.cs:5279` | a | `peer-quest-prompt-clear` |
+| `dotnet/KcdMp.Client/GameBridge.cs:5281` | a | `peer-quest-marker-clear` |
+| `dotnet/KcdMp.Client/GameBridge.cs:5287` | a | `peer-life-clear` |
+| `dotnet/KcdMp.Client/GameBridge.cs:5289` | a | `ghost-remove` |
+| `dotnet/KcdMp.Client/GameBridge.cs:5487` | b | `ghost-death-mark` |
+| `dotnet/KcdMp.Client/GameBridge.cs:5497` | b | `authority-probe` |
+| `dotnet/KcdMp.Client/GameBridge.cs:5967` | b | `ghost-lua-position` |
+| `dotnet/KcdMp.Client/GameBridge.cs:5998` | b | `ghost-health` |
+| `dotnet/KcdMp.Client/GameBridge.cs:6038` | b | `ghost-name` |
+| `dotnet/KcdMp.Client/GameBridge.cs:7351` | b | `native-respawn-toggle` |
+| `dotnet/KcdMp.Client/GameBridge.cs:7638` | b | `native-heartbeat` |
+| `dotnet/KcdMp.Client/GameBridge.cs:7857` | b | `native-position` |
+| `dotnet/KcdMp.Client/GameBridge.cs:7935` | b | `native-npc-scan` |
+| `dotnet/KcdMp.Client/GameBridge.cs:8193` | b | `native-body-query` |
+| `dotnet/KcdMp.Client/GameBridge.Wo114.cs:96` | a | `partner-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo114.cs:484` | b | `fast-travel-gate` |
+| `dotnet/KcdMp.Client/GameBridge.Wo121.cs:328` | b | `engaged-cleanup` |
+| `dotnet/KcdMp.Client/GameBridge.Wo122.cs:341` | b | `saves-known-folder` |
+| `dotnet/KcdMp.Client/GameBridge.Wo124.cs:769` | c | `join-staging-cleanup` Temporäre Join-Datei bei I/O-Fehler für den Staging-Sweep sichtbar machen. |
+| `dotnet/KcdMp.Client/GameBridge.Wo124.cs:1445` | c | `join-abort-after-load` Erfolg des Abbruchversands getrennt vom lokalen Cleanup erfassen. |
+| `dotnet/KcdMp.Client/GameBridge.Wo127Leash.cs:102` | b | `leash-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo131.cs:62` | a | `copy-guard-release` |
+| `dotnet/KcdMp.Client/GameBridge.Wo131.cs:65` | a | `w131-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo131.cs:119` | b | `hit-check` |
+| `dotnet/KcdMp.Client/GameBridge.Wo132.cs:463` | b | `npc-discard` |
+| `dotnet/KcdMp.Client/GameBridge.Wo133.cs:60` | a | `quest-gate-release` |
+| `dotnet/KcdMp.Client/GameBridge.Wo134.cs:95` | a | `ledger-hold` |
+| `dotnet/KcdMp.Client/GameBridge.Wo134.cs:99` | a | `w134-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo134.cs:241` | b | `equipped-query` |
+| `dotnet/KcdMp.Client/GameBridge.Wo134.cs:625` | a | `loot-scope-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo136.cs:270` | a | `native-copy-guard-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo136.cs:273` | a | `native-npc-engage-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo136.cs:321` | b | `w136-reconcile` |
+| `dotnet/KcdMp.Client/GameBridge.Wo137.cs:100` | a | `quest-observer-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo137.cs:102` | a | `quest-mode-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo138.cs:105` | a | `stream-observer-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo138.cs:112` | a | `stream-reconcile-close` |
+| `dotnet/KcdMp.Client/GameBridge.Wo138.cs:280` | b | `stream-runtime-hold` |
+| `dotnet/KcdMp.Client/GameBridge.Wo139.cs:100` | a | `story-observer-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo139.cs:101` | a | `story-punish-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo139.cs:103` | a | `story-mode-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo140.cs:107` | a | `skip-observer-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo140.cs:109` | a | `skip-session-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo140.cs:110` | a | `skip-separation-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo140.cs:758` | b | `skip-partner-state` |
+| `dotnet/KcdMp.Client/GameBridge.Wo141.cs:67` | a | `weather-observer-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo143.cs:78` | a | `pose-observer-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo143.cs:295` | a | `pose-release` |
+| `dotnet/KcdMp.Client/GameBridge.Wo147.cs:351` | b | `soul-observer-status` |
+| `dotnet/KcdMp.Client/GameBridge.Wo147.cs:529` | a | `combat-hold-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo147.cs:600` | b | `quest-type-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo147.cs:628` | b | `quest-type-request` |
+| `dotnet/KcdMp.Client/GameBridge.Wo147.cs:660` | b | `quest-state-request` |
+| `dotnet/KcdMp.Client/GameBridge.Wo148.cs:61` | a | `camera-peer-gone` |
+| `dotnet/KcdMp.Client/GameBridge.Wo148.cs:63` | a | `camera-session-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo148.cs:382` | b | `carry-one-shot` |
+| `dotnet/KcdMp.Client/GameBridge.Wo151.cs:84` | a | `tool-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo151.cs:119` | a | `copy-fight-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo151.cs:764` | a | `copy-fight-reap` |
+| `dotnet/KcdMp.Client/GameBridge.Wo154Menu.cs:81` | a | `menu-session-clear` |
+| `dotnet/KcdMp.Client/GameBridge.Wo154Menu.cs:239` | b | `menu-log-window` |
+| `dotnet/KcdMp.Client/GameBridge.Wo154Voice.cs:109` | a | `voice-reset-dispose` |
+| `dotnet/KcdMp.Client/GameBridge.Wo154Voice.cs:120` | a | `voice-stop` |
+| `dotnet/KcdMp.Client/GameBridge.Wo154Voice.cs:121` | a | `voice-dispose` |
+| `dotnet/KcdMp.Client/GameBridge.Wo159.cs:20` | b | `prologue-saves-folder` |
+| `dotnet/KcdMp.Client/GameBridge.Wo160.cs:42` | b | `load-place-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo160.cs:127` | a | `activity-release` |
+| `dotnet/KcdMp.Client/GameBridge.Wo164.cs:249` | b | `quest-label-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo171.cs:278` | a | `log-prune` |
+| `dotnet/KcdMp.Client/GameBridge.Wo173.cs:63` | b | `persistent-hp-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo177.cs:141` | b | `load-quiet-notice` |
+| `dotnet/KcdMp.Client/GameBridge.Wo178.cs:93` | b | `animation-trace` |
+| `dotnet/KcdMp.Client/GameBridge.Wo178.cs:167` | b | `animation-status` |
+| `dotnet/KcdMp.Client/GameBridge.Wo178.cs:294` | b | `hand-offer` |
+| `dotnet/KcdMp.Client/GameBridge.Wo178.cs:313` | b | `hand-result` |
+| `dotnet/KcdMp.Client/GameBridge.Wo178.cs:362` | b | `animation-log-window` |
+| `dotnet/KcdMp.Client/GameBridge.Wo187.cs:108` | b | `npc-combat-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo187.cs:198` | b | `npc-opponent-report` |
+| `dotnet/KcdMp.Client/GameBridge.Wo187.cs:207` | b | `npc-guard-hold` |
+| `dotnet/KcdMp.Client/GameBridge.Wo190.cs:96` | b | `footstep-status` |
+| `dotnet/KcdMp.Client/GameBridge.Wo190.cs:134` | b | `footstep-surface` |
+| `dotnet/KcdMp.Client/GameBridge.Wo195.cs:90` | b | `inventory-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo197.cs:93` | b | `quest-signal-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo200.cs:511` | b | `quest-clock-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo200.cs:565` | b | `quest-clock-status` |
+| `dotnet/KcdMp.Client/GameBridge.Wo201.cs:117` | b | `story-flow-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo202Net.cs:223` | b | `net-recovery-place-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo206Digest.cs:204` | b | `digest-arm` |
+| `dotnet/KcdMp.Client/GameBridge.Wo213.cs:95` | b | `link-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo213.cs:294` | a | `relay-dispose` |
+| `dotnet/KcdMp.Client/GameBridge.Wo214.cs:48` | b | `npc-vital-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo215.cs:45` | b | `latency-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo216.cs:53` | b | `animation-session-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo217.cs:42` | b | `loot-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo218.cs:47` | b | `stance-probe` |
+| `dotnet/KcdMp.Client/GameBridge.Wo221.cs:156` | b | `world-loot-pages` |
+| `dotnet/KcdMp.Client/HttpGameTransport.cs:166` | b | `http-world-probe` |
+| `dotnet/KcdMp.Client/HttpGameTransport.cs:835` | b | `http-soul-probe` |
+| `dotnet/KcdMp.Client/HttpGameTransport.cs:922` | a | `http-flusher-stop` |
+| `dotnet/KcdMp.Client/HttpGameTransport.cs:923` | a | `http-final-flush` |
+| `dotnet/KcdMp.Client/HttpGameTransport.cs:928` | a | `http-recovery-stop` |
+| `dotnet/KcdMp.Client/HttpGameTransport.cs:934` | a | `http-rotation-stop` |
+| `dotnet/KcdMp.Client/KcdLogLocator.cs:35` | b | `game-log-list` |
+| `dotnet/KcdMp.Client/LogTailGameTransport.cs:1488` | a | `log-tailer-stop` |
+| `dotnet/KcdMp.Client/LogTailGameTransport.cs:1501` | a | `lua-emitter-stop` |
+| `dotnet/KcdMp.Client/RelayConnector.cs:44` | a | `relay-link-dispose` |
+| `dotnet/KcdMp.Client/SaveGameReader.cs:228` | b | `save-root-log-probe` |
+| `dotnet/KcdMp.Client/VersionIpcServer.cs:54` | a | `version-listener-close` |
+| `dotnet/KcdMp.Client/VersionIpcServer.cs:180` | a | `version-error-response` |
+| `dotnet/KcdMp.Client/VoiceChat.cs:83` | a | `voice-recorder-stop` |
+| `dotnet/KcdMp.Client/VoiceChat.cs:84` | a | `voice-player-stop` |
+| `dotnet/KcdMp.Client/Wo202CrashWatch.cs:93` | a | `game-exit-code` |
+| `dotnet/KcdMp.Client/WorldTransfer.cs:192` | c | `world-stage-flush` Durablen Flush/Close zur Bedingung für den Transfererfolg machen. |
+| `dotnet/KcdMp.Client/WorldTransfer.cs:230` | a | `world-stage-close` |
+| `dotnet/KcdMp.LogPack/Briefing.cs:52` | b | `briefing-log` |
+| `dotnet/KcdMp.LogPack/Briefing.cs:130` | b | `briefing-launch` |
+| `dotnet/KcdMp.LogPack/Packer.cs:280` | b | `pack-anim-find` |
+| `dotnet/KcdMp.LogPack/Packer.cs:297` | b | `pack-launch-read` |
+| `dotnet/KcdMp.LogPack/Packer.cs:312` | b | `pack-session-find` |
+| `dotnet/KcdMp.LogPack/Packer.cs:316` | b | `pack-session-time` |
+| `dotnet/KcdMp.Server/Features/ClientHandling/RelayConnection.cs:77` | a | `relay-transport-close` |
+| `dotnet/KcdMp.Server/Features/Tcp/TcpSocketService.cs:109` | a | `relay-expiry-stop` |
+| `dotnet/KcdMp.Setup/ConsentFlags.cs:46` | b | `consent-known-folder` |
+| `dotnet/KcdMp.Setup/FacialFallback.cs:114` | a | `facial-fallback-cleanup` |
+| `dotnet/KcdMp.Setup/ModInstall.cs:92` | b | `install-verdict` |
+| `dotnet/KcdMp.Setup/SetupDetect.cs:45` | b | `steam-library-vdf` |
+| `dotnet/KcdMp.Setup/SetupDetect.cs:113` | b | `game-root-walk` |
+| `dotnet/KcdMp.Setup/SetupDetect.cs:132` | b | `game-modding-tools-probe` |
+| `dotnet/KcdMp.Setup/SetupHost.cs:59` | b | `steam-install-registry` |
+| `dotnet/KcdMp.Setup/SetupHost.cs:88` | b | `steam-process-registry` |
+| `dotnet/KcdMp.Setup/SetupHost.cs:114` | b | `dotnet-runtime-probe` |
+| `dotnet/KcdMp.Setup/Workspace.cs:114` | b | `workspace-link-probe` |
+| `dotnet/KcdMp.Setup/WorkspaceLinker.cs:135` | a | `workspace-readonly-clear` |
+| `dotnet/KcdMp.Setup/WorkspaceLinker.cs:164` | a | `workspace-temp-clear` |
+| `dotnet/KcdMp.Setup/WorkspaceToolRunner.cs:116` | a | `setup-tool-answer` |
+| `dotnet/KcdMp.Setup/WorkspaceToolRunner.cs:223` | a | `setup-tool-kill` |
+| `dotnet/KcdMp.Setup/WorkspaceToolRunner.cs:224` | a | `setup-tool-wait` |
+| `dotnet/KcdMp.Steam/SteamLibraryLocator.cs:57` | b | `steam-sdk-candidate` |
+| `dotnet/KcdMp.Steam/SteamLibraryLocator.cs:107` | b | `steam-sdk-registry` |
+| `dotnet/KcdMp.Steam/SteamSession.cs:457` | b | `steam-presence-clear` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:73` | c | `legacy-log-zip` Ungefilterten Archiv-Fallback durch dieselbe Schwärzung und Auslassungsliste ersetzen. |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:118` | b | `bundle-source-check` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:149` | b | `bundle-game-backups` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:180` | b | `bundle-mod-settings` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:189` | b | `bundle-leash` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:202` | b | `bundle-app-log` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:223` | b | `bundle-relay-log` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:236` | b | `bundle-history` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:274` | b | `bundle-game-crashes` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:284` | b | `bundle-bugsplat` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:292` | b | `bundle-attachments` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:304` | b | `bundle-wer` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:310` | b | `bundle-eventlog` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:378` | b | `log-history-copy` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:383` | a | `log-history-prune` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:386` | b | `log-history-capture` |
+| `KCDMP_launcher/Components/Shared/LogBundle.cs:433` | b | `game-log-candidates` |
+| `KCDMP_launcher/Models/AgentHelper.cs:53` | a | `launcher-agent-kill` |
+| `KCDMP_launcher/Models/RelayReuse.cs:104` | b | `relay-process-path` |
+| `KCDMP_launcher/Models/Wo175Backup.cs:88` | b | `backup-saves-folder` |
+| `KCDMP_launcher/Models/Wo175Backup.cs:146` | b | `backup-mtime` |
+| `KCDMP_launcher/Models/Wo175Backup.cs:184` | a | `backup-prune-count` |
+| `KCDMP_launcher/Models/Wo175Backup.cs:211` | a | `backup-prune-age` |
+| `KCDMP_launcher/Models/Wo175Backup.cs:255` | b | `backup-byte-count` |
+| `KCDMP_launcher/Models/Wo175Backup.cs:459` | a | `backup-stage-cleanup` |
+| `KCDMP_launcher/Pages/Home.razor.cs:241` | b | `launcher-custom-servers` |
+| `KCDMP_launcher/Pages/Home.razor.cs:1192` | b | `launcher-favorites` |
+| `KCDMP_launcher/Pages/Home.Wo150.cs:329` | b | `setup-status-read` |
+| `KCDMP_launcher/Components/Modals/RestoreSavesModal.razor:198` | b | `GameRunning`. Die reine Namensableitung braucht keinen Ausnahme-Rückfall. |
+
+Der Client-Pflichttest `EmptyCatchTests.Production_code_has_no_untyped_empty_catches` setzt die Obergrenze auf 0. Er liest C#-Syntax in Release und Debug einschließlich der C#-Blöcke von Razor-Komponenten.

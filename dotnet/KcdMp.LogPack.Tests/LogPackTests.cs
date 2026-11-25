@@ -140,6 +140,69 @@ public class CollapserTests
 
 public class PackerTests
 {
+    [Fact]
+    public void The_zip_fallback_uses_the_same_redaction_and_excludes_private_files()
+    {
+        string dir = Temp();
+        try
+        {
+            string target = Path.Combine(dir, "fallback.zip");
+            Packer.WriteZipFallback([
+                new("agent.log", Bytes: Encoding.UTF8.GetBytes("peer=192.0.2.21 password=fixture-private\0\0")),
+                new("relay.log", Bytes: Encoding.UTF8.GetBytes("peer=192.0.2.21 ::1")),
+                new("snapshot.whs", Bytes: Encoding.UTF8.GetBytes("not for support")),
+                new("crash.mdmp", Bytes: [0, 1, 2]),
+            ], target);
+            using var archive = System.IO.Compression.ZipFile.OpenRead(target);
+            string Read(string name)
+            {
+                using var reader = new StreamReader(archive.GetEntry(name)!.Open());
+                return reader.ReadToEnd();
+            }
+            Assert.Equal("peer=ip-1 password=<redacted>", Read("agent.log"));
+            Assert.Equal("peer=ip-1 ::1", Read("relay.log"));
+            Assert.Null(archive.GetEntry("crash.mdmp"));
+            Assert.Null(archive.GetEntry("snapshot.whs"));
+            Assert.Contains("snapshot.whs | private dump or save", Read("MANIFEST.txt"));
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Crash_log_survives_nuls_and_publishes_bundle_scoped_network_aliases(bool collapse)
+    {
+        const string address = "203.0.113.19";
+        string dir = Temp();
+        try
+        {
+            var sources = new[]
+            {
+                new SourceFile("agent.log", Bytes: Encoding.UTF8.GetBytes(
+                    $"claim 127.0.0.1:7778 0.0.0.0 [::1]:7778 ::\npeer={address}:7778 build 2.4.6.8\0\0\n" +
+                    "FAULT password=fixture-private v1.2.3.4 version=5.6.7.8 Welt\n" + new string('\0', 4096))),
+                new SourceFile("relay.log", Bytes: Encoding.UTF8.GetBytes($"peer={address}\npeer=10.1.2.3\n")),
+                new SourceFile("binary.dat", Bytes: [0x7F, 0x45, 0x4C, 0x46, 0, 1, 2, 3, 4, 5]),
+            };
+            var packed = Packer.Pack(sources, dir, "crash", new PackOptions { Collapse = collapse });
+            var files = Open(Assert.Single(packed.Parts));
+            string agent = Encoding.UTF8.GetString(files["agent.log"]);
+            string relay = Encoding.UTF8.GetString(files["relay.log"]);
+            Assert.Contains("127.0.0.1:7778 0.0.0.0 [::1]:7778 ::", agent);
+            Assert.Contains("peer=ip-1:7778 build 2.4.6.8", agent);
+            Assert.Contains("FAULT password=<redacted> v1.2.3.4 version=5.6.7.8 Welt", agent);
+            Assert.DoesNotContain('\0', agent);
+            Assert.Contains("peer=ip-1", relay);
+            Assert.Contains("peer=ip-2", relay);
+            Assert.DoesNotContain(address, agent + relay);
+            Assert.DoesNotContain("fixture-private", agent + relay);
+            Assert.DoesNotContain("binary.dat", files.Keys);
+            Assert.Contains("binary.dat | binary", packed.Manifest);
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
     private static string Temp() { var d = Path.Combine(Path.GetTempPath(), "kcdmp-logpack-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(d); return d; }
 
     /// <summary>Reads a .tzst back: every zstd frame, then the tar's entries.</summary>
@@ -203,13 +266,17 @@ public class PackerTests
         var dir = Temp();
         try
         {
+            string[] addressesAndSteamIds =
+            [
+                "192.0.2.88", "2001:db8::333", "::ffff:203.0.113.12", "fe80::4%12",
+                string.Concat("76561198", "012345678"), "[U:1:12345]", "STEAM_1:0:12345",
+            ];
             string[] privateValues =
             [
-                "192.0.2.88", "2001:db8::333", "::ffff:203.0.113.12", "::1", "fe80::4%12",
-                string.Concat("76561198", "012345678"), "[U:1:12345]", "STEAM_1:0:12345",
+                .. addressesAndSteamIds,
                 "Test Windows User", "LinuxTester", "MacTester", "inner-ticket-value", "inner-password-value"
             ];
-            string log = "12:00:15.924 MP-MARK odd " + string.Join(" ", privateValues.Take(8)) + "\n"
+            string log = "12:00:15.924 MP-MARK odd " + string.Join(" ", addressesAndSteamIds) + " ::1\n"
                 + "C:\\Users\\Test Windows User\\game\\kcd.log /home/LinuxTester/game /Users/MacTester/Game\n"
                 + "[MP-STATS] ours_us_p95=1310\n";
             string settings = """{"path":"C:\\Users\\Test Windows User\\game","hostRestartTicket":"inner-ticket-value","password":"inner-password-value"}""";

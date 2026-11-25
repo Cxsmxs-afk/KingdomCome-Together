@@ -45,7 +45,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo214OpStatus, []);
             if (r is { Ok: true } rr) Console.WriteLine($"MP-W214-NATIVE {Encoding.ASCII.GetString(rr.Payload)}");
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("npc-vital-probe", caughtFailure); }
     }
 
     /// <summary>The mod's own switches (anim_hold, one_bind's Lua half, draw_event's hold): told at every connect and every change.</summary>

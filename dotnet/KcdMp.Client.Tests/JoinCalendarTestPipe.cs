@@ -1,6 +1,7 @@
 // Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 using System.Buffers.Binary;
 using System.IO.Pipes;
+using System.Net.Sockets;
 using KcdMp.Wire;
 
 namespace KcdMp.Client.Tests;
@@ -12,6 +13,9 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
     public const double HostRatio = 15;
 
     private const byte Pong = 0x83, Result = 0x81, Wo140Reply = 0xA4, Wo151Reply = 0xAB, Wo163Reply = 0xAC;
+    private const int BrokenPipe = unchecked((int)0x8007006D);
+    private const int PipeClosing = unchecked((int)0x800700E8);
+    private const int PipeNotConnected = unchecked((int)0x800700E9);
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _serverLoop;
     private volatile bool _shutdownStarted;
@@ -92,26 +96,32 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
             while (!ct.IsCancellationRequested)
             {
                 await server.WaitForConnectionAsync(ct);
-                var header = new byte[3];
-                byte seq = 0;
-                // The production client can close between writes. An incomplete
-                // message belongs to that connection and has no valid reply.
-                while (await server.ReadAtLeastAsync(header, header.Length, false, ct) == header.Length)
+                try
                 {
-                    var payload = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
-                    if (await server.ReadAtLeastAsync(payload, payload.Length, false, ct) != payload.Length)
-                        break;
-                    var (type, body) = Reply(header[0], seq++, payload);
-                    byte[] frame = [type, (byte)body.Length, (byte)(body.Length >> 8), .. body];
-                    try
+                    var header = new byte[3];
+                    byte seq = 0;
+                    while (await server.ReadAtLeastAsync(header, header.Length, false, ct) == header.Length)
                     {
+                        var payload = new byte[BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(1))];
+                        if (await server.ReadAtLeastAsync(payload, payload.Length, false, ct) != payload.Length)
+                            break;
+                        var (type, body) = Reply(header[0], seq++, payload);
+                        byte[] frame = [type, (byte)body.Length, (byte)(body.Length >> 8), .. body];
                         await server.WriteAsync(frame, ct);
                         await server.FlushAsync(ct);
                     }
-                    catch (IOException) when (_shutdownStarted && !server.IsConnected)
+                }
+                catch (IOException error) when (PeerDeparted(server, error))
+                {
+                    if (_shutdownStarted) return;
+                    // CombatPipe explicitly drops streams when the physical
+                    // framing or the first sequence can no longer be trusted.
+                    // An unexpected live close still fails the fixture.
+                    string reason = Pipe.LastConnectionDropReason;
+                    if (reason != "sequence-unconfirmed" && !reason.StartsWith("physical-write-cancelled-", StringComparison.Ordinal))
                     {
-                        // A canceled bridge write can close the peer while this reply is in flight.
-                        return;
+                        Console.WriteLine($"[calendar-double] unexpected peer close reason={reason} hresult=0x{error.HResult:x8}");
+                        throw;
                     }
                 }
                 server.Disconnect();
@@ -120,6 +130,14 @@ internal sealed class JoinCalendarTestPipe : IAsyncDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (IOException) when (ct.IsCancellationRequested) { }
     }
+
+    private static bool PeerDeparted(NamedPipeServerStream server, IOException error) =>
+        !server.IsConnected ||
+        error.HResult is BrokenPipe or PipeClosing or PipeNotConnected ||
+        error.InnerException is SocketException
+        {
+            SocketErrorCode: SocketError.ConnectionReset or SocketError.ConnectionAborted or SocketError.Shutdown or SocketError.NotConnected
+        };
 
     private (byte Type, byte[] Body) Reply(byte type, byte seq, byte[] request) => type switch
     {

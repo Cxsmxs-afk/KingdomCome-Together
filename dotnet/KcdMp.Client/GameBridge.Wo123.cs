@@ -56,6 +56,9 @@ public partial class GameBridge
 
     // ---------------------------------------------------------------- host side
 
+    private sealed record JoinResumeCheck(uint Token, TaskCompletionSource<bool> Reply);
+    private int _joinResumeToken;
+
     private sealed class HostJoin : IAsyncDisposable
     {
         private readonly object _lifetime = new();
@@ -78,6 +81,7 @@ public partial class GameBridge
         public long LastJoinerMsgMs = Environment.TickCount64;   // WO-204 IV.1: the joiner's last message of this join (progress, ack, ready)
         public volatile int SentPct;       // WO-154 4.1: the transfer's acknowledged share, for the hold's panel
         public TaskCompletionSource<(string Kind, string Arg)>? LuaReply;
+        public volatile JoinResumeCheck? ResumeCheck;
         public void Cancel(string reason)
         {
             lock (_lifetime)
@@ -255,6 +259,12 @@ public partial class GameBridge
                 return;
             case "join_resumed":    // "<joinId> <reason>": the mod resumed on its own (mp_join_cancel, its safety timer)
                 if (_hostJoin is { } j2 && j2.JoinId == id) j2.Cancel(p.Length > 1 ? p[1] : "mod");
+                return;
+            case "join_resume_check":
+                if (_hostJoin is { } resuming && resuming.JoinId == id && resuming.ResumeCheck is { } check &&
+                    p.Length == 3 && uint.TryParse(p[1], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint token) &&
+                    token == check.Token)
+                    check.Reply.TrySetResult(p[2] == "running");
                 return;
             case "join_cancel":     // mp_join_cancel, on either machine
                 if (_hostJoin is { } j3) { Console.WriteLine("MP-JOIN host: mp_join_cancel"); j3.Cancel("cancel"); }
@@ -759,29 +769,63 @@ public partial class GameBridge
         // does, which is how WO-154's join panel updates during the hold).
         await Wo151JoinHoldAsync(j, false);
         Wo154HostJoinPanelHide($"join {reason}");   // WO-154 4.1
-        if (j.PausedUtc is not null)
-        {
-            await TryJoinControlAsync(() => ExecLuaAsync($"if KCD2MP_JoinResume then KCD2MP_JoinResume(\"{j.JoinId:x8}\", \"{EscapeLua(reason)}\") end"), "host-join-resume");
-        }
-        else
-        {
-            await TryJoinControlAsync(() => ExecLuaAsync($"if KCD2MP_JoinDeferEnd then KCD2MP_JoinDeferEnd(\"{j.JoinId:x8}\", \"{EscapeLua(reason)}\") end"), "host-join-defer-end");
-            // WO-206 B2 (a 5 s cut right after the request): the JoinTry was still waiting in the game's queue when the joiner went;
-            // it ran after this end and paused the world for a join nobody resumed (195 s, the mod's own safety timer). The resume is
-            // the mod's own, keyed by the join and a no-op when that join never paused -- sent after the JoinTry, it ends it.
-            await TryJoinControlAsync(() => ExecLuaAsync($"if KCD2MP_JoinResume then KCD2MP_JoinResume(\"{j.JoinId:x8}\", \"{EscapeLua(reason)}\") end"), "host-join-resume-deferred");
-        }
+        bool resumed = await ConfirmHostResumeAsync(j, reason);
         if (abortReason != 0 && reason != "joiner-gone" && reason != "relay-lost")
             await TryJoinControlAsync(() => WriteJoinAsync(WorldReceiver.BuildAbort(j.Joiner, j.JoinId, abortReason)), "host-join-abort");
-        if (reason != "joiner-gone" && reason != "relay-lost")
+        if (resumed && reason != "joiner-gone" && reason != "relay-lost")
             await TrySendStatusAsync(j, Protocol.JoinStateResumed, reason, (ushort)Math.Min(pausedS, ushort.MaxValue));
         // A new time basis and running rate travel together; never extrapolate the held seconds at rate 15.
-        if (reason == "ready")
+        if (resumed && reason == "ready")
             try { await SendHostCalendarAsync(j.Joiner); }
             catch (Exception ex) { Console.WriteLine($"MP-CALENDAR resumed sample not sent: {ex.GetType().Name}"); }
         Console.WriteLine(FormattableString.Invariant(
-            $"MP-JOIN host: resume join=0x{j.JoinId:x8} reason={reason} paused_s={pausedS:F1} phase_at_end={j.Phase}{(abortReason != 0 ? $" abort_sent={Protocol.JoinAbortName(abortReason)}" : "")}"));
-        Wo202NoteEvent(FormattableString.Invariant($"the join's hold ended ({reason}, {pausedS:F0} s)"));
+            $"MP-JOIN host: resume join=0x{j.JoinId:x8} reason={reason} lua_resume={(resumed ? "confirmed" : "unconfirmed")} paused_s={pausedS:F1} phase_at_end={j.Phase}{(abortReason != 0 ? $" abort_sent={Protocol.JoinAbortName(abortReason)}" : "")}"));
+        if (resumed) Wo202NoteEvent(FormattableString.Invariant($"the join's hold ended ({reason}, {pausedS:F0} s)"));
+    }
+
+    private async Task<bool> ConfirmHostResumeAsync(HostJoin join, string reason)
+    {
+        var transport = _transport;
+        bool deferred = join.PausedUtc is null;
+        string operation = deferred ? "host-join-resume-deferred" : "host-join-resume";
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            if (!ReferenceEquals(Volatile.Read(ref _hostJoin), join) || !ReferenceEquals(_transport, transport) ||
+                ProcessorFrameScope.Capture()?.IsAbandoned == true) return false;
+            uint token = (uint)Interlocked.Increment(ref _joinResumeToken);
+            var reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            join.ResumeCheck = new(token, reply);
+            using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+            try
+            {
+                // Keep the same ordered lane as JoinTry. The token identifies
+                // this check even if a prior HTTP call did execute late.
+                await ExecLuaAsync(
+                    $"if KCD2MP_JoinResumeControl then KCD2MP_JoinResumeControl(\"{join.JoinId:x8}\", \"{EscapeLua(reason)}\", \"{token:x8}\", {(deferred ? "true" : "false")}) end",
+                    deadline.Token);
+                await transport.FlushAsync(deadline.Token);
+                if (await reply.Task.WaitAsync(deadline.Token))
+                {
+                    Console.WriteLine($"MP-JOIN resume-confirmed join=0x{join.JoinId:x8} attempt={attempt} deferred={(deferred ? 1 : 0)}");
+                    return true;
+                }
+                Faults.ReportThrottled(operation, new InvalidOperationException("The mod still reports its join pause."));
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+            {
+                Faults.ReportThrottled(operation, new TimeoutException("The mod did not confirm the join resume within 250 ms."));
+            }
+            catch (OperationCanceledException) when (ProcessorFrameScope.Capture()?.IsAbandoned == true) { return false; }
+            catch (ObjectDisposedException) when (!ReferenceEquals(_transport, transport)) { return false; }
+            catch (Exception ex) { Faults.ReportThrottled(operation, ex); }
+            finally { join.ResumeCheck = null; }
+
+            if (attempt == 3) break;
+            try { await Task.Delay(Timeout.Infinite, deadline.Token); }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested) { }
+        }
+        Console.WriteLine($"MP-JOIN resume-unconfirmed join=0x{join.JoinId:x8} attempts=3 fallback=mod-safety-timer");
+        return false;
     }
 
     private async Task TryJoinControlAsync(Func<Task> action, string operation)
