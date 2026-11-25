@@ -39,7 +39,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo217OpStatus, []);
             if (r is { Ok: true } rr) Console.WriteLine($"MP-W217-NATIVE {Encoding.ASCII.GetString(rr.Payload)}");
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("loot-probe", caughtFailure); }
     }
 
     /// <summary>The mod's own switches: told at every connect and every change.</summary>

@@ -113,7 +113,7 @@ public static class WorkspaceToolRunner
                     proc.StandardInput.Flush();
                     answers++;
                 }
-                catch { /* the tool already died; the exit path reports why */ }
+                catch (Exception closeError) when (closeError is IOException or ObjectDisposedException) { /* the tool already died; the exit path reports why */ } catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("setup-tool-answer", caughtFailure); }
             }
 
             async Task Pump(StreamReader reader, bool isError)
@@ -220,7 +220,7 @@ public static class WorkspaceToolRunner
 
     private static void Kill(Process p)
     {
-        try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
-        try { p.WaitForExit(3000); } catch { }
+        try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("setup-tool-kill", caughtFailure); }
+        try { p.WaitForExit(3000); } catch (InvalidOperationException) { } catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("setup-tool-wait", caughtFailure); }
     }
 }

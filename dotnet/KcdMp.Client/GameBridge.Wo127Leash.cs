@@ -99,7 +99,7 @@ public partial class GameBridge
                     if (isHost && jpos is { } jp) anchors.Add(jp);
 
                     // Host context from Lua (dialogue, fight): asked each second, answered on the log channel.
-                    if (isHost) { try { await ExecLuaAsync("if KCD2MP_LeashCtx then KCD2MP_LeashCtx() end"); } catch { } }
+                    if (isHost) { try { await ExecLuaAsync("if KCD2MP_LeashCtx then KCD2MP_LeashCtx() end"); } catch (Exception caughtFailure) { Faults.ReportThrottled("leash-probe", caughtFailure); } }
 
                     var sample = await _combat.LeashSampleAsync(anchors, LeashRowBuilder.Radius, ct);
                     if (sample is not { } s)

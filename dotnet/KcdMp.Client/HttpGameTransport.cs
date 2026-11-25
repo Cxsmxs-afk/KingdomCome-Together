@@ -163,7 +163,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
                 if (m.Success && m.Groups[1].Value.StartsWith("kcdmp-where=", StringComparison.Ordinal))
                     return m.Groups[1].Value == "kcdmp-where=world";
             }
-            catch { }
+            catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("http-world-probe", caughtFailure); }
             await Task.Delay(100, ct);
         }
         return null;
@@ -832,7 +832,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
                 var m = SoulNameRegex().Match(xml);
                 if (m.Success) return m.Groups[1].Value;
             }
-            catch { /* try the next spelling */ }
+            catch (Exception caughtFailure) { /* try the next spelling */ GameBridge.Faults.ReportThrottled("http-soul-probe", caughtFailure); }
         }
         return null;
     }
@@ -919,19 +919,19 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     public async ValueTask DisposeAsync()
     {
         _flusherCts.Cancel();   // WO-207 B.3: the flusher stops before the locks it uses go
-        if (_flusher is not null) { try { await _flusher; } catch { } }
-        try { await FlushAsync(); } catch { }
+        if (_flusher is not null) { try { await _flusher; } catch (OperationCanceledException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("http-flusher-stop", caughtFailure); } }
+        try { await FlushAsync(); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("http-final-flush", caughtFailure); }
 
         _recoveryCts?.Cancel();
         if (_recovery is not null)
         {
-            try { await _recovery; } catch { }
+            try { await _recovery; } catch (OperationCanceledException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("http-recovery-stop", caughtFailure); }
         }
         _recoveryCts?.Dispose();
         _rotCts?.Cancel();
         if (_rotTask is not null)
         {
-            try { await _rotTask; } catch { }
+            try { await _rotTask; } catch (OperationCanceledException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("http-rotation-stop", caughtFailure); }
         }
         _rotCts?.Dispose();
         _batchLock.Dispose();

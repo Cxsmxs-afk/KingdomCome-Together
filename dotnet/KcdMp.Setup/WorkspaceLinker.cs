@@ -132,7 +132,7 @@ public static class WorkspaceLinker
                 var old = new FileInfo(e.ModdingToolsPath);
                 if (old.Exists && old.LinkTarget is null && old.IsReadOnly) old.IsReadOnly = false;
             }
-            catch { }
+            catch (Exception closeError) when (closeError is FileNotFoundException or DirectoryNotFoundException) { } catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("workspace-readonly-clear", caughtFailure); }
 
             int err = io.MoveReplace(tmp, e.ModdingToolsPath);
             if (err != 0)
@@ -161,6 +161,6 @@ public static class WorkspaceLinker
             var fi = new FileInfo(tmp);
             if (fi.Exists || fi.LinkTarget is not null) fi.Delete();
         }
-        catch { }
+        catch (Exception closeError) when (closeError is FileNotFoundException or DirectoryNotFoundException) { } catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("workspace-temp-clear", caughtFailure); }
     }
 }

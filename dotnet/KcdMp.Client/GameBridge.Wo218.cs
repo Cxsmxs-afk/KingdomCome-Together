@@ -44,7 +44,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo218OpStatus, []);
             if (r is { Ok: true } rr) Console.WriteLine($"MP-W218-NATIVE {Encoding.ASCII.GetString(rr.Payload)}");
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("stance-probe", caughtFailure); }
     }
 
     private Task Wo218TellModAsync() =>

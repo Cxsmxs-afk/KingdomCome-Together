@@ -14,6 +14,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="../KcdMp.Protocol/KcdMp.Protocol.csproj" />
     <PackageReference Include="ZstdSharp.Port" Version="0.8.5" />
     <InternalsVisibleTo Include="KcdMp.LogPack.Tests" />
     <InternalsVisibleTo Include="KcdMp.LogPack.Tool" />

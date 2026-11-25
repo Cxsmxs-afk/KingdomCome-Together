@@ -338,7 +338,7 @@ public partial class GameBridge
                 Marshal.FreeCoTaskMem(p);
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("saves-known-folder", caughtFailure); }
         root ??= Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Saved Games");
         string dir = Path.Combine(root, "KingdomCome2", "saves");
         return Directory.Exists(dir) ? dir : null;

@@ -4,7 +4,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 using Microsoft.Win32;
 using System.Text.RegularExpressions;
@@ -33,55 +32,9 @@ namespace KCDMP_launcher.Components.Shared
     public static class LogBundle
     {
         /// <summary>
-        /// Collects kcd.log, the agent's log files and the launcher's recent
-        /// app logs into a timestamped zip on the user's Desktop. Returns the
-        /// zip path. Files that do not exist are skipped, never fatal -- a
-        /// partial bundle beats no bundle.
-        /// </summary>
-        /// <param name="relayDirectory">
-        /// WO-81: where the relay executable lives, i.e. where it writes
-        /// relay*.log if it has ever run from here. Empty is fine -- this
-        /// machine may be a joiner with no local relay process, exactly like
-        /// an empty GameRoot/AgentDirectory; the file simply will not exist
-        /// and is skipped like any other missing file. Before this WO the
-        /// relay had no persistent log at all (Console-only Serilog sink), so
-        /// there was nothing here to collect regardless of this parameter --
-        /// see docs/WO-81-findings.md.
-        /// </param>
-        public static string Collect(string gameRoot, string agentDirectory, string relayDirectory = "", bool includeEarlierLaunches = true)
-        {
-            string zipPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-                $"KCDMP-logs-{DateTime.Now:yyyyMMdd-HHmmss}.zip");
-
-            using var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create);
-
-            // The game holds kcd.log open while running; the agent holds
-            // agent.log; Serilog holds the current app log. Everything is
-            // therefore read with full sharing rather than ZipArchive's own
-            // exclusive CreateEntryFromFile.
-            foreach (var sf in Gather(gameRoot, agentDirectory, relayDirectory, includeEarlierLaunches))
-            {
-                try
-                {
-                    var entry = zip.CreateEntry(sf.EntryName, CompressionLevel.Optimal);
-                    using var dst = entry.Open();
-                    if (sf.Bytes is not null) { dst.Write(sf.Bytes); continue; }
-                    using var src = new FileStream(sf.Path!, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                    src.CopyTo(dst);
-                }
-                catch
-                {
-                    // One unreadable file must not sink the bundle.
-                }
-            }
-            return zipPath;
-        }
-
-        /// <summary>
         /// WO-171 L: the bundle as parts of at most 19 MB (Discord's free upload limit is 20 MB): a tar compressed with zstd
         /// (<c>.tzst</c>; 7-Zip opens it), repeated noise lines collapsed, identical files stored once, a manifest in part 1.
-        /// The current launch by default; the earlier launches (history\) only when asked for. Falls back to the old zip,
+        /// The current launch by default; the earlier launches (history\) only when asked for. Falls back to a redacted ZIP,
         /// and says so, when the packer cannot run.
         /// </summary>
         public static CollectResult CollectPacked(string gameRoot, string agentDirectory, string relayDirectory, bool includeEarlierLaunches, Action<string>? progress = null)
@@ -96,9 +49,10 @@ namespace KCDMP_launcher.Components.Shared
             }
             catch (Exception ex)
             {
-                string zip = Collect(gameRoot, agentDirectory, relayDirectory, includeEarlierLaunches);
+                string zip = Path.Combine(desktop, baseName + ".zip");
+                KcdMp.LogPack.Packer.WriteZipFallback(sources, zip);
                 long size = new FileInfo(zip).Length;
-                return new CollectResult(new[] { zip }, 0, size, true, ex.Message);
+                return new CollectResult(new[] { zip }, 0, size, true, ex.GetType().Name);
             }
         }
 
@@ -115,7 +69,7 @@ namespace KCDMP_launcher.Components.Shared
                     if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return;
                     list.Add(new KcdMp.LogPack.SourceFile(entryName, path));
                 }
-                catch { }
+                catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-source-check", caughtFailure); }
             }
 
             string? kcdLog = FindKcdLog(gameRoot);
@@ -146,7 +100,7 @@ namespace KCDMP_launcher.Components.Shared
                     foreach (var b in backups)
                         AddIfPresent(b.FullName, $"logbackups/{b.Name}");
                 }
-                catch { }
+                catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-game-backups", caughtFailure); }
             }
 
             if (!string.IsNullOrWhiteSpace(agentDirectory))
@@ -177,7 +131,7 @@ namespace KCDMP_launcher.Components.Shared
                             list.Add(new KcdMp.LogPack.SourceFile("mod-settings.json", Bytes: System.Text.Encoding.UTF8.GetBytes(filtered)));
                     }
                 }
-                catch { }
+                catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-mod-settings", caughtFailure); }
                 // WO-127: the leash recorder's CSVs (mp_leash_trace), newest first.
                 try
                 {
@@ -186,7 +140,7 @@ namespace KCDMP_launcher.Components.Shared
                         foreach (var f in leash.GetFiles("leash-*.csv").OrderByDescending(f => f.LastWriteTimeUtc).Take(8))
                             AddIfPresent(f.FullName, $"leash/{f.Name}");
                 }
-                catch { }
+                catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-leash", caughtFailure); }
             }
 
             // Serilog's rolling file names are app<yyyyMMdd>.log; take the two
@@ -199,7 +153,7 @@ namespace KCDMP_launcher.Components.Shared
                              .Take(2))
                     AddIfPresent(f.FullName, f.Name);
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-app-log", caughtFailure); }
 
             // WO-81: the relay's own Serilog output (relay<yyyyMMdd>.log, same
             // rolling shape as this launcher's app.log -- see
@@ -220,7 +174,7 @@ namespace KCDMP_launcher.Components.Shared
                                  .Take(2))
                         AddIfPresent(f.FullName, f.Name);
                 }
-                catch { }
+                catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-relay-log", caughtFailure); }
             }
 
             // WO-144: the logs of the launches before this one (KeepHistory), newest first -- a
@@ -233,7 +187,7 @@ namespace KCDMP_launcher.Components.Shared
                         foreach (var f in d.GetFiles())
                             AddIfPresent(f.FullName, $"history/{d.Name}/{f.Name}");
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-history", caughtFailure); }
 
             // WO-202 I.1: every crash's evidence from the last 24 h -- the mod's own reports, the game's crash reporter, Windows'.
             if (kcdLog is not null) GatherCrashes(Path.GetDirectoryName(kcdLog) ?? "", list, AddIfPresent);
@@ -271,7 +225,7 @@ namespace KCDMP_launcher.Components.Shared
                         foreach (var f in d.GetFiles("*.txt"))
                             add(f.FullName, $"crashes/{d.Name}/{f.Name}");
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-game-crashes", caughtFailure); }
             try
             {
                 var tmp = new DirectoryInfo(Path.GetTempPath());
@@ -281,7 +235,7 @@ namespace KCDMP_launcher.Components.Shared
                     list.Add(new KcdMp.LogPack.SourceFile($"game-crash/{f.Name}", Bytes: System.Text.Encoding.UTF8.GetBytes(string.Join("\n", keep))));
                 }
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-bugsplat", caughtFailure); }
             try
             {
                 var att = new DirectoryInfo(Path.Combine(gameDir, "BugSplatAttachments"));
@@ -289,7 +243,7 @@ namespace KCDMP_launcher.Components.Shared
                     foreach (var f in att.GetFiles().Where(f => f.LastWriteTime >= since && f.Length < 2L << 20).OrderByDescending(f => f.LastWriteTime).Take(8))
                         add(f.FullName, $"game-crash/attachments/{f.Name}");
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-attachments", caughtFailure); }
             try
             {
                 string wer = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Microsoft", "Windows", "WER");
@@ -301,13 +255,13 @@ namespace KCDMP_launcher.Components.Shared
                         add(Path.Combine(r.FullName, "Report.wer"), $"windows/{kind}/{r.Name}/Report.wer");
                 }
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-wer", caughtFailure); }
             try
             {
                 string events = CrashEvents(since);
                 if (events.Length > 0) list.Add(new KcdMp.LogPack.SourceFile("windows/application-events.txt", Bytes: System.Text.Encoding.UTF8.GetBytes(events)));
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("bundle-eventlog", caughtFailure); }
         }
 
         /// <summary>The Application event log's crash entries (1000 application error, 1001 its report, 1026 .NET) that name
@@ -375,17 +329,18 @@ namespace KCDMP_launcher.Components.Shared
                         using var dst = new FileStream(Path.Combine(dir, name), FileMode.CreateNew, FileAccess.Write);
                         src.CopyTo(dst);
                     }
-                    catch { }
+                    catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("log-history-copy", caughtFailure); }
                 }
                 foreach (var old in new DirectoryInfo(HistoryFolder).GetDirectories("launch-*")
                              .OrderByDescending(d => d.Name).Skip(HistoryKeep))
                 {
-                    try { old.Delete(recursive: true); } catch { }
+                    try { old.Delete(recursive: true); } catch (Exception closeError) when (closeError is FileNotFoundException or DirectoryNotFoundException) { } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("log-history-prune", caughtFailure); }
                 }
             }
-            catch
+            catch (Exception caughtFailure)
             {
                 // log retention must never stop a launch
+                KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("log-history-capture", caughtFailure);
             }
         }
 
@@ -430,7 +385,7 @@ namespace KCDMP_launcher.Components.Shared
                             logs.AddRange(new DirectoryInfo(d)
                                 .EnumerateFiles("kcd.log", SearchOption.TopDirectoryOnly));
                         }
-                        catch { }
+                        catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("game-log-candidates", caughtFailure); }
                     }
                 }
 

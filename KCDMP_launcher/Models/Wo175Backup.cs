@@ -85,7 +85,7 @@ namespace KCDMP_launcher.Models
                     Marshal.FreeCoTaskMem(p);
                 }
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("backup-saves-folder", caughtFailure); }
             root ??= System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Saved Games");
             string dir = System.IO.Path.Combine(root, "KingdomCome2", "saves");
             return Directory.Exists(dir) ? dir : null;
@@ -143,7 +143,7 @@ namespace KCDMP_launcher.Models
                     Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dst)!);
                     hashes.Add((rel, CopyHashing(src, dst, out long n)));
                     bytes += n;
-                    try { File.SetLastWriteTimeUtc(dst, File.GetLastWriteTimeUtc(src)); } catch { }
+                    try { File.SetLastWriteTimeUtc(dst, File.GetLastWriteTimeUtc(src)); } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("backup-mtime", caughtFailure); }
                 }
                 WriteManifest(part, hashes);
 
@@ -181,7 +181,7 @@ namespace KCDMP_launcher.Models
             var valid = ListValid(backupsRoot);   // newest first
             foreach (var old in valid.Skip(keep))
             {
-                try { Directory.Delete(old, recursive: true); removed.Add(old); } catch { }
+                try { Directory.Delete(old, recursive: true); removed.Add(old); } catch (Exception closeError) when (closeError is FileNotFoundException or DirectoryNotFoundException) { } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("backup-prune-count", caughtFailure); }
             }
             removed.AddRange(CleanStaleParts(backupsRoot, now));
             return new PruneResult(valid.Count - removed.Count(r => valid.Contains(r)), removed.Count, removed);
@@ -208,7 +208,7 @@ namespace KCDMP_launcher.Models
                 if (!m.Success || (d.Attributes & FileAttributes.ReparsePoint) != 0) continue;
                 if (!DateTime.TryParseExact(m.Groups[1].Value, StampFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out var started)) continue;
                 if (now - started <= TimeSpan.FromDays(1)) continue;
-                try { d.Delete(recursive: true); removed.Add(d.FullName); } catch { }
+                try { d.Delete(recursive: true); removed.Add(d.FullName); } catch (Exception closeError) when (closeError is FileNotFoundException or DirectoryNotFoundException) { } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("backup-prune-age", caughtFailure); }
             }
             return removed;
         }
@@ -252,7 +252,7 @@ namespace KCDMP_launcher.Models
                 long bytes = 0;
                 foreach (var e in entries)
                 {
-                    try { bytes += new FileInfo(System.IO.Path.Combine(dir, e.Rel)).Length; } catch { }
+                    try { bytes += new FileInfo(System.IO.Path.Combine(dir, e.Rel)).Length; } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("backup-byte-count", caughtFailure); }
                 }
                 list.Add(new BackupInfo(dir, taken, entries.Count, bytes));
             }
@@ -456,7 +456,7 @@ namespace KCDMP_launcher.Models
 
         private static void TryDelete(string dir)
         {
-            try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch { }
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch (Exception closeError) when (closeError is FileNotFoundException or DirectoryNotFoundException) { } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("backup-stage-cleanup", caughtFailure); }
         }
     }
 }

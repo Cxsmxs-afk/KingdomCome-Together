@@ -90,7 +90,7 @@ public static class Wo202CrashWatch
         try { exited = _game.HasExited; } catch { exited = true; }
         if (!exited) return;
         string code = "unknown";
-        try { code = $"0x{_game.ExitCode:X8}"; } catch { }
+        try { code = $"0x{_game.ExitCode:X8}"; } catch (InvalidOperationException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("game-exit-code", caughtFailure); }
         var ended = DateTime.Now;
         bool quit = _quitSeen;
         var game = _game;

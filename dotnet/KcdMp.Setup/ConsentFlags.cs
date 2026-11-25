@@ -43,7 +43,7 @@ public static class ConsentFlags
                 Marshal.FreeCoTaskMem(p);
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("consent-known-folder", caughtFailure); }
         root ??= Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Saved Games");
         return Path.Combine(root, "kingdomcome2");
     }

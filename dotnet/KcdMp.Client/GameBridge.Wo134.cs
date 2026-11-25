@@ -92,11 +92,11 @@ public partial class GameBridge
         {
             _w134LedgerLinkWorld = _w206.World;
             _w134LedgerLinkHeld = true;
-            try { await _transport.ExecuteNowAsync("if KCD2MP_W134LedgerLinkHold then KCD2MP_W134LedgerLinkHold(true) end"); } catch { }
+            try { await _transport.ExecuteNowAsync("if KCD2MP_W134LedgerLinkHold then KCD2MP_W134LedgerLinkHold(true) end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("ledger-hold", caughtFailure); }
         }
         else Wo134ResetLedgerGeneration();
         Wo134FlushHost();
-        try { await _transport.ExecuteNowAsync("if KCD2MP_W134Tick then KCD2MP_W134Tick(false, false, false, 0) end"); } catch { }
+        try { await _transport.ExecuteNowAsync("if KCD2MP_W134Tick then KCD2MP_W134Tick(false, false, false, 0) end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("w134-stop", caughtFailure); }
     }
 
     private async Task Wo134LoopAsync(CancellationToken ct)
@@ -238,7 +238,7 @@ public partial class GameBridge
             if (_w134Worn.TryGetValue(f[2], out var c) && now - c.AtMs < 1500) worn = c.Worn;
             else
             {
-                try { worn = await _transport.ReadGhostEquippedItemClassesAsync(f[2]); } catch { }
+                try { worn = await _transport.ReadGhostEquippedItemClassesAsync(f[2]); } catch (Exception caughtFailure) { Faults.ReportThrottled("equipped-query", caughtFailure); }
                 _w134Worn[f[2]] = (now, worn);
             }
         }
@@ -622,7 +622,7 @@ public partial class GameBridge
     {
         Wo134ResetLedgerGeneration();
         Wo217LootLiveChanged(0);
-        try { await _transport.ExecuteNowAsync("if KCD2MP_W217LootReset then KCD2MP_W217LootReset() end"); } catch { }
+        try { await _transport.ExecuteNowAsync("if KCD2MP_W217LootReset then KCD2MP_W217LootReset() end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("loot-scope-stop", caughtFailure); }
         try { await _transport.ExecuteNowAsync("if KCD2MP_W134LedgerReset then KCD2MP_W134LedgerReset(\"load-or-leave\") end"); }
         catch (Exception ex) { Console.WriteLine($"MP-WO134 ledger reset ({why}): {ex.GetType().Name}"); }
     }

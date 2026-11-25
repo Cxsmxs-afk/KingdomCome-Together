@@ -90,7 +90,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo197OpStatus, []);
             if (r is { Ok: true } x) n = Encoding.ASCII.GetString(x.Payload);
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("quest-signal-probe", caughtFailure); }
         var cats = string.Join(' ', Wo197Rules.SwitchNames.Skip(5).Select(c => $"{c}={On(Wo197Cat(c))}"));
         Console.WriteLine(FormattableString.Invariant(
             $"MP-W197-STATS anim_recoil={On(_w197Recoil)} anim_paired={On(_w197Paired)} anim_clinch={On(_w197Clinch)} anim_knockout={On(_w197Knockout)} copy_guard_engine={On(_w197GuardEngine)} {cats} recoil_out={Interlocked.Read(ref _w197RecoilOut)} recoil_in={Interlocked.Read(ref _w197RecoilIn)} recoil_played={Interlocked.Read(ref _w197RecoilPlayed)} recoil_no_row={Interlocked.Read(ref _w197RecoilNoRow)} clinch_out={Interlocked.Read(ref _w197ClinchOut)} clinch_in={Interlocked.Read(ref _w197ClinchIn)} clinch_played={Interlocked.Read(ref _w197ClinchPlayed)} pair_asked={Interlocked.Read(ref _w197PairAsked)} pair_played={Interlocked.Read(ref _w197PairPlayed)} pair_no_victim_row={Interlocked.Read(ref _w197PairNoVictimRow)} pair_no_victim={Interlocked.Read(ref _w197PairNoVictim)} knock_down={Interlocked.Read(ref _w197KnockDown)} knock_up={Interlocked.Read(ref _w197KnockUp)} | native: {n ?? "no answer"}"));

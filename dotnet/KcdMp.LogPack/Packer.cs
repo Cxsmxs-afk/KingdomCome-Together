@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Globalization;
+using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using ZstdSharp;
@@ -57,6 +58,8 @@ public sealed class FileReport
 
 public sealed class PackResult
 {
+    internal BundlePrivacy Privacy { get; } = new();
+    internal List<(string Entry, string Reason)> Omissions { get; } = new();
     public List<string> Parts = new();
     public List<FileReport> Files = new();
     public long OriginalBytes, PartBytes;
@@ -86,13 +89,19 @@ public static class Packer
     {
         opt ??= new PackOptions();
         Directory.CreateDirectory(outDir);
-        // Repacking an extracted bundle regenerates the verdict from the supplied logs.
-        sources = sources.Where(s => !s.EntryName.Equals(VerdictReport.EntryName, StringComparison.OrdinalIgnoreCase) &&
-            !BundlePrivacy.IsPrivateFile(s.EntryName) && (s.Path is null || !BundlePrivacy.IsPrivateFile(s.Path))).ToList();
-        baseName = BundlePrivacy.Entry(baseName);
+        var res = new PackResult();
+        var privacy = res.Privacy;
+        var readable = new List<SourceFile>(sources.Count);
+        foreach (var source in sources)
+        {
+            // Repacking regenerates the verdict from the supplied logs.
+            if (source.EntryName.Equals(VerdictReport.EntryName, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!OmitPrivate(source, res)) readable.Add(source);
+        }
+        sources = readable;
+        baseName = privacy.Entry(baseName);
         sources = ArrangeAnim(sources);
         sources = ArrangeAnimSession(sources);
-        var res = new PackResult();
         void Say(string s) => progress?.Invoke(s);
 
         // pass 1: the marks (they decide which lines stay in full), over every log
@@ -101,15 +110,14 @@ public static class Packer
             foreach (var s in sources)
                 if (IsLog(s.EntryName))
                 {
-                    byte[]? b = Read(s);
-                    if (b is null) continue;
-                    using var r = new StreamReader(new MemoryStream(b, false), Encoding.Latin1, false, 1 << 16);
+                    if (Read(s) is not { } b || BundlePrivacy.ReadText(b) is not { } log) continue;
+                    using var r = new StringReader(log);
                     var lines = Lines(r).ToList();
                     windows.Scan(lines);
                     if (s.EntryName.StartsWith("agent", StringComparison.OrdinalIgnoreCase))
-                        MarkList.Collect(BundlePrivacy.Entry(s.EntryName), lines, res.Marks);
+                        MarkList.Collect(privacy.Entry(s.EntryName), lines, res.Marks);
                 }
-        for (int i = 0; i < res.Marks.Count; i++) res.Marks[i] = BundlePrivacy.Text(res.Marks[i]);
+        for (int i = 0; i < res.Marks.Count; i++) res.Marks[i] = privacy.Text(res.Marks[i]);
         res.OddMarks = windows.Count;
         // Evaluate before collapse and use the same result in both reports.
         VerdictReport? verdict = null;
@@ -126,8 +134,8 @@ public static class Packer
             res.Briefing = "# Kingdom Come: Together -- briefing\n\n" + verdict.ToMarkdown()
                 + "The briefing could not be written: " + ex.GetType().Name + "\n";
         }
-        res.Briefing = BundlePrivacy.Text(res.Briefing);
-        res.Verdict = BundlePrivacy.Text(verdict.ToText());
+        res.Briefing = privacy.Text(res.Briefing);
+        res.Verdict = privacy.Text(verdict.ToText());
         // WO-206 D: the animation report beside the probe's file (never fatal)
         if (res.Anim is { } an)
             try { sources = sources.Append(new SourceFile(AnimStream.ReportEntry, Bytes: Encoding.UTF8.GetBytes(AnimReport.Html(an)))).ToList(); }
@@ -142,16 +150,12 @@ public static class Packer
         comp.SetParameter(ZSTD_cParameter.ZSTD_c_checksumFlag, 1);
         foreach (var s in sources)
         {
-            byte[]? raw = Read(s);
-            if (raw is null) continue;
-            string entry = BundlePrivacy.Entry(s.EntryName);
-            byte[]? data = BundlePrivacy.Bytes(raw);
-            if (data is null) { Say($"{entry}: omitted binary data"); continue; }
-            string safeName = entry;
-            for (int suffix = 2; !entries.Add(entry); suffix++)
-                entry = $"{Path.ChangeExtension(safeName, null)}-{suffix}{Path.GetExtension(safeName)}";
-            var rep = new FileReport { Entry = entry, InputEntry = s.EntryName, OriginalBytes = raw.Length, Sha256 = Hex(SHA256.HashData(data)) };
-            res.OriginalBytes += raw.Length;
+            string entry = privacy.Entry(s.EntryName);
+            if (ReadRedacted(s, entry, res, Say) is not { } input) continue;
+            var (data, bytes) = input;
+            entry = UniqueEntry(entry, entries);
+            var rep = new FileReport { Entry = entry, InputEntry = s.EntryName, OriginalBytes = bytes, Sha256 = Hex(SHA256.HashData(data)) };
+            res.OriginalBytes += bytes;
             if (seen.TryGetValue(rep.Sha256, out var first)) { rep.SameAs = first; res.Files.Add(rep); Say($"{entry}: identical to {first}"); continue; }
             seen[rep.Sha256] = entry;
 
@@ -186,7 +190,7 @@ public static class Packer
 
         foreach (var r in res.Files.Where(r => r.SameAs is not null))
             r.Part = res.Files.First(x => x.Entry == r.SameAs).Part;
-        res.Manifest = BuildManifest(res, n, baseName, opt);
+        res.Manifest = BuildManifest(res, n, opt);
         byte[] manFrame = comp.Wrap(Tar.Entry("MANIFEST.txt", Encoding.UTF8.GetBytes(res.Manifest), DateTime.UtcNow)).ToArray();
         byte[] briefFrame = comp.Wrap(Tar.Entry("BRIEFING.md", Encoding.UTF8.GetBytes(res.Briefing), DateTime.UtcNow)).ToArray();
         byte[] verdictFrame = comp.Wrap(Tar.Entry(VerdictReport.EntryName, Encoding.UTF8.GetBytes(res.Verdict), DateTime.UtcNow)).ToArray();
@@ -212,6 +216,61 @@ public static class Packer
         return res;
     }
 
+    /// <summary>Support archive fallback when compression to zstd is unavailable.</summary>
+    public static void WriteZipFallback(IReadOnlyList<SourceFile> sources, string path)
+    {
+        var res = new PackResult();
+        var entries = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "MANIFEST.txt" };
+        using var zip = ZipFile.Open(path, ZipArchiveMode.Create);
+        foreach (var source in sources)
+        {
+            if (OmitPrivate(source, res)) continue;
+            string entry = res.Privacy.Entry(source.EntryName).Replace('\\', '/');
+            if (ReadRedacted(source, entry, res) is not { } input) continue;
+            entry = UniqueEntry(entry, entries);
+            using var output = zip.CreateEntry(entry, CompressionLevel.Optimal).Open();
+            output.Write(input.Data);
+            res.OriginalBytes += input.OriginalBytes;
+            res.Files.Add(new FileReport
+            {
+                Part = 1, Entry = entry, OriginalBytes = input.OriginalBytes, StoredBytes = input.Data.Length,
+                Sha256 = Hex(SHA256.HashData(input.Data))
+            });
+        }
+        using var manifest = zip.CreateEntry("MANIFEST.txt").Open();
+        manifest.Write(Encoding.UTF8.GetBytes(BuildManifest(res, 1, new PackOptions { Collapse = false }, zip: true)));
+    }
+
+    private static bool OmitPrivate(SourceFile source, PackResult result)
+    {
+        if (!BundlePrivacy.IsPrivateFile(source.EntryName) &&
+            (source.Path is null || !BundlePrivacy.IsPrivateFile(source.Path))) return false;
+        result.Omissions.Add((result.Privacy.Entry(source.EntryName), "private dump or save"));
+        return true;
+    }
+
+    private static (byte[] Data, int OriginalBytes)? ReadRedacted(SourceFile source, string entry, PackResult result, Action<string>? progress = null)
+    {
+        byte[]? raw = Read(source);
+        if (raw is null)
+        {
+            result.Omissions.Add((entry, "unreadable"));
+            return null;
+        }
+        if (result.Privacy.Bytes(raw) is { } data) return (data, raw.Length);
+        result.Omissions.Add((entry, "binary data"));
+        progress?.Invoke($"{entry}: omitted binary data");
+        return null;
+    }
+
+    private static string UniqueEntry(string safeName, HashSet<string> entries)
+    {
+        string entry = safeName;
+        for (int suffix = 2; !entries.Add(entry); suffix++)
+            entry = $"{Path.ChangeExtension(safeName, null)}-{suffix}{Path.GetExtension(safeName)}";
+        return entry;
+    }
+
     private static void AddEntry(List<(string, byte[], FileReport)> frames, Compressor comp, PackOptions opt, string name, byte[] data, DateTime mtime, FileReport rep, Action<string> say)
     {
         byte[] frame = comp.Wrap(Tar.Entry(name, data, mtime)).ToArray();
@@ -232,12 +291,17 @@ public static class Packer
         }
     }
 
-    private static string BuildManifest(PackResult res, int parts, string baseName, PackOptions opt)
+    private static string BuildManifest(PackResult res, int parts, PackOptions opt, bool zip = false)
     {
         var sb = new StringBuilder();
         sb.Append("Kingdom Come: Together -- log bundle\r\n");
-        sb.Append("Parts: ").Append(parts).Append(" (each a complete .tzst archive: a tar compressed with zstd. 7-Zip 24 or newer: open the .tzst, then the .tar inside it. Or: tar --zstd -xf <part>  /  zstd -d <part>)\r\n");
-        sb.Append("Compression: zstd level ").Append(opt.Level).Append(", the logs' repeated lines collapsed (see below), identical files stored once\r\n");
+        if (zip) sb.Append("Format: ZIP\r\n");
+        else
+        {
+            sb.Append("Parts: ").Append(parts).Append(" (each a complete .tzst archive: a tar compressed with zstd. 7-Zip 24 or newer: open the .tzst, then the .tar inside it. Or: tar --zstd -xf <part>  /  zstd -d <part>)\r\n");
+            sb.Append("Compression: zstd level ").Append(opt.Level).Append(opt.Collapse ? ", repeated lines collapsed" : ", all lines retained")
+                .Append(", identical files stored once\r\n");
+        }
         sb.Append("Original size: ").Append(res.OriginalBytes.ToString(CultureInfo.InvariantCulture)).Append(" bytes in ").Append(res.Files.Count).Append(" files\r\n");
         sb.Append("Marks (mark_odd) found: ").Append(res.OddMarks).Append(" -- every line within 5 minutes of one is kept in full\r\n");
         if (res.Marks.Count > 0)
@@ -256,7 +320,12 @@ public static class Packer
             sb.Append(f.Part).Append(" | ").Append(f.Entry).Append(" | ").Append(f.OriginalBytes).Append(" | ")
               .Append(f.SameAs is null ? f.StoredBytes.ToString(CultureInfo.InvariantCulture) : "0").Append(" | ").Append(f.Sha256).Append(" | ").Append(note).Append("\r\n");
         }
-        _ = baseName;
+        if (res.Omissions.Count > 0)
+        {
+            sb.Append("\r\nOmitted entry | reason\r\n");
+            foreach (var (entry, reason) in res.Omissions)
+                sb.Append(entry).Append(" | ").Append(reason).Append("\r\n");
+        }
         return sb.ToString();
     }
 
@@ -277,7 +346,7 @@ public static class Packer
             if (dir is not null && File.Exists(System.IO.Path.Combine(dir, AnimStream.FileName)))
                 return sources.Append(new SourceFile(AnimStream.BundleEntry, System.IO.Path.Combine(dir, AnimStream.FileName))).ToList();
         }
-        catch { }
+        catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("pack-anim-find", caughtFailure); }
         return sources;
     }
 
@@ -294,7 +363,7 @@ public static class Packer
             var kcd = outp.FirstOrDefault(s => s.EntryName == "kcd.log");
             if (kcd is not null && Read(kcd) is { } kb) launch = SessionRule.LaunchTime(Encoding.UTF8.GetString(kb, 0, Math.Min(kb.Length, 4096)));
         }
-        catch { }
+        catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("pack-launch-read", caughtFailure); }
         var notes = new List<string>();
         foreach (var (name, entry) in new[] { (AnimStream.SessionFileName, AnimStream.SessionEntry), (AnimStream.SessionPrevName, AnimStream.SessionPrevEntry) })
         {
@@ -309,11 +378,11 @@ public static class Packer
                     string? dir = kcd is null ? null : System.IO.Path.GetDirectoryName(kcd.Path);
                     if (dir is not null && File.Exists(System.IO.Path.Combine(dir, name))) found = new SourceFile(entry, System.IO.Path.Combine(dir, name));
                 }
-                catch { }
+                catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("pack-session-find", caughtFailure); }
             }
             if (found is null) continue;
             DateTime? written = null;
-            try { if (found.Path is not null && File.Exists(found.Path)) written = File.GetLastWriteTime(found.Path); } catch { }
+            try { if (found.Path is not null && File.Exists(found.Path)) written = File.GetLastWriteTime(found.Path); } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("pack-session-time", caughtFailure); }
             if (SessionRule.Stale(launch, written))
             {
                 notes.Add($"{name}: last written {written:yyyy-MM-dd HH:mm:ss}, before this launch ({launch:yyyy-MM-dd HH:mm:ss}) -- left out");

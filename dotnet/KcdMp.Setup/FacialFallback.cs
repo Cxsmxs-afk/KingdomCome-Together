@@ -111,7 +111,7 @@ public static class FacialFallback
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or XmlException or ArgumentException or FormatException or RegexMatchTimeoutException)
         {
             // A stale delta must not outlive the source/schema proof. Only our marked files may be removed.
-            try { DeleteOwnedPak(pak); if (OwnedXml(statePath)) File.Delete(statePath); } catch { }
+            try { DeleteOwnedPak(pak); if (OwnedXml(statePath)) File.Delete(statePath); } catch (Exception closeError) when (closeError is FileNotFoundException or DirectoryNotFoundException) { } catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("facial-fallback-cleanup", caughtFailure); }
             if (InspectPak(pak) is PakKind.Owned or PakKind.Unreadable)
                 return new(false, "blocked", 0, 0, "unverified override could not be inspected or removed; close the game and check file access", true);
             return new(false, "disabled", 0, 0, $"validation failed ({ex.GetType().Name}); no facial fallback certified");

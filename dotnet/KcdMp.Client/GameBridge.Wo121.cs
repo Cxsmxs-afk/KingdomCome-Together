@@ -325,7 +325,7 @@ public partial class GameBridge
                 }
             }
             catch (OperationCanceledException) { return; }
-            catch { }
+            catch (Exception caughtFailure) { Faults.ReportThrottled("engaged-cleanup", caughtFailure); }
         }
     }
 

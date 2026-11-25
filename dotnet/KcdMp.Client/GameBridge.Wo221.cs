@@ -153,7 +153,7 @@ public partial class GameBridge
                 Console.WriteLine($"MP-W221-NATIVE {Encoding.ASCII.GetString(rr.Payload)}");
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("world-loot-pages", caughtFailure); }
     }
 
     private Task Wo221TellModAsync() =>

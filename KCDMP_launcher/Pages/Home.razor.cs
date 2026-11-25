@@ -238,7 +238,7 @@ namespace KCDMP_launcher.Pages
                     if (loaded != null) customServers = loaded;
                 }
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("launcher-custom-servers", caughtFailure); }
             NoteCustomServerKeys();   // WO-154: each entry's address as the file has it, for an edit
         }
 
@@ -1189,7 +1189,7 @@ namespace KCDMP_launcher.Pages
         }
 
         // Persistence
-        private void LoadFavorites() { try { if (File.Exists(FavoritesFileName)) favoriteIps = JsonSerializer.Deserialize<HashSet<string>>(File.ReadAllText(FavoritesFileName)) ?? new(); } catch { } }
+        private void LoadFavorites() { try { if (File.Exists(FavoritesFileName)) favoriteIps = JsonSerializer.Deserialize<HashSet<string>>(File.ReadAllText(FavoritesFileName)) ?? new(); } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("launcher-favorites", caughtFailure); } }
 
         /// <summary>
         /// WO-154: settings.json is read key by key (LauncherSettingsStore): a value that does not

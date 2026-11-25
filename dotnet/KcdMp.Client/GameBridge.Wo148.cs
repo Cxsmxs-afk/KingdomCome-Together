@@ -58,9 +58,9 @@ public partial class GameBridge
         lock (_w148Lock) { gone = _w148Ledger.All.Select(kv => (kv.Key, kv.Value)).ToList(); _w148Ledger.Clear(); }
         _w148Held.Clear();
         foreach (byte src in gone.Where(g => g.Entry.Carrier != _myGhostId).Select(g => g.Entry.Carrier).Distinct())
-            try { await ExecLuaAsync($"if KCD2MP_W148AvatarGone then KCD2MP_W148AvatarGone(\"{src}\") end"); } catch { }
+            try { await ExecLuaAsync($"if KCD2MP_W148AvatarGone then KCD2MP_W148AvatarGone(\"{src}\") end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("camera-peer-gone", caughtFailure); }
         _w148AvatarHolds.Clear();
-        try { await ExecLuaAsync("if KCD2MP_W148Session then KCD2MP_W148Session(false, false) end"); } catch { }
+        try { await ExecLuaAsync("if KCD2MP_W148Session then KCD2MP_W148Session(false, false) end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("camera-session-stop", caughtFailure); }
     }
 
     /// <summary>A peer's Disconnect: its avatar sets everything down here.</summary>
@@ -379,7 +379,7 @@ public partial class GameBridge
         string av = $"kcd2mp_{carrier}";
         int? shot = null;
         if (why is "grab" or "put" or "drop")
-            try { shot = await _combat.Wo143OneShotAsync(av, hold ? "CarryItemPickup" : "CarryItemPlace", "", 0, 0); } catch { }
+            try { shot = await _combat.Wo143OneShotAsync(av, hold ? "CarryItemPickup" : "CarryItemPlace", "", 0, 0); } catch (Exception caughtFailure) { Faults.ReportThrottled("carry-one-shot", caughtFailure); }
         Console.WriteLine($"MP-CARRY avatar {carrier} {(hold ? "picks a sack up" : "puts the sack away")} ({why}): one-shot={(shot is int q ? q.ToString() : "-")}");
     }
 

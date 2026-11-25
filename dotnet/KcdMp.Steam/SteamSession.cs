@@ -25,7 +25,7 @@ public enum SteamStartFailure
 /// C++ callback object layout: each callback arrives as (id, bytes) and the
 /// few this needs are decoded by offset. The pump also drains every open
 /// connection's receive queue, so inbound bytes reach a reader within one
-/// pump period (1 ms at timeBeginPeriod(1)).
+/// pump period (1 ms during recent payload traffic, 10 ms idle).
 ///
 /// The app id is chosen by the caller (SteamAppId in the environment, read
 /// by steam_api when the DLL loads) -- WO-120 Phase 0 decides which.
@@ -37,6 +37,7 @@ public sealed class SteamSession : IDisposable
     private readonly IntPtr _user, _utils, _friends, _sockets, _netUtils, _messages, _legacy;
     private readonly int _pipe;
     private readonly Thread _pump;
+    private readonly SteamPumpCadence _cadence = new(TimeProvider.System);
     private volatile bool _running = true;
     private readonly ConcurrentDictionary<uint, SteamP2PConnection> _conns = new();
     private readonly ConcurrentDictionary<uint, SteamP2PListener> _listeners = new();
@@ -349,15 +350,12 @@ public sealed class SteamSession : IDisposable
     [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
     [DllImport("winmm.dll")] private static extern uint timeEndPeriod(uint ms);
 
+    internal void ObserveTraffic() => _cadence.ObservePayload();
+
     private void PumpLoop()
     {
+        bool active = false;
         bool highResolution = false;
-        if (OperatingSystem.IsWindows())
-        {
-            uint result = timeBeginPeriod(1);
-            highResolution = result == 0;
-            if (!highResolution) EmitLog($"steam timer resolution request failed code={result}");
-        }
         var msgs = new IntPtr[64];
         try
         {
@@ -370,8 +368,29 @@ public sealed class SteamSession : IDisposable
                     catch (Exception ex) { EmitLog($"steam callback {cb.ICallback} handler threw {ex.GetType().Name}: {ex.Message}"); }
                     finally { SteamNative.SteamAPI_ManualDispatch_FreeLastCallback(_pipe); }
                 }
-                foreach (var c in _conns.Values) c.Drain(msgs);
-                Thread.Sleep(1);
+                bool received = false;
+                foreach (var c in _conns.Values) received |= c.Drain(msgs);
+                if (received) ObserveTraffic();
+
+                int waitMs = _cadence.WaitMs;
+                bool nowActive = waitMs == SteamPumpCadence.ActiveMs;
+                if (OperatingSystem.IsWindows() && nowActive != active)
+                {
+                    if (nowActive)
+                    {
+                        uint result = timeBeginPeriod(1);
+                        highResolution = result == 0;
+                        if (!highResolution) EmitLog($"steam timer resolution request failed code={result}");
+                    }
+                    else if (highResolution)
+                    {
+                        uint result = timeEndPeriod(1);
+                        highResolution = false;
+                        if (result != 0) EmitLog($"steam timer resolution release failed code={result}");
+                    }
+                }
+                active = nowActive;
+                Thread.Sleep(waitMs);
             }
         }
         finally
@@ -454,7 +473,7 @@ public sealed class SteamSession : IDisposable
         foreach (var l in _listeners.Values) l.Dispose();
         _running = false;
         if (Thread.CurrentThread != _pump) _pump.Join(2000);
-        try { ClearRichPresence(); } catch { }
+        try { ClearRichPresence(); } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("steam-presence-clear", caughtFailure); }
         SteamNative.SteamAPI_Shutdown();
         if (ReferenceEquals(_current, this)) _current = null;
     }

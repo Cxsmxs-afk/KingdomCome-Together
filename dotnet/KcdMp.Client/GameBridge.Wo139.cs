@@ -97,10 +97,10 @@ public partial class GameBridge
         _w139Pursuits.Clear();      // the DLL clears the pairs it set when the pipe closes
         _w139Records.Clear();
         _w139StoppedHere.Clear();
-        try { await _combat.Wo139ConfigAsync(false); } catch { }
-        try { await _combat.Wo139PunishGateAsync(false); } catch { }
+        try { await _combat.Wo139ConfigAsync(false); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("story-observer-stop", caughtFailure); }
+        try { await _combat.Wo139PunishGateAsync(false); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("story-punish-clear", caughtFailure); }
         _w139CfgKey = -1;
-        try { await ExecLuaAsync("if KCD2MP_W139Session then KCD2MP_W139Session(false, false, false) end"); } catch { }
+        try { await ExecLuaAsync("if KCD2MP_W139Session then KCD2MP_W139Session(false, false, false) end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("story-mode-clear", caughtFailure); }
     }
 
     // ---------------------------------------------------------------- the 1 s loop

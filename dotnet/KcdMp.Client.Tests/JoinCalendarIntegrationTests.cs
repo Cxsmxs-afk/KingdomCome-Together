@@ -18,7 +18,37 @@ public sealed class JoinCalendarIntegrationCollection { }
 public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testOutput)
 {
     private const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
-    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts, ChangeCharacter, LocalFresh, CompatibleRestore, PlayerJoinLoop, ReturnDeadlineLoop }
+    private enum JoinProbe { None, Delay, Scope, HostLossBeforeOffer, HostLossWhileWaiting, MissingHold, MenuProgress, RepeatAborts, ChangeCharacter, LocalFresh, CompatibleRestore, PlayerJoinLoop, ReturnDeadlineLoop, ResumeRetry, DeferredResumeRetry }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task A_failed_resume_is_retried_and_the_host_world_runs_within_one_second(bool deferred) =>
+        RunAsync(deferred ? "B" : "A", deferred ? "A" : "B", dropFirstSnapshot: false,
+            deferred ? JoinProbe.DeferredResumeRetry : JoinProbe.ResumeRetry);
+
+    [Fact]
+    public async Task A_rejected_clock_write_keeps_the_previous_local_time_basis()
+    {
+        using var fixture = new SaveFixture();
+        await using var pipe = new JoinCalendarTestPipe();
+        await using var game = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "clock.log"),
+            fixture.GuestSaves, null, pipe.ObserveGameplayStarted) { FailTimeSkipResponse = true };
+        using var link = new MemoryStream();
+        var guest = CreateBridge(1, false, link, pipe.Pipe, game.Transport, fixture.GuestSaves, CancellationToken.None);
+        game.Emit("wo124_where", "world");
+        Set(guest, "_lastPolledWorldTime", (uint?)100u);
+        Set(guest, "_lastPollUtc", DateTime.UtcNow);
+
+        await Apply();
+        Assert.Equal(100u, Get<uint?>(guest, "_lastPolledWorldTime"));
+        game.FailTimeSkipResponse = false;
+        await Apply();
+        Assert.Equal(10_000u, Get<uint?>(guest, "_lastPolledWorldTime"));
+
+        Task Apply() => InvokeAsync(guest, "ApplyTimeSkipAsync", (byte)0, Protocol.TimeSkipKindUnknown,
+            10_000u, true, CancellationToken.None, null);
+    }
 
     [Theory]
     [InlineData(2)]
@@ -184,7 +214,11 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
         Func<int, byte[]> makeHostSave = f4 is F4Probe.TransferAbort or F4Probe.HostAbort or F4Probe.TransportLost
             ? F4LargeHostSave : fixture.MakeHostSave;
         await using var hostGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "host.log"), fixture.HostSaves, makeHostSave,
-            hostPipe.ObserveGameplayStarted, publishCompletedSave: !usePhysicalSaveCadence);
+            hostPipe.ObserveGameplayStarted, publishCompletedSave: !usePhysicalSaveCadence)
+        {
+            FailFirstResume = probe is JoinProbe.ResumeRetry or JoinProbe.DeferredResumeRetry,
+            WithholdPauseReply = probe == JoinProbe.DeferredResumeRetry
+        };
         await using var guestGame = new JoinCalendarTestEngine(Path.Combine(fixture.Root, "guest.log"), fixture.GuestSaves, null, guestPipe.ObserveGameplayStarted);
         var host = CreateBridge(hostPeer.Id, true, hostLink, hostPipe.Pipe, hostGame.Transport, fixture.HostSaves, ct,
             worldSaveTime: usePhysicalSaveCadence ? TimeProvider.System : new CompletedSaveTime());
@@ -290,6 +324,14 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
             await InvokeAsync(guest, "SendJoinRequestAsync");
             uint joinId = Get<uint>(guest, "_joinOutId");
             Assert.NotEqual(0u, joinId);
+            if (probe == JoinProbe.DeferredResumeRetry)
+            {
+                await hostGame.Paused.WaitAsync(ct);
+                hostGame.Emit("join_cancel", "");
+                await AssertResumeAfterRejectedCommandAsync(hostGame, ct);
+                Assert.False(guestGame.LoadIssued.IsCompleted);
+                return;
+            }
             if (probe is JoinProbe.HostLossBeforeOffer or JoinProbe.HostLossWhileWaiting)
             {
                 if (probe == JoinProbe.HostLossBeforeOffer) await atOffer.Task.WaitAsync(ct);
@@ -324,6 +366,7 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
             if (probe == JoinProbe.Delay)
                 await HoldPastOldCalendarDeadlineAsync(host, guest, hostGame, guestGame, hostPipe, guestLink, ct);
 
+            if (probe == JoinProbe.ResumeRetry) await AssertResumeAfterRejectedCommandAsync(hostGame, ct);
             string resumeReason = await hostGame.Resumed.WaitAsync(ct);
             var (clockAtOffer, bootstrapAtOffer) = await atOffer.Task.WaitAsync(ct);
             Assert.NotEmpty(guestLink.FrozenSnapshots);
@@ -900,6 +943,18 @@ public sealed partial class JoinCalendarIntegrationTests(ITestOutputHelper testO
         Assert.Equal(guest, source);
         Assert.Equal(joinId, readyId);
         Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(body));
+    }
+
+    private static async Task AssertResumeAfterRejectedCommandAsync(JoinCalendarTestEngine game, CancellationToken ct)
+    {
+        long failedAt = await game.FirstResumeFailure.WaitAsync(ct);
+        Task completed = await Task.WhenAny(game.Resumed, Task.Delay(TimeSpan.FromSeconds(1), ct));
+        Assert.Same(game.Resumed, completed);
+        Assert.Equal(2, game.ResumeAttempts);
+        Assert.True(game.ResumedAt >= failedAt);
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(failedAt, game.ResumedAt);
+        Console.WriteLine($"HOST-RESUME fixture attempts={game.ResumeAttempts} real-tcp=1 running_ms={elapsed.TotalMilliseconds:F1}");
+        Assert.True(elapsed < TimeSpan.FromSeconds(1));
     }
 
     private static GameBridge CreateBridge(byte id, bool hosting, Stream relay, CombatPipe pipe,

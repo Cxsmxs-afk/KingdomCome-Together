@@ -98,11 +98,12 @@ foreach (var p in res.Parts)
 int bad = 0;
 var wins = new OddWindows();
 foreach (var f in files.Where(f => f.EntryName.EndsWith(".log")))
-    using (var r = new StreamReader(f.Path!, Encoding.Latin1)) wins.Scan(Lines(r));
+    if (Packer.Read(f) is { } bytes && BundlePrivacy.ReadText(bytes) is { } log)
+        using (var r = new StringReader(log)) wins.Scan(Lines(r));
 foreach (var rep in res.Files.Where(r => r.Collapse is not null))
 {
     var source = File.ReadAllBytes(files.First(f => f.EntryName == rep.InputEntry).Path!);
-    var orig = Encoding.Latin1.GetString(BundlePrivacy.Bytes(source)!).Split('\n');
+    var orig = Encoding.Latin1.GetString(res.Privacy.Bytes(source)!).Split('\n');
     if (orig.Length > 0 && orig[^1].Length == 0) orig = orig[..^1];
     var kept = new HashSet<string>(StringComparer.Ordinal);
     // the output lines in order; a subsequence check for the windowed lines

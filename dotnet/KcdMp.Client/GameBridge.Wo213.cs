@@ -92,7 +92,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo213OpStatus, []);
             if (r is { Ok: true } rr) Console.WriteLine($"MP-W213-NATIVE {Encoding.ASCII.GetString(rr.Payload)}");
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("link-probe", caughtFailure); }
     }
 
     private void Wo213OnEvent(string name, string? arg)
@@ -291,7 +291,7 @@ public partial class GameBridge
                     if (f.Length >= 3) _w213Meter.CountFrame(true, f[0], f.AsSpan(3));
                 });
             }
-            catch (Exception ex) { Console.WriteLine($"MP-LINK the writer stopped: {ex.GetType().Name}: {ex.Message}"); try { link.Dispose(); } catch { } }
+            catch (Exception ex) { Console.WriteLine($"MP-LINK the writer stopped: {ex.GetType().Name}: {ex.Message}"); try { link.Dispose(); } catch (ObjectDisposedException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("relay-dispose", caughtFailure); } }
         }
         if (ExecutionContext.IsFlowSuppressed()) _w213WriteTask = Task.Run(RunWriter);
         else { using (ExecutionContext.SuppressFlow()) _w213WriteTask = Task.Run(RunWriter); }
@@ -358,7 +358,15 @@ public partial class GameBridge
         if (!Protocol.TryParseLinkHello(payload, out byte v, out ushort caps, out byte transport, out int rateKBps)) return true;
         _w213Caps = caps;
         if ((caps & Protocol.LinkCapPvpLife) != 0) _ = AdvertisePvpLifeAsync();
-        if (_w213Writer is { } w) w.Scheduler.Options.Unreliable = (caps & Protocol.LinkCapUnreliableState) != 0 && w.Path.CanSendUnreliable;
+        if (_w213Writer is { } writer)
+        {
+            bool unreliable = (caps & Protocol.LinkCapUnreliableState) != 0 && writer.Path.CanSendUnreliable;
+            if (writer.Scheduler.Options.Unreliable != unreliable)
+            {
+                writer.Scheduler.Options.Unreliable = unreliable;
+                writer.Wake(); // The negotiated lane may make cached repeats due.
+            }
+        }
         Console.WriteLine($"MP-LINK hello answered: version={v} caps=0x{caps:X4} transport={Protocol.LinkTransportName(transport)} relay_rate={rateKBps} KB/s -- latest wins={((caps & Protocol.LinkCapLatestWins) != 0 ? 1 : 0)} unreliable state={(_w213Writer?.Scheduler.Options.Unreliable == true ? 1 : 0)} compact npc={((caps & Protocol.LinkCapCompactNpc) != 0 ? 1 : 0)}");
         return true;
     }

@@ -105,7 +105,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(Protocol.Wo187OpStatus, []);
             if (r is { Ok: true } x) n = Encoding.ASCII.GetString(x.Payload);
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("npc-combat-probe", caughtFailure); }
         Console.WriteLine(FormattableString.Invariant(
             $"MP-W187-STATS opp_logical={On(_w187OppLogical)} opp_pin={On(_w187OppPin)} engage_intent={On(_w187EngageIntent)} anim_guard={On(_w187Guard)} anim_idle={On(_w187Idle)} anim_defence={On(_w187Defence)} anim_combo={On(_w187Combo)} anim_scope_log={On(_w187ScopeLog)} fight_pos={On(_w187FightPos)} chase_follow={On(_w187ChaseFollow)} anim_hit_fallback={On(_w187HitFallback)} anim_avatar_hit={On(_w187AvatarHit)} opp_sent={Interlocked.Read(ref _w187OppSent)} opp_applied={Interlocked.Read(ref _w187OppApplied)} guard_sent={Interlocked.Read(ref _w187GuardSent)} intent_engages={Interlocked.Read(ref _w187IntentEngages)} defence_out={Interlocked.Read(ref _w187DefenceOut)} defence_in={Interlocked.Read(ref _w187DefenceIn)} defence_played={Interlocked.Read(ref _w187DefencePlayed)} pos_lines={Interlocked.Read(ref _w187PosLines)} hit_fallbacks={Interlocked.Read(ref _w187HitFallbacks)} hit_fallback_played={Interlocked.Read(ref _w187HitFallbackPlayed)} hit_fallback_none={Interlocked.Read(ref _w187HitFallbackNone)} avatar_hit_out={Interlocked.Read(ref _w187AvatarHitOut)} avatar_hit_in={Interlocked.Read(ref _w187AvatarHitIn)} avatar_hit_played={Interlocked.Read(ref _w187AvatarHitPlayed)} fights={_w187Fights.Count} | native: {n ?? "no answer"}"));
     }
@@ -195,7 +195,7 @@ public partial class GameBridge
             if (changed)
                 Console.WriteLine($"MP-W187 opponent npc={name} wished={(kind == Wo187Rules.OppLocalPlayer ? "me" : $"figure eid 0x{target:X}")} why={why} -> {(r is null ? "no answer" : r.Value.Ok ? (r.Value.Payload.Length > 0 && r.Value.Payload[0] == 1 ? "applied" : "asked") : $"refused (reason {r.Value.Reason})")}");
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("npc-opponent-report", caughtFailure); }
     }
 
     private async Task Wo187SendGuardAsync(uint eid, bool on, BodyState2 st)
@@ -204,7 +204,7 @@ public partial class GameBridge
         BinaryPrimitives.WriteUInt32LittleEndian(a, eid);
         a[4] = (byte)(on ? 1 : 0);
         st.Write(a.AsSpan(5));
-        try { await _combat.Wo163Async(Protocol.Wo187OpGuardHold, a); Interlocked.Increment(ref _w187GuardSent); } catch { }
+        try { await _combat.Wo163Async(Protocol.Wo187OpGuardHold, a); Interlocked.Increment(ref _w187GuardSent); } catch (Exception caughtFailure) { Faults.ReportThrottled("npc-guard-hold", caughtFailure); }
     }
 
     /// <summary>Host (OnNpcCombatStateAsync): an NPC fighting someone -- B1's list.</summary>

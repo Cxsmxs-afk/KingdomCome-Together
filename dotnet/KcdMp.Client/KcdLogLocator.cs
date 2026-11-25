@@ -32,7 +32,7 @@ public static partial class KcdLogLocator
                     logs.AddRange(new DirectoryInfo(dir)
                         .EnumerateFiles("kcd.log", SearchOption.TopDirectoryOnly));
                 }
-                catch { /* unreadable directory */ }
+                catch (Exception caughtFailure) { /* unreadable directory */ GameBridge.Faults.ReportThrottled("game-log-list", caughtFailure); }
             }
 
             return logs.Count == 0

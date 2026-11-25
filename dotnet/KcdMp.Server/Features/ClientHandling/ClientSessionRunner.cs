@@ -22,6 +22,7 @@ public sealed class ClientSessionRunner
 	private readonly ClientHandler _clientHandler;
 	private readonly TcpBroadcastService _broadcastService;
 	private readonly SessionManager _sessions;
+	private long _nextDiagnosticSession;
 
 	/// <summary>
 	/// WO-102.5 Phase 4: configurable so the relay round-trip tests can use a
@@ -68,7 +69,9 @@ public sealed class ClientSessionRunner
 	public void Start(ClientSession client)
 	{
 		_clientHandler.AddClient(client);
-		_faults.FireAndLog(RunSessionAsync(client), "relay-session");
+		// This id exists even if the handshake fails. It contains no peer data.
+		ulong sessionId = (ulong)Interlocked.Increment(ref _nextDiagnosticSession);
+		_faults.FireAndLog(RunSessionAsync(client), "relay-session", sessionId);
 	}
 
 	private async Task RunSessionAsync(ClientSession client)

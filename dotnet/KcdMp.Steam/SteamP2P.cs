@@ -150,14 +150,15 @@ public sealed class SteamP2PConnection : IDisposable
         }
     }
 
-    /// <summary>Pump thread: move every waiting message into the inbox.</summary>
-    internal void Drain(IntPtr[] buf)
+    /// <summary>Pump thread: move every waiting message into the inbox and indicate payload traffic.</summary>
+    internal bool Drain(IntPtr[] buf)
     {
-        if (Volatile.Read(ref _closedFlag) != 0) return;
+        if (Volatile.Read(ref _closedFlag) != 0) return false;
+        bool received = false;
         while (true)
         {
             int n = SteamNative.SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection(_session.Sockets, Handle, buf, buf.Length);
-            if (n <= 0) return;
+            if (n <= 0) return received;
             for (int i = 0; i < n; i++)
             {
                 IntPtr m = buf[i];
@@ -165,12 +166,13 @@ public sealed class SteamP2PConnection : IDisposable
                 int size = Marshal.ReadInt32(m, SteamNative.Msg.Size);
                 var bytes = new byte[size];
                 if (size > 0) Marshal.Copy(data, bytes, 0, size);
+                received |= size > 0;
                 SteamNative.SteamAPI_SteamNetworkingMessage_t_Release(m);
                 MessagesReceived++;
                 BytesReceived += size;
                 _inbox.Writer.TryWrite(bytes);
             }
-            if (n < buf.Length) return;
+            if (n < buf.Length) return received;
         }
     }
 
@@ -210,6 +212,7 @@ public sealed class SteamP2PConnection : IDisposable
             {
                 Interlocked.Increment(ref MessagesSent);
                 Interlocked.Add(ref BytesSent, chunk.Length);
+                if (chunk.Length > 0) _session.ObserveTraffic();
             }
             return r;
         }
@@ -313,6 +316,7 @@ public sealed class SteamP2PConnection : IDisposable
         {
             Interlocked.Increment(ref MessagesSent);
             Interlocked.Add(ref BytesSent, data.Length);
+            if (data.Length > 0) _session.ObserveTraffic();
             if (!reliable) Interlocked.Increment(ref UnreliableSent);
             return true;
         }

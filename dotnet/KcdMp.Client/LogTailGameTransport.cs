@@ -1485,7 +1485,7 @@ public sealed class LogTailGameTransport : IGameTransport
         _cts.Cancel();
         if (_tailTask is not null)
         {
-            try { await _tailTask; } catch { }
+            try { await _tailTask; } catch (OperationCanceledException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("log-tailer-stop", caughtFailure); }
         }
 
         if (_emitterStarted)
@@ -1498,7 +1498,7 @@ public sealed class LogTailGameTransport : IGameTransport
                 await _http.ExecuteAsync("KCD2MP_StopEmitter()");
                 await _http.FlushAsync();
             }
-            catch { }
+            catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("lua-emitter-stop", caughtFailure); }
         }
 
         _cts.Dispose();

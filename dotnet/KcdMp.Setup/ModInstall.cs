@@ -89,7 +89,7 @@ public static class ModInstall
         catch { return new ModReport { VerdictLine = "install-manifest.txt could not be read", TargetDir = target }; }
 
         string verdict = "";
-        try { verdict = File.ReadLines(Path.Combine(appDir, VerdictName)).FirstOrDefault() ?? ""; } catch { }
+        try { verdict = File.ReadLines(Path.Combine(appDir, VerdictName)).FirstOrDefault() ?? ""; } catch (Exception caughtFailure) { SetupDiagnostics.ReportThrottled("install-verdict", caughtFailure); }
 
         var app = new List<string>();
         foreach (var e in entries.Where(e => e.Kind == "APP"))

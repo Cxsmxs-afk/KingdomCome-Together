@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Net;
+using System.Diagnostics;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
@@ -30,6 +31,11 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private readonly Channel<string> _saveLockQueries = Channel.CreateUnbounded<string>();
     private readonly TaskCompletionSource<string> _loadIssued = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<string> _resumed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _paused = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<long> _firstResumeFailure = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private string? _pauseJoin;
+    private long _resumedAt;
+    private int _resumeAttempts;
     private readonly Channel<bool> _joinedNotifications = Channel.CreateUnbounded<bool>();
     private long _eventSequence;
     private int _saveIndex;
@@ -62,6 +68,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public bool DeferOwnFileRead { get; set; }
     public bool DeferExitFileRead { get; set; }
     public bool FailExitResponse { get; set; }
+    public bool FailTimeSkipResponse { get; set; }
     public bool DeferSaveLockReply { get; set; }
     public Action? BeforeNextWhereReply { get; set; }
     public int JoinLoadsIssued => Volatile.Read(ref _joinLoadsIssued);
@@ -69,6 +76,12 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     public int OwnLoadsIssued => Volatile.Read(ref _ownLoadsIssued);
     public Task<string> LoadIssued => _loadIssued.Task;
     public Task<string> Resumed => _resumed.Task;
+    public Task Paused => _paused.Task;
+    public Task<long> FirstResumeFailure => _firstResumeFailure.Task;
+    public long ResumedAt => Volatile.Read(ref _resumedAt);
+    public int ResumeAttempts => Volatile.Read(ref _resumeAttempts);
+    public bool FailFirstResume { get; set; }
+    public bool WithholdPauseReply { get; set; }
     public Task ExitMenu => _exitMenu.Task;
     public Task<string> ExitLoad => _exitLoad.Task;
     // The production toast is sent after the post-load owner has published the
@@ -142,7 +155,12 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private void ConsoleCommand(string command)
     {
         var pause = Regex.Match(command, """KCD2MP_JoinTry\("([0-9a-f]{8})",""");
-        if (pause.Success) Emit("join_try", $"{pause.Groups[1].Value} paused 0");
+        if (pause.Success)
+        {
+            lock (_logGate) _pauseJoin = pause.Groups[1].Value;
+            _paused.TrySetResult();
+            if (!WithholdPauseReply) Emit("join_try", $"{pause.Groups[1].Value} paused 0");
+        }
 
         if (_hostSave is { } hostSave &&
             command.Contains("""KCD2MP_HostWorldSave("join",""", StringComparison.Ordinal))
@@ -203,8 +221,22 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
             Emit("w177_load_quiet", $"{quiet.Groups[1].Value} ok");
         }
 
-        var resume = Regex.Match(command, """KCD2MP_JoinResume\("[0-9a-f]{8}",\s*"([^"]+)"\)""");
-        if (resume.Success) _resumed.TrySetResult(resume.Groups[1].Value);
+        var resume = ResumeMatch(command);
+        if (resume.Success)
+        {
+            lock (_logGate)
+            {
+                string join = resume.Groups[1].Value;
+                if (_pauseJoin == join)
+                {
+                    _pauseJoin = null;
+                    Volatile.Write(ref _resumedAt, Stopwatch.GetTimestamp());
+                }
+                _resumed.TrySetResult(resume.Groups[2].Value);
+                if (resume.Groups[3].Success)
+                    Emit("join_resume_check", $"{join} {resume.Groups[3].Value} {(_pauseJoin is null ? "running" : "paused")}");
+            }
+        }
         if (command.Contains("Co-op: you are in your host's world.", StringComparison.Ordinal))
             _joinedNotifications.Writer.TryWrite(true);
     }
@@ -281,6 +313,9 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
         }
     }
 
+    private static Match ResumeMatch(string command) =>
+        Regex.Match(command, """KCD2MP_JoinResume(?:Control)?\("([0-9a-f]{8})",\s*"([^"]+)"(?:,\s*"([0-9a-f]{8})",\s*(?:true|false))?\)""");
+
     public ValueTask DisposeAsync() => Transport.DisposeAsync();
 
     private sealed class ConsoleHandler(JoinCalendarTestEngine engine) : HttpMessageHandler
@@ -292,6 +327,14 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
             // Production submits the HTTP request under the join gate. The
             // game and log callbacks run independently of that handoff.
             await Task.Yield();
+            if (ResumeMatch(command).Success && Interlocked.Increment(ref engine._resumeAttempts) == 1 && engine.FailFirstResume)
+            {
+                engine._firstResumeFailure.TrySetResult(Stopwatch.GetTimestamp());
+                Console.WriteLine("HOST-RESUME fixture HTTP 503 before delivering the first resume");
+                return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("fixture") };
+            }
+            if (engine.FailTimeSkipResponse && command.Contains("KCD2MP_ApplyTimeSkip(", StringComparison.Ordinal))
+                return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("fixture") };
             engine.ConsoleCommand(command);
             bool failed = engine.FailExitResponse && command.Contains(",\"exit-to-menu\")", StringComparison.Ordinal);
             if (failed) Console.WriteLine("H21-HOME exit audit: HTTP 503 after delivering the engine command");

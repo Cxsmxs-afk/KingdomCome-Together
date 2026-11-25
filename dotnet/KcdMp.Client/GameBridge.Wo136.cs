@@ -267,10 +267,10 @@ public partial class GameBridge
             // Off the host's hold entirely: the copy guard (imm buff) and any engagement.
             if (_w131Guarded.TryRemove(horse, out uint eid))
             {
-                try { await _combat.Wo131CopyGuardAsync(false, eid); } catch { }
+                try { await _combat.Wo131CopyGuardAsync(false, eid); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("native-copy-guard-clear", caughtFailure); }
                 await Wo132DiscardAsync(false, eid);
             }
-            if (_w132Engaged.TryRemove(horse, out var eg)) { try { await _combat.Wo132EngageAsync(false, eg.Eid, default); } catch { } }
+            if (_w132Engaged.TryRemove(horse, out var eg)) { try { await _combat.Wo132EngageAsync(false, eg.Eid, default); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("native-npc-engage-clear", caughtFailure); } }
             Console.WriteLine($"MP-W136 ride: this player rides {horse} -- the rider owns it: the host's stream for it is ignored, its copy guard lifted; the host's horse follows this player's avatar");
         }
         else
@@ -318,7 +318,7 @@ public partial class GameBridge
         {
             var a = new byte[4];
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(a, eid);
-            try { await _combat.Wo132Async(10, a); } catch { }
+            try { await _combat.Wo132Async(10, a); } catch (Exception caughtFailure) { Faults.ReportThrottled("w136-reconcile", caughtFailure); }
         });
     }
 

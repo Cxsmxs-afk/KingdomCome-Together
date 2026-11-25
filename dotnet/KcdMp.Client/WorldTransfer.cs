@@ -189,9 +189,23 @@ public sealed class WorldReceiver : IDisposable
     {
         if (_finished) return (false, Protocol.JoinAbortProtocol, "already finished");
         _finished = true;
-        try { _fs?.Flush(true); } catch { }
-        _fs?.Dispose();
+        Exception? writeFailure = null;
+        try { _fs?.Flush(true); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            writeFailure = ex;
+        }
+        try { _fs?.Dispose(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            writeFailure ??= ex;
+        }
         _fs = null;
+        if (writeFailure is not null)
+        {
+            _sha.Dispose();
+            return Fail(Protocol.JoinAbortIo, $"staging flush/close failed: {writeFailure.GetType().Name}");
+        }
         Sha256 = _sha.GetHashAndReset();
         _sha.Dispose();
         if (Received != Offer.Size || Next != Offer.ChunkCount)
@@ -227,7 +241,7 @@ public sealed class WorldReceiver : IDisposable
         lock (_fileGate)
         {
             _finished = true;
-            try { _fs?.Dispose(); } catch { }
+            try { _fs?.Dispose(); } catch (ObjectDisposedException) { } catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("world-stage-close", caughtFailure); }
             _fs = null;
             _sha.Dispose();
             DeleteFiles();

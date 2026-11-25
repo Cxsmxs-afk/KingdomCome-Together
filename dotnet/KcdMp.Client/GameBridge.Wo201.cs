@@ -114,7 +114,7 @@ public partial class GameBridge
             var r = await _combat.Wo163Async(KcdMp.Wire.Protocol.Wo201OpStatus, []);
             if (r is { Ok: true } rr) dll = System.Text.Encoding.ASCII.GetString(rr.Payload);
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("story-flow-probe", caughtFailure); }
         Console.WriteLine(Wo201StatusText() + " dll=[" + dll + "]");
     }
 

@@ -57,7 +57,7 @@ public partial class GameBridge
         _w133On = false;
         _w133Pushed = false;
         Console.WriteLine($"MP-WO133 session ended: the old quest layer behaves as before ({W133Stats()})");
-        try { await ExecLuaAsync(Wo133Rules.GateLua(false, "none", "no-session")); } catch { }
+        try { await ExecLuaAsync(Wo133Rules.GateLua(false, "none", "no-session")); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("quest-gate-release", caughtFailure); }
     }
 
     private string W133Stats() => FormattableString.Invariant(

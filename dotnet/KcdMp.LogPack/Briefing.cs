@@ -45,11 +45,10 @@ public static class Briefing
                     using var fs = new FileStream(s.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                     using var ms = new MemoryStream(); fs.CopyTo(ms); b = ms.ToArray();
                 }
-                if (b is null) continue;
-                var text = Encoding.UTF8.GetString(b);
+                if (b is null || BundlePrivacy.ReadText(b) is not { } text) continue;
                 inp.Logs[s.EntryName] = text.Replace("\r\n", "\n").Split('\n');
             }
-            catch { }
+            catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("briefing-log", caughtFailure); }
         }
         ReadAnim(sources, inp);
         ReadAnimSession(sources, inp);
@@ -127,7 +126,7 @@ public static class Briefing
         sb.Append("Written by the bug report itself (WO-202). Times are this machine's clock.\n\n");
         var (bv, bid) = BuildOf(inp);   // WO-211 0.2: the build id in the first lines (the installer's name carries the same)
         sb.Append($"**Build:** {bv} build {bid}\n\n");
-        try { sb.Append(LaunchLine(inp)); } catch { }   // WO-221 F
+        try { sb.Append(LaunchLine(inp)); } catch (Exception caughtFailure) { KcdMp.Wire.ProcessFaultLog.Support.ReportThrottled("briefing-launch", caughtFailure); }   // WO-221 F
         // WO-218 F.4: this machine's queue first -- every number below is late by it
         try { sb.Append(W218Section.Section(AgentLines(inp).ToList())); }
         catch (Exception ex) { sb.Append($"{W218Section.Heading}\n\n(not read: {ex.GetType().Name}: {ex.Message})\n\n"); }

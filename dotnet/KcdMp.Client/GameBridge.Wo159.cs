@@ -17,7 +17,7 @@ public partial class GameBridge
                 System.Runtime.InteropServices.Marshal.FreeCoTaskMem(p);
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("prologue-saves-folder", caughtFailure); }
         root ??= Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Saved Games");
         return Path.Combine(root, "KingdomCome2");
     }

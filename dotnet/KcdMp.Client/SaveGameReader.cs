@@ -225,7 +225,7 @@ public static class SaveGameReader
                 if (uf is not null) return uf;
             }
         }
-        catch { }
+        catch (Exception caughtFailure) { GameBridge.Faults.ReportThrottled("save-root-log-probe", caughtFailure); }
         return null;
     }
 

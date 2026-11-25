@@ -348,7 +348,7 @@ public partial class GameBridge
                 {
                     lastStats = Environment.TickCount64;
                     string? nat = null;
-                    try { nat = await _combat.Wo147StatusAsync(ct); } catch { }
+                    try { nat = await _combat.Wo147StatusAsync(ct); } catch (Exception caughtFailure) { Faults.ReportThrottled("soul-observer-status", caughtFailure); }
                     Console.WriteLine(FormattableString.Invariant(
                         $"MP-W147-STATS hostile_engage={(_w147HostileEngage ? "on" : "off")} engaged={_w147Local.Count} engage_on={_w147EngageOn} engage_off={_w147EngageOff} engage_fail={_w147EngageFail} friendly_skipped={_w147EngageFriendly} leash_lane={_w147LeashLaneFrames} {Wo147QuestStatsText()} {Wo147CatchupStatsText()} | {nat ?? "native: no answer"}"));
                 }
@@ -526,7 +526,7 @@ public partial class GameBridge
         // WO-132's own engagement (the host's NPC in combat) keeps the copy: nothing to undo then.
         if (_w132Engaged.ContainsKey(name)) { Console.WriteLine($"MP-W147 {name}: {why} -- the host's NPC is fighting, WO-132 keeps it engaged"); return; }
         Interlocked.Increment(ref _w147EngageOff);
-        try { await _combat.Wo132EngageAsync(false, e.Eid, default); } catch { }
+        try { await _combat.Wo132EngageAsync(false, e.Eid, default); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("combat-hold-clear", caughtFailure); }
         Console.WriteLine($"MP-W147 engage off {name}: {why} -- still bound and paused");
     }
 
@@ -597,7 +597,7 @@ public partial class GameBridge
                 var r = await _combat.Wo137ReadStateTypesAsync([path]);
                 if (r is { Count: 1 } && r[0].Found && r[0].Type.Length > 0) { type = r[0].Type; _w147PathType[path] = type; }
             }
-            catch { }
+            catch (Exception caughtFailure) { Faults.ReportThrottled("quest-type-probe", caughtFailure); }
         }
         _w147PortValues.TryGetValue(path, out var learned);
         string? port = Wo147Rules.CorrectionPort(idx, type, hostVal, learned);
@@ -625,7 +625,7 @@ public partial class GameBridge
             var r = await _combat.Wo137ReadStateTypesAsync([req.Path]);
             if (r is { Count: 1 } && r[0].Found) type = r[0].Type;
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("quest-type-request", caughtFailure); }
         var (kind, why) = Wo147Rules.Destructive(idx, type, req.Port, req.Old, req.New);
         if (kind == Wo147Rules.Destruction.None) return false;
         Interlocked.Increment(ref _w147DestructiveIn);
@@ -657,7 +657,7 @@ public partial class GameBridge
                         if (last != req.Old) break;   // this world went somewhere else
                     }
                 }
-                catch { }
+                catch (Exception caughtFailure) { Faults.ReportThrottled("quest-state-request", caughtFailure); }
             }
             var verdict = Wo147Rules.JudgeDestructive(reached, false);
             Wo137Post(async () =>

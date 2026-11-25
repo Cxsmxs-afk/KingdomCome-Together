@@ -78,7 +78,7 @@ public partial class GameBridge
             await _transport.ExecuteNowAsync(Wo154MenuRules.SessionLua("none", false, null, null, null,
                 Wo154MenuRules.LinkWord(AgentConnectionStatus.State), ReleaseVersionInfo.Current, Wo154MenuGameScreenNow(), false));
         }
-        catch { }
+        catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("menu-session-clear", caughtFailure); }
     }
 
     /// <summary>"Gameplay started": a world (re)loaded -- the saved choices go in again once it has settled.</summary>
@@ -236,7 +236,7 @@ public partial class GameBridge
             if (KcdLogLocator.Find() is string log && Path.GetDirectoryName(log) is string root)
                 bound = KeybindPak.BoundMenuKeyInPak(Path.Combine(root, "Mods", "kdcmp", "Data", KeybindPak.PakFileName));
         }
-        catch { }
+        catch (Exception caughtFailure) { Faults.ReportThrottled("menu-log-window", caughtFailure); }
         _w154mStoredKey = stored;
         _w154mActiveKey = bound is not null && Array.IndexOf(KeybindPak.MenuKeys, bound) >= 0 ? bound : stored;
         Console.WriteLine($"MP-MENU keys: bound={_w154mActiveKey} ({(bound is null ? "the keys pak was not readable: settings.json's" : KeybindPak.PakFileName)}) stored={stored} ({Wo154MenuRules.LauncherSettingsFile}{(note.Length > 0 ? ": " + note : "")})");

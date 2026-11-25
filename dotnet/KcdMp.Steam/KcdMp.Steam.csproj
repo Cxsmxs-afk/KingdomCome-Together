@@ -19,6 +19,7 @@
   <ItemGroup>
     <!-- The WO-120 Phase 0 probe drives the raw APIs (messages, legacy) the product never uses. -->
     <InternalsVisibleTo Include="KcdMpSteamProbe" />
+    <InternalsVisibleTo Include="KcdMp.Relay.Tests" />
   </ItemGroup>
 
   <ItemGroup>

@@ -39,7 +39,7 @@ public partial class GameBridge
         long now = Environment.TickCount64;
         if (!Wo160Rules.WhereRefreshDue(W160ConfirmedAgeMs(), now - _w160AskedMs)) return;
         _w160AskedMs = now;
-        try { await ExecLuaAsync("if KCD2MP_Wo124Where then KCD2MP_Wo124Where() end"); } catch { }
+        try { await ExecLuaAsync("if KCD2MP_Wo124Where then KCD2MP_Wo124Where() end"); } catch (Exception caughtFailure) { Faults.ReportThrottled("load-place-probe", caughtFailure); }
     }
 
     /// <summary>Called every second by the WO-140 loop: a join in flight keeps the verdict quiet for 60 s after it ends.</summary>
@@ -124,7 +124,7 @@ public partial class GameBridge
         if (!avatar && await Wo210ReleaseOnLeaveAsync(name, had, prev, a)) release = true;
         else if (release)
         {
-            try { await ExecLuaAsync($"if KCD2MP_W160Release then KCD2MP_W160Release(\"{EscapeLua(name)}\", \"activity-changed\") end"); } catch { }
+            try { await ExecLuaAsync($"if KCD2MP_W160Release then KCD2MP_W160Release(\"{EscapeLua(name)}\", \"activity-changed\") end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("activity-release", caughtFailure); }
             Interlocked.Increment(ref _w160Released);
         }
         // WO-211 C.1: never a placement into the very seat the hand-over released this copy from a moment ago (the two never fight)

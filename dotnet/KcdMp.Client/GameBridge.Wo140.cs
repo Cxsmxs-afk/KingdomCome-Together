@@ -104,10 +104,10 @@ public partial class GameBridge
         _w140AcceptedJoiners.Clear();
         _w140LocalSkipping = false;
         _w140SaveAfter = false;
-        try { await _combat.Wo140ConfigAsync(false); } catch { }
+        try { await _combat.Wo140ConfigAsync(false); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("skip-observer-stop", caughtFailure); }
         _w140CfgKey = -1;
-        try { await ExecLuaAsync("if KCD2MP_W140Session then KCD2MP_W140Session(false) end"); } catch { }
-        try { await ExecLuaAsync("if KCD2MP_W140Separate then KCD2MP_W140Separate(false, \"\") end"); } catch { }
+        try { await ExecLuaAsync("if KCD2MP_W140Session then KCD2MP_W140Session(false) end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("skip-session-clear", caughtFailure); }
+        try { await ExecLuaAsync("if KCD2MP_W140Separate then KCD2MP_W140Separate(false, \"\") end"); } catch (Exception closeError) when (closeError is OperationCanceledException or ObjectDisposedException or IOException or System.Net.Sockets.SocketException) { } catch (Exception caughtFailure) { Faults.ReportThrottled("skip-separation-clear", caughtFailure); }
         if (_w140Separate) { _w140Separate = false; if (_joinUiState == "own-world") SetJoinUi("idle", ""); }
     }
 
@@ -755,7 +755,7 @@ public partial class GameBridge
 
     private async Task Wo140SendLeashStateSoonAsync()
     {
-        try { await Wo114SendStateAsync(JoinerLeashFlags()); } catch { }
+        try { await Wo114SendStateAsync(JoinerLeashFlags()); } catch (Exception caughtFailure) { Faults.ReportThrottled("skip-partner-state", caughtFailure); }
     }
 
     /// <summary>A frame of the host's world while this joiner is in its own: dropped (counted). At the reader and the processor.</summary>
