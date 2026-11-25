@@ -17620,12 +17620,12 @@ local function mp_item_detect(pp)
     end
 end
 
-local function mp_item_drop_note(key, d, stage, entity)
+function KCD2MP.ItemDropNote(key, d, stage, entity)
     if not d.cls or d.cls ~= KCD2MP.itemDropProbe then return end
     local owner, count = "unknown", nil
     pcall(function()
         local id = entity and entity.item and entity.item:GetOwnerId()
-        if id ~= nil then owner = id == player.id and "player" or "other" end
+        if id ~= nil then owner = id == 0 and "none" or (id == player.id and "player" or "other") end
     end)
     pcall(function() count = player.inventory:GetCountOfClass(d.cls) end)
     local change = count and d.probeCount and count - d.probeCount or nil
@@ -17650,7 +17650,7 @@ function KCD2MP_ItemDropRegistered(dropId, entName)
             d.amount = (e.Properties and e.Properties.nAmount) or 1
             d.health = e.Properties and e.Properties.fHealth
             d.wuid   = e.item and e.item:GetId() or nil
-            mp_item_drop_note(key, d, "registered", e)
+            KCD2MP.ItemDropNote(key, d, "registered", e)
         end
     end)
     KCD2MP.itemDrops[key] = d
@@ -17671,7 +17671,7 @@ function KCD2MP_ItemDropAdd(dropId, cls, amount, health, x, y, z, srcGhostId)
         x = tonumber(x), y = tonumber(y), z = tonumber(z),
         src = tostring(srcGhostId), mine = false, state = "pending",
     }
-    mp_item_drop_note(key, KCD2MP.itemDrops[key], "relay", nil)
+    KCD2MP.ItemDropNote(key, KCD2MP.itemDrops[key], "relay", nil)
     mp_log("ITEM-SYNC drop " .. key .. " pending: " .. cls .. " x" .. tostring(amount))
 end
 
@@ -17794,7 +17794,7 @@ local function mp_item_finalize(key, d)
             d.state = "resolved"
         else
             d.state = "ground"
-            mp_item_drop_note(key, d, "materialized", placed)
+            KCD2MP.ItemDropNote(key, d, "materialized", placed)
             mp_log("ITEM-SYNC drop " .. key .. " materialized -> " .. d.entName)
         end
         return
@@ -17806,7 +17806,7 @@ local function mp_item_finalize(key, d)
             if a then System.RemoveEntity(a.id) end
         end)
         d.state = "resolved"
-        mp_item_drop_note(key, d, "no-placement", nil)
+        KCD2MP.ItemDropNote(key, d, "no-placement", nil)
         mp_log("ITEM-SYNC drop " .. key .. " FAILED: placed entity never appeared")
     end
 end
@@ -17844,7 +17844,7 @@ local function mp_item_watch(pp)
             if dx * dx + dy * dy <= r2 then
                 local e = System.GetEntityByName(d.entName)
                 if not e then
-                    mp_item_drop_note(key, d, "missing", nil)
+                    KCD2MP.ItemDropNote(key, d, "missing", nil)
                     d.state = "claimed_local"
                     KCD2MP_EmitEvent("item_claim", key)
                     mp_log("ITEM-SYNC drop " .. key .. " taken locally -> claim sent")
