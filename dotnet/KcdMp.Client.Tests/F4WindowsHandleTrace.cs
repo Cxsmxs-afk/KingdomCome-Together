@@ -27,6 +27,7 @@ internal sealed class F4WindowsHandleTrace : IDisposable
     private sealed record HandleOperation(int Kind, long Thread, long[] Frames);
     private sealed record HandleHistory(HandleOperation[] Operations, string? Problem = null);
     private sealed record WorkerObservation(long Id, string[] Frames, bool Waiting);
+    private enum WorkerStartupHandle { None, FirstEvent, SecondEvent, Thread }
     internal readonly record struct Allocation(string Kind, long Thread, string Stack, long Worker = 0, long TargetThread = 0,
         string? PersistentMonitor = null);
     internal readonly record struct Bookkeeping(int WinsockPairs, int RegexCacheEvents, int WorkerStarts, int WorkerNameEvents,
@@ -78,7 +79,8 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         var allocations = captured.Select(handle => new Allocation(handle.Kind, handle.Stack.Thread,
             DescribeStack(handle.Stack, modules, runtime), handle.Worker, handle.Target,
             handle.Kind == "Event" ? monitors?.GetValueOrDefault(handle.Handle) : null)).ToArray();
-        var bookkeeping = CountBookkeeping(allocations, liveThreads, out var startedWorkers);
+        bool knownNativeWorkerStack = RuntimeInformation.ProcessArchitecture == Architecture.X64 && Environment.Version == new Version(8, 0, 34);
+        var bookkeeping = CountBookkeeping(allocations, liveThreads, out var startedWorkers, knownNativeWorkerStack);
         var workers = checkIdleWorkers ? ObservePoolWorkers(runtime, startedWorkers, newThreads) : [];
         var histories = allocations.Select(handle =>
             $"{handle.Kind}:{handle.Stack}@thread={handle.Thread}@worker={handle.Worker}@target={handle.TargetThread}" +
@@ -92,7 +94,8 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         return new(details, bookkeeping, workers.Count(worker => worker.Waiting));
     }
 
-    internal static Bookkeeping CountBookkeeping(Allocation[] allocations, IReadOnlySet<long> liveThreads, out HashSet<long> startedWorkers)
+    internal static Bookkeeping CountBookkeeping(Allocation[] allocations, IReadOnlySet<long> liveThreads, out HashSet<long> startedWorkers,
+        bool knownNativeWorkerStack = false)
     {
         var ordinary = allocations.Where(handle => handle.PersistentMonitor is null).ToArray();
         // The provider holds an Event and a reference to its actual calling
@@ -121,16 +124,24 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         // Attribute CLR startup only for identified, still-live pool workers.
         // An application-owned Thread.StartCore or an unmatched Event stays counted.
         var workers = new HashSet<long>();
-        var threadStarts = ordinary.Where(handle => handle.Thread != 0 &&
-            handle.Stack.Contains("coreclr.dll+", StringComparison.Ordinal) &&
-            handle.Stack.Split('>').Contains("System.Threading.Thread.StartCore", StringComparer.Ordinal));
+        var threadStarts = ordinary.Where(handle => handle.Thread != 0 && (ManagedThreadStart(handle) ||
+            knownNativeWorkerStack && handle.Stack.EndsWith(">unresolved", StringComparison.Ordinal) &&
+            NativeThreadStart(handle) != WorkerStartupHandle.None));
         foreach (var launch in threadStarts.GroupBy(handle => handle.Thread))
         {
             var threads = launch.Where(handle => handle.Kind == "Thread").ToArray();
+            var events = launch.Where(handle => handle.Kind == "Event").ToArray();
             var targetIds = threads.Select(handle => handle.Worker).ToHashSet();
-            if (threads.Length > 0 && !targetIds.Contains(0) && targetIds.Count == threads.Length && targetIds.IsSubsetOf(liveThreads) &&
-                launch.Count(handle => handle.Kind == "Event") == 2 * threads.Length)
-                workers.UnionWith(targetIds);
+            if (threads.Length == 0 || targetIds.Contains(0) || targetIds.Count != threads.Length ||
+                !targetIds.IsSubsetOf(liveThreads) || events.Length != 2 * threads.Length) continue;
+
+            // When DAC cannot resolve the managed frame, require both exact
+            // native event call sites and the kernel target of each worker handle.
+            if (launch.Any(handle => !ManagedThreadStart(handle)) &&
+                (threads.Any(thread => thread.Worker != thread.TargetThread || NativeThreadStart(thread) != WorkerStartupHandle.Thread) ||
+                events.Count(handle => NativeThreadStart(handle) == WorkerStartupHandle.FirstEvent) != threads.Length ||
+                events.Count(handle => NativeThreadStart(handle) == WorkerStartupHandle.SecondEvent) != threads.Length)) continue;
+            workers.UnionWith(targetIds);
         }
         // The CLR assigns the name under the new worker's own monitor. Its
         // single contended initialization event belongs to that same worker.
@@ -148,6 +159,25 @@ internal sealed class F4WindowsHandleTrace : IDisposable
             .GroupBy(handle => handle.PersistentMonitor).Count(group => group.Count() == 1);
         startedWorkers = workers;
         return new(pairs, regexEvents == 1 ? 1 : 0, workers.Count, nameEvents, threadReferences, monitorEvents);
+    }
+
+    private static bool ManagedThreadStart(Allocation handle) =>
+        handle.Stack.Contains("coreclr.dll+", StringComparison.Ordinal) &&
+        handle.Stack.Split('>').Contains("System.Threading.Thread.StartCore", StringComparer.Ordinal);
+
+    // CoreCLR 8.0.34 x64. The #74 traces identify these same native stacks
+    // with the managed Thread.StartCore frame. No match for a different runtime.
+    private static WorkerStartupHandle NativeThreadStart(Allocation handle)
+    {
+        const string chain = ">coreclr.dll+416c1>coreclr.dll+413b3>coreclr.dll+408f0>";
+        if (handle.Kind == "Thread" && handle.Stack.Contains(">coreclr.dll+417d4" + chain, StringComparison.Ordinal))
+            return WorkerStartupHandle.Thread;
+        if (handle.Kind != "Event") return WorkerStartupHandle.None;
+        if (handle.Stack.Contains(">coreclr.dll+418df>coreclr.dll+4188c>coreclr.dll+417ad" + chain, StringComparison.Ordinal))
+            return WorkerStartupHandle.FirstEvent;
+        if (handle.Stack.Contains(">coreclr.dll+418df>coreclr.dll+4189a>coreclr.dll+417ad" + chain, StringComparison.Ordinal))
+            return WorkerStartupHandle.SecondEvent;
+        return WorkerStartupHandle.None;
     }
 
     private static WorkerObservation[] ObservePoolWorkers(ClrRuntime? runtime, IReadOnlySet<long> startedWorkers, IReadOnlySet<long> newThreads)

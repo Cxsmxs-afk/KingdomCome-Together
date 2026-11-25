@@ -80,6 +80,35 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void An_unresolved_worker_stack_requires_both_native_events_and_the_live_kernel_target()
+    {
+        const string clr = ">coreclr.dll+416c1>coreclr.dll+413b3>coreclr.dll+408f0>unresolved";
+        const string event1 = "ntdll.dll>KERNELBASE.dll>coreclr.dll+418df>coreclr.dll+4188c>coreclr.dll+417ad" + clr;
+        const string event2 = "ntdll.dll>KERNELBASE.dll>coreclr.dll+418df>coreclr.dll+4189a>coreclr.dll+417ad" + clr;
+        const string thread = "ntdll.dll>KERNELBASE.dll>KERNEL32.DLL>coreclr.dll+417d4" + clr;
+        F4WindowsHandleTrace.Allocation[] allocations =
+        [
+            new("Event", 1, event1), new("Event", 1, event2), new("Thread", 1, thread, Worker: 10, TargetThread: 10),
+            new("Event", 2, event1), new("Event", 2, event1), new("Thread", 2, thread, Worker: 20, TargetThread: 20),
+            new("Event", 3, event1), new("Event", 3, event2), new("Thread", 3, thread, Worker: 30, TargetThread: 31),
+            new("Event", 4, event1), new("Event", 4, event2), new("Thread", 4, thread, Worker: 40, TargetThread: 40),
+            new("Event", 5, event1), new("Event", 5, "KcdMp.Client.App.Open"), new("Thread", 5, thread, Worker: 50, TargetThread: 50),
+            new("Event", 6, event1), new("Event", 6, event2), new("Thread", 6, thread, TargetThread: 60),
+            new("Event", 7, event1), new("Event", 7, event2),
+            new("Thread", 7, thread.Replace("unresolved", "KcdMp.Client.App.ThreadStart"), Worker: 70, TargetThread: 70),
+        ];
+        var live = new HashSet<long> { 10, 20, 30, 31, 50, 60, 70 };
+        var otherRuntime = F4WindowsHandleTrace.CountBookkeeping(allocations, live, out var otherWorkers);
+        Assert.Equal(0, otherRuntime.Total);
+        Assert.Empty(otherWorkers);
+
+        var knownRuntime = F4WindowsHandleTrace.CountBookkeeping(allocations, live, out var started, knownNativeWorkerStack: true);
+        Assert.Equal(1, knownRuntime.WorkerStarts);
+        Assert.Equal(3, knownRuntime.Total);
+        Assert.Equal(10, Assert.Single(started));
+    }
+
+    [Fact]
     public async Task A_baseline_gate_has_a_concrete_runtime_monitor_owner()
     {
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
