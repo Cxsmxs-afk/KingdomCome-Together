@@ -217,6 +217,27 @@ do
     noErrs("D/P/R")
 end
 
+do
+    local name = "tb_retry_keeper"
+    local keeper = copy(name, 1, 0)
+    KCD2MP_W137Session(false, true, true)
+    local attempt = { since = NOW, id = 92, via = "OnTalk", w164Retried = true }
+    KCD2MP.w137.talking[name] = attempt
+    local previous = DialogModule
+    local starts = 0
+    DialogModule = { ForceDialog = function(npc, initiator)
+        if npc == keeper.id and initiator == player.id then starts = starts + 1 end
+    end }
+    local timeout = KCD2MP_W137TalkDropped(92, true)
+    local dupe = KCD2MP_W137TalkDropped(92, true)
+    check("R8: the second local timeout dispatches exactly one forced attempt for its active talk",
+        timeout and not dupe and starts == 1 and attempt.id == nil and KCD2MP.w137.talking[name] == attempt, starts)
+    DialogModule = previous
+    KCD2MP.w137.talking[name] = nil
+    ENTS[name] = nil
+    KCD2MP.npcPuppets[name] = nil
+end
+
 -- (L) the flee limiter -----------------------------------------------------------------------------------------------------------
 do
     ERRS = {}
