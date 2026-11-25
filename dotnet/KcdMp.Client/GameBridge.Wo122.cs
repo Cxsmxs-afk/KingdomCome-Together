@@ -388,10 +388,15 @@ public partial class GameBridge
         catch (Exception ex) { Console.WriteLine($"MP-WORLDSAVE could not watch the saves folder: {ex.Message}"); }
     }
 
+    internal TimeProvider WorldSaveSettleTime { private get; init; } = TimeProvider.System;
+
+    private long WorldSaveSettleNowMs() =>
+        (long)WorldSaveSettleTime.GetElapsedTime(0, WorldSaveSettleTime.GetTimestamp()).TotalMilliseconds;
+
     private void OnSaveFileEvent(string path)
     {
         if (WorldSaved.ParsePath(path) is null) return;   // not an engine-named save (e.g. a transient mpworld file)
-        _saveEventAt[path] = Environment.TickCount64;
+        _saveEventAt[path] = WorldSaveSettleNowMs();
         if (_saveSettling.TryAdd(path, 0)) _ = SettleSaveAsync(path);
     }
 
@@ -403,22 +408,22 @@ public partial class GameBridge
             string display = SaveDisplay(path);
             WhsSave.VerifyResult? last = null;
             const int quietMs = 600, retryMs = 500, timeoutMs = 20_000;
-            long started = Environment.TickCount64, deadline = started + timeoutMs, nextProbe = started;
+            long started = WorldSaveSettleNowMs(), deadline = started + timeoutMs, nextProbe = started;
             while (true)
             {
-                long now = Environment.TickCount64;
+                long now = WorldSaveSettleNowMs();
                 long lastWrite = _saveEventAt.TryGetValue(path, out var at) ? at : started;
                 long due = Math.Max(nextProbe, lastWrite + quietMs);
                 if (now > deadline || due > deadline) break;
                 if (due > now)
                 {
                     // A fresh change can move the quiet deadline. Recheck before reading the file.
-                    await Task.Delay((int)(due - now));
+                    await Task.Delay(TimeSpan.FromMilliseconds(due - now), WorldSaveSettleTime);
                     continue;
                 }
                 last = WhsSave.VerifyFile(path);
                 if (last.Ok) break;
-                nextProbe = Environment.TickCount64 + retryMs;
+                nextProbe = WorldSaveSettleNowMs() + retryMs;
             }
             if (last is null || !last.Ok)
             {

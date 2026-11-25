@@ -16,6 +16,7 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
 
     private readonly string _saves;
     private readonly Func<int, byte[]>? _hostSave;
+    private readonly bool _publishCompletedSave;
     private readonly Action _gameplayStarted;
     private readonly EngineLine _feed;
     private readonly object _logGate = new();
@@ -41,10 +42,11 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
     private readonly Channel<string> _exitLoads = Channel.CreateUnbounded<string>();
 
     public JoinCalendarTestEngine(string logPath, string saves, Func<int, byte[]>? hostSave, Action gameplayStarted,
-        int httpTimeoutMs = 2000)
+        int httpTimeoutMs = 2000, bool publishCompletedSave = false)
     {
         _saves = saves;
         _hostSave = hostSave;
+        _publishCompletedSave = publishCompletedSave;
         _gameplayStarted = gameplayStarted;
         var http = new HttpGameTransport("http://localhost:1403", httpTimeoutMs, new ConsoleHandler(this)) { BatchingEnabled = false };
         Transport = new LogTailGameTransport(http, logPath);
@@ -148,7 +150,16 @@ internal sealed class JoinCalendarTestEngine : IAsyncDisposable
             int index = Interlocked.Increment(ref _saveIndex);
             string path = Path.Combine(_saves, "playline0", FormattableString.Invariant($"save{index:D3}.whs"));
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllBytes(path, hostSave(index));
+            byte[] bytes = hostSave(index);
+            if (_publishCompletedSave)
+            {
+                // Tell the accelerated settle clock about a save only after all
+                // bytes are present. The real watcher sees the finished rename.
+                string staging = path + ".writing";
+                File.WriteAllBytes(staging, bytes);
+                File.Move(staging, path);
+            }
+            else File.WriteAllBytes(path, bytes);
             SaveWritten?.Invoke(path);
         }
 

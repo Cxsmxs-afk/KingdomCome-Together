@@ -41,6 +41,7 @@ function Assert-KcdTrxResults {
     $handleBudgets = [System.Collections.Generic.HashSet[string]]::new()
     $threadBudgets = [System.Collections.Generic.HashSet[string]]::new()
     $fileBudgets = [System.Collections.Generic.HashSet[string]]::new()
+    $clientDurations = [System.Collections.Generic.List[object]]::new()
     $resourceScenarios = @('mpexit', 'mpexit-receipt', 'transfer-player-a', 'transfer-player-b', 'transfer-host', 'transfer-eof',
                           'missing-personal-save', 'cancel-rejoin-2', 'cancel-rejoin-3', 'cancel-rejoin-4', 'return-deadline',
                           'active-guests-3', 'active-guests-4', 'host-return-2', 'host-return-3', 'host-return-4',
@@ -56,6 +57,14 @@ function Assert-KcdTrxResults {
         }
         if ($result.GetAttribute('outcome') -ne 'Passed') {
             throw "$Suite did not pass $($result.GetAttribute('testName')) ($($result.GetAttribute('outcome')))"
+        }
+        if ($Suite -eq 'Client') {
+            $elapsed = [TimeSpan]::Zero
+            if ([TimeSpan]::TryParse($result.GetAttribute('duration'), [Globalization.CultureInfo]::InvariantCulture, [ref]$elapsed) -and
+                $elapsed.TotalSeconds -ge 2) {
+                $method = $result.GetAttribute('testName') -replace '\(.*$', ''
+                $clientDurations.Add(@{ Method = $method; Milliseconds = [int]$elapsed.TotalMilliseconds })
+            }
         }
         if ($Suite -eq 'Client' -and $result.GetAttribute('testName').StartsWith('KcdMp.Client.Tests.JoinCalendar')) {
             $stdout = $result.SelectSingleNode('t:Output/t:StdOut', $names)
@@ -124,6 +133,9 @@ function Assert-KcdTrxResults {
                 -not $resourceCycles[$scenario].SetEquals([int[]](0..5))) {
                 throw "Incomplete join resource checks for $scenario"
             }
+        }
+        $clientDurations | Sort-Object { $_.Milliseconds } -Descending | Select-Object -First 10 | ForEach-Object {
+            Write-Host "Client case duration ms=$($_.Milliseconds) method=$($_.Method)"
         }
     }
     Write-Host "Required suite $Suite PASS: $summary (minimum $MinimumCount)"
