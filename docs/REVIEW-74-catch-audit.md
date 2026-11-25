@@ -1,8 +1,8 @@
 # C#-Catch-Audit nach Draft #74
 
 Basis ist `b1c8cf2548a077e26038eacf13023c3797a2c325`.
-Roslyn findet 183 nackte leere Catches und 16 weitere Catches, die ausschließlich einen Kommentar enthalten.
-Gezählt sind Produktionsdateien in `dotnet/` und `KCDMP_launcher/`. Tests und Build-Ausgaben sind ausgenommen.
+Roslyn findet 183 nackte leere Catches und 16 weitere Catches, die ausschließlich einen Kommentar enthalten, in `.cs`-Produktionsdateien.
+Im C#-Block eines Razor-Modals findet sich eine weitere Stelle. Tests und Build-Ausgaben sind ausgenommen.
 Die Zeilen unten beziehen sich auf die Basis. Die Vorgangskennung lässt sich im aktuellen Code oder im Log suchen.
 
 - (a) Abbruch, auslaufender Transport oder Cleanup. Erwartete Fehler sind typisiert. Unerwartete Fehler bleiben im gedrosselten Log sichtbar.
@@ -210,5 +210,6 @@ Die Zeilen unten beziehen sich auf die Basis. Die Vorgangskennung lässt sich im
 | `KCDMP_launcher/Pages/Home.razor.cs:241` | b | `launcher-custom-servers` |
 | `KCDMP_launcher/Pages/Home.razor.cs:1192` | b | `launcher-favorites` |
 | `KCDMP_launcher/Pages/Home.Wo150.cs:329` | b | `setup-status-read` |
+| `KCDMP_launcher/Components/Modals/RestoreSavesModal.razor:198` | b | `GameRunning`. Die reine Namensableitung braucht keinen Ausnahme-Rückfall. |
 
-Der Client-Pflichttest `EmptyCatchTests.Production_code_has_no_untyped_empty_catches` setzt die Obergrenze auf 0. Er liest C#-Syntax in Release und Debug.
+Der Client-Pflichttest `EmptyCatchTests.Production_code_has_no_untyped_empty_catches` setzt die Obergrenze auf 0. Er liest C#-Syntax in Release und Debug einschließlich der C#-Blöcke von Razor-Komponenten.
