@@ -67,7 +67,8 @@ public sealed partial class JoinCalendarIntegrationTests
         if (firstFile == "pipe-reconnect")
         {
             long connection = pipe.Pipe.EdgeConnectionRevision;
-            typeof(CombatPipe).GetMethod("Drop", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(pipe.Pipe, [null]);
+            typeof(CombatPipe).GetMethod("Drop", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(pipe.Pipe, ["fixture-reconnect", null]);
             Assert.True(await pipe.Pipe.EnsureConnectedAsync(ct));
             Assert.NotEqual(connection, pipe.Pipe.EdgeConnectionRevision);
         }
