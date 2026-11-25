@@ -216,7 +216,8 @@ public class Wo216LifecyclePipeTests
     public async Task Native_rejection_is_a_typed_current_state_and_malformed_ack_cannot_be_applied()
     {
         string name = Name(); using var server = Server(name); var accept = server.WaitForConnectionAsync();
-        await using var pipe = new CombatPipe(name); Assert.True(await pipe.EnsureConnectedAsync()); await accept;
+        await using var pipe = new CombatPipe(name) { ControlTime = new ManualFrameTime() };
+        Assert.True(await pipe.EnsureConnectedAsync()); await accept;
         var stale = pipe.Wo216LifecycleAsync(1, 99); uint id = Id(await Read(server));
         await Reply(server, Wo163Reply, Wo216LifecycleCodecTests.Ack(id, phase: 2, generation: 100, accepted: false, reason: 2, active: true));
         var ack = (await stale.WaitAsync(TimeSpan.FromSeconds(2)))!.Value;
@@ -224,7 +225,11 @@ public class Wo216LifecyclePipeTests
         var malformed = pipe.Wo216LifecycleAsync(3, 0); id = Id(await Read(server));
         byte[] bad = Wo216LifecycleCodecTests.Ack(id); bad[5] = 2;
         await Reply(server, Wo163Reply, bad);
-        Assert.Null(await malformed.WaitAsync(TimeSpan.FromSeconds(2))); Assert.True(pipe.IsConnected);
+        // Answers on this connection are read in wire order. A later valid
+        // ACK must complete this request if the malformed one was ignored.
+        await Reply(server, Wo163Reply, Wo216LifecycleCodecTests.Ack(id, generation: 101));
+        Assert.Equal(101ul, (await malformed.WaitAsync(TimeSpan.FromSeconds(2)))!.Value.Generation);
+        Assert.True(pipe.IsConnected);
     }
 
     [Fact]
