@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/DeepFriedDepp/KingdomCome-Together/releases/latest"><img alt="Latest release" src="https://img.shields.io/badge/latest%20release-v0.63.9-8a3324?style=flat-square"></a>
+  <a href="https://github.com/DeepFriedDepp/KingdomCome-Together/releases/latest"><img alt="Documented version 0.65.2" src="https://img.shields.io/badge/Version-v0.65.2-8a3324?style=flat-square"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-555555?style=flat-square">
   <a href="LICENSE"><img alt="License: GPLv3" src="https://img.shields.io/badge/license-GPLv3-2c3e50?style=flat-square"></a>
   <a href="https://dsc.gg/kcd2-together"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white&style=flat-square"></a>
@@ -38,16 +38,18 @@ and now and then something will break. New builds come often.
 
 | Works well | Works, but rough | Not yet |
 |---|---|---|
-| Joining a friend's world with your own character, or a new one | Joining each other's conversations: you listen in and vote on answers, but the camera and keys can misbehave | Playing far apart (you are kept within about 650 m) |
-| Seeing each other: walking, riding, clothes, weapons | Villagers glide when they walk on the partner's screen | Carts moving on the partner's screen |
+| Joining a friend's world with your own character, or a new one | Listening in on the other player's conversation. The player who starts the dialogue chooses the answers. The camera and keys can misbehave. | Playing far apart (you are kept within about 650 m) |
+| Seeing each other: walking, riding, clothes, weapons | Villagers walk on the partner's screen. A copy that falls behind may be pulled back. | Road encounters matching on both screens |
 | Fighting the same enemies: hits, knockdowns and deaths show for both | Some villagers stand idle, or work without their tools, where the host sees them busy | Grabs in fights |
 | Shared quests: either of you can move a quest forward | Cutscenes play for both, but one can leave the partner on a black screen for a while | Shared chests and shop stock (each player has their own) |
-| Looting bodies and dropping items for each other | Trading as the partner can close by itself | Road encounters matching on both screens |
-| Sleeping together, one shared clock | Paired moves and weapon draws in fights don't always show | Stolen marks on shared items |
+| Looting bodies and dropping items for each other | The joiner's game can close after deaths nearby. | Stolen marks on shared items |
+| Sleeping together, one shared clock | Paired moves and weapon draws in fights don't always show | |
 | Crime: the host's guards judge both of you | Bows and crossbows: the shot shows, the draw and aim don't | The regular (non-Modding-Tools) game |
+| One horse per player with their own saddlebags | The partner's horse can appear without its tack. Food dropped at the stable can vanish. | |
+| Seated riders and turning wheels on cart copies | Trade opens at mirrored shops. A dialogue can time out, and some keepers offer an empty sell list. | |
 | | Lip sync, voice chat and dice between players are unpolished | |
 
-<sub>As of release 0.63.9.</sub>
+<sub>As of version 0.65.2. See the known issues for the remaining in-game checks.</sub>
 
 The full, current list lives in **[Known issues](docs/KNOWN-ISSUES.md)**. What changed in each build is on the
 **[releases page](https://github.com/DeepFriedDepp/KingdomCome-Together/releases)**.

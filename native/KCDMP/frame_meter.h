@@ -23,6 +23,14 @@ constexpr double kSlowFrameUs = 50e3;
 constexpr int    kOursBuckets = 400;          // WO-218 B.2: 50 us x 400 = 20 ms
 constexpr double kOursBucketUs = 50.0;
 
+using CostHistogram = uint32_t[kOursBuckets + 1];
+
+inline void record_cost(CostHistogram& histogram, double us) {
+    const int bucket = us >= kOursBuckets * kOursBucketUs ? kOursBuckets
+        : us > 0 ? static_cast<int>(us / kOursBucketUs) : 0;
+    ++histogram[bucket];
+}
+
 struct Window {
     double   startUs = 0;        // the window's first frame (0 = nothing yet)
     double   lastUs = 0;         // the previous frame
@@ -30,7 +38,7 @@ struct Window {
     double   sumFrameUs = 0, worstFrameUs = 0;
     double   sumOursUs = 0, worstOursUs = 0;
     uint32_t slow = 0;
-    uint32_t oursHist[kOursBuckets + 1]{};   // WO-218 B.2: our time per frame, 50 us buckets (the last: 20 ms and over)
+    CostHistogram oursHist{};   // WO-218 B.2: our time per frame, 50 us buckets (the last: 20 ms and over)
 };
 
 // One frame at nowUs (when the hook ran), oursUs what this DLL's work cost in it.
@@ -47,24 +55,22 @@ inline bool add(Window& w, double nowUs, double oursUs) {
     }
     w.sumOursUs += oursUs;
     if (oursUs > w.worstOursUs) w.worstOursUs = oursUs;
-    {   // WO-218 B.2
-        int b = oursUs > 0 ? static_cast<int>(oursUs / kOursBucketUs) : 0;
-        if (b > kOursBuckets) b = kOursBuckets;
-        ++w.oursHist[b];
-    }
+    record_cost(w.oursHist, oursUs);
     return nowUs - w.startUs >= kPeriodUs;
 }
 
 // WO-218 B.2: the 95th percentile of our time per frame (the bucket's top edge), 0 with no frame.
-inline double ours_p95(const Window& w) {
+inline double p95(const CostHistogram& histogram) {
     uint32_t n = 0;
-    for (int i = 0; i <= kOursBuckets; ++i) n += w.oursHist[i];
+    for (auto count : histogram) n += count;
     if (!n) return 0.0;
     const uint32_t want = static_cast<uint32_t>(n * 0.95 + 0.5);
     uint32_t acc = 0;
-    for (int i = 0; i <= kOursBuckets; ++i) { acc += w.oursHist[i]; if (acc >= want) return (i + 1) * kOursBucketUs; }
+    for (int i = 0; i <= kOursBuckets; ++i) { acc += histogram[i]; if (acc >= want) return (i + 1) * kOursBucketUs; }
     return (kOursBuckets + 1) * kOursBucketUs;
 }
+
+inline double ours_p95(const Window& w) { return p95(w.oursHist); }
 
 inline double fps(const Window& w) {
     return w.sumFrameUs > 0 ? w.frames * 1e6 / w.sumFrameUs : 0.0;

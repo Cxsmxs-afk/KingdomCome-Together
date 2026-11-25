@@ -72,11 +72,13 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
             new("Event", 17, workerStart), new("Event", 17, workerStart), new("Thread", 17, workerStart),
             new("Event", 16, workerName), new("Event", 10, workerName)
         ];
-        var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations,
-            new HashSet<long> { 10, 11, 12, 13, 16, 19, 20, 21 }, out var started);
+        var live = new HashSet<long> { 10, 11, 12, 13, 16, 19, 20, 21 };
+        var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations, live, out var started, knownNativeWorkerStack: true);
         Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1, 1, 1, 1, 1), runtime);
         Assert.Equal(9, runtime.Total);
         Assert.Equal(16, Assert.Single(started));
+        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1, 1, 1, 1, 0),
+            F4WindowsHandleTrace.CountBookkeeping(allocations, live, out _));
     }
 
     [Fact]

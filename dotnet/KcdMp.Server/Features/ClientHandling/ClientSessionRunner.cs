@@ -71,12 +71,12 @@ public sealed class ClientSessionRunner
 		_clientHandler.AddClient(client);
 		// This id exists even if the handshake fails. It contains no peer data.
 		ulong sessionId = (ulong)Interlocked.Increment(ref _nextDiagnosticSession);
-		_faults.FireAndLog(RunSessionAsync(client), "relay-session", sessionId);
+		_faults.FireAndLog(RunSessionAsync(client, sessionId), "relay-session", sessionId);
 	}
 
-	private async Task RunSessionAsync(ClientSession client)
+	private async Task RunSessionAsync(ClientSession client, ulong sessionId)
 	{
-		try { await client.RunAsync(); }
+		try { await client.RunAsync(sessionId); }
 		finally
 		{
 			_clientHandler.RemoveClient(client);

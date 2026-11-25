@@ -12,7 +12,7 @@
 //                    BeforePlay, streams the scene, plays and gets its own AfterPlay. Not idle = not at that step: nothing is played.
 //   B3 the hold      the joiner's own enqueue (not the mod's, the partner not already playing it) is held at "initialized": AutoPlay
 //                    (configuration +0x20, read by OnCutsceneInitialized) cleared. Released by the agent (the host's copy runs, a menu,
-//                    the host is not at that step), by any save request (never held across a save), or by the DLL's own 3 s bound.
+//                    the host is not at that step), by any save request (never held across a save), or by the DLL's own 1.8 s bound.
 //                    A release puts AutoPlay back; an initialized copy is played through its handler's own PlayCutscene input (else
 //                    C_CutscenePlayer::PlayCutscene, WO-189's call). Rechecked 1.5 s and 4 s later.
 //   B3 / C time      op 63: the active in-game sequence's time (CMovieSystem GetPlayingTime / SetPlayingTime, the movie system found by

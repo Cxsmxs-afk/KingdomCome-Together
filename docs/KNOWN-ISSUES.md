@@ -27,8 +27,9 @@ it. The work orders' findings (`docs/WO-215-findings.md` … `docs/WO-221-findin
 - **The joiner's game can still close after people die near the joiner.** The fight crash of 0.65.0 (a fighting copy whose body was
   taken away mid-swing) is fixed. A different crash after deaths is not: on our bench, in a staged massacre (a death near the
   joiner every 15 seconds), the joiner's game closed once in 2 to 26 deaths. If a game closes during or after a fight, start it
-  again and send the bug report at once: the crash report goes with it. `mp_combat_action_end off` gives 0.65.0's behaviour back
-  (it crashes on our bench too, sooner).
+  again and send the bug report at once. The candidate checks action ownership and body scope before retiring callbacks. With
+  `mp_death_trace on`, its crash text records the last retirement steps. The cause of the game allocator faults is still open.
+  Preserve the original `crash.dmp` separately and share it privately with the maintainer.
 - **A knocked-down copy stays down while its host NPC lies**; it may fall or get up a few tenths of a second after the host's, and
   on our bench one get-up in a handful was not shown.
 - **Paired attacks** (one fighter's move answered by another's) are not always shown on the joiner. **Grabs** do not happen between the
@@ -75,24 +76,29 @@ it. The work orders' findings (`docs/WO-215-findings.md` … `docs/WO-221-findin
 
 ## Conversations
 
-- **A talk may not start at the first try** (about one in twelve on our bench: the request timed out). Talk to them again.
+- **A talk may not start** after timeouts. The candidate offers one final attempt for the same local request, recorded as
+  `MP-FIX TALK`. Actual dialogue and trade completion still need a game check.
 - **Some shopkeepers do not take every item** on the joiner's side that they take on the host's (two keepers on our bench never
   took an onion). Press `.` and say which shopkeeper and which item.
 - **Listening in on the partner's talk:** once in a while the listener's keys may stop working for that talk (seen on the host, about
   one listen in five in some sessions on our bench, not traced). The listen keys are re-asserted once a second; press `.` if it
   still happens and leave with Back.
+- **Cutscenes can still go black.** The mod's hold of a locally initialized cutscene now expires after 1.8 s at the next eligible
+  frame. `MP-FIX CUT` records its release. Visible recovery and scenes waiting for a remote quest step need a game check.
 
 ## The connection
 
 - **A short stall when something loads** (a trade screen, a conversation's scene): the joiner's game itself stops for a second or
   two, and what the host does in that moment arrives just after.
 - **The host's memory climbs while the host waits alone:** join within a couple of minutes of the host loading.
+- **Launcher agent replacement while the guest world is loaded:** choose Leave first. The launcher can replace its agent when the
+  return to your save or the menu is confirmed. A reconnect directly in the loaded guest world remains unverified.
 
 ## The game's own systems
 
-- **Lip-sync of conversation lines** depends on the game's facial data, which the Modding Tools build does not ship. The mod installs
-  nothing outside its own folder; if you want lip-sync, the community's own instructions for adding the game's facial data to the
-  Modding Tools install apply.
+- **Lip-sync of conversation lines** depends on the game's facial data. Setup links the files under the retail installation's
+  `Data/Facials` into the Modding Tools workspace where available. Test actual NPC lines and the partner's conversation on both PCs.
+  See [the facial data notes](PAKET-F4-FACIALS.md).
 - **Weapons may pop in** for a moment when a person draws on the joiner's screen.
 - **Playing far apart** (beyond the leash) is not supported: people near the far player may freeze or be missing.
 - **Flying is off** in co-op (`mp_allow_fly on` for testers).

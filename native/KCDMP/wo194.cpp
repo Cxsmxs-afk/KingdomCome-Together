@@ -270,7 +270,7 @@ void note_enqueue(void* player, void* spRef) {
     if (held) c_held.fetch_add(1);
     push(kind, name, path, det);
     logf("WO194-ENQUEUE %s in-game cutscene '%s' handler=%s %s%s", mod ? "the mod's" : "this quest's", name.c_str(), path[0] ? path : "-", det,
-         held ? " -- HELD at initialized (AutoPlay cleared; released by the host's copy, a save, the agent or 3 s)" : "");
+         held ? " -- HELD at initialized (AutoPlay cleared; released by the host's copy, a save, the agent or the local deadline)" : "");
     if (timeOff) {
         c_timeOff.fetch_add(1);
         push(kEvTimeOff, name, path, "the scene's own time of day is off here until its Play ran");
@@ -352,6 +352,9 @@ void release(Held& h, Release why) {
                   static_cast<unsigned long long>(h.doneAtMs - h.atMs));
     push(kEvReleased, h.name, h.path, std::string(det) + " how=" + how);
     logf("WO194-HOLD released '%s': %s -- %s", h.name.c_str(), det, how.c_str());
+    deferred_log::Scope defer;
+    logf("MP-FIX CUT released after %.3f s (%s) scene='%s' action=%u",
+         static_cast<double>(h.doneAtMs - h.atMs) / 1000.0, release_name(why), h.name.c_str(), static_cast<unsigned>(act));
 }
 
 void recheck(Held& h) {
@@ -487,7 +490,7 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
             if (body[3] != 255) g_ffStop.store(body[3] != 0);
             if (body[4] != 255) g_timeGate.store(body[4] != 0);
             uint16_t ms = 0; std::memcpy(&ms, body + 5, 2);
-            if (ms != 0xFFFF && ms >= 500) g_holdMs.store(ms);
+            if (ms != 0xFFFF && ms >= 500) g_holdMs.store((std::min)(static_cast<uint32_t>(ms), static_cast<uint32_t>(kHoldBoundMs)));
             out[0] = g_role.load(); out[1] = g_hold.load() ? 1 : 0; out[2] = g_ffStop.load() ? 1 : 0; out[3] = g_timeGate.load() ? 1 : 0;
             const uint16_t hm = static_cast<uint16_t>(g_holdMs.load());
             std::memcpy(out + 4, &hm, 2);

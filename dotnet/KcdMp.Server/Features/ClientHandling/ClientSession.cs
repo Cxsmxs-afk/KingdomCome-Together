@@ -358,7 +358,7 @@ public partial class ClientSession
         }
     }
 
-    public async Task RunAsync()
+    public async Task RunAsync(ulong diagnosticSessionId = 0)
     {
         var writeTask = _writer is null ? WriteLoopAsync() : SchedWriteLoopAsync();   // WO-213 C
         try
@@ -463,8 +463,8 @@ public partial class ClientSession
                 return;
             }
 
-            _logger.Information("[+] '{Name}' connected (id={Id}, protocol v{Version}, release {Release}, loopback={Loopback}) from {ClientRemoteEndPoint}.",
-                Name, Id, clientVersion, ReleaseVersion ?? "(none)", IsLoopback ? 1 : 0, _conn.Remote);
+            _logger.Information("MP-FIX RELAY connected session={DiagnosticSessionId:x} name=<redacted> id={Id} protocol={Version} loopback={Loopback}",
+                diagnosticSessionId, Id, clientVersion, IsLoopback ? 1 : 0);
 
             // WO-144 1.1: the same player's older connection (a restarted game or
             // agent) goes now, before anyone counts it as a second partner.

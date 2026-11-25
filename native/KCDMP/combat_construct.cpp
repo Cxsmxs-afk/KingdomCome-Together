@@ -288,8 +288,15 @@ combatactions::QueueResult submit_combat_action(const combatactions::BodyProof& 
         },
         [&] { void* offered = action; return call_queue_action(queue, manager, &offered, -1.0f); },
         combatactions::settle_queue);
-    if (outcome == QueueResult::Refused) call_release(action);  // QueueAction never received its reference
-    if (outcome != QueueResult::Submitted) call_release(action);  // only our own reference after an uncertain dispatch
+    if (outcome == QueueResult::Refused) {
+        // QueueAction never received the offered reference. Both are still ours.
+        call_release(action);
+        call_release(action);
+    } else if (outcome == QueueResult::Submitted) {
+        call_release(action); // QueueAction accepted the offered reference.
+    }
+    // An uncertain dispatch may already have torn down its controller. Do not
+    // invoke the action through a pointer after that ownership check failed.
     return outcome;
 }
 

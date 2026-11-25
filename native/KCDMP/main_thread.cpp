@@ -45,15 +45,19 @@ struct Repeating {
     const char*           name;
     fault::Site           site;
     bool                  blocked = false;   // WO-210 H.3 (research only): KCDMP_TEST_TASK_BLOCK names it
-    Repeating(const char* n, std::function<void()> f)
+    const bool            researchWatch;
+    bool                  throttled = false;
+    double                nextUs = 0;
+    Repeating(const char* n, std::function<void()> f, bool research)
         : fn(std::move(f)), siteName(std::string("main::task/") + (n ? n : "?")), name(n ? n : "?"),
-          site(siteName.c_str(), fault::Kind::Call) {}
+          site(siteName.c_str(), fault::Kind::Call), researchWatch(research) {}
 };
 
 std::mutex                              g_mutex;
 struct Queued { std::function<bool()> eligible; std::function<void()> work; };
 std::deque<Queued>                      g_queue;
-std::vector<std::shared_ptr<Repeating>> g_repeating;
+using RepeatingList = std::vector<std::shared_ptr<Repeating>>;
+std::shared_ptr<const RepeatingList> g_repeating = std::make_shared<RepeatingList>();
 std::condition_variable                 g_drained;
 std::atomic<unsigned long long>         g_frames{0};
 std::atomic<float>                      g_lastDt{0.0f};   // WO-138
@@ -92,7 +96,12 @@ void note_frame_rate(double nowUs, double oursUs) {
 // the caller's self time (CCryAction::PreSystemUpdate). Main thread only.
 // WO-151: behind mp_main_cost (off by default; the hunt's tool, kept for the next one).
 std::atomic<bool> g_costOn{false};
-struct TaskCost { const char* name = "?"; double sumUs = 0, maxUs = 0; };
+struct TaskCost {
+    const char* name = "?";
+    double sumUs = 0, maxUs = 0;
+    uint32_t calls = 0;
+    framemeter::CostHistogram histogram{};
+};
 std::vector<TaskCost> g_cost;
 double   g_winStartUs = 0;
 uint32_t g_winFrames = 0, g_winItems = 0;
@@ -120,6 +129,7 @@ void note_cost(double origUs, double oursUs, double batchUs, uint32_t items, dou
     g_batchSumUs += batchUs;
     if (oursUs > g_oursMaxUs) g_oursMaxUs = oursUs;
     if (nowUs - g_winStartUs < kCostWindowUs) return;
+    deferred_log::Scope defer;
     const double f = g_winFrames ? static_cast<double>(g_winFrames) : 1.0;
     std::vector<size_t> idx(g_cost.size());
     std::iota(idx.begin(), idx.end(), size_t{0});
@@ -140,7 +150,11 @@ void note_cost(double origUs, double oursUs, double batchUs, uint32_t items, dou
     }
     g_slow.clear(); g_slowFrames = 0;
     logf("%s", buf);
-    for (auto& c : g_cost) { c.sumUs = 0; c.maxUs = 0; }
+    for (auto& c : g_cost) {
+        if (c.calls) logf("MP-FIX PERF task=%s us_p95=%.0f mean_us=%.0f max_us=%.0f calls=%u",
+            c.name, framemeter::p95(c.histogram), c.sumUs / c.calls, c.maxUs, c.calls);
+        c = {};
+    }
     g_winStartUs = nowUs;
     g_winFrames = g_winItems = 0;
     g_origSumUs = g_oursSumUs = g_oursMaxUs = g_batchSumUs = 0;
@@ -181,27 +195,42 @@ void hooked_update(void* self, float dt) {
     // Copy under the lock, run outside it. Running them while holding g_mutex
     // would block every post() for the duration of a call into the game, which
     // is exactly the deadlock the comment above warns about.
-    std::vector<std::shared_ptr<Repeating>> repeating;
+    std::shared_ptr<const RepeatingList> scheduled;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         for (size_t n = 0; !g_queue.empty() && n < wo218rules::kRequestsPerFrame; ++n) {
             batch.push_back(std::move(g_queue.front())); g_queue.pop_front();
         }
-        repeating = g_repeating;
+        scheduled = g_repeating;
     }
+    const auto& repeating = *scheduled;
     const bool cost = g_costOn.load(std::memory_order_relaxed);
     if (cost && g_cost.size() < repeating.size()) g_cost.resize(repeating.size());
     const char* topName = "?"; double topUs = 0;   // WO-221 F.1: this frame's largest item
     for (size_t i = 0; i < repeating.size(); ++i) {
         Repeating& r = *repeating[i];
-        if (r.blocked) continue;
-        if (!cost) { run_guarded(r.site, &r.fn); continue; }
+        if (r.blocked || (r.researchWatch && t1 < r.nextUs)) continue;
+        if (!cost && !r.researchWatch) { run_guarded(r.site, &r.fn); continue; }
         const double a = now_us();
+        if (r.researchWatch) r.nextUs = a + wo218rules::research_watch_delay_us(0);
         run_guarded(r.site, &r.fn);
-        const double d = now_us() - a;
+        const double end = now_us();
+        const double d = end - a;
+        if (r.researchWatch) {
+            const bool over = d > wo218rules::kResearchBudgetUs;
+            r.nextUs = end + wo218rules::research_watch_delay_us(d);
+            if (over && !r.throttled) {
+                deferred_log::Scope defer;
+                logf("MP-FIX PERF task=%s over_budget_us=%.0f next_ms=%.0f", r.name, d, (r.nextUs - end) / 1'000.0);
+            }
+            r.throttled = over;
+        }
+        if (!cost) continue;
         TaskCost& c = g_cost[i];
         c.name = r.name;
         c.sumUs += d;
+        ++c.calls;
+        framemeter::record_cost(c.histogram, d);
         if (d > c.maxUs) c.maxUs = d;
         if (d > topUs) { topUs = d; topName = r.name; }
     }
@@ -293,11 +322,15 @@ bool test_task_blocked(const char* name) {
     return false;
 }
 
-void post_repeating(const char* name, std::function<void()> work) {
-    auto r = std::make_shared<Repeating>(name, std::move(work));
+void post_repeating(const char* name, std::function<void()> work, bool researchWatch) {
+    auto r = std::make_shared<Repeating>(name, std::move(work), researchWatch);
     if (test_task_blocked(name)) { r->blocked = true; logf("MAIN: task %s blocked for this game (KCDMP_TEST_TASK_BLOCK, research)", r->name); }
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_repeating.push_back(std::move(r));
+    // Registration is cold. Publish a new list so each frame holds one
+    // snapshot and never copies or allocates per callback.
+    auto next = std::make_shared<RepeatingList>(*g_repeating);
+    next->push_back(std::move(r));
+    g_repeating = std::move(next);
 }
 
 void set_frame_lanes(Drain realtime, Drain bulk) {

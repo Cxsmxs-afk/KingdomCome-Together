@@ -119,7 +119,7 @@ public partial class Home
 
     private void AgentReconnectRefused(string reason, string? message = null)
     {
-        Log.Information("MP-LAUNCH agent reconnect refused reason={Reason}", reason);
+        Log.Information("MP-FIX REJOIN reconnect=refused reason={Reason}", reason);
         UiService.ShowError(message ?? (reason switch
         {
             "engine-read-or-control-unavailable" => "Wait for any load to finish. If you are still in the host’s world, choose Leave in the co-op menu. Reconnect once you are back in your own game or at the main menu.",
@@ -153,7 +153,7 @@ public partial class Home
                 return;
             }
             TrackAgent(prior.Restart(game, agentRun, StartSessionAgent));
-            Log.Information("MP-LAUNCH agent reconnected gamePid={GamePid} previousAgentPid={PreviousPid} agentPid={Pid} stop={Stop}",
+            Log.Information("MP-FIX REJOIN reconnect=started gamePid={GamePid} previousAgentPid={PreviousPid} agentPid={Pid} stop={Stop}",
                 game.Id, prior.AgentPid, agentProcess!.Id, stop);
         }
         catch (AgentRecoveryRefused ex) { AgentReconnectRefused(ex.Message); }

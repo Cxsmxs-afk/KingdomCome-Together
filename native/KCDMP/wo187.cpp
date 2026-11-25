@@ -618,6 +618,15 @@ uint8_t on_windup(uint32_t eid, const char* name, void* ca, void* model) {
     if (v != WindupOpp::NoWish && (n <= kLogFirst || n % 50 == 0 || v == WindupOpp::Overwritten))
         logf("WO187-OPP npc=%s windup=%s opponent=%s wished=%s (%s)", name ? name : name_of(eid), windup_name(v), who(cur).c_str(), who(want).c_str(),
              viaReq ? "its requested target" : "its opponent");
+    // The requested target can differ from the active opponent. Capture both
+    // in the explicit animation trace, without adding a read to normal play.
+    if (wish && g_scopeLog.load(std::memory_order_relaxed) && (n <= kLogFirst || n % 50 == 0)) {
+        motion::ModelRead live{};
+        const bool observed = motion::read_model(eid, &live);
+        deferred_log::Scope defer;
+        logf("MP-FIX TGT npc=%s expected=0x%X request_before=0x%X active_after=0x%X active_read=%d",
+             name ? name : "?", want, viaReq ? cur : 0, live.opponentEid, observed ? 1 : 0);
+    }
     (void)ca;
     return static_cast<uint8_t>(v);
 }

@@ -8371,13 +8371,17 @@ function KCD2MP_W137TalkResume(name, via)
 end
 
 -- WO-144 1.3: "Canceling dialog request id N ... Request timed out" (the agent relays it): the copy
--- never took the request -- the talk ends now, not after talkStartS.
-function KCD2MP_W137TalkDropped(id)
+-- never took the request. The second local timeout can start the final, forced attempt.
+function KCD2MP_W137TalkDropped(id, mine)
     local w = KCD2MP.w137
     id = tonumber(id)
     if not id then return false end
     for name, t in pairs(w.talking) do
-        if t.id == id and not t.started then KCD2MP_W137TalkEnd(name, "never-started"); return true end
+        if t.id == id and not t.started and not t.sawDialog then
+            if mine and KCD2MP_W221TalkForce and KCD2MP_W221TalkForce(name, t, "engine-timeout") then return true end
+            KCD2MP_W137TalkEnd(name, "never-started")
+            return true
+        end
     end
     return false
 end
@@ -17579,6 +17583,8 @@ local function mp_item_detect(pp)
     local prev = KCD2MP._itemInvCounts
     if horseKey ~= (KCD2MP._itemHorseKey or "-") then prev = nil; KCD2MP._itemHorseKey = horseKey end   -- WO-221 E.3: a baseline tick
     if counts then KCD2MP._itemInvCounts = counts end
+    local probe = KCD2MP.itemDropProbe
+    local matched = 0
     local ents = System.GetEntitiesInSphere(pp, KCD2MP.itemSync.dropRadius) or {}
     for _, e in ipairs(ents) do
         if e.class == "PickableItem" then
@@ -17600,6 +17606,7 @@ local function mp_item_detect(pp)
                         if ok and ep then
                             KCD2MP_EmitEvent("item_drop", string.format("%s %d %.4f %.3f %.3f %.3f %s",
                                 cls, amt, hp, ep.x, ep.y, ep.z, nm))
+                            if cls == probe then matched = matched + 1 end
                             mp_log("ITEM-SYNC local drop detected: " .. cls .. " x" .. amt .. " (" .. nm .. ")")
                         end
                     end
@@ -17607,6 +17614,24 @@ local function mp_item_detect(pp)
             end
         end
     end
+    if probe and prev and counts and (prev[probe] or 0) > (counts[probe] or 0) then
+        mp_log(string.format("MP-FIX DROP stage=detect class=%s total_before=%d total_after=%d horse=%s emitted=%d",
+            probe, prev[probe], counts[probe] or 0, horseKey ~= "-" and "present" or "absent", matched))
+    end
+end
+
+local function mp_item_drop_note(key, d, stage, entity)
+    if not d.cls or d.cls ~= KCD2MP.itemDropProbe then return end
+    local owner, count = "unknown", nil
+    pcall(function()
+        local id = entity and entity.item and entity.item:GetOwnerId()
+        if id ~= nil then owner = id == player.id and "player" or "other" end
+    end)
+    pcall(function() count = player.inventory:GetCountOfClass(d.cls) end)
+    local change = count and d.probeCount and count - d.probeCount or nil
+    if stage == "registered" or stage == "materialized" then d.probeCount = count end
+    mp_log(string.format("MP-FIX DROP stage=%s drop=%s class=%s origin=%s health=%s owner=%s player_delta=%s",
+        stage, key, d.cls, d.mine and "local" or "peer", tostring(d.health or "?"), owner, tostring(change or "?")))
 end
 
 -- The agent minted a dropId for the drop this world just detected; from here
@@ -17623,7 +17648,9 @@ function KCD2MP_ItemDropRegistered(dropId, entName)
             d.x, d.y, d.z = p.x, p.y, p.z
             d.cls    = e.Properties and e.Properties.sItemClassId
             d.amount = (e.Properties and e.Properties.nAmount) or 1
+            d.health = e.Properties and e.Properties.fHealth
             d.wuid   = e.item and e.item:GetId() or nil
+            mp_item_drop_note(key, d, "registered", e)
         end
     end)
     KCD2MP.itemDrops[key] = d
@@ -17644,6 +17671,7 @@ function KCD2MP_ItemDropAdd(dropId, cls, amount, health, x, y, z, srcGhostId)
         x = tonumber(x), y = tonumber(y), z = tonumber(z),
         src = tostring(srcGhostId), mine = false, state = "pending",
     }
+    mp_item_drop_note(key, KCD2MP.itemDrops[key], "relay", nil)
     mp_log("ITEM-SYNC drop " .. key .. " pending: " .. cls .. " x" .. tostring(amount))
 end
 
@@ -17766,6 +17794,7 @@ local function mp_item_finalize(key, d)
             d.state = "resolved"
         else
             d.state = "ground"
+            mp_item_drop_note(key, d, "materialized", placed)
             mp_log("ITEM-SYNC drop " .. key .. " materialized -> " .. d.entName)
         end
         return
@@ -17777,6 +17806,7 @@ local function mp_item_finalize(key, d)
             if a then System.RemoveEntity(a.id) end
         end)
         d.state = "resolved"
+        mp_item_drop_note(key, d, "no-placement", nil)
         mp_log("ITEM-SYNC drop " .. key .. " FAILED: placed entity never appeared")
     end
 end
@@ -17814,6 +17844,7 @@ local function mp_item_watch(pp)
             if dx * dx + dy * dy <= r2 then
                 local e = System.GetEntityByName(d.entName)
                 if not e then
+                    mp_item_drop_note(key, d, "missing", nil)
                     d.state = "claimed_local"
                     KCD2MP_EmitEvent("item_claim", key)
                     mp_log("ITEM-SYNC drop " .. key .. " taken locally -> claim sent")
@@ -23691,6 +23722,7 @@ function KCD2MP_W164Retry(name, t)
     if press and press.orig then
         reissue = "asked"
         Script.SetTimer(300, function()
+            if not w164_joiner() or KCD2MP.w137.talking[name] ~= t or t.started or t.sawDialog or t.w221Forced then return end
             local ok = pcall(press.orig, press.npc, press.user, press.slot)
             if not ok then w.stats.reissueErr = w.stats.reissueErr + 1 end
             mp_log(string.format("WO164-TALK retry npc=%s reissue=%s", name, ok and "ok" or "err"))
@@ -32197,14 +32229,14 @@ function KCD2MP_W194Switch(key, field, arg, what)
     return true
 end
 function KCD2MP_W194SetShared(arg) return KCD2MP_W194Switch("shared", "shared", arg, "in-game cutscenes are shared: the partner's quest starts its own copy when it is at that step") end
-function KCD2MP_W194SetHold(arg) return KCD2MP_W194Switch("hold", "hold", arg, "the joiner's own trigger firing first waits at most 3 s for the host's copy") end
+function KCD2MP_W194SetHold(arg) return KCD2MP_W194Switch("hold", "hold", arg, "the joiner's own trigger firing first waits up to 1.8 s for the host's copy") end
 function KCD2MP_W194SetFfStop(arg) return KCD2MP_W194Switch("ffstop", "ffstop", arg, "at a scene's end the host's copies' fast-forward is stopped (the joiner positions at once)") end
 function KCD2MP_W194SetTime(arg) return KCD2MP_W194Switch("time_host", "timegate", arg, "a scene's own time of day comes from the host's clock on the joiner") end
 function KCD2MP_W194SetNudge(arg) return KCD2MP_W194Switch("nudge", "nudge", arg, "after a shared scene the joiner is moved about 1 m off the shared spot") end
 function KCD2MP_W194SetFigure(arg) return KCD2MP_W194Switch("figure_hide", "figure", arg, "the partner's figure is hidden while a cutscene plays here") end
 function KCD2MP_W194SetSkip(arg) return KCD2MP_W194Switch("skip_both", "skip", arg, "a skip (part or all) skips the partner's copy too") end
 System.AddCCommand("mp_scene_ingame_shared", 'KCD2MP_W194SetShared(%line)', "WO-194: (both) story cutscenes in the engine are watched together: your partner's game starts its own copy when its quest is at that step (default on): mp_scene_ingame_shared on|off")
-System.AddCCommand("mp_scene_ingame_hold", 'KCD2MP_W194SetHold(%line)', "WO-194: (joiner) when your own trigger fires first, your cutscene waits at most 3 s for the host's (default on): mp_scene_ingame_hold on|off")
+System.AddCCommand("mp_scene_ingame_hold", 'KCD2MP_W194SetHold(%line)', "WO-194: (joiner) when your own trigger fires first, your cutscene waits up to 1.8 s for the host's (default on): mp_scene_ingame_hold on|off")
 System.AddCCommand("mp_scene_ingame_ffstop", 'KCD2MP_W194SetFfStop(%line)', "WO-194: (joiner) at a cutscene's end the host's people never keep your game in the cutscene view (default on): mp_scene_ingame_ffstop on|off")
 System.AddCCommand("mp_scene_ingame_time_host", 'KCD2MP_W194SetTime(%line)', "WO-194: (joiner) a cutscene's own time of day comes from the host's clock (default on): mp_scene_ingame_time_host on|off")
 System.AddCCommand("mp_scene_ingame_nudge", 'KCD2MP_W194SetNudge(%line)', "WO-194: (joiner) after a shared cutscene you are moved about 1 m off the spot both of you were placed on (default on): mp_scene_ingame_nudge on|off")
@@ -37451,7 +37483,7 @@ do
         combat_action_end = "mp_combat_action_end", talk_hold = "mp_talk_hold", drive = "mp_drive", holders = "mp_holders",
         shop_keeper = "mp_shop_keeper", own_horse = "mp_own_horse", talk_force = "mp_talk_force",
         corpse_look = "mp_corpse_look", horse_drop = "mp_horse_drop", saddlebags = "mp_saddlebags", route_quiet = "mp_route_quiet", cart_seat = "mp_cart_seat", cart_wheels = "mp_cart_wheels",
-        ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller", rp_combat = "mp_rp_combat",
+        ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller", rp_combat = "mp_rp_combat", death_trace = "mp_death_trace",
         load_sequence = "mp_load_sequence", baseline_events = "mp_baseline_events", world_recovery = "mp_world_recovery",
     }
     W221.HELP = {
@@ -37471,6 +37503,7 @@ do
         ragdoll_once = "A: (joiner) a fresh corpse is laid down by one ragdoll at a time, after the game's own death action had its time, never when it already lies",
         rp_controller = "Move the partner's figure through the game's movement request when the body supports it",
         rp_combat = "Play the partner's timed combat through native requests",
+        death_trace = "Record bounded native combat retirement details for crash reports",
         load_sequence = "Apply the world only for its current load generation",
         baseline_events = "Install the world baseline and confirm each ordered event",
         world_recovery = "Check the world by area and repair that area or reconnect",
@@ -37510,10 +37543,77 @@ do
         local parts = {}
         for k, label in pairs(W221.NAMES) do parts[#parts + 1] = label .. "=" .. (KCD2MP_W221On(k) and "on" or "off") end
         table.sort(parts)
-        mp_log("WO221-STATUS " .. table.concat(parts, " "))
+        mp_log("WO221-STATUS " .. table.concat(parts, " ") .. " mp_drop_probe=" .. (KCD2MP.itemDropProbe or "off")
+            .. " mp_scene_ingame_hold=" .. (KCD2MP.w194.hold and "on" or "off")
+            .. " mp_fader_bound=" .. (KCD2MP.w191.faderBound and "on" or "off")
+            .. " mp_main_cost=" .. (KCD2MP.w151.mainCost and "on" or "off"))
         KCD2MP_EmitEvent("w221_status", "")
         return true
     end
+    function KCD2MP_W221DropProbe(arg)
+        local cls = tostring(arg or ""):match("^%s*\"?([%w%-]+)\"?%s*$")
+        if cls == "off" then KCD2MP.itemDropProbe = nil
+        elseif cls and #cls == 36 and cls:match("^[%x%-]+$") then KCD2MP.itemDropProbe = cls
+        else mp_log("mp_drop_probe: enter an item class GUID or off"); return false end
+        mp_log("MP-FIX DROP probe=" .. (KCD2MP.itemDropProbe or "off"))
+        return true
+    end
+    System.AddCCommand("mp_drop_probe", "KCD2MP_W221DropProbe(%line)", "Trace the drop ledger for one item class: mp_drop_probe <class GUID>|off")
+
+    function KCD2MP_W221ShopProbe(arg)
+        local name = tostring(arg or ""):match("^%s*\"?([%w_]+)\"?%s*$")
+        if not name or #name > 59 then return false end
+        local db = nil
+        pcall(function()
+            local e = System.GetEntityByName(name)
+            if e and Shops and Shops.GetShopDBIdByKeeper then db = Shops.GetShopDBIdByKeeper(e.id) end
+        end)
+        mp_log(string.format("MP-FIX SHOP npc=%s shop=%s side=%s", name, tostring(db or "unknown"),
+            KCD2MP.w137 and KCD2MP.w137.joiner and "joiner" or "local"))
+        return type(db) == "number" and db >= 0
+    end
+    System.AddCCommand("mp_shop_probe", "KCD2MP_W221ShopProbe(%line)", "Show the live shop database ID for a named keeper: mp_shop_probe <NPC>")
+
+    function KCD2MP_W221EscortProbe(arg)
+        local name = tostring(arg or ""):match("^%s*\"?([%w_]+)\"?%s*$")
+        if not name or #name > 59 then return false end
+        local pos = nil
+        pcall(function() pos = System.GetEntityByName(name):GetWorldPos() end)
+        if not pos then return false end
+        local escort = KCD2MP.w164.escort[name]
+        local carry = KCD2MP.w148
+        local function describe(label, figure, held)
+            local distance = nil
+            pcall(function() distance = math.sqrt(w164_dist2(pos, figure:GetWorldPos())) end)
+            if distance then
+                mp_log(string.format("MP-FIX ESC npc=%s player=%s distance_m=%.1f tracked_carrier=%s",
+                    name, label, distance, tostring(held ~= nil and held.name == name)))
+            end
+        end
+        mp_log(string.format("MP-FIX ESC npc=%s configured_follower=%s", name, escort and tostring(escort.ghost) or "quest"))
+        describe("local", player, carry and carry.mine)
+        for id, g in pairs(KCD2MP.ghosts or {}) do
+            if tonumber(id) then describe(tostring(tonumber(id)), g.entity, carry and carry.av and carry.av[tostring(id)]) end
+        end
+        return true
+    end
+    System.AddCCommand("mp_escort_probe", "KCD2MP_W221EscortProbe(%line)", "Show which live figures and tracked carriers surround an escort: mp_escort_probe <NPC>")
+
+    function KCD2MP_W221HorseTackProbe(arg)
+        local name = tostring(arg or ""):match("^%s*\"?([%w_]+)\"?%s*$")
+        if not name or #name > 59 then return false end
+        local count, own = nil, false
+        pcall(function()
+            local h = System.GetEntityByName(name)
+            if not (h and h.class == "Horse") then return end
+            own = player and player.player and player.player:GetHorseId() == h.id
+            if h.inventory then count = #h.inventory:GetInventoryTable() end
+        end)
+        mp_log(string.format("MP-FIX TACK horse=%s own=%s inventory_entries=%s equipped_slots=unobserved",
+            name, tostring(own), tostring(count or "unknown")))
+        return count ~= nil
+    end
+    System.AddCCommand("mp_horse_tack_probe", "KCD2MP_W221HorseTackProbe(%line)", "Compare the horse binding and bag readout: mp_horse_tack_probe <horse>")
     -- B (host, every 10 s, asked by the agent): which shop each keeper near a player keeps. In the game a keeper keeps a shop only
     -- while its own state holds the "open shop" element (its brain takes it up with its work); a joiner's copies never do, so the
     -- host says it and the joiner's DLL opens the same shop with the copy (the shop's own call). The game's own script call reads it.
@@ -37753,8 +37853,10 @@ do
     -- same dialogue with the same choices, the trade among them, without waiting for the copy's brain.
     --   WO221-TALK force npc=<n> ok=<bool> -- ...
     W221.forceStats = W221.forceStats or { forced = 0, failed = 0 }
-    function KCD2MP_W221TalkForce(name, t)
-        if not KCD2MP_W221On("talk_force") then return false end
+    function KCD2MP_W221TalkForce(name, t, reason)
+        if not KCD2MP_W221On("talk_force") or not KCD2MP_W137TalkWanted() or not KCD2MP.w164.talkGuard
+            or KCD2MP.w137.talking[name] ~= t or not KCD2MP.npcPuppets[name] or not t.w164Retried
+            or t.started or t.sawDialog or t.w221Forced or t.via == "request-fallback" or t.via == "forced" then return false end
         t.w221Forced = true
         local e = nil
         pcall(function() e = System.GetEntityByName(name) end)
@@ -37764,16 +37866,17 @@ do
             return false
         end
         -- this player's open request goes first (the soul's own way, as the retry does): the forced dialogue is the one that runs
+        t.id = nil
         pcall(function()
             local s = player.soul
             if s and s.RestrictDialog then s:RestrictDialog(true); s:RestrictDialog(false) end
         end)
-        t.id = nil
-        t.since = os.clock()   -- the talk's own start window begins again
-        local ok = pcall(DialogModule.ForceDialog, e.id, player.id)
+        local ok, result = pcall(DialogModule.ForceDialog, e.id, player.id)
+        ok = ok and result ~= false
+        if ok then t.since = os.clock() end
         if ok then W221.forceStats.forced = W221.forceStats.forced + 1 else W221.forceStats.failed = W221.forceStats.failed + 1 end
-        mp_log(string.format("WO221-TALK force npc=%s ok=%s -- the request and its retry were not taken: the conversation is started the game's own forced way [n=%d]",
-            tostring(name), tostring(ok), W221.forceStats.forced))
+        mp_log(string.format("MP-FIX TALK npc=%s attempt=3 trigger=%s dispatched=%s",
+            tostring(name), reason or "retry-delay", tostring(ok)))
         KCD2MP_EmitEvent("w164_talk", "retry " .. tostring(name) .. " forced=" .. (ok and "ok" or "err"))
         return ok
     end
