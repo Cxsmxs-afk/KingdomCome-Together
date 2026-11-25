@@ -274,12 +274,47 @@ public sealed partial class JoinCalendarIntegrationTests
         finally { guestLink.DropIncoming = null; }
         resources.AssertBudget();
 
-        engine.Emit("join_request", "");
-        await engine.WaitForJoinLoadAsync(ct);
+        var requested = new TaskCompletionSource<uint>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var offered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int calendarsBefore = guestLink.FrozenSnapshots.Count;
+        guestLink.BeforeWrite = (packet, _) =>
+        {
+            if (packet.Length >= 8 && packet.Span[0] == Protocol.JoinRequestUp)
+                requested.TrySetResult(BinaryPrimitives.ReadUInt32LittleEndian(packet.Span[4..]));
+            return ValueTask.CompletedTask;
+        };
+        guestLink.BeforeFirstOffer = () => offered.TrySetResult();
+        uint retryId;
+        try
+        {
+            engine.Emit("join_request", "");
+            string loadedFile = await engine.WaitForJoinLoadAsync(ct);
+            Assert.True(requested.Task.IsCompletedSuccessfully && offered.Task.IsCompletedSuccessfully);
+            retryId = requested.Task.Result;
+            Assert.Equal($"mpworld{retryId:x8}.whs", Path.GetFileName(loadedFile));
+        }
+        catch (OperationCanceledException ex) when (ct.IsCancellationRequested)
+        {
+            object? hostAttempt = Get<object?>(host, "_hostJoin");
+            object? guestAttempt = Get<object?>(guest, "_jj");
+            uint request = requested.Task.IsCompletedSuccessfully ? requested.Task.Result : 0;
+            throw new TimeoutException($"F4 rejoin scenario={scenario} request={request:x8} offer={offered.Task.IsCompleted} " +
+                $"calendars={guestLink.FrozenSnapshots.Count - calendarsBefore} native_arms={guestPipe.ArmRequests} " +
+                $"guest_ui={Get<string>(guest, "_joinUiState")} guest_reason={Get<string>(guest, "_joinUiReason")} " +
+                $"host_phase={(hostAttempt is null ? "none" : GetVisible<string>(hostAttempt, "Phase"))} " +
+                $"guest_phase={(guestAttempt is null ? "none" : GetVisible<string>(guestAttempt, "Phase"))} " +
+                $"out={Get<uint>(guest, "_joinOutId"):x8} eof={guestLink.EndOfStreamObserved}", ex);
+        }
+        finally
+        {
+            guestLink.BeforeWrite = null;
+            guestLink.BeforeFirstOffer = null;
+        }
         await WaitAsync(() => Get<bool>(guest, "_joinedWorld") && Get<object?>(host, "_hostJoin") is null,
             "the next world load and Ready on the same guest reader", ct);
         await engine.WaitForJoinedNotificationAsync(ct);
         uint ready = Assert.Single(guestLink.ReadySent);
+        Assert.Equal(retryId, ready);
         Assert.DoesNotContain(ready, cancelled);
         Assert.Equal(ready, Assert.Single(hostLink.ReadyReceived));
         Assert.Equal(1, engine.JoinLoadsIssued);
