@@ -53,11 +53,14 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
         const string workerName = "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Threading.Thread.SetThreadPoolWorkerThreadName";
         F4WindowsHandleTrace.Allocation[] allocations =
         [
-            new("Event", 10, socketEvent), new("Thread", 10, socketThread),
-            new("Event", 11, socketEvent), new("Thread", 12, socketThread),
-            new("Event", 13, socketEvent), new("Thread", 13, socketThread),
-            new("Event", 13, socketEvent), new("Thread", 13, socketThread),
-            new("Event", 14, socketEvent), new("Thread", 14, socketThread),
+            new("Event", 10, socketEvent), new("Thread", 10, socketThread, TargetThread: 10),
+            new("Event", 11, socketEvent), new("Thread", 12, socketThread, TargetThread: 11),
+            new("Event", 13, socketEvent), new("Thread", 13, socketThread, TargetThread: 13),
+            new("Event", 13, socketEvent), new("Thread", 13, socketThread, TargetThread: 13),
+            new("Event", 14, socketEvent), new("Thread", 14, socketThread, TargetThread: 14),
+            new("Thread", 19, socketThread, TargetThread: 19),
+            new("Thread", 20, socketThread, TargetThread: 20), new("Thread", 20, socketThread, TargetThread: 20),
+            new("Event", 21, socketEvent),
             new("File", 10, socketEvent),
             new("Event", 10, "ntdll.dll>KERNELBASE.dll>coreclr.dll+886b>System.Threading.SemaphoreSlim.WaitAsync"),
             new("Event", 10, regexCache),
@@ -65,9 +68,10 @@ public sealed class JoinCalendarResourceTests(ITestOutputHelper output)
             new("Event", 17, workerStart), new("Event", 17, workerStart), new("Thread", 17, workerStart),
             new("Event", 16, workerName), new("Event", 10, workerName)
         ];
-        var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations, new HashSet<long> { 10, 11, 12, 13, 16 }, out var started);
-        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1, 1, 1), runtime);
-        Assert.Equal(7, runtime.Total);
+        var runtime = F4WindowsHandleTrace.CountBookkeeping(allocations,
+            new HashSet<long> { 10, 11, 12, 13, 16, 19, 20, 21 }, out var started);
+        Assert.Equal(new F4WindowsHandleTrace.Bookkeeping(1, 1, 1, 1, 1), runtime);
+        Assert.Equal(8, runtime.Total);
         Assert.Equal(16, Assert.Single(started));
     }
 
@@ -876,20 +880,17 @@ public sealed partial class JoinCalendarIntegrationTests
 
         public static async Task WaitForNativeTransitionAsync(GameBridge player, CancellationToken ct)
         {
-            foreach (string name in new[] { "_loadSequencePublish", "_hostCalendarGate", "_hostCalendarSendGate" })
-            {
-                var gate = Get<SemaphoreSlim>(player, name);
-                await gate.WaitAsync(ct);
-                gate.Release();
-            }
             if (Get<Task<bool>?>(player, "_p1Pending") is { } authority)
                 await authority.WaitAsync(ct);
             await Get<Task>(player, "_privateReturnMenuUpdate").WaitAsync(ct);
-            // The phase can be published while a queued single-frame native
-            // call still owns a bounded write or reply wait.
+            // The observer must not contend on a group's private semaphore
+            // monitors while it samples Windows resource growth.
+            var publish = Get<SemaphoreSlim>(player, "_loadSequencePublish");
+            var calendar = Get<SemaphoreSlim>(player, "_hostCalendarGate");
+            var send = Get<SemaphoreSlim>(player, "_hostCalendarSendGate");
             var native = Get<SemaphoreSlim>(Get<CombatPipe>(player, "_combat"), "_gate");
-            await native.WaitAsync(ct);
-            native.Release();
+            await WaitAsync(() => publish.CurrentCount != 0 && calendar.CurrentCount != 0 && send.CurrentCount != 0 &&
+                native.CurrentCount != 0, "native publications and their frame waits to finish", ct);
         }
 
         public void AssertBudget()
@@ -920,7 +921,8 @@ public sealed partial class JoinCalendarIntegrationTests
             int comparedThreads = after.Threads - idleWorkers;
             _output.WriteLine($"F4-HANDLE-BUDGET scenario={_scenario} before={before.Handles} after={after.Handles} " +
                 $"winsock_pairs={runtime.WinsockPairs} regex_cache_events={runtime.RegexCacheEvents} " +
-                $"worker_starts={runtime.WorkerStarts} worker_name_events={runtime.WorkerNameEvents} compared_after={comparedHandles}");
+                $"worker_starts={runtime.WorkerStarts} worker_name_events={runtime.WorkerNameEvents} " +
+                $"winsock_thread_refs={runtime.WinsockThreadReferences} compared_after={comparedHandles}");
             _output.WriteLine($"F4-THREAD-BUDGET scenario={_scenario} before={before.Threads} after={after.Threads} " +
                 $"idle_new_workers={idleWorkers} compared_after={comparedThreads}");
             int? startFiles = before.WindowsHandles.FileHandles;
