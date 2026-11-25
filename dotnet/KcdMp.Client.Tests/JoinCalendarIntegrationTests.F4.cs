@@ -851,6 +851,9 @@ public sealed partial class JoinCalendarIntegrationTests
                 $"raw_threads={sample.RawThreads} raw_handles={sample.RawHandles} thread_pool_workers={sample.ThreadPoolWorkers} " +
                 $"runtime_timers={sample.RuntimeTimers} guest_pipe={sample.Owned.PipeConnections} tracked_leases={sample.Owned.Reservations} " +
                 $"pipe_revision={sample.Owned.PipeRevision} rejoin_timer={sample.Owned.Timers}");
+            if (sample.Owned.PipeRevision != _before.Owned.PipeRevision)
+                _output.WriteLine($"F4-PIPE-REVISION scenario={_scenario} cycle={cycle} before={_before.Owned.PipeRevision} after={sample.Owned.PipeRevision} " +
+                    $"reason={Get<CombatPipe>(_guest, "_combat").LastConnectionDropReason}");
             if (sample.WindowsHandles.Details is string types)
                 _output.WriteLine($"F4-HANDLE-TYPES scenario={_scenario} cycle={cycle} {types}");
 
@@ -871,7 +874,7 @@ public sealed partial class JoinCalendarIntegrationTests
         private void LogTimers(string phase, F4ResourceSample sample) =>
             _output.WriteLine($"F4-TIMER-SAMPLE scenario={_scenario} phase={phase} count={sample.RuntimeTimers} frame_deadlines={sample.FrameDeadlines.Length} owner=ProcessorFrameScope");
 
-        private static async Task WaitForNativeTransitionAsync(GameBridge player, CancellationToken ct)
+        public static async Task WaitForNativeTransitionAsync(GameBridge player, CancellationToken ct)
         {
             foreach (string name in new[] { "_loadSequencePublish", "_hostCalendarGate", "_hostCalendarSendGate" })
             {

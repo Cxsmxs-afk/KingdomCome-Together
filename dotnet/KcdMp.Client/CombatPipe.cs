@@ -474,6 +474,8 @@ public sealed partial class CombatPipe : IAsyncDisposable
     public Func<Guid, float, float, bool, bool, bool, Task>? OnLocalHit { get; set; }
 
     public bool IsConnected => _pipe?.IsConnected == true;
+    private string _lastConnectionDropReason = "none";
+    internal string LastConnectionDropReason => Volatile.Read(ref _lastConnectionDropReason);
 
     /// <summary>
     /// Connect if not already connected. Returns false when the DLL is absent,
@@ -498,7 +500,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             {
                 if (Volatile.Read(ref _disposed) != 0) return false;
                 if (IsConnected) return true;
-                if (_pipe is { } old) Drop(old);
+                if (_pipe is { } old) Drop("reconnect", old);
                 candidate = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
                 _pipe = candidate;
                 Interlocked.Increment(ref _edgeConnectionRevision);
@@ -2416,7 +2418,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
         {
             notices.Writer.TryComplete();
             Console.WriteLine("[combat] pipe reader exited");
-            Drop(myPipe);
+            Drop("reader-ended", myPipe);
         }
     }
 
@@ -2826,7 +2828,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
                 {
                     // A late result from before the first numbered reply
                     // cannot establish a mapping. Retry on a fresh stream.
-                    if (_singleSequenceUncertain) { Drop(source.Pipe); return (null, PipeReason.NotConnected); }
+                    if (_singleSequenceUncertain) { Drop("sequence-unconfirmed", source.Pipe); return (null, PipeReason.NotConnected); }
                 }
             }
             // Drop anything left over from an earlier command that timed out.
@@ -3016,12 +3018,12 @@ public sealed partial class CombatPipe : IAsyncDisposable
             // A physical write/flush may have sent only part of this frame.
             // Reuse would corrupt framing. Waiting/queued cancellation never
             // comes here and must not reset unrelated requests.
-            if (writing) Drop(pipe);
+            if (writing) Drop($"physical-write-cancelled-{type:X2}", pipe);
             throw;
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
-            Drop(pipe);
+            Drop($"physical-write-failed-{type:X2}", pipe);
             throw;
         }
     }
@@ -3047,13 +3049,14 @@ public sealed partial class CombatPipe : IAsyncDisposable
         }
     }
 
-    private void Drop(NamedPipeClientStream? expected = null)
+    private void Drop(string reason, NamedPipeClientStream? expected = null)
     {
         lock (_connectionState)
         {
             if (expected is not null && !ReferenceEquals(_pipe, expected)) return;
             var dropped = _pipe;
             _pipe = null;
+            if (dropped is not null) Volatile.Write(ref _lastConnectionDropReason, reason);
             Volatile.Write(ref _pvpNativeLife, 0);
             dropped?.Dispose();
             // Complete old promises before a new connection can be published.
@@ -3066,14 +3069,14 @@ public sealed partial class CombatPipe : IAsyncDisposable
             _singleSequenceBase = null;
             _singleSequenceUncertain = false;
             OnDropBatch();
-            if (dropped is not null) Console.WriteLine("[combat] lost the connection to KCDMP.dll");
+            if (dropped is not null) Console.WriteLine($"[combat] lost the connection to KCDMP.dll reason={reason}");
         }
     }
 
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        Drop();
+        Drop("disposed");
         _replies.Writer.TryComplete();
         // An in-progress ConnectAsync owns this lock until the disposed pipe
         // wakes it. Do not dispose its semaphore before its finally releases it.
