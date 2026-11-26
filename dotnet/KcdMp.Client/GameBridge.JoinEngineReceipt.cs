@@ -26,7 +26,7 @@ public partial class GameBridge
             _tail.GameQuit += OnGameQuit;
         }
 
-        private void OnGameQuit() => _owner.ReleaseLauncherGuestWorld(this);
+        private void OnGameQuit() => _owner.ReleaseLauncherGuestWorld(this, "game-exited");
 
         public void Dispose()
         {
@@ -35,10 +35,13 @@ public partial class GameBridge
         }
     }
 
-    private void ReleaseLauncherGuestWorld(LauncherGuestWorld scope)
+    private void ReleaseLauncherGuestWorld(LauncherGuestWorld scope, string reason)
     {
         if (ReferenceEquals(Interlocked.CompareExchange(ref _launcherGuestWorld, null, scope), scope))
+        {
             scope.Dispose();
+            Console.WriteLine($"MP-FIX REJOIN guest_lease=released reason={reason}");
+        }
     }
 
     private bool TryProtectLauncherHandoff(out FileStream? lease)
@@ -56,7 +59,8 @@ public partial class GameBridge
         var guest = destination == LauncherPrivateReturn.None ? null : Volatile.Read(ref _launcherGuestWorld);
         Action<bool>? onTerminal = guest is null ? null : loaded =>
         {
-            if (destination == LauncherPrivateReturn.OwnSave || !loaded) ReleaseLauncherGuestWorld(guest);
+            if (destination == LauncherPrivateReturn.OwnSave || !loaded)
+                ReleaseLauncherGuestWorld(guest, destination == LauncherPrivateReturn.Menu ? "menu-return-terminal" : "private-save-read-ended");
         };
         try { return new(tail, _combat, path, savesRoot, lease, onTerminal, destination); }
         catch { lease?.Dispose(); throw; }

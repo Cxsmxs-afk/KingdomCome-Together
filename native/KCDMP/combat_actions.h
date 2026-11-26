@@ -71,11 +71,14 @@ inline bool observe_finished(Retirement& state, bool actionKnown, uint32_t statu
     return state == Retirement::Finished;
 }
 
-template <class Quiet, class Stop>
-bool retire(Retirement& state, bool actionKnown, uint32_t status, bool canStop, Quiet quiet, Stop stop) {
+struct AlwaysCurrent { bool operator()() const { return true; } };
+
+template <class Quiet, class Stop, class Current = AlwaysCurrent>
+bool retire(Retirement& state, bool actionKnown, uint32_t status, bool canStop, Quiet quiet, Stop stop, Current current = {}) {
     if (state != Retirement::Active) return state != Retirement::Quarantined;
     if (observe_finished(state, actionKnown, status)) return true;
-    if (actionKnown && status < wo167rules::kStatusFinished && quiet() && canStop && stop()) state = Retirement::StopRequested;
+    if (actionKnown && status < wo167rules::kStatusFinished && current() && quiet() && canStop && current() && stop())
+        state = Retirement::StopRequested;
     else state = Retirement::Quarantined;
     return state != Retirement::Quarantined;
 }

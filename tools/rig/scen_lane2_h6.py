@@ -68,7 +68,7 @@ def role_evidence(lines, role, build):
                 rp_owner_n=number(owner, 'rp_owner_n'), owner_violations=number(owner, 'owner_violations'))
 
 
-def native_evidence(rows):
+def native_evidence(rows, *, bugfix_soak=False):
     history = defaultdict(list)
     tracker = defaultdict(list)
     red = []
@@ -147,11 +147,17 @@ def native_evidence(rows):
             grey.append(f'attempt-{attempt}-new-body-binding-unmeasured')
             continue
         body_ids.add(body)
+        dispatched = next(tick for _, tick, fields in entries if fields['stage'] == 'death-dispatched')
         proved.append(dict(attempt=attempt, eid=eid, lifecycle=lifecycle, connection=connection, path=path,
-                           waiting=waiting, active=active, at_ms=entries[-1][1]))
+                           waiting=waiting, active=active, at_ms=entries[-1][1], dispatched_ms=dispatched))
 
-    if len(proved) < REQUIRED_DEATHS:
-        grey.append('fewer-than-30-qualified-deaths')
+    required = 100 if bugfix_soak else REQUIRED_DEATHS
+    if len(proved) < required:
+        grey.append(f'fewer-than-{required}-qualified-deaths')
+    if bugfix_soak:
+        dispatched = sorted(row['dispatched_ms'] for row in proved)
+        if any(not 14_000 <= b - a <= 16_000 for a, b in zip(dispatched, dispatched[1:])):
+            grey.append('15-second-death-cadence-unverified')
     observed = peak = None
     if proved:
         scopes = {(row['connection'], row['lifecycle']) for row in proved}
@@ -176,12 +182,12 @@ def native_evidence(rows):
                 ours_us_p95_max=peak, release_hook_armed=armed, red=list(dict.fromkeys(red)), grey=list(dict.fromkeys(grey)))
 
 
-def check_pair(host, joiner, build):
+def check_pair(host, joiner, build, *, bugfix_soak=False):
     host_build, host_native = native_launch(host['native'])
     joiner_build, joiner_native = native_launch(joiner['native'])
     role_checks = {role: role_evidence(logs['agent'], role, build) for role, logs in (('host', host), ('joiner', joiner))}
     join_id = fresh_join(joiner['agent'], host['game'])
-    evidence = native_evidence(joiner_native)
+    evidence = native_evidence(joiner_native, bugfix_soak=bugfix_soak)
     red = list(evidence['red'])
     grey = list(evidence['grey'])
     if host_build != build or joiner_build != build or not all(row['build_verified'] for row in role_checks.values()):
@@ -210,6 +216,7 @@ def check_pair(host, joiner, build):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', required=True, help='exact candidate Build-ID from MP-BUILD and the DLL')
+    parser.add_argument('--bugfix-soak', action='store_true', help='require 100 deaths per role, 15 s apart (±1 s)')
     names = ('a-host', 'b-joiner', 'b-host', 'a-joiner')
     for name in names:
         parser.add_argument(f'--{name}', nargs=3, required=True, type=Path, metavar=('AGENT', 'NATIVE', 'GAME'))
@@ -227,7 +234,7 @@ def main(argv=None):
                             for kind, path in zip(('agent', 'native', 'game'), paths)}
         except OSError as error:
             parser.error(str(error))
-    runs = {f'{host}/{joiner}': check_pair(copies[host], copies[joiner], args.build)
+    runs = {f'{host}/{joiner}': check_pair(copies[host], copies[joiner], args.build, bugfix_soak=args.bugfix_soak)
             for host, joiner in (('a-host', 'b-joiner'), ('b-host', 'a-joiner'))}
     values = list(runs.values())
     distinct_joins = bool(values[0]['join_id'] and values[1]['join_id'] and values[0]['join_id'] != values[1]['join_id'])

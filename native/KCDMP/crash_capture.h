@@ -26,6 +26,14 @@ namespace kcdmp::crash {
 void install();                           // plugin_main, first thing: the writer thread, the filter, the module table
 void tick();                              // main thread: re-asserts the filter every 5 s, refreshes the module table every 10 s
 void note_pipe(uint8_t type, uint8_t op, uint16_t len);   // the pipe server: the request it is about to serve
+
+struct ActionNote {
+    uint64_t serial;
+    uintptr_t action, vtable, actor;
+    uint32_t eid, status, refs;
+    const char* stage; // static label owned by the mod
+};
+void note_action(const ActionNote& note);
 void set_on(bool on);
 bool on();
 int status_text(char* out, int n);

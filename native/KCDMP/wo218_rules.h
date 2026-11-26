@@ -26,6 +26,11 @@ constexpr double  kBudgetUs = 2000.0;                          // the main threa
 constexpr unsigned kRequestsPerFrame = 8;
 constexpr uint8_t kReasonTaskFaulted = 17, kReasonNotBatchable = 19;
 
+constexpr double kResearchBudgetUs = 500.0;
+inline double research_watch_delay_us(double costUs) {
+    return costUs > kResearchBudgetUs ? 8'000'000.0 : 2'000'000.0;
+}
+
 inline bool batchable(uint8_t type) { return type >= kFirstGeneric && type <= kLastGeneric; }
 
 struct Sub { uint8_t type = 0; uint16_t len = 0; size_t off = 0; };

@@ -25,13 +25,13 @@ int wo194_tests(int* passed) {
     WCHECK(!hold_wanted(kRoleJoiner, true, true, true, false), "the mod's own start (B2): plays at once");
     WCHECK(!hold_wanted(kRoleJoiner, true, true, false, true), "the partner already plays it (the 0.60.9 seminArrival 7.5 s case): plays at once, aligned");
     // the bound and the order of reasons
-    WCHECK(release_due(1000, 3999, kHoldBoundMs, Release::None, false) == Release::None, "2.999 s: still held");
-    WCHECK(release_due(1000, 4000, kHoldBoundMs, Release::None, false) == Release::Bound, "3 s: plays solo");
+    WCHECK(release_due(1000, 2799, kHoldBoundMs, Release::None, false) == Release::None, "1.799 s: still held");
+    WCHECK(release_due(1000, 2800, kHoldBoundMs, Release::None, false) == Release::Bound, "1.8 s: plays solo");
     WCHECK(release_due(1000, 1001, kHoldBoundMs, Release::Partner, false) == Release::Partner, "the host's copy runs: released at once");
     WCHECK(release_due(1000, 1001, kHoldBoundMs, Release::Partner, true) == Release::Save, "a save request wins (never held across a save)");
     WCHECK(release_due(1000, 9000, kHoldBoundMs, Release::None, true) == Release::Save, "a save request past the bound is still named a save");
     WCHECK(release_due(1000, 1001, kHoldBoundMs, Release::Agent, false) == Release::Agent, "a menu / load / the host not at that step");
-    WCHECK(kHoldBoundMs == 3000, "the WO's 3 s");
+    WCHECK(kHoldBoundMs == 1800, "leave 200 ms for a frame and the game's scene transition");
     // how a release is done
     WCHECK(release_act(false, true, false, 2) == Act::Gone, "the handler no longer holds the configuration: nothing written");
     WCHECK(release_act(true, true, true, 3) == Act::AlreadyPlaying, "already in progress");

@@ -21,6 +21,7 @@ namespace pipeout = kcdmp::pipeout;
 }
 
 int wo218_tests(int* passed) {
+    CHECK(research_watch_delay_us(500) == 2'000'000 && research_watch_delay_us(501) == 8'000'000);
     // a batch of two: [id 0x0102][n 2] (0x2B len 2 [133 7]) (0x27 len 1 [3])
     const uint8_t b[] = {0x02, 0x01, 2, 0x2B, 2, 0, 133, 7, 0x27, 1, 0, 3};
     uint16_t id = 0;

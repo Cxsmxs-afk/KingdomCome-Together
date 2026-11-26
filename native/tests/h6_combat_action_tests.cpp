@@ -72,6 +72,14 @@ int h6_combat_action_tests(int* passed) {
           stopFailed == Retirement::Quarantined && quieted == 3 && stopped == 2,
           "even successfully silenced callbacks do not prove a failed Stop");
 
+    Retirement releasedDuringQuiet = Retirement::Active;
+    bool bodyCurrent = true;
+    bool lateStop = false;
+    check(!retire(releasedDuringQuiet, true, kStatusInstalled, true,
+          [&] { bodyCurrent = false; return true; }, [&] { lateStop = true; return true; }, [&] { return bodyCurrent; }) &&
+          releasedDuringQuiet == Retirement::Quarantined && !lateStop,
+          "a release which invalidates the body after callback silencing prevents Stop");
+
     int action = 0;
     const QueueTicket ticket{body, &action, 1};
     unsigned phase = 0, calls = 0;

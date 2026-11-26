@@ -10,7 +10,7 @@ namespace kcdmp::wo194rules {
 constexpr uint8_t kRoleUnknown = 0, kRoleHost = 1, kRoleJoiner = 2;
 
 /// B3: a held copy waits at most this long for the host's (then it plays solo).
-constexpr uint64_t kHoldBoundMs = 3000;
+constexpr uint64_t kHoldBoundMs = 1800;
 /// The partner told us it plays a scene: remembered this long at most (its end clears it sooner).
 constexpr uint64_t kPartnerPlayingTtlMs = 180000;
 /// An enqueue of the node the mod just pulsed counts as the mod's start for this long (the pulse is synchronous; this is the margin).
@@ -37,7 +37,7 @@ enum class Release : uint8_t { None = 0, Partner = 1, Bound = 2, Save = 3, Agent
 inline const char* release_name(Release r) {
     switch (r) {
         case Release::Partner: return "the host's copy runs";
-        case Release::Bound: return "3 s bound (plays solo)";
+        case Release::Bound: return "local hold deadline";
         case Release::Save: return "a save request (never held across a save)";
         case Release::Agent: return "the agent (a menu, a load, the partner is not at that step)";
         default: return "-";

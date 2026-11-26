@@ -36,15 +36,14 @@
           run's own kcdmp-client.json, agent.log and relay.log never land in
           the folder the installer embeds -- New-InstallManifest.ps1 would
           otherwise ship them);
-       2. start KcdMpServer.exe from that copy on a free TCP port with its
-          HTTP listener on a random loopback port (no clash with a live relay
-          on 7778/5273, no master-server announce);
+       2. start KcdMpServer.exe from that copy on free loopback ports for TCP
+          and HTTP (no clash with a live relay on 7778/5273, no master-server
+          announce);
        3. run KcdMpClient.exe --relay-smoke against it: real Handshake with
           this build's protocol byte and release version, Ack, one Ping/Pong
           (RelaySmoke.cs); exit 0 with a RELAY-SMOKE ok line, else 1;
-       4. the agent's stdout must carry no "Could not load file or assembly"
-          / "Unhandled exception" line -- a caught-and-logged load failure
-          is still a broken payload;
+       4. match the accepted connection in this relay's stdout to the agent's
+          Ack ID and protocol. Check both programs for assembly-load failures;
        5. stop the relay, delete the copy, exit non-zero on any failure.
 
     Same-build only by construction: both exes come from the same payload,
@@ -139,7 +138,7 @@ try {
     $relayOut = Join-Path $work 'relay-stdout.txt'
     $relayErr = Join-Path $work 'relay-stderr.txt'
     $relay = Start-Process -FilePath (Join-Path $work 'KcdMpServer.exe') `
-        -ArgumentList @('--port', "$port", '--Urls', 'http://127.0.0.1:0') `
+        -ArgumentList @('--port', "$port", '--Tcp:BindAddress', '127.0.0.1', '--Urls', 'http://127.0.0.1:0') `
         -WorkingDirectory $work -PassThru -NoNewWindow `
         -RedirectStandardOutput $relayOut -RedirectStandardError $relayErr
     $null = $relay.Handle   # cache the handle so ExitCode is readable later (PS 5.1 quirk)
@@ -176,7 +175,11 @@ try {
     $lines = @()
     if (Test-Path $agentOut) { $lines = Get-Content $agentOut }
     $smoke = $lines | Where-Object { $_ -match 'RELAY-SMOKE' } | Select-Object -Last 1
-    if ($code -eq 0 -and $smoke -match 'RELAY-SMOKE ok') { Ok "$smoke" }
+    $connectPattern = $null
+    if ($code -eq 0 -and $smoke -cmatch '^RELAY-SMOKE ok id=(?<id>[0-9]+) protocol=v(?<protocol>[0-9]+) ') {
+        $connectPattern = '\bMP-FIX RELAY connected session=[1-9a-f][0-9a-f]* name=<redacted> id={0} protocol={1} loopback=1\s*$' -f $Matches['id'], $Matches['protocol']
+        Ok "$smoke"
+    }
     else {
         Bad "agent exit=$code : $smoke"
         $lines | Select-Object -Last 15 | ForEach-Object { Write-Host "    agent: $_" }
@@ -190,11 +193,14 @@ try {
     }
 
     $relayLog = Get-ChildItem $work -Filter 'relay*.log' -ErrorAction SilentlyContinue | Select-Object -First 1
-    $relayText = @()
+    # stdout ties the acceptance proof to the relay started above.
+    $relayStdout = @(Get-Content $relayOut)
+    $connect = $relayStdout | Where-Object { $connectPattern -and $_ -cmatch $connectPattern } | Select-Object -First 1
+    if ($connect) { Ok "published relay logged the smoke client's connect: $connect" }
+    else { Bad "published relay did not log a redacted connect matching the smoke client's Ack ID and protocol" }
+
+    $relayText = @($relayStdout)
     if ($relayLog) { $relayText += Get-Content $relayLog.FullName }
-    if (Test-Path $relayOut) { $relayText += Get-Content $relayOut }
-    if (($relayText | Where-Object { $_ -match "'payload-smoke' connected" }).Count -ge 1) { Ok "published relay logged the smoke client's connect" }
-    else { Bad "published relay never logged 'payload-smoke' connected" }
     $relayLoadErrors = $relayText | Where-Object { $_ -match 'Could not load file or assembly|Unhandled exception' }
     if ($relayLoadErrors.Count -eq 0) { Ok "published relay logged no assembly-load failure" }
     else {

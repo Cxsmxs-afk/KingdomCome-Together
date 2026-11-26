@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <dbghelp.h>
 #include <psapi.h>
+#include <array>
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
@@ -101,6 +102,16 @@ struct PipeNote { uint64_t at; uint8_t type, op; uint16_t len; };
 constexpr int kPipeRing = 64;
 PipeNote g_pipe[kPipeRing];
 std::atomic<long> g_pipeNext{0};
+
+constexpr size_t kActionNotes = 96;
+struct ActionNoteSlot {
+    std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    uint64_t index = 0, at = 0;
+    DWORD thread = 0;
+    ActionNote note{};
+};
+std::array<ActionNoteSlot, kActionNotes> g_actionNotes;
+std::atomic<uint64_t> g_actionNext{0};
 
 // ---- the report text (static: the heap may be what broke) ----
 char g_txt[320 * 1024];
@@ -313,6 +324,27 @@ void write_report() {
         for (long i = n > kPipeRing ? n - kPipeRing : 0; i < n; ++i) {
             const PipeNote& p = g_pipe[i % kPipeRing];
             put("  -%.2fs type 0x%02X op %u len %u\r\n", (now - p.at) / 1000.0, p.type, p.op, p.len);
+        }
+    }
+
+    // Action metadata was copied while the mod still owned the ledger entry.
+    // Never dereference those addresses here or wait for the crashing thread.
+    {
+        const uint64_t last = g_actionNext.load(std::memory_order_relaxed);
+        const uint64_t now = GetTickCount64();
+        put("\r\ncombat retirement observations (status=4294967295 means unreadable):\r\n");
+        for (uint64_t i = last > kActionNotes ? last - kActionNotes + 1 : 1; i <= last; ++i) {
+            auto& slot = g_actionNotes[i % kActionNotes];
+            if (slot.busy.test_and_set(std::memory_order_acquire)) continue;
+            const bool present = slot.index == i;
+            const auto note = slot.note;
+            const auto at = slot.at;
+            const auto thread = slot.thread;
+            slot.busy.clear(std::memory_order_release);
+            if (present) put("MP-FIX ACT seq=%llu age_ms=%llu thread=%lu eid=0x%X actor=0x%llX action=0x%llX vftable=0x%llX status=%u refs=%u stage=%s\r\n",
+                static_cast<unsigned long long>(note.serial), static_cast<unsigned long long>(now >= at ? now - at : 0),
+                static_cast<unsigned long>(thread), note.eid, static_cast<unsigned long long>(note.actor),
+                static_cast<unsigned long long>(note.action), static_cast<unsigned long long>(note.vtable), note.status, note.refs, note.stage);
         }
     }
 
@@ -659,6 +691,19 @@ void tick() {
 void note_pipe(uint8_t type, uint8_t op, uint16_t len) {
     const long i = g_pipeNext.fetch_add(1);
     g_pipe[i % kPipeRing] = PipeNote{GetTickCount64(), type, op, len};
+}
+
+void note_action(const ActionNote& note) {
+    const uint64_t index = g_actionNext.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto& slot = g_actionNotes[index % kActionNotes];
+    if (slot.busy.test_and_set(std::memory_order_acquire)) return;
+    if (slot.index < index) {
+        slot.note = note;
+        slot.at = GetTickCount64();
+        slot.thread = GetCurrentThreadId();
+        slot.index = index;
+    }
+    slot.busy.clear(std::memory_order_release);
 }
 
 void set_on(bool on) {

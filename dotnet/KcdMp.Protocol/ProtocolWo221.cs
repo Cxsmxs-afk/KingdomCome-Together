@@ -38,7 +38,7 @@ public static class W221Switch
     /// part), talk_hold (B: a copy woken for a talk has its own schedule held), drive (C: a walking human copy is moved by the engine's
     /// per-frame movement request), holders (C.3: one table of who holds a body), own_horse (D: each player's own horse -- the record,
     /// the quest gate's horse rule, the call, the saddlebags).</summary>
-    public static readonly string[] NativeNames = ["combat_action_end", "talk_hold", "drive", "holders", "own_horse", "corpse_look", "rp_controller", "rp_combat"];
+    public static readonly string[] NativeNames = ["combat_action_end", "talk_hold", "drive", "holders", "own_horse", "corpse_look", "rp_controller", "rp_combat", "death_trace"];
 
     /// <summary>The agent's and the mod's own switches (the agent tells the mod): shop_keeper (B: a copy of a shopkeeper keeps the host
     /// keeper's shop -- the host says which, the joiner's DLL opens it with the copy by the shop's own call), talk_force (B: the

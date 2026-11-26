@@ -37,7 +37,7 @@ void post_when(std::function<bool()> eligible, std::function<void()> work);
 // the hook's caller, CCryAction::PreSystemUpdate) and its fault site (WO-151: a task
 // that keeps faulting is switched off on its own, "main::task/<name>").
 void post_repeating(std::function<void()> work);
-void post_repeating(const char* name, std::function<void()> work);
+void post_repeating(const char* name, std::function<void()> work, bool researchWatch = false);
 
 // Pipe realtime runs before ordinary repeating work, bulk afterwards. These
 // drains use their own budgets and never wait for the compatibility queue.

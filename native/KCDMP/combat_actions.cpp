@@ -4,6 +4,7 @@
 // The lifetime of the combat animation actions this mod queues (combat_actions.h).
 #include "combat_actions.h"
 #include "combat_swing.h"
+#include "crash_capture.h"
 #include "load_sequence.h"
 #include "motion.h"
 #include "wo221.h"
@@ -48,6 +49,7 @@ constexpr uint64_t kDoneKeepMs = 30000;
 constexpr uint64_t kWatchMs = static_cast<uint64_t>(wo167rules::kWatchS * 1000);
 using detail::Retirement;
 enum class QueueStage : uint8_t { Reserved, InFlight, Settled };
+enum class ActionAccess : uint8_t { CurrentBody, EngineRelease, RetiredQueue };
 
 struct Entry {
     BodyProof body;
@@ -237,10 +239,34 @@ bool set_vft(void* action) {
     return done;
 }
 
-bool read_status(void* action, uint32_t* status) {
+bool read_status(void* action, uint32_t* status, void** observedTable = nullptr) {
     void* table = nullptr;
-    return g_armed.load(std::memory_order_acquire) && rd_ptr(action, 0, &table) &&
+    const bool ok = g_armed.load(std::memory_order_acquire) && rd_ptr(action, 0, &table) &&
         (table == g_actionVft || table == &g_quiet[1]) && rd_u32(action, kActStatus, status) && *status <= 4;
+    if (observedTable) *observedTable = table;
+    return ok;
+}
+
+struct ActionReadback { void* table = nullptr; uint32_t status = UINT32_MAX, refs = 0; };
+
+bool may_write(Bucket& bucket, const Entry& entry, ActionAccess access) {
+    if (!entry.serial || entry.queue == QueueStage::Reserved ||
+        entry.body.lifecycle != wo216::lifecycle_observation_stamp() || entry.body.load != loadsequence::stamp()) return false;
+    const auto* life = find_life(bucket, entry.body.actor);
+    if (!life) return false;
+    const auto revision = life->revision.load(std::memory_order_acquire);
+    const auto releases = bucket.releaseDepth.load(std::memory_order_acquire);
+    if (access == ActionAccess::EngineRelease)
+        return releases == 1 && revision == entry.body.combatRevision + 1;
+    return releases == 0 && revision == entry.body.combatRevision &&
+        (access == ActionAccess::RetiredQueue || g_epoch.load(std::memory_order_acquire) == entry.body.queueEpoch);
+}
+
+bool read_owned_action(const Entry& entry, ActionReadback& seen) {
+    // reserve_queue published a separate, counted reference before admission.
+    // The observed table alone does not establish that ownership or its lifetime.
+    return entry.serial && read_status(entry.action, &seen.status, &seen.table) && rd_u32(entry.action, kActRefs, &seen.refs) &&
+        seen.refs > 0 && seen.refs <= static_cast<uint32_t>((std::numeric_limits<LONG>::max)());
 }
 
 void quarantine(Entry& entry) {
@@ -249,35 +275,50 @@ void quarantine(Entry& entry) {
     c_quarantined.fetch_add(1, std::memory_order_relaxed);
 }
 
-bool note_finished(Entry& entry, bool actionKnown, uint32_t status) {
+void trace(const Entry& entry, const char* stage, const ActionReadback& seen = {}) {
+    if (!wo221::on(wo221::kBitDeathTrace)) return;
+    crash::note_action({entry.serial, reinterpret_cast<uintptr_t>(entry.action),
+        reinterpret_cast<uintptr_t>(seen.table), reinterpret_cast<uintptr_t>(entry.body.actor),
+        entry.body.eid, seen.status, seen.refs, stage});
+}
+
+bool note_finished(Entry& entry, bool actionKnown, const ActionReadback& seen) {
     if (entry.retirement == Retirement::Finished) return true;
-    if (!detail::observe_finished(entry.retirement, actionKnown, status)) return false;
+    if (!detail::observe_finished(entry.retirement, actionKnown, seen.status)) return false;
+    trace(entry, "finished", seen);
     c_ended.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
 // Called only for the recorded physical body and owned action. A verified quiet table closes callbacks before Stop,
 // but quiet alone is no stop receipt. An unreadable status or unexpected table is never written through.
-bool end_entry(Entry& entry, bool canStop) {
-    if (entry.body.lifecycle != wo216::lifecycle_observation_stamp() || entry.body.load != loadsequence::stamp()) {
+bool end_entry(Bucket& bucket, Entry& entry, ActionAccess access) {
+    if (entry.retirement == Retirement::Finished) return true;
+    const auto current = [&] { return may_write(bucket, entry, access); };
+    if (!current()) {
+        if (entry.retirement != Retirement::Quarantined) trace(entry, "proof-lost");
         quarantine(entry);
         return false;
     }
-    if (entry.retirement == Retirement::Finished) return true;
-    uint32_t status = 0;
-    const bool actionKnown = read_status(entry.action, &status);
-    if (note_finished(entry, actionKnown, status)) return true;
+    ActionReadback seen;
+    const bool actionKnown = read_owned_action(entry, seen);
+    if (note_finished(entry, actionKnown && current(), seen)) return true;
     if (entry.retirement != Retirement::Active) return false;
-    const bool requested = detail::retire(entry.retirement, actionKnown, status, canStop,
+    const bool canStop = access != ActionAccess::EngineRelease;
+    const bool requested = detail::retire(entry.retirement, actionKnown, seen.status, canStop,
         [&] {
-            const bool quiet = set_vft(entry.action);
+            if (seen.table != &g_quiet[1]) trace(entry, "before-quiet", seen);
+            if (!current()) return false;
+            const bool quiet = seen.table == &g_quiet[1] || set_vft(entry.action);
             if (quiet && !canStop) c_quietOnly.fetch_add(1, std::memory_order_relaxed);
             return quiet;
         }, [&] {
+            trace(entry, "before-stop", seen);
+            if (!current()) return false;
             if (!rttr::stop_action(entry.action)) return false;
             c_stopped.fetch_add(1, std::memory_order_relaxed);
             return true;
-        });
+        }, current);
     if (!requested) c_quarantined.fetch_add(1, std::memory_order_relaxed);
     else c_finishPending.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -288,20 +329,30 @@ struct ReleaseEvidence { unsigned waiting = 0, active = 0; };
 ReleaseReceipt end_matching(Bucket& bucket, const BodyProof& proof, bool canStop, ReleaseEvidence* evidence = nullptr) {
     bool pending = false, uncertain = false;
     size_t stops = 0;
-    const auto* life = canStop ? find_life(bucket, proof.actor) : nullptr;
+    const auto access = canStop ? ActionAccess::CurrentBody : ActionAccess::EngineRelease;
     // Stop can reenter the release hook. Before the first engine call, silence every exact unfinished action in this batch.
     if (canStop) for (auto& entry : bucket.entries) {
         if (!entry.action || !detail::same_body(entry.body, proof) || entry.retirement == Retirement::Finished) continue;
-        uint32_t status = 0;
-        const bool readable = read_status(entry.action, &status);
+        if (entry.queue != QueueStage::Settled) continue;
+        if (!may_write(bucket, entry, access)) return ReleaseReceipt::Stale;
+        ActionReadback seen;
+        const bool readable = read_owned_action(entry, seen);
         if (evidence && readable) {
-            if (status == wo167rules::kStatusPending || status == wo167rules::kStatusNone) ++evidence->waiting;
-            else if (status == wo167rules::kStatusInstalled || status == wo167rules::kStatusExiting) ++evidence->active;
+            if (seen.status == wo167rules::kStatusPending || seen.status == wo167rules::kStatusNone) ++evidence->waiting;
+            else if (seen.status == wo167rules::kStatusInstalled || seen.status == wo167rules::kStatusExiting) ++evidence->active;
         }
-        if (entry.queue != QueueStage::Settled || entry.retirement != Retirement::Active) continue;
-        if (!readable) quarantine(entry);
-        else if (status == wo167rules::kStatusFinished) note_finished(entry, true, status);
-        else if (!set_vft(entry.action)) quarantine(entry);
+        if (entry.retirement != Retirement::Active) continue;
+        if (!may_write(bucket, entry, access)) return ReleaseReceipt::Stale;
+        if (!readable) {
+            trace(entry, "unreadable", seen);
+            quarantine(entry);
+        } else if (seen.status == wo167rules::kStatusFinished) {
+            note_finished(entry, true, seen);
+        } else if (seen.table != &g_quiet[1]) {
+            trace(entry, "before-quiet", seen);
+            if (!may_write(bucket, entry, access)) return ReleaseReceipt::Stale;
+            if (!set_vft(entry.action)) quarantine(entry);
+        }
     }
     for (auto& entry : bucket.entries) {
         if (!entry.action || entry.body.actor != proof.actor) continue;
@@ -312,14 +363,11 @@ ReleaseReceipt end_matching(Bucket& bucket, const BodyProof& proof, bool canStop
             if (entry.retirement != Retirement::Finished) uncertain = true;
             continue;
         }
-        if (canStop && entry.queue != QueueStage::Settled && entry.retirement == Retirement::Active) {
-            pending = true;
+        if (entry.queue == QueueStage::Reserved || (canStop && entry.queue != QueueStage::Settled && entry.retirement == Retirement::Active)) {
+            if (canStop) pending = true;
             continue;
         }
-        if (canStop && entry.retirement != Retirement::Finished && (!life || bucket.releaseDepth.load(std::memory_order_acquire) ||
-            life->revision.load(std::memory_order_acquire) != proof.combatRevision ||
-            g_epoch.load(std::memory_order_acquire) != proof.queueEpoch ||
-            wo216::lifecycle_observation_stamp() != proof.lifecycle || loadsequence::stamp() != proof.load)) {
+        if (canStop && entry.retirement != Retirement::Finished && !may_write(bucket, entry, access)) {
             quarantine(entry);
             return ReleaseReceipt::Stale;
         }
@@ -327,7 +375,7 @@ ReleaseReceipt end_matching(Bucket& bucket, const BodyProof& proof, bool canStop
             if (stops == kReleaseStops) { pending = true; continue; }
             ++stops;
         }
-        if (end_entry(entry, canStop)) continue;
+        if (end_entry(bucket, entry, access)) continue;
         if (entry.retirement == Retirement::StopRequested) pending = true;
         else uncertain = true;
     }
@@ -447,6 +495,7 @@ void forget(Entry& entry) {
 
 void forget_unconfirmed(Entry& entry) {
     if (entry.retirement != Retirement::Finished) {
+        trace(entry, "scope-retired");
         quarantine(entry);
         note_tracking_gap(entry.body.actor);
     }
@@ -494,14 +543,14 @@ void tick() {
                 continue;
             }
             if (entry.epoch != epoch) {
-                end_entry(entry, true);
+                end_entry(bucket, entry, ActionAccess::RetiredQueue);
                 entry.epoch = epoch;
             }
             if (now - entry.trackedAt < kDoneKeepMs) continue;
-            uint32_t status = 0;
-            if (!read_status(entry.action, &status)) quarantine(entry);
-            else if (status == wo167rules::kStatusFinished) {
-                note_finished(entry, true, status);
+            ActionReadback seen;
+            if (!read_owned_action(entry, seen)) quarantine(entry);
+            else if (seen.status == wo167rules::kStatusFinished && may_write(bucket, entry, ActionAccess::RetiredQueue)) {
+                note_finished(entry, true, seen);
                 // Status None can still belong to the controller's queue. Only its explicit Finished status can give our ref back.
                 done[finished++] = {entry.body.actor, entry.action};
                 forget(entry);
@@ -516,7 +565,7 @@ void tick() {
 }
 
 int status(char* out, int n) {
-    return std::snprintf(out, static_cast<size_t>(n), "armed=%d on=%d recorded=%u live=%u forgotten=%u release_calls=%u with_part=%u "
+    return std::snprintf(out, static_cast<size_t>(n), "MP-FIX ACT armed=%d on=%d recorded=%u live=%u forgotten=%u release_calls=%u with_part=%u "
                          "off_main=%u stopped=%u ended=%u quiet=%u explicit=%u quarantined=%u hook_busy=%u no_body_proof=%u bucket_full=%u "
                          "retire_scopes=%u quiet_without_stop=%u tracking_gap=%u finish_pending=%u queue_refused=%u queue_uncertain=%u queue_no_release_hook=%u",
                          g_armed.load() ? 1 : 0, g_releaseOn.load() ? 1 : 0, c_tracked.load(), c_live.load(), c_forgotten.load(), c_hook.load(),
@@ -613,9 +662,7 @@ QueueResult settle_queue(const QueueTicket& ticket, QueueResult result) {
         } else {
             // QueueAction may have installed before reentry or a fault. The ledger's reference stays and the event is never retried.
             entry->queue = QueueStage::Settled;
-            uint32_t status = 0;
-            if (entry->retirement != Retirement::Finished && read_status(entry->action, &status) &&
-                status != wo167rules::kStatusFinished) set_vft(entry->action);
+            trace(*entry, "queue-uncertain");
             quarantine(*entry);
             c_queueUncertain.fetch_add(1, std::memory_order_relaxed);
             return QueueResult::Uncertain;
@@ -641,7 +688,7 @@ bool body_pose_holds(uint32_t eid) {
         if (status == wo167rules::kStatusInstalled || status == wo167rules::kStatusExiting) return true;
         if (status == wo167rules::kStatusPending || status == wo167rules::kStatusNone) {
             if (now - entry.trackedAt < kWatchMs) return true;
-            if (entry.retirement == Retirement::Active) end_entry(entry, true);
+            if (entry.retirement == Retirement::Active) end_entry(bucket, entry, ActionAccess::CurrentBody);
             // A queued action may already be entering the controller when Stop arrives. Hold until it is observed out.
             return true;
         }

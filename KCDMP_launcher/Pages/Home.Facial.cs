@@ -22,8 +22,8 @@ public partial class Home
                 using (process) running |= !process.HasExited;
             var r = await Task.Run(() => FacialFallback.Prepare(gameRoot, Path.Combine(gameRoot, "Mods", "kdcmp"), running));
             // One bounded summary per launch, regardless of the number of repeated engine warnings.
-            if (r.Ok) Log.Information("facial fallback: {Action}, {Databases} databases, {References} invalid clips ({Detail})", r.Action, r.Databases, r.References, r.Detail);
-            else Log.Warning("facial fallback: {Action} ({Detail})", r.Action, r.Detail);
+            if (r.Ok) Log.Information("MP-FIX FACE facial fallback: {Action}, {Databases} databases, {References} invalid clips ({Detail})", r.Action, r.Databases, r.References, r.Detail);
+            else Log.Warning("MP-FIX FACE facial fallback: {Action} ({Detail})", r.Action, r.Detail);
             return !r.BlocksLaunch;
         }
         catch (Exception ex)

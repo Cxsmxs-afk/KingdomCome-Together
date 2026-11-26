@@ -1051,6 +1051,7 @@ public partial class GameBridge
                     join.LauncherGuestScopeWasInitial = previousGuest is null && !_joinedWorld;
                     previousGuest?.Dispose();
                     guestLease = null;
+                    Console.WriteLine("MP-FIX REJOIN guest_lease=held");
                 }
                 receipt.ProtectSubmittedLoad();
                 join.EngineReceipt = receipt;
@@ -1072,7 +1073,7 @@ public partial class GameBridge
         if (!JoinSaveReadEnded(join) || join.SavesRoot is not { } root || join.SplicedSha is not { } sha ||
             !_retainedJoinWorlds.TryDelete(path, join, full => _joinWorldJournal.TryDeleteOwned(root, full, join.JoinId, sha))) return false;
         if (join.LauncherGuestScopeWasInitial && join.LauncherGuestScope is { } guest && join.EngineReceipt is { CanRemoveFile: true } receipt &&
-            !receipt.Terminal.Task.Result) ReleaseLauncherGuestWorld(guest);
+            !receipt.Terminal.Task.Result) ReleaseLauncherGuestWorld(guest, "initial-load-failed");
         return true;
     }
 

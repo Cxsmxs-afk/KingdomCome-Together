@@ -212,8 +212,8 @@ public partial class GameBridge
                 bool mine = soul == "Dude";
                 long n = mine ? Interlocked.Increment(ref _w153CancelMine) : Interlocked.Increment(ref _w153CancelOther);
                 if (mine || n <= 5 || n % 50 == 0)
-                    Console.WriteLine($"MP-W137 the engine cancelled dialog request {id} of '{soul}' (a participant was not free; its text says \"timed out\"){(mine ? " -- this player's own: if it was a talk, it ends here and nothing was held on the host (the mod's WO137-TALK end line has how long it waited)" : $" [n={n}, not this player's]")}");
-                _ = ExecLuaAsync($"if KCD2MP_W137TalkDropped then KCD2MP_W137TalkDropped({id}) end");
+                    Console.WriteLine($"MP-W137 the engine cancelled dialog request {id} of '{soul}' (a participant was not free; its text says \"timed out\"){(mine ? " -- this player's own: the current talk receives the timeout" : $" [n={n}, not this player's]")}");
+                _ = ExecLuaAsync($"if KCD2MP_W137TalkDropped then KCD2MP_W137TalkDropped({id}, {(mine ? "true" : "false")}) end");
             }
             return;
         }

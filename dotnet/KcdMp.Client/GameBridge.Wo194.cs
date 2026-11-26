@@ -145,7 +145,7 @@ public partial class GameBridge
     private async Task Wo194TickAsync(long now)
     {
         await Wo194PushCfgAsync(now);
-        // a menu or a load releases a held copy at once (it then plays solo; the DLL's own 3 s bound is the backstop)
+        // A menu or load releases the held copy immediately. The DLL's 1.8 s bound is the backstop.
         var own = _w194Own;
         if (own is { Held: true, PlayMs: 0 } && (W179NotInWorld))
         {

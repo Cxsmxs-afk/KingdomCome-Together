@@ -89,6 +89,7 @@ internal sealed class F4WindowsHandleTrace : IDisposable
         var workerStacks = workers.OrderBy(worker => worker.Id)
             .Select(worker => $"{worker.Id}:{(worker.Waiting ? "waiting" : "other")}:{string.Join('>', worker.Frames.Take(6))}");
         string details = $"enabled=1 clr={Environment.Version} managed={(runtime is null ? 0 : 1)} order={order} " +
+            (knownNativeWorkerStack ? "" : $"native=[Allowlist gilt nicht für {Environment.Version} ({RuntimeInformation.ProcessArchitecture})] ") +
             $"new_worker_stacks={string.Join(',', workerStacks)} " +
             string.Join(',', histories.GroupBy(x => x).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key}={g.Count()}"));
         return new(details, bookkeeping, workers.Count(worker => worker.Waiting));
@@ -151,12 +152,12 @@ internal sealed class F4WindowsHandleTrace : IDisposable
             .GroupBy(handle => handle.Thread).Count(group => group.Count() == 1);
         // A real native handle and a named pre-existing gate must both match.
         // Unknown or per-leave monitors are charged even with this stack.
-        int monitorEvents = allocations.Where(handle => handle.Kind == "Event" && handle.PersistentMonitor is not null)
+        int monitorEvents = knownNativeWorkerStack ? allocations.Where(handle => handle.Kind == "Event" && handle.PersistentMonitor is not null)
             .Select(handle => (handle.PersistentMonitor, Stack: handle.Stack.Split('>')))
             .Where(handle => handle.Stack.Contains("coreclr.dll+886b", StringComparer.OrdinalIgnoreCase) &&
                 handle.Stack.Any(frame => frame is "System.Threading.SemaphoreSlim.WaitAsync" or
                     "System.Threading.SemaphoreSlim.Wait" or "System.Threading.SemaphoreSlim.Release"))
-            .GroupBy(handle => handle.PersistentMonitor).Count(group => group.Count() == 1);
+            .GroupBy(handle => handle.PersistentMonitor).Count(group => group.Count() == 1) : 0;
         startedWorkers = workers;
         return new(pairs, regexEvents == 1 ? 1 : 0, workers.Count, nameEvents, threadReferences, monitorEvents);
     }
