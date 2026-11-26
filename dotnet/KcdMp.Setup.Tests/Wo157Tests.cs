@@ -15,7 +15,7 @@ public class Wo157Tests
     [Fact]
     public void VcRuntimePresentIsDoneAndReadyStands()
     {
-        using var f = new FakeSteam("vc-ok").WithGame().WithModdingTools().Linked().WithInstall().WithModPlaced();
+        using var f = new FakeSteam("vc-ok").WithGame().WithRetailFacials().WithModdingTools().Linked().WithInstall().WithModPlaced();
         var steps = SetupChecklist.Evaluate(f.Snapshot(new FakeHost { VcRuntime = true }), SetupActivity.Idle);
         var vc = Step(steps, StepId.VcRuntime);
         Assert.Equal(StepStatus.Done, vc.Status);
@@ -28,7 +28,7 @@ public class Wo157Tests
     [Fact]
     public void VcRuntimeMissingWithSteamsRedistOffersTheInstallButNeverBlocks()
     {
-        using var f = new FakeSteam("vc-redist").WithGame().WithModdingTools().Linked().WithInstall().WithModPlaced();
+        using var f = new FakeSteam("vc-redist").WithGame().WithRetailFacials().WithModdingTools().Linked().WithInstall().WithModPlaced();
         string redist = Path.Combine([f.Library, .. VcRuntime2013.RedistRelPath]);
         Directory.CreateDirectory(Path.GetDirectoryName(redist)!);
         File.WriteAllText(redist, "fake");
