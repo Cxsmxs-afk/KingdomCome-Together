@@ -193,6 +193,10 @@ struct ModelRead {
 constexpr uint16_t kMvState = 1, kMvGuardZone = 2, kMvBlockZone = 4, kMvBlockHand = 8, kMvBlockMode = 16, kMvPerfect = 32,
                    kMvAtkZone = 64, kMvAtkType = 128, kMvAtkStrength = 256, kMvAtkHand = 512, kMvCombatMode = 1024;
 bool read_model(uint32_t eid, ModelRead* out);        // false = no actor for eid
+// Periodic observers can share the sample. A mutation, contact or readback requires read_model.
+bool observe_model(uint32_t eid, ModelRead* out);
+void begin_model_frame();
+void end_model_frame();
 
 // For hits.cpp: is this entity id a native-written avatar, and its soul.
 bool is_avatar_eid(uint32_t eid);

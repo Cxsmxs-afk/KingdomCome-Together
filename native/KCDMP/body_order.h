@@ -13,12 +13,12 @@
 // Pipe ops (the WO-163 family, registered through wo203.h; numbers 190..199 are WO-221's), main thread:
 //   195 Go   [gait:1][name len:1][name][x y z:3f] -> [code:1][order:4]   (gait: 0 walk, 1 jog, 2 run, 3 sprint)
 //   196 Stop [name len:1][name]                   -> [code:1]
-// Codes: 1 ordered / stopped, 2 no such body here, 3 the request is not armed on this build, 4 the switch is off.
+// Codes: 1 ordered / stopped, 2 no such body here, 3 the request is not armed, 4 the switch is off, 5 the queue refused the order.
 #include <cstdint>
 
 namespace kcdmp::bodyorder {
 
 constexpr uint8_t kOpGo = 195, kOpStop = 196;
-constexpr uint8_t kOk = 1, kNoBody = 2, kNotArmed = 3, kOff = 4;
+constexpr uint8_t kOk = 1, kNoBody = 2, kNotArmed = 3, kOff = 4, kRefused = 5;
 
 } // namespace kcdmp::bodyorder

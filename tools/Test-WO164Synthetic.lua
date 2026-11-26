@@ -371,6 +371,34 @@ do
     check("C4 (host): 2 m behind the figure, on its own side", moved ~= nil and math.abs(moved.x - 18) < 0.01, moved and moved.x)
     KCD2MP_W164EscortFollow(nil, 1, false)
     check("C5 (host): the end gives its brain back", cmdCount("wh_ai_ResumeNPC hledaniPsa_ignaz") == 1 and next(KCD2MP.w164.escort) == nil)
+
+    -- One native escort scenario iterates through two, three and four players. C3–C5 above are the off twin.
+    KCD2MP_W221Cfg("escort_nav=on")
+    KCD2MP.w137.host, KCD2MP.w137.active = true, true
+    PX = -7
+    moved = nil
+    ENTS["kcd2mp_1"].GetWorldPos = function() return { x = 17, y = 0, z = 0 } end
+    local near = { GetWorldPos = function() return { x = 7, y = 0, z = 0 } end }
+    KCD2MP.ghosts["1"] = { entity = ENTS["kcd2mp_1"] }
+    mark = #LOG
+    KCD2MP_W164EscortFollow("hledaniPsa_ignaz", 1, true)
+    KCD2MP_W164EscortTick()
+    local hostFirst = lastLog("MP-FIX ESC follow=host mode=nav", mark) ~= nil
+    KCD2MP.ghosts["2"] = { entity = near }
+    NOW = NOW + 0.25
+    KCD2MP_W164EscortTick()
+    local held = not lastLog("MP-FIX ESC follow=2 mode=nav", mark)
+    KCD2MP.ghosts["3"] = { entity = { GetWorldPos = function() return { x = 28, y = 0, z = 0 } end } }
+    NOW = NOW + 2
+    KCD2MP_W164EscortTick()
+    KCD2MP_W164EscortFollow(nil, 1, false)
+    check("C6: nearest native escort with a stable lead change, no placement, and one stop", hostFirst and held
+        and lastLog("MP-FIX ESC follow=2 mode=nav", mark) ~= nil and moved == nil
+        and countEvt("w221_go", "hledaniPsa_ignaz", mark) == 2 and countEvt("w221_stop", "hledaniPsa_ignaz", mark) == 1)
+    KCD2MP_W221Cfg("escort_nav=off")
+    KCD2MP.ghosts["1"], KCD2MP.ghosts["2"], KCD2MP.ghosts["3"] = nil, nil, nil
+    KCD2MP.w137.host = false
+    PX = 0
     ENTS["hledaniPsa_ignaz"] = nil; ENTS["kcd2mp_1"] = nil; ENTS["tc_copy"] = nil; KCD2MP.npcPuppets["tc_copy"] = nil
     SPHERE = {}
     noErrs("C")

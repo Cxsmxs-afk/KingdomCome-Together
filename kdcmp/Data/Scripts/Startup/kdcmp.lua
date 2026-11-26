@@ -5624,7 +5624,7 @@ function KCD2MP_JoinTry(joinId, partner, timeoutS)
         w.partner = tostring(partner or "your partner")
         if (os.clock() - w.busyToldAt) >= 15 then
             w.busyToldAt = os.clock()
-            mp_log(string.format("MP-JOIN defer join=%s partner=%s reason=%s -- asked again every 2 s", joinId, w.partner, busy))
+            mp_log(string.format("MP-JOIN defer join=%s partner=<redacted> reason=%s -- asked again every 2 s", joinId, busy))
             pcall(KCD2MP_ShowInteractionMsg, string.format("%s wants to join -- waiting (%s)", w.partner, busy))
         end
         KCD2MP_EmitEvent("join_try", joinId .. " busy " .. busy)
@@ -5658,8 +5658,8 @@ function KCD2MP_JoinTry(joinId, partner, timeoutS)
     local names, k = {}, 0
     for n in pairs(w.npcs) do k = k + 1; if k <= 12 then names[#names + 1] = n end end
     table.sort(names)
-    mp_log(string.format("MP-JOIN pause join=%s partner=%s ratio_was=%s ratio_now=%s clock=%s npcs_paused=%d skipped=%d hold=%s(%s) ms=%.1f names=%s%s%s",
-        joinId, w.partner, tostring(w.ratioWas), tostring(ratioNow), tostring(clock0), w.npcN, w.npcSkipped,
+    mp_log(string.format("MP-JOIN pause join=%s partner=<redacted> ratio_was=%s ratio_now=%s clock=%s npcs_paused=%d skipped=%d hold=%s(%s) ms=%.1f names=%s%s%s",
+        joinId, tostring(w.ratioWas), tostring(ratioNow), tostring(clock0), w.npcN, w.npcSkipped,
         tostring(holdHow), holdOk and "ok" or "FAILED", (os.clock() - t0) * 1000, table.concat(names, ","), k > 12 and ",..." or "",
         w.noSuspend and " -- no NPC suspended (mp_join_no_npc_suspend): the clock and the engine's own hold keep the world still" or ""))
     -- the safety timer, independent of the agent
@@ -27032,8 +27032,8 @@ end
 function KCD2MP_W164SetJoinerEvents(arg) return w164_toggle("joinerEvents", "mp_joiner_events", arg, "on = a joiner's own random events are off during a session (the host's are the only ones)") end
 -- ---- WO-164 ESC: a quest NPC that follows the joiner ----------------------------------------------------------------------------
 -- Joiner: the quest just made an NPC follow this player (its follow step went to the host): the nearest of this game's own
--- people / animals within 8 m that is not a host copy is it; the host is told. Host: its NPC of that name is paused and walked
--- behind the joiner's figure (4 Hz, the draw loop) until the quest's end step, 15 minutes, or the joiner's off.
+-- people / animals within 8 m that is not a host copy is it; the host is told. The host drives its own quest NPC until the
+-- quest's end step, 15 minutes, or the requesting guest leaves.
 KCD2MP.w164.escort = KCD2MP.w164.escort or {}       -- host: npc -> { ghost, since }
 function KCD2MP_W164EscortFind()
     local pp = w164_ppos()
@@ -27077,20 +27077,76 @@ function KCD2MP_W164EscortFollow(name, ghost, on)
         local e = nil
         pcall(function() e = System.GetEntityByName(name) end)
         if not e then mp_log("WO164-ESCORT host: no NPC named " .. name .. " in this world -- nothing follows"); return false end
-        w.escort[name] = { ghost = tonumber(ghost), since = os.clock() }
-        w164_exec("wh_ai_PauseNPC " .. name)
-        mp_log(string.format("WO164-ESCORT host npc=%s ghost=%s on -- paused, walked behind the figure kcd2mp_%s", name, tostring(ghost), tostring(ghost)))
+        if w.escort[name] then return true end
+        local nav = KCD2MP_W221On("escort_nav")
+        if nav and (not KCD2MP.w137.host or not KCD2MP_W221On("own_horse") or e == player or KCD2MP.npcPuppets[name]
+                or not e.soul or (mp_is_mod_entity and mp_is_mod_entity(e))) then return false end
+        w.escort[name] = { ghost = tonumber(ghost), since = os.clock(), nav = nav, entity = e }
+        if not nav then w164_exec("wh_ai_PauseNPC " .. name) end
+        mp_log(string.format("WO164-ESCORT host npc=%s ghost=%s on mode=%s", name, tostring(ghost), nav and "nav" or "legacy"))
         return true
     end
     for nm, x in pairs(w.escort) do
         if (name == nil or nm == name) and (ghost == nil or x.ghost == tonumber(ghost)) then
             w.escort[nm] = nil
-            w164_exec("wh_ai_ResumeNPC " .. nm)
+            if x.nav then
+                if x.goal and System.GetEntityByName(nm) == x.entity then KCD2MP_EmitEvent("w221_stop", nm) end
+            else
+                w164_exec("wh_ai_ResumeNPC " .. nm)
+            end
             mp_log("WO164-ESCORT host npc=" .. nm .. " off -- its own brain again")
         end
     end
     return true
 end
+
+function KCD2MP.w164.escortDistance(e, origin)
+    if not e then return nil end
+    local ok, pos = pcall(e.GetWorldPos, e)
+    if ok and pos then return pos, math.sqrt(w164_dist2(origin, pos)) end
+end
+
+function KCD2MP.w164.escortNavigate(nm, x, now)
+    local w = KCD2MP.w164
+    local ok, ep = pcall(x.entity.GetWorldPos, x.entity)
+    if not ok or not ep then return end
+    local bestPos, bestD = w.escortDistance(player, ep)
+    local best = bestPos and "host" or nil
+    local currentPos, currentD = nil, nil
+    if x.leader == "host" then currentPos, currentD = bestPos, bestD end
+    for id, g in pairs(KCD2MP.ghosts) do
+        local pos, d = w.escortDistance(g.entity, ep)
+        if id == x.leader then currentPos, currentD = pos, d end
+        if pos and (not bestD or d < bestD) then best, bestPos, bestD = id, pos, d end
+    end
+    if not best then return end
+
+    if currentD and best ~= x.leader then
+        if currentD - bestD >= 3 then
+            if x.challenger ~= best then x.challenger, x.challengerAt = best, now end
+        else
+            x.challenger = nil
+        end
+        if not x.challenger or now - x.challengerAt < 2 then
+            best, bestPos, bestD = x.leader, currentPos, currentD
+        end
+    else
+        x.challenger = nil
+    end
+
+    if bestD <= 3 then
+        if x.goal then KCD2MP_EmitEvent("w221_stop", nm); x.goal = nil end
+        x.leader = best
+    elseif (not x.orderAt or now - x.orderAt >= 1) and (not x.goal or x.leader ~= best or w164_dist2(x.goal, bestPos) >= 4) then
+        -- Send coordinates to the existing AI-update order queue. A guest body supplies the goal in the host's world.
+        KCD2MP_EmitEvent("w221_go", string.format("%s %.3f %.3f %.3f %d", nm, bestPos.x, bestPos.y, bestPos.z, bestD > 8 and 2 or 0))
+        if not x.goal or x.leader ~= best then
+            mp_log(string.format("MP-FIX ESC follow=%s mode=nav distance=%.1f stage=requested", best, bestD))
+        end
+        x.goal, x.leader, x.orderAt = bestPos, best, now
+    end
+end
+
 function KCD2MP_W164EscortTick()
     local w = KCD2MP.w164
     if next(w.escort) == nil then return end
@@ -27098,7 +27154,14 @@ function KCD2MP_W164EscortTick()
     for nm, x in pairs(w.escort) do
         local e, a = nil, nil
         pcall(function() e = System.GetEntityByName(nm); a = System.GetEntityByName("kcd2mp_" .. tostring(x.ghost)) end)
-        if not e or not a or (now - x.since) > 900 then
+        if x.nav then
+            if e ~= x.entity or not KCD2MP.w137.host or not KCD2MP.w137.active or not a or (now - x.since) > 900
+                    or not KCD2MP_W221On("escort_nav") or not KCD2MP_W221On("own_horse") then
+                KCD2MP_W164EscortFollow(nm, nil, false)
+            else
+                w.escortNavigate(nm, x, now)
+            end
+        elseif not e or not a or (now - x.since) > 900 then
             KCD2MP_W164EscortFollow(nm, nil, false)
         else
             local ep, ap = nil, nil
@@ -37474,7 +37537,7 @@ do
 end
 
 -- ===== WO-221: bodies that walk right, and a horse each (docs/WO-221-findings.md) =====
--- Every switch ships on. The agent tells this file the states (KCD2MP_W221Cfg, with the bench's twins applied); a console switch here goes
+-- The agent tells this file the states (KCD2MP_W221Cfg, with the bench's twins applied); a console switch here goes
 -- to the agent, which tells the DLL and this file back. mp_w221_status lists them.
 do
     W221 = W221 or {}
@@ -37486,14 +37549,17 @@ do
         ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller", rp_combat = "mp_rp_combat", death_trace = "mp_death_trace",
         load_sequence = "mp_load_sequence", baseline_events = "mp_baseline_events", world_recovery = "mp_world_recovery",
         queue_ref_release = "mp_queue_ref_release", escort_nearest_all = "mp_escort_nearest_all", npc_target_owner = "mp_npc_target_owner",
-        attack_window_snapshot = "mp_attack_window_snapshot",
+        attack_window_snapshot = "mp_attack_window_snapshot", escort_nav = "mp_escort_nav", frame_snapshot = "mp_frame_snapshot",
+        shop_definition = "mp_shop_definition", reaction_sync = "mp_reaction_sync", target_fallback = "mp_target_fallback", bow_phases = "mp_bow_phases",
     }
+    W221.DEFAULT_OFF = { escort_nav = true, frame_snapshot = true, shop_definition = true, reaction_sync = true, target_fallback = true, bow_phases = true }
     W221.HELP = {
         combat_action_end = "A: (both) no combat animation of ours outlives its body's combat part (the joiner's fight crash)",
         talk_hold = "B: (joiner) a copy woken for a talk asks nothing of its own schedule while it talks (the trade that closed)",
         drive = "C: (joiner) a walking person is moved by the game's own movement, not placed: the step and the feet are the game's",
         holders = "C.3: (joiner) one table says who holds a body: the driver, the writer, a seat, an activity, a fall, a mount, a one-shot",
         shop_keeper = "B: (both) a shopkeeper's copy keeps the same shop as the host's keeper, so the joiner's Trade opens its shop",
+        shop_definition = "Include the NPC soul, faction and inventory counts in the shop probe",
         own_horse = "D: (both) each player owns their own horse: the host's world keeps the record, a purchase is the buyer's only",
         corpse_look = "E.1: (both) a dead body the joiner did not see die has the host body's wounds",
         horse_drop = "E.3: (both) an item dropped out of your own horse's inventory is a drop for both players, like one out of your own",
@@ -37508,15 +37574,20 @@ do
         death_trace = "Record bounded native combat retirement details for crash reports",
         queue_ref_release = "Keep an uncertain action's caller reference until its confirmed finish",
         escort_nearest_all = "Use all bound partners for the host's distance triggers",
+        escort_nav = "Use the host's engine movement order for a quest escort (requires the body order path)",
         npc_target_owner = "Use the host's opponent stream as the sole target writer for NPC copies",
         attack_window_snapshot = "Share the player's combat observation across this frame's attack windows",
+        frame_snapshot = "Share an Engine combat-model sample among frame observers",
+        reaction_sync = "Play queued melee reactions in the source's observed order",
+        target_fallback = "Fall back to the host's combat events when its target stream goes stale",
+        bow_phases = "Require a current draw or aim observation before playing the bow shot",
         load_sequence = "Apply the world only for its current load generation",
         baseline_events = "Install the world baseline and confirm each ordered event",
         world_recovery = "Check the world by area and repair that area or reconnect",
     }
     function KCD2MP_W221On(name)
         local v = W221.on[tostring(name)]
-        if v == nil then return true end
+        if v == nil then return not W221.DEFAULT_OFF[name] end
         return v
     end
     function KCD2MP_W221Cfg(list)
@@ -37569,13 +37640,47 @@ do
     function KCD2MP_W221ShopProbe(arg)
         local name = tostring(arg or ""):match("^%s*\"?([%w_]+)\"?%s*$")
         if not name or #name > 59 then return false end
-        local db = nil
+        local db, e = nil, nil
         pcall(function()
-            local e = System.GetEntityByName(name)
-            if e and Shops and Shops.GetShopDBIdByKeeper then db = Shops.GetShopDBIdByKeeper(e.id) end
+            e = System.GetEntityByName(name)
+            if e and e ~= player and not string.find(name, "^kcd2mp_") and Shops and Shops.GetShopDBIdByKeeper then
+                db = Shops.GetShopDBIdByKeeper(e.id)
+            else
+                e = nil
+            end
         end)
-        mp_log(string.format("MP-FIX SHOP npc=%s shop=%s side=%s", name, tostring(db or "unknown"),
-            KCD2MP.w137 and KCD2MP.w137.joiner and "joiner" or "local"))
+        local line = string.format("MP-FIX SHOP npc=%s shop=%s side=%s", name, tostring(db or "unknown"),
+            KCD2MP.w137 and KCD2MP.w137.joiner and "joiner" or "local")
+        if KCD2MP_W221On("shop_definition") then
+            local soul, faction, entries, classes = "unobserved", "unobserved", "unobserved", "unobserved"
+            if e and e.soul then
+                pcall(function()
+                    local guid = tostring(e.soul:GetId())
+                    if #guid == 36 and guid:match("^%x+%-%x+%-%x+%-%x+%-%x+$") then soul = guid end
+                end)
+                pcall(function()
+                    local id = e.soul:GetFactionID()
+                    if type(id) == "string" and #id <= 127 and id:match("^[%w_%-]+$") then faction = id end
+                end)
+            end
+            if e and e.inventory then
+                pcall(function()
+                    local stock = e.inventory:GetInventoryTable()
+                    if type(stock) ~= "table" then return end
+                    entries = #stock
+                    local seen, count = {}, 0
+                    for i = 1, entries do
+                        local item = ItemManager.GetItem(stock[i])
+                        if not (item and item.class) then return end
+                        if not seen[item.class] then seen[item.class] = true; count = count + 1 end
+                    end
+                    classes = count
+                end)
+            end
+            line = line .. string.format(" keeper_soul=%s faction=%s inventory_entries=%s inventory_classes=%s inventory_categories=unobserved buy_categories=unobserved buy_filters=unobserved",
+                soul, faction, tostring(entries), tostring(classes))
+        end
+        mp_log(line)
         return type(db) == "number" and db >= 0
     end
     System.AddCCommand("mp_shop_probe", "KCD2MP_W221ShopProbe(%line)", "Show the live shop database ID for a named keeper: mp_shop_probe <NPC>")
@@ -38240,7 +38345,7 @@ do
     for k, label in pairs(W221.NAMES) do
         local fname = "KCD2MP_W221Set_" .. k
         _G[fname] = function(arg) return KCD2MP_W221Set(k, arg) end
-        System.AddCCommand(label, fname .. "(%line)", "WO-221 " .. (W221.HELP[k] or k) .. " (default on): " .. label .. " on|off")
+        System.AddCCommand(label, fname .. "(%line)", "WO-221 " .. (W221.HELP[k] or k) .. " (default " .. (W221.DEFAULT_OFF[k] and "off" or "on") .. "): " .. label .. " on|off")
     end
 end
 

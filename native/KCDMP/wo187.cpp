@@ -19,6 +19,7 @@
 #include "wo195.h"
 #include "wo195_rules.h"
 #include "wo209.h"
+#include "wo209_rules.h"
 #include "wo221.h"
 #include "load_sequence.h"
 
@@ -153,6 +154,7 @@ struct Wish {
     void* pinFrom = nullptr; void* pinTo = nullptr;
     uint32_t windups = 0;
     bool mirrored = false;     // WO-209 A: set by the opponent mirror (the host NPC's own opponent), not by the agent's op 36
+    bool fallback = false;
     uint64_t load = 0;
     void* entity = nullptr;
     void* targetEntity = nullptr;
@@ -190,7 +192,7 @@ uint32_t active_eid(void* model) {
 }
 
 bool scope_current(uint32_t copy, const Wish& w) {
-    return !w.mirrored || !wo221::on(wo221::kBitNpcTargetOwner) ||
+    return (!w.fallback && (!w.mirrored || !wo221::on(wo221::kBitNpcTargetOwner))) ||
         (w.load == loadsequence::stamp() && w.entity && w.entity == engine::entity_by_id(copy) &&
          w.targetEntity && w.targetEntity == wish_entity(w));
 }
@@ -198,7 +200,7 @@ bool scope_current(uint32_t copy, const Wish& w) {
 void unpin(uint32_t copy, Wish& w, const char* why) {
     if (!w.pinned) return;
     if (w.pinFrom && w.pinTo && hits::soul_of_eid(copy) == w.pinFrom &&
-        (!w.mirrored || !wo221::on(wo221::kBitNpcTargetOwner) ||
+        ((!w.fallback && (!w.mirrored || !wo221::on(wo221::kBitNpcTargetOwner))) ||
          (scope_current(copy, w) && hits::soul_of_eid(w.kind == Opp::LocalPlayer ? kPlayerEntity : w.target) == w.pinTo)))
         sctx::set_soul_relation(w.pinFrom, w.pinTo, "combat_forcedTarget", false);
     logf("WO187-OPP npc=%s pin cleared (%s)", name_of(copy), why);
@@ -763,8 +765,11 @@ void tick() {
             it = g_wishes.erase(it);
             continue;
         }
+        const auto owner = w.mirrored && !wo221::on(wo221::kBitTargetFallback) ? wo209rules::TargetWriter::Legacy : wo209::target_writer(it->first);
         if (!opp_wish_live(now, w.refreshedAt) || !engine::entity_by_id(it->first) ||
-            (!w.mirrored && wo209::host_target_owner(it->first))) {
+            (!w.mirrored && owner == wo209rules::TargetWriter::Host) ||
+            (w.mirrored && owner == wo209rules::TargetWriter::Fallback) ||
+            (w.fallback && (owner != wo209rules::TargetWriter::Fallback || !scope_current(it->first, w)))) {
             unpin(it->first, w, "the wish ended");
             c_dropped.fetch_add(1);
             if (c_dropped.load() <= kLogFirst) logf("WO187-OPP npc=%s wish dropped (no word from the agent for %.0f s)", name_of(it->first), kOppStaleS);
@@ -791,12 +796,14 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
             if (wo208::probe_only(copy)) { out[0] = 0; *outLen = 1; return wo163::kROk; }   // WO-208 A.1
             const double now = now_s();
             auto it = g_wishes.find(copy);
-            if (wo209::host_target_owner(copy)) {
+            const auto owner = wo209::target_writer(copy);
+            const bool fallback = owner == wo209rules::TargetWriter::Fallback;
+            if (owner == wo209rules::TargetWriter::Host) {
                 c_mirrorSkipped.fetch_add(1);
                 out[0] = 0; *outLen = 1;
                 return wo163::kROk;
             }
-            if (it != g_wishes.end() && it->second.mirrored && opp_wish_live(now, it->second.refreshedAt)) {   // WO-209 A: the mirror's copy
+            if (!fallback && it != g_wishes.end() && it->second.mirrored && opp_wish_live(now, it->second.refreshedAt)) {
                 c_mirrorSkipped.fetch_add(1);
                 out[0] = it->second.applied ? 1 : 0; *outLen = 1;
                 return wo163::kROk;
@@ -814,12 +821,23 @@ uint8_t handle(uint8_t op, const uint8_t* body, size_t len, uint8_t* out, size_t
             const Opp k = static_cast<Opp>(kind);
             const uint32_t tgt = k == Opp::Figure ? target : 0;
             if (k == Opp::Figure && !engine::entity_by_id(tgt)) return wo163::kRNoActor;
-            if (it == g_wishes.end() || it->second.kind != k || it->second.target != tgt) {
+            if (it == g_wishes.end() || it->second.kind != k || it->second.target != tgt ||
+                (fallback && (it->second.mirrored || !it->second.fallback || !scope_current(copy, it->second)))) {
                 if (it != g_wishes.end()) unpin(copy, it->second, "a new wish");
                 Wish w; w.kind = k; w.target = tgt; w.why = why; w.refreshedAt = now;
+                if (fallback) {
+                    w.fallback = true;
+                    w.load = loadsequence::stamp();
+                    w.entity = engine::entity_by_id(copy);
+                    w.targetEntity = wish_entity(w);
+                }
                 g_wishes[copy] = w;
-                c_wishes.fetch_add(1);
+                const uint32_t n = c_wishes.fetch_add(1) + 1;
                 if (g_logical.load()) apply_wish(copy, g_wishes[copy], now, "new wish");
+                if (fallback && (n <= kLogFirst || n % 64 == 0)) {
+                    deferred_log::Scope defer;
+                    logf("MP-FIX TGT owner=fallback npc=%s applied=%d", name_of(copy), g_wishes[copy].applied);
+                }
             } else {
                 it->second.refreshedAt = now;
                 it->second.why = why;

@@ -48,7 +48,7 @@ and now and then something will break. New builds come often.
 | One horse per player with their own saddlebags | The partner's horse can appear without its tack. Food dropped at the stable can vanish. | |
 | Seated riders and turning wheels on cart copies | Trade opens at mirrored shops. A dialogue can time out, and some keepers offer an empty sell list. | |
 | Setup reports missing retail facial files in the feature draft | NPC lip sync when listening to a partner's conversation still needs a live check. Voice chat and dice between players are unpolished. | |
-| | The feature draft counts up to four bound players in quest distance checks. Native escort following and carried quest steps remain open. | Replacing the agent directly in a loaded guest world |
+| | The feature draft tests native escort orders, reaction ordering and bow-shot admission with doubles. Visible results and carried quest steps need game evidence. | Replacing the agent directly in a loaded guest world |
 
 <sub>Released behavior as of version 0.65.2. See the [two-PC checklist](docs/TEST-2PC-FEATURES.md) for candidate changes and pending game evidence.</sub>
 

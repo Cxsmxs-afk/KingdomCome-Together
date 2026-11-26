@@ -7,6 +7,7 @@
 #include "frame_meter.h"
 #include "iat_hook.h"
 #include "log.h"
+#include "motion.h"
 #include "wo140.h"
 #include "wo218_rules.h"
 
@@ -188,6 +189,7 @@ void hooked_update(void* self, float dt) {
     // proven on the path a real engine crash takes.
     if (crash::test_main_fault_due()) *reinterpret_cast<volatile int*>(0x10) = 1;
     if (const auto drain = g_realtimeDrain.load(std::memory_order_acquire)) drain();
+    motion::begin_model_frame();
 
     // Swap under the lock and run outside it: queued work may post more work,
     // and holding the lock across a call into the game invites a deadlock.
@@ -235,6 +237,7 @@ void hooked_update(void* self, float dt) {
         if (d > topUs) { topUs = d; topName = r.name; }
     }
 
+    motion::end_model_frame();
     if (const auto drain = g_bulkDrain.load(std::memory_order_acquire)) drain();
     double batchUs = 0;
     uint32_t items = 0;

@@ -219,6 +219,8 @@ do
     check("d0: (WO-202 on) JoinTry pauses the world", KCD2MP_JoinTry("0000d0a1", "Bob", 180) == true and RATIO == 0)
     check("d0: (WO-202 on) no NPC paused", countCmd("wh_ai_PauseNPC", cm) == 0 and (w.npcN or 0) == 0, tostring(countCmd("wh_ai_PauseNPC", cm)))
     check("d0: (WO-202 on) the pause line says why", (lastLog("MP-JOIN pause join=0000d0a1", mark) or ""):find("no NPC suspended", 1, true) ~= nil)
+    check("d0: the join prompt retains the display name and the pause log redacts it", w.partner == "Bob"
+        and (lastLog("MP-JOIN pause join=0000d0a1", mark) or ""):find("partner=<redacted>", 1, true) ~= nil)
     KCD2MP_JoinResume("0000d0a1", "ready")
     check("d0: (WO-202 on) resumed: the clock runs again", RATIO == 15 and w.paused == false)
     noErrs("d0")

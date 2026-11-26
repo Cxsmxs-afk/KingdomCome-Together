@@ -600,6 +600,43 @@ public sealed class P6RangedBridgeTests
         Assert.DoesNotContain(r.Game.Calls, call => call.Contains("W201Shot") || call.Contains("ApplyDamage"));
     }
 
+    [Fact]
+    public async Task A_bow_shot_uses_one_charge_of_the_current_body_and_ignores_a_second_fire()
+    {
+        await using var r = await Rig.Create(host: false);
+        await r.StartTimedReceiveAsync();
+        byte[] fence = await r.PrimeHandAsync(Bow);
+        Get<ConcurrentDictionary<string, bool>>(r.Bridge, "_w221On")["bow_phases"] = true;
+
+        r.Link.Feed(TimedRanged(r.Peer, Step(seq: 9)), Down(Protocol.W164RangedStep, "after-unarmed", r.Peer));
+        using (var stop = new CancellationTokenSource())
+        {
+            var header = new byte[3];
+            var native = ReadFrameHeaderAsync(r.Server, header, stop.Token);
+            var processed = Until(() => Count(r.Bridge, "ranged_malformed") == 1);
+            if (await Task.WhenAny(native, processed) == native && await native)
+                Assert.Fail($"An unarmed Fire reached the DLL with opcode 0x{header[0]:X2}.");
+            await processed;
+            stop.Cancel();
+            Assert.False(await native);
+        }
+
+        r.Link.Feed(TimedRanged(r.Peer, Step(seq: 10) with { Phase = 1 }));
+        await Until(() => Count(r.Bridge, "ranged_phase_unrenderable") == 1);
+        r.Link.Feed(TimedRanged(r.Peer, Step(seq: 11)));
+        var request = await Read(r.Server);
+        AssertRangedFire(request.Type, request.Body, RangedWeaponKind.Bow, 3, Bow, fence);
+        await ReplyEdge(r.Server, request.Body, EdgeOutcome.Completed, 1, 0, 0);
+        await Until(() => Get<long>(r.Bridge, "_w201RangedDispatched") == 1);
+
+        r.Link.Feed(TimedRanged(r.Peer, Step(seq: 12)), TimedRanged(r.Peer, Step(seq: 11)),
+            Down(Protocol.W164RangedStep, "after-duplicate", r.Peer));
+        await Until(() => Count(r.Bridge, "ranged_malformed") == 2);
+        Assert.Equal(2, Count(r.Bridge, "ranged_bow_fire_unarmed"));
+        Assert.Equal(1, Count(r.Bridge, "ranged_duplicate"));
+        Assert.Equal(1, Get<long>(r.Bridge, "_w201RangedDispatched"));
+    }
+
     private static async Task<bool> ReadFrameHeaderAsync(Stream stream, byte[] header, CancellationToken ct)
     {
         try { await stream.ReadExactlyAsync(header, ct); return true; }

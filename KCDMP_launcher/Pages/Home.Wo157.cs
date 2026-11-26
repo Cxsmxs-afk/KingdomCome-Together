@@ -72,7 +72,8 @@ namespace KCDMP_launcher.Pages
             skipModFileCheckOnce = false;
             var checks = await Task.Run(() => CheckLaunchFiles(appFiles));
             foreach (var c in checks.Where(c => c.Finding != FileFinding.Ok))
-                Log.Warning("MP-LAUNCH file-check {Finding} {Label}: {Path} {Detail}", c.Finding.ToString().ToLowerInvariant(), c.Label, c.Path, c.Detail);
+                Log.Warning("MP-LAUNCH file-check {Finding} {Label}: {File} {Detail}",
+                    c.Finding.ToString().ToLowerInvariant(), c.Label, System.IO.Path.GetFileName(c.Path), c.Detail);
 
             // A different file (not what Setup installed) is told and logged, never blocking: a hand-built
             // pak, or a manifest from another install, must not stop a game (WO-150 step 6's rule).

@@ -28,7 +28,7 @@ struct Simulation {
     uint64_t now = kReadMs, applied = 0, target = 0, token = 0;
     npcdrive::PartnerPose pose;
     uint8_t kind = rpcombat::kSwing;
-    bool mode = true, protectedVisual = true;
+    bool mode = true, protectedVisual = true, reactionSync = false;
     rttr::SwingResult providerResult = rttr::SwingResult::Ok;
     unsigned typedCalls = 0, legacyCalls = 0;
     unsigned rangedCalls = 0;
@@ -37,17 +37,17 @@ struct Simulation {
     std::vector<std::string> logs;
 } sim;
 
-auto row_wire() {
+auto row_wire(uint32_t key = kRow) {
     std::array<uint8_t, rpcombat::kRegistrationHeader + 1> bytes{};
     bytes[0] = kPeer;
     loadsequence::write_le(bytes.data() + 1, kEid, 4);
     bytes[5] = sim.kind;
-    loadsequence::write_le(bytes.data() + 6, kRow, 4);
+    loadsequence::write_le(bytes.data() + 6, key, 4);
     bytes.back() = 'a';
     return bytes;
 }
 
-auto action_wire(uint64_t hostMs, uint16_t sequence) {
+auto action_wire(uint64_t hostMs, uint16_t sequence, uint32_t key = kRow) {
     std::array<uint8_t, rpcombat::kActionHeader + 4> bytes{};
     bytes[0] = kPeer;
     loadsequence::write_le(bytes.data() + 1, kEid, 4);
@@ -55,7 +55,7 @@ auto action_wire(uint64_t hostMs, uint16_t sequence) {
     loadsequence::write_le(bytes.data() + 13, sequence, 2);
     bytes[15] = sim.kind;
     bytes[16] = timelineactions::kCommit;
-    loadsequence::write_le(bytes.data() + rpcombat::kActionHeader, kRow, 4);
+    loadsequence::write_le(bytes.data() + rpcombat::kActionHeader, key, 4);
     return bytes;
 }
 
@@ -226,7 +226,7 @@ bool lifecycle_gameplay() { return true; }
 uint64_t lifecycle_observation_stamp() { return sim.scope.lifecycle; }
 }
 namespace kcdmp::wo221 {
-bool on(uint32_t) { return sim.mode; }
+bool on(uint32_t bit) { return bit == kBitReactionSync ? sim.reactionSync : sim.mode; }
 }
 namespace kcdmp::rttr {
 SwingResult ghost_swing(uint32_t, const char*, uint64_t, bool*) {
@@ -251,6 +251,37 @@ int rp_timeline_outcome_integration(int* passed) {
         if (ok) ++ok_count;
         else { ++failed; std::printf("H15 FAIL %s\n", name); }
     };
+
+    const auto reaction_chain = [](bool enabled) {
+        if (!begin()) return false;
+        sim.reactionSync = enabled;
+        const auto send = [](uint8_t kind, uint64_t at, uint16_t seq) {
+            sim.kind = kind;
+            const uint32_t key = kRow + kind;
+            const auto row = row_wire(key);
+            const auto event = action_wire(at, seq, key);
+            return register_combat(row.data(), row.size(), sim.scope) == Accepted &&
+                submit_combat(event.data(), event.size(), sim.scope, sim.now) == Accepted;
+        };
+        // Ordinary block was lost; recoil arrives ahead of the perfect block. A duplicate follows.
+        if (!send(rpcombat::kRecoil, kHostMs + 200, 4) || !send(rpcombat::kParry, kHostMs + 100, 3) ||
+            !send(rpcombat::kParry, kHostMs + 100, 3)) return false;
+        sim.target = sim.applied = kHostMs + 200;
+        for (unsigned i = 0; i < 3; ++i) { tick(); observed(sim.token, true); }
+        std::vector<uint8_t> played;
+        for (const auto& line : sim.logs) {
+            if (line.find(" result=installed ") == std::string::npos) continue;
+            for (uint8_t kind : {rpcombat::kSwing, rpcombat::kParry, rpcombat::kRecoil})
+                if (line.find(" kind=" + std::to_string(kind) + " ") != std::string::npos) played.push_back(kind);
+        }
+        const bool ordered = played == (enabled ? std::vector<uint8_t>{rpcombat::kSwing, rpcombat::kParry, rpcombat::kRecoil} :
+                                                  std::vector<uint8_t>{rpcombat::kSwing, rpcombat::kRecoil, rpcombat::kParry});
+        if (!send(rpcombat::kHit, kHostMs + 150, 2)) return false;
+        tick();
+        observed(sim.token, true);
+        return ordered && sim.typedCalls == (enabled ? 3u : 4u);
+    };
+    check(reaction_chain(true) && reaction_chain(false), "P5b typed swing, parry and recoil use due time after loss and reordering; each installs once");
 
     check(begin(false) && confirm_ranged_hand(1, HandSlot::Left) && submit_ranged(1, kSequence) == Accepted,
           "H4 confirmed left hand admits the typed Fire");

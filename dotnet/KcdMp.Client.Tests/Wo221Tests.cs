@@ -64,7 +64,16 @@ public class Wo221Tests
         Assert.Equal(1u << 9, W221Switch.NativeBits(n => n == "queue_ref_release"));
         Assert.Equal(1u << 10, W221Switch.NativeBits(n => n == "npc_target_owner"));
         Assert.Equal(1u << 11, W221Switch.NativeBits(n => n == "attack_window_snapshot"));
-        Assert.Equal(0xF3Fu, W221Switch.NativeBits(n => n is not ("rp_controller" or "rp_combat")));
+        Assert.Equal(1u << 12, W221Switch.NativeBits(n => n == "frame_snapshot"));
+        Assert.Equal(1u << 13, W221Switch.NativeBits(n => n == "reaction_sync"));
+        Assert.Equal(1u << 14, W221Switch.NativeBits(n => n == "target_fallback"));
+        Assert.Equal(0xF3Fu, W221Switch.NativeBits(n => W221Switch.DefaultOn(n) && n is not ("rp_controller" or "rp_combat")));
+        Assert.All(new[] { "escort_nav", "frame_snapshot", "shop_definition", "reaction_sync", "target_fallback", "bow_phases" }, n =>
+        {
+            Assert.Contains(n, W221Switch.Names);
+            Assert.False(W221Switch.DefaultOn(n));
+            Assert.True(W221Switch.TwinOff("all", n));
+        });
         Assert.Contains("talk_force", W221Switch.AgentNames);
     }
 

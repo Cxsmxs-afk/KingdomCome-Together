@@ -580,7 +580,7 @@ void trace_tick(double now) {
     for (const auto& a : acts)
         logf("WO178-TRACE t=%.0f action=%s by=%s", (a.t - g_traceT0) * 1000.0, cls_name(a.cls), a.player ? "me" : name_of(a.eid));
     motion::ModelRead me{};
-    if (!motion::read_model(kTracePlayerEntity, &me)) return;
+    if (!motion::observe_model(kTracePlayerEntity, &me)) return;
     std::string mt = model_text(me, false);
     {   // the defender's own windows (named blocks: BlockSlot 0x998, PerfectBlockSlot 0x9D8, MasterStrikeSlot 0xA58, RiposteSlot 0xAD8)
         void* pca = nullptr; void* pm = nullptr;
@@ -619,7 +619,7 @@ void trace_tick(double now) {
     }
     std::string ot = "-";
     motion::ModelRead op{};
-    if (me.opponentEid && motion::read_model(me.opponentEid, &op)) {
+    if (me.opponentEid && motion::observe_model(me.opponentEid, &op)) {
         ot = std::string(name_of(me.opponentEid)) + " " + model_text(op, true);
         void* oca = nullptr; void* om = nullptr;
         if (motion::combat_parts(me.opponentEid, false, &oca, &om) && om) {

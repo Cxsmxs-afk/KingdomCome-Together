@@ -10,6 +10,8 @@
 #include "wo178.h"
 #include "wo163_rules.h"
 #include "fault_guard.h"
+#include "frame_snapshot.h"
+#include "load_sequence.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -53,6 +55,7 @@
 #include "wo201_rules.h"
 #include "wo215.h"
 #include "wo216.h"
+#include "wo221.h"
 #include "body_drive.h"
 
 namespace kcdmp::motion {
@@ -2263,9 +2266,8 @@ bool read_npc_combat(uint32_t eid, NpcCombat* out) {
     return true;
 }
 
-bool read_model(uint32_t eid, ModelRead* out) {
+static bool read_actor_model(void* actor, ModelRead* out) {
     *out = ModelRead{};
-    void* actor = actor_by_eid(eid);
     if (!actor) return false;
     void* ca = combat_actor_of(actor, false);
     if (!ca) return true;
@@ -2298,6 +2300,43 @@ bool read_model(uint32_t eid, ModelRead* out) {
         }
     }
     return true;
+}
+
+bool read_model(uint32_t eid, ModelRead* out) { return read_actor_model(actor_by_eid(eid), out); }
+
+namespace {
+thread_local bool g_observationFrame = false;
+thread_local FrameModels g_frameModels;
+thread_local FrameModels::Counts g_observationWindow;
+thread_local unsigned g_observationFrames = 0;
+}
+
+void begin_model_frame() {
+    g_observationFrame = wo221::on(wo221::kBitFrameSnapshot);
+    if (g_observationFrame) g_frameModels.begin();
+}
+
+void end_model_frame() {
+    if (!g_observationFrame) return;
+    g_observationFrame = false;
+    const auto& counts = g_frameModels.counts;
+    g_observationWindow.reads += counts.reads;
+    g_observationWindow.reused += counts.reused;
+    g_observationWindow.overflow += counts.overflow;
+    if (++g_observationFrames < 1024) return;
+    deferred_log::Scope defer;
+    logf("MP-FIX PERF frame frames=%u reads=%u reused=%u overflow=%u", g_observationFrames,
+         g_observationWindow.reads, g_observationWindow.reused, g_observationWindow.overflow);
+    g_observationFrames = 0;
+    g_observationWindow = {};
+}
+
+bool observe_model(uint32_t eid, ModelRead* out) {
+    if (!g_observationFrame) return read_model(eid, out);
+    const auto scope = loadsequence::stamp();
+    void* actor = actor_by_eid(eid);
+    if (scope != loadsequence::stamp()) return read_model(eid, out);
+    return g_frameModels.read(eid, actor, scope, out, &read_actor_model);
 }
 
 bool is_avatar_eid(uint32_t eid) {

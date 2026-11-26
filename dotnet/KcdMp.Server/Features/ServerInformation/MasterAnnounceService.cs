@@ -123,7 +123,7 @@ public sealed class MasterAnnounceService : BackgroundService
 
 			if (reply is null)
 			{
-				_log.LogWarning("The master server at {Uri} closed the connection without answering the announce.", uri);
+				_log.LogWarning("The master server closed the connection without answering the announce.");
 				return false;
 			}
 
@@ -142,8 +142,7 @@ public sealed class MasterAnnounceService : BackgroundService
 
 			accepted = true;
 
-			_log.LogInformation("Listed on the master server at {Uri} as \"{Name}\", reachable at {Address}:{Port}.",
-				uri, announce.Name, reply.Accepted.Address, _relayPort);
+			_log.LogInformation("Listed on the master server (relay port {Port}).", _relayPort);
 
 			foreach (var warning in reply.Accepted.Warnings)
 				_log.LogWarning("Master server note: {Warning}", warning);
@@ -157,7 +156,7 @@ public sealed class MasterAnnounceService : BackgroundService
 		}
 		catch (Exception ex) when (ex is WebSocketException or OperationCanceledException or JsonException)
 		{
-			_log.LogWarning("Lost the master server at {Uri}: {Message}", uri, ex.Message);
+			_log.LogWarning("Lost the master server ({Type}).", ex.GetType().Name);
 		}
 		finally
 		{

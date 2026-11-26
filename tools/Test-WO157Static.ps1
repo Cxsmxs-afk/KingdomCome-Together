@@ -83,6 +83,11 @@ Check "Build-Installer: without it the soak is demanded" ($bi -match '& python \
 Check "the installer writes the release-candidate line into install-verify.txt" ($iss -match '#ifdef ReleaseCandidate' -and $iss -match "not soak-tested: release candidate, not for public release")
 Check "the installer is signed only when Build-Installer defines the tool" ($iss -match '#ifdef KcdmpSign\s+SignTool=kcdmpsign')
 
+$master = Get-Content (Join-Path $root "dotnet/KcdMp.Server/Features/ServerInformation/MasterAnnounceService.cs") -Raw
+Check "the relay announcement logs its port without a listing name, master URI or public address" (
+    $master -match 'LogInformation\("Listed on the master server \(relay port \{Port\}\)\."\s*,\s*_relayPort\s*\)' -and
+    $master -notmatch 'LogInformation\("Listed on the master server[^"\r\n]*\{(?:Uri|Name|Address)\}')
+
 Write-Host ""
 Write-Host "--------------------------------------------"
 Write-Host "  passed: $pass   failed: $fail"

@@ -37,7 +37,8 @@ public partial class GameBridge
     private int _w201RangedRefusals;
     private int _p6CaptureWasOn;
     private long _w201RangedOut, _w201RangedIn, _w201RangedDispatched, _w201RangedRefused;
-    private readonly ConcurrentDictionary<byte, (long Peer, ulong Gen, ulong Epoch, uint Seq)> _p6RemoteSteps = new();
+    private readonly record struct P6RemoteStep(long Peer, ulong Gen, ulong Epoch, uint Seq, FigureBody Body, Guid ChargedBow);
+    private readonly ConcurrentDictionary<byte, P6RemoteStep> _p6RemoteSteps = new();
 
     private bool P6Current(P6Context c) => !c.Stop.IsCancellationRequested && ReferenceEquals(c.Stream, _wo122Stream) &&
         ReferenceEquals(c.Stream, _p6ReceiveStream) && !_p6ReceiveToken.IsCancellationRequested &&
@@ -249,9 +250,19 @@ public partial class GameBridge
             if (step.Generation < last.Gen || (step.Generation == last.Gen && step.Epoch < last.Epoch)) { T3Increment("ranged_stale"); return; }
             if (step.Generation == last.Gen && step.Epoch == last.Epoch && unchecked((int)(step.Sequence - last.Seq)) <= 0) { T3Increment("ranged_duplicate"); return; }
         }
-        if (last.Gen != step.Generation || last.Epoch != step.Epoch || last.Peer != frame.P6PeerSerial) T3Increment("ranged_stream_reset");
-        _p6RemoteSteps[src] = (frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence);
+        bool sameStream = last.Gen == step.Generation && last.Epoch == step.Epoch && last.Peer == frame.P6PeerSerial;
+        if (!sameStream) T3Increment("ranged_stream_reset");
+        Guid chargedBow = step.Kind == RangedWeaponKind.Bow && step.Phase is 1 or 2 ? step.ItemClass : Guid.Empty;
+        var newest = new P6RemoteStep(frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence, body, chargedBow);
+        _p6RemoteSteps[src] = newest;
         T3Increment("ranged_in"); Interlocked.Increment(ref _w201RangedIn);
+        bool verifyShot = W221On("bow_phases") && step.Kind == RangedWeaponKind.Bow && step.Phase == 3;
+        if (verifyShot && (!sameStream || last.Body != body || last.ChargedBow != step.ItemClass))
+        {
+            T3Increment("ranged_bow_fire_unarmed");
+            Wo201RangedRefused(src, step, "bow-charge-not-observed");
+            return;
+        }
         var catalog = await P6CatalogAsync();
         if (!P6Current(context) || !P6PeerCurrent(src, frame.P6PeerSerial)) return;
         if (step.Kind == RangedWeaponKind.Unknown || catalog?.Kind(step.ItemClass) != step.Kind)
@@ -260,7 +271,7 @@ public partial class GameBridge
             body == Wo214FigureBody(src) && Wo214RangedReceiptCurrent(src, context, frame.P6PeerSerial, body, message.Tok, step.ItemClass) &&
             frame.P6ModeSerial == Interlocked.Read(ref _p6VisualModeSerial) &&
             frame.P6VisualSerial == Interlocked.Read(ref _p6VisualSerial) && (!_w179Remote.TryGetValue(src, out var scene) || (scene.Ended && !scene.CopyPlaying && scene.Landing != 1)) &&
-            _p6RemoteSteps.TryGetValue(src, out var latest) && latest == (frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence) &&
+            _p6RemoteSteps.TryGetValue(src, out var latest) && latest == newest &&
             Stopwatch.GetElapsedTime(frame.Arrival).TotalMilliseconds + step.AgeMs <= Protocol.RangedCaptureMaxAgeMs;
         if (!_p5Peers.TryGetValue(src, out var peer) || peer.Serial != frame.P6PeerSerial) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, context.Cancellation, peer.Token);
@@ -301,6 +312,8 @@ public partial class GameBridge
             return;
         }
         Interlocked.Increment(ref _w201RangedDispatched);
+        if (verifyShot)
+            Console.WriteLine(FormattableString.Invariant($"MP-FIX BOW phase=fire shot={step.Sequence} hit=unlinked peer={src} stage=accepted"));
         Console.WriteLine(FormattableString.Invariant(
             $"MP-RP-RANGED-IN peer={src} eid=0x{body.Entity:X} weapon={step.Kind} phase={step.Phase} seq={step.Sequence} event_host_ms={frame.Presentation.SampleMs} result=accepted body_generation={body.Generation} hand_rev={hand.Revision} cls={step.ItemClass:D}"));
     }

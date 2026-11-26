@@ -475,7 +475,7 @@ void lock_tick(const uint32_t* npcs, int n) {
                 static kcdmp::wo166rules::LineLimiter s_c1;
                 if (now - row.onFigureSince >= 10.0 && (la < 0 || now - la >= 10.0) && s_c1.allow(npcs[i], now)) {
                     motion::ModelRead nm{}, fm{};
-                    const bool nok = motion::read_model(npcs[i], &nm), fok = motion::read_model(c.opponentEid, &fm);
+                    const bool nok = motion::observe_model(npcs[i], &nm), fok = motion::observe_model(c.opponentEid, &fm);
                     logf("WO166-C1 npc=%s on the figure eid=0x%X for %.0f s within %.1f m, no attack committed for %s: npc state=0x%X cm=%u at=%d "
                          "figure state=0x%X cm=%u opp=%s automation_mode=%u tid=%lu", npc_name(npcs[i]), c.opponentEid, now - row.onFigureSince, od,
                          la < 0 ? "ever" : "10 s+", nok ? static_cast<unsigned>(nm.state) : 0u, nok ? nm.combatMode : 0u, nok ? nm.atkType : -9,

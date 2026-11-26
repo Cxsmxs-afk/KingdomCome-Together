@@ -442,11 +442,11 @@ public partial class GameBridge
         }
         if (j is null)
         {
-            Console.WriteLine($"MP-JOIN host: join 0x{joinId:x8} from {who} (ghost {joiner}) refused: {refuse}");
+            Console.WriteLine($"MP-JOIN host: join 0x{joinId:x8} from ghost {joiner} refused: {refuse}");
             await TryJoinControlAsync(() => WriteJoinAsync(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateRefused, Protocol.JoinReasonId(refuse), 0)), "join-status-reply");
             return;
         }
-        Console.WriteLine($"MP-JOIN host: join 0x{joinId:x8} requested by {who} (ghost {joiner}) -- timeout {_joinTimeoutS} s once paused");
+        Console.WriteLine($"MP-JOIN host: join 0x{joinId:x8} requested by ghost {joiner} -- timeout {_joinTimeoutS} s once paused");
         Wo206HostJoinStarted(joinId);   // WO-206 E: a new join epoch
         Faults.FireAndLog(RunHostJoinAsync(j), "host-join");
     }
@@ -517,7 +517,7 @@ public partial class GameBridge
                 string busy = reply.Value.Arg == "" ? "failed" : reply.Value.Arg;
                 if (busy != lastBusy || (DateTime.UtcNow - lastStatus).TotalSeconds >= 10)
                 {
-                    Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8} deferred: {busy} -- telling {j.Partner} 'your host is busy'");
+                    Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8} deferred: {busy} -- telling ghost {j.Joiner} 'your host is busy'");
                     var (busyName, busyArg) = Wo159Rules.BusyReason(busy);   // WO-159: "prologue <min>" -> the reason + minutes left
                     await TrySendStatusAsync(j, Protocol.JoinStateDeferred, busyName, busyArg);
                     lastBusy = busy; lastStatus = DateTime.UtcNow;
@@ -534,7 +534,7 @@ public partial class GameBridge
             j.Deadline = j.PausedUtc.Value.AddSeconds(_joinTimeoutS);
             j.Phase = "saving";
             Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8} paused the world after {(j.PausedUtc.Value - j.RequestUtc).TotalSeconds:F1} s of deferral -- writing the world save");
-            Wo202NoteEvent($"a join of {j.Partner} held the world");   // WO-202 II.4: a quest failure's window names it
+            Wo202NoteEvent($"a join of ghost {j.Joiner} held the world");   // WO-202 II.4: a quest failure's window names it
             await TrySendStatusAsync(j, Protocol.JoinStatePaused, "none");
             await TrySendStatusAsync(j, Protocol.JoinStateSaving, "none");
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -619,7 +619,7 @@ public partial class GameBridge
                 {
                     abortReason = Protocol.JoinAbortTimeout; resumeReason = "timeout";
                     Console.WriteLine(FormattableString.Invariant(
-                        $"MP-JOIN host: join 0x{j.JoinId:x8}: {(sender.AllAcked ? "no Done" : "no ack")} from {j.Partner} for {silenceS} s -- nothing at all arrived (acked {sender.AckedBytes}/{sender.TotalBytes} B) -- abort"));
+                        $"MP-JOIN host: join 0x{j.JoinId:x8}: {(sender.AllAcked ? "no Done" : "no ack")} from ghost {j.Joiner} for {silenceS} s -- nothing at all arrived (acked {sender.AckedBytes}/{sender.TotalBytes} B) -- abort"));
                     return;
                 }
                 switch (msg.Type)
@@ -650,7 +650,7 @@ public partial class GameBridge
                         break;
                     case Protocol.JoinAbortDown:
                         byte r = msg.Body.Length > 0 ? msg.Body[0] : (byte)0;
-                        Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: {j.Partner} aborted ({Protocol.JoinAbortName(r)}) -- resuming");
+                        Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: ghost {j.Joiner} aborted ({Protocol.JoinAbortName(r)}) -- resuming");
                         resumeReason = r == Protocol.JoinAbortJoinerCancel ? "cancel" : "failed";
                         return;
                     case Protocol.JoinerReadyDown:
@@ -685,7 +685,7 @@ public partial class GameBridge
                             abortReason = Protocol.JoinAbortTimeout; resumeReason = "timeout";
                             Interlocked.Increment(ref _w204JoinSilenceAborts);
                             Console.WriteLine(FormattableString.Invariant(
-                                $"MP-JOIN host: join 0x{j.JoinId:x8}: nothing from {j.Partner} for {quietMs / 1000.0:F0} s while they load -- abort (WO-204 IV.1), the world runs again"));
+                                $"MP-JOIN host: join 0x{j.JoinId:x8}: nothing from ghost {j.Joiner} for {quietMs / 1000.0:F0} s while they load -- abort (WO-204 IV.1), the world runs again"));
                             return;
                         }
                         continue;
@@ -699,7 +699,7 @@ public partial class GameBridge
                         Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: Ready refused (loaded worldsaved_seq={seq}, sent {sender.Offer.WorldSavedSeq})");
                         continue;
                     }
-                    Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: {j.Partner} is ready (loaded worldsaved_seq={seq})");
+                    Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: ghost {j.Joiner} is ready (loaded worldsaved_seq={seq})");
                     if (_wo122Stream is Stream markerStream) _ = P5AnnounceMarkersAsync(markerStream, _wo122Ct);
                     _ = Wo134SendLedgerAsync(j.Joiner);   // WO-134: this world's chest ledger (what the host took)
                     resumeReason = "ready";
@@ -709,7 +709,7 @@ public partial class GameBridge
                 if (msg.Type == Protocol.JoinAbortDown)
                 {
                     byte r = msg.Body.Length > 0 ? msg.Body[0] : (byte)0;
-                    Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: {j.Partner} aborted while loading ({Protocol.JoinAbortName(r)})");
+                    Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: ghost {j.Joiner} aborted while loading ({Protocol.JoinAbortName(r)})");
                     resumeReason = r == Protocol.JoinAbortJoinerCancel ? "cancel" : "failed";
                     return;
                 }
