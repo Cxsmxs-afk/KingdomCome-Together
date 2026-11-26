@@ -141,7 +141,7 @@ public partial class GameBridge
         if (!Wo209Rules.TryJoinerOp(body, _myGhostId, src,
                                     name => _npcEntityIds.TryGetValue(name, out uint e) ? e : 0u,
                                     g => _ghostEntityIds.TryGetValue(g.ToString(CultureInfo.InvariantCulture), out uint fe) ? fe : 0u,
-                                    out byte[] op, out int known, out int unknown))
+                                    out byte[] op, out int known, out int unknown, retireUnbound: W221On("npc_target_owner")))
         {
             Interlocked.Increment(ref _w209OppBad);
             return;

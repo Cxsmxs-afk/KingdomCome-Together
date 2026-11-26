@@ -20,6 +20,13 @@ int wo209_tests(int* passed) {
     WCHECK(twin_off_bits("copy_opponent_mirror") == kBitOppMirror, "a twin name turns its bit off");
     WCHECK(twin_off_bits("x,copy_attack_ai") == kBitAttackAi, "anywhere in the list");
     WCHECK(twin_off_bits("copy_opponent_mirror_x") == 0 && twin_off_bits("opponent_mirror") == 0, "only a whole name");
+    int reads = 1;
+    const auto resample = [&] { ++reads; return 42u; };
+    WCHECK(window_player_opponent(true, true, 7, resample) == 7 &&
+           window_player_opponent(true, false, 7, resample) == 0 &&
+           window_player_opponent(true, true, 7, resample) == 7 && reads == 1 &&
+           window_player_opponent(false, true, 7, resample) == 42 && reads == 2,
+           "all attack windows share this frame's player read, including an unavailable read; the twin re-reads");
 
     // ---- A: the host's kinds
     WCHECK(host_kind(0, 0x7777, false) == kHostNone, "no opponent: nobody");

@@ -103,6 +103,34 @@ public class FacialWorkspaceTests
     }
 
     [Fact]
+    public void Setup_warns_about_missing_or_empty_retail_facials_without_gating_host_and_join()
+    {
+        static WorkspaceEntry Entry(string rel, long size) =>
+            new(rel, Path.Combine("retail", rel), Path.Combine("tools", rel), size, EntryState.Copy, LinkKind.Copy, 0);
+        var pak = Entry(Path.Combine("Data", "Tables.pak"), 32);
+        var face = Entry(Path.Combine("Data", "Facials", "dialogue", "voice.fsq"), 8);
+        IReadOnlyList<StepView> Checklist(params WorkspaceEntry[] entries) => SetupChecklist.Evaluate(new SetupSnapshot
+        {
+            Steam = new SteamInstall("steam", ["library"]),
+            SteamRunning = true,
+            SteamSignedIn = true,
+            GameRoot = "retail",
+            ModdingToolsRoot = "tools",
+            Workspace = new WorkspaceReport("retail", "tools", entries)
+        }, SetupActivity.Idle);
+
+        foreach (var missing in new[] { Checklist(pak), Checklist(pak, face with { GameLength = 0 }) })
+        {
+            Assert.True(SetupChecklist.IsReady(missing));
+            Assert.Contains(missing, step => step.Optional && step.Status == StepStatus.NeedsYou &&
+                step.Detail.Contains("Data/Facials", StringComparison.Ordinal));
+        }
+        var restored = Checklist(pak, face);
+        Assert.True(SetupChecklist.IsReady(restored));
+        Assert.False(SetupChecklist.OptionalNeedsYou(restored));
+    }
+
+    [Fact]
     public async Task Existing_installs_run_the_normal_link_flow_when_only_facial_files_are_missing()
     {
         using var f = new FakeSteam("facial-existing").WithGame().WithModdingTools().Linked();

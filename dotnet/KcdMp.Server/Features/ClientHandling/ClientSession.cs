@@ -201,6 +201,9 @@ public partial class ClientSession
     /// </summary>
     public byte Id { get; internal set; }
     public string? Name { get; private set; }
+    private ulong _diagnosticSessionId;
+    // Formatted once at each handshake stage from relay-assigned values.
+    internal string DiagnosticPeer { get; private set; } = "session=0 name=<redacted> id=- loopback=0";
     internal Guid RosterMember { get; private set; }
     private volatile bool _superseded;
     private int _disconnectAnnounced;
@@ -216,6 +219,7 @@ public partial class ClientSession
         RosterMember = rosterMember;
         EnqueueRaw(BuildPacket(Protocol.Ack, [Id]));
         EnqueueRosterPeer(this);
+        DiagnosticPeer = FormattableString.Invariant($"session={_diagnosticSessionId:x} name=<redacted> id={Id} loopback={(IsLoopback ? 1 : 0)}");
         Name = name;
     }
 
@@ -360,6 +364,8 @@ public partial class ClientSession
 
     public async Task RunAsync(ulong diagnosticSessionId = 0)
     {
+        _diagnosticSessionId = diagnosticSessionId;
+        DiagnosticPeer = FormattableString.Invariant($"session={diagnosticSessionId:x} name=<redacted> id=- loopback={(IsLoopback ? 1 : 0)}");
         var writeTask = _writer is null ? WriteLoopAsync() : SchedWriteLoopAsync();   // WO-213 C
         try
         {
@@ -405,14 +411,13 @@ public partial class ClientSession
                 return;
             }
             string rawName = Encoding.UTF8.GetString(handshakePayload, 2, nameLen);
-            // WO-110 R15: the peer name is logged raw into both machines'
-            // kcd.log and interpolated into Lua by the agents; a name carrying
+            // WO-110 R15: the peer name is sent to other agents and interpolated into Lua; a name carrying
             // a newline or a "[KCD2-MP-EVT]" tag could break a Lua batch or
             // forge a log-tail event (docs/WO-109-audit.md R15). Sanitised
             // once, here, for every consumer downstream.
             string name = SanitizeName(rawName);
             if (!string.Equals(name, rawName, StringComparison.Ordinal))
-                _logger.Warning("[!] Peer name sanitised: {Raw} -> {Clean}", rawName.Replace('\n', ' ').Replace('\r', ' '), name);
+                _logger.Warning("[!] Peer name sanitised {Peer:l}", DiagnosticPeer);
 
             // WO-19: an optional trailing release-version field, the same
             // idiom as Invite's [configLen][config] -- whatever is left after
@@ -433,8 +438,8 @@ public partial class ClientSession
             {
                 bool hostHere = _clientHandler.HasHostConnected();
                 int ready = _clientHandler.ReadyClientCount;
-                _logger.Information("[test] connection test over {Transport} from {ClientRemoteEndPoint}: answered release {Release}, ready={Ready}, host={Host}.",
-                    Transport, _conn.Remote, RelayReleaseVersion.Current, ready, hostHere ? 1 : 0);
+                _logger.Information("[test] connection test {Peer:l} transport={Transport:l} release={Release:l} ready={Ready} host={Host}",
+                    DiagnosticPeer, Transport, RelayReleaseVersion.Current, ready, hostHere ? 1 : 0);
                 EnqueueRaw(BuildPacket(Protocol.ReleaseVersionMismatch, ConnectionTestReply.BuildPayload(RelayReleaseVersion.Wire, ready, hostHere)));
                 return;
             }
@@ -444,8 +449,8 @@ public partial class ClientSession
             {
                 _clientHandler.NoteRefusedRelease(ReleaseVersion);   // WO-127: the host's launcher says so in plain words
                 bool otherBuild = KcdMp.Wire.BuildId.SameVersionOtherBuild(ReleaseVersion, RelayReleaseVersion.Wire);
-                _logger.Warning("[!] Rejecting '{Name}' from {ClientRemoteEndPoint}: release {ClientRelease} does not match this relay's {RelayRelease} ({Why}; both machines must run the same build).",
-                    name, _conn.Remote, ReleaseVersion, RelayReleaseVersion.Wire, otherBuild ? "the same version, another build" : "another version");
+                _logger.Warning("MP-FIX RELAY reject-release {Peer:l} release={Release:l} reason={Reason:l}",
+                    DiagnosticPeer, RelayReleaseVersion.Wire, otherBuild ? "build-mismatch" : "release-mismatch");
                 _clientHandler.CountDrop(Protocol.Handshake, otherBuild ? "build-mismatch" : "release-mismatch");
                 EnqueueRaw(BuildPacket(Protocol.ReleaseVersionMismatch, Encoding.UTF8.GetBytes(RelayReleaseVersion.Wire)));
                 return;
@@ -453,8 +458,7 @@ public partial class ClientSession
 
             if (!_clientHandler.TryMarkReady(this, name, out var superseded))
             {
-                _logger.Warning("[!] Rejecting '{Name}' from {ClientRemoteEndPoint}: server is full.",
-                    name, _conn.Remote);
+                _logger.Warning("MP-FIX RELAY reject-full {Peer:l} server is full.", DiagnosticPeer);
                 // WO-76: previously just returned, closing the socket with no
                 // packet -- the client's generic "expected Ack" failure looked
                 // identical to any other refusal, so it retried forever,
@@ -463,15 +467,15 @@ public partial class ClientSession
                 return;
             }
 
-            _logger.Information("MP-FIX RELAY connected session={DiagnosticSessionId:x} name=<redacted> id={Id} protocol={Version} loopback={Loopback}",
-                diagnosticSessionId, Id, clientVersion, IsLoopback ? 1 : 0);
+            _logger.Information("MP-FIX RELAY connected {Peer:l} protocol={Version} release={Release:l}",
+                DiagnosticPeer, clientVersion, ReleaseVersion is null ? "legacy" : RelayReleaseVersion.Wire);
 
             // WO-144 1.1: the same player's older connection (a restarted game or
             // agent) goes now, before anyone counts it as a second partner.
             foreach (var old in superseded)
             {
-                _logger.Information("[+] '{Name}' (id={Id}) replaces its older connection id={OldId} ({Transport}): the same player connected again.",
-                    Name, Id, old.Id, Transport);
+                _logger.Information("[+] {Peer:l} replaces its older connection ({OldPeer:l}) transport={Transport:l}",
+                    DiagnosticPeer, old.DiagnosticPeer, Transport);
                 old.Supersede(Id);
             }
             if (IsSuperseded) return;
@@ -712,8 +716,8 @@ public partial class ClientSession
                     if (!_clientHandler.IsDamageAuthority(this))
                     {
                         string why = _clientHandler.HostAbsent ? "host-absent" : "not-host";
-                        _logger.Warning("[!] '{Name}' (id={Id}) sent PlayerHitUp without holding damage authority -- dropped ({Why}).",
-                            Name, Id, why);
+                        _logger.Warning("[!] {Peer:l} sent PlayerHitUp without holding damage authority -- dropped ({Why:l}).",
+                            DiagnosticPeer, why);
                         _clientHandler.CountDrop(Protocol.PlayerHitUp, why);
                         continue;
                     }
@@ -767,15 +771,13 @@ public partial class ClientSession
                     if (!float.IsFinite(npcX) || !float.IsFinite(npcY) || !float.IsFinite(npcZ))
                     {
                         _clientHandler.CountNpcRejectSpeed();
-                        _logger.Information("[WO66-REJECT] speed '{Name}' (id={Id}) npc '{Npc}': non-finite position.",
-                            Name, Id, npcName);
+                        _logger.Information("[WO66-REJECT] speed {Peer:l} reason=non-finite position.", DiagnosticPeer);
                         continue;
                     }
                     if (!float.IsFinite(npcRotZ))
                     {
                         _clientHandler.CountNpcRejectRotation();
-                        _logger.Information("[WO66-REJECT] rotation '{Name}' (id={Id}) npc '{Npc}': non-finite rotZ.",
-                            Name, Id, npcName);
+                        _logger.Information("[WO66-REJECT] rotation {Peer:l} reason=non-finite rotZ.", DiagnosticPeer);
                         continue;
                     }
 
@@ -786,19 +788,16 @@ public partial class ClientSession
                             break;
                         case ClientHandler.NpcRoute.MutedEcho:
                             // WO-39 echo-loop mute, normal operation.
-                            _logger.Debug("[npcclaim] authority re-sample of '{Npc}' muted (claimed).", npcName);
+                            _logger.Debug("[npcclaim] {Peer:l} authority re-sample muted (claimed).", DiagnosticPeer);
                             break;
                         case ClientHandler.NpcRoute.RejectSpeed:
-                            _logger.Information("[WO66-REJECT] speed '{Name}' (id={Id}) npc '{Npc}': implausible movement.",
-                                Name, Id, npcName);
+                            _logger.Information("[WO66-REJECT] speed {Peer:l} reason=implausible movement.", DiagnosticPeer);
                             break;
                         case ClientHandler.NpcRoute.RejectReservedName:
-                            _logger.Information("[WO66-REJECT] reserved-name '{Name}' (id={Id}) npc '{Npc}': refused, never-synced entity name (mod spawn or engine conversation stand-in).",
-                                Name, Id, npcName);
+                            _logger.Information("[WO66-REJECT] reserved-name {Peer:l} reason=never-synced entity.", DiagnosticPeer);
                             break;
                         case ClientHandler.NpcRoute.RejectStaleOwner:
-                            _logger.Information("[WO66-REJECT] stale-owner '{Name}' (id={Id}) npc '{Npc}': claimed by another client.",
-                                Name, Id, npcName);
+                            _logger.Information("[WO66-REJECT] stale-owner {Peer:l} reason=claimed by another client.", DiagnosticPeer);
                             break;
                     }
                     continue;
@@ -827,23 +826,23 @@ public partial class ClientSession
                     switch (routing)
                     {
                         case ClientHandler.TimeSkipRouting.BroadcastStart:
-                            _logger.Information("[timeskip] '{Name}' (id={Id}) began the session's active skip (kind={Kind}).", Name, Id, body[1]);
+                            _logger.Information("[timeskip] {Peer:l} began the session's active skip (kind={Kind}).", DiagnosticPeer, body[1]);
                             _broadcastService.BroadcastTimeSkip(this, body);
                             break;
                         case ClientHandler.TimeSkipRouting.BroadcastDone:
-                            _logger.Information("[timeskip] '{Name}' (id={Id}) skip done -> worldTime={Time} (announced).",
-                                Name, Id, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(2)));
+                            _logger.Information("[timeskip] {Peer:l} skip done -> worldTime={Time} (announced).",
+                                DiagnosticPeer, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(2)));
                             _broadcastService.BroadcastTimeSkip(this, body);
                             break;
                         case ClientHandler.TimeSkipRouting.BroadcastDoneQuiet:
-                            _logger.Information("[timeskip] '{Name}' (id={Id}) {What} -> worldTime={Time} (quiet).",
-                                Name, Id, phase == Protocol.TimeSkipPhaseSync ? "clock sync" : "joined-skip done",
+                            _logger.Information("[timeskip] {Peer:l} {What:l} -> worldTime={Time} (quiet).",
+                                DiagnosticPeer, phase == Protocol.TimeSkipPhaseSync ? "clock sync" : "joined-skip done",
                                 BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(2)));
                             body[0] = Protocol.TimeSkipPhaseDoneQuiet;
                             _broadcastService.BroadcastTimeSkip(this, body);
                             break;
                         default:
-                            _logger.Information("[timeskip] '{Name}' (id={Id}) phase={Phase} absorbed (joined/duplicate).", Name, Id, phase);
+                            _logger.Information("[timeskip] {Peer:l} phase={Phase} absorbed (joined/duplicate).", DiagnosticPeer, phase);
                             break;
                     }
                     continue;
@@ -1006,8 +1005,8 @@ public partial class ClientSession
                         {
                             string fatalNpc = System.Text.Encoding.UTF8.GetString(body, 1, body[0]);
                             float fatalHp = BitConverter.ToSingle(body, 1 + body[0] + 4);
-                            _logger.Information("[NPCDEATH] relayed FATAL npc={Npc} from='{Name}' (id={Id}) blowHp={BlowHp:F1}",
-                                fatalNpc, Name, Id, fatalHp);
+                            _logger.Information("[NPCDEATH] relayed FATAL npc={Npc} {Peer:l} blowHp={BlowHp:F1}",
+                                fatalNpc, DiagnosticPeer, fatalHp);
                         }
                         _broadcastService.BroadcastNpcDamage(this, body);
                     }
@@ -1075,8 +1074,8 @@ public partial class ClientSession
                 {
                     var body = new byte[Protocol.ItemClaimUpPayloadLen];
                     await ReadExactAsync(body);
-                    _logger.Information("[itemsync] '{Name}' (id={Id}) claimed drop {DropId}.",
-                        Name, Id, BinaryPrimitives.ReadUInt32LittleEndian(body));
+                    _logger.Information("[itemsync] {Peer:l} claimed drop {DropId}.",
+                        DiagnosticPeer, BinaryPrimitives.ReadUInt32LittleEndian(body));
                     _broadcastService.BroadcastItemClaim(this, body);
                     continue;
                 }
@@ -1100,22 +1099,22 @@ public partial class ClientSession
                     await ReadExactAsync(body);
                     if (type == Protocol.PlayerRespawnedUp)
                     {
-                        _logger.Information("[respawn] '{Name}' (id={Id}) respawned at ({X:F1}, {Y:F1}, {Z:F1}) reason={Reason}.",
-                            Name, Id, BitConverter.ToSingle(body, 0), BitConverter.ToSingle(body, 4),
+                        _logger.Information("[respawn] {Peer:l} respawned at ({X:F1}, {Y:F1}, {Z:F1}) reason={Reason}.",
+                            DiagnosticPeer, BitConverter.ToSingle(body, 0), BitConverter.ToSingle(body, 4),
                             BitConverter.ToSingle(body, 8), Protocol.RespawnReasonName(body[12]));
                         _broadcastService.BroadcastSenderFact(this, Protocol.PlayerRespawnedDown, body);
                     }
                     else if (type == Protocol.GraveAddUp)
                     {
-                        _logger.Information("[grave] '{Name}' (id={Id}) grave 0x{Grave:X16} at ({X:F1}, {Y:F1}, {Z:F1}).",
-                            Name, Id, BinaryPrimitives.ReadUInt64LittleEndian(body), BitConverter.ToSingle(body, 8),
+                        _logger.Information("[grave] {Peer:l} grave 0x{Grave:X16} at ({X:F1}, {Y:F1}, {Z:F1}).",
+                            DiagnosticPeer, BinaryPrimitives.ReadUInt64LittleEndian(body), BitConverter.ToSingle(body, 8),
                             BitConverter.ToSingle(body, 12), BitConverter.ToSingle(body, 16));
                         _broadcastService.BroadcastSenderFact(this, Protocol.GraveAddDown, body);
                     }
                     else
                     {
-                        _logger.Information("[grave] '{Name}' (id={Id}) grave 0x{Grave:X16} removed.",
-                            Name, Id, BinaryPrimitives.ReadUInt64LittleEndian(body));
+                        _logger.Information("[grave] {Peer:l} grave 0x{Grave:X16} removed.",
+                            DiagnosticPeer, BinaryPrimitives.ReadUInt64LittleEndian(body));
                         _broadcastService.BroadcastSenderFact(this, Protocol.GraveRemoveDown, body);
                     }
                     continue;
@@ -1150,7 +1149,7 @@ public partial class ClientSession
                     {
                         _clientHandler.CountDrop((byte)type, why, Protocol.DropKeyHasKind(type) ? Protocol.JoinBodyKind(body) : -1);
                         if (!why.StartsWith("host-absent", StringComparison.Ordinal))
-                            _logger.Warning("[join] {Kind} from '{Name}' (id={Id}) to {Target} dropped: {Why}.", jw.Name, Name, Id, body[0], why);
+                            _logger.Warning("[join] {Kind} {Peer:l} to {Target} dropped: {Why}.", jw.Name, DiagnosticPeer, body[0], why);
                         continue;
                     }
                     bool carryHeld = type == Protocol.CarryUp && body.Length > Protocol.JoinHeaderLen && body[Protocol.JoinHeaderLen] == Protocol.CarryHeld;   // WO-148: every 2 s while carrying
@@ -1158,8 +1157,8 @@ public partial class ClientSession
                     // neither gets a line per frame either (the agents log their own)
                     bool quiet = type is Protocol.ConvUp or Protocol.W203Up;
                     if (type != Protocol.WorldChunkUp && type != Protocol.WorldAckUp && type != Protocol.ActivityHostUp && type != Protocol.ActivityPeerUp && type != Protocol.HitVerdictUp && !carryHeld && !quiet)   // WO-141: rows every few seconds, counted not logged; WO-161: a verdict per hit in a fight, the agents log each (WO161-HIT)
-                        _logger.Information("[join] {Kind} '{Name}' (id={Id}) -> id={Dest} join=0x{Join:X8} ({Len} B).",
-                            jw.Name, Name, Id, dest.Id, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(1)), payloadLen);
+                        _logger.Information("[join] {Kind} {Peer:l} -> id={Dest} join=0x{Join:X8} ({Len} B).",
+                            jw.Name, DiagnosticPeer, dest.Id, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(1)), payloadLen);
                     continue;
                 }
 
@@ -1174,12 +1173,12 @@ public partial class ClientSession
                     if (!_clientHandler.IsDamageAuthority(this))
                     {
                         string why = _clientHandler.HostAbsent ? "host-absent" : "not-host";
-                        _logger.Warning("[!] '{Name}' (id={Id}) sent WorldSaved without holding damage authority -- dropped ({Why}).", Name, Id, why);
+                        _logger.Warning("[!] {Peer:l} sent WorldSaved without holding damage authority -- dropped ({Why:l}).", DiagnosticPeer, why);
                         _clientHandler.CountDrop(Protocol.WorldSavedUp, why);
                         continue;
                     }
-                    _logger.Information("[worldsave] '{Name}' (id={Id}) saved the world: seq {Seq} playline{Playline}/{File}.",
-                        Name, Id, ws?.Seq, ws?.Playline, ws?.FileName);
+                    _logger.Information("[worldsave] {Peer:l} saved the world: seq {Seq} playline{Playline}.",
+                        DiagnosticPeer, ws?.Seq, ws?.Playline);
                     _broadcastService.BroadcastSenderFact(this, Protocol.WorldSavedDown, body);
                     continue;
                 }
@@ -1187,7 +1186,7 @@ public partial class ClientSession
                 if (type == Protocol.PlayerDeathUp && payloadLen == Protocol.PlayerDeathUpPayloadLen)
                 {
                     // Carries nothing: the relay already knows who sent it.
-                    _logger.Information("[death] '{Name}' (id={Id}) reported their own death.", Name, Id);
+                    _logger.Information("[death] {Peer:l} reported their own death.", DiagnosticPeer);
                     _broadcastService.BroadcastPlayerDeath(this);
                     continue;
                 }
@@ -1221,8 +1220,8 @@ public partial class ClientSession
                     claims = false;
                 if (claims != ClaimsHost && _clientHandler.UpdateHostClaim(this, claims))
                 {
-                    _logger.Information("MP-HOST-CLAIM '{Name}' (id={Id}, {Transport}) {What} the session host.",
-                        Name, Id, Transport, claims ? "claims" : "no longer claims");
+                    _logger.Information("MP-HOST-CLAIM {Peer:l} transport={Transport:l} {What:l} the session host.",
+                        DiagnosticPeer, Transport, claims ? "claims" : "no longer claims");
                     _broadcastService.BroadcastCombatRole();   // re-decides and logs MP-AUTHORITY-OWNER
                 }
                 if (_clientHandler.HostAbsent) continue;
@@ -1696,8 +1695,8 @@ public partial class ClientSession
                 break;
 
             default:
-                _logger.Warning("[!] '{Name}' sent malformed interaction packet 0x{Type:X2} ({Len} bytes)",
-                    Name, type, body.Length);
+                _logger.Warning("[!] {Peer:l} sent malformed interaction packet 0x{Type:X2} ({Len} bytes)",
+                    DiagnosticPeer, type, body.Length);
                 // WO-203 II.5: counted, not only a line. The gate at the top
                 // already refuses a body under its type's minimum (RelayUp),
                 // so what lands here is a dice intent the protocol does not
@@ -1970,7 +1969,7 @@ public partial class ClientSession
         }
 
         if (reason is not null)
-            _logger.Warning("[!] Disconnecting {Name}: {Reason}.", Name ?? $"id={Id}", reason);
+            _logger.Warning("[!] Disconnecting {Peer:l}: {Reason:l}.", DiagnosticPeer, reason);
         _conn.Dispose();
     }
 
@@ -2032,11 +2031,8 @@ public partial class ClientSession
             {
                 // Normal on a disconnect -- the peer's read side of the same
                 // socket is what RunAsync's own catch already treats as
-                // unremarkable, so this is Debug, not a warning. It still logs
-                // the exception rather than swallowing it silently: an
-                // unexpected write failure (not just "the peer is gone") used
-                // to be indistinguishable from a normal disconnect from here.
-                _logger.Debug(ex, "[!] Write loop for {Name} stopped", Name ?? $"id={Id}");
+                // unremarkable. Keep the exception type without transport or endpoint details.
+                _logger.Debug("[!] Write loop for {Peer:l} stopped ({Type:l})", DiagnosticPeer, ex.GetType().Name);
                 AbortWriteQueue(null);
                 break;
             }

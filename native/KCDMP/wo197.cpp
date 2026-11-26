@@ -372,8 +372,8 @@ uint8_t pair(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* 
     if (pair_is_query(lenA, lenV)) { std::memcpy(out, &v, 4); out[4] = out[5] = 255; out[6] = 0; *outLen = 7; return wo163::kROk; }
     void* aca = nullptr; void* am = nullptr; void* vca = nullptr; void* vm = nullptr;
     uint8_t targets = 0;
-    if (motion::combat_parts(a, false, &aca, &am) && wo187::set_logical_target(aca, engine::entity_by_id(v))) targets |= 1;
-    if (motion::combat_parts(v, false, &vca, &vm) && wo187::set_logical_target(vca, engine::entity_by_id(a))) targets |= 2;
+    if (motion::combat_parts(a, false, &aca, &am) && wo187::legacy_target(a, aca, am, engine::entity_by_id(v))) targets |= 1;
+    if (motion::combat_parts(v, false, &vca, &vm) && wo187::legacy_target(v, vca, vm, engine::entity_by_id(a))) targets |= 2;
     uint8_t rv = 255, ra = 255;
     auto play = [](uint32_t eid, const std::string& spec) {
         const rttr::SwingResult r = rttr::ghost_swing(eid, spec.c_str());
@@ -407,8 +407,8 @@ uint8_t sync_guard(const uint8_t* body, size_t len, uint8_t* out, size_t cap, si
     if (!masterPose) return wo163::kRFailed;
     auto slavePose = rttr::begin_combat_pose(s, "wo197.sync_guard");
     if (!slavePose) return wo163::kRFailed;
-    wo187::set_logical_target(mca, engine::entity_by_id(s));
-    wo187::set_logical_target(sca, engine::entity_by_id(m));
+    wo187::legacy_target(m, mca, mm, engine::entity_by_id(s));
+    wo187::legacy_target(s, sca, sm, engine::entity_by_id(m));
     bool r = false;
     c_syncGuards.fetch_add(1);
     KCDMP_FAULT_CALL(site, "wo197::start_sync_guard");

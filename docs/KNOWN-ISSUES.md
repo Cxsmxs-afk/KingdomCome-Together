@@ -34,11 +34,14 @@ it. The work orders' findings (`docs/WO-215-findings.md` … `docs/WO-221-findin
   on our bench one get-up in a handful was not shown.
 - **Paired attacks** (one fighter's move answered by another's) are not always shown on the joiner. **Grabs** do not happen between the
   players and the host's people.
+- **NPC targets in the feature draft.** The host's opponent stream owns the target on bound guest-world NPC copies. The relay-to-engine diagnostic counts the active opponent. How many attacks are visible on the intended body still needs a two-PC check, especially after a target switch.
+- **Ranged phases.** Bow charge and aim, and reload for individual crossbow subclasses, still need verified animation entries from the local game data.
 - **The host's frame rate in fights** may drop a few frames a second with the fast fight updates of 0.64; `mp_npc_bands off` in the
   host's console brings back the old rates. Tell us if you see it.
 - **The mod's own work on the host** costs about 1.9 ms of a frame on average and, in about one frame in twenty, 10 ms
   (our bench; 0.65.0: 2.8 and 13 ms). The target was 1.5 ms in that one frame in twenty. The bug report's recorders now write
   their files on their own thread; what is left is the reading of the game's state itself, which has to happen on the game's main thread. A stutter on the host you can feel: press `.`.
+  The feature draft reuses the local player's combat-model read within a single task and frame. Its effect on frame p95 is unmeasured.
 
 ## Horses
 
@@ -85,6 +88,7 @@ it. The work orders' findings (`docs/WO-215-findings.md` … `docs/WO-221-findin
   still happens and leave with Back.
 - **Cutscenes can still go black.** The mod's hold of a locally initialized cutscene now expires after 1.8 s at the next eligible
   frame. `MP-FIX CUT` records its release. Visible recovery and scenes waiting for a remote quest step need a game check.
+- **Escort NPCs** still need a verified native call that follows a partner's figure and commits a guest's carry to the host quest. The draft uses all bound figures for the host's distance trigger.
 
 ## The connection
 
@@ -97,7 +101,8 @@ it. The work orders' findings (`docs/WO-215-findings.md` … `docs/WO-221-findin
 ## The game's own systems
 
 - **Lip-sync of conversation lines** depends on the game's facial data. Setup links the files under the retail installation's
-  `Data/Facials` into the Modding Tools workspace where available. Test actual NPC lines and the partner's conversation on both PCs.
+  `Data/Facials` into the Modding Tools workspace where available and shows an optional warning when the source is missing or empty.
+  Test actual NPC lines and the partner's conversation on both PCs.
   See [the facial data notes](PAKET-F4-FACIALS.md).
 - **Weapons may pop in** for a moment when a person draws on the joiner's screen.
 - **Playing far apart** (beyond the leash) is not supported: people near the far player may freeze or be missing.
@@ -113,3 +118,5 @@ it. The work orders' findings (`docs/WO-215-findings.md` … `docs/WO-221-findin
 - **A joiner's bought horse lost at the next join; a whistle that fetched instead of called** (`mp_own_horse`, on).
 - **Dead bodies standing or in the bind pose** when the joiner had not seen them die (`mp_corpse_look`, on).
 - **Cart riders standing, wheels not turning, cart horses missing** (`mp_cart_seat`, `mp_cart_wheels`, on).
+
+The [two-PC checklist](TEST-2PC-FEATURES.md) names the evidence still needed for the feature draft.

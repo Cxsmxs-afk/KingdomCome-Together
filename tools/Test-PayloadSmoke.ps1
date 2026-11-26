@@ -43,7 +43,7 @@
           this build's protocol byte and release version, Ack, one Ping/Pong
           (RelaySmoke.cs); exit 0 with a RELAY-SMOKE ok line, else 1;
        4. match the accepted connection in this relay's stdout to the agent's
-          Ack ID and protocol. Check both programs for assembly-load failures;
+          Ack ID, protocol and release. Check both programs for assembly-load failures;
        5. stop the relay, delete the copy, exit non-zero on any failure.
 
     Same-build only by construction: both exes come from the same payload,
@@ -176,8 +176,8 @@ try {
     if (Test-Path $agentOut) { $lines = Get-Content $agentOut }
     $smoke = $lines | Where-Object { $_ -match 'RELAY-SMOKE' } | Select-Object -Last 1
     $connectPattern = $null
-    if ($code -eq 0 -and $smoke -cmatch '^RELAY-SMOKE ok id=(?<id>[0-9]+) protocol=v(?<protocol>[0-9]+) ') {
-        $connectPattern = '\bMP-FIX RELAY connected session=[1-9a-f][0-9a-f]* name=<redacted> id={0} protocol={1} loopback=1\s*$' -f $Matches['id'], $Matches['protocol']
+    if ($code -eq 0 -and $smoke -cmatch '^RELAY-SMOKE ok id=(?<id>[0-9]+) protocol=v(?<protocol>[0-9]+) release=(?<release>\S+) ') {
+        $connectPattern = '\bMP-FIX RELAY connected session=[1-9a-f][0-9a-f]* name=<redacted> id={0} loopback=1 protocol={1} release={2}\s*$' -f $Matches['id'], $Matches['protocol'], [regex]::Escape($Matches['release'])
         Ok "$smoke"
     }
     else {
@@ -197,7 +197,7 @@ try {
     $relayStdout = @(Get-Content $relayOut)
     $connect = $relayStdout | Where-Object { $connectPattern -and $_ -cmatch $connectPattern } | Select-Object -First 1
     if ($connect) { Ok "published relay logged the smoke client's connect: $connect" }
-    else { Bad "published relay did not log a redacted connect matching the smoke client's Ack ID and protocol" }
+    else { Bad "published relay did not log a redacted connect matching the smoke client's Ack ID, protocol and release" }
 
     $relayText = @($relayStdout)
     if ($relayLog) { $relayText += Get-Content $relayLog.FullName }

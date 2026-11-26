@@ -80,7 +80,7 @@ public class SessionManager
 	{
 		if (!Enum.IsDefined(kind))
 		{
-			_logger.Warning("[session] {From} sent an invite with unknown kind {Kind}", from.Name, (byte)kind);
+			_logger.Warning("[session] {From:l} sent an invite with unknown kind {Kind}", from.DiagnosticPeer, (byte)kind);
 			from.EnqueueSessionEnd(0, SessionEndReason.ProtocolError);
 			return null;
 		}
@@ -117,8 +117,8 @@ public class SessionManager
 			};
 			_sessions[session.Id] = session;
 
-			_logger.Information("[session {Id}] {From} invited {To} to {Kind} (wager {Wager})",
-				session.Id, from.Name, target.Name, kind, wager);
+			_logger.Information("[session {Id}] {From:l} invited {To:l} to {Kind} (wager {Wager})",
+				session.Id, from.DiagnosticPeer, target.DiagnosticPeer, kind, wager);
 
 			target.EnqueueInviteReceived(session.Id, from.Id, kind, openConfig);
 			return session;
@@ -158,14 +158,14 @@ public class SessionManager
 
 		if (!accept)
 		{
-			_logger.Information("[session {Id}] declined by {Who}", sessionId, from.Name);
+			_logger.Information("[session {Id}] declined by {Who:l}", sessionId, from.DiagnosticPeer);
 			session.Initiator.EnqueueSessionEnd(sessionId, SessionEndReason.Declined);
 			session.Acceptor.EnqueueSessionEnd(sessionId, SessionEndReason.Declined);
 			return;
 		}
 
-		_logger.Information("[session {Id}] {Kind} started: {A} vs {B}",
-			sessionId, session.Kind, session.Initiator.Name, session.Acceptor.Name);
+		_logger.Information("[session {Id}] {Kind} started: {A:l} vs {B:l}",
+			sessionId, session.Kind, session.Initiator.DiagnosticPeer, session.Acceptor.DiagnosticPeer);
 
 		session.Initiator.EnqueueSessionStart(sessionId, session.Acceptor.Id, session.Kind, SessionRole.Initiator);
 		session.Acceptor.EnqueueSessionStart(sessionId, session.Initiator.Id, session.Kind, SessionRole.Acceptor);
@@ -224,8 +224,8 @@ public class SessionManager
 
 		if (!result.Accepted)
 		{
-			_logger.Information("[session {Id}] dice intent {Intent} from {Who} rejected: {Reason}",
-				sessionId, intentType, from.Name, result.RejectReason);
+			_logger.Information("[session {Id}] dice intent {Intent} from {Who:l} rejected: {Reason}",
+				sessionId, intentType, from.DiagnosticPeer, result.RejectReason);
 			from.EnqueueDiceError(sessionId, ToWireReason(result.RejectReason));
 			return;
 		}
@@ -263,7 +263,7 @@ public class SessionManager
 		// misreport how a session finished to its peer.
 		var end = reason == SessionEndReason.Completed ? reason : SessionEndReason.Left;
 
-		_logger.Information("[session {Id}] ended by {Who}: {Reason}", sessionId, from.Name, end);
+		_logger.Information("[session {Id}] ended by {Who:l}: {Reason}", sessionId, from.DiagnosticPeer, end);
 		session.Initiator.EnqueueSessionEnd(sessionId, end);
 		session.Acceptor.EnqueueSessionEnd(sessionId, end);
 	}
@@ -285,7 +285,7 @@ public class SessionManager
 		foreach (var s in affected)
 		{
 			var survivor = s.Other(gone);
-			_logger.Information("[session {Id}] ended: {Who} disconnected", s.Id, gone.Name);
+			_logger.Information("[session {Id}] ended: {Who:l} disconnected", s.Id, gone.DiagnosticPeer);
 			survivor.EnqueueSessionEnd(s.Id, SessionEndReason.PeerDisconnected);
 		}
 	}

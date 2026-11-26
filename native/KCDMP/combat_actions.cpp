@@ -59,6 +59,9 @@ struct Entry {
     bool movesBody = false;
     uint64_t serial = 0;
     QueueStage queue = QueueStage::Reserved;
+    bool callerHeld = false;
+    bool protectUncertain = true;
+    uint32_t refsBeforeQueue = 0, refsAfterQueue = 0;
 };
 
 // The engine may reenter a release while Stop is on the stack. Never wait and never recursively acquire this gate.
@@ -204,7 +207,7 @@ bool add_ref(void* action) {
     }) && added;
 }
 // the controller's own way of giving a reference back (CryAction: lock xadd [+0x58], -1; at zero the action's slot 23)
-bool drop_ref(void* action, bool unsubmitted = false) {
+bool drop_ref(void* action, bool unsubmitted = false, LONG owned = 1) {
     KCDMP_FAULT_READ(site, "combat_actions::drop_ref");
     LONG left = 1;
     void** vt = nullptr;
@@ -216,8 +219,8 @@ bool drop_ref(void* action, bool unsubmitted = false) {
             if (state != wo167rules::kStatusFinished && !(unsubmitted && state == wo167rules::kStatusNone)) return;
             auto* refs = reinterpret_cast<volatile LONG*>(static_cast<char*>(action) + kActRefs);
             const LONG count = InterlockedCompareExchange(refs, 0, 0);
-            if (count <= 0 || InterlockedCompareExchange(refs, count - 1, count) != count) return;
-            left = count - 1;
+            if (count < owned || InterlockedCompareExchange(refs, count - owned, count) != count) return;
+            left = count - owned;
             released = true;
         }) || !released) return false;
     // the action's own delete frees memory (the allocator's lock): a plain call, never under the fault guard
@@ -286,6 +289,12 @@ bool note_finished(Entry& entry, bool actionKnown, const ActionReadback& seen) {
     if (entry.retirement == Retirement::Finished) return true;
     if (!detail::observe_finished(entry.retirement, actionKnown, seen.status)) return false;
     trace(entry, "finished", seen);
+    if (entry.refsBeforeQueue && entry.refsAfterQueue) {
+        deferred_log::Scope defer;
+        logf("MP-FIX REF before=%u after_queue=%u after_finish=%u eid=0x%X ticket=%llu twin=%d",
+             entry.refsBeforeQueue, entry.refsAfterQueue, seen.refs, entry.body.eid,
+             static_cast<unsigned long long>(entry.serial), entry.protectUncertain ? 0 : 1);
+    }
     c_ended.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -522,7 +531,7 @@ void tick() {
     const uint64_t epoch = g_epoch.load(std::memory_order_acquire), now = GetTickCount64();
     static size_t next = 0;
     auto& bucket = g_buckets[next++ & (kBuckets - 1)];
-    struct FinishedAction { void* actor; void* action; };
+    struct FinishedAction { void* actor; void* action; LONG owned; };
     std::array<FinishedAction, kSweepReads> done{};
     size_t reads = 0, finished = 0;
     {
@@ -552,13 +561,13 @@ void tick() {
             else if (seen.status == wo167rules::kStatusFinished && may_write(bucket, entry, ActionAccess::RetiredQueue)) {
                 note_finished(entry, true, seen);
                 // Status None can still belong to the controller's queue. Only its explicit Finished status can give our ref back.
-                done[finished++] = {entry.body.actor, entry.action};
+                done[finished++] = {entry.body.actor, entry.action, entry.callerHeld ? 2L : 1L};
                 forget(entry);
             }
         }
     }
     for (size_t i = 0; i < finished; ++i) {
-        if (drop_ref(done[i].action)) continue;
+        if (drop_ref(done[i].action, false, done[i].owned)) continue;
         c_quarantined.fetch_add(1, std::memory_order_relaxed);
         note_tracking_gap(done[i].actor);
     }
@@ -633,6 +642,12 @@ bool begin_queue(const QueueTicket& ticket) {
     auto* entry = ticket_entry(bucket, ticket);
     if (!entry || entry->queue != QueueStage::Reserved || entry->retirement != Retirement::Active) return false;
     entry->queue = QueueStage::InFlight;
+    entry->protectUncertain = wo221::on(wo221::kBitQueueRefRelease);
+    if (wo221::on(wo221::kBitDeathTrace) && (entry->serial <= 32 || entry->serial % 32 == 0)) {
+        ActionReadback seen;
+        if (may_write(bucket, *entry, ActionAccess::CurrentBody) && read_owned_action(*entry, seen))
+            entry->refsBeforeQueue = seen.refs;
+    }
     return true;
 }
 
@@ -657,10 +672,28 @@ QueueResult settle_queue(const QueueTicket& ticket, QueueResult result) {
             release = true;
         } else if (result == QueueResult::Submitted && entry->queue == QueueStage::InFlight &&
                    entry->retirement == Retirement::Active && detail::same_body(ticket.body, observe_actor(ticket.body.actor))) {
+            ActionReadback seen;
+            if (entry->refsBeforeQueue && may_write(bucket, *entry, ActionAccess::CurrentBody) && read_owned_action(*entry, seen))
+                entry->refsAfterQueue = seen.refs;
             entry->queue = QueueStage::Settled;
             return result;
         } else {
-            // QueueAction may have installed before reentry or a fault. The ledger's reference stays and the event is never retried.
+            // Reentry or a fault can hide a successful install. Keep both known references until Finished.
+            // The bench may give back the caller's reference as in #75, while the ledger still owns its reference.
+            entry->callerHeld = true;
+            if (!entry->protectUncertain && entry->queue == QueueStage::InFlight) {
+                ActionReadback seen;
+                const bool current = may_write(bucket, *entry, ActionAccess::CurrentBody) && read_owned_action(*entry, seen);
+                if (seen.refs > 1 && detail::caller_releases(QueueResult::Uncertain, false, current)) {
+                    KCDMP_FAULT_READ(site, "combat_actions::settle_uncertain_caller");
+                    fault::guarded(site, [&] {
+                        if (!may_write(bucket, *entry, ActionAccess::CurrentBody)) return;
+                        auto* refs = reinterpret_cast<volatile LONG*>(static_cast<char*>(entry->action) + kActRefs);
+                        const auto count = static_cast<LONG>(seen.refs);
+                        if (InterlockedCompareExchange(refs, count - 1, count) == count) entry->callerHeld = false;
+                    });
+                }
+            }
             entry->queue = QueueStage::Settled;
             trace(*entry, "queue-uncertain");
             quarantine(*entry);

@@ -41,6 +41,12 @@ struct QueueTicket {
 
 namespace detail {
 
+// A completed manager call consumed the offer. A successful caller still owns its ordinary reference.
+constexpr unsigned caller_releases(QueueResult result, bool protectUncertain, bool provedCurrent) {
+    if (result == QueueResult::Refused) return 2;
+    return result == QueueResult::Uncertain && !protectUncertain && provedCurrent ? 1 : 0;
+}
+
 inline bool known_body(const BodyProof& body) {
     return body.eid && body.actor && body.entity && body.lifecycle;
 }

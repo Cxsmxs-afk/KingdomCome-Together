@@ -34,6 +34,9 @@ int load_sequence_log_stall_tests(int* passed);
 int wo203_conv_tests(int* passed);
 int t3_recovery_stats_tests(int* passed);
 int h6_combat_action_tests(int* passed);
+int wo187_tests(int* passed);
+int wo201_tests(int* passed);
+int wo209_tests(int* passed);
 int npc_death_release_tests(int* passed);
 int wo155_rules_tests(int* passed);
 
@@ -61,6 +64,9 @@ int main() {
     passed &= run_tests("ordered dialog votes and apply receipts", &wo203_conv_tests);
     passed &= run_tests("scoped recovery and reconnect diagnostics", &t3_recovery_stats_tests);
     passed &= run_tests("combat action incarnation and retirement", &h6_combat_action_tests);
+    passed &= run_tests("active NPC target and wind-up rules", &wo187_tests);
+    passed &= run_tests("quest distance triggers", &wo201_tests);
+    passed &= run_tests("host opponent mirror and frame read reuse", &wo209_tests);
     passed &= run_tests("native NPC death boundary (engine doubles)", &npc_death_release_tests);
     passed &= run_tests("friendly-fire measurement windows and life scope", &wo155_rules_tests);
     return passed ? 0 : 1;
@@ -76,6 +82,7 @@ EOF
         native/tests/load_sequence_log_stall_tests.cpp native/KCDMP/load_sequence.cpp \
         native/tests/wo203_conv_tests.cpp native/tests/t3_recovery_stats_tests.cpp \
         native/tests/h6_combat_action_tests.cpp \
+        native/tests/wo187_tests.cpp native/tests/wo201_tests.cpp native/tests/wo209_tests.cpp \
         native/tests/npc_death_release_tests.cpp native/tests/wo155_rules_tests.cpp \
         -o "$native_tmp/native-contracts"
     if ! native_result="$(cd "$native_tmp" && ./native-contracts)"; then

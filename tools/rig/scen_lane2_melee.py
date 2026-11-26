@@ -25,6 +25,7 @@ SWING_FALLBACK = re.compile(r'\bMP-ACTION section=inbound ghost=(\d+) kind=Attac
 OUTBOUND_KINDS = {'Attack': (ACTION_KINDS['swing'],), 'BlockImpulse': (ACTION_KINDS['block'], ACTION_KINDS['parry'])}
 DAMAGE_FIELDS = ('dmg_double', 'dmg_double_blocked', 'dmg_double_unconfirmed')
 MELEE_UNAVAILABLE = 'melee_presentation_unavailable'
+NPC_TARGET = re.compile(r'\bMP-FIX TGT (.+)$')
 FF_READBACK = ('if KCD2MP and KCD2MP.w121 then System.LogAlways("[LANE2-FF] " .. '
                '(KCD2MP.w121.ffSession and "on" or "off")) end')
 LIVE_CASES = {
@@ -130,8 +131,38 @@ def measure(stages, agent, native_logs, peer):
         'paired_attack': {'status': 'red' if paired & unverified_install else 'grey'},
         'master_strike': {'status': 'red' if counters & unverified_install else 'grey'},
         'unverified_ordinary_installs': sorted(unverified_install),
+        'npc_target_readback': npc_target_evidence(native_logs),
         'screen_observation': {'status': 'grey', 'reason': 'observer/video evidence is separate from the native action watch'},
     }
+
+
+def npc_target_evidence(native_logs):
+    def entity(row, key):
+        try:
+            return int(row[key], 16)
+        except (KeyError, ValueError):
+            return None
+
+    counts = {'active_match': 0, 'active_other': 0, 'requested_match_but_active_other': 0, 'unreadable': 0}
+    for lines in native_logs:
+        for line in lines:
+            if not (match := NPC_TARGET.search(line)):
+                continue
+            row = dict(FIELD.findall(match[1]))
+            if 'expected' not in row:
+                continue  # a successful owner transition is not a sample of the wind-up
+            want = entity(row, 'expected')
+            active = entity(row, 'active_after')
+            if row.get('active_read') != '1' or not want or active is None:
+                counts['unreadable'] += 1
+            elif active == want:
+                counts['active_match'] += 1
+            else:
+                counts['active_other'] += 1
+                if entity(row, 'request_before') == want:
+                    counts['requested_match_but_active_other'] += 1
+    total = counts['active_match'] + counts['active_other']
+    return dict(counts, active_match_percent=100 * counts['active_match'] / total if total else None)
 
 
 def damage_evidence(before, after, receiver, stable):

@@ -47,9 +47,10 @@ and now and then something will break. New builds come often.
 | Crime: the host's guards judge both of you | Bows and crossbows: the shot shows, the draw and aim don't | The regular (non-Modding-Tools) game |
 | One horse per player with their own saddlebags | The partner's horse can appear without its tack. Food dropped at the stable can vanish. | |
 | Seated riders and turning wheels on cart copies | Trade opens at mirrored shops. A dialogue can time out, and some keepers offer an empty sell list. | |
-| | Lip sync, voice chat and dice between players are unpolished | |
+| Setup reports missing retail facial files in the feature draft | NPC lip sync when listening to a partner's conversation still needs a live check. Voice chat and dice between players are unpolished. | |
+| | The feature draft counts up to four bound players in quest distance checks. Native escort following and carried quest steps remain open. | Replacing the agent directly in a loaded guest world |
 
-<sub>As of version 0.65.2. See the known issues for the remaining in-game checks.</sub>
+<sub>Released behavior as of version 0.65.2. See the [two-PC checklist](docs/TEST-2PC-FEATURES.md) for candidate changes and pending game evidence.</sub>
 
 The full, current list lives in **[Known issues](docs/KNOWN-ISSUES.md)**. What changed in each build is on the
 **[releases page](https://github.com/DeepFriedDepp/KingdomCome-Together/releases)**.

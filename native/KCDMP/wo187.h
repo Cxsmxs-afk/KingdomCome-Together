@@ -55,6 +55,7 @@ bool avatar_hit_on();    // mp_anim_avatar_hit (motion's capture: the local play
 
 // A2, main thread. The engine's own SetLogicalTarget on a combat actor; false when not armed or it faulted.
 bool set_logical_target(void* ca, void* entity);
+bool legacy_target(uint32_t copy, void* ca, void* model, void* entity);
 // WO-178's wind-up (wo166.cpp): the copy's target becomes `entity` the engine's way. hadIt = its requested target was that already.
 bool ensure_target(void* ca, void* model, void* entity, bool* hadIt);
 // Every wind-up of a copy (wo166.cpp, before its slot planning): its wish checked and written back if overwritten.

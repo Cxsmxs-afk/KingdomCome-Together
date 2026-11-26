@@ -89,6 +89,27 @@ public class Wo209Tests
     }
 
     [Fact]
+    public void Host_target_retirement_clears_a_bound_copy_before_an_unbound_seat_can_reuse_its_target()
+    {
+        Assert.True(Wo209Rules.TryHostWire(Dll(("a", 1, 0x7777, ""), ("b", 2, 0x200, ""),
+                ("c", 2, 0x300, ""), ("d", 2, 0x400, "")), eid => (byte)(eid >> 8), out var wire, out _));
+        uint Copy(string name) => (uint)(0x100 + (name[0] - 'a'));
+        for (int seats = 2; seats <= 4; seats++)
+        {
+            Assert.True(Wo209Rules.TryJoinerOp(wire, 2, 1, Copy, seat => seat <= seats ? 0x7000u + seat : 0u,
+                out var op, out int written, out int unresolved, retireUnbound: true));
+            Assert.Equal(4, written);
+            Assert.Equal(4 - seats, unresolved);
+            var rows = Enumerable.Range(0, 4)
+                .Select(i => (op[5 + i * 9], BinaryPrimitives.ReadUInt32LittleEndian(op.AsSpan(6 + i * 9)))).ToArray();
+            Assert.Equal((Wo209Rules.HereEntity, 0x7001u), rows[0]);
+            Assert.Equal((Wo209Rules.HerePlayer, 0u), rows[1]);
+            for (int seat = 3; seat <= 4; seat++)
+                Assert.Equal(seat <= seats ? (Wo209Rules.HereEntity, 0x7000u + (uint)seat) : (Wo209Rules.HereNone, 0u), rows[seat - 1]);
+        }
+    }
+
+    [Fact]
     public void Malformed_bytes_are_refused()
     {
         Assert.False(Wo209Rules.TryHostWire([], _ => 0, out _, out _));

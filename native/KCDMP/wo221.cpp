@@ -21,7 +21,9 @@ namespace {
 struct N { const char* n; uint32_t b; };
 const N kNames[] = {{"combat_action_end", kBitCombatActionEnd}, {"talk_hold", kBitTalkHold}, {"drive", kBitDrive},
                     {"holders", kBitHolders}, {"own_horse", kBitOwnHorse}, {"corpse_look", kBitCorpseLook},
-                    {"rp_controller", kBitRemoteController}, {"rp_combat", kBitRemoteCombat}, {"death_trace", kBitDeathTrace}};
+                    {"rp_controller", kBitRemoteController}, {"rp_combat", kBitRemoteCombat}, {"death_trace", kBitDeathTrace},
+                    {"queue_ref_release", kBitQueueRefRelease}, {"npc_target_owner", kBitNpcTargetOwner},
+                    {"attack_window_snapshot", kBitAttackWindowSnapshot}};
 }
 
 uint32_t twin_off_bits(const char* names) {

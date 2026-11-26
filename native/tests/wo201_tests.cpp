@@ -8,6 +8,7 @@
 
 #include "wo201_rules.h"
 #include "wo200_rules.h"
+#include "wo204_rules.h"
 
 using namespace kcdmp;
 
@@ -92,6 +93,16 @@ int wo201_tests(int* passed) {
         const NodeReads nr = evaluate_reads(ev.data(), ev.size());
         WCHECK(nr.origin == 0x268 && nr.target == 0x270 && nr.slot == 0x50, "Evaluate: origin +0x268, target +0x270, position slot +0x50");
         WCHECK(figure_nearer(30.0f, 5.0f) && !figure_nearer(5.0f, 30.0f) && !figure_nearer(10.0f, 10.0f), "the nearer body counts; a tie stays Henry's");
+        const float guests[] = {27.0f, 16.0f, 4.0f};
+        const float allFar[] = {21.0f, 31.0f, 25.0f};
+        bool tooFar = true, everybodyFar = false;
+        WCHECK(nearest_player(20.0f, guests, 1) == 20.0f &&
+               nearest_player(20.0f, guests, 2) == 16.0f &&
+               nearest_player(20.0f, guests, 3) == 4.0f &&
+               nearest_player(16.005f, guests, 2) == 16.0f &&
+               kcdmp::wo204rules::trigger_result(2, nearest_player(20.0f, guests, 3), 15.0f, &tooFar) && !tooFar &&
+               kcdmp::wo204rules::trigger_result(2, nearest_player(20.0f, allFar, 3), 15.0f, &everybodyFar) && everybodyFar,
+               "escort distance uses all bound players in 2, 3 and 4 seats and only matches far when all are far");
     }
     // ---- B7: the joiner's own quest logic starts no story bark ----
     {

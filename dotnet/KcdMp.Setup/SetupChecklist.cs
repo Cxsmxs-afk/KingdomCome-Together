@@ -3,7 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 namespace KcdMp.Setup;
 
-public enum StepId { Steam = 1, Game = 2, DiskSpace = 3, ModdingTools = 4, Workspace = 5, Mod = 6, Ready = 7, VcRuntime = 8 }
+public enum StepId { Steam = 1, Game = 2, DiskSpace = 3, ModdingTools = 4, Workspace = 5, Mod = 6, Ready = 7, VcRuntime = 8, FacialAssets = 9 }
 
 public enum StepStatus
 {
@@ -89,6 +89,10 @@ public static class SetupChecklist
         steps.Add(ws);
         steps.Add(ModStep(s, a, ws.Status == StepStatus.Done));
         steps.Add(VcRuntimeStep(s, a));
+        if (ws.Status == StepStatus.Done && s.Workspace is { HasRetailFacials: false })
+            steps.Add(new StepView(StepId.FacialAssets, "Facial animation files", StepStatus.NeedsYou,
+                "Data/Facials is missing or empty in the game installation. Verify the game's files in Steam, then click Check again. You can still Host or Join.",
+                Optional: true));
 
         bool allDone = steps.All(x => x.Optional || x.Status == StepStatus.Done);
         steps.Add(allDone

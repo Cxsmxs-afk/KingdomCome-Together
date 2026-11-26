@@ -25,8 +25,12 @@ constexpr uint32_t kBitCorpseLook = 1u << 5;        // E.1: a dead body's wounds
 constexpr uint32_t kBitRemoteController = 1u << 6;  // the partner's figure uses the engine movement request
 constexpr uint32_t kBitRemoteCombat = 1u << 7;      // the partner's combat uses timed native requests
 constexpr uint32_t kBitDeathTrace = 1u << 8;
+constexpr uint32_t kBitQueueRefRelease = 1u << 9;
+constexpr uint32_t kBitNpcTargetOwner = 1u << 10;
+constexpr uint32_t kBitAttackWindowSnapshot = 1u << 11;
 constexpr uint32_t kBitsDefault = kBitCombatActionEnd | kBitTalkHold | kBitDrive | kBitHolders | kBitOwnHorse | kBitCorpseLook |
-                                  kBitRemoteController | kBitRemoteCombat | kBitDeathTrace;
+                                  kBitRemoteController | kBitRemoteCombat | kBitDeathTrace | kBitQueueRefRelease | kBitNpcTargetOwner |
+                                  kBitAttackWindowSnapshot;
 
 uint8_t role();            // 0 none, 1 the host, 2 a joiner in the host's world
 bool on(uint32_t bit);     // the agent's word, less the bench twin's

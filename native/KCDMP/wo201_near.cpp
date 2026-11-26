@@ -2,8 +2,8 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // WO-201 V.2 nearest_player_triggers (the host), rebuilt by WO-204 Act I (nearest_player_v2): a quest's distance trigger on "the
-// player" measures from the nearer of the host's Henry and the partner's figure. "Came near" fires when either does; "is far" (the
-// escort's "player out from the tour") only when both are.
+// player" measures from the nearest of the host's Henry and the bound partner figures. "Came near" fires when any does; "is far"
+// (the escort's "player out from the tour") only once all of those figures are far.
 //
 // The engine's C_DistanceTrigger (XGenAIModule) reads its Origin and Target ports when it becomes active, keeps the two objects on the
 // node, registers the node as a move listener on BOTH objects, and evaluates on every move of either: Evaluate reads each one's
@@ -44,10 +44,12 @@
 #include "rttr_abi.h"
 #include "inline_hook.h"
 #include "hook_prologues.h"
+#include "load_sequence.h"
 #include "main_thread.h"
 #include "wo202.h"
 #include "wo202_rules.h"
 #include <windows.h>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -64,6 +66,9 @@ namespace r4 = wo204rules;
 constexpr uint32_t kPlayerEntity = 0x7777;
 constexpr size_t kMgrNpcOf = 0x20;   // C_NPCManager vtable: the C_NPC of an entity id (WO-189's read)
 constexpr char kActivateText[] = "no origin or target on input";
+constexpr size_t kMaxGuests = 3;
+constexpr uint64_t kSampleIntervalMs = 33;
+using Roster = std::array<uint32_t, kMaxGuests>;
 
 const char* g_why = "not resolved";
 void* g_eval = nullptr;
@@ -77,18 +82,24 @@ using SetResultFn = void (*)(void* node, bool match);
 EvalFn g_evalOrig = nullptr;
 bool g_hooked = false;
 std::atomic<bool> g_on{false}, g_agentQuiet{false};
-std::atomic<uint32_t> g_figEid{0};
-std::atomic<uint64_t> g_quietUntil{0};
+std::atomic<uint64_t> g_quietUntil{0}, g_rosterRevision{0}, g_lastLog{0};
 std::atomic<uint32_t> c_evals{0}, c_bound{0}, c_overrides{0}, c_overridesOffMain{0}, c_quiet{0}, c_stale{0}, c_unsettled{0}, c_kindUnknown{0};
 std::atomic<uint32_t> c_snapOk{0}, c_figNone{0}, c_figChanged{0}, c_noHenry{0};   // the main thread's snapshot, per frame
 
-// The main thread's snapshot: Henry's and the figure's C_NPC (compared by value only, never dereferenced off the main thread) and the
-// figure's position, under one SRW lock (readers on the engine's AI workers).
-struct Snap { void* P = nullptr; void* B = nullptr; float pos[3]{}; uint64_t at = 0; };
+// Partner C_NPC pointers are identity only on the workers. All partner positions are sampled on the main thread.
+struct Figure { void* npc = nullptr; float pos[3]{}; bool ready = false; };
+struct Snap {
+    void* P = nullptr;
+    std::array<Figure, kMaxGuests> figures{};
+    uint64_t at = 0, revision = 0, load = 0;
+    size_t expected = 0;
+};
 SRWLOCK g_snapLock = SRWLOCK_INIT;
+Roster g_roster{}; // under g_snapLock
 Snap g_snap;   // under g_snapLock
-void* g_figStable = nullptr;
-uint64_t g_figStableSince = 0, g_lastTick = 0, g_lastLog = 0;
+struct PreviousFigure { void* npc = nullptr; uint64_t since = 0; };
+std::array<PreviousFigure, kMaxGuests> g_previous{};
+uint64_t g_lastTick = 0, g_lastSample = 0, g_lastRevision = 0, g_lastLoad = 0;
 void* g_lastSoul = nullptr;
 bool g_wasSkipping = false;
 
@@ -141,7 +152,7 @@ Snap read_snap() {
 }
 void write_snap(const Snap& s) {
     AcquireSRWLockExclusive(&g_snapLock);
-    g_snap = s;
+    if (g_rosterRevision.load() == s.revision) g_snap = s;
     ReleaseSRWLockExclusive(&g_snapLock);
 }
 
@@ -154,7 +165,7 @@ void eval_detour(void* node) {
         c_quiet.fetch_add(1, std::memory_order_relaxed); g_evalOrig(node); return;
     }
     const Snap s = read_snap();
-    if (!s.P || !s.B || s.P == s.B) { g_evalOrig(node); return; }
+    if (!s.P || s.revision != g_rosterRevision.load() || s.load != loadsequence::stamp()) { g_evalOrig(node); return; }
     void* o = nullptr; void* t = nullptr;
     if (!rd(node, static_cast<ptrdiff_t>(g_offO), &o) || !rd(node, static_cast<ptrdiff_t>(g_offT), &t) || !o || !t || o == t
         || (o != s.P && t != s.P)) {
@@ -162,25 +173,38 @@ void eval_detour(void* node) {
     }
     c_bound.fetch_add(1, std::memory_order_relaxed);
     void* other = o == s.P ? t : o;
-    if (other == s.B) { g_evalOrig(node); return; }   // a trigger between Henry and the figure itself stays the engine's
+    // A trigger whose other end is a player retains its own engine semantics.
+    for (const auto& figure : s.figures) if (other == figure.npc) { g_evalOrig(node); return; }
     if (!r4::snapshot_fresh(now, s.at)) { c_stale.fetch_add(1, std::memory_order_relaxed); g_evalOrig(node); return; }
     float pp[3], po[3];
     if (!pos_of(s.P, pp) || !pos_of(other, po)) { g_evalOrig(node); return; }
-    const float dHenry = r4::distance3(pp, po), dFigure = r4::distance3(s.pos, po);
-    if (!figure_nearer(dHenry, dFigure)) { g_evalOrig(node); return; }
+    std::array<float, kMaxGuests> distances{};
+    size_t known = 0;
+    for (const auto& figure : s.figures) {
+        if (!figure.ready) continue;
+        const float distance = r4::distance3(figure.pos, po);
+        if (std::isfinite(distance)) distances[known++] = distance;
+    }
+    const float dHenry = r4::distance3(pp, po), nearest = nearest_player(dHenry, distances.data(), known);
+    const bool partnerNearer = nearest < dHenry;
+    if (!partnerNearer && known == s.expected) { g_evalOrig(node); return; }
     int32_t kind = -1; float thr = 0;
     bool match = false;
     if (!rd(node, static_cast<ptrdiff_t>(g_offKind), &kind) || !rd(node, static_cast<ptrdiff_t>(g_offThr), &thr)) { g_evalOrig(node); return; }
-    if (!r4::trigger_result(kind, dFigure, thr, &match)) { c_kindUnknown.fetch_add(1, std::memory_order_relaxed); g_evalOrig(node); return; }
+    if (!r4::trigger_result(kind, nearest, thr, &match)) { c_kindUnknown.fetch_add(1, std::memory_order_relaxed); g_evalOrig(node); return; }
+    if (s.revision != g_rosterRevision.load() || s.load != loadsequence::stamp()) { g_evalOrig(node); return; }
+    if (match && (kind == 2 || kind == 3) && known < s.expected) return; // a missing position cannot prove everyone is far
+    if (!partnerNearer) { g_evalOrig(node); return; }
     KCDMP_FAULT_CALL(site, "wo201near::set_result");
     if (!fault::guarded(site, [&] { reinterpret_cast<SetResultFn>(g_setResult)(node, match); })) return;
     c_overrides.fetch_add(1, std::memory_order_relaxed);
     const bool offMain = GetCurrentThreadId() != main_thread::main_thread_id();
     if (offMain) c_overridesOffMain.fetch_add(1, std::memory_order_relaxed);
-    if (now - g_lastLog >= 10000) {
-        g_lastLog = now;
-        logf("WO204-NEAR a distance trigger on the player measured from the partner's figure (%.1f m vs Henry's %.1f m, kind %d thr %.1f -> %s) [overrides=%u bound=%u quiet=%u] no node write thread=%lu",
-             dFigure, dHenry, kind, thr, match ? "match" : "no match", c_overrides.load(), c_bound.load(), c_quiet.load(),
+    auto last = g_lastLog.load(std::memory_order_relaxed);
+    if (now >= last && now - last >= 10000 && g_lastLog.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        deferred_log::Scope defer;
+        logf("MP-FIX ESC distance=%.1f host=%.1f players=%zu/%zu reason=near-trigger kind=%d threshold=%.1f match=%d [overrides=%u bound=%u quiet=%u] thread=%lu",
+             nearest, dHenry, known + 1, s.expected + 1, kind, thr, match ? 1 : 0, c_overrides.load(), c_bound.load(), c_quiet.load(),
              static_cast<unsigned long>(GetCurrentThreadId()));
     }
 }
@@ -254,57 +278,94 @@ void install_resolve() {
          (g_offO == kKnownOriginOff && g_offT == kKnownTargetOff && g_offActive == kKnownActiveOff) ? "the same as" : "DIFFERENT from (the resolved values are used)");
 }
 
-// Main thread, every frame: the snapshot and the quiet window. Nothing here evaluates a node.
+// Main thread: quiet on a load and publish a bounded roster snapshot at most 30 times a second.
 void tick() {
     if (!g_on.load() || !g_hooked) return;
     const uint64_t now = GetTickCount64();
     const uint64_t gap = now - g_lastTick;
     g_lastTick = now;
+    const uint64_t load = loadsequence::stamp();
+    if (gap > 500 || load != g_lastLoad) {
+        g_quietUntil = now + r4::kQuietAfterMs;
+        g_previous = {};
+        g_lastLoad = load;
+    }
+    if (now - g_lastSample < kSampleIntervalMs) return;
+    g_lastSample = now;
     // I.3: a load (a long frame), a new player soul, a time skip -- quiet until kQuietAfterMs after it
     void* ps = rttr::read_player_soul();
     const int skip = wo140::skip_state_now();
     const bool skipping = skip > 0 && r4::skip_quiet(static_cast<uint32_t>(skip));
-    if (gap > 500 || !ps || ps != g_lastSoul || skipping) {
+    if (!ps || ps != g_lastSoul || skipping) {
         if (skipping && !g_wasSkipping) logf("WO204-NEAR quiet: a time skip (state %d) -- the triggers are the host's Henry's until %llu ms after it ends", skip,
                                              static_cast<unsigned long long>(r4::kQuietAfterMs));
         g_lastSoul = ps;
         g_quietUntil = now + r4::kQuietAfterMs;
-        g_figStable = nullptr;
-        write_snap(Snap{});
+        g_previous = {};
     }
     g_wasSkipping = skipping;
-    if (now < g_quietUntil.load()) return;
+    if (r4::near_quiet(now, g_quietUntil.load(), g_agentQuiet.load())) return;
+    Snap s;
+    s.at = now;
+    s.load = load;
+    AcquireSRWLockShared(&g_snapLock);
+    const Roster roster = g_roster;
+    s.revision = g_rosterRevision.load();
+    ReleaseSRWLockShared(&g_snapLock);
+    if (s.revision != g_lastRevision) {
+        g_lastRevision = s.revision;
+        g_previous = {};
+    }
     void* mgr = wo141::x::npc_manager();
     void* get = is_a(mgr, g_vftNpcMgr) ? vslot(mgr, kMgrNpcOf) : nullptr;
-    const uint32_t fe = g_figEid.load();
-    Snap s;
     s.P = get ? npc_of(mgr, get, kPlayerEntity) : nullptr;
-    void* B = get && fe && engine::entity_by_id(fe) ? npc_of(mgr, get, fe) : nullptr;
-    if (!B) c_figNone.fetch_add(1, std::memory_order_relaxed);
-    if (B != g_figStable) { if (B && g_figStable) c_figChanged.fetch_add(1, std::memory_order_relaxed); g_figStable = B; g_figStableSince = now; }
-    if (!wo202rules::figure_usable(B, g_figStable, g_figStableSince, now)) { c_unsettled.fetch_add(1, std::memory_order_relaxed); write_snap(Snap{}); return; }
-    if (!s.P || !pos_of(B, s.pos)) { c_noHenry.fetch_add(1, std::memory_order_relaxed); write_snap(Snap{}); return; }
-    s.B = B;
-    s.at = now;
+    if (!s.P) c_noHenry.fetch_add(1, std::memory_order_relaxed);
+    for (size_t i = 0; s.P && i < roster.size() && roster[i]; ++i) {
+        ++s.expected;
+        auto& fig = s.figures[i];
+        auto& prev = g_previous[i];
+        fig.npc = engine::entity_by_id(roster[i]) ? npc_of(mgr, get, roster[i]) : nullptr;
+        if (fig.npc == s.P) fig.npc = nullptr;
+        if (!fig.npc) c_figNone.fetch_add(1, std::memory_order_relaxed);
+        if (fig.npc != prev.npc) {
+            if (fig.npc && prev.npc) c_figChanged.fetch_add(1, std::memory_order_relaxed);
+            prev = {fig.npc, now};
+        }
+        fig.ready = wo202rules::figure_usable(fig.npc, prev.npc, prev.since, now) && pos_of(fig.npc, fig.pos);
+        if (!fig.ready) c_unsettled.fetch_add(1, std::memory_order_relaxed);
+    }
     write_snap(s);
     c_snapOk.fetch_add(1, std::memory_order_relaxed);
 }
 
 uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
-    // [op][on:1][figureEid:4] (+ WO-204 [quiet:1]: a join or a load runs) -> [armed:1][overrides:4][bound:4]
-    if ((len != 6 && len != 7) || cap < 9) return wo163::kRBadRequest;
+    // [op][on:1][first:4][quiet?:1][second?:4][third?:4] -> [armed:1][overrides:4][bound:4]
+    if ((len != 6 && len != 7 && len != 15) || cap < 9) return wo163::kRBadRequest;
     const bool on = body[1] != 0;
-    uint32_t fe = 0; std::memcpy(&fe, body + 2, 4);
-    const bool quiet = len == 7 && body[6] != 0;
+    Roster roster{};
+    const bool quiet = on && len >= 7 && body[6] != 0;
     if (on) {
+        std::memcpy(&roster[0], body + 2, 4);
+        if (len == 15) std::memcpy(&roster[1], body + 7, 8);
+        if (!roster[0] || (roster[2] && !roster[1])) return wo163::kRBadRequest;
+        for (size_t i = 0; i < roster.size() && roster[i]; ++i) {
+            if (roster[i] == kPlayerEntity) return wo163::kRBadRequest;
+            for (size_t j = 0; j < i; ++j) if (roster[i] == roster[j]) return wo163::kRBadRequest;
+        }
         const char* why = "";
         if (!arm(&why)) { logf("WO201-NEAR NOT armed (%s) -- the player's distance triggers stay the host's Henry's", why); return wo163::kRFailed; }
     }
-    if (on != g_on.load() || fe != g_figEid.load())
-        logf("WO204-NEAR %s figure eid=0x%X", on ? "on" : "off", fe);
-    if (quiet != g_agentQuiet.load()) logf("WO204-NEAR %s (the agent: a join or a load)", quiet ? "quiet" : "no longer quiet");
-    g_on = on; g_figEid = fe; g_agentQuiet = quiet;
-    if (!on) write_snap(Snap{});
+    AcquireSRWLockExclusive(&g_snapLock);
+    const bool changed = roster != g_roster || quiet != g_agentQuiet.load() || on != g_on.load();
+    if (changed) {
+        g_roster = roster;
+        g_snap = {};
+        g_rosterRevision.fetch_add(1);
+        g_agentQuiet = quiet;
+        g_on = on;
+    }
+    ReleaseSRWLockExclusive(&g_snapLock);
+    if (changed) logf("WO204-NEAR figures=%u quiet=%d", (roster[0] ? 1u : 0u) + (roster[1] ? 1u : 0u) + (roster[2] ? 1u : 0u), quiet ? 1 : 0);
     out[0] = g_hooked ? 1 : 0;
     const uint32_t ov = c_overrides.load(), bd = c_bound.load();
     std::memcpy(out + 1, &ov, 4); std::memcpy(out + 5, &bd, 4);
@@ -313,10 +374,11 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
 }
 
 int status_text(char* out, int n) {
+    const auto snap = read_snap();
     return std::snprintf(out, static_cast<size_t>(n),
-                         "near=%s v2 on=%d quiet_agent=%d fig=0x%X evals=%u bound=%u overrides=%u off_main=%u quiet=%u stale=%u unsettled=%u kind_unknown=%u "
+                         "near=%s v2 on=%d quiet_agent=%d figures=%zu evals=%u bound=%u overrides=%u off_main=%u quiet=%u stale=%u unsettled=%u kind_unknown=%u "
                          "snap_ok=%u fig_none=%u fig_changed=%u no_henry=%u",
-                         g_why, g_on.load() ? 1 : 0, g_agentQuiet.load() ? 1 : 0, g_figEid.load(), c_evals.load(), c_bound.load(), c_overrides.load(),
+                         g_why, g_on.load() ? 1 : 0, g_agentQuiet.load() ? 1 : 0, snap.expected, c_evals.load(), c_bound.load(), c_overrides.load(),
                          c_overridesOffMain.load(), c_quiet.load(), c_stale.load(), c_unsettled.load(), c_kindUnknown.load(),
                          c_snapOk.load(), c_figNone.load(), c_figChanged.load(), c_noHenry.load());
 }

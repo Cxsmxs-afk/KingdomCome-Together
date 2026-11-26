@@ -18,8 +18,8 @@ namespace KcdMp.Server.Features.ClientHandling;
 /// authority from the host's own agent (docs/WO-120-findings.md, "Constraint
 /// found for Phase 1").
 ///
-/// <see cref="Remote"/> is what log lines print: the TCP endpoint as before,
-/// and only "steam-peer" for Steam (never a SteamID).
+/// <see cref="Remote"/> is transport metadata. Peer logs carry only the
+/// relay's diagnostic session, wire id and loopback flag.
 /// </summary>
 public sealed class RelayConnection : IDisposable
 {

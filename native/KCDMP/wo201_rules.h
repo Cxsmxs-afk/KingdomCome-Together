@@ -146,6 +146,13 @@ constexpr int64_t kKnownOriginOff = 0x268, kKnownTargetOff = 0x270, kKnownActive
 // The figure counts when it is nearer to the other end than the host's Henry (by more than a centimetre: a tie stays Henry's).
 inline bool figure_nearer(float dHenry, float dFigure) { return dFigure + 0.01f < dHenry; }
 
+inline float nearest_player(float host, const float* guests, size_t count) {
+    float nearest = host;
+    for (size_t i = 0; i < count; ++i)
+        if (guests[i] < nearest) nearest = guests[i];
+    return nearest;
+}
+
 // ---- B9 follow-up (mp_copy_no_idle_turn): a standing copy never turns in place on its own ----
 // The animated character's desired motion parameters (EntityModule, its vt +0x168): { float value[6]; uint8 id[6]; uint8 count; } --
 // 0x20 bytes. The index of parameter `id` in that block, false when the block holds none (or reads malformed).
