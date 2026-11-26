@@ -111,14 +111,16 @@ def solo_save(cid):
 def loopback_supported(executable):
     """The supported bench build handles both listeners, including via an apphost DLL."""
     needles = tuple(value.encode('utf-16-le') for value in (
-        'Tcp:LoopbackOnly', 'TCP listener bound to {Address}:{Port}.', 'HTTP loopback ready on {Url}.'))
+        'Tcp:LoopbackOnly', 'HTTP loopback ready on {Url}.'))
+    tcp = tuple(value.encode('utf-16-le') for value in (
+        'TCP listener bound port={Port} loopback={Loopback}', 'TCP listener bound to {Address}:{Port}.'))
     companion = os.path.splitext(executable)[0] + '.dll'
-    def includes(path, markers):
+    def includes(path, markers, either=()):
         if not os.path.isfile(path) or not os.path.getsize(path): return False
         with open(path, 'rb') as stream, mmap(stream.fileno(), 0, access=ACCESS_READ) as data:
-            return all(data.find(marker) >= 0 for marker in markers)
-    return includes(executable, needles) or (includes(executable, (os.path.basename(companion).encode('ascii') + b'\0',))
-        and includes(companion, needles))
+            return all(data.find(marker) >= 0 for marker in markers) and (not either or any(data.find(marker) >= 0 for marker in either))
+    return includes(executable, needles, tcp) or (includes(executable, (os.path.basename(companion).encode('ascii') + b'\0',))
+        and includes(companion, needles, tcp))
 
 
 def solo_check():
@@ -400,12 +402,14 @@ def relay(plan_file=None, *, profile=None, loopback=False):
     rig.say('relay pid', rec['pid'], 'port', RELAY_PORT, 'faults' if plan_file else '')
     if loopback:
         until = time.monotonic() + 15
+        tcp_ready = (f'TCP listener bound port={RELAY_PORT} loopback=1'.encode('ascii'),
+                     f'TCP listener bound to 127.0.0.1:{RELAY_PORT}.'.encode('ascii'))
+        http_ready = f'HTTP loopback ready on http://127.0.0.1:{RELAY_HTTP}.'.encode('ascii')
         while time.monotonic() < until and procs.matches(rec):
             with open(log, 'rb') as f:
                 f.seek(offset)
-                ready = f.read()
-                if (('TCP listener bound to 127.0.0.1:%d.' % RELAY_PORT).encode('ascii') in ready and
-                    ('HTTP loopback ready on http://127.0.0.1:%d.' % RELAY_HTTP).encode('ascii') in ready):
+                lines = f.read().splitlines()
+                if any(line.endswith(tcp_ready) for line in lines) and any(line.endswith(http_ready) for line in lines):
                     if not procs.matches(rec): break
                     rec['loopback_ready'] = True
                     record_start(st, 'relay', rec)

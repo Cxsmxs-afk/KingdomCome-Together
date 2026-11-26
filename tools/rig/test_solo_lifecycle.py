@@ -110,7 +110,7 @@ class SoloLifecycleTests(unittest.TestCase):
         started = []
         def start(argv, cwd, env, role, log_path=None):
             started.extend(argv)
-            Path(log_path).write_text(f'TCP listener bound to 127.0.0.1:{pair.RELAY_PORT}.\n'
+            Path(log_path).write_text(f'TCP listener bound port={pair.RELAY_PORT} loopback=1\n'
                 f'HTTP loopback ready on http://127.0.0.1:{pair.RELAY_HTTP}.\n', encoding='utf-8')
             return {'pid': 79}
         with patch.object(pair, 'loopback_supported', return_value=True), \
@@ -145,9 +145,10 @@ class SoloLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'does not support'):
                 pair.relay(loopback=True)
             start.assert_not_called()
-        dll.write_bytes('|'.join(('Tcp:LoopbackOnly', 'TCP listener bound to {Address}:{Port}.',
-            'HTTP loopback ready on {Url}.')).encode('utf-16-le'))
-        self.assertTrue(pair.loopback_supported(str(executable)))
+        for tcp in ('TCP listener bound to {Address}:{Port}.', 'TCP listener bound port={Port} loopback={Loopback}'):
+            with self.subTest(tcp=tcp):
+                dll.write_bytes('|'.join(('Tcp:LoopbackOnly', tcp, 'HTTP loopback ready on {Url}.')).encode('utf-16-le'))
+                self.assertTrue(pair.loopback_supported(str(executable)))
 
 
 if __name__ == '__main__':
