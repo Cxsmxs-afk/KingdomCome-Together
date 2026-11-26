@@ -28,6 +28,9 @@ int wo187_tests(int* passed) {
         WCHECK(!pin_due(1, false, true) && pin_due(2, false, true) && !pin_due(3, true, true) && !pin_due(5, false, false),
                "pinned after two overwrites, once, and only with mp_opp_pin");
         WCHECK(std::string_view(windup_name(WindupOpp::Overwritten)) == "overwritten", "the log word");
+        WCHECK(!mirror_target_matches(true, 7, 7, 8) && !mirror_target_matches(true, 7, 7, 0) &&
+               mirror_target_matches(true, 7, 7, 7) && mirror_target_matches(false, 7, 7, 8),
+               "an accepted request for the host's target is pending until the active opponent matches");
     }
     // ---- C2: the guard hold and the figure's linger
     {

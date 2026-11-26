@@ -23,6 +23,8 @@
 #include "wo178.h"
 #include "wo210.h"
 #include "wo210_rules.h"
+#include "wo221.h"
+#include "load_sequence.h"
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
@@ -154,6 +156,9 @@ uint8_t op_opp_read(const uint8_t* body, size_t len, uint8_t* out, size_t cap, s
 struct MirrorCopy {
     uint8_t kind = kHereNone; uint32_t target = 0; double at = 0, applyAt = -1e9, changedAt = 0;
     bool followed = true;   // the copy took the newest want (the follow time measured once per change)
+    uint64_t load = 0;
+    void* entity = nullptr;
+    void* targetEntity = nullptr;
 };
 std::unordered_map<uint32_t, MirrorCopy> g_mirror;   // main thread
 std::atomic<uint32_t> c_in{0}, c_bad{0}, c_samples{0}, c_match{0}, c_engaged{0}, c_engageRefused{0}, c_cleared{0}, c_follows{0};
@@ -166,14 +171,19 @@ uint8_t op_opp_in(const uint8_t* body, size_t len, uint8_t* out, size_t cap, siz
     const int n = body[1];
     if (len != 2 + static_cast<size_t>(n) * 9) { c_bad.fetch_add(1); return wo163::kRBadRequest; }
     const double now = qpc_s();
+    const auto load = loadsequence::stamp();
     for (int i = 0; i < n; ++i) {
         const uint8_t* p = body + 2 + i * 9;
         uint32_t copy = 0, target = 0;
         std::memcpy(&copy, p, 4); std::memcpy(&target, p + 5, 4);
         const uint8_t kind = p[4] <= kHereEntity ? p[4] : kHereNone;
         if (!copy) continue;
+        void* entity = engine::entity_by_id(copy);
+        if (!entity) continue;
+        void* targetEntity = kind == kHereEntity ? engine::entity_by_id(target) : nullptr;
         MirrorCopy& m = g_mirror[copy];
-        if (m.kind != kind || m.target != target || m.at == 0) {
+        if (m.kind != kind || m.target != target || m.at == 0 || m.load != load ||
+            m.entity != entity || m.targetEntity != targetEntity) {
             if (m.at != 0) {
                 const uint32_t k = c_inChanges.fetch_add(1) + 1;   // changes only (d8: a count of every sample went quiet in minutes)
                 if (k <= 2000 || k % 200 == 0)
@@ -181,6 +191,9 @@ uint8_t op_opp_in(const uint8_t* body, size_t len, uint8_t* out, size_t cap, siz
                          kind == kHerePlayer ? "the-local-player" : kind == kHereEntity ? who(target).c_str() : "nobody");
             }
             m.kind = kind; m.target = target; m.changedAt = now; m.followed = false; m.applyAt = -1e9;   // applied this frame
+            m.load = load;
+            m.entity = entity;
+            m.targetEntity = targetEntity;
         }
         m.at = now;
         c_in.fetch_add(1);
@@ -220,16 +233,22 @@ void mirror_tick(double now) {
         return;
     }
     g_mirrorWasOn = true;
+    const bool strict = wo221::on(wo221::kBitNpcTargetOwner);
+    const auto load = loadsequence::stamp();
     for (auto it = g_mirror.begin(); it != g_mirror.end();) {
         const uint32_t copy = it->first;
         MirrorCopy& m = it->second;
-        if (now - m.at > kMirrorStaleS || !engine::entity_by_id(copy)) {
+        void* entity = engine::entity_by_id(copy);
+        const bool due = now - m.applyAt >= kMirrorTickS;
+        if (now - m.at > kMirrorStaleS || !entity ||
+            (strict && (m.load != load || m.entity != entity ||
+                (due && m.kind == kHereEntity && (!m.targetEntity || m.targetEntity != engine::entity_by_id(m.target)))))) {
             wo187::mirror_wish(copy, 0, 0, nullptr);
             c_cleared.fetch_add(1);
             it = g_mirror.erase(it);
             continue;
         }
-        if (now - m.applyAt < kMirrorTickS) { ++it; continue; }
+        if (!due) { ++it; continue; }
         m.applyAt = now;
         const Mirror step = mirror_step(m.kind, wo132::engaged(copy));
         if (step == Mirror::EngageWish) {
@@ -245,7 +264,11 @@ void mirror_tick(double now) {
         if (step == Mirror::Clear) wo187::mirror_wish(copy, 0, 0, nullptr);
         if (match && !m.followed) {
             m.followed = true;
-            c_follows.fetch_add(1);
+            const auto follows = c_follows.fetch_add(1) + 1;
+            if (strict && (follows <= 32 || follows % 64 == 0)) {
+                deferred_log::Scope defer;
+                logf("MP-FIX TGT owner=host npc=%s active=0x%X kind=%u", name_of(copy), have, static_cast<unsigned>(m.kind));
+            }
             if (g_followMs.size() >= 512) g_followMs.erase(g_followMs.begin());
             g_followMs.push_back(static_cast<float>((now - m.changedAt) * 1000.0));
         }
@@ -351,16 +374,22 @@ bool bearing(void* pe, uint32_t eid, float* deg, float* m) {
 void ai_window_tick(double now) {
     void* pe = engine::entity_by_id(kPlayerEntity);
     const uint32_t me = pe ? engine::entity_id(pe) : 0;
+    const bool shared = wo221::on(wo221::kBitAttackWindowSnapshot);
     motion::ModelRead pm{};
-    const bool dodging = me && motion::read_model(me, &pm) && (pm.valid & motion::kMvState) && (pm.state & wo208rules::kPlayerStateDodge) != 0;
+    const bool known = me && motion::read_model(me, &pm);
+    const bool dodging = known && (pm.valid & motion::kMvState) && (pm.state & wo208rules::kPlayerStateDodge) != 0;
+    unsigned reused = 0;
     for (auto it = g_aiWindows.begin(); it != g_aiWindows.end();) {
         AiWindow& w = *it;
         if (w.end == 0) {
             if (dodging) w.dodged = true;
             if (!w.midDone && now - w.begin >= kLockSampleS) {   // lock-on: is the swinging copy the local player's own opponent now?
                 w.midDone = true;
-                motion::ModelRead pm2{};
-                const uint32_t po = me && motion::read_model(me, &pm2) ? pm2.opponentEid : 0;
+                const uint32_t po = window_player_opponent(shared, known, pm.opponentEid, [&] {
+                    motion::ModelRead pm2{};
+                    return me && motion::read_model(me, &pm2) ? pm2.opponentEid : 0u;
+                });
+                if (shared && me) ++reused;
                 c_lockSamples.fetch_add(1);
                 if (po == w.eid) c_lockOn.fetch_add(1);
                 const uint32_t k = c_lockSamples.load();
@@ -391,6 +420,16 @@ void ai_window_tick(double now) {
                      w.dodged ? " (his dodge seen)" : "", wo208rules::def_outcome_name(o));
         }
         it = g_aiWindows.erase(it);
+    }
+    if (reused) {
+        static uint64_t total = 0;
+        const auto before = total;
+        total += reused;
+        if (before == 0 || before / 64 != total / 64) {
+            deferred_log::Scope defer;
+            logf("MP-FIX PERF task=wo209-attack-window model_reads_saved=%llu",
+                 static_cast<unsigned long long>(total));
+        }
     }
 }
 
@@ -438,10 +477,17 @@ bool on(uint32_t bit) { return (g_bits.load(std::memory_order_relaxed) & ~twin_o
 
 bool fix_on(uint32_t fixBit) { return (twin_off() & fixBit) == 0; }
 
+bool host_target_owner(uint32_t copy) {
+    return wo221::on(wo221::kBitNpcTargetOwner) && on(kBitOppMirror) && wo221::role() == 2 &&
+        !motion::is_avatar_eid(copy) && npcdrive::is_bound_eid(copy);
+}
+
 bool mirror_holds_player(uint32_t copy) {
     if (!on(kBitOppMirror)) return false;
     auto it = g_mirror.find(copy);
-    return it != g_mirror.end() && it->second.kind == kHerePlayer && qpc_s() - it->second.at <= kMirrorStaleS;
+    return it != g_mirror.end() && it->second.kind == kHerePlayer && qpc_s() - it->second.at <= kMirrorStaleS &&
+        (!wo221::on(wo221::kBitNpcTargetOwner) || (it->second.load == loadsequence::stamp() &&
+                                                it->second.entity == engine::entity_by_id(copy)));
 }
 
 bool host_fights(uint32_t eid) {
@@ -452,7 +498,9 @@ bool host_fights(uint32_t eid) {
 bool mirrored(uint32_t copy) {
     if (!on(kBitOppMirror)) return false;
     auto it = g_mirror.find(copy);
-    return it != g_mirror.end() && qpc_s() - it->second.at <= kMirrorStaleS;
+    return it != g_mirror.end() && qpc_s() - it->second.at <= kMirrorStaleS &&
+        (!wo221::on(wo221::kBitNpcTargetOwner) || (it->second.load == loadsequence::stamp() &&
+                                                it->second.entity == engine::entity_by_id(copy)));
 }
 
 namespace {

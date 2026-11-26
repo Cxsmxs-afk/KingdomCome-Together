@@ -94,10 +94,11 @@ public static class Wo209Rules
     /// The joiner: the host's wire body as the DLL's op 137 ([n] per copy [copyEid:4][kind:1][targetEid:4]), in this world's entities:
     /// the host's own player is the host's figure here (hostGhost's), the joiner's own figure there is the local player here, another
     /// peer's figure is that figure here, another NPC is its copy here. A body with no copy here, or an opponent this world cannot name,
-    /// is left out (unknown counts them). False when malformed.
+    /// is left out (unknown counts them). With the host owner, an unbound opponent clears a bound copy's old wish immediately.
+    /// False when malformed.
     /// </summary>
     public static bool TryJoinerOp(ReadOnlySpan<byte> wire, byte myGhost, byte hostGhost, Func<string, uint> copyOf, Func<byte, uint> figureOf,
-                                   out byte[] op, out int known, out int unknown)
+                                   out byte[] op, out int known, out int unknown, bool retireUnbound = false)
     {
         op = []; known = 0; unknown = 0;
         if (wire.Length < 1) return false;
@@ -127,8 +128,12 @@ public static class Wo209Rules
                 case HostFigure: target = figureOf(ghost); here = target != 0 ? HereEntity : HereNone; break;
                 case HostNpc: target = opp.Length > 0 ? copyOf(opp) : 0; here = target != 0 ? HereEntity : HereNone; break;
             }
-            // an opponent this world cannot name: nothing is told for this copy (its last word stands until it goes stale)
-            if (copy == 0 || (kind != HostNone && here == HereNone) || known >= 255) { unknown++; continue; }
+            if (copy == 0 || known >= 255) { unknown++; continue; }
+            if (kind != HostNone && here == HereNone)
+            {
+                unknown++;
+                if (!retireUnbound) continue;
+            }
             BinaryPrimitives.WriteUInt32LittleEndian(rec, copy);
             rec[4] = here;
             BinaryPrimitives.WriteUInt32LittleEndian(rec[5..], target);

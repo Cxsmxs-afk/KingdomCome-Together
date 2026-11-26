@@ -97,8 +97,8 @@ public sealed class ClientSessionRunner
 			// with this client needs telling, or it waits forever.
 			_sessions.HandleDisconnect(client);
 
-			_logger.Information("[-] {ClientName} disconnected ({Transport}). Clients: {ClientHandlerClientCount}",
-				client.Name ?? "(not ready)", client.Transport, _clientHandler.ClientCount);
+			_logger.Information("[-] {Peer:l} disconnected transport={Transport:l} clients={ClientHandlerClientCount}",
+				client.DiagnosticPeer, client.Transport, _clientHandler.ClientCount);
 			client.AnnounceDisconnect();
 
 			// Role notices follow the disconnect and reflect the same

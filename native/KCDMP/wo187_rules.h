@@ -29,6 +29,10 @@ constexpr int kPinAfterOverwrites = 2;
 inline bool opp_wish_live(double now, double refreshedAt) { return refreshedAt > 0 && now - refreshedAt < kOppStaleS; }
 inline bool pin_due(int overwrites, bool pinned, bool pinOn) { return pinOn && !pinned && overwrites >= kPinAfterOverwrites; }
 
+inline bool mirror_target_matches(bool strict, uint32_t expected, uint32_t requested, uint32_t active) {
+    return expected && expected == (strict ? active : requested);
+}
+
 // A wind-up's verdict on the copy's opponent: no wish (nothing to check), held (still the wished one), overwritten (something else
 // wrote it since: the skirmish picker, the opponent manager's own requested target) -- the caller writes it back.
 enum class WindupOpp : uint8_t { NoWish = 0, Held = 1, Overwritten = 2 };

@@ -103,5 +103,21 @@ int h6_combat_action_tests(int* passed) {
     check(submit([&] { return ticket; }, [](const QueueTicket&) { return true; },
           [&] { ++calls; return false; }, identity) == QueueResult::Uncertain && calls == 2,
           "an engine fault retains uncertain ownership and never retries");
+
+    // The caller, offered smart pointer and ledger start with one reference each.
+    const auto remaining = [](QueueResult result, bool protect, bool proved, bool controllerRetains) {
+        int refs = 3;
+        if (result == QueueResult::Refused) --refs; // ledger undoes the reservation
+        if (result == QueueResult::Submitted) refs += controllerRetains ? 0 : -1; // manager consumes the offer
+        refs -= static_cast<int>(kcdmp::combatactions::detail::caller_releases(result, protect, proved));
+        return refs;
+    };
+    check(remaining(QueueResult::Submitted, true, true, true) == 3 &&
+          remaining(QueueResult::Submitted, true, true, false) == 2 &&
+          remaining(QueueResult::Refused, true, false, false) == 0 &&
+          remaining(QueueResult::Uncertain, true, true, false) == 3 &&
+          remaining(QueueResult::Uncertain, false, true, false) == 2 &&
+          remaining(QueueResult::Uncertain, false, false, false) == 3,
+          "submitted preserves the caller and ledger references; the twin releases an uncertain caller only with proof");
     return failed;
 }

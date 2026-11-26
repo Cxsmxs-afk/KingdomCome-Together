@@ -25,9 +25,11 @@ public sealed record WorkspaceEntry(string Rel, string GamePath, string ModdingT
 
 public sealed record WorkspaceReport(string GameRoot, string ModdingToolsRoot, IReadOnlyList<WorkspaceEntry> Entries)
 {
+    private static readonly string FacialPrefix = Path.Combine("Data", "Facials") + Path.DirectorySeparatorChar;
     public bool Complete => Entries.Count > 0 && Entries.All(e => e.Ok);
     public int OkCount => Entries.Count(e => e.Ok);
     public IEnumerable<WorkspaceEntry> NeedingWork => Entries.Where(e => !e.Ok);
+    public bool HasRetailFacials => Entries.Any(e => e.GameLength > 0 && e.Rel.StartsWith(FacialPrefix, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>"91 hard links" / "86 copies, 5 symlinks" -- for the checklist line and the log.</summary>
     public string KindSummary()

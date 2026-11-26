@@ -65,7 +65,7 @@ public class TcpSocketService : BackgroundService
 		}
 		var endpoint = (IPEndPoint)listener.LocalEndpoint;
 		_boundEndpoint.TrySetResult(endpoint);
-		_logger.Information("TCP listener bound to {Address}:{Port}.", endpoint.Address, endpoint.Port);
+		_logger.Information("TCP listener bound port={Port} loopback={Loopback}", endpoint.Port, IPAddress.IsLoopback(endpoint.Address) ? 1 : 0);
 		_logger.Information("Listening on port {Port}...", endpoint.Port);
 		_logger.Information("Waiting for clients to connect.");
 

@@ -78,6 +78,14 @@ public sealed class FakeSteam : IDisposable
 
     public enum Linking { HardLinks, Copies }
 
+    public FakeSteam WithRetailFacials()
+    {
+        string folder = Path.Combine(GameRoot, "Data", "Facials");
+        Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, "dialogue.fsq"), "retail facial sequence fixture");
+        return this;
+    }
+
     public FakeSteam Linked(Linking how = Linking.HardLinks)
     {
         foreach (var rel in Workspace.ExpectedFiles(GameRoot))

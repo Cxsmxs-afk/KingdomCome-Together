@@ -69,8 +69,7 @@ namespace KCDMP_launcher.Pages
                     }
                     else if (SetupChecklist.OptionalNeedsYou(setupSteps))
                     {
-                        // WO-157: ready, but an optional step (the Visual C++ 2013 runtime) asks for the player:
-                        // shown once at start; Host and Join are not held back by it.
+                        // An optional setup warning is shown once at start.
                         Log.Information("setup: ready; an optional step needs the player, showing the checklist once");
                         showSetup = true;
                     }
@@ -105,8 +104,10 @@ namespace KCDMP_launcher.Pages
                 string key = $"{s.Status}|{s.Action}|{(s.Progress is double p ? ((int)(p * 10)).ToString() : "")}";
                 if (setupLogged.TryGetValue(s.Id, out var last) && last == key) continue;
                 setupLogged[s.Id] = key;
+                if (s.Id == StepId.FacialAssets) Log.Warning("MP-FIX FACE source=missing-or-empty ui=warning");
                 Log.Information("setup: step {Step} {Title}: {Status} -- {Detail}", (int)s.Id, s.Title, s.Status, Redact.Text(s.Detail));
             }
+            if (!setupSteps.Any(s => s.Id == StepId.FacialAssets)) setupLogged.Remove(StepId.FacialAssets);
         }
 
         private void StartSetupPoll()

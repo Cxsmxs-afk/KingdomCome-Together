@@ -504,8 +504,8 @@ public class ClientHandler
 		if (!HostAbsentRules.SameReturn(left, client.IdentityKey, client.Name ?? "", client.AnnouncedWorldEpoch, client.AnnouncedRunId))
 		{
 			if (client.AnnouncedWorldEpoch != 0 || client.AnnouncedRunId != Guid.Empty)
-				_logger.Information("MP-HOST-ABSENT resume=refused name={Name} epoch={Epoch} run={Run}",
-					client.Name ?? "-", client.AnnouncedWorldEpoch, client.AnnouncedRunId);
+				_logger.Information("MP-HOST-ABSENT resume=refused {Peer:l} epoch={Epoch} run={Run}",
+					client.DiagnosticPeer, client.AnnouncedWorldEpoch, client.AnnouncedRunId);
 			return false;
 		}
 		_sessionHost = client;
@@ -601,8 +601,8 @@ public class ClientHandler
 			int ready = _readyClients.Count;
 			bool changed = a?.Id != _lastAuthorityId;
 			_lastAuthorityId = a?.Id;
-			_logger.Information("MP-AUTHORITY-OWNER id={Id} name={Name} reason={Reason} trigger={Trigger} ready={Ready} changed={Changed}",
-				a is null ? "-" : a.Id.ToString(), a?.Name ?? "-", reason, trigger, ready, changed ? 1 : 0);
+			_logger.Information("MP-AUTHORITY-OWNER {Peer:l} reason={Reason:l} trigger={Trigger:l} ready={Ready} changed={Changed}",
+				a?.DiagnosticPeer ?? "session=- name=<redacted> id=- loopback=0", reason, trigger, ready, changed ? 1 : 0);
 		}
 	}
 

@@ -153,8 +153,9 @@ public partial class GameBridge
         if (!Wo187Rules.Near(dHost)) return false;   // a far copy: no wish, no guard hold (each is a main-thread pipe call)
         // the host: the sender of this npc-combat event (only the host speaks for its NPCs), else what the leash / host mode named
         byte hostGhost = fromGhost != 0xFF ? fromGhost : _leashHostId != 0xFF ? _leashHostId : _hostModeFrom;
-        // A2: the opponent
-        if (_w187OppLogical && Wo187Rules.OppWish(ev, _myGhostId, hostGhost) is { } w)
+        // The host opponent stream owns this target with the single-owner switch.
+        if (_w187OppLogical && !(W221On("npc_target_owner") && W209Eff("copy_opponent_mirror", 1u)) &&
+            Wo187Rules.OppWish(ev, _myGhostId, hostGhost) is { } w)
         {
             uint target = 0;
             bool ok = w.Kind == Wo187Rules.OppLocalPlayer || _ghostEntityIds.TryGetValue(w.Ghost.ToString(CultureInfo.InvariantCulture), out target);

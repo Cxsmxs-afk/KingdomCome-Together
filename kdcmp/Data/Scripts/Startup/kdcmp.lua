@@ -32179,7 +32179,7 @@ System.AddCCommand("mp_station_release", 'KCD2MP_W192SetStation(%line)', "WO-192
 -- in the engine with "Skip part / Skip all") play for both players: each machine's own quest copy, started together, one skip for both, the
 -- end positioning never stalling on the host's copies. The switches (all default ON):
 --   mp_scene_ingame_shared on|off       (both) the scene goes on the scene bus; the partner's own quest starts its copy when it is at that step
---   mp_scene_ingame_hold on|off         (joiner) your own trigger firing first waits at most 3 s for the host's copy
+--   mp_scene_ingame_hold on|off         (joiner) your own trigger firing first waits at most 1.8 s for the host's copy
 --   mp_scene_ingame_ffstop on|off       (joiner) at a scene's end the host's copies' fast-forward is stopped so your game positions at once
 --   mp_scene_ingame_time_host on|off    (joiner) a scene's own time of day comes from the host's clock, not a second jump here
 --   mp_scene_ingame_nudge on|off        (joiner) after a shared scene you are moved about 1 m off the spot both Henrys were placed on
@@ -37485,6 +37485,8 @@ do
         corpse_look = "mp_corpse_look", horse_drop = "mp_horse_drop", saddlebags = "mp_saddlebags", route_quiet = "mp_route_quiet", cart_seat = "mp_cart_seat", cart_wheels = "mp_cart_wheels",
         ragdoll_once = "mp_ragdoll_once", rp_controller = "mp_rp_controller", rp_combat = "mp_rp_combat", death_trace = "mp_death_trace",
         load_sequence = "mp_load_sequence", baseline_events = "mp_baseline_events", world_recovery = "mp_world_recovery",
+        queue_ref_release = "mp_queue_ref_release", escort_nearest_all = "mp_escort_nearest_all", npc_target_owner = "mp_npc_target_owner",
+        attack_window_snapshot = "mp_attack_window_snapshot",
     }
     W221.HELP = {
         combat_action_end = "A: (both) no combat animation of ours outlives its body's combat part (the joiner's fight crash)",
@@ -37504,6 +37506,10 @@ do
         rp_controller = "Move the partner's figure through the game's movement request when the body supports it",
         rp_combat = "Play the partner's timed combat through native requests",
         death_trace = "Record bounded native combat retirement details for crash reports",
+        queue_ref_release = "Keep an uncertain action's caller reference until its confirmed finish",
+        escort_nearest_all = "Use all bound partners for the host's distance triggers",
+        npc_target_owner = "Use the host's opponent stream as the sole target writer for NPC copies",
+        attack_window_snapshot = "Share the player's combat observation across this frame's attack windows",
         load_sequence = "Apply the world only for its current load generation",
         baseline_events = "Install the world baseline and confirm each ordered event",
         world_recovery = "Check the world by area and repair that area or reconnect",

@@ -38,14 +38,14 @@ public static class W221Switch
     /// part), talk_hold (B: a copy woken for a talk has its own schedule held), drive (C: a walking human copy is moved by the engine's
     /// per-frame movement request), holders (C.3: one table of who holds a body), own_horse (D: each player's own horse -- the record,
     /// the quest gate's horse rule, the call, the saddlebags).</summary>
-    public static readonly string[] NativeNames = ["combat_action_end", "talk_hold", "drive", "holders", "own_horse", "corpse_look", "rp_controller", "rp_combat", "death_trace"];
+    public static readonly string[] NativeNames = ["combat_action_end", "talk_hold", "drive", "holders", "own_horse", "corpse_look", "rp_controller", "rp_combat", "death_trace", "queue_ref_release", "npc_target_owner", "attack_window_snapshot"];
 
     /// <summary>The agent's and the mod's own switches (the agent tells the mod): shop_keeper (B: a copy of a shopkeeper keeps the host
     /// keeper's shop -- the host says which, the joiner's DLL opens it with the copy by the shop's own call), talk_force (B: the
     /// mod's own: a talk the copy never takes is started the game's forced way), ragdoll_once (A: a fresh corpse is laid down by one
     /// ragdoll at a time, only after the game's own death action had its time -- the joiner's crashes came ~1 s after a ragdoll of a
     /// body 0.65 s dead).</summary>
-    public static readonly string[] AgentNames = ["shop_keeper", "talk_force", "horse_drop", "saddlebags", "route_quiet", "cart_seat", "cart_wheels", "ragdoll_once", "load_sequence", "baseline_events", "world_recovery"];
+    public static readonly string[] AgentNames = ["shop_keeper", "talk_force", "horse_drop", "saddlebags", "route_quiet", "cart_seat", "cart_wheels", "ragdoll_once", "load_sequence", "baseline_events", "world_recovery", "escort_nearest_all"];
 
     public static readonly string[] Names = [.. NativeNames, .. AgentNames];
 

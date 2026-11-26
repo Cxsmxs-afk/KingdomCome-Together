@@ -314,7 +314,7 @@ bool resolve_opp_set_target() {
 }
 
 // The copy's combat target is the local player's entity (set once by the engine's own call when it is not); false when it could not be.
-bool ensure_target_player(void* ca, void* model, bool* hadIt) {
+bool ensure_target_player(uint32_t copy, void* ca, void* model, bool* hadIt) {
     *hadIt = false;
     void* pEnt = engine::entity_by_id(0x7777);
     void* mgr = nullptr; void* back = nullptr; void* tgt = nullptr;
@@ -330,6 +330,7 @@ bool ensure_target_player(void* ca, void* model, bool* hadIt) {
         KCDMP_FAULT_CALL(tsite, "wo166::target_entity");
         if (fault::guarded(tsite, [&] { te = (*reinterpret_cast<void* (__fastcall***)(void*)>(tgt))[1](tgt); }) && te == pEnt) { *hadIt = true; return true; }
     }
+    if (wo209::host_target_owner(copy)) return false;   // read the active target above; the mirror owns any retarget
     // WO-187 A2 (mp_opp_logical): the engine's own SetLogicalTarget -- the requested target as well, so the opponent manager's update keeps it
     if (wo187::opp_logical_on()) return wo187::ensure_target(ca, model, pEnt, hadIt);
     if (!resolve_opp_set_target()) return false;
@@ -784,7 +785,7 @@ void tick() {
                     s.engineReach = engine_reach(ca, model);   // in State 4 now: the reach's guard step stays out
                     s.canHit = !wo178rules::reach_miss(dist, wo178rules::copy_reach_limit(s.engineReach, s.hitDist), age);
                     bool hadTarget = false;
-                    s.targetSet = oppMe && wo208::target_player_ok(s.eid, "strike") && ensure_target_player(ca, model, &hadTarget);   // WO-208 F.1
+                    s.targetSet = oppMe && wo208::target_player_ok(s.eid, "strike") && ensure_target_player(s.eid, ca, model, &hadTarget);   // WO-208 F.1
                     (s.targetSet ? (hadTarget ? c_targetHad : c_targetSet) : c_targetFailed).fetch_add(1);
                     if (!s.targetSet) s.canHitWrote = set_can_hit(model, s.canHit);   // no target: ours, re-written every frame
                     if (oppMe && s.countdown && plan_allowed(s.eid, s.name.c_str())) s.planned = plan_defender_slots(ca);   // the attack's own planning: the perfect-block window

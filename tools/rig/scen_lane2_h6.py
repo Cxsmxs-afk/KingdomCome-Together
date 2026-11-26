@@ -216,7 +216,8 @@ def check_pair(host, joiner, build, *, bugfix_soak=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', required=True, help='exact candidate Build-ID from MP-BUILD and the DLL')
-    parser.add_argument('--bugfix-soak', action='store_true', help='require 100 deaths per role, 15 s apart (±1 s)')
+    parser.add_argument('--bugfix-soak', action='store_true',
+                        help='optional timed soak: require 100 deaths per role, 15 s apart (±1 s)')
     names = ('a-host', 'b-joiner', 'b-host', 'a-joiner')
     for name in names:
         parser.add_argument(f'--{name}', nargs=3, required=True, type=Path, metavar=('AGENT', 'NATIVE', 'GAME'))

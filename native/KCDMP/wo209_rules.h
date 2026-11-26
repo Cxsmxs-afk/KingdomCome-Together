@@ -129,6 +129,12 @@ inline bool ai_retry_due(double now, double refusedAt) { return now >= refusedAt
 // word a stream tick later) waits for it, kAiRetryS at most: the attack starts only if the mirror then has the copy on him and in his fight
 // (attack_ai_drives). d10: a fight's first row came before the copy was in his fight at all, and the owner's state started it 0.8 s late.
 inline bool row_waits_for_mirror(bool mirrorHolds, bool engaged) { return !(mirrorHolds && engaged); }
+
+template <class Resample>
+uint32_t window_player_opponent(bool share, bool known, uint32_t first, Resample resample) {
+    if (share) return known ? first : 0;
+    return resample();
+}
 // The attack an AI call queued appears in the director's scope 0 within this, or the window ends (the engine never ran it).
 constexpr double kAiAdoptS = 0.25;
 // The row path (WO-167's spec "Fragment, tag+tag..."): its fragment's id by name (the same attack fragments), 0 = not an attack.
