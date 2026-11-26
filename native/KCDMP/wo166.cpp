@@ -6,6 +6,7 @@
 #include "wo208.h"
 #include "wo208_rules.h"
 #include "wo209.h"
+#include "wo209_rules.h"
 #include "wo163.h"
 #include "wo166_rules.h"
 #include "wo172.h"
@@ -330,7 +331,7 @@ bool ensure_target_player(uint32_t copy, void* ca, void* model, bool* hadIt) {
         KCDMP_FAULT_CALL(tsite, "wo166::target_entity");
         if (fault::guarded(tsite, [&] { te = (*reinterpret_cast<void* (__fastcall***)(void*)>(tgt))[1](tgt); }) && te == pEnt) { *hadIt = true; return true; }
     }
-    if (wo209::host_target_owner(copy)) return false;   // read the active target above; the mirror owns any retarget
+    if (!wo209rules::legacy_target_may_write(wo209::target_writer(copy))) return false;
     // WO-187 A2 (mp_opp_logical): the engine's own SetLogicalTarget -- the requested target as well, so the opponent manager's update keeps it
     if (wo187::opp_logical_on()) return wo187::ensure_target(ca, model, pEnt, hadIt);
     if (!resolve_opp_set_target()) return false;

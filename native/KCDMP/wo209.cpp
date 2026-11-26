@@ -240,7 +240,7 @@ void mirror_tick(double now) {
         MirrorCopy& m = it->second;
         void* entity = engine::entity_by_id(copy);
         const bool due = now - m.applyAt >= kMirrorTickS;
-        if (now - m.at > kMirrorStaleS || !entity ||
+        if (now - m.at >= kMirrorStaleS || !entity ||
             (strict && (m.load != load || m.entity != entity ||
                 (due && m.kind == kHereEntity && (!m.targetEntity || m.targetEntity != engine::entity_by_id(m.target)))))) {
             wo187::mirror_wish(copy, 0, 0, nullptr);
@@ -491,8 +491,6 @@ TargetWriter target_writer(uint32_t copy) {
         (mirror.kind != kHereEntity || (mirror.targetEntity && mirror.targetEntity == engine::entity_by_id(mirror.target)));
     return wo209rules::target_writer(configured, true, age, current);
 }
-
-bool host_target_owner(uint32_t copy) { return target_writer(copy) == TargetWriter::Host; }
 
 bool mirror_holds_player(uint32_t copy) {
     if (!on(kBitOppMirror)) return false;

@@ -621,7 +621,7 @@ bool set_logical_target(void* ca, void* entity) {
 
 bool legacy_target(uint32_t copy, void* ca, void* model, void* entity) {
     if (!ca || !model || !entity) return false;
-    if (wo209::host_target_owner(copy)) return active_eid(model) == engine::entity_id(entity);
+    if (!wo209rules::legacy_target_may_write(wo209::target_writer(copy))) return active_eid(model) == engine::entity_id(entity);
     return set_logical_target(ca, entity);
 }
 
@@ -641,7 +641,7 @@ bool ensure_target(void* ca, void* model, void* entity, bool* hadIt) {
 uint8_t on_windup(uint32_t eid, const char* name, void* ca, void* model) {
     auto it = g_wishes.find(eid);
     const bool wish = it != g_wishes.end() && scope_current(eid, it->second) &&
-        (it->second.mirrored || !wo209::host_target_owner(eid)) &&
+        wo209rules::target_wish_owned(wo209::target_writer(eid), it->second.mirrored, it->second.fallback) &&
         opp_wish_live(now_s(), it->second.refreshedAt) && g_logical.load() && !wo195::dead_gate(eid, "wish");
     bool viaReq = false;
     const uint32_t cur = model ? current_eid(eid, model, &viaReq) : 0;
@@ -767,9 +767,7 @@ void tick() {
         }
         const auto owner = w.mirrored && !wo221::on(wo221::kBitTargetFallback) ? wo209rules::TargetWriter::Legacy : wo209::target_writer(it->first);
         if (!opp_wish_live(now, w.refreshedAt) || !engine::entity_by_id(it->first) ||
-            (!w.mirrored && owner == wo209rules::TargetWriter::Host) ||
-            (w.mirrored && owner == wo209rules::TargetWriter::Fallback) ||
-            (w.fallback && (owner != wo209rules::TargetWriter::Fallback || !scope_current(it->first, w)))) {
+            !wo209rules::target_wish_owned(owner, w.mirrored, w.fallback) || (w.fallback && !scope_current(it->first, w))) {
             unpin(it->first, w, "the wish ended");
             c_dropped.fetch_add(1);
             if (c_dropped.load() <= kLogFirst) logf("WO187-OPP npc=%s wish dropped (no word from the agent for %.0f s)", name_of(it->first), kOppStaleS);

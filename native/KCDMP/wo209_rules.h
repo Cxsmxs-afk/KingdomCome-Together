@@ -91,6 +91,13 @@ inline TargetWriter target_writer(bool configured, bool fallback, double age, bo
     if (!fallback || (currentScope && age >= 0 && age < kMirrorStaleS)) return TargetWriter::Host;
     return TargetWriter::Fallback;
 }
+
+inline bool legacy_target_may_write(TargetWriter writer) { return writer == TargetWriter::Legacy; }
+
+inline bool target_wish_owned(TargetWriter writer, bool mirrored, bool fallback) {
+    if (mirrored) return writer != TargetWriter::Fallback;
+    return writer == (fallback ? TargetWriter::Fallback : TargetWriter::Legacy);
+}
 // The mirror re-applies (and samples) each copy this often: one stream tick.
 constexpr double kMirrorTickS = 0.1;
 // The mirror engages a copy in the local player's fight up to this far from him (the host's NPC fights his figure there; the copy may

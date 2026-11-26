@@ -57,7 +57,7 @@ NightCoop trennt die Sitzung vom tatsächlichen Laden der Welt. Seamless Co-op b
 | `MP-FIX SHOP` | [TEST-2PC-FEATURES.md:17](TEST-2PC-FEATURES.md#L17) | [kdcmp.lua:37652](../kdcmp/Data/Scripts/Startup/kdcmp.lua#L37652), [kdcmp.lua:37680](../kdcmp/Data/Scripts/Startup/kdcmp.lua#L37680) |
 | `MP-FIX TACK` | [TEST-2PC-FEATURES.md:20](TEST-2PC-FEATURES.md#L20) | [kdcmp.lua:37723](../kdcmp/Data/Scripts/Startup/kdcmp.lua#L37723) |
 | `MP-FIX TALK` | [KNOWN-ISSUES.md:83](KNOWN-ISSUES.md#L83) | [kdcmp.lua:37989](../kdcmp/Data/Scripts/Startup/kdcmp.lua#L37989) |
-| `MP-FIX TGT` | [TEST-2PC-FEATURES.md:23](TEST-2PC-FEATURES.md#L23) | [wo209.cpp:270](../native/KCDMP/wo209.cpp#L270), [wo187.cpp:839](../native/KCDMP/wo187.cpp#L839), [wo187.cpp:665](../native/KCDMP/wo187.cpp#L665) |
+| `MP-FIX TGT` | [TEST-2PC-FEATURES.md:23](TEST-2PC-FEATURES.md#L23) | [wo209.cpp:270](../native/KCDMP/wo209.cpp#L270), [wo187.cpp:837](../native/KCDMP/wo187.cpp#L837), [wo187.cpp:665](../native/KCDMP/wo187.cpp#L665) |
 | `mp_allow_fly` | [KNOWN-ISSUES.md:109](KNOWN-ISSUES.md#L109) | [kdcmp.lua:36382](../kdcmp/Data/Scripts/Startup/kdcmp.lua#L36382) |
 | `mp_anim_clinch` | [TEST-2PC-FEATURES.md:24](TEST-2PC-FEATURES.md#L24) | [kdcmp.lua:31395](../kdcmp/Data/Scripts/Startup/kdcmp.lua#L31395) |
 | `mp_anim_paired` | [TEST-2PC-FEATURES.md:24](TEST-2PC-FEATURES.md#L24) | [kdcmp.lua:31394](../kdcmp/Data/Scripts/Startup/kdcmp.lua#L31394) |

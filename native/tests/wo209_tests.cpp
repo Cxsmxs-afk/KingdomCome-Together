@@ -72,12 +72,18 @@ int wo209_tests(int* passed) {
     WCHECK(wish_kind(kHerePlayer) == 1 && wish_kind(kHereEntity) == 2 && wish_kind(kHereNone) == 0, "the wo187 wish kinds");
     WCHECK(kMirrorTickS <= 0.1, "one stream tick");
     {
-        WCHECK(target_writer(true, true, 0.1, true) == TargetWriter::Host &&
-               target_writer(true, true, kMirrorStaleS, true) == TargetWriter::Fallback &&
+        const auto host = target_writer(true, true, 0.1, true);
+        const auto duringLoss = target_writer(true, true, kMirrorStaleS, true);
+        const auto legacy = target_writer(false, true, 0.1, true);
+        WCHECK(host == TargetWriter::Host && duringLoss == TargetWriter::Fallback &&
                target_writer(true, true, 0.1, false) == TargetWriter::Fallback &&
                target_writer(true, false, kMirrorStaleS, true) == TargetWriter::Host &&
-               target_writer(false, true, 0.1, true) == TargetWriter::Legacy,
-               "stream loss grants one fallback writer until a fresh sample of this body arrives");
+               legacy == TargetWriter::Legacy && !legacy_target_may_write(host) &&
+               !legacy_target_may_write(duringLoss) && legacy_target_may_write(legacy) &&
+               !target_wish_owned(duringLoss, false, false) && !target_wish_owned(duringLoss, true, false) &&
+               target_wish_owned(duringLoss, false, true) && !target_wish_owned(host, false, true) &&
+               target_wish_owned(host, true, false),
+               "stream loss grants only the fallback wish writer; direct legacy calls remain readers");
     }
 
     // ---- A.4's sample
