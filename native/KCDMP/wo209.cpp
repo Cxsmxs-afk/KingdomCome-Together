@@ -125,7 +125,7 @@ uint8_t op_opp_read(const uint8_t* body, size_t len, uint8_t* out, size_t cap, s
         if (nl == 0 || nl > 63) continue;
         motion::ModelRead m{};
         c_oppReads.fetch_add(1);
-        const uint32_t opp = motion::read_model(eid, &m) && m.hasModel ? m.opponentEid : 0;
+        const uint32_t opp = motion::observe_model(eid, &m) && m.hasModel ? m.opponentEid : 0;
         const uint8_t kind = host_kind(opp, me, opp != 0 && motion::is_avatar_eid(opp));
         HostOpp& h = g_hostOpp[eid];
         const bool changed = !h.told || h.kind != kind || h.opp != opp;
@@ -240,7 +240,7 @@ void mirror_tick(double now) {
         MirrorCopy& m = it->second;
         void* entity = engine::entity_by_id(copy);
         const bool due = now - m.applyAt >= kMirrorTickS;
-        if (now - m.at > kMirrorStaleS || !entity ||
+        if (now - m.at >= kMirrorStaleS || !entity ||
             (strict && (m.load != load || m.entity != entity ||
                 (due && m.kind == kHereEntity && (!m.targetEntity || m.targetEntity != engine::entity_by_id(m.target)))))) {
             wo187::mirror_wish(copy, 0, 0, nullptr);
@@ -477,9 +477,19 @@ bool on(uint32_t bit) { return (g_bits.load(std::memory_order_relaxed) & ~twin_o
 
 bool fix_on(uint32_t fixBit) { return (twin_off() & fixBit) == 0; }
 
-bool host_target_owner(uint32_t copy) {
-    return wo221::on(wo221::kBitNpcTargetOwner) && on(kBitOppMirror) && wo221::role() == 2 &&
+TargetWriter target_writer(uint32_t copy) {
+    const bool configured = wo221::on(wo221::kBitNpcTargetOwner) && on(kBitOppMirror) && wo221::role() == 2 &&
         !motion::is_avatar_eid(copy) && npcdrive::is_bound_eid(copy);
+    if (!configured) return TargetWriter::Legacy;
+    if (!wo221::on(wo221::kBitTargetFallback)) return TargetWriter::Host;
+    const auto it = g_mirror.find(copy);
+    if (it == g_mirror.end()) return TargetWriter::Fallback;
+    const auto& mirror = it->second;
+    const double age = qpc_s() - mirror.at;
+    const bool current = age >= 0 && age < kMirrorStaleS && mirror.load == loadsequence::stamp() &&
+        mirror.entity && mirror.entity == engine::entity_by_id(copy) &&
+        (mirror.kind != kHereEntity || (mirror.targetEntity && mirror.targetEntity == engine::entity_by_id(mirror.target)));
+    return wo209rules::target_writer(configured, true, age, current);
 }
 
 bool mirror_holds_player(uint32_t copy) {

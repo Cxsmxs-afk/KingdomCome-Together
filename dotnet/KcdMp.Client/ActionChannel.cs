@@ -29,7 +29,10 @@ namespace KcdMp.Client;
 /// </summary>
 public sealed class ActionOutbox
 {
+    private readonly object _gate = new();
     private readonly Dictionary<ActionKind, ushort> _seq = new();
+    private ActionGen _gen;
+    private long _sent;
 
     /// <summary>
     /// The sender's own validity counter. Incarnation moves when this player's
@@ -38,22 +41,22 @@ public sealed class ActionOutbox
     /// run starts at 1.0.0 and bumps the epoch on connect, so without it a
     /// relaunched sender looked like the old run replaying its first packets.
     /// </summary>
-    public ActionGen Gen { get; private set; }
+    public ActionGen Gen { get { lock (_gate) return _gen; } }
 
-    public ActionOutbox(byte? runId = null) => Gen = new(1, 0, runId ?? Wo191Rules.NewRunId());
+    public ActionOutbox(byte? runId = null) => _gen = new(1, 0, runId ?? Wo191Rules.NewRunId());
 
-    public long Sent { get; private set; }
+    public long Sent { get { lock (_gate) return _sent; } }
 
     /// <summary>A new body: anything still in flight for the old one is now invalid.</summary>
     public void BumpIncarnation()
     {
-        Gen = new ActionGen((ushort)(Gen.Incarnation + 1), Gen.Epoch, Gen.Revision);
+        lock (_gate) _gen = new ActionGen((ushort)(_gen.Incarnation + 1), _gen.Epoch, _gen.Revision);
     }
 
     /// <summary>A new relay connection: an event that survived the drop is invalid.</summary>
     public void BumpEpoch()
     {
-        Gen = new ActionGen(Gen.Incarnation, (byte)(Gen.Epoch + 1), Gen.Revision);
+        lock (_gate) _gen = new ActionGen(_gen.Incarnation, (byte)(_gen.Epoch + 1), _gen.Revision);
     }
 
     /// <summary>Builds one ActionUp packet. Payload may be empty.</summary>
@@ -63,10 +66,15 @@ public sealed class ActionOutbox
             throw new ArgumentOutOfRangeException(nameof(payload),
                 $"action payload {payload.Length} > {Protocol.ActionPayloadMaxLen}");
 
-        _seq.TryGetValue(kind, out ushort seq);
-        seq = unchecked((ushort)(seq + 1));
-        _seq[kind] = seq;
-        Sent++;
+        ushort seq;
+        uint generation;
+        lock (_gate)
+        {
+            seq = unchecked((ushort)(_seq.GetValueOrDefault(kind) + 1));
+            _seq[kind] = seq;
+            generation = _gen.Pack();
+            ++_sent;
+        }
 
         int payloadLen = Protocol.ActionUpHeaderLen + payload.Length;
         var packet = new byte[3 + payloadLen];
@@ -75,7 +83,7 @@ public sealed class ActionOutbox
         packet[3] = (byte)kind;
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(4), seq);
         packet[6] = (byte)phase;
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(7), Gen.Pack());
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(7), generation);
         packet[11] = (byte)payload.Length;
         payload.CopyTo(packet.AsSpan(12));
         return packet;

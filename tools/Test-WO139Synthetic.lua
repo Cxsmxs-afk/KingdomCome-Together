@@ -817,6 +817,26 @@ do
     KCD2MP_W139Session(false, false, false)
     local ev = emitted("w139_shop", mark)
     check("K: the session ends: every one cleared", ev[#ev] == "tzel_trader 0" and next(KCD2MP.w139.shops) == nil)
+    local savedShops = Shops
+    local soul = "12345678-1234-1234-1234-123456789abc"
+    Shops = { GetShopDBIdByKeeper = function(id) return id == k2.id and 42 or nil end }
+    k2.soul.GetId = function() return soul end
+    k2.inventory.GetInventoryTable = function() return { "fixture_stock", "fixture_stock" } end
+    ITEMS.fixture_stock = { class = "fixture_class", amount = 1 }
+    KCD2MP_W221Cfg("shop_definition=on")
+    local probe = #LOG
+    local found = KCD2MP_W221ShopProbe("tzel_trader")
+    KCD2MP_W221ShopProbe("absent_keeper")
+    KCD2MP_W221Cfg("shop_definition=off")
+    local twin = #LOG
+    KCD2MP_W221ShopProbe("tzel_trader")
+    check("K: the shop probe records observed keeper facts and names its unknowns; the twin emits the original line", found
+        and logCount("keeper_soul=" .. soul .. " faction=" .. ZEL .. " inventory_entries=2 inventory_classes=1", probe) == 1
+        and logCount("buy_categories=unobserved buy_filters=unobserved", probe) == 2
+        and logCount("keeper_soul=unobserved faction=unobserved inventory_entries=unobserved", probe) == 1
+        and logCount("MP-FIX SHOP npc=tzel_trader shop=42", twin) == 1
+        and logCount("buy_categories=", twin) == 0)
+    Shops = savedShops
     noErrs("K")
 end
 

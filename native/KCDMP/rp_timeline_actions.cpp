@@ -96,6 +96,7 @@ struct Body {
     rpcombat::Receipts typedRecent{};
     std::unordered_map<uint32_t, Row> rows{};
     uint64_t replayLoggedMs = 0;
+    uint64_t lastMeleeDispatchMs = 0;
     RangedHand rangedHand{};
 };
 struct Observation {
@@ -151,6 +152,14 @@ void settle(uint32_t eid, uint8_t peer, const Pending& action, Dispatch dispatch
             uint64_t poseHostMs = 0) {
     if (action.typed) --g_combat.actions_pending;
     report(eid, peer, action, result, poseHostMs, reason, dispatch);
+}
+
+void note_reaction(uint8_t peer, const Pending& action, bool applied) {
+#ifndef KCDMP_H15_SCHEDULER_TEST
+    deferred_log::Scope defer;
+#endif
+    logf("MP-FIX HIT kind=%u seq=%u applied=%u peer=%u%s", action.kind, action.sequence,
+         applied ? 1u : 0u, peer, applied ? "" : " reason=out-of-order");
 }
 
 bool wake(const Pending& action) {
@@ -275,6 +284,13 @@ void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, bool l
         settle(eid, body.peer, action, Dispatch::NotStarted, "refused", "runtime-gate");
         return;
     }
+    const bool row = rpcombat::uses_row(event.kind);
+    if (row && wo221::on(wo221::kBitReactionSync) && event.hostMs < body.lastMeleeDispatchMs) {
+        note_reaction(body.peer, action, false);
+        settle(eid, body.peer, action, Dispatch::NotStarted, "refused", "out-of-order-reaction");
+        return;
+    }
+    if (row) body.lastMeleeDispatchMs = (std::max)(body.lastMeleeDispatchMs, event.hostMs);
     const uint64_t token = ++g_nextToken;
     const uint64_t watchMs = event.kind == rpcombat::kKo ? kKoWatchMs : kWatchMs;
     // Providers may confirm synchronously. Publish the observation before any native call.
@@ -294,7 +310,6 @@ void dispatch_typed(uint32_t eid, Body& body, Pending action, bool timed, bool l
             refused = rttr::swing_result_name(result);
         }
     }
-    const bool row = rpcombat::uses_row(event.kind);
     if (watching) {
         if (g_observing.find(token) != g_observing.end()) {
             const char* reason = livePose ? "guarded-live-pose" : timed ? "timed" : row ? "guarded-current-target" : "missing-current-pose";
@@ -525,7 +540,16 @@ Receipt submit_combat(const uint8_t* bytes, size_t size, Scope received, uint64_
         body->typedRecent.remember(key, Blocked);
         return !refuse && !rpcombat::uses_row(event.kind) ? Unavailable : Blocked;
     }
-    body->pending.push_back(std::move(action));
+    auto at = body->pending.end();
+    if (rpcombat::uses_row(event.kind) && wo221::on(wo221::kBitReactionSync)) {
+        while (at != body->pending.begin()) {
+            const auto previous = at - 1;
+            // A KO, ranged event or legacy action keeps its place as a boundary.
+            if (!previous->typed || !rpcombat::uses_row(previous->kind) || previous->hostMs <= event.hostMs) break;
+            at = previous;
+        }
+    }
+    body->pending.insert(at, std::move(action));
     ++g_pending;
     ++g_combat.actions_pending;
     return body->typedRecent.remember(key, Accepted);
@@ -633,6 +657,7 @@ void observed(uint64_t token, bool installed) {
         const auto ms = elapsed(entry.action.readMs, GetTickCount64());
         g_actionLag.add(static_cast<uint32_t>(ms));
         if (entry.action.kind == rpcombat::kKo) g_koLag.add(static_cast<uint32_t>(ms));
+        if (rpcombat::uses_row(entry.action.kind) && wo221::on(wo221::kBitReactionSync)) note_reaction(entry.peer, entry.action, true);
     }
     const char* reason = entry.livePose ? "guarded-live-pose" : shown ? "-" : "missing-current-pose";
     settle(entry.eid, entry.peer, entry.action, Dispatch::Installed, "installed", reason, shown);

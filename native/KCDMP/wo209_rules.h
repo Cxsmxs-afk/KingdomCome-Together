@@ -84,6 +84,20 @@ constexpr double kOppResendS = 1.5;
 inline bool opp_send_due(bool changed, double sinceSentS, uint8_t kind) { return changed || (kind != kHostNone && sinceSentS >= kOppResendS); }
 // The joiner: a copy the stream has not spoken of for this long is let go (its wish clears; WO-187's agent word may take it again).
 constexpr double kMirrorStaleS = 4.0;
+
+enum class TargetWriter : uint8_t { Legacy, Host, Fallback };
+inline TargetWriter target_writer(bool configured, bool fallback, double age, bool currentScope) {
+    if (!configured) return TargetWriter::Legacy;
+    if (!fallback || (currentScope && age >= 0 && age < kMirrorStaleS)) return TargetWriter::Host;
+    return TargetWriter::Fallback;
+}
+
+inline bool legacy_target_may_write(TargetWriter writer) { return writer == TargetWriter::Legacy; }
+
+inline bool target_wish_owned(TargetWriter writer, bool mirrored, bool fallback) {
+    if (mirrored) return writer != TargetWriter::Fallback;
+    return writer == (fallback ? TargetWriter::Fallback : TargetWriter::Legacy);
+}
 // The mirror re-applies (and samples) each copy this often: one stream tick.
 constexpr double kMirrorTickS = 0.1;
 // The mirror engages a copy in the local player's fight up to this far from him (the host's NPC fights his figure there; the copy may

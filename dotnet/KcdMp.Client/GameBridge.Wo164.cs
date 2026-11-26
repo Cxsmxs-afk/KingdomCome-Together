@@ -365,6 +365,11 @@ public partial class GameBridge
                 return;
             case Protocol.W164Escort when W164Text.TryParseEscort(m.Text, out string enpc, out bool eon):
                 if (!W137Host) { Interlocked.Increment(ref _w164Malformed); return; }
+                if (eon && W221On("escort_nav") && !_w164Escorts.Any(k => k.Key.Peer == src && W164Now() - k.Value <= Wo164Rules.EscortMaxS))
+                {
+                    Interlocked.Increment(ref _w164Malformed);
+                    return;
+                }
                 Interlocked.Increment(ref _w164EscortFollows);
                 Console.WriteLine($"WO164-ESCORT npc={enpc} leader=player{src} follow={(eon ? "on" : "off")} -- the host's NPC {(eon ? "walks behind the joiner's figure" : "is its own again")}");
                 await ExecLuaAsync($"if KCD2MP_W164EscortFollow then KCD2MP_W164EscortFollow(\"{EscapeLua(enpc)}\", {src}, {B(eon)}) end");
@@ -674,7 +679,7 @@ public partial class GameBridge
     {
         if (!_w164On) return false;
         double now = W164Now();
-        foreach (var k in _w164Escorts.Keys) if (now - _w164Escorts[k] > Wo164Rules.EscortMaxS) _w164Escorts.TryRemove(k, out _);
+        foreach (var row in _w164Escorts) if (now - row.Value > Wo164Rules.EscortMaxS) _w164Escorts.TryRemove(row);
         string? scope = Wo164Rules.EscortScope(req.Path);
         bool follow = Wo164Rules.IsFollowPort(req.Port);
         bool active = _w164Escorts.Keys.Any(k => k.Peer == src && Wo164Rules.InEscortScope(k.Scope, req.Path));

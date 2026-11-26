@@ -34,14 +34,14 @@ it. The work orders' findings (`docs/WO-215-findings.md` … `docs/WO-221-findin
   on our bench one get-up in a handful was not shown.
 - **Paired attacks** (one fighter's move answered by another's) are not always shown on the joiner. **Grabs** do not happen between the
   players and the host's people.
-- **NPC targets in the feature draft.** The host's opponent stream owns the target on bound guest-world NPC copies. The relay-to-engine diagnostic counts the active opponent. How many attacks are visible on the intended body still needs a two-PC check, especially after a target switch.
-- **Ranged phases.** Bow charge and aim, and reload for individual crossbow subclasses, still need verified animation entries from the local game data.
+- **NPC targets in the feature draft.** The host's opponent stream owns the target on bound guest-world NPC copies. The optional `mp_target_fallback` uses the existing combat stream when the per-body opponent stream is stale. The relay-to-engine diagnostic counts the active opponent. How many attacks are visible on the intended body still needs a two-PC check, especially after a target switch.
+- **Ranged phases.** The optional `mp_bow_phases` accepts one Fire per observed charge or aim for the current bow and body. Bow charge and aim, and reload for individual crossbow subclasses, still need verified animation entries from the local game data. The relationship between the shown shot, the flying arrow and the host’s measured contact remains open.
 - **The host's frame rate in fights** may drop a few frames a second with the fast fight updates of 0.64; `mp_npc_bands off` in the
   host's console brings back the old rates. Tell us if you see it.
 - **The mod's own work on the host** costs about 1.9 ms of a frame on average and, in about one frame in twenty, 10 ms
   (our bench; 0.65.0: 2.8 and 13 ms). The target was 1.5 ms in that one frame in twenty. The bug report's recorders now write
   their files on their own thread; what is left is the reading of the game's state itself, which has to happen on the game's main thread. A stutter on the host you can feel: press `.`.
-  The feature draft reuses the local player's combat-model read within a single task and frame. Its effect on frame p95 is unmeasured.
+  The optional `mp_frame_snapshot` also shares the combat-model observation across selected frame readers. The fixture measures read counts. The effect on frame p95 and the distance tiers remain open.
 
 ## Horses
 
@@ -82,13 +82,13 @@ it. The work orders' findings (`docs/WO-215-findings.md` … `docs/WO-221-findin
 - **A talk may not start** after timeouts. The candidate offers one final attempt for the same local request, recorded as
   `MP-FIX TALK`. Actual dialogue and trade completion still need a game check.
 - **Some shopkeepers do not take every item** on the joiner's side that they take on the host's (two keepers on our bench never
-  took an onion). Press `.` and say which shopkeeper and which item.
+  took an onion). The optional `mp_shop_definition` exposes the keeper’s soul, faction and inventory counts through the shop probe. Buy categories and filters remain open. Press `.` and say which shopkeeper and which item.
 - **Listening in on the partner's talk:** once in a while the listener's keys may stop working for that talk (seen on the host, about
   one listen in five in some sessions on our bench, not traced). The listen keys are re-asserted once a second; press `.` if it
   still happens and leave with Back.
 - **Cutscenes can still go black.** The mod's hold of a locally initialized cutscene now expires after 1.8 s at the next eligible
   frame. `MP-FIX CUT` records its release. Visible recovery and scenes waiting for a remote quest step need a game check.
-- **Escort NPCs** still need a verified native call that follows a partner's figure and commits a guest's carry to the host quest. The draft uses all bound figures for the host's distance trigger.
+- **Escort NPCs.** The optional `mp_escort_nav` sends the nearest player’s position to the host’s engine movement queue with a two-second lead change. The visible movement, recovery from large gaps and the host quest step when a guest carries an escort need game evidence.
 
 ## The connection
 

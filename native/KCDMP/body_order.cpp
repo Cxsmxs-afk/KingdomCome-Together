@@ -55,6 +55,7 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
         return answer(kOk, 0);
     }
     const uint32_t id = wo215::order_go(eid, to, gait);
+    if (!id) return answer(kRefused, 0);
     const uint32_t k = c_go.fetch_add(1, std::memory_order_relaxed) + 1;
     if (k <= 200 || k % 100 == 0)
         logf("WO221-ORDER npc=%s go to (%.1f,%.1f,%.1f) gait=%u -> order %u (the engine's own movement request, made at the AI update's entry) [n=%u]",

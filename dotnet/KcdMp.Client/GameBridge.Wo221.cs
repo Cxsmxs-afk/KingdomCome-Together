@@ -7,13 +7,13 @@ using KcdMp.Wire;
 
 namespace KcdMp.Client;
 
-// WO-221 (docs/WO-221-findings.md): bodies that walk right, and a horse each. Every switch ships on (W221Switch; `mp_<name> on|off` in
+// WO-221 (docs/WO-221-findings.md): bodies that walk right, and a horse each. Switches and defaults live in W221Switch (`mp_<name> on|off` in
 // the game's console, `mp_w221_status` lists them); the bench's twin is KCDMP_TEST_W221_OFF=<names|all> in both agents' and both games'
 // environment. Log tags: MP-W221, MP-W221-NATIVE, MP-W221-STATS; the DLL's WO221-CFG, WO221-ACTEND.
 public partial class GameBridge
 {
     private readonly ConcurrentDictionary<string, bool> _w221On = new(StringComparer.Ordinal);
-    private bool W221On(string name) => _w221On.TryGetValue(name, out bool v) ? v : !W221Switch.TwinOff(name);
+    private bool W221On(string name) => _w221On.TryGetValue(name, out bool v) ? v : W221Switch.DefaultOn(name) && !W221Switch.TwinOff(name);
     private int _w221Pushing;
 
     // ---- B: the keepers' shops ---------------------------------------------------------------------------------------------
@@ -260,7 +260,7 @@ public partial class GameBridge
             byte code = r is { Ok: true } rr && rr.Payload.Length >= 1 ? rr.Payload[0] : (byte)0;
             if (code == 1) Interlocked.Increment(ref _w221Orders);
             else if (Interlocked.Increment(ref _w221OrderRefused) <= 50)
-                Console.WriteLine($"MP-W221 order {(op == Protocol.Wo221OpGo ? "go" : "stop")} '{what}' not carried out: {code switch { 2 => "no such body in this world", 3 => "the movement request is not armed on this build", 4 => "mp_own_horse is off", _ => "the DLL did not answer" }}");
+                Console.WriteLine($"MP-W221 order {(op == Protocol.Wo221OpGo ? "go" : "stop")} '{what}' not carried out: {code switch { 2 => "no such body in this world", 3 => "the movement request is not armed on this build", 4 => "mp_own_horse is off", 5 => "the engine order queue refused", _ => "the DLL did not answer" }}");
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException or TimeoutException) { }
     }

@@ -17,7 +17,7 @@ public static partial class Protocol
     /// <summary>talk_hold.h: 194 Talk [on:1][name len:1][name] -> [code:1] (1 held, 2 released, 3 not held, 4 the switch is off).</summary>
     public const byte Wo221OpTalk = 194;
     /// <summary>body_order.h: 195 Go [gait:1][name len:1][name][x y z:3f] -> [code:1][order:4]; 196 Stop [name len:1][name] -> [code:1].
-    /// Codes: 1 ordered / stopped, 2 no such body here, 3 the request is not armed on this build, 4 the switch is off.</summary>
+    /// Codes: 1 ordered / stopped, 2 no such body here, 3 the request is not armed, 4 the switch is off, 5 the queue refused the order.</summary>
     public const byte Wo221OpGo = 195, Wo221OpStop = 196;
     /// <summary>corpse_look.h: 197 Read [name len:1][name] -> [code:1][six zones 0..255]; 198 Set [name len:1][name][six zones] -> [code:1][changed:1].
     /// Codes: 1 ok, 2 no such body here, 3 not armed, 4 the switch is off, 5 the body has no helper (never bloodied).</summary>
@@ -38,16 +38,18 @@ public static class W221Switch
     /// part), talk_hold (B: a copy woken for a talk has its own schedule held), drive (C: a walking human copy is moved by the engine's
     /// per-frame movement request), holders (C.3: one table of who holds a body), own_horse (D: each player's own horse -- the record,
     /// the quest gate's horse rule, the call, the saddlebags).</summary>
-    public static readonly string[] NativeNames = ["combat_action_end", "talk_hold", "drive", "holders", "own_horse", "corpse_look", "rp_controller", "rp_combat", "death_trace", "queue_ref_release", "npc_target_owner", "attack_window_snapshot"];
+    public static readonly string[] NativeNames = ["combat_action_end", "talk_hold", "drive", "holders", "own_horse", "corpse_look", "rp_controller", "rp_combat", "death_trace", "queue_ref_release", "npc_target_owner", "attack_window_snapshot", "frame_snapshot", "reaction_sync", "target_fallback"];
 
     /// <summary>The agent's and the mod's own switches (the agent tells the mod): shop_keeper (B: a copy of a shopkeeper keeps the host
     /// keeper's shop -- the host says which, the joiner's DLL opens it with the copy by the shop's own call), talk_force (B: the
     /// mod's own: a talk the copy never takes is started the game's forced way), ragdoll_once (A: a fresh corpse is laid down by one
     /// ragdoll at a time, only after the game's own death action had its time -- the joiner's crashes came ~1 s after a ragdoll of a
     /// body 0.65 s dead).</summary>
-    public static readonly string[] AgentNames = ["shop_keeper", "talk_force", "horse_drop", "saddlebags", "route_quiet", "cart_seat", "cart_wheels", "ragdoll_once", "load_sequence", "baseline_events", "world_recovery", "escort_nearest_all"];
+    public static readonly string[] AgentNames = ["shop_keeper", "talk_force", "horse_drop", "saddlebags", "route_quiet", "cart_seat", "cart_wheels", "ragdoll_once", "load_sequence", "baseline_events", "world_recovery", "escort_nearest_all", "escort_nav", "shop_definition", "bow_phases"];
 
     public static readonly string[] Names = [.. NativeNames, .. AgentNames];
+
+    public static bool DefaultOn(string name) => name is not ("escort_nav" or "frame_snapshot" or "shop_definition" or "reaction_sync" or "target_fallback" or "bow_phases");
 
     public static bool TwinOff(string name) => TwinOff(Environment.GetEnvironmentVariable(EnvVar), name);
 

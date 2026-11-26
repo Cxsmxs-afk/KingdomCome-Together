@@ -23,7 +23,8 @@ const N kNames[] = {{"combat_action_end", kBitCombatActionEnd}, {"talk_hold", kB
                     {"holders", kBitHolders}, {"own_horse", kBitOwnHorse}, {"corpse_look", kBitCorpseLook},
                     {"rp_controller", kBitRemoteController}, {"rp_combat", kBitRemoteCombat}, {"death_trace", kBitDeathTrace},
                     {"queue_ref_release", kBitQueueRefRelease}, {"npc_target_owner", kBitNpcTargetOwner},
-                    {"attack_window_snapshot", kBitAttackWindowSnapshot}};
+                    {"attack_window_snapshot", kBitAttackWindowSnapshot}, {"frame_snapshot", kBitFrameSnapshot},
+                    {"reaction_sync", kBitReactionSync}, {"target_fallback", kBitTargetFallback}};
 }
 
 uint32_t twin_off_bits(const char* names) {
@@ -35,7 +36,7 @@ uint32_t twin_off_bits(const char* names) {
         const char* e = p;
         while (*e && *e != ',' && *e != ' ') ++e;
         const size_t len = static_cast<size_t>(e - p);
-        if (len == 3 && std::strncmp(p, "all", 3) == 0) bits |= kBitsDefault;
+        if (len == 3 && std::strncmp(p, "all", 3) == 0) for (const auto& x : kNames) bits |= x.b;
         for (const N& x : kNames) if (std::strlen(x.n) == len && std::strncmp(p, x.n, len) == 0) bits |= x.b;
         p = e;
     }

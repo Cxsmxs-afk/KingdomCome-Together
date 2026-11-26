@@ -28,6 +28,9 @@ constexpr uint32_t kBitDeathTrace = 1u << 8;
 constexpr uint32_t kBitQueueRefRelease = 1u << 9;
 constexpr uint32_t kBitNpcTargetOwner = 1u << 10;
 constexpr uint32_t kBitAttackWindowSnapshot = 1u << 11;
+constexpr uint32_t kBitFrameSnapshot = 1u << 12;
+constexpr uint32_t kBitReactionSync = 1u << 13;
+constexpr uint32_t kBitTargetFallback = 1u << 14;
 constexpr uint32_t kBitsDefault = kBitCombatActionEnd | kBitTalkHold | kBitDrive | kBitHolders | kBitOwnHorse | kBitCorpseLook |
                                   kBitRemoteController | kBitRemoteCombat | kBitDeathTrace | kBitQueueRefRelease | kBitNpcTargetOwner |
                                   kBitAttackWindowSnapshot;

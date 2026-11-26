@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "wo209_rules.h"
+#include "frame_snapshot.h"
 
 using namespace kcdmp::wo209rules;
 
@@ -27,6 +28,24 @@ int wo209_tests(int* passed) {
            window_player_opponent(true, true, 7, resample) == 7 && reads == 1 &&
            window_player_opponent(false, true, 7, resample) == 42 && reads == 2,
            "all attack windows share this frame's player read, including an unavailable read; the twin re-reads");
+
+    {
+        using kcdmp::motion::ModelRead;
+        unsigned reads = 0;
+        int original = 1, replacement = 2;
+        const auto raw = [&](const void* actor, ModelRead* out) {
+            ++reads;
+            out->opponentEid = *static_cast<const int*>(actor);
+            return true;
+        };
+        kcdmp::motion::FrameModels frame;
+        frame.begin();
+        const auto read = [&](void* actor, uint64_t scope, ModelRead* out) { return frame.read(7, actor, scope, out, raw); };
+        ModelRead first{}, same{}, rebound{}, reloaded{};
+        const bool observed = read(&original, 1, &first) && read(&original, 1, &same) && read(&replacement, 1, &rebound) && read(&replacement, 2, &reloaded);
+        WCHECK(observed && reads == 3 && frame.counts.reused == 1 && same.opponentEid == 1 && rebound.opponentEid == 2 && reloaded.opponentEid == 2,
+               "duplicate observations cost one read, and body replacement and world generation invalidate it (reads=%u)", reads);
+    }
 
     // ---- A: the host's kinds
     WCHECK(host_kind(0, 0x7777, false) == kHostNone, "no opponent: nobody");
@@ -52,6 +71,20 @@ int wo209_tests(int* passed) {
     WCHECK(mirror_step(kHereNone, true) == Mirror::Clear, "nobody: the mirrored wish goes (the fight's end releases the skirmish, not the mirror)");
     WCHECK(wish_kind(kHerePlayer) == 1 && wish_kind(kHereEntity) == 2 && wish_kind(kHereNone) == 0, "the wo187 wish kinds");
     WCHECK(kMirrorTickS <= 0.1, "one stream tick");
+    {
+        const auto host = target_writer(true, true, 0.1, true);
+        const auto duringLoss = target_writer(true, true, kMirrorStaleS, true);
+        const auto legacy = target_writer(false, true, 0.1, true);
+        WCHECK(host == TargetWriter::Host && duringLoss == TargetWriter::Fallback &&
+               target_writer(true, true, 0.1, false) == TargetWriter::Fallback &&
+               target_writer(true, false, kMirrorStaleS, true) == TargetWriter::Host &&
+               legacy == TargetWriter::Legacy && !legacy_target_may_write(host) &&
+               !legacy_target_may_write(duringLoss) && legacy_target_may_write(legacy) &&
+               !target_wish_owned(duringLoss, false, false) && !target_wish_owned(duringLoss, true, false) &&
+               target_wish_owned(duringLoss, false, true) && !target_wish_owned(host, false, true) &&
+               target_wish_owned(host, true, false),
+               "stream loss grants only the fallback wish writer; direct legacy calls remain readers");
+    }
 
     // ---- A.4's sample
     WCHECK(!sample_counts(kHereNone, 10.0), "nobody wanted: not sampled");

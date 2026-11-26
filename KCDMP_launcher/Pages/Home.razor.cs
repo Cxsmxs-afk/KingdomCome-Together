@@ -924,7 +924,7 @@ namespace KCDMP_launcher.Pages
             string masterServerPath = ResolveAgainstLauncher(settings.MasterServerPath);
             if (!File.Exists(masterServerPath))
             {
-                Log.Warning("Master server executable not found at: {Path}. The status bar will read \"Master: Offline\" until one is installed or Settings -> Master Server URL points elsewhere.", masterServerPath);
+                Log.Warning("Master server executable missing. The status bar will read \"Master: Offline\" until one is installed or Settings -> Master Server URL points elsewhere.");
                 return;
             }
 
@@ -944,7 +944,7 @@ namespace KCDMP_launcher.Pages
                     Log.Warning("Process.Start returned null for the master server; not retrying this launch.");
                     return;
                 }
-                Log.Information("Starting local master server: {Path} (pid {Pid})", masterServerPath, hostedMasterServerProcess.Id);
+                Log.Information("Starting local master server (pid {Pid})", hostedMasterServerProcess.Id);
 
                 // Polled rather than a single fixed delay: a self-contained
                 // ASP.NET Core app's cold start (JIT, Kestrel bind) can take

@@ -4,6 +4,7 @@
 using KcdMp.Client;
 using KcdMp.Wire;
 using Xunit;
+using System.Buffers.Binary;
 
 namespace KcdMp.Client.Tests;
 
@@ -55,6 +56,28 @@ public class ActionChannelTests
         Assert.Equal("attack_heavy", got.InputClassName);
         Assert.Equal("upper_right", got.ZoneName);
         Assert.Equal("slash", got.AttackTypeName);
+    }
+
+    [Fact]
+    public async Task Concurrent_reaction_publishers_get_unique_sequences_of_the_same_kind()
+    {
+        const int producers = 4, packetsPerProducer = 256;
+        var outbox = new ActionOutbox(Run);
+        outbox.Build(ActionKind.BlockImpulse, ActionPhase.Commit, []);
+        var sequences = new ushort[producers * packetsPerProducer];
+        using var barrier = new Barrier(producers);
+        var writers = Enumerable.Range(0, producers).Select(writer => Task.Factory.StartNew(() =>
+        {
+            for (int i = 0; i < packetsPerProducer; i++)
+            {
+                if (!barrier.SignalAndWait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Reaction producers did not rendezvous.");
+                var packet = outbox.Build(ActionKind.BlockImpulse, ActionPhase.Commit, []);
+                sequences[(writer * packetsPerProducer) + i] = BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(4));
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
+        await Task.WhenAll(writers);
+        Assert.Equal(sequences.Length, sequences.Distinct().Count());
+        Assert.Equal(sequences.Length + 1, outbox.Sent);
     }
 
     [Fact]
