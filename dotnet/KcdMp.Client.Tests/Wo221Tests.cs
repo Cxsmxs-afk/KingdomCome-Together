@@ -3,6 +3,7 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using KcdMp.Client;
 using KcdMp.Wire;
+using System.Text.RegularExpressions;
 using Xunit;
 
 namespace KcdMp.Client.Tests;
@@ -66,15 +67,61 @@ public class Wo221Tests
         Assert.Equal(1u << 11, W221Switch.NativeBits(n => n == "attack_window_snapshot"));
         Assert.Equal(1u << 12, W221Switch.NativeBits(n => n == "frame_snapshot"));
         Assert.Equal(1u << 13, W221Switch.NativeBits(n => n == "reaction_sync"));
-        Assert.Equal(1u << 14, W221Switch.NativeBits(n => n == "target_fallback"));
-        Assert.Equal(0xF3Fu, W221Switch.NativeBits(n => W221Switch.DefaultOn(n) && n is not ("rp_controller" or "rp_combat")));
-        Assert.All(new[] { "escort_nav", "frame_snapshot", "shop_definition", "reaction_sync", "target_fallback", "bow_phases" }, n =>
-        {
-            Assert.Contains(n, W221Switch.Names);
-            Assert.False(W221Switch.DefaultOn(n));
-            Assert.True(W221Switch.TwinOff("all", n));
-        });
+        Assert.DoesNotContain("target_fallback", W221Switch.Names);
+        Assert.Equal(1u << 14, W221Switch.NativeBits(n => n == "escort_nav"));
+        Assert.Equal(0x3F3Fu, W221Switch.NativeBits(n => W221Switch.DefaultOn(n) && n is not ("rp_controller" or "rp_combat")));
+        Assert.All(W221Switch.Names, n => Assert.True(W221Switch.TwinOff("all", n)));
         Assert.Contains("talk_force", W221Switch.AgentNames);
+    }
+
+    [Fact]
+    public void Native_lua_and_agent_use_the_same_feature_defaults_and_native_bits()
+    {
+        const string luaPath = "kdcmp/Data/Scripts/Startup/kdcmp.lua";
+        DirectoryInfo? root = new(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, luaPath))) root = root.Parent;
+        Assert.NotNull(root);
+
+        string Read(string path) => File.ReadAllText(Path.Combine(root!.FullName, path));
+        string LuaBlock(string source, string key) =>
+            Regex.Match(source, $@"\b{Regex.Escape(key)}\s*=\s*\{{([^}}]*)\}}").Groups[1].Value;
+        var lua = Read(luaPath);
+
+        void Check(string block, string nativeNames, string header, IEnumerable<string> names,
+            Func<string, bool> defaultOn, Func<Func<string, bool>, uint> agentBits)
+        {
+            var switches = Regex.Matches(LuaBlock(lua, block + ".NAMES"), @"(\w+)\s*=\s*""mp_[^""]+""")
+                .Select(m => m.Groups[1].Value).Order(StringComparer.Ordinal);
+            Assert.Equal(names.Order(StringComparer.Ordinal), switches);
+            var off = Regex.Matches(LuaBlock(lua, block + ".DEFAULT_OFF"), @"(\w+)\s*=\s*true")
+                .Select(m => m.Groups[1].Value).Order(StringComparer.Ordinal);
+            Assert.Equal(names.Where(n => !defaultOn(n)).Order(StringComparer.Ordinal), off);
+
+            var defaults = Regex.Match(header, @"\bkBitsDefault\s*=\s*([^;]+);").Groups[1].Value
+                .Split('|', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            var bits = Regex.Matches(nativeNames, """\{"(\w+)",\s*(kBit\w+)\}""");
+            Assert.NotEmpty(bits);
+            uint nativeDefault = 0;
+            foreach (Match bit in bits)
+            {
+                string name = bit.Groups[1].Value, symbol = bit.Groups[2].Value;
+                var value = Regex.Match(header, $@"\b{symbol}\s*=\s*(\d+)u?(?:\s*<<\s*(\d+))?\s*;");
+                Assert.True(value.Success, symbol);
+                uint mask = uint.Parse(value.Groups[1].Value);
+                if (value.Groups[2].Success) mask <<= int.Parse(value.Groups[2].Value);
+                Assert.Equal(mask, agentBits(n => n == name));
+                if (defaults.Contains(symbol)) nativeDefault |= mask;
+            }
+            Assert.Equal(agentBits(defaultOn), nativeDefault);
+        }
+
+        Check("W221", Read("native/KCDMP/wo221.cpp"), Read("native/KCDMP/wo221.h"),
+            W221Switch.Names, W221Switch.DefaultOn, W221Switch.NativeBits);
+        var w209 = Read("native/KCDMP/wo209_rules.h");
+        Check("W209", w209, w209, Wo209Rules.SwitchNames, n => Wo209Rules.Default(n, null, null), Wo209Rules.ConfigBits);
+        Assert.All(new[] { "frame_snapshot", "reaction_sync", "shop_definition", "bow_phases" },
+            n => Assert.True(W221Switch.DefaultOn(n), n));
+        Assert.False(W221Switch.DefaultOn("escort_nav")); // the quest's own AI still holds the follow goal
     }
 
     [Fact]

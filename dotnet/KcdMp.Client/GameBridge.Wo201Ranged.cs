@@ -37,7 +37,7 @@ public partial class GameBridge
     private int _w201RangedRefusals;
     private int _p6CaptureWasOn;
     private long _w201RangedOut, _w201RangedIn, _w201RangedDispatched, _w201RangedRefused;
-    private readonly record struct P6RemoteStep(long Peer, ulong Gen, ulong Epoch, uint Seq, FigureBody Body, Guid ChargedBow);
+    private readonly record struct P6RemoteStep(long Peer, ulong Gen, ulong Epoch, uint Seq, FigureBody Body, Guid ChargedBow, Guid FiredBow);
     private readonly ConcurrentDictionary<byte, P6RemoteStep> _p6RemoteSteps = new();
 
     private bool P6Current(P6Context c) => !c.Stop.IsCancellationRequested && ReferenceEquals(c.Stream, _wo122Stream) &&
@@ -252,17 +252,19 @@ public partial class GameBridge
         }
         bool sameStream = last.Gen == step.Generation && last.Epoch == step.Epoch && last.Peer == frame.P6PeerSerial;
         if (!sameStream) T3Increment("ranged_stream_reset");
+        bool bowFire = step.Kind == RangedWeaponKind.Bow && step.Phase == 3;
+        bool recoverShot = bowFire && W221On("bow_phases");
+        bool sameBodyStream = sameStream && last.Body == body;
+        bool recovered = recoverShot && (!sameBodyStream || last.ChargedBow != step.ItemClass);
         Guid chargedBow = step.Kind == RangedWeaponKind.Bow && step.Phase is 1 or 2 ? step.ItemClass : Guid.Empty;
-        var newest = new P6RemoteStep(frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence, body, chargedBow);
+        var newest = new P6RemoteStep(frame.P6PeerSerial, step.Generation, step.Epoch, step.Sequence, body,
+            chargedBow, bowFire ? step.ItemClass : Guid.Empty);
         _p6RemoteSteps[src] = newest;
+        // The native sender assigns a sequence only to phase edges. Two adjacent Fire rows for the same bow
+        // cannot be two shots. A sequence gap can cover the intervening phases of a real second shot.
+        if (recoverShot && sameBodyStream && last.FiredBow == step.ItemClass && unchecked(step.Sequence - last.Seq) == 1)
+        { T3Increment("ranged_duplicate"); return; }
         T3Increment("ranged_in"); Interlocked.Increment(ref _w201RangedIn);
-        bool verifyShot = W221On("bow_phases") && step.Kind == RangedWeaponKind.Bow && step.Phase == 3;
-        if (verifyShot && (!sameStream || last.Body != body || last.ChargedBow != step.ItemClass))
-        {
-            T3Increment("ranged_bow_fire_unarmed");
-            Wo201RangedRefused(src, step, "bow-charge-not-observed");
-            return;
-        }
         var catalog = await P6CatalogAsync();
         if (!P6Current(context) || !P6PeerCurrent(src, frame.P6PeerSerial)) return;
         if (step.Kind == RangedWeaponKind.Unknown || catalog?.Kind(step.ItemClass) != step.Kind)
@@ -312,8 +314,11 @@ public partial class GameBridge
             return;
         }
         Interlocked.Increment(ref _w201RangedDispatched);
-        if (verifyShot)
-            Console.WriteLine(FormattableString.Invariant($"MP-FIX BOW phase=fire shot={step.Sequence} hit=unlinked peer={src} stage=accepted"));
+        if (recoverShot)
+        {
+            if (recovered) T3Increment("ranged_bow_fire_recovered");
+            Console.WriteLine(FormattableString.Invariant($"MP-FIX BOW phase=fire shot={step.Sequence} hit=unlinked recovered={(recovered ? 1 : 0)} class={step.ItemClass:D} peer={src} stage=accepted"));
+        }
         Console.WriteLine(FormattableString.Invariant(
             $"MP-RP-RANGED-IN peer={src} eid=0x{body.Entity:X} weapon={step.Kind} phase={step.Phase} seq={step.Sequence} event_host_ms={frame.Presentation.SampleMs} result=accepted body_generation={body.Generation} hand_rev={hand.Revision} cls={step.ItemClass:D}"));
     }

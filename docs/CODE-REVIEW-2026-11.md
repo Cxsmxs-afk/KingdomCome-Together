@@ -1,4 +1,31 @@
-# Code-Review · Koop-Features Teil 2
+# Code-Review · Koop-Features
+
+## Teil 3 auf Draft #78
+
+Basis `40ea31da68e0267de4c2d7e383632e97f7beda20`. Die statische Inventur hat alle 3.350 getrackten Dateien gelesen und den Text nach Zustandsgrenzen, Besitz, Frame-Arbeit und Logquellen durchsucht. Das manuelle Review folgte den unten benannten Produktionspfaden und ihren Tests. Eine manuelle Prüfung sämtlicher Dateien, Callbacks und Grenzfälle bleibt offen.
+
+| Befund | Schwere | Code und Entscheidung | Prüfung |
+|---|---|---|---|
+| Zielzuständigkeit beim Ablauf des Streams | Mittel | `wo209.cpp:480` auf #78 hält den Host als Besitzer, wenn der Rückfall aus ist. Der Kandidat prüft Body, Ziel, Load und Alter. Ohne gültigen Wunsch wird der bisherige Zielpfad freigegeben. | `wo209_tests`, 67/68 → 68/68. Sichtbare Gegnerwahl mit 2–4 Spielern offen. |
+| Eskorten benötigen den Pferdeschalter, alter Pfad versetzt den NPC | Mittel | `body_order.cpp:46` und `kdcmp.lua:27150` auf #78. Der Host reiht Eskorte unter eigener Bewegungslease ein. Abbruch und Rollenwechsel räumen sie auf. Im Standardprofil führt die Quest-KI. | `Test-WO164Synthetic.ps1`, 73/74 → 74/74. Dauerhaftes Folgen, sichere Rettung und Carry-Commit offen. |
+| Fehlende Charge unterdrückt Fire | Mittel | `GameBridge.Wo201Ranged.cs:263` auf #78. Eine aktuelle Fire-Kante mit bestätigter Bogenhand bleibt gültig. Gleiche Sequenzen und aufeinanderfolgende Fire-Zeilen derselben Waffe bleiben dedupliziert. | `Lost_bow_charge_keeps_one_typed_fire_and_does_not_repeat_the_same_capture`, kontrollierte fehlende Pipe-Anfrage → typisierter Dispatch. Charge-Pose und reale Trefferzuordnung offen. |
+| 8 · Agentenwechsel in geladener Gastwelt | Mittel | `GameBridge.JoinEngineReceipt.cs:14`, `pipe_server.cpp:2676` und `ClientHandler.cs:226` auf #78. Die bestehende Gast-Lease, die Einzel-Pipe und der Relay-Sitz haben keine gemeinsame Übergabequittung. | Offen. Der bestätigte Rückweg bleibt verfügbar. Der Simulator prüft den bestehenden Join-Save-Lebenszyklus. |
+| 9 · Doppelte Actor-Lookups und verschiedene Ablesezeitpunkte | Mittel | `motion.cpp:2336` auf #78. Die feste Beobachtersicht übernimmt nur Samples mit bestätigter Entity-Identität und passenden Stempeln. Kontakt, Aktion und Rücklesung bleiben am Live-Pfad. | `wo209_tests`, drei Modellproben bei vier Actor-Lookups → drei bei drei. Distanzstufen und Spielwerte bleiben offen. |
+| 10 · Paaraktion über zwei Körper | Mittel | `wo197.cpp:428` auf #78. Die Diagnose beobachtet den angenommenen Guard sowie die Clinch-Scopes und Gegner beider Körper. | Diagnose. Die Guard-Tests laufen mit 30/30. Sichtbarer vollständiger Paarablauf offen. |
+| 11 · Namen und Pfade aus freiem Logtext | Mittel | `Program.cs:207,236,260,299,310` und `DiagnosticRedaction.cs:20` auf #78. Die Startausgaben nutzen Zustände. Das LogPack deckt weitere Windows-/UNC-/Unix-Pfade und bekannte Anzeigenamenformate ab. | `The_shared_bundle_redacts_private_values_in_payloads_paths_and_reports`, 0/2 → 2/2, mit und ohne Kollaps. Andere Freitextquellen bleiben offen. |
+| 12 · Mannequin, Pferdeslots, Facial-Wiedergabe | Mittel | `Wo201.cs:52`, `kdcmp.lua:37723` und `Home.Wo150.cs:107` auf #78. Die Pferdeprobe prüft die reale Besitzabfrage und zählt lesbare Inventareinträge. | Diagnose. Verifizierbare Slot-/ADB-Daten und sichtbare Facial-Wiedergabe fehlen. |
+| Nebenläufiger Zugriff auf WO-221-Zwillingsmaske | Mittel | `wo221.cpp:51` auf #78. Die Maske wurde beim ersten Zugriff ohne Synchronisation in mehreren Threads publiziert. Der Kandidat berechnet sie einmal beim DLL-Start und entfernt die Ausgabe des rohen Umgebungswerts. | Native Syntax, Default- und Zwillingsprüfung. Keine erneute Initialisierung im Frame. |
+| Zählerstände einer Kampfaktion | Niedrig | `combat_construct.cpp:624,1048,1134` und `combat_actions.cpp:570` auf #78. Caller, Watcher, WO-208 und Ledger tragen getrennten Besitz. Die Terminalabfrage summiert 64 belegte Ledger-Freigaben. | 24/24 im Besitztest und unter ASan/UBSan. Die ausgewerteten Engine-Referenzen brauchen Spielbeleg. |
+
+### Selbst-Review Teil 3
+
+- Körper und Load. Die Host-Wahl verlangt eine aktuelle NPC-Kopie und ein aktuelles Ziel. Ein alter Wunsch darf nach einem Körper- oder Loadwechsel nicht schreiben. Der Eskortauftrag nimmt nur Host-NPCs an und reserviert denselben Körper gegen andere Bewegungsaufträge. Normaler Stop, Wechsel des Schalters und Trennen geben die neue Eskort-Lease über die vorhandene AI-Warteschlange zurück.
+- Abbruch. Die bestehende Agenten- und Spielstand-Lease bleibt in Kraft. Der Kandidat führt keinen zusätzlichen Speicherpfad ein. Der Sim-Lauf prüft dieselbe Join-ID, Lifecycle und Rückkehr in zwei bis vier Teilnehmern.
+- Kosten. Die Beobachtersicht hat 256 feste Plätze und prüft höchstens vier je Zugriff. Das Ref-Fenster gibt nach 64 bestätigten Abschlüssen eine Zeile aus. Die Paar-Diagnose tastet nur einen angenommenen Auftrag höchstens fünf Sekunden lang im 50-ms-Takt ab. Der synthetische Beobachter-Bench ersetzt keine Spielmessung.
+- Gelöschte Pfade. Der Schalter, der die Rückfallzuständigkeit abklemmen konnte, und die Eskort-Schleife mit Pause, Terrain-Abfrage und `SetWorldPos` sind entfernt. Die Horse- und Zielpfade nutzen die vorhandenen Besitzer und Queues.
+- Vergleich NightCoop/Seamless. Die Referenzen trennen den Eintritt in die Sitzung von der Spielwelt und bedienen den lokalen Spieler über die Engine. Die KCT-Doubles prüfen Zustandsgrenzen bis zum Engine-Aufruf. Der Vergleich des Spielbildes gehört zur Zwei-PC-Abnahme. [NightCoop SDK](https://nightcoop.net/sdk-concepts.html) · [Seamless Co-op](https://ersc-docs.github.io/how-to-install-and-update/)
+
+## Teil 2
 
 Basis `417a95210316584b6343c40b1c309cdd0cabe3e3` aus Draft #77. Geprüft wurden ausgewählte Produktionspfade und deren Tests in Native-DLL, Agent, Relay, Launcher, Setup, Lua und LogPack. Die Prüfung folgte Aufrufern, Zustandsgrenzen, Schreibrechten und Rückmeldungen. Die Tabelle ist ein Befundnachweis für diese Pfade. Eine Vollprüfung jeder Datei und jedes Engine-Callbacks steht aus.
 

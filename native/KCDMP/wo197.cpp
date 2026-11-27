@@ -14,7 +14,9 @@
 #include "engine.h"
 #include "fault_guard.h"
 #include "log.h"
+#include "load_sequence.h"
 #include "motion.h"
+#include "p4.h"
 #include "pe_exports.h"
 
 #include <windows.h>
@@ -70,6 +72,54 @@ const char* name_of(uint32_t eid) {
 uint32_t player_eid() {
     void* e = engine::entity_by_id(kPlayerEntity);
     return e ? engine::entity_id(e) : 0;
+}
+
+struct PairObservation {
+    uint64_t id = 0, load = 0, life = 0, since = 0, next = 0;
+    uint32_t master = 0, slave = 0, frag = 0;
+    void* masterEntity = nullptr;
+    void* slaveEntity = nullptr;
+    bool both = false;
+};
+PairObservation g_pair; // WO-209's local-Henry guard, observed only on the main thread
+uint64_t g_pairId = 0;
+
+void pair_log(const PairObservation& pair, const char* stage, const char* reason) {
+    deferred_log::Scope defer;
+    logf("MP-FIX PAIR id=%llu a=0x%X b=0x%X fragment=%u stage=%s reason=%s",
+         static_cast<unsigned long long>(pair.id), pair.master, pair.slave, pair.frag, stage, reason);
+}
+
+void observe_pair(Clinch local, bool localReadable) {
+    if (!g_pair.id) return;
+    const uint64_t now = GetTickCount64();
+    if (now < g_pair.next) return;
+    g_pair.next = now + 50;
+    const bool current = g_pair.load == loadsequence::stamp() && g_pair.life == p4::life_edge_tick() &&
+        g_pair.masterEntity == engine::entity_by_id(g_pair.master) && g_pair.slaveEntity == engine::entity_by_id(g_pair.slave);
+    if (!current || now - g_pair.since >= 5000) {
+        pair_log(g_pair, "unconfirmed", current ? "deadline" : "scope");
+        g_pair = {};
+        return;
+    }
+    if (!localReadable) return;
+    void* copy = nullptr;
+    void* model = nullptr;
+    if (!motion::combat_parts(g_pair.master, false, &copy, &model)) return;
+    const auto a0 = wo187::director_scope(copy, 0), a1 = wo187::director_scope(copy, 1);
+    if (!a0.ok || !a1.ok) return;
+    const Clinch remote = clinch_of(a0.name, a1.name);
+    if (!g_pair.both && local != Clinch::None && remote != Clinch::None) {
+        motion::ModelRead a{}, b{};
+        if (motion::read_model(g_pair.master, &a) && motion::read_model(g_pair.slave, &b) &&
+            a.opponentEid == g_pair.slave && b.opponentEid == g_pair.master) {
+            g_pair.both = true;
+            pair_log(g_pair, "both", "reciprocal-clinch");
+        }
+    } else if (g_pair.both && local == Clinch::None && remote == Clinch::None) {
+        pair_log(g_pair, "end", "both-scopes-clear");
+        g_pair = {};
+    }
 }
 
 void guid_text(const uint8_t g[16], char* out, size_t n) {
@@ -210,11 +260,11 @@ void blow_end() {
 
 void poll_player() {
     void* ca = motion::player_combat_actor();
-    if (!ca) return;
+    if (!ca) { observe_pair(Clinch::None, false); return; }
     const wo187::DirAction s4 = wo187::director_scope(ca, 4);
-    if (!s4.ok) return;
+    if (!s4.ok) { observe_pair(Clinch::None, false); return; }
     const wo187::DirAction s0 = wo187::director_scope(ca, 0);
-    // the player and his opponent, read only while a main action runs (a fight)
+    // Read both models at the live contact edge, during a main action.
     motion::ModelRead me{}, opp{};
     bool meOk = false, oppOk = false, oppPb = false;
     if (g_recoil.load() && s0.act) {
@@ -251,6 +301,7 @@ void poll_player() {
     // B1: a new FailedAttack in scope 4
     if (g_recoil.load() && new_recoil(g_lastFa, s4.act, s4.name)) {
         if (!meOk) {
+            // The new FailedAttack action needs a live block verdict.
             const uint32_t pe = player_eid();
             meOk = pe && motion::read_model(pe, &me);
             oppOk = meOk && me.opponentEid && motion::read_model(me.opponentEid, &opp) && (opp.valid & motion::kMvState);
@@ -297,9 +348,11 @@ void poll_player() {
         if (dt >= static_cast<uint64_t>(kProbeMs)) blow_end();
     }
     // B3: the clinch
-    if (!g_clinch.load()) return;
+    if (!g_clinch.load() && !g_pair.id) return;
     const wo187::DirAction s1 = wo187::director_scope(ca, 1);
     const Clinch now = clinch_of(s0.act ? s0.name : "", s1.act ? s1.name : "");
+    observe_pair(now, s0.ok && s1.ok);
+    if (!g_clinch.load()) return;
     const bool newMove = now == Clinch::Move && s0.act != g_lastSt;
     const uint8_t ev = clinch_event(g_clinchWas, now, newMove);
     if (now == Clinch::Move) g_lastSt = s0.act;
@@ -353,6 +406,7 @@ uint8_t pair(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* 
     // player's clinch can name the body it clinched (the joiner's copy of it is found by that name; the field: 4 of the host's clinches
     // reached the joiner and none played, "his figure has no opponent body here")
     if (a == 0xFFFFFFFFu && pair_is_query(lenA, lenV)) {
+        // The request names the current clinch partner for the action that follows.
         motion::ModelRead pm{};
         const uint32_t pe = player_eid();
         const uint32_t opp = (pe && motion::read_model(pe, &pm)) ? pm.opponentEid : 0;
@@ -367,6 +421,7 @@ uint8_t pair(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* 
     }
     if (!pair_is_query(lenA, lenV)) c_pairs.fetch_add(1);
     if (!(g_paired.load() || g_clinch.load()) || !body_ok(a)) { c_pairRefused.fetch_add(1); return wo163::kRNoActor; }
+    // Resolve that opponent before attempting to apply either half of the action.
     if (!v) { motion::ModelRead m{}; if (motion::read_model(a, &m)) v = m.opponentEid; }
     if (!body_ok(v)) { c_pairRefused.fetch_add(1); return wo163::kRNoActor; }   // never the local player: his own body is his input's
     if (pair_is_query(lenA, lenV)) { std::memcpy(out, &v, 4); out[4] = out[5] = 255; out[6] = 0; *outLen = 7; return wo163::kROk; }
@@ -449,6 +504,18 @@ int start_sync_guard(int32_t type, uint32_t master, uint32_t slave, char* why, s
     return r ? 1 : 0;
 }
 
+void note_pair_request(uint32_t master, uint32_t slave, uint32_t fragment, int result) {
+    PairObservation pair{++g_pairId, loadsequence::stamp(), p4::life_edge_tick(), GetTickCount64(), 0,
+        master, slave, fragment, engine::entity_by_id(master), engine::entity_by_id(slave)};
+    if (result != 1 || !pair.masterEntity || !pair.slaveEntity) {
+        pair_log(pair, result == 1 ? "unconfirmed" : "refused", result == 1 ? "scope" : result == 0 ? "engine" : "unavailable");
+        return;
+    }
+    if (g_pair.id) pair_log(g_pair, "unconfirmed", "replaced");
+    g_pair = pair;
+    pair_log(pair, "start", "guard-accepted");
+}
+
 bool cat_on(uint8_t bit) { return (g_cats.load(std::memory_order_relaxed) & bit) != 0; }
 bool activity_now(bool minigame, bool stance, bool unstance) {
     const uint8_t want = minigame ? kCatWork : stance ? kCatSeats : unstance ? kCatRoutines : kCatSeats;   // "none" (standing up) rides the seats switch
@@ -473,7 +540,7 @@ int ensure_guard(void* ca) {
 void tick() {
     static bool s_resolved = false;
     if (!s_resolved) { s_resolved = true; resolve(); }   // the armed line at startup (EnsureGuardAction, StartSyncGuard)
-    if (!g_recoil.load() && !g_clinch.load()) return;
+    if (!g_recoil.load() && !g_clinch.load() && !g_pair.id) return;
     poll_player();
 }
 

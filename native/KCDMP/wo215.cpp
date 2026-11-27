@@ -618,7 +618,7 @@ void retire_lease(uint32_t eid, uint32_t seq, Holder owner) {
     std::lock_guard<std::mutex> l(g_ordMu);
     auto it = g_leases.find(eid);
     if (it != g_leases.end() && it->second.seq == seq) {
-        holders::engine_stopped(eid, owner);
+        if (holders::engine_stopped(eid, owner) && owner == Holder::Escort) holders::forget(eid);
         g_leases.erase(it);
     }
 }
@@ -1815,10 +1815,22 @@ bool walk_own(uint32_t eid) {
     return it != g_routes.end() && it->second.active;
 }
 bool probe_owned(uint32_t eid) { return (g_probe.on && g_probe.eid == eid) || motion_pending(eid, Holder::Probe); }
-uint32_t order_go(uint32_t eid, const float target[3], uint8_t gait) {
-    return post_order(eid, kOrdGoPlain, target, speed_enum(static_cast<Gait>(gait < kGaits ? gait : 0)), 0.0f, Holder::Probe);
+uint32_t order_go(uint32_t eid, const float target[3], uint8_t gait, bool escort) {
+    return post_order(eid, kOrdGoPlain, target, speed_enum(static_cast<Gait>(gait < kGaits ? gait : 0)), 0.0f,
+                      escort ? Holder::Escort : Holder::Probe);
 }
-void order_stop(uint32_t eid) { post_order(eid, kOrdStopPlain, nullptr, 0, 0.0f, Holder::Probe); }
+void order_stop(uint32_t eid, bool escort) {
+    post_order(eid, kOrdStopPlain, nullptr, 0, 0.0f, escort ? Holder::Escort : Holder::Probe);
+}
+void release_escort_orders() {
+    std::vector<uint32_t> owned;
+    {
+        std::lock_guard<std::mutex> lock(g_ordMu);
+        for (const auto& item : g_leases)
+            if (item.second.owner == Holder::Escort && !item.second.stopping) owned.push_back(item.first);
+    }
+    for (uint32_t eid : owned) order_stop(eid, true);
+}
 bool ai_post(std::function<void()> fn) {
     if (!g_hooked.load(std::memory_order_relaxed)) return false;   // no door: the caller decides
     { std::lock_guard<std::mutex> l(g_aiFnMu); g_aiFns.push_back(std::move(fn)); }

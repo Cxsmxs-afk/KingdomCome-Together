@@ -578,6 +578,7 @@ public sealed class P6RangedBridgeTests
     {
         await using var r = await Rig.Create(host);
         await r.StartTimedReceiveAsync();
+        Get<ConcurrentDictionary<string, bool>>(r.Bridge, "_w221On")["bow_phases"] = false;
         Guid itemClass = weapon == RangedWeaponKind.Bow ? Bow : Crossbow;
         byte[] fence = await r.PrimeHandAsync(itemClass);
         var fire = Step(seq: 10) with { Kind = weapon, ItemClass = itemClass };
@@ -601,25 +602,23 @@ public sealed class P6RangedBridgeTests
     }
 
     [Fact]
-    public async Task A_bow_shot_uses_one_charge_of_the_current_body_and_ignores_a_second_fire()
+    public async Task Lost_bow_charge_keeps_one_typed_fire_and_does_not_repeat_the_same_capture()
     {
         await using var r = await Rig.Create(host: false);
         await r.StartTimedReceiveAsync();
         byte[] fence = await r.PrimeHandAsync(Bow);
         Get<ConcurrentDictionary<string, bool>>(r.Bridge, "_w221On")["bow_phases"] = true;
 
-        r.Link.Feed(TimedRanged(r.Peer, Step(seq: 9)), Down(Protocol.W164RangedStep, "after-unarmed", r.Peer));
-        using (var stop = new CancellationTokenSource())
-        {
-            var header = new byte[3];
-            var native = ReadFrameHeaderAsync(r.Server, header, stop.Token);
-            var processed = Until(() => Count(r.Bridge, "ranged_malformed") == 1);
-            if (await Task.WhenAny(native, processed) == native && await native)
-                Assert.Fail($"An unarmed Fire reached the DLL with opcode 0x{header[0]:X2}.");
-            await processed;
-            stop.Cancel();
-            Assert.False(await native);
-        }
+        byte[] lostCharge = TimedRanged(r.Peer, Step(seq: 9));
+        r.Link.Feed(lostCharge, lostCharge, Down(Protocol.W164RangedStep, "after-loss", r.Peer));
+        var first = Read(r.Server);
+        Task processed = Until(() => Count(r.Bridge, "ranged_malformed") == 1);
+        Assert.True(await Task.WhenAny(first, processed) == first, "The current Fire never reached the DLL after the Charge was lost.");
+        var recovered = await first;
+        AssertRangedFire(recovered.Type, recovered.Body, RangedWeaponKind.Bow, 3, Bow, fence);
+        await ReplyEdge(r.Server, recovered.Body, EdgeOutcome.Completed, 1, 0, 0);
+        await processed;
+        Assert.Equal(1, Count(r.Bridge, "ranged_bow_fire_recovered"));
 
         r.Link.Feed(TimedRanged(r.Peer, Step(seq: 10) with { Phase = 1 }));
         await Until(() => Count(r.Bridge, "ranged_phase_unrenderable") == 1);
@@ -627,14 +626,14 @@ public sealed class P6RangedBridgeTests
         var request = await Read(r.Server);
         AssertRangedFire(request.Type, request.Body, RangedWeaponKind.Bow, 3, Bow, fence);
         await ReplyEdge(r.Server, request.Body, EdgeOutcome.Completed, 1, 0, 0);
-        await Until(() => Get<long>(r.Bridge, "_w201RangedDispatched") == 1);
+        await Until(() => Get<long>(r.Bridge, "_w201RangedDispatched") == 2);
 
         r.Link.Feed(TimedRanged(r.Peer, Step(seq: 12)), TimedRanged(r.Peer, Step(seq: 11)),
             Down(Protocol.W164RangedStep, "after-duplicate", r.Peer));
         await Until(() => Count(r.Bridge, "ranged_malformed") == 2);
-        Assert.Equal(2, Count(r.Bridge, "ranged_bow_fire_unarmed"));
-        Assert.Equal(1, Count(r.Bridge, "ranged_duplicate"));
-        Assert.Equal(1, Get<long>(r.Bridge, "_w201RangedDispatched"));
+        Assert.Equal(1, Count(r.Bridge, "ranged_bow_fire_recovered"));
+        Assert.Equal(3, Count(r.Bridge, "ranged_duplicate"));
+        Assert.Equal(2, Get<long>(r.Bridge, "_w201RangedDispatched"));
     }
 
     private static async Task<bool> ReadFrameHeaderAsync(Stream stream, byte[] header, CancellationToken ct)

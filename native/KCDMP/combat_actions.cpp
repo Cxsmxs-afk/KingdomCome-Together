@@ -61,7 +61,7 @@ struct Entry {
     QueueStage queue = QueueStage::Reserved;
     bool callerHeld = false;
     bool protectUncertain = true;
-    uint32_t refsBeforeQueue = 0, refsAfterQueue = 0;
+    uint32_t refsBeforeQueue = 0, refsAfterQueue = 0, refsAtFinish = 0;
 };
 
 // The engine may reenter a release while Stop is on the stack. Never wait and never recursively acquire this gate.
@@ -191,23 +191,24 @@ BodyProof observe_actor(void* actor) {
     return !bucket.releaseDepth.load(std::memory_order_acquire) && revision == life->revision.load(std::memory_order_acquire)
         ? proof : BodyProof{};
 }
-bool add_ref(void* action) {
+uint32_t add_ref(void* action) {
     KCDMP_FAULT_READ(site, "combat_actions::add_ref");
-    bool added = false;
-    return fault::guarded(site, [&] {
+    uint32_t added = 0;
+    const bool readable = fault::guarded(site, [&] {
         const void* table = *reinterpret_cast<void**>(action);
         if (!g_actionVft || (table != g_actionVft && table != &g_quiet[1])) return;
         auto* refs = reinterpret_cast<volatile LONG*>(static_cast<char*>(action) + kActRefs);
         LONG count = InterlockedCompareExchange(refs, 0, 0);
         for (int attempt = 0; attempt < 4 && count > 0 && count < (std::numeric_limits<LONG>::max)(); ++attempt) {
             const LONG previous = InterlockedCompareExchange(refs, count + 1, count);
-            if (previous == count) { added = true; return; }
+            if (previous == count) { added = static_cast<uint32_t>(count + 1); return; }
             count = previous;
         }
-    }) && added;
+    });
+    return readable ? added : 0;
 }
 // the controller's own way of giving a reference back (CryAction: lock xadd [+0x58], -1; at zero the action's slot 23)
-bool drop_ref(void* action, bool unsubmitted = false, LONG owned = 1) {
+bool drop_ref(void* action, bool unsubmitted = false, LONG owned = 1, uint32_t* after = nullptr) {
     KCDMP_FAULT_READ(site, "combat_actions::drop_ref");
     LONG left = 1;
     void** vt = nullptr;
@@ -223,6 +224,8 @@ bool drop_ref(void* action, bool unsubmitted = false, LONG owned = 1) {
             left = count - owned;
             released = true;
         }) || !released) return false;
+    // Use the result of our decrement; reading the object after its last release is unsafe.
+    if (after) *after = static_cast<uint32_t>(left);
     // the action's own delete frees memory (the allocator's lock): a plain call, never under the fault guard
     if (left == 0) reinterpret_cast<void (*)(void*)>(vt[kSlotDelete])(action);
     return true;
@@ -289,12 +292,7 @@ bool note_finished(Entry& entry, bool actionKnown, const ActionReadback& seen) {
     if (entry.retirement == Retirement::Finished) return true;
     if (!detail::observe_finished(entry.retirement, actionKnown, seen.status)) return false;
     trace(entry, "finished", seen);
-    if (entry.refsBeforeQueue && entry.refsAfterQueue) {
-        deferred_log::Scope defer;
-        logf("MP-FIX REF before=%u after_queue=%u after_finish=%u eid=0x%X ticket=%llu twin=%d",
-             entry.refsBeforeQueue, entry.refsAfterQueue, seen.refs, entry.body.eid,
-             static_cast<unsigned long long>(entry.serial), entry.protectUncertain ? 0 : 1);
-    }
+    if (entry.refsAfterQueue) entry.refsAtFinish = seen.refs;
     c_ended.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -531,7 +529,13 @@ void tick() {
     const uint64_t epoch = g_epoch.load(std::memory_order_acquire), now = GetTickCount64();
     static size_t next = 0;
     auto& bucket = g_buckets[next++ & (kBuckets - 1)];
-    struct FinishedAction { void* actor; void* action; LONG owned; };
+    struct FinishedAction {
+        void* actor;
+        void* action;
+        LONG owned;
+        uint32_t before, queued, finished;
+        bool twin;
+    };
     std::array<FinishedAction, kSweepReads> done{};
     size_t reads = 0, finished = 0;
     {
@@ -561,15 +565,35 @@ void tick() {
             else if (seen.status == wo167rules::kStatusFinished && may_write(bucket, entry, ActionAccess::RetiredQueue)) {
                 note_finished(entry, true, seen);
                 // Status None can still belong to the controller's queue. Only its explicit Finished status can give our ref back.
-                done[finished++] = {entry.body.actor, entry.action, entry.callerHeld ? 2L : 1L};
+                done[finished++] = {entry.body.actor, entry.action, entry.callerHeld ? 2L : 1L,
+                    entry.refsBeforeQueue, entry.refsAfterQueue, entry.refsAtFinish, !entry.protectUncertain};
                 forget(entry);
             }
         }
     }
+    struct RefWindow { uint64_t before = 0, queue = 0, finish = 0, after = 0; unsigned actions = 0; };
+    static RefWindow windows[2]; // main thread only; bench and normal totals stay separate
     for (size_t i = 0; i < finished; ++i) {
-        if (drop_ref(done[i].action, false, done[i].owned)) continue;
-        c_quarantined.fetch_add(1, std::memory_order_relaxed);
-        note_tracking_gap(done[i].actor);
+        const auto& action = done[i];
+        uint32_t after = 0;
+        if (!drop_ref(action.action, false, action.owned, &after)) {
+            c_quarantined.fetch_add(1, std::memory_order_relaxed);
+            note_tracking_gap(action.actor);
+            continue;
+        }
+        if (!action.finished) continue;
+        auto& window = windows[action.twin];
+        window.before += action.before;
+        window.queue += action.queued;
+        window.finish += action.finished;
+        window.after += after;
+        if (++window.actions < 64) continue;
+        deferred_log::Scope defer;
+        logf("MP-FIX REF window=64 before=%llu after_queue=%llu after_finish=%llu after=%llu delta=%lld quarantined=%u twin=%d",
+             static_cast<unsigned long long>(window.before), static_cast<unsigned long long>(window.queue),
+             static_cast<unsigned long long>(window.finish), static_cast<unsigned long long>(window.after),
+             static_cast<long long>(window.after) - static_cast<long long>(window.before), c_quarantined.load(), action.twin ? 1 : 0);
+        window = {};
     }
 }
 
@@ -623,9 +647,11 @@ QueueTicket reserve_queue(const BodyProof& body, void* action, bool movesBody) {
         c_full.fetch_add(1, std::memory_order_relaxed);
         return refuse();
     }
-    if (!add_ref(action)) return refuse();
+    const uint32_t refs = add_ref(action);
+    if (!refs) return refuse();
     const auto serial = ++g_nextQueue;
     *free = {body, action, GetTickCount64(), body.queueEpoch, Retirement::Active, movesBody, serial};
+    if (wo221::on(wo221::kBitDeathTrace)) free->refsBeforeQueue = refs;
     c_tracked.fetch_add(1, std::memory_order_relaxed);
     c_live.fetch_add(1, std::memory_order_relaxed);
     return {body, action, serial};
@@ -643,11 +669,6 @@ bool begin_queue(const QueueTicket& ticket) {
     if (!entry || entry->queue != QueueStage::Reserved || entry->retirement != Retirement::Active) return false;
     entry->queue = QueueStage::InFlight;
     entry->protectUncertain = wo221::on(wo221::kBitQueueRefRelease);
-    if (wo221::on(wo221::kBitDeathTrace) && (entry->serial <= 32 || entry->serial % 32 == 0)) {
-        ActionReadback seen;
-        if (may_write(bucket, *entry, ActionAccess::CurrentBody) && read_owned_action(*entry, seen))
-            entry->refsBeforeQueue = seen.refs;
-    }
     return true;
 }
 

@@ -29,7 +29,8 @@ bool host_fights(uint32_t eid);
 // A (main thread): the mirror holds this copy in the local player's fight -- its host NPC fights his figure there now (wo132's op 2 never
 // lets it go for its distance meanwhile).
 bool mirror_holds_player(uint32_t copy);
-wo209rules::TargetWriter target_writer(uint32_t copy); // Main thread. All target writers use this decision.
+// Main thread. A proposed wish must already have a current body, target and load stamp.
+wo209rules::TargetWriter target_writer(uint32_t copy, bool proposedWish = false, const char** reason = nullptr);
 // A (main thread): the mirror speaks for this copy's opponent (WO-187's agent wish leaves it alone).
 bool mirrored(uint32_t copy);
 // B (main thread, mp_copy_attack_ai): is this host action (its class and fragment) to be the copy's own combat attack at the local player --

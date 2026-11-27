@@ -86,16 +86,16 @@ inline bool opp_send_due(bool changed, double sinceSentS, uint8_t kind) { return
 constexpr double kMirrorStaleS = 4.0;
 
 enum class TargetWriter : uint8_t { Legacy, Host, Fallback };
-inline TargetWriter target_writer(bool configured, bool fallback, double age, bool currentScope) {
+inline TargetWriter target_writer(bool configured, bool scopedWish, double age, bool currentScope) {
     if (!configured) return TargetWriter::Legacy;
-    if (!fallback || (currentScope && age >= 0 && age < kMirrorStaleS)) return TargetWriter::Host;
-    return TargetWriter::Fallback;
+    if (currentScope && age >= 0 && age < kMirrorStaleS) return TargetWriter::Host;
+    return scopedWish ? TargetWriter::Fallback : TargetWriter::Legacy;
 }
 
 inline bool legacy_target_may_write(TargetWriter writer) { return writer == TargetWriter::Legacy; }
 
 inline bool target_wish_owned(TargetWriter writer, bool mirrored, bool fallback) {
-    if (mirrored) return writer != TargetWriter::Fallback;
+    if (mirrored) return writer == TargetWriter::Host;
     return writer == (fallback ? TargetWriter::Fallback : TargetWriter::Legacy);
 }
 // The mirror re-applies (and samples) each copy this often: one stream tick.

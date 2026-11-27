@@ -198,6 +198,7 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             if (n0 == 0) eid = player_eid();
             else { const std::string nm(reinterpret_cast<const char*>(body + 2), n0); eid = hits::eid_of_name(nm.c_str()); }
             motion::ModelRead m{};
+            // The pipe command promises the model at the time of the query.
             if (!eid || !motion::read_model(eid, &m)) return kRNoActor;
             const unsigned v = m.valid;
             const int n = std::snprintf(reinterpret_cast<char*>(out), cap,

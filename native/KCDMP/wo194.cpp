@@ -353,8 +353,9 @@ void release(Held& h, Release why) {
     push(kEvReleased, h.name, h.path, std::string(det) + " how=" + how);
     logf("WO194-HOLD released '%s': %s -- %s", h.name.c_str(), det, how.c_str());
     deferred_log::Scope defer;
-    logf("MP-FIX CUT released after %.3f s (%s) scene='%s' action=%u",
-         static_cast<double>(h.doneAtMs - h.atMs) / 1000.0, release_name(why), h.name.c_str(), static_cast<unsigned>(act));
+    logf("MP-FIX CUT stage=hold-release reason=%s held_ms=%llu handler_state=%d active=%d in_progress=%d action=%u",
+         release_name(why), static_cast<unsigned long long>(h.doneAtMs - h.atMs), r.state, active ? 1 : 0, prog ? 1 : 0,
+         static_cast<unsigned>(act));
 }
 
 void recheck(Held& h) {

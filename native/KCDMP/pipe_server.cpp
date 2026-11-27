@@ -67,6 +67,8 @@
 #include "wo206.h"
 #include "wo218_rules.h"
 #include "wo221.h"
+#include "wo215.h"
+#include "body_order.h"
 #include "wo200.h"
 #include "wo197.h"
 #include "wo173.h"
@@ -668,7 +670,7 @@ LoadAccess load_access(uint8_t type, const uint8_t* body, size_t n) {
             return op == wo163::kOpReplay || op == wo163::kOpSkirmishPair ||
                    op == wo173::kOpRealHit || op == wo197::kOpPair || op == wo197::kOpSyncGuard ||
                    op == wo197::kOpEnsureGuard || op == wo187::kOpOpponent || op == wo187::kOpGuardHold ||
-                   op == wo200::kOpReplay || op == wo216::kOpRouteIn ? LoadAccess::Live : LoadAccess::Control;
+                   op == wo200::kOpReplay || op == wo216::kOpRouteIn || op == bodyorder::kOpEscortGo ? LoadAccess::Live : LoadAccess::Control;
         default:
             return LoadAccess::Read;
     }
@@ -2684,6 +2686,7 @@ void serve(HANDLE h) {
     logf("PIPE: agent disconnected");
     // WO-118: no agent, no stream -- every native binding is dropped.
     npcdrive::on_pipe_closed();
+    main_thread::post([] { wo215::release_escort_orders(); });
     main_thread::post([] { kcdmp::wo132::on_pipe_closed(); });   // WO-132: engaged copies let go (main-thread state)
     main_thread::post([] { kcdmp::motion::on_pipe_closed(); });  // WO-154 2: the avatars' identities go with the session
     main_thread::post([] { kcdmp::wo201::on_pipe_closed(); });   // WO-201: its session parts stand down

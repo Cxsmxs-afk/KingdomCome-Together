@@ -13,8 +13,9 @@ namespace KcdMp.Client;
 public partial class GameBridge
 {
     private readonly ConcurrentDictionary<string, bool> _w221On = new(StringComparer.Ordinal);
-    private bool W221On(string name) => _w221On.TryGetValue(name, out bool v) ? v : W221Switch.DefaultOn(name) && !W221Switch.TwinOff(name);
+    private bool W221On(string name) => !W221Switch.TwinOff(name) && (_w221On.TryGetValue(name, out bool v) ? v : W221Switch.DefaultOn(name));
     private int _w221Pushing;
+    private int _w221StartupLogged;
 
     // ---- B: the keepers' shops ---------------------------------------------------------------------------------------------
     private string _w221KeepersSent = "";
@@ -252,7 +253,7 @@ public partial class GameBridge
     }
     private string _w221HostHorseClash = "";
 
-    private async Task Wo221OrderAsync(byte op, byte[] body, string what)
+    private async Task Wo221OrderAsync(byte op, byte[] body)
     {
         try
         {
@@ -260,12 +261,24 @@ public partial class GameBridge
             byte code = r is { Ok: true } rr && rr.Payload.Length >= 1 ? rr.Payload[0] : (byte)0;
             if (code == 1) Interlocked.Increment(ref _w221Orders);
             else if (Interlocked.Increment(ref _w221OrderRefused) <= 50)
-                Console.WriteLine($"MP-W221 order {(op == Protocol.Wo221OpGo ? "go" : "stop")} '{what}' not carried out: {code switch { 2 => "no such body in this world", 3 => "the movement request is not armed on this build", 4 => "mp_own_horse is off", 5 => "the engine order queue refused", _ => "the DLL did not answer" }}");
+                Console.WriteLine($"MP-W221 order op={op} not carried out: {code switch { 2 => "no such body in this world", 3 => "the movement request is not armed on this build", 4 => "the feature is off", 5 => "the engine order queue refused", _ => "the DLL did not answer" }}");
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException or TimeoutException) { }
     }
 
-    private void Wo221OnConnect(CancellationToken ct) { _w221MyHorse = "?"; _ = Wo221TellModAsync(); _ = Wo221PushNativeAsync(); }
+    private void Wo221OnConnect()
+    {
+        _w221MyHorse = "?";
+        if (Interlocked.Exchange(ref _w221StartupLogged, 1) == 0)
+        {
+            static string State(bool on) => on ? "on" : "off";
+            var switches = W221Switch.Names.Select(n => $"{n}={State(W221On(n))}")
+                .Concat(Wo209Rules.SwitchNames.Select(n => $"{n}={State(W209(n))}"));
+            Console.WriteLine($"MP-FIX CFG {string.Join(' ', switches)} figure_ranged={State(W201("figure_ranged"))} anim_clinch={State(_w197Clinch)} scene_ingame_hold={State(_w194Hold)}");
+        }
+        _ = Wo221TellModAsync();
+        _ = Wo221PushNativeAsync();
+    }
 
     private void Wo221OnEvent(string name, string? arg)
     {
@@ -291,11 +304,14 @@ public partial class GameBridge
                 Wo221OnHostKeepers(arg);
                 return;
             case "w221_go":      // D.2 (host): "<name> <x> <y> <z> <gait>" -- a body of this world sent there by its own movement
-                if (W137Host && Wo221Rules.GoBody(arg) is { } gb) _ = Wo221OrderAsync(Protocol.Wo221OpGo, gb, arg!);
-                else Console.WriteLine($"MP-W221 order refused: '{arg}'");
+            case "w221_escort_go":
+                if (W137Host && Wo221Rules.GoBody(arg) is { } gb)
+                    _ = Wo221OrderAsync(name == "w221_go" ? Protocol.Wo221OpGo : Protocol.Wo221OpEscortGo, gb);
                 return;
             case "w221_stop":    // D.2 (host): "<name>" -- its request cancelled
-                if (W137Host && arg is { Length: > 0 and <= 63 } sn && Wo137Text.IsNpc(sn)) _ = Wo221OrderAsync(Protocol.Wo221OpStop, Wo221Rules.CloseBody(sn), sn);
+            case "w221_escort_stop": // cancellation is safe after role loss, because the DLL only releases an escort's own order
+                if ((W137Host || name == "w221_escort_stop") && arg is { Length: > 0 and <= 63 } sn && Wo137Text.IsNpc(sn))
+                    _ = Wo221OrderAsync(name == "w221_stop" ? Protocol.Wo221OpStop : Protocol.Wo221OpEscortStop, Wo221Rules.CloseBody(sn));
                 return;
             case "w221_bags":      // D.4 (joiner): "<horse> <rev> <part> <parts> <items>" -- this player's horse inventory, to the host
                 if (W137Joiner && Wo221BagRules.IsBags(arg)) _ = Wo137SendAsync(Protocol.QuestAskUp, Protocol.JoinTargetHost, Protocol.QuestAskHorseBags, Wo157InstallKey(), arg!);

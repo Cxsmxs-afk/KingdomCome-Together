@@ -330,7 +330,7 @@ bool body_json(const Body& b, double now, bool firstBody, std::string& line) {
     // and on a copy the host NPC's FullBody family as the owner last applied it (the stale-posture and combat-idle instruments)
     {
         motion::ModelRead m{};
-        const bool mr = motion::observe_model(b.eid, &m);
+        const bool mr = motion::observe_model(b.eid, &m, e);
         char opn[96] = "";
         if (mr && m.opponentEid) { void* oe = engine::entity_by_id(m.opponentEid); const char* on = oe ? engine::entity_name(oe) : nullptr; json_escape(on ? on : "?", opn, sizeof opn); }
         const char* fam = "empty";

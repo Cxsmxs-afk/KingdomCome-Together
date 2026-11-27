@@ -31,8 +31,9 @@ int wo209_tests(int* passed) {
 
     {
         using kcdmp::motion::ModelRead;
-        unsigned reads = 0;
+        unsigned reads = 0, lookups = 0;
         int original = 1, replacement = 2;
+        const auto lookup = [&](const void* entity) { ++lookups; return entity; };
         const auto raw = [&](const void* actor, ModelRead* out) {
             ++reads;
             out->opponentEid = *static_cast<const int*>(actor);
@@ -40,11 +41,13 @@ int wo209_tests(int* passed) {
         };
         kcdmp::motion::FrameModels frame;
         frame.begin();
-        const auto read = [&](void* actor, uint64_t scope, ModelRead* out) { return frame.read(7, actor, scope, out, raw); };
+        const auto read = [&](void* entity, uint64_t scope, ModelRead* out) {
+            return frame.read(7, entity, {scope, 2, 3}, out, [&] { return lookup(entity); }, raw);
+        };
         ModelRead first{}, same{}, rebound{}, reloaded{};
         const bool observed = read(&original, 1, &first) && read(&original, 1, &same) && read(&replacement, 1, &rebound) && read(&replacement, 2, &reloaded);
-        WCHECK(observed && reads == 3 && frame.counts.reused == 1 && same.opponentEid == 1 && rebound.opponentEid == 2 && reloaded.opponentEid == 2,
-               "duplicate observations cost one read, and body replacement and world generation invalidate it (reads=%u)", reads);
+        WCHECK(observed && reads == 3 && lookups == 3 && frame.counts.reused == 1 && same.opponentEid == 1 && rebound.opponentEid == 2 && reloaded.opponentEid == 2,
+               "duplicate observations cost one actor lookup and model read; body replacement and load invalidate both (reads=%u lookups=%u)", reads, lookups);
     }
 
     // ---- A: the host's kinds
@@ -72,18 +75,22 @@ int wo209_tests(int* passed) {
     WCHECK(wish_kind(kHerePlayer) == 1 && wish_kind(kHereEntity) == 2 && wish_kind(kHereNone) == 0, "the wo187 wish kinds");
     WCHECK(kMirrorTickS <= 0.1, "one stream tick");
     {
-        const auto host = target_writer(true, true, 0.1, true);
-        const auto duringLoss = target_writer(true, true, kMirrorStaleS, true);
-        const auto legacy = target_writer(false, true, 0.1, true);
-        WCHECK(host == TargetWriter::Host && duringLoss == TargetWriter::Fallback &&
-               target_writer(true, true, 0.1, false) == TargetWriter::Fallback &&
-               target_writer(true, false, kMirrorStaleS, true) == TargetWriter::Host &&
-               legacy == TargetWriter::Legacy && !legacy_target_may_write(host) &&
-               !legacy_target_may_write(duringLoss) && legacy_target_may_write(legacy) &&
-               !target_wish_owned(duringLoss, false, false) && !target_wish_owned(duringLoss, true, false) &&
-               target_wish_owned(duringLoss, false, true) && !target_wish_owned(host, false, true) &&
-               target_wish_owned(host, true, false),
-               "stream loss grants only the fallback wish writer; direct legacy calls remain readers");
+        bool exactlyOne = true;
+        for (const bool enabled : {true, false}) for (const bool oldSwitch : {false, true}) {
+            // Fresh; expired; same id with a different entity; same entity in a new load.
+            for (unsigned state : {1u, 0u, 2u, 3u}) for (const bool checkedWish : {false, true}) {
+                const auto writer = target_writer(enabled, checkedWish, state == 1 ? kMirrorStaleS : 0.1, state < 2);
+                const bool host = enabled && state == 0 && target_wish_owned(writer, true, false);
+                const bool fallback = checkedWish && target_wish_owned(writer, false, true);
+                const bool direct = legacy_target_may_write(writer);
+                if (host + fallback + direct != 1) {
+                    std::printf("owner=%d fallback_switch=%d stream=%u scoped_wish=%d writers=%d\n",
+                                enabled, oldSwitch, state, checkedWish, host + fallback + direct);
+                    exactlyOne = false;
+                }
+            }
+        }
+        WCHECK(exactlyOne, "a current host or scoped wish writes; otherwise exactly one legacy path remains eligible");
     }
 
     // ---- A.4's sample

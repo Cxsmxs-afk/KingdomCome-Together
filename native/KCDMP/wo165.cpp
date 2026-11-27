@@ -204,6 +204,7 @@ Result replay(const Request& rq) {
     if (!vEnt || !engine::entity_world_pos(vEnt, pos)) { res.reason = kNoPosition; c_refused.fetch_add(1); return res; }
     pos[2] += 1.2f;   // the chest, not the feet: the record's hit position is only used for effects
     void* vSoul = victimIsPlayer ? rttr::read_player_soul() : hits::soul_of_eid(veid);
+    // Both reads describe the contact immediately before its damage call.
     motion::read_model(veid, &res.victimModel);
     motion::read_model(rq.attackerEid, &res.attackerModel);
     if (refer_blocking((rq.flags & kFlagReferBlocking) != 0, (rq.flags & kFlagReferUnlessStriking) != 0, victim_blocking(res.victimModel),
@@ -475,7 +476,7 @@ void lock_tick(const uint32_t* npcs, int n) {
                 static kcdmp::wo166rules::LineLimiter s_c1;
                 if (now - row.onFigureSince >= 10.0 && (la < 0 || now - la >= 10.0) && s_c1.allow(npcs[i], now)) {
                     motion::ModelRead nm{}, fm{};
-                    const bool nok = motion::observe_model(npcs[i], &nm), fok = motion::observe_model(c.opponentEid, &fm);
+                    const bool nok = motion::observe_model(npcs[i], &nm, e), fok = motion::observe_model(c.opponentEid, &fm, oe);
                     logf("WO166-C1 npc=%s on the figure eid=0x%X for %.0f s within %.1f m, no attack committed for %s: npc state=0x%X cm=%u at=%d "
                          "figure state=0x%X cm=%u opp=%s automation_mode=%u tid=%lu", npc_name(npcs[i]), c.opponentEid, now - row.onFigureSince, od,
                          la < 0 ? "ever" : "10 s+", nok ? static_cast<unsigned>(nm.state) : 0u, nok ? nm.combatMode : 0u, nok ? nm.atkType : -9,

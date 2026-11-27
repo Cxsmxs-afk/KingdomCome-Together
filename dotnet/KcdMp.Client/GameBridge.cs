@@ -1873,7 +1873,7 @@ public partial class GameBridge(ClientConfig config)
         Wo216OnConnect(cts.Token);           // WO-216: the switches, the host's route lines (A)
         Wo217OnConnect(cts.Token);           // WO-217: the switches
         Wo218OnConnect(cts.Token);           // WO-218: the switches, the batch's probe
-        Wo221OnConnect(cts.Token);           // WO-221: the switches
+        Wo221OnConnect();                    // WO-221: the switches
         Wo147OnConnect(cts.Token);           // WO-147: the joiner fights hostile copies, destructive quest steps checked, the leash's stats
         Wo148OnConnect(cts.Token);           // WO-148: carrying on the other screen (the carrier owns the body; the host's world decides)
         Wo154MenuOnConnect(cts.Token);       // WO-154 7b: the mod menu (the saved choices, the host's levers, fast travel)

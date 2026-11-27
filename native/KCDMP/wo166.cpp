@@ -6,7 +6,6 @@
 #include "wo208.h"
 #include "wo208_rules.h"
 #include "wo209.h"
-#include "wo209_rules.h"
 #include "wo163.h"
 #include "wo166_rules.h"
 #include "wo172.h"
@@ -331,7 +330,7 @@ bool ensure_target_player(uint32_t copy, void* ca, void* model, bool* hadIt) {
         KCDMP_FAULT_CALL(tsite, "wo166::target_entity");
         if (fault::guarded(tsite, [&] { te = (*reinterpret_cast<void* (__fastcall***)(void*)>(tgt))[1](tgt); }) && te == pEnt) { *hadIt = true; return true; }
     }
-    if (!wo209rules::legacy_target_may_write(wo209::target_writer(copy))) return false;
+    if (!wo187::direct_target_allowed(copy)) return false;
     // WO-187 A2 (mp_opp_logical): the engine's own SetLogicalTarget -- the requested target as well, so the opponent manager's update keeps it
     if (wo187::opp_logical_on()) return wo187::ensure_target(ca, model, pEnt, hadIt);
     if (!resolve_opp_set_target()) return false;
@@ -897,6 +896,7 @@ void tick() {
         if (s.wrote && !s.done && !s.playerDodged && now >= s.begin && wo208::on(wo208rules::kBitDefenceLocal)) {
             motion::ModelRead pm{};
             const uint32_t pe = player_eid();
+            // Live dodge, striking and block edges below decide whether this swing may land.
             if (pe && motion::read_model(pe, &pm) && (pm.valid & motion::kMvState) && (pm.state & wo208rules::kPlayerStateDodge) != 0) s.playerDodged = true;
         }
         if (s.wrote && !s.done && !s.midRead && now >= (s.begin + s.end) / 2) {

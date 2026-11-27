@@ -5,6 +5,7 @@
 #include "wo221.h"
 #include "wo203.h"
 #include "wo163.h"
+#include "wo215.h"
 #include "log.h"
 
 #ifndef NOMINMAX
@@ -24,7 +25,7 @@ const N kNames[] = {{"combat_action_end", kBitCombatActionEnd}, {"talk_hold", kB
                     {"rp_controller", kBitRemoteController}, {"rp_combat", kBitRemoteCombat}, {"death_trace", kBitDeathTrace},
                     {"queue_ref_release", kBitQueueRefRelease}, {"npc_target_owner", kBitNpcTargetOwner},
                     {"attack_window_snapshot", kBitAttackWindowSnapshot}, {"frame_snapshot", kBitFrameSnapshot},
-                    {"reaction_sync", kBitReactionSync}, {"target_fallback", kBitTargetFallback}};
+                    {"reaction_sync", kBitReactionSync}, {"escort_nav", kBitEscortNav}};
 }
 
 uint32_t twin_off_bits(const char* names) {
@@ -49,16 +50,13 @@ std::atomic<uint32_t> g_bits{kBitsDefault};
 std::atomic<bool> g_configured{false};
 std::atomic<uint8_t> g_role{0};
 
-uint32_t twin_off() {
-    static uint32_t s = 0xFFFFFFFFu;
-    if (s == 0xFFFFFFFFu) {
-        char b[256] = {};
-        const DWORD n = GetEnvironmentVariableA("KCDMP_TEST_W221_OFF", b, sizeof b);
-        s = (n > 0 && n < sizeof b) ? twin_off_bits(b) : 0;
-        if (s) logf("WO221-CFG the bench's twin: bits 0x%X off for this game (KCDMP_TEST_W221_OFF=%s)", s, b);
-    }
-    return s;
-}
+const uint32_t kTwinOff = [] {
+    char names[256]{};
+    const DWORD n = GetEnvironmentVariableA("KCDMP_TEST_W221_OFF", names, sizeof names);
+    return n > 0 && n < sizeof names ? twin_off_bits(names) : 0u;
+}();
+
+uint32_t twin_off() { return kTwinOff; }
 
 struct More { const char* area; StatusFn fn; };
 More g_more[24];
@@ -88,6 +86,7 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
         const uint8_t wasRole = g_role.exchange(body[5]);
         if (wasRole != body[5]) logf("WO221-CFG role %u -> %u (0 none, 1 the host, 2 a joiner in the host's world)", wasRole, body[5]);
         const uint32_t was = g_bits.exchange(bits);
+        if ((wasRole == 1 && body[5] != 1) || ((was & kBitEscortNav) && !(bits & kBitEscortNav))) wo215::release_escort_orders();
         if (was != bits || !g_configured.exchange(true)) {
             char t[300];
             status(t, sizeof t);

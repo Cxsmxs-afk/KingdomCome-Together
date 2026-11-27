@@ -125,7 +125,8 @@ uint8_t op_opp_read(const uint8_t* body, size_t len, uint8_t* out, size_t cap, s
         if (nl == 0 || nl > 63) continue;
         motion::ModelRead m{};
         c_oppReads.fetch_add(1);
-        const uint32_t opp = motion::observe_model(eid, &m) && m.hasModel ? m.opponentEid : 0;
+        // The published opponent is authoritative for other peers; take a live read at dispatch.
+        const uint32_t opp = motion::read_model(eid, &m) && m.hasModel ? m.opponentEid : 0;
         const uint8_t kind = host_kind(opp, me, opp != 0 && motion::is_avatar_eid(opp));
         HostOpp& h = g_hostOpp[eid];
         const bool changed = !h.told || h.kind != kind || h.opp != opp;
@@ -165,6 +166,12 @@ std::atomic<uint32_t> c_in{0}, c_bad{0}, c_samples{0}, c_match{0}, c_engaged{0},
 std::atomic<uint32_t> c_combatHeld{0}, c_inChanges{0};   // mirror ticks that held a copy in combat mode on the local player
 std::vector<float> g_followMs;   // the follow times (ms), the newest 512
 
+uint32_t mirror_entity(uint8_t kind, uint32_t target) { return kind == kHerePlayer ? player_eid() : target; }
+bool target_scope(const MirrorCopy& m, void* entity, uint64_t load) {
+    return entity && m.entity == entity && m.load == load && (m.kind == kHereNone ||
+        (m.targetEntity && m.targetEntity == engine::entity_by_id(mirror_entity(m.kind, m.target))));
+}
+
 uint8_t op_opp_in(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
     *outLen = 0;
     if (len < 2) return wo163::kRBadRequest;
@@ -180,7 +187,7 @@ uint8_t op_opp_in(const uint8_t* body, size_t len, uint8_t* out, size_t cap, siz
         if (!copy) continue;
         void* entity = engine::entity_by_id(copy);
         if (!entity) continue;
-        void* targetEntity = kind == kHereEntity ? engine::entity_by_id(target) : nullptr;
+        void* targetEntity = kind != kHereNone ? engine::entity_by_id(mirror_entity(kind, target)) : nullptr;
         MirrorCopy& m = g_mirror[copy];
         if (m.kind != kind || m.target != target || m.at == 0 || m.load != load ||
             m.entity != entity || m.targetEntity != targetEntity) {
@@ -210,11 +217,12 @@ void twin_sample(double now) {
     const uint32_t me = player_eid();
     for (auto it = g_mirror.begin(); it != g_mirror.end();) {
         MirrorCopy& m = it->second;
-        if (now - m.at > kMirrorStaleS || !engine::entity_by_id(it->first)) { it = g_mirror.erase(it); continue; }
+        void* entity = engine::entity_by_id(it->first);
+        if (now - m.at > kMirrorStaleS || !entity) { it = g_mirror.erase(it); continue; }
         if (now - m.applyAt < kMirrorTickS || !sample_counts(m.kind, now - m.changedAt)) { ++it; continue; }
         m.applyAt = now;
         motion::ModelRead r{};
-        const uint32_t have = motion::read_model(it->first, &r) && r.hasModel ? r.opponentEid : 0;
+        const uint32_t have = motion::observe_model(it->first, &r, entity) && r.hasModel ? r.opponentEid : 0;
         const uint32_t want = m.kind == kHerePlayer ? me : m.target;
         c_twinSamples.fetch_add(1);
         if (want && have == want) c_twinMatch.fetch_add(1);
@@ -223,7 +231,7 @@ void twin_sample(double now) {
 }
 
 void mirror_tick(double now) {
-    if (!on(kBitOppMirror)) {
+    if (!on(kBitOppMirror) || !wo221::on(wo221::kBitNpcTargetOwner) || wo221::role() != 2 || !wo187::opp_logical_on()) {
         if (g_mirrorWasOn) {
             for (auto& kv : g_mirror) wo187::mirror_wish(kv.first, 0, 0, nullptr);
             g_mirrorWasOn = false;
@@ -233,16 +241,15 @@ void mirror_tick(double now) {
         return;
     }
     g_mirrorWasOn = true;
-    const bool strict = wo221::on(wo221::kBitNpcTargetOwner);
     const auto load = loadsequence::stamp();
+    if (!loadsequence::allows(load, loadsequence::Access::Live)) return;
     for (auto it = g_mirror.begin(); it != g_mirror.end();) {
         const uint32_t copy = it->first;
         MirrorCopy& m = it->second;
         void* entity = engine::entity_by_id(copy);
         const bool due = now - m.applyAt >= kMirrorTickS;
-        if (now - m.at >= kMirrorStaleS || !entity ||
-            (strict && (m.load != load || m.entity != entity ||
-                (due && m.kind == kHereEntity && (!m.targetEntity || m.targetEntity != engine::entity_by_id(m.target)))))) {
+        if (!npcdrive::is_bound_eid(copy) || motion::is_avatar_eid(copy) || now - m.at >= kMirrorStaleS ||
+            !entity || m.load != load || m.entity != entity || (due && !target_scope(m, entity, load))) {
             wo187::mirror_wish(copy, 0, 0, nullptr);
             c_cleared.fetch_add(1);
             it = g_mirror.erase(it);
@@ -265,9 +272,9 @@ void mirror_tick(double now) {
         if (match && !m.followed) {
             m.followed = true;
             const auto follows = c_follows.fetch_add(1) + 1;
-            if (strict && (follows <= 32 || follows % 64 == 0)) {
+            if (follows <= 32 || follows % 64 == 0) {
                 deferred_log::Scope defer;
-                logf("MP-FIX TGT owner=host npc=%s active=0x%X kind=%u", name_of(copy), have, static_cast<unsigned>(m.kind));
+                logf("MP-FIX TGT owner=host reason=fresh npc=%s active=0x%X kind=%u", name_of(copy), have, static_cast<unsigned>(m.kind));
             }
             if (g_followMs.size() >= 512) g_followMs.erase(g_followMs.begin());
             g_followMs.push_back(static_cast<float>((now - m.changedAt) * 1000.0));
@@ -376,6 +383,7 @@ void ai_window_tick(double now) {
     const uint32_t me = pe ? engine::entity_id(pe) : 0;
     const bool shared = wo221::on(wo221::kBitAttackWindowSnapshot);
     motion::ModelRead pm{};
+    // Sample the current defender before resolving this frame's queued attack windows.
     const bool known = me && motion::read_model(me, &pm);
     const bool dodging = known && (pm.valid & motion::kMvState) && (pm.state & wo208rules::kPlayerStateDodge) != 0;
     unsigned reused = 0;
@@ -477,27 +485,36 @@ bool on(uint32_t bit) { return (g_bits.load(std::memory_order_relaxed) & ~twin_o
 
 bool fix_on(uint32_t fixBit) { return (twin_off() & fixBit) == 0; }
 
-TargetWriter target_writer(uint32_t copy) {
+TargetWriter target_writer(uint32_t copy, bool proposedWish, const char** reason) {
     const bool configured = wo221::on(wo221::kBitNpcTargetOwner) && on(kBitOppMirror) && wo221::role() == 2 &&
-        !motion::is_avatar_eid(copy) && npcdrive::is_bound_eid(copy);
+        wo187::opp_logical_on() && !motion::is_avatar_eid(copy) && npcdrive::is_bound_eid(copy);
+    if (reason) *reason = "scope";
     if (!configured) return TargetWriter::Legacy;
-    if (!wo221::on(wo221::kBitTargetFallback)) return TargetWriter::Host;
+    const double now = qpc_s();
     const auto it = g_mirror.find(copy);
-    if (it == g_mirror.end()) return TargetWriter::Fallback;
-    const auto& mirror = it->second;
-    const double age = qpc_s() - mirror.at;
-    const bool current = age >= 0 && age < kMirrorStaleS && mirror.load == loadsequence::stamp() &&
-        mirror.entity && mirror.entity == engine::entity_by_id(copy) &&
-        (mirror.kind != kHereEntity || (mirror.targetEntity && mirror.targetEntity == engine::entity_by_id(mirror.target)));
-    return wo209rules::target_writer(configured, true, age, current);
+    const double age = it != g_mirror.end() ? now - it->second.at : kMirrorStaleS;
+    const bool timely = age >= 0 && age < kMirrorStaleS;
+    const auto load = loadsequence::stamp();
+    const bool live = loadsequence::allowed(load, load, loadsequence::Access::Live);
+    const bool current = it != g_mirror.end() && timely && live && target_scope(it->second, engine::entity_by_id(copy), load);
+    const bool scoped = !current && live && (proposedWish || wo187::scoped_target_wish(copy, now));
+    const TargetWriter writer = wo209rules::target_writer(configured, scoped, age, current);
+    const char* why = current ? "fresh" : !live || timely ? "scope" : "stale";
+    if (reason) *reason = why;
+    if (writer == TargetWriter::Legacy) {
+        static double nextLog = 0;
+        if (now >= nextLog) {
+            nextLog = now + 1.0;
+            deferred_log::Scope defer;
+            logf("MP-FIX TGT owner=legacy reason=%s eid=0x%X", why, copy);
+        }
+    }
+    return writer;
 }
 
 bool mirror_holds_player(uint32_t copy) {
-    if (!on(kBitOppMirror)) return false;
-    auto it = g_mirror.find(copy);
-    return it != g_mirror.end() && it->second.kind == kHerePlayer && qpc_s() - it->second.at <= kMirrorStaleS &&
-        (!wo221::on(wo221::kBitNpcTargetOwner) || (it->second.load == loadsequence::stamp() &&
-                                                it->second.entity == engine::entity_by_id(copy)));
+    const auto it = g_mirror.find(copy);
+    return it != g_mirror.end() && it->second.kind == kHerePlayer && mirrored(copy);
 }
 
 bool host_fights(uint32_t eid) {
@@ -507,10 +524,12 @@ bool host_fights(uint32_t eid) {
 
 bool mirrored(uint32_t copy) {
     if (!on(kBitOppMirror)) return false;
-    auto it = g_mirror.find(copy);
-    return it != g_mirror.end() && qpc_s() - it->second.at <= kMirrorStaleS &&
-        (!wo221::on(wo221::kBitNpcTargetOwner) || (it->second.load == loadsequence::stamp() &&
-                                                it->second.entity == engine::entity_by_id(copy)));
+    const auto it = g_mirror.find(copy);
+    if (it == g_mirror.end() || qpc_s() - it->second.at >= kMirrorStaleS) return false;
+    if (!wo221::on(wo221::kBitNpcTargetOwner)) return true;
+    const auto load = loadsequence::stamp();
+    return loadsequence::allowed(load, load, loadsequence::Access::Live) &&
+        target_scope(it->second, engine::entity_by_id(copy), load);
 }
 
 namespace {
@@ -563,6 +582,7 @@ bool ai_attack(uint32_t copy, uint32_t hostFrag) {
     // read -> the engine's own pick (-1), as the AI's
     motion::ModelRead m{};
     int zone = -1;
+    // The engine attack request consumes the zone that is current at dispatch.
     if (motion::read_model(copy, &m) && (m.valid & motion::kMvAtkZone) && m.atkZone >= 0 && m.atkZone < 16) zone = m.atkZone;
     return ai_attack_zone(copy, hostFrag, zone, "owner");
 }
@@ -666,7 +686,9 @@ bool paired_engine(uint32_t copy, uint32_t frag) {
         return ok;
     }
     char why[256];
-    const int r = wo197::start_sync_guard(kClinchGuardType, copy, player_eid(), why, sizeof why);
+    const uint32_t player = player_eid();
+    const int r = wo197::start_sync_guard(kClinchGuardType, copy, player, why, sizeof why);
+    wo197::note_pair_request(copy, player, frag, r);
     (r == 1 ? c_pairStart : c_pairStartRefused).fetch_add(1);
     const uint32_t k = c_pairStart.load() + c_pairStartRefused.load();
     if (k <= 40 || k % 25 == 0)

@@ -11,6 +11,7 @@
 #include "wo163_rules.h"
 #include "fault_guard.h"
 #include "frame_snapshot.h"
+#include "frame_meter.h"
 #include "load_sequence.h"
 
 #include <windows.h>
@@ -2308,7 +2309,14 @@ namespace {
 thread_local bool g_observationFrame = false;
 thread_local FrameModels g_frameModels;
 thread_local FrameModels::Counts g_observationWindow;
+thread_local framemeter::CostHistogram g_observationCost{};
+thread_local double g_observationTotal = 0;
+thread_local unsigned g_observationThrottled = 0;
 thread_local unsigned g_observationFrames = 0;
+
+ModelScope model_scope() {
+    return {loadsequence::stamp(), wo216::lifecycle_observation_stamp(), p4::life_edge_tick()};
+}
 }
 
 void begin_model_frame() {
@@ -2316,27 +2324,33 @@ void begin_model_frame() {
     if (g_observationFrame) g_frameModels.begin();
 }
 
-void end_model_frame() {
+void end_model_frame(double oursUs, unsigned throttled) {
     if (!g_observationFrame) return;
     g_observationFrame = false;
     const auto& counts = g_frameModels.counts;
     g_observationWindow.reads += counts.reads;
     g_observationWindow.reused += counts.reused;
     g_observationWindow.overflow += counts.overflow;
+    g_observationThrottled += throttled;
+    g_observationTotal += oursUs;
+    framemeter::record_cost(g_observationCost, oursUs);
     if (++g_observationFrames < 1024) return;
     deferred_log::Scope defer;
-    logf("MP-FIX PERF frame frames=%u reads=%u reused=%u overflow=%u", g_observationFrames,
-         g_observationWindow.reads, g_observationWindow.reused, g_observationWindow.overflow);
+    logf("MP-FIX PERF frame frames=%u reads=%u reused=%u actor_reused=%u overflow=%u throttled=%u us_p95=%.0f mean_us=%.0f",
+         g_observationFrames, g_observationWindow.reads, g_observationWindow.reused, g_observationWindow.reused,
+         g_observationWindow.overflow, g_observationThrottled, framemeter::p95(g_observationCost), g_observationTotal / g_observationFrames);
     g_observationFrames = 0;
     g_observationWindow = {};
+    std::memset(g_observationCost, 0, sizeof(g_observationCost));
+    g_observationTotal = 0;
+    g_observationThrottled = 0;
 }
 
-bool observe_model(uint32_t eid, ModelRead* out) {
-    if (!g_observationFrame) return read_model(eid, out);
-    const auto scope = loadsequence::stamp();
-    void* actor = actor_by_eid(eid);
-    if (scope != loadsequence::stamp()) return read_model(eid, out);
-    return g_frameModels.read(eid, actor, scope, out, &read_actor_model);
+bool observe_model(uint32_t eid, ModelRead* out, const void* entity) {
+    if (!g_observationFrame || !entity) return read_model(eid, out);
+    const auto scope = model_scope();
+    const bool observed = g_frameModels.read(eid, entity, scope, out, [eid] { return actor_by_eid(eid); }, &read_actor_model);
+    return scope == model_scope() ? observed : read_model(eid, out);
 }
 
 bool is_avatar_eid(uint32_t eid) {
