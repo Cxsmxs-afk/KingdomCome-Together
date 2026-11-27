@@ -107,7 +107,7 @@ void observe_pair(Clinch local, bool localReadable) {
     void* model = nullptr;
     if (!motion::combat_parts(g_pair.master, false, &copy, &model)) return;
     const auto a0 = wo187::director_scope(copy, 0), a1 = wo187::director_scope(copy, 1);
-    if (!a0.ok || !a1.ok) return;
+    if (!clinch_scope_readable(a0.ok, a0.act, a0.name) || !clinch_scope_readable(a1.ok, a1.act, a1.name)) return;
     const Clinch remote = clinch_of(a0.name, a1.name);
     if (!g_pair.both && local != Clinch::None && remote != Clinch::None) {
         motion::ModelRead a{}, b{};
@@ -351,7 +351,7 @@ void poll_player() {
     if (!g_clinch.load() && !g_pair.id) return;
     const wo187::DirAction s1 = wo187::director_scope(ca, 1);
     const Clinch now = clinch_of(s0.act ? s0.name : "", s1.act ? s1.name : "");
-    observe_pair(now, s0.ok && s1.ok);
+    observe_pair(now, clinch_scope_readable(s0.ok, s0.act, s0.name) && clinch_scope_readable(s1.ok, s1.act, s1.name));
     if (!g_clinch.load()) return;
     const bool newMove = now == Clinch::Move && s0.act != g_lastSt;
     const uint8_t ev = clinch_event(g_clinchWas, now, newMove);

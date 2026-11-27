@@ -57,6 +57,9 @@ constexpr int kProbeMs = 2000, kProbeWindows = 2, kProbeLines = 160;
 
 // ---- B3 ----------------------------------------------------------------------------------------------------------------------------
 enum class Clinch : uint8_t { None = 0, Idle = 1, Move = 2 };
+constexpr bool clinch_scope_readable(bool read, bool hasAction, const char* actionName) {
+    return read && (!hasAction || (actionName && *actionName && *actionName != '?'));
+}
 inline bool is_clinch_idle(const char* scope1) { return scope1 && std::strcmp(scope1, "GuardSyncMovement") == 0; }
 inline bool is_clinch_move(const char* scope0) { return scope0 && std::strcmp(scope0, "SyncTransition") == 0; }
 inline Clinch clinch_of(const char* scope0, const char* scope1) {
