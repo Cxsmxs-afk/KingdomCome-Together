@@ -274,12 +274,18 @@ public class PackerTests
             string[] privateValues =
             [
                 .. addressesAndSteamIds,
-                "Test Windows User", "LinuxTester", "MacTester", "inner-ticket-value", "inner-password-value"
+                "Test Windows User", "LinuxTester", "MacTester", "inner-ticket-value", "inner-password-value",
+                "Games Folder", "private-branch.log", "private-share", "Private Display Name", "Other Display Name",
+                "game/kcd-private.log", "game\\kcd-private.log", "Private Retail Persona"
             ];
             string log = "12:00:15.924 MP-MARK odd " + string.Join(" ", addressesAndSteamIds) + " ::1\n"
-                + "C:\\Users\\Test Windows User\\game\\kcd.log /home/LinuxTester/game /Users/MacTester/Game\n"
+                + "C:\\Users\\Test Windows User\\game\\kcd-private.log /home/LinuxTester/game/kcd-private.log /Users/MacTester/Game\n"
+                + "failed opening D:\\Games Folder\\private-branch.log stage=setup\n"
+                + "source=\\\\private-share\\logs\\agent.log stage=copy\n"
+                + "[KcdLog] Found Steam name: Private Display Name\n"
+                + $"Game user_id={addressesAndSteamIds[4]}='Private Retail Persona'\n"
                 + "[MP-STATS] ours_us_p95=1310\n";
-            string settings = """{"path":"C:\\Users\\Test Windows User\\game","hostRestartTicket":"inner-ticket-value","password":"inner-password-value"}""";
+            string settings = """{"path":"C:\\Users\\Test Windows User\\game","playerName":"Other Display Name","hostRestartTicket":"inner-ticket-value","password":"inner-password-value"}""";
             var result = Packer.Pack([
                 new("agent.log", Bytes: Encoding.UTF8.GetBytes(log)),
                 new("settings.json", Bytes: Encoding.UTF8.GetBytes(settings)),
@@ -300,8 +306,11 @@ public class PackerTests
             Assert.True(leaked.Length == 0, "A private value remained in the manifest.");
             Assert.Contains("12:00:15.924", Encoding.UTF8.GetString(archive["agent.log"]));
             Assert.Contains("ours_us_p95=1310", Encoding.UTF8.GetString(archive["agent.log"]));
+            Assert.Contains("<path> stage=setup", Encoding.UTF8.GetString(archive["agent.log"]));
             using var sanitizedSettings = System.Text.Json.JsonDocument.Parse(archive["settings.json"]);
             Assert.Equal("<redacted>", sanitizedSettings.RootElement.GetProperty("password").GetString());
+            Assert.Equal("<path>", sanitizedSettings.RootElement.GetProperty("path").GetString());
+            Assert.Equal("<redacted>", sanitizedSettings.RootElement.GetProperty("playerName").GetString());
         }
         finally { Directory.Delete(dir, true); }
     }

@@ -23,16 +23,31 @@ public static partial class DiagnosticRedaction
     [GeneratedRegex("""(?<prefix>/(?:Users|home)/)[^/\s"']+""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex UnixProfiles();
 
-    [GeneratedRegex("""(?<!\w)(?<key>["']?(?:host[-_ ]?restart[-_ ]?ticket|steam(?:join)?code|password|passphrase|api[_-]?key|access[_-]?token|relay[_-]?token|authorization)["']?\s*[:=]\s*)(?<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer[ ])?[^\s,;}\]]+)""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
-    private static partial Regex SecretValues();
+    [GeneratedRegex("""(?<!\w)(?<key>["']?(?:host[-_ ]?restart[-_ ]?ticket|steam(?:join)?code|password|passphrase|api[_-]?key|access[_-]?token|relay[_-]?token|authorization|(?:player|display)[_-]?name)["']?\s*[:=]\s*)(?<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer[ ])?[^\s,;}\]]+)""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex PrivateValues();
 
+    // Keep surrounding quotes and following key=value fields in textual diagnostics and JSON.
+    [GeneratedRegex("""(?<![\w/\\:])(?:[A-Z]:[\\/]+|\\{2,}[^\\/\s"'<>|]+\\+|/(?:home|users|mnt|media|run|tmp|var|opt|workspace|volumes|srv|root|etc|private|applications)/)[^"'<>|\r\n]*?(?=$|[\r\n"'<>|]|[ \t]+(?:/|[A-Z]:[\\/]|[A-Z_][\w-]*=))""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex AbsolutePaths();
+
+    [GeneratedRegex("""^(?<prefix>[ \t]*(?:\d{2}:\d{2}:\d{2}(?:\.\d+)?[ \t]+)?(?:\[KcdLog\][ \t]+Found Steam name[ \t]*:|\[Steam\][ \t]+PersonaName[ \t]*=|Name[ \t]*:)[ \t]*)[^\r\n]+""", RegexOptions.Multiline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex LegacyAgentNames();
+
+    [GeneratedRegex("""(?<!\w)(?<prefix>user_id[ \t]*=[ \t]*)\d+[ \t]*=[ \t]*'[^'\r\n]*'""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex GameUser();
 
     [GeneratedRegex("""(?<![a-z0-9])(?:version|build|v)\s*[:=]?\s*$""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex VersionLabel();
 
     public static string Text(string text, Func<IPAddress, string?>? addressAlias = null, bool entry = false)
     {
-        text = SecretValues().Replace(text, match =>
+        if (!entry)
+        {
+            text = AbsolutePaths().Replace(text, "<path>");
+            text = LegacyAgentNames().Replace(text, "${prefix}<redacted>");
+            text = GameUser().Replace(text, "${prefix}<steam-id>='<redacted>'");
+        }
+        text = PrivateValues().Replace(text, match =>
         {
             string value = match.Groups["value"].Value;
             string quote = value[0] is '"' or '\'' ? value[..1] : "";

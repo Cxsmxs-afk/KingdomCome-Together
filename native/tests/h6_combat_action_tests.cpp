@@ -2,6 +2,7 @@
 #include "combat_actions.h"
 
 #include <cstdio>
+#include <initializer_list>
 
 int h6_combat_action_tests(int* passed) {
     using kcdmp::combatactions::BodyProof;
@@ -104,20 +105,33 @@ int h6_combat_action_tests(int* passed) {
           [&] { ++calls; return false; }, identity) == QueueResult::Uncertain && calls == 2,
           "an engine fault retains uncertain ownership and never retries");
 
-    // The caller, offered smart pointer and ledger start with one reference each.
-    const auto remaining = [](QueueResult result, bool protect, bool proved, bool controllerRetains) {
-        int refs = 3;
-        if (result == QueueResult::Refused) --refs; // ledger undoes the reservation
-        if (result == QueueResult::Submitted) refs += controllerRetains ? 0 : -1; // manager consumes the offer
-        refs -= static_cast<int>(kcdmp::combatactions::detail::caller_releases(result, protect, proved));
-        return refs;
-    };
-    check(remaining(QueueResult::Submitted, true, true, true) == 3 &&
-          remaining(QueueResult::Submitted, true, true, false) == 2 &&
-          remaining(QueueResult::Refused, true, false, false) == 0 &&
-          remaining(QueueResult::Uncertain, true, true, false) == 3 &&
-          remaining(QueueResult::Uncertain, false, true, false) == 2 &&
-          remaining(QueueResult::Uncertain, false, false, false) == 3,
-          "submitted preserves the caller and ledger references; the twin releases an uncertain caller only with proof");
+    // Main owns the caller and offered references, and the ledger owns its reservation.
+    // The engine can take its own references and independently consumes the offer.
+    enum class Recipient { Immediate, Watcher, Wo208 };
+    bool balanced = true;
+    for (const auto result : {QueueResult::Refused, QueueResult::Submitted, QueueResult::Uncertain})
+        for (const bool protect : {false, true}) for (const bool proved : {false, true})
+            for (const auto recipient : {Recipient::Immediate, Recipient::Watcher, Recipient::Wo208}) {
+                const int opening = 0;
+                int refs = opening + 3;
+                const auto drop = [&](int count) { balanced = balanced && refs >= count; refs -= count; };
+                const int engine = result == QueueResult::Refused ? 0 : 2;
+                refs += engine;
+                if (result == QueueResult::Refused) drop(1); // settle undoes its ledger reservation
+                else drop(1); // manager consumes the offered smart pointer
+                const int early = static_cast<int>(kcdmp::combatactions::detail::caller_releases(result, protect, proved));
+                drop(early);
+                if (result == QueueResult::Submitted && recipient == Recipient::Immediate) drop(1);
+                drop(engine);
+                if (result == QueueResult::Submitted && recipient != Recipient::Immediate) drop(1); // inherited caller ref
+                if (result == QueueResult::Submitted) drop(1); // ledger at Finished
+                if (result == QueueResult::Uncertain) {
+                    const int retained = protect || !proved ? 2 : 1;
+                    balanced = balanced && refs == retained; // an unknown state must still own its safety references
+                    drop(retained); // exact receipt now proves Finished
+                }
+                balanced = balanced && refs == opening;
+            }
+    check(balanced, "ledger, Watcher and WO208 return exactly their own references after proven completion");
     return failed;
 }

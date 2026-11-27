@@ -12,6 +12,7 @@
 #include "engine.h"
 #include "log.h"
 #include "npc_drive.h"
+#include "motion.h"
 
 #include <atomic>
 #include <cstdio>
@@ -21,6 +22,7 @@ namespace kcdmp::bodyorder {
 
 namespace {
 
+constexpr uint32_t kPlayerEntity = 0x7777;
 std::atomic<uint32_t> c_go{0}, c_stop{0}, c_noBody{0}, c_notArmed{0};
 
 uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
@@ -30,36 +32,39 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
     char name[64]{};
     uint8_t gait = 0;
     float to[3]{};
-    if (opc == kOpGo) {
+    const bool escort = opc == kOpEscortGo || opc == kOpEscortStop;
+    const bool go = opc == kOpGo || opc == kOpEscortGo;
+    if (go) {
         if (len < 4) return wo163::kRBadRequest;
         gait = body[1];
         const uint8_t nl = body[2];
         if (nl == 0 || nl > 63 || gait > 3 || static_cast<size_t>(3 + nl + 12) != len) return wo163::kRBadRequest;
         std::memcpy(name, body + 3, nl);
         std::memcpy(to, body + 3 + nl, 12);
-    } else if (opc == kOpStop) {
+    } else if (opc == kOpStop || opc == kOpEscortStop) {
         if (len < 3) return wo163::kRBadRequest;
         const uint8_t nl = body[1];
         if (nl == 0 || nl > 63 || static_cast<size_t>(2 + nl) != len) return wo163::kRBadRequest;
         std::memcpy(name, body + 2, nl);
     } else return wo163::kRBadRequest;
-    if (opc == kOpGo && !wo221::on(wo221::kBitOwnHorse)) return answer(kOff, 0);
+    if (go && !wo221::on(escort ? wo221::kBitEscortNav : wo221::kBitOwnHorse)) return answer(kOff, 0);
     if (!wo215::route_armed()) { c_notArmed.fetch_add(1, std::memory_order_relaxed); return answer(kNotArmed, 0); }
     void* e = npcdrive::entity_by_name(name);
     const uint32_t eid = e ? engine::entity_id(e) : 0;
     if (!eid) { c_noBody.fetch_add(1, std::memory_order_relaxed); return answer(kNoBody, 0); }
-    if (opc == kOpStop) {
-        wo215::order_stop(eid);
+    if (!go) {
+        wo215::order_stop(eid, escort);
         const uint32_t k = c_stop.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (k <= 100 || k % 100 == 0) logf("WO221-ORDER npc=%s stop: its movement request is cancelled the task's own way [n=%u]", name, k);
+        if (k <= 100 || k % 100 == 0) logf("WO221-ORDER eid=0x%X stop requested [n=%u]", eid, k);
         return answer(kOk, 0);
     }
-    const uint32_t id = wo215::order_go(eid, to, gait);
+    if (escort && (wo221::role() != 1 || eid == kPlayerEntity || motion::is_avatar_eid(eid) || npcdrive::is_bound_eid(eid)))
+        return answer(kRefused, 0);
+    const uint32_t id = wo215::order_go(eid, to, gait, escort);
     if (!id) return answer(kRefused, 0);
     const uint32_t k = c_go.fetch_add(1, std::memory_order_relaxed) + 1;
     if (k <= 200 || k % 100 == 0)
-        logf("WO221-ORDER npc=%s go to (%.1f,%.1f,%.1f) gait=%u -> order %u (the engine's own movement request, made at the AI update's entry) [n=%u]",
-             name, to[0], to[1], to[2], gait, id, k);
+        logf("WO221-ORDER eid=0x%X go gait=%u order=%u stage=queued [n=%u]", eid, gait, id, k);
     return answer(kOk, id);
 }
 
@@ -68,7 +73,8 @@ int status(char* out, int n) {
                          c_notArmed.load(), wo215::route_armed() ? 1 : 0);
 }
 
-const bool kReg = wo203::reg_op(kOpGo, &op) && wo203::reg_op(kOpStop, &op) && wo221::add_status("body_order", &status);
+const bool kReg = wo203::reg_op(kOpGo, &op) && wo203::reg_op(kOpStop, &op) &&
+    wo203::reg_op(kOpEscortGo, &op) && wo203::reg_op(kOpEscortStop, &op) && wo221::add_status("body_order", &status);
 
 } // namespace
 

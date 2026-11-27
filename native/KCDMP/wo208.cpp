@@ -1516,6 +1516,7 @@ void target_watch_tick() {
     for (int i = 0; i < n; ++i) {
         if (motion::is_avatar_eid(bb[i].eid)) continue;
         motion::ModelRead m{};
+        // Only borrow a body whose active target is the player at this decision.
         if (!motion::read_model(bb[i].eid, &m) || !m.hasModel || m.opponentEid != me) continue;
         void* cs = hits::soul_of_eid(bb[i].eid);
         bool answered = false, hostile = false;

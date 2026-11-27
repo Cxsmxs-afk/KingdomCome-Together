@@ -13,7 +13,7 @@ namespace kcdmp::holders {
 
 enum class Holder : uint8_t {
     None = 0, Writer, Driver, Seat, Activity, Fall, Mount, OneShot,
-    Route, Respawn, Leash, Unstuck, Figure, Cart, Probe, Count
+    Route, Respawn, Leash, Unstuck, Figure, Cart, Probe, Escort, Count
 };
 enum class Claim { Available, Held, Release };
 
@@ -70,7 +70,7 @@ class Table {
 
     static bool valid(Holder who) { return who > Holder::None && who < Holder::Count; }
     static bool engine_request(Holder who) {
-        return who == Holder::Driver || who == Holder::Route || who == Holder::Probe;
+        return who == Holder::Driver || who == Holder::Route || who == Holder::Probe || who == Holder::Escort;
     }
 
     static bool conflicts(const Body& body, Holder who, std::string_view path, uint64_t frame) {

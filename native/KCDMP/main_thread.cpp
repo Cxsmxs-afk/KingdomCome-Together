@@ -209,9 +209,11 @@ void hooked_update(void* self, float dt) {
     const bool cost = g_costOn.load(std::memory_order_relaxed);
     if (cost && g_cost.size() < repeating.size()) g_cost.resize(repeating.size());
     const char* topName = "?"; double topUs = 0;   // WO-221 F.1: this frame's largest item
+    unsigned throttled = 0;
     for (size_t i = 0; i < repeating.size(); ++i) {
         Repeating& r = *repeating[i];
-        if (r.blocked || (r.researchWatch && t1 < r.nextUs)) continue;
+        if (r.blocked) continue;
+        if (r.researchWatch && t1 < r.nextUs) { throttled += r.throttled; continue; }
         if (!cost && !r.researchWatch) { run_guarded(r.site, &r.fn); continue; }
         const double a = now_us();
         if (r.researchWatch) r.nextUs = a + wo218rules::research_watch_delay_us(0);
@@ -237,7 +239,6 @@ void hooked_update(void* self, float dt) {
         if (d > topUs) { topUs = d; topName = r.name; }
     }
 
-    motion::end_model_frame();
     if (const auto drain = g_bulkDrain.load(std::memory_order_acquire)) drain();
     double batchUs = 0;
     uint32_t items = 0;
@@ -259,6 +260,7 @@ void hooked_update(void* self, float dt) {
     const double t2 = now_us();
     fault::tick(t2 / 1e6);                 // WO-151: the 60 s FAULT-SUM line
     const double calendarUs = tEngine - t0;
+    motion::end_model_frame(t2 - t1 + calendarUs, throttled);
     note_frame_rate(t1, t2 - t1 + calendarUs); // WO-151: include the pre-update work too
     if (cost && t2 - t1 >= kSlowOursUs) { if (batchUs > topUs) note_slow("queued-work", batchUs); else note_slow(topName, topUs); }   // WO-221 F.1
     if (cost) note_cost(t1 - tEngine, t2 - t1 + calendarUs, batchUs, items, t2);

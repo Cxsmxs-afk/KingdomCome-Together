@@ -27078,23 +27078,15 @@ function KCD2MP_W164EscortFollow(name, ghost, on)
         pcall(function() e = System.GetEntityByName(name) end)
         if not e then mp_log("WO164-ESCORT host: no NPC named " .. name .. " in this world -- nothing follows"); return false end
         if w.escort[name] then return true end
-        local nav = KCD2MP_W221On("escort_nav")
-        if nav and (not KCD2MP.w137.host or not KCD2MP_W221On("own_horse") or e == player or KCD2MP.npcPuppets[name]
-                or not e.soul or (mp_is_mod_entity and mp_is_mod_entity(e))) then return false end
-        w.escort[name] = { ghost = tonumber(ghost), since = os.clock(), nav = nav, entity = e }
-        if not nav then w164_exec("wh_ai_PauseNPC " .. name) end
-        mp_log(string.format("WO164-ESCORT host npc=%s ghost=%s on mode=%s", name, tostring(ghost), nav and "nav" or "legacy"))
+        if not KCD2MP_W221On("escort_nav") or not KCD2MP.w137.host or e == player or KCD2MP.npcPuppets[name]
+                or not e.soul or (mp_is_mod_entity and mp_is_mod_entity(e)) then return false end
+        w.escort[name] = { ghost = tonumber(ghost), since = os.clock(), entity = e }
         return true
     end
     for nm, x in pairs(w.escort) do
         if (name == nil or nm == name) and (ghost == nil or x.ghost == tonumber(ghost)) then
             w.escort[nm] = nil
-            if x.nav then
-                if x.goal and System.GetEntityByName(nm) == x.entity then KCD2MP_EmitEvent("w221_stop", nm) end
-            else
-                w164_exec("wh_ai_ResumeNPC " .. nm)
-            end
-            mp_log("WO164-ESCORT host npc=" .. nm .. " off -- its own brain again")
+            if x.goal and System.GetEntityByName(nm) == x.entity then KCD2MP_EmitEvent("w221_escort_stop", nm) end
         end
     end
     return true
@@ -27135,11 +27127,11 @@ function KCD2MP.w164.escortNavigate(nm, x, now)
     end
 
     if bestD <= 3 then
-        if x.goal then KCD2MP_EmitEvent("w221_stop", nm); x.goal = nil end
+        if x.goal then KCD2MP_EmitEvent("w221_escort_stop", nm); x.goal = nil end
         x.leader = best
     elseif (not x.orderAt or now - x.orderAt >= 1) and (not x.goal or x.leader ~= best or w164_dist2(x.goal, bestPos) >= 4) then
-        -- Send coordinates to the existing AI-update order queue. A guest body supplies the goal in the host's world.
-        KCD2MP_EmitEvent("w221_go", string.format("%s %.3f %.3f %.3f %d", nm, bestPos.x, bestPos.y, bestPos.z, bestD > 8 and 2 or 0))
+        -- The movement request is made on the AI update thread and owns only the host escort's current body.
+        KCD2MP_EmitEvent("w221_escort_go", string.format("%s %.3f %.3f %.3f %d", nm, bestPos.x, bestPos.y, bestPos.z, bestD > 8 and 2 or 0))
         if not x.goal or x.leader ~= best then
             mp_log(string.format("MP-FIX ESC follow=%s mode=nav distance=%.1f stage=requested", best, bestD))
         end
@@ -27152,33 +27144,12 @@ function KCD2MP_W164EscortTick()
     if next(w.escort) == nil then return end
     local now = os.clock()
     for nm, x in pairs(w.escort) do
-        local e, a = nil, nil
-        pcall(function() e = System.GetEntityByName(nm); a = System.GetEntityByName("kcd2mp_" .. tostring(x.ghost)) end)
-        if x.nav then
-            if e ~= x.entity or not KCD2MP.w137.host or not KCD2MP.w137.active or not a or (now - x.since) > 900
-                    or not KCD2MP_W221On("escort_nav") or not KCD2MP_W221On("own_horse") then
-                KCD2MP_W164EscortFollow(nm, nil, false)
-            else
-                w.escortNavigate(nm, x, now)
-            end
-        elseif not e or not a or (now - x.since) > 900 then
+        local e = System.GetEntityByName(nm)
+        if e ~= x.entity or not KCD2MP.w137.host or not KCD2MP.w137.active or not KCD2MP.ghosts[tostring(x.ghost)] or now - x.since > 900
+                or not KCD2MP_W221On("escort_nav") then
             KCD2MP_W164EscortFollow(nm, nil, false)
         else
-            local ep, ap = nil, nil
-            pcall(function() ep = e:GetWorldPos(); ap = a:GetWorldPos() end)
-            if ep and ap then
-                local dx, dy = ep.x - ap.x, ep.y - ap.y
-                local d = math.sqrt(dx * dx + dy * dy)
-                if d > 3.0 then
-                    -- 2 m from the figure on the side it already stands (it trails, never on top)
-                    local k = 2.0 / math.max(d, 0.01)
-                    local tz = ap.z
-                    pcall(function() tz = System.GetTerrainElevation({ x = ap.x + dx * k, y = ap.y + dy * k, z = ap.z }) or ap.z end)
-                    if math.abs(tz - ap.z) > 2.5 then tz = ap.z end
-                    pcall(function() e:SetWorldPos({ x = ap.x + dx * k, y = ap.y + dy * k, z = tz }) end)
-                    x.moves = (x.moves or 0) + 1
-                end
-            end
+            w.escortNavigate(nm, x, now)
         end
     end
 end
@@ -37550,9 +37521,9 @@ do
         load_sequence = "mp_load_sequence", baseline_events = "mp_baseline_events", world_recovery = "mp_world_recovery",
         queue_ref_release = "mp_queue_ref_release", escort_nearest_all = "mp_escort_nearest_all", npc_target_owner = "mp_npc_target_owner",
         attack_window_snapshot = "mp_attack_window_snapshot", escort_nav = "mp_escort_nav", frame_snapshot = "mp_frame_snapshot",
-        shop_definition = "mp_shop_definition", reaction_sync = "mp_reaction_sync", target_fallback = "mp_target_fallback", bow_phases = "mp_bow_phases",
+        shop_definition = "mp_shop_definition", reaction_sync = "mp_reaction_sync", bow_phases = "mp_bow_phases",
     }
-    W221.DEFAULT_OFF = { escort_nav = true, frame_snapshot = true, shop_definition = true, reaction_sync = true, target_fallback = true, bow_phases = true }
+    W221.DEFAULT_OFF = { escort_nav = true }
     W221.HELP = {
         combat_action_end = "A: (both) no combat animation of ours outlives its body's combat part (the joiner's fight crash)",
         talk_hold = "B: (joiner) a copy woken for a talk asks nothing of its own schedule while it talks (the trade that closed)",
@@ -37575,12 +37546,11 @@ do
         queue_ref_release = "Keep an uncertain action's caller reference until its confirmed finish",
         escort_nearest_all = "Use all bound partners for the host's distance triggers",
         escort_nav = "Use the host's engine movement order for a quest escort (requires the body order path)",
-        npc_target_owner = "Use the host's opponent stream as the sole target writer for NPC copies",
+        npc_target_owner = "Use one current target owner for an NPC copy, with a local fallback when the stream is stale",
         attack_window_snapshot = "Share the player's combat observation across this frame's attack windows",
         frame_snapshot = "Share an Engine combat-model sample among frame observers",
         reaction_sync = "Play queued melee reactions in the source's observed order",
-        target_fallback = "Fall back to the host's combat events when its target stream goes stale",
-        bow_phases = "Require a current draw or aim observation before playing the bow shot",
+        bow_phases = "Keep a current bow shot when its draw or aim message is missing and reject repeated phase edges",
         load_sequence = "Apply the world only for its current load generation",
         baseline_events = "Install the world baseline and confirm each ordered event",
         world_recovery = "Check the world by area and repair that area or reconnect",
@@ -37713,13 +37683,19 @@ do
     function KCD2MP_W221HorseTackProbe(arg)
         local name = tostring(arg or ""):match("^%s*\"?([%w_]+)\"?%s*$")
         if not name or #name > 59 then return false end
-        local count, own = nil, false
+        local count, own, found = nil, false, false
         pcall(function()
             local h = System.GetEntityByName(name)
             if not (h and h.class == "Horse") then return end
-            own = player and player.player and player.player:GetHorseId() == h.id
-            if h.inventory then count = #h.inventory:GetInventoryTable() end
+            found = true
+            if player and player.player then
+                local id = player.player:GetHorseId()
+                own = id and id ~= 0 and System.GetEntity(id) == h or false
+            end
+            local items = h.inventory and h.inventory:GetInventoryTable()
+            if type(items) == "table" then count = #items end
         end)
+        if not found then return false end
         mp_log(string.format("MP-FIX TACK horse=%s own=%s inventory_entries=%s equipped_slots=unobserved",
             name, tostring(own), tostring(count or "unknown")))
         return count ~= nil

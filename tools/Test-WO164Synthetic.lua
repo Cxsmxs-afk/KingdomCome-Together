@@ -366,15 +366,17 @@ do
     ENTS["hledaniPsa_ignaz"] = dog
     ENTS["kcd2mp_1"] = { GetWorldPos = function() return { x = 20, y = 0, z = 0 } end }
     CMDS = {}
-    check("C3 (host): paused and followed", KCD2MP_W164EscortFollow("hledaniPsa_ignaz", 1, true) == true and cmdCount("wh_ai_PauseNPC hledaniPsa_ignaz") == 1)
+    KCD2MP.w137.host, KCD2MP.w137.active = true, true
+    check("C3 (host, off): quest brain stays in control", not KCD2MP_W164EscortFollow("hledaniPsa_ignaz", 1, true)
+        and cmdCount("wh_ai_PauseNPC hledaniPsa_ignaz") == 0)
     KCD2MP_W164EscortTick()
-    check("C4 (host): 2 m behind the figure, on its own side", moved ~= nil and math.abs(moved.x - 18) < 0.01, moved and moved.x)
+    check("C4 (host, off): no order or manual placement", moved == nil
+        and countEvt("w221_escort_go", "hledaniPsa_ignaz", mark) == 0)
     KCD2MP_W164EscortFollow(nil, 1, false)
-    check("C5 (host): the end gives its brain back", cmdCount("wh_ai_ResumeNPC hledaniPsa_ignaz") == 1 and next(KCD2MP.w164.escort) == nil)
+    check("C5 (host, off): no lease or AI resume", cmdCount("wh_ai_ResumeNPC hledaniPsa_ignaz") == 0 and next(KCD2MP.w164.escort) == nil)
 
     -- One native escort scenario iterates through two, three and four players. C3–C5 above are the off twin.
-    KCD2MP_W221Cfg("escort_nav=on")
-    KCD2MP.w137.host, KCD2MP.w137.active = true, true
+    KCD2MP_W221Cfg("escort_nav=on,own_horse=off")
     PX = -7
     moved = nil
     ENTS["kcd2mp_1"].GetWorldPos = function() return { x = 17, y = 0, z = 0 } end
@@ -392,10 +394,11 @@ do
     NOW = NOW + 2
     KCD2MP_W164EscortTick()
     KCD2MP_W164EscortFollow(nil, 1, false)
-    check("C6: nearest native escort with a stable lead change, no placement, and one stop", hostFirst and held
+    check("C6: nearest native escort without the horse feature, a stable lead change, no placement, and one stop", hostFirst and held
         and lastLog("MP-FIX ESC follow=2 mode=nav", mark) ~= nil and moved == nil
-        and countEvt("w221_go", "hledaniPsa_ignaz", mark) == 2 and countEvt("w221_stop", "hledaniPsa_ignaz", mark) == 1)
-    KCD2MP_W221Cfg("escort_nav=off")
+        and countEvt("w221_escort_go", "hledaniPsa_ignaz", mark) == 2 and countEvt("w221_escort_stop", "hledaniPsa_ignaz", mark) == 1
+        and countEvt("w221_go", "hledaniPsa_ignaz", mark) == 0 and countEvt("w221_stop", "hledaniPsa_ignaz", mark) == 0)
+    KCD2MP_W221Cfg("escort_nav=off,own_horse=on")
     KCD2MP.ghosts["1"], KCD2MP.ghosts["2"], KCD2MP.ghosts["3"] = nil, nil, nil
     KCD2MP.w137.host = false
     PX = 0

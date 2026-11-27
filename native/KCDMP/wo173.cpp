@@ -591,6 +591,7 @@ void tick() {
         Pending& p = *it;
         if (!p.stateRead && now - p.t0 >= kReactionReadS) {
             motion::ModelRead m{};
+            // This is the victim's state after the engine processed this hit.
             if (motion::read_model(p.veid, &m) && (m.valid & motion::kMvState)) p.stateAfter = m.state;
             p.stateRead = true;
         }

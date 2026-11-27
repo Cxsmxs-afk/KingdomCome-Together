@@ -88,6 +88,7 @@ const char* name(Holder h) {
         case Holder::Figure: return "figure";
         case Holder::Cart: return "cart";
         case Holder::Probe: return "probe";
+        case Holder::Escort: return "escort";
         default: return "none";
     }
 }

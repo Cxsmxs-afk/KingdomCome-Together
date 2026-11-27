@@ -43,6 +43,9 @@ int wo197_tests(int* passed) {
     WCHECK(clinch_event(Clinch::Move, Clinch::Move, false) == 0, "the same move on the next read: nothing");
     WCHECK(clinch_event(Clinch::Move, Clinch::Idle, false) == 0, "back to the clinch idle: nothing");
     WCHECK(clinch_event(Clinch::Idle, Clinch::None, false) == kClinchLeave && clinch_event(Clinch::Move, Clinch::None, false) == kClinchLeave, "out: leave");
+    WCHECK(!clinch_scope_readable(true, true, "?") && !clinch_scope_readable(true, true, "") &&
+           !clinch_scope_readable(false, false, "") && clinch_scope_readable(true, false, "") && clinch_scope_readable(true, true, "Guard"),
+           "a scope with an unrecognizable action cannot confirm that the pair finished");
     // B5: what A6 never ends, and when EnsureGuardAction has work
     WCHECK(keep_main_action("Hit") && keep_main_action("SyncHit") && keep_main_action("SyncTransition") && keep_main_action("SyncPerfectBlockHit"),
            "real reactions and paired moves are kept");

@@ -155,7 +155,7 @@ public partial class GameBridge
         byte hostGhost = fromGhost != 0xFF ? fromGhost : _leashHostId != 0xFF ? _leashHostId : _hostModeFrom;
         // Stop sending requests while the host's stream is fresh. The DLL arbitrates against its exact body and load stamp.
         bool streamOwner = W221On("npc_target_owner") && W209Eff("copy_opponent_mirror", 1u);
-        bool mayFallback = streamOwner && W221On("target_fallback") &&
+        bool mayFallback = streamOwner &&
             (!_w209OppLast.TryGetValue(ev.Name, out var received) || now - received.At is < 0 or >= Wo209Rules.MirrorFightFreshMs);
         if (_w187OppLogical && (!streamOwner || mayFallback) &&
             Wo187Rules.OppWish(ev, _myGhostId, hostGhost) is { } w)

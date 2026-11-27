@@ -93,12 +93,12 @@ try
         File.Copy(agentLogPath, prevLogPath, overwrite: true);
     var teeStream = new StreamWriter(agentLogPath, append: false) { AutoFlush = true };
     Console.SetOut(new TeeTextWriter(Console.Out, teeStream));
-    Console.WriteLine($"[log] agent output tee -> {agentLogPath}");
+    Console.WriteLine("[log] agent output tee active");
     Console.WriteLine($"MP-BUILD version={ReleaseVersionInfo.Current} build={ReleaseVersionInfo.BuildIdValue} (WO-211 0.2: the installer, the launcher's About, the DLL's log and the crash reports name the same id)");
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"[log] file logging unavailable: {ex.Message}");
+    Console.WriteLine($"[log] file logging unavailable: {ex.GetType().Name}");
 }
 
 // --dump-swing-catalog (WO-47) prints the per-weapon-class swing rows parsed
@@ -204,7 +204,7 @@ static string? GetSteamNameFromKcdLog()
         // for modding -- and so silently fell through to the loginusers.vdf
         // fallback. KcdLogLocator scans every library and takes the newest log.
         string? logPath = KcdLogLocator.Find();
-        Console.WriteLine($"[KcdLog] kcd.log = {logPath ?? "(not found)"}");
+        Console.WriteLine($"[KcdLog] game log found={logPath is not null}");
         if (logPath is null) return null;
 
         var nameRe = new Regex(@"user_id=\d+='([^']+)'");
@@ -233,13 +233,13 @@ static string? GetSteamNameFromKcdLog()
             var m = nameRe.Match(line);
             if (m.Success)
             {
-                Console.WriteLine($"[KcdLog] Found Steam name: {m.Groups[1].Value}");
+                Console.WriteLine("[KcdLog] Steam profile found");
                 return m.Groups[1].Value;
             }
             if (++n > 500) break;
         }
     }
-    catch (Exception ex) { Console.WriteLine($"[KcdLog] Error: {ex.Message}"); }
+    catch (Exception ex) { Console.WriteLine($"[KcdLog] Error: {ex.GetType().Name}"); }
     return null;
 }
 
@@ -257,7 +257,7 @@ static string? GetSteamPersonaName()
         string? autoLogin =
             Registry.GetValue(@"HKEY_CURRENT_USER\SOFTWARE\Valve\Steam", "AutoLoginUser", null) as string;
 
-        Console.WriteLine($"[Steam] VDF InstallPath={steamPath ?? "(not found)"}  AutoLoginUser={autoLogin ?? "(not found)"}");
+        Console.WriteLine($"[Steam] install found={steamPath is not null}");
         if (steamPath is null) return null;
 
         string vdfPath = Path.Combine(steamPath, "config", "loginusers.vdf");
@@ -296,19 +296,17 @@ static string? GetSteamPersonaName()
         }
 
         string? result = bestPersona ?? recentPersona;
-        Console.WriteLine($"[Steam] PersonaName = {result ?? "(not found)"}");
+        Console.WriteLine($"[Steam] profile found={result is not null}");
         return result;
     }
-    catch (Exception ex) { Console.WriteLine($"[Steam] Error: {ex.Message}"); }
+    catch (Exception ex) { Console.WriteLine($"[Steam] Error: {ex.GetType().Name}"); }
     return null;
 }
 
 Console.WriteLine("=== KCD2 Multiplayer Client Agent ===");
 Console.WriteLine(string.IsNullOrWhiteSpace(config.SteamCode)
-    ? $"Server   : {config.ServerHost}:{config.ServerPort}"
+    ? "Server   : TCP"
     : $"Server   : through Steam (app {config.SteamAppId}); the code is not logged");
-Console.WriteLine($"Name     : {config.PlayerName}");
-Console.WriteLine($"Game     : {config.GameApiBase}");
 Console.WriteLine($"Voice    : {(config.VoiceChatEnabled ? "on" : "off")}");
 Console.WriteLine($"Protocol : v{Protocol.Version}");
 Console.WriteLine();

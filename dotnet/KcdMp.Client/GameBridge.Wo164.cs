@@ -365,13 +365,14 @@ public partial class GameBridge
                 return;
             case Protocol.W164Escort when W164Text.TryParseEscort(m.Text, out string enpc, out bool eon):
                 if (!W137Host) { Interlocked.Increment(ref _w164Malformed); return; }
-                if (eon && W221On("escort_nav") && !_w164Escorts.Any(k => k.Key.Peer == src && W164Now() - k.Value <= Wo164Rules.EscortMaxS))
+                if (eon && !W221On("escort_nav")) return;
+                if (eon && !_w164Escorts.Any(k => k.Key.Peer == src && W164Now() - k.Value <= Wo164Rules.EscortMaxS))
                 {
                     Interlocked.Increment(ref _w164Malformed);
                     return;
                 }
                 Interlocked.Increment(ref _w164EscortFollows);
-                Console.WriteLine($"WO164-ESCORT npc={enpc} leader=player{src} follow={(eon ? "on" : "off")} -- the host's NPC {(eon ? "walks behind the joiner's figure" : "is its own again")}");
+                Console.WriteLine($"WO164-ESCORT peer={src} request={(eon ? "start" : "stop")}");
                 await ExecLuaAsync($"if KCD2MP_W164EscortFollow then KCD2MP_W164EscortFollow(\"{EscapeLua(enpc)}\", {src}, {B(eon)}) end");
                 return;
             case Protocol.W164Torch when W164Text.TryParseTorch(m.Text, out byte ghost, out bool on):
